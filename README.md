@@ -12,6 +12,8 @@ Create an `expri.toml` in the repo you want to sync, then run:
 expri sync runpod --config cs336-assignment5-alignment/expri.toml
 ```
 
+See `examples/cs336.toml` for a CS336-shaped starting point.
+
 or from inside that repo:
 
 ```sh

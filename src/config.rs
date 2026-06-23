@@ -9,10 +9,16 @@ use crate::filter::{DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES, SyncRules};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+  pub project: Option<ProjectConfig>,
   pub ssh: Option<SshConfig>,
   #[serde(default)]
   pub target: BTreeMap<String, TargetConfig>,
   pub sync: Option<SyncConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectConfig {
+  pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,8 +42,19 @@ pub struct SyncConfig {
 
 impl Config {
   pub fn load(path: &Path) -> Result<Self> {
-    let raw = fs::read_to_string(path)?;
+    let raw = fs::read_to_string(path).map_err(|source| ExpriError::IoContext {
+      action: "read",
+      path: path.display().to_string(),
+      source,
+    })?;
     Ok(toml::from_str(&raw)?)
+  }
+
+  pub fn project_name(&self) -> Option<&str> {
+    self
+      .project
+      .as_ref()
+      .and_then(|project| project.name.as_deref())
   }
 
   pub fn resolve_target_name(&self, requested: Option<&str>) -> Result<String> {

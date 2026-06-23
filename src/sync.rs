@@ -10,6 +10,7 @@ use crate::transport::Remote;
 
 pub struct SyncOptions {
   pub repo_root: PathBuf,
+  pub project_name: Option<String>,
   pub target_name: String,
   pub target: TargetConfig,
   pub sync: SyncRules,
@@ -31,6 +32,9 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     options.quiet,
   );
   if options.verbosity > 0 && !options.quiet {
+    if let Some(project_name) = &options.project_name {
+      eprintln!("project: {project_name}");
+    }
     eprintln!("sync target: {}", options.target_name);
     eprintln!("repo root: {}", options.repo_root.display());
   }

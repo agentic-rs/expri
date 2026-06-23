@@ -5,7 +5,7 @@ pub fn quote(value: impl AsRef<str>) -> String {
   }
   if value
     .bytes()
-    .all(|byte| byte.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&byte))
+    .all(|byte| byte.is_ascii_alphanumeric() || b"@%_+=:,./-~".contains(&byte))
   {
     return value.to_string();
   }

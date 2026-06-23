@@ -34,7 +34,12 @@ pub fn local_has_commit(repo_root: &Path, commit: &str) -> Result<bool> {
     .arg(format!("{commit}^{{commit}}"))
     .stdout(Stdio::null())
     .stderr(Stdio::null())
-    .status()?;
+    .status()
+    .map_err(|source| ExpriError::IoContext {
+      action: "run git in",
+      path: repo_root.display().to_string(),
+      source,
+    })?;
   Ok(status.success())
 }
 
@@ -109,7 +114,12 @@ fn git_capture<const N: usize>(repo_root: &Path, args: [&str; N]) -> Result<Stri
   let output = Command::new("git")
     .current_dir(repo_root)
     .args(args)
-    .output()?;
+    .output()
+    .map_err(|source| ExpriError::IoContext {
+      action: "run git in",
+      path: repo_root.display().to_string(),
+      source,
+    })?;
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
@@ -123,7 +133,12 @@ fn git_capture_bytes<const N: usize>(repo_root: &Path, args: [&str; N]) -> Resul
   let output = Command::new("git")
     .current_dir(repo_root)
     .args(args)
-    .output()?;
+    .output()
+    .map_err(|source| ExpriError::IoContext {
+      action: "run git in",
+      path: repo_root.display().to_string(),
+      source,
+    })?;
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
@@ -137,7 +152,12 @@ fn git_run<const N: usize>(repo_root: &Path, args: [&OsStr; N]) -> Result<()> {
   let status = Command::new("git")
     .current_dir(repo_root)
     .args(args)
-    .status()?;
+    .status()
+    .map_err(|source| ExpriError::IoContext {
+      action: "run git in",
+      path: repo_root.display().to_string(),
+      source,
+    })?;
   if !status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),

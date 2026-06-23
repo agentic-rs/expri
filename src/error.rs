@@ -6,10 +6,18 @@ pub type Result<T> = std::result::Result<T, ExpriError>;
 #[derive(Debug)]
 pub enum ExpriError {
   Io(io::Error),
+  IoContext {
+    action: &'static str,
+    path: String,
+    source: io::Error,
+  },
   Toml(toml::de::Error),
   Glob(globset::Error),
   Zip(zip::result::ZipError),
-  CommandFailed { program: String, code: Option<i32> },
+  CommandFailed {
+    program: String,
+    code: Option<i32>,
+  },
   Message(String),
 }
 
@@ -28,6 +36,13 @@ impl Display for ExpriError {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::Io(error) => write!(formatter, "{error}"),
+      Self::IoContext {
+        action,
+        path,
+        source,
+      } => {
+        write!(formatter, "failed to {action} {path}: {source}")
+      }
       Self::Toml(error) => write!(formatter, "{error}"),
       Self::Glob(error) => write!(formatter, "{error}"),
       Self::Zip(error) => write!(formatter, "{error}"),

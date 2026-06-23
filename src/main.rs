@@ -80,6 +80,7 @@ fn run_sync(command: SyncCommand) -> Result<()> {
     std::env::current_dir()?.join(config_path)
   };
   let config = Config::load(&config_path)?;
+  let project_name = config.project_name().map(str::to_string);
   let repo_root = match command.repo {
     Some(path) if path.is_absolute() => path,
     Some(path) => std::env::current_dir()?.join(path),
@@ -98,6 +99,7 @@ fn run_sync(command: SyncCommand) -> Result<()> {
 
   sync_target(SyncOptions {
     repo_root,
+    project_name,
     target_name,
     target,
     sync,

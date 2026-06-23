@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 
-use crate::error::Result;
+use crate::error::{ExpriError, Result};
 use crate::git::DirtyPaths;
 
 #[derive(Debug)]
@@ -22,7 +22,11 @@ pub struct PatchArchive {
 pub fn build_patch_archive(repo_root: &Path, dirty: &DirtyPaths) -> Result<PatchArchive> {
   let temp_dir = tempfile::Builder::new().prefix("expri-patch-").tempdir()?;
   let path = temp_dir.path().join("patch.zip");
-  let file = File::create(&path)?;
+  let file = File::create(&path).map_err(|source| ExpriError::IoContext {
+    action: "create",
+    path: path.display().to_string(),
+    source,
+  })?;
   let mut archive = zip::ZipWriter::new(file);
   let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
@@ -36,7 +40,12 @@ pub fn build_patch_archive(repo_root: &Path, dirty: &DirtyPaths) -> Result<Patch
 
   for relative_path in &dirty.files {
     archive.start_file(relative_path.to_string_lossy(), options)?;
-    let mut file = File::open(repo_root.join(relative_path))?;
+    let absolute_path = repo_root.join(relative_path);
+    let mut file = File::open(&absolute_path).map_err(|source| ExpriError::IoContext {
+      action: "open",
+      path: absolute_path.display().to_string(),
+      source,
+    })?;
     io::copy(&mut file, &mut archive)?;
   }
   archive.finish()?;
@@ -53,7 +62,11 @@ pub fn build_patch_archive(repo_root: &Path, dirty: &DirtyPaths) -> Result<Patch
 }
 
 pub fn sha256_file(path: &Path) -> Result<(String, u64)> {
-  let mut file = File::open(path)?;
+  let mut file = File::open(path).map_err(|source| ExpriError::IoContext {
+    action: "open",
+    path: path.display().to_string(),
+    source,
+  })?;
   let mut hasher = Sha256::new();
   let mut size = 0;
   let mut buffer = [0; 64 * 1024];
