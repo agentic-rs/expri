@@ -6,6 +6,10 @@ untracked local files.
 
 ## Sync
 
+Top-level commands are controller-side commands: they run from your workstation
+and operate on a configured target. `expri node ...` is the target-machine
+namespace for commands that run locally on a synced node.
+
 Create an `expri.toml` in the repo you want to sync, then run:
 
 ```sh

@@ -1,19 +1,20 @@
 mod archive;
 mod config;
+mod controller;
 mod error;
 mod filter;
 mod git;
+mod node;
 mod shell;
-mod sync;
-mod transport;
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::Config;
+use crate::controller::sync::{SyncOptions, sync_target};
 use crate::error::{ExpriError, Result};
-use crate::sync::{SyncOptions, sync_target};
+use crate::node::cli::NodeCommand;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Repo-local remote workflow tools")]
@@ -25,6 +26,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
   Sync(SyncCommand),
+  Node {
+    #[command(subcommand)]
+    command: NodeCommand,
+  },
 }
 
 #[derive(Debug, Args)]
@@ -67,6 +72,7 @@ fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
     Command::Sync(command) => run_sync(command),
+    Command::Node { command } => node::cli::run(command),
   }
 }
 
