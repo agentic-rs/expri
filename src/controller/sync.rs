@@ -3,12 +3,12 @@ use std::path::PathBuf;
 
 use crate::archive::{PatchArchive, build_patch_archive};
 use crate::config::TargetConfig;
+use crate::controller::protocol::{ProtocolPreference, apply_sync_with_preference};
 use crate::controller::transport::Remote;
 use crate::error::Result;
 use crate::filter::SyncRules;
 use crate::git::{self, SourceBundle};
 use crate::protocol::SyncApplyRequest;
-use crate::shell;
 
 pub struct SyncOptions {
   pub repo_root: PathBuf,
@@ -25,6 +25,12 @@ pub struct SyncOptions {
 }
 
 pub fn sync_target(options: SyncOptions) -> Result<()> {
+  let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
+  let node_bin = options
+    .target
+    .node_bin
+    .clone()
+    .unwrap_or_else(|| "expri".to_string());
   let remote = Remote::new(
     options.target,
     options.control_path,
@@ -55,7 +61,15 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
 
   let bundle = git::build_source_bundle(&options.repo_root, None)?;
   print_digest("source bundle", &bundle.digest, bundle.size, options.quiet);
-  upload_artifacts_and_apply(&remote, &head, &bundle, &patch, options.force)?;
+  upload_artifacts_and_apply(
+    &remote,
+    &head,
+    &bundle,
+    &patch,
+    options.force,
+    preference,
+    &node_bin,
+  )?;
   Ok(())
 }
 
@@ -65,6 +79,8 @@ fn upload_artifacts_and_apply(
   bundle: &SourceBundle,
   patch: &PatchArchive,
   force: bool,
+  preference: ProtocolPreference,
+  node_bin: &str,
 ) -> Result<()> {
   let inbox = format!("{}/inbox", remote.meta_dir());
   remote.ssh(&format!("mkdir -p {inbox}"))?;
@@ -86,11 +102,12 @@ fn upload_artifacts_and_apply(
   let request_path = request_dir.path().join("sync-request.json");
   fs::write(&request_path, serde_json::to_string_pretty(&request)?)?;
   remote.upload_file(&request_path, &format!("{inbox}/sync-request.json"))?;
-  remote.ssh(&format!(
-    "cd {} && expri node sync-apply --request {}",
-    remote.quoted_remote_dir(),
-    shell::quote(".expri/inbox/sync-request.json")
-  ))
+  apply_sync_with_preference(
+    remote,
+    ".expri/inbox/sync-request.json",
+    preference,
+    node_bin,
+  )
 }
 
 fn print_digest(label: &str, digest: &str, size: u64, quiet: bool) {

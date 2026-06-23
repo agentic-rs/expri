@@ -60,6 +60,22 @@ impl Remote {
     )
   }
 
+  pub fn ssh_success(&self, remote_command: &str) -> Result<bool> {
+    let args = self.ssh_args(remote_command);
+    if self.show_commands() && !self.quiet {
+      print_command("ssh", &args);
+    }
+    if self.dry_run {
+      return Ok(true);
+    }
+    let status = Command::new("ssh")
+      .args(args)
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status()?;
+    Ok(status.success())
+  }
+
   pub fn upload_file(&self, local_path: &Path, remote_path: &str) -> Result<()> {
     let mut args = self.rsync_base_args();
     args.push(local_path.to_string_lossy().to_string());

@@ -18,6 +18,10 @@ expri sync runpod --config cs336-assignment5-alignment/expri.toml
 
 See `examples/cs336.toml` for a CS336-shaped starting point.
 
+Targets default to `protocol = "auto"`, which tries `expri node sync-apply`
+first and falls back to the SSH protocol. Set `protocol = "expri-node"` to
+require the node binary, or `protocol = "ssh"` for the fallback path.
+
 or from inside that repo:
 
 ```sh

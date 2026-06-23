@@ -31,6 +31,8 @@ pub struct TargetConfig {
   pub host: String,
   pub remote_dir: String,
   pub port: Option<u16>,
+  pub protocol: Option<String>,
+  pub node_bin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
