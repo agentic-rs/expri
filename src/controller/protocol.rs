@@ -140,7 +140,7 @@ if request.get("remote_url"):
     "git", "--git-dir", str(git_dir), "fetch", request["remote_url"],
     "+refs/heads/*:refs/remotes/bootstrap/*", "+HEAD:refs/remotes/bootstrap/HEAD",
   ], check=False)
-if subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "-e", f"{{request['head']}}^{{commit}}"], check=False).returncode == 0:
+if subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "-e", request["head"] + "^{{commit}}"], check=False).returncode == 0:
   subprocess.run(["git", "--git-dir", str(git_dir), "update-ref", "refs/heads/synced", request["head"]], check=True)
 else:
   if not request.get("source_bundle"):
@@ -196,5 +196,7 @@ mod tests {
     let script = ssh_sync_apply_script(".expri/inbox/sync-request.json");
     assert!(script.contains(r#"pathlib.Path(".expri/inbox/sync-request.json").read_text()"#));
     assert!(!script.contains("pathlib.Path(.expri/inbox"));
+    assert!(script.contains(r#"request["head"] + "^{commit}""#));
+    assert!(!script.contains(r#"f"{request['head']}^{commit}""#));
   }
 }
