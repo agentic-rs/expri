@@ -41,7 +41,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
     eprintln!("task: {}", options.name);
     eprintln!("repo root: {}", options.repo_root.display());
   }
-  if options.dry_run || (options.verbosity > 0 && !options.quiet) {
+  if (options.dry_run || options.verbosity > 0) && !options.quiet {
     eprintln!(
       "+ cd {} && {}",
       shell::quote(options.repo_root.to_string_lossy()),

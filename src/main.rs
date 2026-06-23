@@ -29,6 +29,12 @@ struct Cli {
   #[arg(short = 'T', long)]
   target: Option<String>,
 
+  #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+  verbose: u8,
+
+  #[arg(short, long, global = true)]
+  quiet: bool,
+
   #[command(subcommand)]
   command: Command,
 }
@@ -68,12 +74,6 @@ struct SyncCommand {
   #[arg(long)]
   pull: bool,
 
-  #[arg(short, long, action = clap::ArgAction::Count)]
-  verbose: u8,
-
-  #[arg(short, long)]
-  quiet: bool,
-
   #[arg(value_name = "PATH", last = true)]
   paths: Vec<PathBuf>,
 }
@@ -97,12 +97,6 @@ struct SetupCommand {
 
   #[arg(long)]
   force: bool,
-
-  #[arg(short, long, action = clap::ArgAction::Count)]
-  verbose: u8,
-
-  #[arg(short, long)]
-  quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -121,12 +115,6 @@ struct DownloadCommand {
 
   #[arg(long)]
   dry_run: bool,
-
-  #[arg(short, long, action = clap::ArgAction::Count)]
-  verbose: u8,
-
-  #[arg(short, long)]
-  quiet: bool,
 
   #[arg(value_name = "NAME", last = true)]
   names: Vec<String>,
@@ -151,12 +139,6 @@ struct TaskCommand {
   #[arg(long)]
   dry_run: bool,
 
-  #[arg(short, long, action = clap::ArgAction::Count)]
-  verbose: u8,
-
-  #[arg(short, long)]
-  quiet: bool,
-
   #[arg(value_name = "ARG", last = true)]
   args: Vec<String>,
 }
@@ -171,10 +153,12 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Sync(command) => run_sync(command, cli.target.as_deref()),
-    Command::Download(command) => run_download(command, cli.target.as_deref()),
-    Command::Setup(command) => run_setup(command, cli.target.as_deref()),
-    Command::Task(command) => run_task(command, cli.target.as_deref()),
+    Command::Sync(command) => run_sync(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Download(command) => {
+      run_download(command, cli.target.as_deref(), cli.verbose, cli.quiet)
+    }
+    Command::Setup(command) => run_setup(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Task(command) => run_task(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
@@ -186,7 +170,7 @@ fn run() -> Result<()> {
   }
 }
 
-fn run_sync(command: SyncCommand, target: Option<&str>) -> Result<()> {
+fn run_sync(command: SyncCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let context = CommandContext::load(command.config, command.repo)?
     .into_target(target, command.control_path)?;
   let sync = context.config.sync_rules()?;
@@ -203,12 +187,17 @@ fn run_sync(command: SyncCommand, target: Option<&str>) -> Result<()> {
     force: command.force,
     pull: command.pull,
     paths: command.paths,
-    verbosity: command.verbose,
-    quiet: command.quiet,
+    verbosity,
+    quiet,
   })
 }
 
-fn run_download(command: DownloadCommand, target: Option<&str>) -> Result<()> {
+fn run_download(
+  command: DownloadCommand,
+  target: Option<&str>,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
   let context = CommandContext::load(command.config, command.repo)?
     .into_target(target, command.control_path)?;
   let results_dir = context.config.download_results_dir();
@@ -225,12 +214,17 @@ fn run_download(command: DownloadCommand, target: Option<&str>) -> Result<()> {
     control_path: context.control_path,
     control_persist: command.control_persist,
     dry_run: command.dry_run,
-    verbosity: command.verbose,
-    quiet: command.quiet,
+    verbosity,
+    quiet,
   })
 }
 
-fn run_setup(command: SetupCommand, target: Option<&str>) -> Result<()> {
+fn run_setup(
+  command: SetupCommand,
+  target: Option<&str>,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
   let context = CommandContext::load(command.config, command.repo)?
     .into_target(target, command.control_path)?;
   let steps = context.config.setup_steps();
@@ -245,12 +239,12 @@ fn run_setup(command: SetupCommand, target: Option<&str>) -> Result<()> {
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     force: command.force,
-    verbosity: command.verbose,
-    quiet: command.quiet,
+    verbosity,
+    quiet,
   })
 }
 
-fn run_task(command: TaskCommand, target: Option<&str>) -> Result<()> {
+fn run_task(command: TaskCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let context = CommandContext::load(command.config, command.repo)?;
   let task = context.config.task(&command.name)?;
   if target.is_some() {
@@ -266,8 +260,8 @@ fn run_task(command: TaskCommand, target: Option<&str>) -> Result<()> {
       task,
       args: command.args,
       dry_run: command.dry_run,
-      verbosity: command.verbose,
-      quiet: command.quiet,
+      verbosity,
+      quiet,
     });
   }
 
@@ -278,7 +272,7 @@ fn run_task(command: TaskCommand, target: Option<&str>) -> Result<()> {
     task,
     args: command.args,
     dry_run: command.dry_run,
-    verbosity: command.verbose,
-    quiet: command.quiet,
+    verbosity,
+    quiet,
   })
 }
