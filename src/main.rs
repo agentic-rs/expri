@@ -5,6 +5,7 @@ mod error;
 mod filter;
 mod git;
 mod node;
+mod protocol;
 mod shell;
 
 use std::path::PathBuf;

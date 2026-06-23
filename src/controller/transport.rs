@@ -47,30 +47,8 @@ impl Remote {
     format!("{}/.expri", self.quoted_remote_dir())
   }
 
-  pub fn git_dir(&self) -> String {
-    format!("{}/git", self.meta_dir())
-  }
-
   pub fn show_commands(&self) -> bool {
     self.verbosity > 0 || self.dry_run
-  }
-
-  pub fn ssh_capture(&self, remote_command: &str) -> Result<String> {
-    let args = self.ssh_args(remote_command);
-    if self.show_commands() && !self.quiet {
-      print_command("ssh", &args);
-    }
-    if self.dry_run {
-      return Ok(String::new());
-    }
-    let output = Command::new("ssh").args(args).output()?;
-    if !output.status.success() {
-      return Err(ExpriError::CommandFailed {
-        program: "ssh".to_string(),
-        code: output.status.code(),
-      });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
   }
 
   pub fn ssh(&self, remote_command: &str) -> Result<()> {

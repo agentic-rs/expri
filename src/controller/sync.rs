@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::PathBuf;
 
 use crate::archive::{PatchArchive, build_patch_archive};
 use crate::config::TargetConfig;
@@ -6,7 +7,7 @@ use crate::controller::transport::Remote;
 use crate::error::Result;
 use crate::filter::SyncRules;
 use crate::git::{self, SourceBundle};
-use crate::node;
+use crate::protocol::SyncApplyRequest;
 use crate::shell;
 
 pub struct SyncOptions {
@@ -52,118 +53,43 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     );
   }
 
-  if !options.force
-    && remote_synced_head(&remote)? == head
-    && remote_patch_digest(&remote)? == patch.digest
-  {
-    if options.verbosity > 0 && !options.quiet {
-      eprintln!("remote workspace is current");
-    }
-    return Ok(());
-  }
-
-  sync_bundle(
-    &remote,
-    &options.repo_root,
-    &head,
-    options.verbosity,
-    options.quiet,
-  )?;
-  checkout_synced_commit(&remote, &head)?;
-  apply_patch_archive(&remote, &patch)?;
+  let bundle = git::build_source_bundle(&options.repo_root, None)?;
+  print_digest("source bundle", &bundle.digest, bundle.size, options.quiet);
+  upload_artifacts_and_apply(&remote, &head, &bundle, &patch, options.force)?;
   Ok(())
 }
 
-fn sync_bundle(
+fn upload_artifacts_and_apply(
   remote: &Remote,
-  repo_root: &Path,
   head: &str,
-  verbosity: u8,
-  quiet: bool,
+  bundle: &SourceBundle,
+  patch: &PatchArchive,
+  force: bool,
 ) -> Result<()> {
-  let meta = remote.meta_dir();
-  let git_dir = remote.git_dir();
-  remote.ssh(&format!("mkdir -p {meta}"))?;
-  remote.ssh(&format!("test -d {git_dir} || git init --bare {git_dir}"))?;
+  let inbox = format!("{}/inbox", remote.meta_dir());
+  remote.ssh(&format!("mkdir -p {inbox}"))?;
+  remote.upload_file(&bundle.path, &format!("{inbox}/source.bundle"))?;
+  remote.upload_file(&patch.path, &format!("{inbox}/patch.zip"))?;
 
-  if remote_has_commit(remote, head)? {
-    if verbosity > 0 && !quiet {
-      eprintln!("remote already has commit: {head}");
-    }
-    remote.ssh(&format!(
-      "git --git-dir {git_dir} update-ref refs/heads/synced {}",
-      shell::quote(head)
-    ))?;
-    return Ok(());
-  }
-
-  let base_commit = match remote_synced_head(remote)? {
-    commit if !commit.is_empty() && git::local_has_commit(repo_root, &commit)? => Some(commit),
-    _ => None,
+  let request = SyncApplyRequest {
+    head: head.to_string(),
+    source_bundle: ".expri/inbox/source.bundle".to_string(),
+    source_bundle_sha256: bundle.digest.clone(),
+    patch: ".expri/inbox/patch.zip".to_string(),
+    patch_sha256: patch.digest.clone(),
+    state_dir: ".expri".to_string(),
+    force,
   };
-  if verbosity > 0 && !quiet {
-    match &base_commit {
-      Some(commit) => eprintln!("source bundle refspec: {commit}..HEAD"),
-      None => eprintln!("source bundle refspec: HEAD"),
-    }
-  }
-
-  let bundle = git::build_source_bundle(repo_root, base_commit.as_deref())?;
-  print_digest("source bundle", &bundle.digest, bundle.size, quiet);
-  upload_bundle(remote, &bundle)?;
-  Ok(())
-}
-
-fn upload_bundle(remote: &Remote, bundle: &SourceBundle) -> Result<()> {
-  let meta = remote.meta_dir();
-  remote.upload_file(&bundle.path, &format!("{meta}/source.bundle"))?;
+  let request_dir = tempfile::Builder::new()
+    .prefix("expri-request-")
+    .tempdir()?;
+  let request_path = request_dir.path().join("sync-request.json");
+  fs::write(&request_path, serde_json::to_string_pretty(&request)?)?;
+  remote.upload_file(&request_path, &format!("{inbox}/sync-request.json"))?;
   remote.ssh(&format!(
-    "cd {} && git --git-dir .expri/git fetch .expri/source.bundle +HEAD:refs/heads/synced && printf %s {} > .expri/source.bundle.sha256",
+    "cd {} && expri node sync-apply --request {}",
     remote.quoted_remote_dir(),
-    shell::quote(&bundle.digest)
-  ))
-}
-
-fn checkout_synced_commit(remote: &Remote, head: &str) -> Result<()> {
-  remote.ssh(&format!(
-    "cd {} && git --git-dir .expri/git --work-tree . checkout -f {}",
-    remote.quoted_remote_dir(),
-    shell::quote(head)
-  ))
-}
-
-fn apply_patch_archive(remote: &Remote, patch: &PatchArchive) -> Result<()> {
-  let meta = remote.meta_dir();
-  remote.upload_file(&patch.path, &format!("{meta}/patch.zip"))?;
-  let script = node::sync::patch_apply_script(&patch.digest);
-  remote.ssh(&format!(
-    "cd {} && python3 - <<'PY'\n{script}\nPY",
-    remote.quoted_remote_dir(),
-  ))
-}
-
-fn remote_has_commit(remote: &Remote, commit: &str) -> Result<bool> {
-  Ok(
-    remote.ssh_capture(&format!(
-      "git --git-dir {} cat-file -e {}^{{commit}} 2>/dev/null && echo yes || true",
-      remote.git_dir(),
-      shell::quote(commit)
-    ))?
-      == "yes",
-  )
-}
-
-fn remote_synced_head(remote: &Remote) -> Result<String> {
-  remote.ssh_capture(&format!(
-    "git --git-dir {} rev-parse refs/heads/synced 2>/dev/null || true",
-    remote.git_dir()
-  ))
-}
-
-fn remote_patch_digest(remote: &Remote) -> Result<String> {
-  remote.ssh_capture(&format!(
-    "cat {}/patch.sha256 2>/dev/null || true",
-    remote.meta_dir()
+    shell::quote(".expri/inbox/sync-request.json")
   ))
 }
 

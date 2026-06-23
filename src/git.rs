@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use tempfile::TempDir;
 
@@ -25,22 +25,6 @@ pub struct DirtyPaths {
 
 pub fn head(repo_root: &Path) -> Result<String> {
   git_capture(repo_root, ["rev-parse", "HEAD"])
-}
-
-pub fn local_has_commit(repo_root: &Path, commit: &str) -> Result<bool> {
-  let status = Command::new("git")
-    .current_dir(repo_root)
-    .args(["cat-file", "-e"])
-    .arg(format!("{commit}^{{commit}}"))
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status()
-    .map_err(|source| ExpriError::IoContext {
-      action: "run git in",
-      path: repo_root.display().to_string(),
-      source,
-    })?;
-  Ok(status.success())
 }
 
 pub fn build_source_bundle(repo_root: &Path, base_commit: Option<&str>) -> Result<SourceBundle> {

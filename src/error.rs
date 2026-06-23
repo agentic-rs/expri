@@ -12,6 +12,7 @@ pub enum ExpriError {
     source: io::Error,
   },
   Toml(toml::de::Error),
+  Json(serde_json::Error),
   Glob(globset::Error),
   Zip(zip::result::ZipError),
   CommandFailed {
@@ -44,6 +45,7 @@ impl Display for ExpriError {
         write!(formatter, "failed to {action} {path}: {source}")
       }
       Self::Toml(error) => write!(formatter, "{error}"),
+      Self::Json(error) => write!(formatter, "{error}"),
       Self::Glob(error) => write!(formatter, "{error}"),
       Self::Zip(error) => write!(formatter, "{error}"),
       Self::CommandFailed { program, code } => match code {
@@ -66,6 +68,12 @@ impl From<io::Error> for ExpriError {
 impl From<toml::de::Error> for ExpriError {
   fn from(error: toml::de::Error) -> Self {
     Self::Toml(error)
+  }
+}
+
+impl From<serde_json::Error> for ExpriError {
+  fn from(error: serde_json::Error) -> Self {
+    Self::Json(error)
   }
 }
 
