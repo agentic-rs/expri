@@ -8,7 +8,8 @@ use zip::ZipArchive;
 
 use crate::archive::sha256_file;
 use crate::error::{ExpriError, Result};
-use crate::protocol::SyncApplyRequest;
+use crate::git;
+use crate::protocol::{PullArtifacts, SyncApplyRequest};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SyncState {
@@ -105,6 +106,52 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
 
   apply_patch_zip(state_dir, Path::new(&request.patch), &request.patch_sha256)?;
   write_state(state_dir, request)?;
+  Ok(())
+}
+
+pub fn prepare_pull() -> Result<()> {
+  let state_dir = Path::new(".expri");
+  let out_dir = state_dir.join("out");
+  fs::create_dir_all(&out_dir).map_err(|source| ExpriError::IoContext {
+    action: "create directory",
+    path: out_dir.display().to_string(),
+    source,
+  })?;
+  let head = git_capture(["rev-parse", "HEAD"])?;
+  let bundle_path = out_dir.join("pull-source.bundle");
+  run_git(vec![
+    "bundle".to_string(),
+    "create".to_string(),
+    bundle_path.to_string_lossy().to_string(),
+    "HEAD".to_string(),
+  ])?;
+  let dirty = git::dirty_paths(Path::new("."), &crate::filter::SyncRules::defaults()?)?;
+  let patch = crate::archive::build_patch_archive(Path::new("."), &dirty)?;
+  let patch_path = out_dir.join("pull-patch.zip");
+  fs::copy(&patch.path, &patch_path).map_err(|source| ExpriError::IoContext {
+    action: "copy",
+    path: patch_path.display().to_string(),
+    source,
+  })?;
+  let (source_bundle_sha256, _) = sha256_file(&bundle_path)?;
+  let (patch_sha256, _) = sha256_file(&patch_path)?;
+  let artifacts = PullArtifacts {
+    head,
+    source_bundle: ".expri/out/pull-source.bundle".to_string(),
+    source_bundle_sha256,
+    patch: ".expri/out/pull-patch.zip".to_string(),
+    patch_sha256,
+    state_dir: ".expri".to_string(),
+  };
+  fs::write(
+    out_dir.join("pull-artifacts.json"),
+    serde_json::to_string_pretty(&artifacts)?,
+  )
+  .map_err(|source| ExpriError::IoContext {
+    action: "write",
+    path: out_dir.join("pull-artifacts.json").display().to_string(),
+    source,
+  })?;
   Ok(())
 }
 
@@ -320,6 +367,17 @@ fn run_git(args: Vec<String>) -> Result<()> {
     });
   }
   Ok(())
+}
+
+fn git_capture<const N: usize>(args: [&str; N]) -> Result<String> {
+  let output = Command::new("git").args(args).output()?;
+  if !output.status.success() {
+    return Err(ExpriError::CommandFailed {
+      program: "git".to_string(),
+      code: output.status.code(),
+    });
+  }
+  Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn run_git_success(args: Vec<String>) -> Result<bool> {

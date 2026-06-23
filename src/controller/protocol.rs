@@ -176,7 +176,7 @@ for step in request["steps"]:
       cmd.extend(["--extra", extra])
     cmd.extend(step.get("args", []))
   elif kind == "hf":
-    cmd = ["hf", "download", step["repo"]]
+    cmd = ["uv", "run", "hf", "download", step["repo"]]
     if step.get("revision"):
       cmd.extend(["--revision", step["revision"]])
     cmd.extend(step.get("args", []))

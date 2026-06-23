@@ -57,6 +57,9 @@ struct SyncCommand {
   #[arg(long)]
   force: bool,
 
+  #[arg(long)]
+  pull: bool,
+
   #[arg(short, long, action = clap::ArgAction::Count)]
   verbose: u8,
 
@@ -146,6 +149,7 @@ fn run_sync(command: SyncCommand) -> Result<()> {
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     force: command.force,
+    pull: command.pull,
     verbosity: command.verbose,
     quiet: command.quiet,
   })

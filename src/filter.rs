@@ -29,6 +29,20 @@ pub struct SyncRules {
 }
 
 impl SyncRules {
+  pub fn defaults() -> Result<Self> {
+    Self::new(
+      DEFAULT_EXCLUDED_DIRS
+        .iter()
+        .map(ToString::to_string)
+        .collect(),
+      DEFAULT_EXCLUDED_FILES
+        .iter()
+        .map(ToString::to_string)
+        .collect(),
+      Vec::new(),
+    )
+  }
+
   pub fn new(
     exclude_dirs: Vec<String>,
     exclude_files: Vec<String>,

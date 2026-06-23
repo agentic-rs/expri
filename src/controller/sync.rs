@@ -1,14 +1,15 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::archive::{PatchArchive, build_patch_archive};
+use crate::archive::{PatchArchive, build_patch_archive, sha256_file};
 use crate::config::TargetConfig;
 use crate::controller::protocol::{ProtocolPreference, apply_sync_with_preference};
 use crate::controller::transport::Remote;
 use crate::error::Result;
 use crate::filter::SyncRules;
 use crate::git::{self, RemoteCandidate, SourceBundle};
-use crate::protocol::SyncApplyRequest;
+use crate::protocol::{PullArtifacts, SyncApplyRequest};
+use crate::shell;
 
 pub struct SyncOptions {
   pub repo_root: PathBuf,
@@ -20,6 +21,7 @@ pub struct SyncOptions {
   pub control_persist: String,
   pub dry_run: bool,
   pub force: bool,
+  pub pull: bool,
   pub verbosity: u8,
   pub quiet: bool,
 }
@@ -32,13 +34,16 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     .clone()
     .unwrap_or_else(|| "expri".to_string());
   let remote = Remote::new(
-    options.target,
-    options.control_path,
-    options.control_persist,
+    options.target.clone(),
+    options.control_path.clone(),
+    options.control_persist.clone(),
     options.dry_run,
     options.verbosity,
     options.quiet,
   );
+  if options.pull {
+    return pull_target(options, remote, preference, &node_bin);
+  }
   if options.verbosity > 0 && !options.quiet {
     if let Some(project_name) = &options.project_name {
       eprintln!("project: {project_name}");
@@ -92,6 +97,142 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     &node_bin,
   )?;
   Ok(())
+}
+
+fn pull_target(
+  options: SyncOptions,
+  remote: Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  if options.verbosity > 0 && !options.quiet {
+    if let Some(project_name) = &options.project_name {
+      eprintln!("project: {project_name}");
+    }
+    eprintln!("pull target: {}", options.target_name);
+    eprintln!("repo root: {}", options.repo_root.display());
+  }
+  let _opened_master = remote.open_master()?;
+  prepare_remote_pull(&remote, preference, node_bin)?;
+
+  let local_dir = options
+    .repo_root
+    .join(".git")
+    .join("expri")
+    .join(&options.target_name);
+  fs::create_dir_all(&local_dir)?;
+  let artifacts_path = local_dir.join("pull-artifacts.json");
+  let bundle_path = local_dir.join("source.bundle");
+  let patch_path = local_dir.join("patch.zip");
+  remote.download_file(
+    &format!("{}/out/pull-artifacts.json", remote.meta_dir()),
+    &artifacts_path,
+  )?;
+  remote.download_file(
+    &format!("{}/out/pull-source.bundle", remote.meta_dir()),
+    &bundle_path,
+  )?;
+  remote.download_file(
+    &format!("{}/out/pull-patch.zip", remote.meta_dir()),
+    &patch_path,
+  )?;
+  if options.dry_run {
+    eprintln!(
+      "+ git -C {} fetch {} +HEAD:refs/expri/{}/HEAD",
+      options.repo_root.display(),
+      bundle_path.display(),
+      options.target_name
+    );
+    return Ok(());
+  }
+
+  let artifacts: PullArtifacts = serde_json::from_str(&fs::read_to_string(&artifacts_path)?)?;
+  verify_download(
+    &bundle_path,
+    &artifacts.source_bundle_sha256,
+    "source bundle",
+  )?;
+  verify_download(&patch_path, &artifacts.patch_sha256, "patch")?;
+  let ref_name = format!("refs/expri/{}/HEAD", options.target_name);
+  git::fetch_bundle_to_ref(&options.repo_root, &bundle_path, &ref_name)?;
+  if !options.quiet {
+    eprintln!(
+      "updated refs/expri/{}/HEAD to {}",
+      options.target_name, artifacts.head
+    );
+    eprintln!("stored remote patch at {}", patch_path.display());
+  }
+  Ok(())
+}
+
+fn prepare_remote_pull(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  match preference {
+    ProtocolPreference::ExpriNode | ProtocolPreference::Auto => remote.ssh(&format!(
+      "cd {} && {} node pull-prepare",
+      remote.quoted_remote_dir(),
+      shell::quote(node_bin)
+    )),
+    ProtocolPreference::Ssh => remote.ssh(&format!(
+      "cd {} && python3 - <<'PY'\n{}\nPY",
+      remote.quoted_remote_dir(),
+      pull_prepare_script()
+    )),
+  }
+}
+
+fn verify_download(path: &PathBuf, expected: &str, label: &str) -> Result<()> {
+  let (actual, _) = sha256_file(path)?;
+  if actual != expected {
+    return Err(crate::error::ExpriError::Message(format!(
+      "{label} sha256 mismatch: expected {expected}, got {actual}"
+    )));
+  }
+  Ok(())
+}
+
+fn pull_prepare_script() -> String {
+  r#"import hashlib, json, pathlib, subprocess, zipfile
+
+def sha256(path):
+  h = hashlib.sha256()
+  with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+      h.update(chunk)
+  return h.hexdigest()
+
+out = pathlib.Path(".expri/out")
+out.mkdir(parents=True, exist_ok=True)
+head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+bundle = out / "pull-source.bundle"
+patch = out / "pull-patch.zip"
+subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], check=True)
+changed = subprocess.check_output(["git", "diff", "--name-only", "-z", "HEAD", "--"])
+untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
+paths = sorted({p for p in (changed + untracked).decode().split("\0") if p})
+with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+  deleted = []
+  for path in paths:
+    p = pathlib.Path(path)
+    if p.is_file():
+      archive.write(p, path)
+    else:
+      deleted.append(path)
+  archive.writestr(".deleted", "".join(f"{path}\n" for path in deleted))
+artifacts = {
+  "head": head,
+  "source_bundle": ".expri/out/pull-source.bundle",
+  "source_bundle_sha256": sha256(bundle),
+  "patch": ".expri/out/pull-patch.zip",
+  "patch_sha256": sha256(patch),
+  "state_dir": ".expri",
+}
+(out / "pull-artifacts.json").write_text(json.dumps(artifacts, indent=2, sort_keys=True))
+"#
+  .to_string()
 }
 
 fn build_source_bundle_for_remote(

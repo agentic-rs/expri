@@ -53,13 +53,18 @@ fn run_step(step: &SetupStep) -> Result<()> {
       revision,
       args,
     } => {
-      let mut command_args = vec!["download".to_string(), repo.clone()];
+      let mut command_args = vec![
+        "run".to_string(),
+        "hf".to_string(),
+        "download".to_string(),
+        repo.clone(),
+      ];
       if let Some(revision) = revision {
         command_args.push("--revision".to_string());
         command_args.push(revision.clone());
       }
       command_args.extend(args.iter().cloned());
-      run_command("hf", command_args)
+      run_command("uv", command_args)
     }
     SetupStep::Script { path, args } => {
       let path = PathBuf::from(path);

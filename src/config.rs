@@ -92,27 +92,24 @@ impl Config {
 
   pub fn sync_rules(&self) -> Result<SyncRules> {
     let sync = self.sync.as_ref();
-    SyncRules::new(
-      sync
-        .and_then(|sync| sync.exclude_dirs.clone())
-        .unwrap_or_else(|| {
+    match sync {
+      Some(sync) => SyncRules::new(
+        sync.exclude_dirs.clone().unwrap_or_else(|| {
           DEFAULT_EXCLUDED_DIRS
             .iter()
             .map(ToString::to_string)
             .collect()
         }),
-      sync
-        .and_then(|sync| sync.exclude_files.clone())
-        .unwrap_or_else(|| {
+        sync.exclude_files.clone().unwrap_or_else(|| {
           DEFAULT_EXCLUDED_FILES
             .iter()
             .map(ToString::to_string)
             .collect()
         }),
-      sync
-        .and_then(|sync| sync.include_ignored.clone())
-        .unwrap_or_default(),
-    )
+        sync.include_ignored.clone().unwrap_or_default(),
+      ),
+      None => SyncRules::defaults(),
+    }
   }
 
   pub fn setup_steps(&self) -> Vec<SetupStep> {

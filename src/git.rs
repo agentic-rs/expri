@@ -107,6 +107,17 @@ pub fn build_source_bundle(repo_root: &Path, base_commit: Option<&str>) -> Resul
   })
 }
 
+pub fn fetch_bundle_to_ref(repo_root: &Path, bundle_path: &Path, ref_name: &str) -> Result<()> {
+  git_run(
+    repo_root,
+    [
+      OsStr::new("fetch"),
+      bundle_path.as_os_str(),
+      OsStr::new(&format!("+HEAD:{ref_name}")),
+    ],
+  )
+}
+
 pub fn dirty_paths(repo_root: &Path, rules: &SyncRules) -> Result<DirtyPaths> {
   let mut relative_paths = BTreeSet::new();
   for value in git_capture_bytes(repo_root, ["diff", "--name-only", "-z", "HEAD", "--"])?
