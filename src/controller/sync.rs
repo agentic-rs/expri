@@ -138,7 +138,7 @@ fn pull_target(
   )?;
   if options.dry_run {
     eprintln!(
-      "+ git -C {} fetch {} +HEAD:refs/expri/{}/HEAD",
+      "+ git -C {} fetch {} +HEAD:refs/remotes/expri/{}/HEAD",
       options.repo_root.display(),
       bundle_path.display(),
       options.target_name
@@ -153,11 +153,11 @@ fn pull_target(
     "source bundle",
   )?;
   verify_download(&patch_path, &artifacts.patch_sha256, "patch")?;
-  let ref_name = format!("refs/expri/{}/HEAD", options.target_name);
+  let ref_name = format!("refs/remotes/expri/{}/HEAD", options.target_name);
   git::fetch_bundle_to_ref(&options.repo_root, &bundle_path, &ref_name)?;
   if !options.quiet {
     eprintln!(
-      "updated refs/expri/{}/HEAD to {}",
+      "updated refs/remotes/expri/{}/HEAD to {}",
       options.target_name, artifacts.head
     );
     eprintln!("stored remote patch at {}", patch_path.display());
