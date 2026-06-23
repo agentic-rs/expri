@@ -52,7 +52,7 @@ require the node binary, or `protocol = "ssh"` for the fallback path.
 
 ## Task
 
-`expri task <name>` runs a repo-local command alias in the repo root:
+`expri run <name>` runs a repo-local command alias in the repo root:
 
 ```toml
 [tasks]
@@ -64,9 +64,9 @@ The array form runs exactly that command. The object form supports options;
 `uv = true` prefixes the command with `uv run`.
 
 ```sh
-expri task dev
-expri task train -- --epochs 3
-expri -T runpod task train -- --epochs 3
+expri run dev
+expri run train -- --epochs 3
+expri -T runpod run train -- --epochs 3
 ```
 
 ## Setup

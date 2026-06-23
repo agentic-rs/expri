@@ -44,7 +44,7 @@ enum Command {
   Sync(SyncCommand),
   Download(DownloadCommand),
   Setup(SetupCommand),
-  Task(TaskCommand),
+  Run(RunCommand),
   Node {
     #[command(subcommand)]
     command: NodeCommand,
@@ -121,7 +121,7 @@ struct DownloadCommand {
 }
 
 #[derive(Debug, Args)]
-struct TaskCommand {
+struct RunCommand {
   name: String,
 
   #[arg(long)]
@@ -158,7 +158,7 @@ fn run() -> Result<()> {
       run_download(command, cli.target.as_deref(), cli.verbose, cli.quiet)
     }
     Command::Setup(command) => run_setup(command, cli.target.as_deref(), cli.verbose, cli.quiet),
-    Command::Task(command) => run_task(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Run(command) => run_task(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
@@ -244,7 +244,7 @@ fn run_setup(
   })
 }
 
-fn run_task(command: TaskCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
+fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let context = CommandContext::load(command.config, command.repo)?;
   let task = context.config.task(&command.name)?;
   if target.is_some() {
