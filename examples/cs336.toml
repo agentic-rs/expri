@@ -1,0 +1,34 @@
+[project]
+name = "cs336-assignment5-alignment"
+
+[target.runpod]
+host = "user@example.com"
+remote_dir = "~/cs336-assignment5-alignment"
+
+[sync]
+exclude_dirs = [
+  ".git",
+  ".venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".pyre",
+  ".hypothesis",
+  "alignment.egg-info",
+  "out",
+]
+
+exclude_files = [
+  ".env",
+  "*.pyc",
+  "*.pyo",
+  "*.log",
+  "*.tmp",
+  ".DS_Store",
+]
+
+include_ignored = [
+  "wandb/config.json",
+  "wandb/.gitignore",
+]

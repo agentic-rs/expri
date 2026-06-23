@@ -1,0 +1,25 @@
+# expri
+
+`expri` is a repo-local remote workflow tool. The first implemented command is
+`sync`, which makes a remote working tree match local `HEAD` plus dirty and
+untracked local files.
+
+## Sync
+
+Create an `expri.toml` in the repo you want to sync, then run:
+
+```sh
+expri sync runpod --config cs336-assignment5-alignment/expri.toml
+```
+
+or from inside that repo:
+
+```sh
+expri sync runpod
+```
+
+The sync algorithm uploads committed history with a git bundle, checks out
+`HEAD` on the remote, then overlays a zip archive of local dirty and untracked
+files. Remote tool state lives under `.expri/`.
+
+Use `--dry-run` to print the SSH/rsync commands without executing them.
