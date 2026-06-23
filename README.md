@@ -10,7 +10,29 @@ Top-level commands are controller-side commands: they run from your workstation
 and operate on a configured target. `expri node ...` is the target-machine
 namespace for commands that run locally on a synced node.
 
-Create an `expri.toml` in the repo you want to sync, then run:
+Create an `expri.toml` in the repo you want to sync, and keep machine targets
+in a sibling `expri.target.toml`. `expri.target.toml` is local/private; add it
+to that repo's `.gitignore`.
+
+```toml
+# expri.toml
+[project]
+name = "my-project"
+
+[download.mappings]
+wandb = "wandb"
+```
+
+```toml
+# expri.target.toml
+[target.runpod]
+host = "user@example.com"
+remote_dir = "~/my-project"
+protocol = "auto"
+node_bin = "expri"
+```
+
+Then run:
 
 ```sh
 expri sync runpod --config cs336-assignment5-alignment/expri.toml
@@ -44,6 +66,25 @@ For a path-scoped rsync, pass paths after `--`. Only files returned by
 ```sh
 expri sync runpod -- src scripts
 expri sync --pull runpod -- outputs/checkpoints
+```
+
+## Download
+
+`expri download <target>` downloads configured result mappings into
+`results/<target>/`. Mappings are declared in `expri.toml`:
+
+```toml
+[download.mappings]
+wandb = "wandb"
+jobs = "out/jobs"
+```
+
+That example downloads the remote repo's `wandb/` directory into
+`results/<target>/wandb/`, and `out/jobs/` into `results/<target>/jobs/`.
+Pass mapping names after `--` to download a subset:
+
+```sh
+expri download runpod -- wandb
 ```
 
 Use `--dry-run` to print the SSH/rsync commands without executing them.

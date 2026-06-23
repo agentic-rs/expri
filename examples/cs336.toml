@@ -1,12 +1,6 @@
 [project]
 name = "cs336-assignment5-alignment"
 
-[target.runpod]
-host = "user@example.com"
-remote_dir = "~/cs336-assignment5-alignment"
-protocol = "auto"
-node_bin = "expri"
-
 [sync]
 exclude_dirs = [
   ".git",
@@ -34,6 +28,10 @@ include_ignored = [
   "wandb/config.json",
   "wandb/.gitignore",
 ]
+
+[download.mappings]
+wandb = "wandb"
+jobs = "out/jobs"
 
 [[setup.steps]]
 kind = "uv"

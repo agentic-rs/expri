@@ -124,7 +124,11 @@ fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
   } else {
     git::ls_files(&options.repo_root, &options.paths)?
   };
-  if list.is_empty() && options.verbosity > 0 && !options.quiet {
+  if list.is_empty()
+    && options.verbosity > 0
+    && !options.quiet
+    && !(options.pull && options.dry_run)
+  {
     eprintln!("no tracked files matched");
   }
   let list_dir = tempfile::Builder::new().prefix("expri-files-").tempdir()?;

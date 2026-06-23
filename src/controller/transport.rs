@@ -146,6 +146,17 @@ impl Remote {
     self.run("rsync", args)
   }
 
+  pub fn download_dir(&self, remote_dir: &str, local_dir: &Path) -> Result<()> {
+    let mut args = self.rsync_base_args();
+    args.push(format!(
+      "{}:{}",
+      self.host,
+      ensure_trailing_slash(remote_dir)
+    ));
+    args.push(ensure_trailing_slash(&local_dir.to_string_lossy()));
+    self.run("rsync", args)
+  }
+
   pub fn open_master(&self) -> Result<bool> {
     if self.master_running()? {
       if self.verbosity > 0 && !self.quiet {
