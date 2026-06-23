@@ -1,5 +1,6 @@
 mod archive;
 mod config;
+mod context;
 mod controller;
 mod error;
 mod filter;
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::Config;
+use crate::context::CommandContext;
 use crate::controller::download::{DownloadOptions, download_target};
 use crate::controller::setup::{SetupOptions, setup_target};
 use crate::controller::sync::{SyncOptions, sync_target};
@@ -22,6 +23,9 @@ use crate::node::cli::NodeCommand;
 #[derive(Debug, Parser)]
 #[command(version, about = "Repo-local remote workflow tools")]
 struct Cli {
+  #[arg(short = 'T', long)]
+  target: Option<String>,
+
   #[command(subcommand)]
   command: Command,
 }
@@ -39,8 +43,6 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct SyncCommand {
-  target: Option<String>,
-
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -74,8 +76,6 @@ struct SyncCommand {
 
 #[derive(Debug, Args)]
 struct SetupCommand {
-  target: Option<String>,
-
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -103,8 +103,6 @@ struct SetupCommand {
 
 #[derive(Debug, Args)]
 struct DownloadCommand {
-  target: Option<String>,
-
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -140,47 +138,32 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Sync(command) => run_sync(command),
-    Command::Download(command) => run_download(command),
-    Command::Setup(command) => run_setup(command),
-    Command::Node { command } => node::cli::run(command),
+    Command::Sync(command) => run_sync(command, cli.target.as_deref()),
+    Command::Download(command) => run_download(command, cli.target.as_deref()),
+    Command::Setup(command) => run_setup(command, cli.target.as_deref()),
+    Command::Node { command } => {
+      if cli.target.is_some() {
+        return Err(ExpriError::Message(
+          "--target is only valid for controller commands".to_string(),
+        ));
+      }
+      node::cli::run(command)
+    }
   }
 }
 
-fn run_sync(command: SyncCommand) -> Result<()> {
-  let config_path = command
-    .config
-    .unwrap_or_else(|| PathBuf::from("expri.toml"));
-  let config_path = if config_path.is_absolute() {
-    config_path
-  } else {
-    std::env::current_dir()?.join(config_path)
-  };
-  let config = Config::load(&config_path)?;
-  let project_name = config.project_name().map(str::to_string);
-  let repo_root = match command.repo {
-    Some(path) if path.is_absolute() => path,
-    Some(path) => std::env::current_dir()?.join(path),
-    None => config_path
-      .parent()
-      .ok_or_else(|| ExpriError::Message("config path has no parent".to_string()))?
-      .to_path_buf(),
-  };
-  let target_name = config.resolve_target_name(command.target.as_deref())?;
-  let target = config.target(&target_name)?;
-  let sync = config.sync_rules()?;
-  let control_path = command
-    .control_path
-    .or_else(|| config.ssh.as_ref().and_then(|ssh| ssh.control_path.clone()))
-    .unwrap_or_else(default_control_path);
+fn run_sync(command: SyncCommand, target: Option<&str>) -> Result<()> {
+  let context = CommandContext::load(command.config, command.repo)?
+    .into_target(target, command.control_path)?;
+  let sync = context.config.sync_rules()?;
 
   sync_target(SyncOptions {
-    repo_root,
-    project_name,
-    target_name,
-    target,
+    repo_root: context.repo_root,
+    project_name: context.project_name,
+    target_name: context.target_name,
+    target: context.target,
     sync,
-    control_path,
+    control_path: context.control_path,
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     force: command.force,
@@ -191,41 +174,21 @@ fn run_sync(command: SyncCommand) -> Result<()> {
   })
 }
 
-fn run_download(command: DownloadCommand) -> Result<()> {
-  let config_path = command
-    .config
-    .unwrap_or_else(|| PathBuf::from("expri.toml"));
-  let config_path = if config_path.is_absolute() {
-    config_path
-  } else {
-    std::env::current_dir()?.join(config_path)
-  };
-  let config = Config::load(&config_path)?;
-  let project_name = config.project_name().map(str::to_string);
-  let repo_root = match command.repo {
-    Some(path) if path.is_absolute() => path,
-    Some(path) => std::env::current_dir()?.join(path),
-    None => config_path
-      .parent()
-      .ok_or_else(|| ExpriError::Message("config path has no parent".to_string()))?
-      .to_path_buf(),
-  };
-  let target_name = config.resolve_target_name(command.target.as_deref())?;
-  let target = config.target(&target_name)?;
-  let control_path = command
-    .control_path
-    .or_else(|| config.ssh.as_ref().and_then(|ssh| ssh.control_path.clone()))
-    .unwrap_or_else(default_control_path);
+fn run_download(command: DownloadCommand, target: Option<&str>) -> Result<()> {
+  let context = CommandContext::load(command.config, command.repo)?
+    .into_target(target, command.control_path)?;
+  let results_dir = context.config.download_results_dir();
+  let mappings = context.config.download_mappings();
 
   download_target(DownloadOptions {
-    repo_root,
-    project_name,
-    target_name,
-    target,
-    results_dir: config.download_results_dir(),
-    mappings: config.download_mappings(),
+    repo_root: context.repo_root,
+    project_name: context.project_name,
+    target_name: context.target_name,
+    target: context.target,
+    results_dir,
+    mappings,
     names: command.names,
-    control_path,
+    control_path: context.control_path,
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     verbosity: command.verbose,
@@ -233,51 +196,22 @@ fn run_download(command: DownloadCommand) -> Result<()> {
   })
 }
 
-fn run_setup(command: SetupCommand) -> Result<()> {
-  let config_path = command
-    .config
-    .unwrap_or_else(|| PathBuf::from("expri.toml"));
-  let config_path = if config_path.is_absolute() {
-    config_path
-  } else {
-    std::env::current_dir()?.join(config_path)
-  };
-  let config = Config::load(&config_path)?;
-  let project_name = config.project_name().map(str::to_string);
-  let repo_root = match command.repo {
-    Some(path) if path.is_absolute() => path,
-    Some(path) => std::env::current_dir()?.join(path),
-    None => config_path
-      .parent()
-      .ok_or_else(|| ExpriError::Message("config path has no parent".to_string()))?
-      .to_path_buf(),
-  };
-  let target_name = config.resolve_target_name(command.target.as_deref())?;
-  let target = config.target(&target_name)?;
-  let control_path = command
-    .control_path
-    .or_else(|| config.ssh.as_ref().and_then(|ssh| ssh.control_path.clone()))
-    .unwrap_or_else(default_control_path);
+fn run_setup(command: SetupCommand, target: Option<&str>) -> Result<()> {
+  let context = CommandContext::load(command.config, command.repo)?
+    .into_target(target, command.control_path)?;
+  let steps = context.config.setup_steps();
 
   setup_target(SetupOptions {
-    repo_root,
-    project_name,
-    target_name,
-    target,
-    steps: config.setup_steps(),
-    control_path,
+    repo_root: context.repo_root,
+    project_name: context.project_name,
+    target_name: context.target_name,
+    target: context.target,
+    steps,
+    control_path: context.control_path,
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     force: command.force,
     verbosity: command.verbose,
     quiet: command.quiet,
   })
-}
-
-fn default_control_path() -> String {
-  let value = "~/.ssh/cm-%r@%h:%p";
-  match std::env::var("HOME") {
-    Ok(home) => value.replacen('~', &home, 1),
-    Err(_) => value.to_string(),
-  }
 }
