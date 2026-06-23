@@ -7,7 +7,14 @@ use crate::error::Result;
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
   Ping,
+  Setup(SetupCommand),
   SyncApply(SyncApplyCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct SetupCommand {
+  #[arg(long)]
+  pub request: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -22,6 +29,7 @@ pub fn run(command: NodeCommand) -> Result<()> {
       println!("ok");
       Ok(())
     }
+    NodeCommand::Setup(command) => crate::node::setup::apply_request_file(&command.request),
     NodeCommand::SyncApply(command) => crate::node::sync::apply_request_file(&command.request),
   }
 }

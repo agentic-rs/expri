@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SetupStep {
+  Uv {
+    #[serde(default)]
+    extras: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
+  },
+  Hf {
+    repo: String,
+    revision: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+  },
+  Script {
+    path: String,
+    #[serde(default)]
+    args: Vec<String>,
+  },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SetupRequest {
+  pub state_dir: String,
+  pub force: bool,
+  pub steps: Vec<SetupStep>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SyncApplyRequest {
   pub head: String,

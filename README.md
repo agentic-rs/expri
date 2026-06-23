@@ -22,6 +22,12 @@ Targets default to `protocol = "auto"`, which tries `expri node sync-apply`
 first and falls back to the SSH protocol. Set `protocol = "expri-node"` to
 require the node binary, or `protocol = "ssh"` for the fallback path.
 
+## Setup
+
+`expri setup <target>` runs repo-configured setup steps on the target. Built-in
+steps are `uv`, `hf`, and `script`; scripts are resolved relative to the remote
+repo root.
+
 or from inside that repo:
 
 ```sh

@@ -7,6 +7,10 @@ pub trait SyncProtocol {
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()>;
 }
 
+pub trait SetupProtocol {
+  fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()>;
+}
+
 #[derive(Debug)]
 pub struct ExpriNodeProtocol {
   node_bin: String,
@@ -40,6 +44,17 @@ impl SyncProtocol for ExpriNodeProtocol {
   }
 }
 
+impl SetupProtocol for ExpriNodeProtocol {
+  fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()> {
+    remote.ssh(&format!(
+      "cd {} && {} node setup --request {}",
+      remote.quoted_remote_dir(),
+      shell::quote(&self.node_bin),
+      shell::quote(request_path)
+    ))
+  }
+}
+
 #[derive(Debug, Default)]
 pub struct SshProtocol;
 
@@ -50,6 +65,16 @@ impl SyncProtocol for SshProtocol {
 
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()> {
     let script = ssh_sync_apply_script(request_path);
+    remote.ssh(&format!(
+      "cd {} && python3 - <<'PY'\n{script}\nPY",
+      remote.quoted_remote_dir()
+    ))
+  }
+}
+
+impl SetupProtocol for SshProtocol {
+  fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()> {
+    let script = ssh_setup_script(request_path);
     remote.ssh(&format!(
       "cd {} && python3 - <<'PY'\n{script}\nPY",
       remote.quoted_remote_dir()
@@ -101,6 +126,68 @@ pub fn apply_sync_with_preference(
       ssh.apply_sync(remote, request_path)
     }
   }
+}
+
+pub fn apply_setup_with_preference(
+  remote: &Remote,
+  request_path: &str,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  let expri = ExpriNodeProtocol::new(node_bin.to_string());
+  let ssh = SshProtocol;
+  match preference {
+    ProtocolPreference::ExpriNode => expri.apply_setup(remote, request_path),
+    ProtocolPreference::Ssh => ssh.apply_setup(remote, request_path),
+    ProtocolPreference::Auto => {
+      if expri.available(remote)? {
+        if remote.verbosity > 0 && !remote.quiet {
+          eprintln!("using setup protocol: {}", expri.name());
+        }
+        return expri.apply_setup(remote, request_path);
+      }
+      if remote.verbosity > 0 && !remote.quiet {
+        eprintln!("using setup protocol: {}", ssh.name());
+      }
+      ssh.apply_setup(remote, request_path)
+    }
+  }
+}
+
+fn ssh_setup_script(request_path: &str) -> String {
+  let request_path =
+    serde_json::to_string(request_path).expect("request path string is serializable");
+  format!(
+    r#"import json, pathlib, subprocess
+
+def check_path(path):
+  p = pathlib.PurePosixPath(path)
+  if p.is_absolute() or any(part in ("", ".", "..") for part in p.parts):
+    raise SystemExit(f"unsafe setup script path: {{path}}")
+  return path
+
+request = json.loads(pathlib.Path({request_path}).read_text())
+pathlib.Path(request["state_dir"]).mkdir(parents=True, exist_ok=True)
+for step in request["steps"]:
+  kind = step["kind"]
+  if kind == "uv":
+    cmd = ["uv", "sync"]
+    for extra in step.get("extras", []):
+      cmd.extend(["--extra", extra])
+    cmd.extend(step.get("args", []))
+  elif kind == "hf":
+    cmd = ["hf", "download", step["repo"]]
+    if step.get("revision"):
+      cmd.extend(["--revision", step["revision"]])
+    cmd.extend(step.get("args", []))
+  elif kind == "script":
+    cmd = ["bash", check_path(step["path"]), *step.get("args", [])]
+  else:
+    raise SystemExit(f"unknown setup step kind: {{kind}}")
+  subprocess.run(cmd, check=True)
+(pathlib.Path(request["state_dir"]) / "setup-state.json").write_text(json.dumps(request, indent=2, sort_keys=True))
+"#
+  )
 }
 
 fn ssh_sync_apply_script(request_path: &str) -> String {

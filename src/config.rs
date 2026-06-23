@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::error::{ExpriError, Result};
 use crate::filter::{DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES, SyncRules};
+use crate::protocol::SetupStep;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -14,6 +15,7 @@ pub struct Config {
   #[serde(default)]
   pub target: BTreeMap<String, TargetConfig>,
   pub sync: Option<SyncConfig>,
+  pub setup: Option<SetupConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +42,12 @@ pub struct SyncConfig {
   pub exclude_dirs: Option<Vec<String>>,
   pub exclude_files: Option<Vec<String>>,
   pub include_ignored: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupConfig {
+  #[serde(default)]
+  pub steps: Vec<SetupStep>,
 }
 
 impl Config {
@@ -105,5 +113,13 @@ impl Config {
         .and_then(|sync| sync.include_ignored.clone())
         .unwrap_or_default(),
     )
+  }
+
+  pub fn setup_steps(&self) -> Vec<SetupStep> {
+    self
+      .setup
+      .as_ref()
+      .map(|setup| setup.steps.clone())
+      .unwrap_or_default()
   }
 }

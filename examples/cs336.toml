@@ -34,3 +34,7 @@ include_ignored = [
   "wandb/config.json",
   "wandb/.gitignore",
 ]
+
+[[setup.steps]]
+kind = "uv"
+extras = ["plots"]
