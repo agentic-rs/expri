@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::archive::{PatchArchive, build_patch_archive, sha256_file};
 use crate::config::TargetConfig;
@@ -59,17 +59,18 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
   let _opened_master = remote.open_master()?;
   let head = git::head(&options.repo_root)?;
   let remote_candidate = git::nearest_remote_url(&options.repo_root, &head)?;
-  if options.verbosity > 0 && !options.quiet {
-    if let Some(candidate) = &remote_candidate {
-      match candidate.distance {
-        Some(distance) => eprintln!(
-          "nearest git remote: {} ({}, base={}, distance={distance})",
-          candidate.name,
-          candidate.url,
-          candidate.base_commit.as_deref().unwrap_or("unknown")
-        ),
-        None => eprintln!("nearest git remote: {} ({})", candidate.name, candidate.url),
-      }
+  if options.verbosity > 0
+    && !options.quiet
+    && let Some(candidate) = &remote_candidate
+  {
+    match candidate.distance {
+      Some(distance) => eprintln!(
+        "nearest git remote: {} ({}, base={}, distance={distance})",
+        candidate.name,
+        candidate.url,
+        candidate.base_commit.as_deref().unwrap_or("unknown")
+      ),
+      None => eprintln!("nearest git remote: {} ({})", candidate.name, candidate.url),
     }
   }
   let dirty = git::dirty_paths(&options.repo_root, &options.sync)?;
@@ -88,18 +89,18 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     options.verbosity,
     options.quiet,
   )?;
-  upload_artifacts_and_apply(
-    &remote,
-    &head,
-    bundle.as_ref(),
-    &patch,
-    remote_candidate
+  let apply_request = UploadApplyRequest {
+    head: &head,
+    bundle: bundle.as_ref(),
+    patch: &patch,
+    remote_url: remote_candidate
       .as_ref()
       .map(|candidate| candidate.url.as_str()),
-    options.force,
+    force: options.force,
     preference,
-    &node_bin,
-  )?;
+    node_bin: &node_bin,
+  };
+  upload_artifacts_and_apply(&remote, apply_request)?;
   Ok(())
 }
 
@@ -251,7 +252,7 @@ fn prepare_remote_pull(
   }
 }
 
-fn verify_download(path: &PathBuf, expected: &str, label: &str) -> Result<()> {
+fn verify_download(path: &Path, expected: &str, label: &str) -> Result<()> {
   let (actual, _) = sha256_file(path)?;
   if actual != expected {
     return Err(crate::error::ExpriError::Message(format!(
@@ -303,7 +304,7 @@ artifacts = {
 }
 
 fn build_source_bundle_for_remote(
-  repo_root: &PathBuf,
+  repo_root: &Path,
   remote_candidate: Option<&RemoteCandidate>,
   verbosity: u8,
   quiet: bool,
@@ -328,32 +329,35 @@ fn build_source_bundle_for_remote(
   Ok(Some(bundle))
 }
 
-fn upload_artifacts_and_apply(
-  remote: &Remote,
-  head: &str,
-  bundle: Option<&SourceBundle>,
-  patch: &PatchArchive,
-  remote_url: Option<&str>,
+struct UploadApplyRequest<'a> {
+  head: &'a str,
+  bundle: Option<&'a SourceBundle>,
+  patch: &'a PatchArchive,
+  remote_url: Option<&'a str>,
   force: bool,
   preference: ProtocolPreference,
-  node_bin: &str,
-) -> Result<()> {
+  node_bin: &'a str,
+}
+
+fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) -> Result<()> {
   let inbox = format!("{}/inbox", remote.meta_dir());
   remote.ssh(&format!("mkdir -p {inbox}"))?;
-  if let Some(bundle) = bundle {
+  if let Some(bundle) = apply.bundle {
     remote.upload_file(&bundle.path, &format!("{inbox}/source.bundle"))?;
   }
-  remote.upload_file(&patch.path, &format!("{inbox}/patch.zip"))?;
+  remote.upload_file(&apply.patch.path, &format!("{inbox}/patch.zip"))?;
 
   let request = SyncApplyRequest {
-    head: head.to_string(),
-    remote_url: remote_url.map(ToString::to_string),
-    source_bundle: bundle.map(|_| ".expri/inbox/source.bundle".to_string()),
-    source_bundle_sha256: bundle.map(|bundle| bundle.digest.clone()),
+    head: apply.head.to_string(),
+    remote_url: apply.remote_url.map(ToString::to_string),
+    source_bundle: apply
+      .bundle
+      .map(|_| ".expri/inbox/source.bundle".to_string()),
+    source_bundle_sha256: apply.bundle.map(|bundle| bundle.digest.clone()),
     patch: ".expri/inbox/patch.zip".to_string(),
-    patch_sha256: patch.digest.clone(),
+    patch_sha256: apply.patch.digest.clone(),
     state_dir: ".expri".to_string(),
-    force,
+    force: apply.force,
   };
   let request_dir = tempfile::Builder::new()
     .prefix("expri-request-")
@@ -364,8 +368,8 @@ fn upload_artifacts_and_apply(
   apply_sync_with_preference(
     remote,
     ".expri/inbox/sync-request.json",
-    preference,
-    node_bin,
+    apply.preference,
+    apply.node_bin,
   )
 }
 
