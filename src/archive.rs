@@ -78,5 +78,16 @@ pub fn sha256_file(path: &Path) -> Result<(String, u64)> {
     size += read as u64;
     hasher.update(&buffer[..read]);
   }
-  Ok((format!("{:x}", hasher.finalize()), size))
+  Ok((hex_digest(hasher.finalize()), size))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+  use std::fmt::Write as _;
+
+  let bytes = bytes.as_ref();
+  let mut digest = String::with_capacity(bytes.len() * 2);
+  for byte in bytes {
+    write!(&mut digest, "{byte:02x}").expect("write to string");
+  }
+  digest
 }
