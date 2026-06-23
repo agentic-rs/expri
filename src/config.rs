@@ -69,7 +69,7 @@ pub struct DownloadMapping {
 impl Config {
   pub fn load(path: &Path) -> Result<Self> {
     let mut config = Self::load_file(path)?;
-    let target_path = path.with_file_name("expri.target.toml");
+    let target_path = target_config_path(path)?;
     if target_path.exists() {
       let target_config = Self::load_file(&target_path)?;
       config.target.extend(target_config.target);
@@ -173,6 +173,16 @@ impl Config {
   }
 }
 
+fn target_config_path(path: &Path) -> Result<std::path::PathBuf> {
+  let stem = path
+    .file_stem()
+    .and_then(|stem| stem.to_str())
+    .ok_or_else(|| {
+      ExpriError::Message(format!("config path has no file stem: {}", path.display()))
+    })?;
+  Ok(path.with_file_name(format!("{stem}.target.toml")))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -183,8 +193,8 @@ mod tests {
       .prefix("expri-config-")
       .tempdir()
       .expect("create temp dir");
-    let config_path = temp_dir.path().join("expri.toml");
-    let target_path = temp_dir.path().join("expri.target.toml");
+    let config_path = temp_dir.path().join("cs336.toml");
+    let target_path = temp_dir.path().join("cs336.target.toml");
     fs::write(
       &config_path,
       r#"

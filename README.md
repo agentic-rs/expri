@@ -11,8 +11,10 @@ and operate on a configured target. `expri node ...` is the target-machine
 namespace for commands that run locally on a synced node.
 
 Create an `expri.toml` in the repo you want to sync, and keep machine targets
-in a sibling `expri.target.toml`. `expri.target.toml` is local/private; add it
-to that repo's `.gitignore`.
+in a sibling target file. The target filename follows the config filename:
+`expri.toml` uses `expri.target.toml`, and `cs336.toml` uses
+`cs336.target.toml`. Target files are local/private; add them to that repo's
+`.gitignore`.
 
 ```toml
 # expri.toml
