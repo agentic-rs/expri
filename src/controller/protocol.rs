@@ -126,15 +126,26 @@ request = json.loads(pathlib.Path({request_path}).read_text())
 state_dir = pathlib.Path(request["state_dir"])
 state_dir.mkdir(parents=True, exist_ok=True)
 
-if sha256(request["source_bundle"]) != request["source_bundle_sha256"]:
-  raise SystemExit("source bundle sha256 mismatch")
+if request.get("source_bundle"):
+  if sha256(request["source_bundle"]) != request["source_bundle_sha256"]:
+    raise SystemExit("source bundle sha256 mismatch")
 if sha256(request["patch"]) != request["patch_sha256"]:
   raise SystemExit("patch sha256 mismatch")
 
 git_dir = state_dir / "git"
 if not git_dir.is_dir():
   subprocess.run(["git", "init", "--bare", str(git_dir)], check=True)
-subprocess.run(["git", "--git-dir", str(git_dir), "fetch", request["source_bundle"], "+HEAD:refs/heads/synced"], check=True)
+if request.get("remote_url"):
+  subprocess.run([
+    "git", "--git-dir", str(git_dir), "fetch", request["remote_url"],
+    "+refs/heads/*:refs/remotes/bootstrap/*", "+HEAD:refs/remotes/bootstrap/HEAD",
+  ], check=False)
+if subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "-e", f"{{request['head']}}^{{commit}}"], check=False).returncode == 0:
+  subprocess.run(["git", "--git-dir", str(git_dir), "update-ref", "refs/heads/synced", request["head"]], check=True)
+else:
+  if not request.get("source_bundle"):
+    raise SystemExit(f"remote URL did not provide {{request['head']}}, and no source bundle was uploaded")
+  subprocess.run(["git", "--git-dir", str(git_dir), "fetch", request["source_bundle"], "+HEAD:refs/heads/synced"], check=True)
 subprocess.run(["git", "--git-dir", str(git_dir), "--work-tree", ".", "checkout", "-f", request["head"]], check=True)
 
 manifest_path = state_dir / "patch.manifest"

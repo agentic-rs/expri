@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
@@ -13,7 +13,7 @@ use crate::protocol::SyncApplyRequest;
 #[derive(Debug, Deserialize, Serialize)]
 struct SyncState {
   head: String,
-  source_bundle_sha256: String,
+  source_bundle_sha256: Option<String>,
   patch_sha256: String,
 }
 
@@ -28,11 +28,15 @@ pub fn apply_request_file(path: &Path) -> Result<()> {
 }
 
 pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
-  verify_digest(
-    Path::new(&request.source_bundle),
-    &request.source_bundle_sha256,
-    "source bundle",
-  )?;
+  if let (Some(source_bundle), Some(source_bundle_sha256)) =
+    (&request.source_bundle, &request.source_bundle_sha256)
+  {
+    verify_digest(
+      Path::new(source_bundle),
+      source_bundle_sha256,
+      "source bundle",
+    )?;
+  }
   verify_digest(Path::new(&request.patch), &request.patch_sha256, "patch")?;
 
   let state_dir = Path::new(&request.state_dir);
@@ -55,13 +59,40 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
       git_dir_string(&git_dir),
     ])?;
   }
-  run_git(vec![
-    "--git-dir".to_string(),
-    git_dir_string(&git_dir),
-    "fetch".to_string(),
-    request.source_bundle.clone(),
-    "+HEAD:refs/heads/synced".to_string(),
-  ])?;
+  if let Some(remote_url) = &request.remote_url {
+    let fetched_remote = run_git_success(vec![
+      "--git-dir".to_string(),
+      git_dir_string(&git_dir),
+      "fetch".to_string(),
+      remote_url.clone(),
+      "+refs/heads/*:refs/remotes/bootstrap/*".to_string(),
+      "+HEAD:refs/remotes/bootstrap/HEAD".to_string(),
+    ])?;
+    if fetched_remote && head_available(&git_dir, &request.head)? {
+      run_git(vec![
+        "--git-dir".to_string(),
+        git_dir_string(&git_dir),
+        "update-ref".to_string(),
+        "refs/heads/synced".to_string(),
+        request.head.clone(),
+      ])?;
+    }
+  }
+  if !head_available(&git_dir, &request.head)? {
+    let Some(source_bundle) = &request.source_bundle else {
+      return Err(ExpriError::Message(format!(
+        "remote URL did not provide {}, and no source bundle was uploaded",
+        request.head
+      )));
+    };
+    run_git(vec![
+      "--git-dir".to_string(),
+      git_dir_string(&git_dir),
+      "fetch".to_string(),
+      source_bundle.clone(),
+      "+HEAD:refs/heads/synced".to_string(),
+    ])?;
+  }
   run_git(vec![
     "--git-dir".to_string(),
     git_dir_string(&git_dir),
@@ -291,6 +322,25 @@ fn run_git(args: Vec<String>) -> Result<()> {
   Ok(())
 }
 
+fn run_git_success(args: Vec<String>) -> Result<bool> {
+  let status = Command::new("git")
+    .args(args)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()?;
+  Ok(status.success())
+}
+
+fn head_available(git_dir: &Path, head: &str) -> Result<bool> {
+  run_git_success(vec![
+    "--git-dir".to_string(),
+    git_dir_string(git_dir),
+    "cat-file".to_string(),
+    "-e".to_string(),
+    format!("{head}^{{commit}}"),
+  ])
+}
+
 fn git_dir_string(path: &Path) -> String {
   path.to_string_lossy().to_string()
 }
@@ -346,8 +396,9 @@ mod tests {
     env::set_current_dir(worktree.path()).expect("set cwd");
     let request = SyncApplyRequest {
       head,
-      source_bundle: bundle.to_string_lossy().to_string(),
-      source_bundle_sha256,
+      remote_url: None,
+      source_bundle: Some(bundle.to_string_lossy().to_string()),
+      source_bundle_sha256: Some(source_bundle_sha256),
       patch: patch.to_string_lossy().to_string(),
       patch_sha256,
       state_dir: ".expri".to_string(),
