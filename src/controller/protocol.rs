@@ -104,7 +104,8 @@ pub fn apply_sync_with_preference(
 }
 
 fn ssh_sync_apply_script(request_path: &str) -> String {
-  let request_path = shell::quote(request_path);
+  let request_path =
+    serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
     r#"import hashlib, json, pathlib, shutil, subprocess, zipfile
 
@@ -173,4 +174,16 @@ manifest_path.write_text("".join(f"{{path}}\n" for path in sorted(manifest)))
 }}, indent=2, sort_keys=True))
 "#
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn ssh_sync_apply_script_quotes_request_path_as_python_string() {
+    let script = ssh_sync_apply_script(".expri/inbox/sync-request.json");
+    assert!(script.contains(r#"pathlib.Path(".expri/inbox/sync-request.json").read_text()"#));
+    assert!(!script.contains("pathlib.Path(.expri/inbox"));
+  }
 }
