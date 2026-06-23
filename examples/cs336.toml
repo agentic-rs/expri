@@ -29,6 +29,9 @@ include_ignored = [
   "wandb/.gitignore",
 ]
 
+[tasks]
+train = { command = ["python", "scripts/train.py"], uv = true }
+
 [download.mappings]
 wandb = "wandb"
 jobs = "out/jobs"

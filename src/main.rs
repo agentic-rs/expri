@@ -17,6 +17,9 @@ use crate::context::CommandContext;
 use crate::controller::download::{DownloadOptions, download_target};
 use crate::controller::setup::{SetupOptions, setup_target};
 use crate::controller::sync::{SyncOptions, sync_target};
+use crate::controller::task::{
+  LocalTaskOptions, RemoteTaskOptions, run_local_task, run_remote_task,
+};
 use crate::error::{ExpriError, Result};
 use crate::node::cli::NodeCommand;
 
@@ -35,6 +38,7 @@ enum Command {
   Sync(SyncCommand),
   Download(DownloadCommand),
   Setup(SetupCommand),
+  Task(TaskCommand),
   Node {
     #[command(subcommand)]
     command: NodeCommand,
@@ -128,6 +132,35 @@ struct DownloadCommand {
   names: Vec<String>,
 }
 
+#[derive(Debug, Args)]
+struct TaskCommand {
+  name: String,
+
+  #[arg(long)]
+  config: Option<PathBuf>,
+
+  #[arg(long)]
+  repo: Option<PathBuf>,
+
+  #[arg(long)]
+  control_path: Option<String>,
+
+  #[arg(long, default_value = "30m")]
+  control_persist: String,
+
+  #[arg(long)]
+  dry_run: bool,
+
+  #[arg(short, long, action = clap::ArgAction::Count)]
+  verbose: u8,
+
+  #[arg(short, long)]
+  quiet: bool,
+
+  #[arg(value_name = "ARG", last = true)]
+  args: Vec<String>,
+}
+
 fn main() {
   if let Err(error) = run() {
     eprintln!("error: {error}");
@@ -141,6 +174,7 @@ fn run() -> Result<()> {
     Command::Sync(command) => run_sync(command, cli.target.as_deref()),
     Command::Download(command) => run_download(command, cli.target.as_deref()),
     Command::Setup(command) => run_setup(command, cli.target.as_deref()),
+    Command::Task(command) => run_task(command, cli.target.as_deref()),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
@@ -211,6 +245,39 @@ fn run_setup(command: SetupCommand, target: Option<&str>) -> Result<()> {
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     force: command.force,
+    verbosity: command.verbose,
+    quiet: command.quiet,
+  })
+}
+
+fn run_task(command: TaskCommand, target: Option<&str>) -> Result<()> {
+  let context = CommandContext::load(command.config, command.repo)?;
+  let task = context.config.task(&command.name)?;
+  if target.is_some() {
+    let context = context.into_target(target, command.control_path)?;
+    return run_remote_task(RemoteTaskOptions {
+      repo_root: context.repo_root,
+      project_name: context.project_name,
+      target_name: context.target_name,
+      target: context.target,
+      control_path: context.control_path,
+      control_persist: command.control_persist,
+      name: command.name,
+      task,
+      args: command.args,
+      dry_run: command.dry_run,
+      verbosity: command.verbose,
+      quiet: command.quiet,
+    });
+  }
+
+  run_local_task(LocalTaskOptions {
+    repo_root: context.repo_root,
+    project_name: context.project_name,
+    name: command.name,
+    task,
+    args: command.args,
+    dry_run: command.dry_run,
     verbosity: command.verbose,
     quiet: command.quiet,
   })

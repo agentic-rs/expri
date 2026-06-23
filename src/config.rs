@@ -14,6 +14,8 @@ pub struct Config {
   pub ssh: Option<SshConfig>,
   #[serde(default)]
   pub target: BTreeMap<String, TargetConfig>,
+  #[serde(default)]
+  pub tasks: BTreeMap<String, TaskDefinition>,
   pub sync: Option<SyncConfig>,
   pub setup: Option<SetupConfig>,
   pub download: Option<DownloadConfig>,
@@ -36,6 +38,26 @@ pub struct TargetConfig {
   pub port: Option<u16>,
   pub protocol: Option<String>,
   pub node_bin: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TaskDefinition {
+  Command(Vec<String>),
+  Options(TaskOptionsConfig),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TaskOptionsConfig {
+  pub command: Vec<String>,
+  #[serde(default)]
+  pub uv: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskConfig {
+  pub command: Vec<String>,
+  pub uv: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +138,14 @@ impl Config {
       .ok_or_else(|| ExpriError::Message(format!("unknown target: {name}")))
   }
 
+  pub fn task(&self, name: &str) -> Result<TaskConfig> {
+    self
+      .tasks
+      .get(name)
+      .map(TaskConfig::from)
+      .ok_or_else(|| ExpriError::Message(format!("unknown task: {name}")))
+  }
+
   pub fn sync_rules(&self) -> Result<SyncRules> {
     let sync = self.sync.as_ref();
     match sync {
@@ -173,6 +203,21 @@ impl Config {
   }
 }
 
+impl From<&TaskDefinition> for TaskConfig {
+  fn from(definition: &TaskDefinition) -> Self {
+    match definition {
+      TaskDefinition::Command(command) => Self {
+        command: command.clone(),
+        uv: false,
+      },
+      TaskDefinition::Options(options) => Self {
+        command: options.command.clone(),
+        uv: options.uv,
+      },
+    }
+  }
+}
+
 fn target_config_path(path: &Path) -> Result<std::path::PathBuf> {
   let stem = path
     .file_stem()
@@ -207,6 +252,10 @@ remote_dir = "~/shared"
 
 [download.mappings]
 wandb = "wandb"
+
+[tasks]
+dev = ["pnpm", "dev"]
+train = { command = ["python", "scripts/train.py"], uv = true }
 "#,
     )
     .expect("write config");
@@ -223,6 +272,9 @@ remote_dir = "~/override"
 
 [download.mappings]
 ignored = "ignored"
+
+[tasks]
+ignored = ["false"]
 "#,
     )
     .expect("write target config");
@@ -239,5 +291,13 @@ ignored = "ignored"
       "override.example"
     );
     assert_eq!(config.download_mappings().len(), 1);
+    assert_eq!(
+      config.task("dev").expect("dev task").command,
+      ["pnpm", "dev"]
+    );
+    let train = config.task("train").expect("train task");
+    assert_eq!(train.command, ["python", "scripts/train.py"]);
+    assert!(train.uv);
+    assert!(config.task("ignored").is_err());
   }
 }

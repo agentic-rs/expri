@@ -23,6 +23,10 @@ name = "my-project"
 
 [download.mappings]
 wandb = "wandb"
+
+[tasks]
+dev = ["pnpm", "dev"]
+train = { command = ["python", "scripts/train.py"], uv = true }
 ```
 
 ```toml
@@ -45,6 +49,25 @@ See `examples/cs336.toml` for a CS336-shaped starting point.
 Targets default to `protocol = "auto"`, which tries `expri node sync-apply`
 first and falls back to the SSH protocol. Set `protocol = "expri-node"` to
 require the node binary, or `protocol = "ssh"` for the fallback path.
+
+## Task
+
+`expri task <name>` runs a repo-local command alias in the repo root:
+
+```toml
+[tasks]
+dev = ["pnpm", "dev"]
+train = { command = ["python", "scripts/train.py"], uv = true }
+```
+
+The array form runs exactly that command. The object form supports options;
+`uv = true` prefixes the command with `uv run`.
+
+```sh
+expri task dev
+expri task train -- --epochs 3
+expri -T runpod task train -- --epochs 3
+```
 
 ## Setup
 
