@@ -22,6 +22,7 @@ pub struct SyncOptions {
   pub dry_run: bool,
   pub force: bool,
   pub pull: bool,
+  pub paths: Vec<PathBuf>,
   pub verbosity: u8,
   pub quiet: bool,
 }
@@ -41,6 +42,9 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     options.verbosity,
     options.quiet,
   );
+  if !options.paths.is_empty() {
+    return sync_paths(options, remote);
+  }
   if options.pull {
     return pull_target(options, remote, preference, &node_bin);
   }
@@ -99,6 +103,65 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
   Ok(())
 }
 
+fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
+  if options.verbosity > 0 && !options.quiet {
+    if let Some(project_name) = &options.project_name {
+      eprintln!("project: {project_name}");
+    }
+    if options.pull {
+      eprintln!("pull paths target: {}", options.target_name);
+    } else {
+      eprintln!("sync paths target: {}", options.target_name);
+    }
+    for path in &options.paths {
+      eprintln!("path: {}", path.display());
+    }
+  }
+  validate_sync_paths(&options.paths)?;
+  let _opened_master = remote.open_master()?;
+  let list = if options.pull {
+    remote_git_ls_files(&remote, &options.paths)?
+  } else {
+    git::ls_files(&options.repo_root, &options.paths)?
+  };
+  if list.is_empty() && options.verbosity > 0 && !options.quiet {
+    eprintln!("no tracked files matched");
+  }
+  let list_dir = tempfile::Builder::new().prefix("expri-files-").tempdir()?;
+  let list_path = list_dir.path().join("files-from");
+  fs::write(&list_path, &list)?;
+  if options.pull {
+    remote.download_files_from(&remote.remote_dir, &options.repo_root, &list_path)
+  } else {
+    remote.upload_files_from(&options.repo_root, &remote.remote_dir, &list_path)
+  }
+}
+
+fn remote_git_ls_files(remote: &Remote, paths: &[PathBuf]) -> Result<Vec<u8>> {
+  let mut command = format!("cd {} && git ls-files -z --", remote.quoted_remote_dir());
+  for path in paths {
+    command.push(' ');
+    command.push_str(&shell::quote(path.to_string_lossy()));
+  }
+  remote.ssh_capture_bytes(&command)
+}
+
+fn validate_sync_paths(paths: &[PathBuf]) -> Result<()> {
+  for path in paths {
+    if path.is_absolute()
+      || path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+      return Err(crate::error::ExpriError::Message(format!(
+        "sync path must be relative and stay inside the repo: {}",
+        path.display()
+      )));
+    }
+  }
+  Ok(())
+}
+
 fn pull_target(
   options: SyncOptions,
   remote: Remote,
@@ -138,7 +201,7 @@ fn pull_target(
   )?;
   if options.dry_run {
     eprintln!(
-      "+ git -C {} fetch {} +HEAD:refs/remotes/expri/{}/HEAD",
+      "+ git -C {} fetch {} +HEAD:refs/remotes/expri/{}/synced",
       options.repo_root.display(),
       bundle_path.display(),
       options.target_name
@@ -153,11 +216,11 @@ fn pull_target(
     "source bundle",
   )?;
   verify_download(&patch_path, &artifacts.patch_sha256, "patch")?;
-  let ref_name = format!("refs/remotes/expri/{}/HEAD", options.target_name);
+  let ref_name = format!("refs/remotes/expri/{}/synced", options.target_name);
   git::fetch_bundle_to_ref(&options.repo_root, &bundle_path, &ref_name)?;
   if !options.quiet {
     eprintln!(
-      "updated refs/remotes/expri/{}/HEAD to {}",
+      "updated refs/remotes/expri/{}/synced to {}",
       options.target_name, artifacts.head
     );
     eprintln!("stored remote patch at {}", patch_path.display());

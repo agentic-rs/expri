@@ -65,6 +65,9 @@ struct SyncCommand {
 
   #[arg(short, long)]
   quiet: bool,
+
+  #[arg(value_name = "PATH", last = true)]
+  paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -150,6 +153,7 @@ fn run_sync(command: SyncCommand) -> Result<()> {
     dry_run: command.dry_run,
     force: command.force,
     pull: command.pull,
+    paths: command.paths,
     verbosity: command.verbose,
     quiet: command.quiet,
   })

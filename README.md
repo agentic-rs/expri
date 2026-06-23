@@ -38,4 +38,12 @@ The sync algorithm uploads committed history with a git bundle, checks out
 `HEAD` on the remote, then overlays a zip archive of local dirty and untracked
 files. Remote tool state lives under `.expri/`.
 
+For a path-scoped rsync, pass paths after `--`. Only files returned by
+`git ls-files` under those paths are transferred:
+
+```sh
+expri sync runpod -- src scripts
+expri sync --pull runpod -- outputs/checkpoints
+```
+
 Use `--dry-run` to print the SSH/rsync commands without executing them.

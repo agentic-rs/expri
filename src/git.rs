@@ -160,6 +160,25 @@ pub fn dirty_paths(repo_root: &Path, rules: &SyncRules) -> Result<DirtyPaths> {
   Ok(DirtyPaths { files, deleted })
 }
 
+pub fn ls_files(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<u8>> {
+  let mut command = Command::new("git");
+  command.current_dir(repo_root);
+  command.args(["ls-files", "-z", "--"]);
+  command.args(paths);
+  let output = command.output().map_err(|source| ExpriError::IoContext {
+    action: "run git in",
+    path: repo_root.display().to_string(),
+    source,
+  })?;
+  if !output.status.success() {
+    return Err(ExpriError::CommandFailed {
+      program: "git".to_string(),
+      code: output.status.code(),
+    });
+  }
+  Ok(output.stdout)
+}
+
 fn git_capture<const N: usize>(repo_root: &Path, args: [&str; N]) -> Result<String> {
   let output = Command::new("git")
     .current_dir(repo_root)

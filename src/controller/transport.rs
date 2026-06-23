@@ -76,6 +76,24 @@ impl Remote {
     Ok(status.success())
   }
 
+  pub fn ssh_capture_bytes(&self, remote_command: &str) -> Result<Vec<u8>> {
+    let args = self.ssh_args(remote_command);
+    if self.show_commands() && !self.quiet {
+      print_command("ssh", &args);
+    }
+    if self.dry_run {
+      return Ok(Vec::new());
+    }
+    let output = Command::new("ssh").args(args).output()?;
+    if !output.status.success() {
+      return Err(ExpriError::CommandFailed {
+        program: "ssh".to_string(),
+        code: output.status.code(),
+      });
+    }
+    Ok(output.stdout)
+  }
+
   pub fn upload_file(&self, local_path: &Path, remote_path: &str) -> Result<()> {
     let mut args = self.rsync_base_args();
     args.push(local_path.to_string_lossy().to_string());
@@ -87,6 +105,44 @@ impl Remote {
     let mut args = self.rsync_base_args();
     args.push(format!("{}:{}", self.host, remote_path));
     args.push(local_path.to_string_lossy().to_string());
+    self.run("rsync", args)
+  }
+
+  pub fn upload_files_from(
+    &self,
+    local_root: &Path,
+    remote_dir: &str,
+    files_from: &Path,
+  ) -> Result<()> {
+    let mut args = self.rsync_base_args();
+    args.push("--from0".to_string());
+    args.push("--files-from".to_string());
+    args.push(files_from.to_string_lossy().to_string());
+    args.push(ensure_trailing_slash(&local_root.to_string_lossy()));
+    args.push(format!(
+      "{}:{}",
+      self.host,
+      ensure_trailing_slash(remote_dir)
+    ));
+    self.run("rsync", args)
+  }
+
+  pub fn download_files_from(
+    &self,
+    remote_dir: &str,
+    local_root: &Path,
+    files_from: &Path,
+  ) -> Result<()> {
+    let mut args = self.rsync_base_args();
+    args.push("--from0".to_string());
+    args.push("--files-from".to_string());
+    args.push(files_from.to_string_lossy().to_string());
+    args.push(format!(
+      "{}:{}",
+      self.host,
+      ensure_trailing_slash(remote_dir)
+    ));
+    args.push(ensure_trailing_slash(&local_root.to_string_lossy()));
     self.run("rsync", args)
   }
 
@@ -228,4 +284,12 @@ fn print_command(program: &str, args: &[String]) {
   let mut parts = vec![program.to_string()];
   parts.extend(args.iter().cloned());
   eprintln!("+ {}", shell::join(&parts));
+}
+
+fn ensure_trailing_slash(value: &str) -> String {
+  if value.ends_with('/') {
+    value.to_string()
+  } else {
+    format!("{value}/")
+  }
 }
