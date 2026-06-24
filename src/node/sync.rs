@@ -52,6 +52,7 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
     return Ok(());
   }
 
+  let masked_files = save_remote_managed_files(state_dir, &request.remote_managed)?;
   let git_dir = state_dir.join("git");
   if !git_dir.is_dir() {
     run_git(vec![
@@ -104,7 +105,13 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
     request.head.clone(),
   ])?;
 
-  apply_patch_zip(state_dir, Path::new(&request.patch), &request.patch_sha256)?;
+  apply_patch_zip(
+    state_dir,
+    Path::new(&request.patch),
+    &request.patch_sha256,
+    &request.remote_managed,
+  )?;
+  restore_remote_managed_files(masked_files)?;
   write_state(state_dir, request)?;
   Ok(())
 }
@@ -199,7 +206,86 @@ fn state_path(state_dir: &Path) -> PathBuf {
   state_dir.join("sync-state.json")
 }
 
-fn apply_patch_zip(state_dir: &Path, patch_path: &Path, patch_digest: &str) -> Result<()> {
+struct MaskedFile {
+  path: PathBuf,
+  saved_path: PathBuf,
+  existed: bool,
+}
+
+fn save_remote_managed_files(state_dir: &Path, paths: &[String]) -> Result<Vec<MaskedFile>> {
+  let mask_dir = state_dir.join("remote-managed");
+  if mask_dir.exists() {
+    fs::remove_dir_all(&mask_dir).map_err(|source| ExpriError::IoContext {
+      action: "remove directory",
+      path: mask_dir.display().to_string(),
+      source,
+    })?;
+  }
+  fs::create_dir_all(&mask_dir).map_err(|source| ExpriError::IoContext {
+    action: "create directory",
+    path: mask_dir.display().to_string(),
+    source,
+  })?;
+
+  let mut masked = Vec::new();
+  for value in paths {
+    let path = PathBuf::from(value);
+    validate_relative_path(&path)?;
+    let saved_path = mask_dir.join(&path);
+    let existed = fs::symlink_metadata(&path)
+      .map(|metadata| metadata.file_type().is_file() || metadata.file_type().is_symlink())
+      .unwrap_or(false);
+    if existed {
+      if let Some(parent) = saved_path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
+          action: "create directory",
+          path: parent.display().to_string(),
+          source,
+        })?;
+      }
+      fs::rename(&path, &saved_path).map_err(|source| ExpriError::IoContext {
+        action: "move",
+        path: path.display().to_string(),
+        source,
+      })?;
+    }
+    masked.push(MaskedFile {
+      path,
+      saved_path,
+      existed,
+    });
+  }
+  Ok(masked)
+}
+
+fn restore_remote_managed_files(masked_files: Vec<MaskedFile>) -> Result<()> {
+  for masked in masked_files {
+    remove_worktree_file(&masked.path)?;
+    if !masked.existed {
+      continue;
+    }
+    if let Some(parent) = masked.path.parent() {
+      fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
+        action: "create directory",
+        path: parent.display().to_string(),
+        source,
+      })?;
+    }
+    fs::rename(&masked.saved_path, &masked.path).map_err(|source| ExpriError::IoContext {
+      action: "move",
+      path: masked.saved_path.display().to_string(),
+      source,
+    })?;
+  }
+  Ok(())
+}
+
+fn apply_patch_zip(
+  state_dir: &Path,
+  patch_path: &Path,
+  patch_digest: &str,
+  remote_managed: &[String],
+) -> Result<()> {
   remove_previous_overlay(state_dir)?;
   let patch_dir = state_dir.join("patch");
   if patch_dir.exists() {
@@ -223,6 +309,9 @@ fn apply_patch_zip(state_dir: &Path, patch_path: &Path, patch_digest: &str) -> R
   let mut archive = ZipArchive::new(file)?;
   let deleted = read_deleted_paths(&mut archive)?;
   for path in deleted {
+    if is_remote_managed(&path, remote_managed) {
+      continue;
+    }
     remove_worktree_file(&path)?;
   }
 
@@ -239,6 +328,9 @@ fn apply_patch_zip(state_dir: &Path, patch_path: &Path, patch_digest: &str) -> R
       continue;
     }
     validate_relative_path(&relative_path)?;
+    if is_remote_managed(&relative_path, remote_managed) {
+      continue;
+    }
     let destination = PathBuf::from(&relative_path);
     if let Some(parent) = destination.parent() {
       fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
@@ -265,6 +357,12 @@ fn apply_patch_zip(state_dir: &Path, patch_path: &Path, patch_digest: &str) -> R
     }
   })?;
   Ok(())
+}
+
+fn is_remote_managed(path: &Path, remote_managed: &[String]) -> bool {
+  remote_managed
+    .iter()
+    .any(|managed| path == Path::new(managed))
 }
 
 fn read_deleted_paths(archive: &mut ZipArchive<File>) -> Result<Vec<PathBuf>> {
@@ -403,6 +501,7 @@ fn git_dir_string(path: &Path) -> String {
 mod tests {
   use std::env;
   use std::io::Write;
+  use std::sync::{Mutex, OnceLock};
 
   use zip::write::SimpleFileOptions;
 
@@ -410,6 +509,7 @@ mod tests {
 
   #[test]
   fn sync_apply_fetches_checkout_and_applies_patch() {
+    let _guard = cwd_lock().lock().expect("cwd lock");
     let source = tempfile::tempdir().expect("source tempdir");
     run_command_in(source.path(), ["git", "init"]);
     fs::write(source.path().join("tracked.txt"), "tracked\n").expect("write tracked");
@@ -456,6 +556,7 @@ mod tests {
       patch: patch.to_string_lossy().to_string(),
       patch_sha256,
       state_dir: ".expri".to_string(),
+      remote_managed: Vec::new(),
       force: false,
     };
     let result = apply_request(&request);
@@ -471,6 +572,70 @@ mod tests {
       "dirty\n"
     );
     assert!(worktree.path().join(".expri/sync-state.json").is_file());
+  }
+
+  #[test]
+  fn sync_apply_preserves_remote_managed_files() {
+    let _guard = cwd_lock().lock().expect("cwd lock");
+    let source = tempfile::tempdir().expect("source tempdir");
+    run_command_in(source.path(), ["git", "init"]);
+    fs::write(source.path().join("tracked.txt"), "tracked\n").expect("write tracked");
+    fs::write(source.path().join("uv.lock"), "from git\n").expect("write lock");
+    run_command_in(source.path(), ["git", "add", "tracked.txt", "uv.lock"]);
+    run_command_in(
+      source.path(),
+      [
+        "git",
+        "-c",
+        "user.name=Expri",
+        "-c",
+        "user.email=expri@example.com",
+        "commit",
+        "-m",
+        "initial",
+      ],
+    );
+    let head = command_output_in(source.path(), ["git", "rev-parse", "HEAD"]);
+    let bundle = source.path().join("source.bundle");
+    run_command_in(
+      source.path(),
+      [
+        "git",
+        "bundle",
+        "create",
+        bundle.to_str().expect("bundle path"),
+        "HEAD",
+      ],
+    );
+
+    let patch = source.path().join("patch.zip");
+    write_patch_with_entries(&patch, &[("uv.lock", "from patch\n")]);
+    let (source_bundle_sha256, _) = sha256_file(&bundle).expect("bundle sha");
+    let (patch_sha256, _) = sha256_file(&patch).expect("patch sha");
+
+    let worktree = tempfile::tempdir().expect("worktree tempdir");
+    fs::write(worktree.path().join("uv.lock"), "from remote\n").expect("remote lock");
+    let previous_cwd = env::current_dir().expect("cwd");
+    env::set_current_dir(worktree.path()).expect("set cwd");
+    let request = SyncApplyRequest {
+      head,
+      remote_url: None,
+      source_bundle: Some(bundle.to_string_lossy().to_string()),
+      source_bundle_sha256: Some(source_bundle_sha256),
+      patch: patch.to_string_lossy().to_string(),
+      patch_sha256,
+      state_dir: ".expri".to_string(),
+      remote_managed: vec!["uv.lock".to_string()],
+      force: false,
+    };
+    let result = apply_request(&request);
+    env::set_current_dir(previous_cwd).expect("restore cwd");
+    result.expect("sync apply");
+
+    assert_eq!(
+      fs::read_to_string(worktree.path().join("uv.lock")).expect("lock"),
+      "from remote\n"
+    );
   }
 
   #[test]
@@ -493,6 +658,7 @@ mod tests {
       patch: "patch.zip".to_string(),
       patch_sha256: "patch".to_string(),
       state_dir: ".expri".to_string(),
+      remote_managed: Vec::new(),
       force: false,
     };
 
@@ -500,13 +666,19 @@ mod tests {
   }
 
   fn write_test_patch(path: &Path) {
+    write_patch_with_entries(path, &[("dirty.txt", "dirty\n")]);
+  }
+
+  fn write_patch_with_entries(path: &Path, entries: &[(&str, &str)]) {
     let file = File::create(path).expect("patch file");
     let mut archive = zip::ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     archive.start_file(".deleted", options).expect("deleted");
     archive.write_all(b"").expect("deleted body");
-    archive.start_file("dirty.txt", options).expect("dirty");
-    archive.write_all(b"dirty\n").expect("dirty body");
+    for (name, body) in entries {
+      archive.start_file(*name, options).expect("entry");
+      archive.write_all(body.as_bytes()).expect("entry body");
+    }
     archive.finish().expect("finish patch");
   }
 
@@ -532,5 +704,10 @@ mod tests {
       .expect("utf8")
       .trim()
       .to_string()
+  }
+
+  fn cwd_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
   }
 }

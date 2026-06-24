@@ -26,6 +26,7 @@ pub struct SyncRules {
   exclude_dirs: Vec<String>,
   exclude_files: GlobSet,
   include_ignored: Vec<String>,
+  remote_managed: Vec<String>,
 }
 
 impl SyncRules {
@@ -40,6 +41,7 @@ impl SyncRules {
         .map(ToString::to_string)
         .collect(),
       Vec::new(),
+      Vec::new(),
     )
   }
 
@@ -47,7 +49,11 @@ impl SyncRules {
     exclude_dirs: Vec<String>,
     exclude_files: Vec<String>,
     include_ignored: Vec<String>,
+    remote_managed: Vec<String>,
   ) -> Result<Self> {
+    for path in &remote_managed {
+      validate_remote_managed_path(Path::new(path))?;
+    }
     let mut builder = GlobSetBuilder::new();
     for pattern in exclude_files {
       builder.add(Glob::new(&pattern)?);
@@ -56,6 +62,7 @@ impl SyncRules {
       exclude_dirs,
       exclude_files: builder.build()?,
       include_ignored,
+      remote_managed,
     })
   }
 
@@ -63,8 +70,19 @@ impl SyncRules {
     &self.include_ignored
   }
 
+  pub fn remote_managed(&self) -> &[String] {
+    &self.remote_managed
+  }
+
   pub fn should_include(&self, relative_path: &Path) -> bool {
     if !relative_path.is_relative() {
+      return false;
+    }
+    if self
+      .remote_managed
+      .iter()
+      .any(|managed| relative_path == Path::new(managed))
+    {
       return false;
     }
     if relative_path.components().any(|component| match component {
@@ -81,4 +99,18 @@ impl SyncRules {
       None => true,
     }
   }
+}
+
+fn validate_remote_managed_path(path: &Path) -> Result<()> {
+  if !path.is_relative()
+    || path
+      .components()
+      .any(|component| !matches!(component, Component::Normal(_)))
+  {
+    return Err(crate::error::ExpriError::Message(format!(
+      "sync remote_managed path must be relative and stay inside the repo: {}",
+      path.display()
+    )));
+  }
+  Ok(())
 }

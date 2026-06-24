@@ -108,6 +108,7 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     head: &head,
     bundle: bundle.as_ref(),
     patch: &patch,
+    remote_managed: options.sync.remote_managed(),
     remote_url: remote_candidate
       .as_ref()
       .map(|candidate| candidate.url.as_str()),
@@ -372,6 +373,7 @@ struct UploadApplyRequest<'a> {
   head: &'a str,
   bundle: Option<&'a SourceBundle>,
   patch: &'a PatchArchive,
+  remote_managed: &'a [String],
   remote_url: Option<&'a str>,
   force: bool,
   preference: ProtocolPreference,
@@ -396,6 +398,7 @@ fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) ->
     patch: ".expri/inbox/patch.zip".to_string(),
     patch_sha256: apply.patch.digest.clone(),
     state_dir: ".expri".to_string(),
+    remote_managed: apply.remote_managed.to_vec(),
     force: apply.force,
   };
   let request_dir = tempfile::Builder::new()

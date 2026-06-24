@@ -209,6 +209,36 @@ def check_path(path):
     raise SystemExit(f"unsafe patch path: {{path}}")
   return pathlib.Path(path)
 
+def remove_worktree_file(path):
+  path = check_path(path)
+  if path.exists() or path.is_symlink():
+    if path.is_file() or path.is_symlink():
+      path.unlink()
+
+def save_remote_managed(state_dir, paths):
+  mask_dir = state_dir / "remote-managed"
+  if mask_dir.exists():
+    shutil.rmtree(mask_dir)
+  mask_dir.mkdir(parents=True, exist_ok=True)
+  masked = []
+  for raw in paths:
+    path = check_path(raw)
+    saved = mask_dir / path
+    existed = path.is_file() or path.is_symlink()
+    if existed:
+      saved.parent.mkdir(parents=True, exist_ok=True)
+      path.rename(saved)
+    masked.append((path, saved, existed))
+  return masked
+
+def restore_remote_managed(masked):
+  for path, saved, existed in masked:
+    remove_worktree_file(path.as_posix())
+    if not existed:
+      continue
+    path.parent.mkdir(parents=True, exist_ok=True)
+    saved.rename(path)
+
 request = json.loads(pathlib.Path({request_path}).read_text())
 state_dir = pathlib.Path(request["state_dir"])
 state_dir.mkdir(parents=True, exist_ok=True)
@@ -219,6 +249,8 @@ if request.get("source_bundle"):
 if sha256(request["patch"]) != request["patch_sha256"]:
   raise SystemExit("patch sha256 mismatch")
 
+remote_managed = set(request.get("remote_managed", []))
+masked = save_remote_managed(state_dir, remote_managed)
 git_dir = state_dir / "git"
 if not git_dir.is_dir():
   subprocess.run(["git", "init", "--bare", str(git_dir)], check=True)
@@ -255,6 +287,8 @@ with zipfile.ZipFile(request["patch"]) as archive:
     deleted = archive.read(".deleted").decode().splitlines()
   for line in deleted:
     if line:
+      if line in remote_managed:
+        continue
       path = check_path(line)
       if path.exists() or path.is_symlink():
         path.unlink()
@@ -262,12 +296,15 @@ with zipfile.ZipFile(request["patch"]) as archive:
     name = entry.filename
     if name == ".deleted" or entry.is_dir():
       continue
+    if name in remote_managed:
+      continue
     dst = check_path(name)
     dst.parent.mkdir(parents=True, exist_ok=True)
     with archive.open(entry) as src, dst.open("wb") as out:
       shutil.copyfileobj(src, out)
     manifest.append(dst.as_posix())
 
+restore_remote_managed(masked)
 manifest_path.write_text("".join(f"{{path}}\n" for path in sorted(manifest)))
 (state_dir / "patch.sha256").write_text(request["patch_sha256"])
 (state_dir / "sync-state.json").write_text(json.dumps({{

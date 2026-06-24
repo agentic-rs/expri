@@ -29,6 +29,10 @@ include_ignored = [
   "wandb/.gitignore",
 ]
 
+remote_managed = [
+  "uv.lock",
+]
+
 [tasks]
 train = { command = ["python", "scripts/train.py"], uv = true }
 

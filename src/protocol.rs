@@ -38,6 +38,8 @@ pub struct SyncApplyRequest {
   pub patch: String,
   pub patch_sha256: String,
   pub state_dir: String,
+  #[serde(default)]
+  pub remote_managed: Vec<String>,
   pub force: bool,
 }
 

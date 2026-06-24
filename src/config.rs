@@ -65,6 +65,7 @@ pub struct SyncConfig {
   pub exclude_dirs: Option<Vec<String>>,
   pub exclude_files: Option<Vec<String>>,
   pub include_ignored: Option<Vec<String>>,
+  pub remote_managed: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +166,7 @@ impl Config {
             .collect()
         }),
         sync.include_ignored.clone().unwrap_or_default(),
+        sync.remote_managed.clone().unwrap_or_default(),
       ),
       None => SyncRules::defaults(),
     }

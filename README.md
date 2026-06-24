@@ -21,6 +21,9 @@ in a sibling target file. The target filename follows the config filename:
 [project]
 name = "my-project"
 
+[sync]
+remote_managed = ["uv.lock"]
+
 [download.mappings]
 wandb = "wandb"
 
@@ -90,6 +93,11 @@ expri -T runpod sync
 The sync algorithm uploads committed history with a git bundle, checks out
 `HEAD` on the remote, then overlays a zip archive of local dirty and untracked
 files. Remote tool state lives under `.expri/`.
+
+Use `sync.remote_managed` for repo-relative files that the target should own,
+even if they are tracked by Git or appear in the dirty patch. For example,
+`remote_managed = ["uv.lock"]` preserves the target's lockfile across syncs and
+excludes local changes to that file from `patch.zip`.
 
 For a path-scoped rsync, pass paths after `--`. Only files returned by
 `git ls-files` under those paths are transferred:
