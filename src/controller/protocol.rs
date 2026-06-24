@@ -227,7 +227,12 @@ if request.get("remote_url"):
     "git", "--git-dir", str(git_dir), "fetch", request["remote_url"],
     "+refs/heads/*:refs/remotes/bootstrap/*", "+HEAD:refs/remotes/bootstrap/HEAD",
   ], check=False)
-if subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "-e", request["head"] + "^{{commit}}"], check=False).returncode == 0:
+if subprocess.run(
+  ["git", "--git-dir", str(git_dir), "cat-file", "-e", request["head"] + "^{{commit}}"],
+  check=False,
+  stdout=subprocess.DEVNULL,
+  stderr=subprocess.DEVNULL,
+).returncode == 0:
   subprocess.run(["git", "--git-dir", str(git_dir), "update-ref", "refs/heads/synced", request["head"]], check=True)
 else:
   if not request.get("source_bundle"):

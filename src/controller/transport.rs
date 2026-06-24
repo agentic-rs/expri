@@ -146,8 +146,17 @@ impl Remote {
     self.run("rsync", args)
   }
 
-  pub fn download_dir(&self, remote_dir: &str, local_dir: &Path) -> Result<()> {
+  pub fn download_dir_with_excludes(
+    &self,
+    remote_dir: &str,
+    local_dir: &Path,
+    excludes: &[String],
+  ) -> Result<()> {
     let mut args = self.rsync_base_args();
+    for pattern in excludes {
+      args.push("--exclude".to_string());
+      args.push(pattern.clone());
+    }
     args.push(format!(
       "{}:{}",
       self.host,
@@ -235,7 +244,7 @@ impl Remote {
   }
 
   fn rsync_base_args(&self) -> Vec<String> {
-    vec![
+    let mut args = vec![
       "-az".to_string(),
       "--no-owner".to_string(),
       "--no-group".to_string(),
@@ -245,7 +254,11 @@ impl Remote {
         args.extend(self.ssh_base_args());
         args
       }),
-    ]
+    ];
+    if self.verbosity > 0 && !self.quiet {
+      args.push("--progress".to_string());
+    }
+    args
   }
 
   fn run(&self, program: &str, args: Vec<String>) -> Result<()> {

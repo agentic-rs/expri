@@ -105,6 +105,9 @@ expri -T runpod sync --pull -- outputs/checkpoints
 `results/<target>/`. Mappings are declared in `expri.toml`:
 
 ```toml
+[download]
+ignore = ["*.pt"]
+
 [download.mappings]
 wandb = "wandb"
 jobs = "out/jobs"
@@ -112,6 +115,7 @@ jobs = "out/jobs"
 
 That example downloads the remote repo's `wandb/` directory into
 `results/<target>/wandb/`, and `out/jobs/` into `results/<target>/jobs/`.
+Ignore patterns are passed to rsync as excludes relative to each mapping root.
 Pass mapping names after `--` to download a subset:
 
 ```sh

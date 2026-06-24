@@ -209,6 +209,7 @@ fn run_download(
     .into_target(target, command.control_path)?;
   let results_dir = context.config.download_results_dir();
   let mappings = context.config.download_mappings();
+  let ignore = context.config.download_ignore();
 
   download_target(DownloadOptions {
     repo_root: context.repo_root,
@@ -217,6 +218,7 @@ fn run_download(
     target: context.target,
     results_dir,
     mappings,
+    ignore,
     names: command.names,
     control_path: context.control_path,
     control_persist: command.control_persist,

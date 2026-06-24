@@ -32,6 +32,9 @@ include_ignored = [
 [tasks]
 train = { command = ["python", "scripts/train.py"], uv = true }
 
+[download]
+ignore = ["*.pt"]
+
 [download.mappings]
 wandb = "wandb"
 jobs = "out/jobs"

@@ -78,6 +78,8 @@ pub struct DownloadConfig {
   #[serde(default)]
   pub results_dir: Option<String>,
   #[serde(default)]
+  pub ignore: Vec<String>,
+  #[serde(default)]
   pub mappings: BTreeMap<String, String>,
 }
 
@@ -199,6 +201,14 @@ impl Config {
           })
           .collect()
       })
+      .unwrap_or_default()
+  }
+
+  pub fn download_ignore(&self) -> Vec<String> {
+    self
+      .download
+      .as_ref()
+      .map(|download| download.ignore.clone())
       .unwrap_or_default()
   }
 }

@@ -14,6 +14,7 @@ pub struct DownloadOptions {
   pub target: TargetConfig,
   pub results_dir: String,
   pub mappings: Vec<DownloadMapping>,
+  pub ignore: Vec<String>,
   pub names: Vec<String>,
   pub control_path: String,
   pub control_persist: String,
@@ -31,6 +32,7 @@ pub fn download_target(options: DownloadOptions) -> Result<()> {
 
   let mappings = selected_mappings(options.mappings, &options.names)?;
   let results_dir = safe_relative_path(&options.results_dir, "download results_dir")?;
+  validate_ignore_patterns(&options.ignore)?;
   let local_root = options
     .repo_root
     .join(results_dir)
@@ -51,6 +53,9 @@ pub fn download_target(options: DownloadOptions) -> Result<()> {
     eprintln!("download target: {}", options.target_name);
     eprintln!("repo root: {}", options.repo_root.display());
     eprintln!("results root: {}", local_root.display());
+    for pattern in &options.ignore {
+      eprintln!("ignore: {pattern}");
+    }
   }
 
   let _opened_master = remote.open_master()?;
@@ -80,7 +85,7 @@ pub fn download_target(options: DownloadOptions) -> Result<()> {
         source,
       })?;
     }
-    remote.download_dir(&source, &destination)?;
+    remote.download_dir_with_excludes(&source, &destination, &options.ignore)?;
   }
   Ok(())
 }
@@ -131,6 +136,23 @@ fn safe_relative_path(value: &str, label: &str) -> Result<PathBuf> {
     )));
   }
   Ok(path)
+}
+
+fn validate_ignore_patterns(patterns: &[String]) -> Result<()> {
+  for pattern in patterns {
+    let path = PathBuf::from(pattern);
+    if pattern.is_empty()
+      || path.is_absolute()
+      || path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+    {
+      return Err(ExpriError::Message(format!(
+        "download ignore pattern must be relative and stay inside the mapping root: {pattern}"
+      )));
+    }
+  }
+  Ok(())
 }
 
 fn join_remote_path(remote_dir: &str, relative_path: &Path) -> String {
