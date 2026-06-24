@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::archive::{PatchArchive, build_patch_archive, sha256_file};
 use crate::config::TargetConfig;
 use crate::controller::protocol::{ProtocolPreference, apply_sync_with_preference};
@@ -25,6 +27,12 @@ pub struct SyncOptions {
   pub paths: Vec<PathBuf>,
   pub verbosity: u8,
   pub quiet: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteSyncState {
+  head: String,
+  patch_sha256: String,
 }
 
 pub fn sync_target(options: SyncOptions) -> Result<()> {
@@ -82,6 +90,12 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
       patch.file_count, patch.deleted_count
     );
   }
+  if !options.force && remote_sync_is_current(&remote, &head, &patch)? {
+    if !options.quiet {
+      eprintln!("sync skipped: target already has HEAD and patch");
+    }
+    return Ok(());
+  }
 
   let bundle = build_source_bundle_for_remote(
     &options.repo_root,
@@ -103,6 +117,20 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
   };
   upload_artifacts_and_apply(&remote, apply_request)?;
   Ok(())
+}
+
+fn remote_sync_is_current(remote: &Remote, head: &str, patch: &PatchArchive) -> Result<bool> {
+  let raw = remote.ssh_capture_bytes(&format!(
+    "cat {}/sync-state.json 2>/dev/null || true",
+    remote.meta_dir()
+  ))?;
+  if raw.is_empty() {
+    return Ok(false);
+  }
+  let Ok(state) = serde_json::from_slice::<RemoteSyncState>(&raw) else {
+    return Ok(false);
+  };
+  Ok(state.head == head && state.patch_sha256 == patch.digest)
 }
 
 fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {

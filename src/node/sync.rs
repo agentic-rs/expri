@@ -176,11 +176,7 @@ fn sync_is_current(state_dir: &Path, request: &SyncApplyRequest) -> Result<bool>
     source,
   })?;
   let state = serde_json::from_str::<SyncState>(&raw)?;
-  Ok(
-    state.head == request.head
-      && state.source_bundle_sha256 == request.source_bundle_sha256
-      && state.patch_sha256 == request.patch_sha256,
-  )
+  Ok(state.head == request.head && state.patch_sha256 == request.patch_sha256)
 }
 
 fn write_state(state_dir: &Path, request: &SyncApplyRequest) -> Result<()> {
@@ -475,6 +471,32 @@ mod tests {
       "dirty\n"
     );
     assert!(worktree.path().join(".expri/sync-state.json").is_file());
+  }
+
+  #[test]
+  fn sync_current_ignores_source_bundle_digest() {
+    let state_dir = tempfile::tempdir().expect("state tempdir");
+    fs::write(
+      state_path(state_dir.path()),
+      r#"{
+  "head": "abc",
+  "source_bundle_sha256": "old",
+  "patch_sha256": "patch"
+}"#,
+    )
+    .expect("write state");
+    let request = SyncApplyRequest {
+      head: "abc".to_string(),
+      remote_url: None,
+      source_bundle: Some("source.bundle".to_string()),
+      source_bundle_sha256: Some("new".to_string()),
+      patch: "patch.zip".to_string(),
+      patch_sha256: "patch".to_string(),
+      state_dir: ".expri".to_string(),
+      force: false,
+    };
+
+    assert!(sync_is_current(state_dir.path(), &request).expect("current"));
   }
 
   fn write_test_patch(path: &Path) {
