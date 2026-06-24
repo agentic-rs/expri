@@ -65,9 +65,15 @@ The array form runs exactly that command. The object form supports options;
 
 ```sh
 expri run dev
-expri run train -- --epochs 3
-expri -T runpod run train -- --epochs 3
+expri run train --epochs 3
+expri -T runpod run train --epochs 3
+expri -T runpod run --no-sync train --epochs 3
 ```
+
+When `-T/--target` is provided, `run` syncs the repo to the target before
+executing the task there. Pass `--no-sync` before the task name to skip that
+sync. Run options must appear before the task name; arguments after the task
+name are passed through to the task.
 
 ## Setup
 

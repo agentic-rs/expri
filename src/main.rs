@@ -122,8 +122,6 @@ struct DownloadCommand {
 
 #[derive(Debug, Args)]
 struct RunCommand {
-  name: String,
-
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -139,8 +137,17 @@ struct RunCommand {
   #[arg(long)]
   dry_run: bool,
 
-  #[arg(value_name = "ARG", last = true)]
-  args: Vec<String>,
+  #[arg(long)]
+  no_sync: bool,
+
+  #[arg(
+    value_name = "TASK",
+    required = true,
+    num_args = 1..,
+    trailing_var_arg = true,
+    allow_hyphen_values = true
+  )]
+  task: Vec<String>,
 }
 
 fn main() {
@@ -246,9 +253,32 @@ fn run_setup(
 
 fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let context = CommandContext::load(command.config, command.repo)?;
-  let task = context.config.task(&command.name)?;
+  let mut task_parts = command.task.into_iter();
+  let name = task_parts
+    .next()
+    .expect("clap requires at least one task argument");
+  let args = task_parts.collect::<Vec<_>>();
+  let task = context.config.task(&name)?;
   if target.is_some() {
     let context = context.into_target(target, command.control_path)?;
+    if !command.no_sync {
+      let sync = context.config.sync_rules()?;
+      sync_target(SyncOptions {
+        repo_root: context.repo_root.clone(),
+        project_name: context.project_name.clone(),
+        target_name: context.target_name.clone(),
+        target: context.target.clone(),
+        sync,
+        control_path: context.control_path.clone(),
+        control_persist: command.control_persist.clone(),
+        dry_run: command.dry_run,
+        force: false,
+        pull: false,
+        paths: Vec::new(),
+        verbosity,
+        quiet,
+      })?;
+    }
     return run_remote_task(RemoteTaskOptions {
       repo_root: context.repo_root,
       project_name: context.project_name,
@@ -256,9 +286,9 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
       target: context.target,
       control_path: context.control_path,
       control_persist: command.control_persist,
-      name: command.name,
+      name,
       task,
-      args: command.args,
+      args,
       dry_run: command.dry_run,
       verbosity,
       quiet,
@@ -268,11 +298,64 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   run_local_task(LocalTaskOptions {
     repo_root: context.repo_root,
     project_name: context.project_name,
-    name: command.name,
+    name,
     task,
-    args: command.args,
+    args,
     dry_run: command.dry_run,
     verbosity,
     quiet,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn run_options_before_name_belong_to_expri() {
+    let cli = Cli::try_parse_from([
+      "expri",
+      "run",
+      "--dry-run",
+      "--no-sync",
+      "train",
+      "--model",
+      "tiny",
+    ])
+    .unwrap();
+
+    let Command::Run(command) = cli.command else {
+      panic!("expected run command");
+    };
+
+    assert_eq!(command.task[0], "train");
+    assert!(command.dry_run);
+    assert!(command.no_sync);
+    assert_eq!(command.task[1..], ["--model", "tiny"]);
+  }
+
+  #[test]
+  fn run_options_after_name_are_task_args() {
+    let cli = Cli::try_parse_from([
+      "expri",
+      "run",
+      "train",
+      "--dry-run",
+      "--config",
+      "task-config.toml",
+    ])
+    .unwrap();
+
+    let Command::Run(command) = cli.command else {
+      panic!("expected run command");
+    };
+
+    assert_eq!(command.task[0], "train");
+    assert!(!command.dry_run);
+    assert!(command.config.is_none());
+    assert_eq!(
+      command.task[1..],
+      ["--dry-run", "--config", "task-config.toml"]
+    );
+  }
 }
