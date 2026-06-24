@@ -115,6 +115,7 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
   )?;
   let checkout_manifest_sha256 = install_staged_checkout(
     state_dir,
+    &git_dir,
     &stage_dir,
     &request.remote_managed,
     &request.patch_sha256,
@@ -326,15 +327,13 @@ fn read_deleted_paths(archive: &mut ZipArchive<File>) -> Result<Vec<PathBuf>> {
 
 fn install_staged_checkout(
   state_dir: &Path,
+  git_dir: &Path,
   stage_dir: &Path,
   remote_managed: &[String],
   patch_digest: &str,
 ) -> Result<String> {
   let staged_files = collect_staged_files(stage_dir, remote_managed)?;
-  let previous_files = read_manifest(checkout_manifest_path(state_dir))?
-    .into_iter()
-    .chain(read_manifest(manifest_path(state_dir))?)
-    .collect::<BTreeSet<_>>();
+  let previous_files = previous_installed_files(state_dir, git_dir)?;
 
   for path in &staged_files {
     install_staged_file(stage_dir, path)?;
@@ -361,6 +360,63 @@ fn install_staged_checkout(
     }
   })?;
   Ok(digest)
+}
+
+fn previous_installed_files(state_dir: &Path, git_dir: &Path) -> Result<BTreeSet<PathBuf>> {
+  let checkout_manifest = checkout_manifest_path(state_dir);
+  let mut previous_files = read_manifest(checkout_manifest.clone())?
+    .into_iter()
+    .chain(read_manifest(manifest_path(state_dir))?)
+    .collect::<BTreeSet<_>>();
+  if checkout_manifest.is_file() {
+    return Ok(previous_files);
+  }
+
+  let state = read_sync_state(state_dir)?;
+  if let Some(state) = state {
+    previous_files.extend(git_tree_files(git_dir, &state.head)?);
+  }
+  Ok(previous_files)
+}
+
+fn read_sync_state(state_dir: &Path) -> Result<Option<SyncState>> {
+  let path = state_path(state_dir);
+  if !path.is_file() {
+    return Ok(None);
+  }
+  let raw = fs::read_to_string(&path).map_err(|source| ExpriError::IoContext {
+    action: "read",
+    path: path.display().to_string(),
+    source,
+  })?;
+  Ok(serde_json::from_str::<SyncState>(&raw).ok())
+}
+
+fn git_tree_files(git_dir: &Path, revision: &str) -> Result<BTreeSet<PathBuf>> {
+  let output = Command::new("git")
+    .args([
+      "--git-dir",
+      &git_dir_string(git_dir),
+      "ls-tree",
+      "-r",
+      "-z",
+      "--name-only",
+      revision,
+    ])
+    .output()?;
+  if !output.status.success() {
+    return Ok(BTreeSet::new());
+  }
+  let mut files = BTreeSet::new();
+  for value in output.stdout.split(|byte| *byte == 0) {
+    if value.is_empty() {
+      continue;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(value).as_ref());
+    validate_relative_path(&path)?;
+    files.insert(path);
+  }
+  Ok(files)
 }
 
 fn collect_staged_files(stage_dir: &Path, remote_managed: &[String]) -> Result<BTreeSet<PathBuf>> {
@@ -697,6 +753,98 @@ mod tests {
       fs::read_to_string(worktree.path().join("uv.lock")).expect("lock"),
       "from remote\n"
     );
+  }
+
+  #[test]
+  fn sync_apply_removes_previous_tracked_files_without_checkout_manifest() {
+    let _guard = cwd_lock().lock().expect("cwd lock");
+    let source = tempfile::tempdir().expect("source tempdir");
+    run_command_in(source.path(), ["git", "init"]);
+    fs::write(source.path().join("kept.txt"), "kept\n").expect("write kept");
+    fs::write(source.path().join("gone.txt"), "gone\n").expect("write gone");
+    run_command_in(source.path(), ["git", "add", "kept.txt", "gone.txt"]);
+    run_command_in(
+      source.path(),
+      [
+        "git",
+        "-c",
+        "user.name=Expri",
+        "-c",
+        "user.email=expri@example.com",
+        "commit",
+        "-m",
+        "initial",
+      ],
+    );
+    let old_head = command_output_in(source.path(), ["git", "rev-parse", "HEAD"]);
+    fs::remove_file(source.path().join("gone.txt")).expect("remove gone");
+    run_command_in(source.path(), ["git", "add", "gone.txt"]);
+    run_command_in(
+      source.path(),
+      [
+        "git",
+        "-c",
+        "user.name=Expri",
+        "-c",
+        "user.email=expri@example.com",
+        "commit",
+        "-m",
+        "remove gone",
+      ],
+    );
+    let head = command_output_in(source.path(), ["git", "rev-parse", "HEAD"]);
+    let bundle = source.path().join("source.bundle");
+    run_command_in(
+      source.path(),
+      [
+        "git",
+        "bundle",
+        "create",
+        bundle.to_str().expect("bundle path"),
+        "HEAD",
+      ],
+    );
+
+    let patch = source.path().join("patch.zip");
+    write_patch_with_entries(&patch, &[]);
+    let (source_bundle_sha256, _) = sha256_file(&bundle).expect("bundle sha");
+    let (patch_sha256, _) = sha256_file(&patch).expect("patch sha");
+
+    let worktree = tempfile::tempdir().expect("worktree tempdir");
+    fs::write(worktree.path().join("kept.txt"), "old kept\n").expect("old kept");
+    fs::write(worktree.path().join("gone.txt"), "old gone\n").expect("old gone");
+    fs::create_dir_all(worktree.path().join(".expri")).expect("expri dir");
+    fs::write(
+      worktree.path().join(".expri/sync-state.json"),
+      format!(
+        r#"{{
+  "head": "{old_head}",
+  "source_bundle_sha256": null,
+  "patch_sha256": "old"
+}}"#
+      ),
+    )
+    .expect("old state");
+
+    let previous_cwd = env::current_dir().expect("cwd");
+    env::set_current_dir(worktree.path()).expect("set cwd");
+    let request = SyncApplyRequest {
+      head,
+      remote_url: None,
+      source_bundle: Some(bundle.to_string_lossy().to_string()),
+      source_bundle_sha256: Some(source_bundle_sha256),
+      patch: patch.to_string_lossy().to_string(),
+      patch_sha256,
+      state_dir: ".expri".to_string(),
+      remote_managed: Vec::new(),
+      force: false,
+    };
+    let result = apply_request(&request);
+    env::set_current_dir(previous_cwd).expect("restore cwd");
+    result.expect("sync apply");
+
+    assert!(worktree.path().join("kept.txt").is_file());
+    assert!(!worktree.path().join("gone.txt").exists());
   }
 
   #[test]
