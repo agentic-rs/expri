@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
@@ -16,6 +18,7 @@ struct SyncState {
   head: String,
   source_bundle_sha256: Option<String>,
   patch_sha256: String,
+  checkout_manifest_sha256: Option<String>,
 }
 
 pub fn apply_request_file(path: &Path) -> Result<()> {
@@ -52,7 +55,6 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
     return Ok(());
   }
 
-  let masked_files = save_remote_managed_files(state_dir, &request.remote_managed)?;
   let git_dir = state_dir.join("git");
   if !git_dir.is_dir() {
     run_git(vec![
@@ -95,24 +97,34 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
       "+HEAD:refs/heads/synced".to_string(),
     ])?;
   }
+  let stage_dir = create_stage_dir(state_dir)?;
   run_git(vec![
     "--git-dir".to_string(),
     git_dir_string(&git_dir),
     "--work-tree".to_string(),
-    ".".to_string(),
+    git_dir_string(&stage_dir),
     "checkout".to_string(),
     "-f".to_string(),
     request.head.clone(),
   ])?;
 
   apply_patch_zip(
-    state_dir,
+    &stage_dir,
     Path::new(&request.patch),
-    &request.patch_sha256,
     &request.remote_managed,
   )?;
-  restore_remote_managed_files(masked_files)?;
-  write_state(state_dir, request)?;
+  let checkout_manifest_sha256 = install_staged_checkout(
+    state_dir,
+    &stage_dir,
+    &request.remote_managed,
+    &request.patch_sha256,
+  )?;
+  fs::remove_dir_all(&stage_dir).map_err(|source| ExpriError::IoContext {
+    action: "remove directory",
+    path: stage_dir.display().to_string(),
+    source,
+  })?;
+  write_state(state_dir, request, checkout_manifest_sha256)?;
   Ok(())
 }
 
@@ -183,14 +195,23 @@ fn sync_is_current(state_dir: &Path, request: &SyncApplyRequest) -> Result<bool>
     source,
   })?;
   let state = serde_json::from_str::<SyncState>(&raw)?;
-  Ok(state.head == request.head && state.patch_sha256 == request.patch_sha256)
+  Ok(
+    state.head == request.head
+      && state.patch_sha256 == request.patch_sha256
+      && state.checkout_manifest_sha256.is_some(),
+  )
 }
 
-fn write_state(state_dir: &Path, request: &SyncApplyRequest) -> Result<()> {
+fn write_state(
+  state_dir: &Path,
+  request: &SyncApplyRequest,
+  checkout_manifest_sha256: String,
+) -> Result<()> {
   let state = SyncState {
     head: request.head.clone(),
     source_bundle_sha256: request.source_bundle_sha256.clone(),
     patch_sha256: request.patch_sha256.clone(),
+    checkout_manifest_sha256: Some(checkout_manifest_sha256),
   };
   let path = state_path(state_dir);
   let raw = serde_json::to_string_pretty(&state)?;
@@ -206,101 +227,31 @@ fn state_path(state_dir: &Path) -> PathBuf {
   state_dir.join("sync-state.json")
 }
 
-struct MaskedFile {
-  path: PathBuf,
-  saved_path: PathBuf,
-  existed: bool,
-}
-
-fn save_remote_managed_files(state_dir: &Path, paths: &[String]) -> Result<Vec<MaskedFile>> {
-  let mask_dir = state_dir.join("remote-managed");
-  if mask_dir.exists() {
-    fs::remove_dir_all(&mask_dir).map_err(|source| ExpriError::IoContext {
-      action: "remove directory",
-      path: mask_dir.display().to_string(),
-      source,
-    })?;
-  }
-  fs::create_dir_all(&mask_dir).map_err(|source| ExpriError::IoContext {
+fn create_stage_dir(state_dir: &Path) -> Result<PathBuf> {
+  let tmp_dir = state_dir.join("tmp");
+  fs::create_dir_all(&tmp_dir).map_err(|source| ExpriError::IoContext {
     action: "create directory",
-    path: mask_dir.display().to_string(),
+    path: tmp_dir.display().to_string(),
     source,
   })?;
-
-  let mut masked = Vec::new();
-  for value in paths {
-    let path = PathBuf::from(value);
-    validate_relative_path(&path)?;
-    let saved_path = mask_dir.join(&path);
-    let existed = fs::symlink_metadata(&path)
-      .map(|metadata| metadata.file_type().is_file() || metadata.file_type().is_symlink())
-      .unwrap_or(false);
-    if existed {
-      if let Some(parent) = saved_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
-          action: "create directory",
-          path: parent.display().to_string(),
-          source,
-        })?;
-      }
-      fs::rename(&path, &saved_path).map_err(|source| ExpriError::IoContext {
-        action: "move",
-        path: path.display().to_string(),
-        source,
-      })?;
-    }
-    masked.push(MaskedFile {
-      path,
-      saved_path,
-      existed,
-    });
-  }
-  Ok(masked)
-}
-
-fn restore_remote_managed_files(masked_files: Vec<MaskedFile>) -> Result<()> {
-  for masked in masked_files {
-    remove_worktree_file(&masked.path)?;
-    if !masked.existed {
-      continue;
-    }
-    if let Some(parent) = masked.path.parent() {
-      fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
-        action: "create directory",
-        path: parent.display().to_string(),
-        source,
-      })?;
-    }
-    fs::rename(&masked.saved_path, &masked.path).map_err(|source| ExpriError::IoContext {
-      action: "move",
-      path: masked.saved_path.display().to_string(),
-      source,
-    })?;
-  }
-  Ok(())
+  let nanos = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_nanos())
+    .unwrap_or(0);
+  let stage_dir = tmp_dir.join(format!("sync-{}-{nanos}", std::process::id()));
+  fs::create_dir_all(&stage_dir).map_err(|source| ExpriError::IoContext {
+    action: "create directory",
+    path: stage_dir.display().to_string(),
+    source,
+  })?;
+  Ok(stage_dir)
 }
 
 fn apply_patch_zip(
-  state_dir: &Path,
+  worktree_root: &Path,
   patch_path: &Path,
-  patch_digest: &str,
   remote_managed: &[String],
 ) -> Result<()> {
-  remove_previous_overlay(state_dir)?;
-  let patch_dir = state_dir.join("patch");
-  if patch_dir.exists() {
-    fs::remove_dir_all(&patch_dir).map_err(|source| ExpriError::IoContext {
-      action: "remove directory",
-      path: patch_dir.display().to_string(),
-      source,
-    })?;
-  }
-  fs::create_dir_all(&patch_dir).map_err(|source| ExpriError::IoContext {
-    action: "create directory",
-    path: patch_dir.display().to_string(),
-    source,
-  })?;
-
   let file = File::open(patch_path).map_err(|source| ExpriError::IoContext {
     action: "open",
     path: patch_path.display().to_string(),
@@ -312,10 +263,9 @@ fn apply_patch_zip(
     if is_remote_managed(&path, remote_managed) {
       continue;
     }
-    remove_worktree_file(&path)?;
+    remove_worktree_file(worktree_root, &path)?;
   }
 
-  let mut manifest = Vec::new();
   for index in 0..archive.len() {
     let mut entry = archive.by_index(index)?;
     let Some(relative_path) = entry.enclosed_name() else {
@@ -331,7 +281,7 @@ fn apply_patch_zip(
     if is_remote_managed(&relative_path, remote_managed) {
       continue;
     }
-    let destination = PathBuf::from(&relative_path);
+    let destination = worktree_root.join(&relative_path);
     if let Some(parent) = destination.parent() {
       fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
         action: "create directory",
@@ -345,17 +295,8 @@ fn apply_patch_zip(
       source,
     })?;
     io::copy(&mut entry, &mut output)?;
-    manifest.push(destination);
   }
 
-  write_manifest(state_dir, &manifest)?;
-  fs::write(state_dir.join("patch.sha256"), patch_digest).map_err(|source| {
-    ExpriError::IoContext {
-      action: "write",
-      path: state_dir.join("patch.sha256").display().to_string(),
-      source,
-    }
-  })?;
   Ok(())
 }
 
@@ -383,34 +324,108 @@ fn read_deleted_paths(archive: &mut ZipArchive<File>) -> Result<Vec<PathBuf>> {
   Ok(deleted)
 }
 
-fn remove_previous_overlay(state_dir: &Path) -> Result<()> {
-  let manifest_path = manifest_path(state_dir);
-  if !manifest_path.is_file() {
-    return Ok(());
+fn install_staged_checkout(
+  state_dir: &Path,
+  stage_dir: &Path,
+  remote_managed: &[String],
+  patch_digest: &str,
+) -> Result<String> {
+  let staged_files = collect_staged_files(stage_dir, remote_managed)?;
+  let previous_files = read_manifest(checkout_manifest_path(state_dir))?
+    .into_iter()
+    .chain(read_manifest(manifest_path(state_dir))?)
+    .collect::<BTreeSet<_>>();
+
+  for path in &staged_files {
+    install_staged_file(stage_dir, path)?;
   }
-  let raw = fs::read_to_string(&manifest_path).map_err(|source| ExpriError::IoContext {
-    action: "read",
-    path: manifest_path.display().to_string(),
-    source,
-  })?;
-  for line in raw.lines() {
-    if line.is_empty() {
-      continue;
+  for path in previous_files.difference(&staged_files) {
+    if !is_remote_managed(path, remote_managed) {
+      remove_worktree_file(Path::new("."), path)?;
     }
-    let path = PathBuf::from(line);
-    validate_relative_path(&path)?;
-    remove_worktree_file(&path)?;
+  }
+  let digest = write_manifest(checkout_manifest_path(state_dir), &staged_files)?;
+  let old_patch_manifest = manifest_path(state_dir);
+  if old_patch_manifest.exists() {
+    fs::remove_file(&old_patch_manifest).map_err(|source| ExpriError::IoContext {
+      action: "remove",
+      path: old_patch_manifest.display().to_string(),
+      source,
+    })?;
+  }
+  fs::write(state_dir.join("patch.sha256"), patch_digest).map_err(|source| {
+    ExpriError::IoContext {
+      action: "write",
+      path: state_dir.join("patch.sha256").display().to_string(),
+      source,
+    }
+  })?;
+  Ok(digest)
+}
+
+fn collect_staged_files(stage_dir: &Path, remote_managed: &[String]) -> Result<BTreeSet<PathBuf>> {
+  let mut files = BTreeSet::new();
+  collect_staged_files_inner(stage_dir, Path::new(""), remote_managed, &mut files)?;
+  Ok(files)
+}
+
+fn collect_staged_files_inner(
+  stage_dir: &Path,
+  relative_dir: &Path,
+  remote_managed: &[String],
+  files: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+  for entry in
+    fs::read_dir(stage_dir.join(relative_dir)).map_err(|source| ExpriError::IoContext {
+      action: "read directory",
+      path: stage_dir.join(relative_dir).display().to_string(),
+      source,
+    })?
+  {
+    let entry = entry?;
+    let relative_path = relative_dir.join(entry.file_name());
+    validate_relative_path(&relative_path)?;
+    let metadata = entry.metadata()?;
+    if metadata.is_dir() {
+      collect_staged_files_inner(stage_dir, &relative_path, remote_managed, files)?;
+    } else if metadata.is_file() && !is_remote_managed(&relative_path, remote_managed) {
+      files.insert(relative_path);
+    }
   }
   Ok(())
 }
 
-fn remove_worktree_file(path: &Path) -> Result<()> {
+fn install_staged_file(stage_dir: &Path, path: &Path) -> Result<()> {
+  let source = stage_dir.join(path);
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).map_err(|source| ExpriError::IoContext {
+      action: "create directory",
+      path: parent.display().to_string(),
+      source,
+    })?;
+  }
+  remove_worktree_path_for_install(path)?;
+  if let Err(link_error) = fs::hard_link(&source, path) {
+    fs::copy(&source, path).map_err(|source_error| {
+      ExpriError::Message(format!(
+        "failed to install {}: hard link failed: {}; copy failed: {}",
+        path.display(),
+        link_error,
+        source_error
+      ))
+    })?;
+  }
+  Ok(())
+}
+
+fn remove_worktree_file(root: &Path, path: &Path) -> Result<()> {
   validate_relative_path(path)?;
-  match fs::symlink_metadata(path) {
+  let absolute_path = root.join(path);
+  match fs::symlink_metadata(&absolute_path) {
     Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
-      fs::remove_file(path).map_err(|source| ExpriError::IoContext {
+      fs::remove_file(&absolute_path).map_err(|source| ExpriError::IoContext {
         action: "remove",
-        path: path.display().to_string(),
+        path: absolute_path.display().to_string(),
         source,
       })?;
     }
@@ -419,23 +434,69 @@ fn remove_worktree_file(path: &Path) -> Result<()> {
   Ok(())
 }
 
-fn write_manifest(state_dir: &Path, manifest: &[PathBuf]) -> Result<()> {
+fn remove_worktree_path_for_install(path: &Path) -> Result<()> {
+  validate_relative_path(path)?;
+  match fs::symlink_metadata(path) {
+    Ok(metadata) if metadata.is_dir() => {
+      fs::remove_dir_all(path).map_err(|source| ExpriError::IoContext {
+        action: "remove directory",
+        path: path.display().to_string(),
+        source,
+      })?;
+    }
+    Ok(_) => {
+      fs::remove_file(path).map_err(|source| ExpriError::IoContext {
+        action: "remove",
+        path: path.display().to_string(),
+        source,
+      })?;
+    }
+    Err(_) => {}
+  }
+  Ok(())
+}
+
+fn read_manifest(path: PathBuf) -> Result<BTreeSet<PathBuf>> {
+  if !path.is_file() {
+    return Ok(BTreeSet::new());
+  }
+  let raw = fs::read_to_string(&path).map_err(|source| ExpriError::IoContext {
+    action: "read",
+    path: path.display().to_string(),
+    source,
+  })?;
+  let mut paths = BTreeSet::new();
+  for line in raw.lines() {
+    if line.is_empty() {
+      continue;
+    }
+    let path = PathBuf::from(line);
+    validate_relative_path(&path)?;
+    paths.insert(path);
+  }
+  Ok(paths)
+}
+
+fn write_manifest(path: PathBuf, manifest: &BTreeSet<PathBuf>) -> Result<String> {
   let mut raw = String::new();
   for path in manifest {
     raw.push_str(&path.to_string_lossy());
     raw.push('\n');
   }
-  let path = manifest_path(state_dir);
   fs::write(&path, raw).map_err(|source| ExpriError::IoContext {
     action: "write",
     path: path.display().to_string(),
     source,
   })?;
-  Ok(())
+  sha256_file(&path).map(|(digest, _)| digest)
 }
 
 fn manifest_path(state_dir: &Path) -> PathBuf {
   state_dir.join("patch.manifest")
+}
+
+fn checkout_manifest_path(state_dir: &Path) -> PathBuf {
+  state_dir.join("checkout.manifest")
 }
 
 fn validate_relative_path(path: &Path) -> Result<()> {
@@ -646,7 +707,8 @@ mod tests {
       r#"{
   "head": "abc",
   "source_bundle_sha256": "old",
-  "patch_sha256": "patch"
+  "patch_sha256": "patch",
+  "checkout_manifest_sha256": "manifest"
 }"#,
     )
     .expect("write state");

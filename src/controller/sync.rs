@@ -33,6 +33,7 @@ pub struct SyncOptions {
 struct RemoteSyncState {
   head: String,
   patch_sha256: String,
+  checkout_manifest_sha256: Option<String>,
 }
 
 pub fn sync_target(options: SyncOptions) -> Result<()> {
@@ -131,7 +132,11 @@ fn remote_sync_is_current(remote: &Remote, head: &str, patch: &PatchArchive) -> 
   let Ok(state) = serde_json::from_slice::<RemoteSyncState>(&raw) else {
     return Ok(false);
   };
-  Ok(state.head == head && state.patch_sha256 == patch.digest)
+  Ok(
+    state.head == head
+      && state.patch_sha256 == patch.digest
+      && state.checkout_manifest_sha256.is_some(),
+  )
 }
 
 fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
