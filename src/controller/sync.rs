@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use chrono::Utc;
 use serde::Deserialize;
 
 use crate::archive::{PatchArchive, build_patch_archive, sha256_file};
@@ -428,16 +428,14 @@ fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) ->
 }
 
 fn request_id(head: &str, patch_digest: &str) -> String {
-  let nanos = SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .map(|duration| duration.as_nanos())
-    .unwrap_or(0);
   let head_prefix = head.get(..12).unwrap_or(head);
   let patch_prefix = patch_digest.get(..12).unwrap_or(patch_digest);
-  format!(
-    "req-{head_prefix}-{patch_prefix}-{}-{nanos}",
-    std::process::id()
-  )
+  let timestamp = utc_timestamp();
+  format!("sync-{head_prefix}-{patch_prefix}-{timestamp}")
+}
+
+fn utc_timestamp() -> String {
+  Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 fn print_digest(label: &str, digest: &str, size: u64, quiet: bool) {
