@@ -106,7 +106,6 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
 
   let bundle = build_source_bundle_for_remote(
     &options.repo_root,
-    &head,
     remote_candidate.as_ref(),
     options.verbosity,
     options.quiet,
@@ -351,28 +350,18 @@ artifacts = {
 
 fn build_source_bundle_for_remote(
   repo_root: &Path,
-  head: &str,
   remote_candidate: Option<&RemoteCandidate>,
   verbosity: u8,
   quiet: bool,
 ) -> Result<Option<SourceBundle>> {
-  let remote_has_head = remote_candidate
-    .map(|candidate| git::remote_advertises_commit(repo_root, &candidate.url, head))
-    .transpose()?
-    .unwrap_or(false);
-  let base_commit = remote_candidate
-    .and_then(|candidate| candidate.base_commit.as_deref())
-    .filter(|base_commit| *base_commit != head);
   let distance = remote_candidate.and_then(|candidate| candidate.distance);
-  if matches!(distance, Some(0)) && remote_has_head {
+  if matches!(distance, Some(0)) {
     if verbosity > 0 && !quiet {
       eprintln!("source bundle: skipped; nearest remote already has HEAD");
     }
     return Ok(None);
   }
-  if matches!(distance, Some(0)) && verbosity > 0 && !quiet {
-    eprintln!("source bundle: nearest remote did not advertise HEAD; uploading fallback bundle");
-  }
+  let base_commit = remote_candidate.and_then(|candidate| candidate.base_commit.as_deref());
   let bundle = git::build_source_bundle(repo_root, base_commit)?;
   match base_commit {
     Some(base_commit) if verbosity > 0 && !quiet => {

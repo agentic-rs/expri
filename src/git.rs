@@ -107,27 +107,6 @@ pub fn build_source_bundle(repo_root: &Path, base_commit: Option<&str>) -> Resul
   })
 }
 
-pub fn remote_advertises_commit(repo_root: &Path, remote_url: &str, commit: &str) -> Result<bool> {
-  let output = Command::new("git")
-    .current_dir(repo_root)
-    .args(["ls-remote", remote_url])
-    .output()
-    .map_err(|source| ExpriError::IoContext {
-      action: "run git in",
-      path: repo_root.display().to_string(),
-      source,
-    })?;
-  if !output.status.success() {
-    return Ok(false);
-  }
-  Ok(output.stdout.split(|byte| *byte == b'\n').any(|line| {
-    line
-      .split(|byte| *byte == b'\t')
-      .next()
-      .is_some_and(|advertised| advertised == commit.as_bytes())
-  }))
-}
-
 pub fn fetch_bundle_to_ref(repo_root: &Path, bundle_path: &Path, ref_name: &str) -> Result<()> {
   git_run(
     repo_root,
