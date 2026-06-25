@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -67,6 +68,11 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
 
   let _opened_master = remote.open_master()?;
   let head = git::head(&options.repo_root)?;
+  let remote_sync_state = if options.force {
+    None
+  } else {
+    read_remote_sync_state(&remote)?
+  };
   let remote_candidate = git::nearest_remote_url(&options.repo_root, &head)?;
   if options.verbosity > 0
     && !options.quiet
@@ -91,7 +97,7 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
       patch.file_count, patch.deleted_count
     );
   }
-  if !options.force && remote_sync_is_current(&remote, &head, &patch)? {
+  if remote_sync_is_current(remote_sync_state.as_ref(), &head, &patch) {
     if !options.quiet {
       eprintln!("sync skipped: target already has HEAD and patch");
     }
@@ -121,22 +127,27 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
   Ok(())
 }
 
-fn remote_sync_is_current(remote: &Remote, head: &str, patch: &PatchArchive) -> Result<bool> {
+fn read_remote_sync_state(remote: &Remote) -> Result<Option<RemoteSyncState>> {
   let raw = remote.ssh_capture_bytes(&format!(
     "cat {}/sync-state.json 2>/dev/null || true",
     remote.meta_dir()
   ))?;
   if raw.is_empty() {
-    return Ok(false);
+    return Ok(None);
   }
-  let Ok(state) = serde_json::from_slice::<RemoteSyncState>(&raw) else {
-    return Ok(false);
-  };
-  Ok(
+  Ok(serde_json::from_slice::<RemoteSyncState>(&raw).ok())
+}
+
+fn remote_sync_is_current(
+  state: Option<&RemoteSyncState>,
+  head: &str,
+  patch: &PatchArchive,
+) -> bool {
+  state.is_some_and(|state| {
     state.head == head
       && state.patch_sha256 == patch.digest
-      && state.checkout_manifest_sha256.is_some(),
-  )
+      && state.checkout_manifest_sha256.is_some()
+  })
 }
 
 fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
@@ -386,37 +397,57 @@ struct UploadApplyRequest<'a> {
 }
 
 fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) -> Result<()> {
-  let inbox = format!("{}/inbox", remote.meta_dir());
-  remote.ssh(&format!("mkdir -p {inbox}"))?;
-  if let Some(bundle) = apply.bundle {
-    remote.upload_file(&bundle.path, &format!("{inbox}/source.bundle"))?;
-  }
-  remote.upload_file(&apply.patch.path, &format!("{inbox}/patch.zip"))?;
+  let request_id = request_id(apply.head, &apply.patch.digest);
+  let remote_request_dir = format!("{}/inbox/{request_id}", remote.meta_dir());
+  remote.ssh(&format!("mkdir -p {remote_request_dir}"))?;
+
+  let request_dir = tempfile::Builder::new()
+    .prefix("expri-request-")
+    .tempdir()?;
+  let patch_path = request_dir.path().join("patch.zip");
+  fs::copy(&apply.patch.path, &patch_path)?;
+  let source_bundle_path = if let Some(bundle) = apply.bundle {
+    let path = request_dir.path().join("source.bundle");
+    fs::copy(&bundle.path, &path)?;
+    Some(path)
+  } else {
+    None
+  };
 
   let request = SyncApplyRequest {
     head: apply.head.to_string(),
     remote_url: apply.remote_url.map(ToString::to_string),
-    source_bundle: apply
-      .bundle
-      .map(|_| ".expri/inbox/source.bundle".to_string()),
+    source_bundle: source_bundle_path
+      .as_ref()
+      .map(|_| format!(".expri/inbox/{request_id}/source.bundle")),
     source_bundle_sha256: apply.bundle.map(|bundle| bundle.digest.clone()),
-    patch: ".expri/inbox/patch.zip".to_string(),
+    patch: format!(".expri/inbox/{request_id}/patch.zip"),
     patch_sha256: apply.patch.digest.clone(),
     state_dir: ".expri".to_string(),
     remote_managed: apply.remote_managed.to_vec(),
     force: apply.force,
   };
-  let request_dir = tempfile::Builder::new()
-    .prefix("expri-request-")
-    .tempdir()?;
-  let request_path = request_dir.path().join("sync-request.json");
+  let request_path = request_dir.path().join("request.json");
   fs::write(&request_path, serde_json::to_string_pretty(&request)?)?;
-  remote.upload_file(&request_path, &format!("{inbox}/sync-request.json"))?;
+  remote.upload_dir(request_dir.path(), &remote_request_dir)?;
   apply_sync_with_preference(
     remote,
-    ".expri/inbox/sync-request.json",
+    &format!(".expri/inbox/{request_id}/request.json"),
     apply.preference,
     apply.node_bin,
+  )
+}
+
+fn request_id(head: &str, patch_digest: &str) -> String {
+  let nanos = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_nanos())
+    .unwrap_or(0);
+  let head_prefix = head.get(..12).unwrap_or(head);
+  let patch_prefix = patch_digest.get(..12).unwrap_or(patch_digest);
+  format!(
+    "req-{head_prefix}-{patch_prefix}-{}-{nanos}",
+    std::process::id()
   )
 }
 

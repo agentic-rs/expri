@@ -101,6 +101,17 @@ impl Remote {
     self.run("rsync", args)
   }
 
+  pub fn upload_dir(&self, local_dir: &Path, remote_dir: &str) -> Result<()> {
+    let mut args = self.rsync_base_args();
+    args.push(ensure_trailing_slash(&local_dir.to_string_lossy()));
+    args.push(format!(
+      "{}:{}",
+      self.host,
+      ensure_trailing_slash(remote_dir)
+    ));
+    self.run("rsync", args)
+  }
+
   pub fn download_file(&self, remote_path: &str, local_path: &Path) -> Result<()> {
     let mut args = self.rsync_base_args();
     args.push(format!("{}:{}", self.host, remote_path));
