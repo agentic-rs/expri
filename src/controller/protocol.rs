@@ -194,7 +194,7 @@ fn ssh_sync_apply_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
-    r#"import hashlib, json, pathlib, shutil, subprocess, zipfile
+    r#"import hashlib, json, pathlib, shutil, subprocess, tempfile, zipfile
 
 def sha256(path):
   h = hashlib.sha256()
@@ -205,39 +205,84 @@ def sha256(path):
 
 def check_path(path):
   p = pathlib.PurePosixPath(path)
-  if p.is_absolute() or any(part in ("", ".", "..") for part in p.parts):
+  if not p.parts or p.is_absolute() or any(part in ("", ".", "..") for part in p.parts):
     raise SystemExit(f"unsafe patch path: {{path}}")
   return pathlib.Path(path)
 
-def remove_worktree_file(path):
-  path = check_path(path)
-  if path.exists() or path.is_symlink():
-    if path.is_file() or path.is_symlink():
-      path.unlink()
+def remove_worktree_file(root, path):
+  path = root / check_path(path)
+  if path.is_file() or path.is_symlink():
+    path.unlink()
 
-def save_remote_managed(state_dir, paths):
-  mask_dir = state_dir / "remote-managed"
-  if mask_dir.exists():
-    shutil.rmtree(mask_dir)
-  mask_dir.mkdir(parents=True, exist_ok=True)
-  masked = []
-  for raw in paths:
-    path = check_path(raw)
-    saved = mask_dir / path
-    existed = path.is_file() or path.is_symlink()
-    if existed:
-      saved.parent.mkdir(parents=True, exist_ok=True)
-      path.rename(saved)
-    masked.append((path, saved, existed))
-  return masked
+def read_manifest(path):
+  if not path.is_file():
+    return set()
+  return {{check_path(line) for line in path.read_text().splitlines() if line}}
 
-def restore_remote_managed(masked):
-  for path, saved, existed in masked:
-    remove_worktree_file(path.as_posix())
-    if not existed:
-      continue
+def previous_installed_files(state_dir, git_dir):
+  checkout_manifest = state_dir / "checkout.manifest"
+  previous = read_manifest(checkout_manifest) | read_manifest(state_dir / "patch.manifest")
+  state_path = state_dir / "sync-state.json"
+  state = {{}}
+  if state_path.is_file():
+    try:
+      state = json.loads(state_path.read_text())
+    except ValueError:
+      pass
+  # Legacy SSH may leave an older native manifest behind. Recover its HEAD too.
+  if (not checkout_manifest.is_file() or not state.get("checkout_manifest_sha256")) and state.get("head"):
+    tree = subprocess.run(
+      ["git", "--git-dir", str(git_dir), "ls-tree", "-r", "-z", "--name-only", state["head"]],
+      check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    if tree.returncode == 0:
+      previous.update(check_path(path) for path in tree.stdout.decode().split("\0") if path)
+  return previous
+
+def apply_patch(stage_dir, patch, remote_managed):
+  with zipfile.ZipFile(patch) as archive:
+    if ".deleted" in archive.namelist():
+      for line in archive.read(".deleted").decode().splitlines():
+        if line:
+          path = check_path(line)
+          if path not in remote_managed:
+            remove_worktree_file(stage_dir, path)
+    for entry in archive.infolist():
+      if entry.filename == ".deleted" or entry.is_dir():
+        continue
+      path = check_path(entry.filename)
+      if path in remote_managed:
+        continue
+      dst = stage_dir / path
+      dst.parent.mkdir(parents=True, exist_ok=True)
+      with archive.open(entry) as src, dst.open("wb") as out:
+        shutil.copyfileobj(src, out)
+
+def install_staged_checkout(state_dir, stage_dir, previous, remote_managed):
+  desired = {{
+    path.relative_to(stage_dir) for path in stage_dir.rglob("*")
+    if path.is_file() or path.is_symlink()
+  }} - remote_managed
+  # A previous overlay may now be in HEAD; only remove paths absent from the
+  # complete desired checkout. Clear these first so files can become directories.
+  for path in sorted(previous - desired - remote_managed):
+    remove_worktree_file(pathlib.Path("."), path)
+  for path in sorted(desired):
+    for parent in reversed(path.parents):
+      if parent.is_symlink():
+        raise SystemExit(f"cannot install {{path}} through symlink parent {{parent}}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    saved.rename(path)
+    if path.is_dir() and not path.is_symlink():
+      shutil.rmtree(path)
+    else:
+      remove_worktree_file(pathlib.Path("."), path)
+    shutil.copy2(stage_dir / path, path, follow_symlinks=False)
+  checkout_manifest = state_dir / "checkout.manifest"
+  checkout_manifest.write_text("".join(f"{{path.as_posix()}}\n" for path in sorted(desired)))
+  manifest_path = state_dir / "patch.manifest"
+  if manifest_path.exists():
+    manifest_path.unlink()
+  return sha256(checkout_manifest)
 
 request = json.loads(pathlib.Path({request_path}).read_text())
 state_dir = pathlib.Path(request["state_dir"])
@@ -249,8 +294,7 @@ if request.get("source_bundle"):
 if sha256(request["patch"]) != request["patch_sha256"]:
   raise SystemExit("patch sha256 mismatch")
 
-remote_managed = set(request.get("remote_managed", []))
-masked = save_remote_managed(state_dir, remote_managed)
+remote_managed = {{check_path(path) for path in request.get("remote_managed", [])}}
 git_dir = state_dir / "git"
 if not git_dir.is_dir():
   subprocess.run(["git", "init", "--bare", str(git_dir)], check=True)
@@ -270,51 +314,33 @@ else:
   if not request.get("source_bundle"):
     raise SystemExit(f"remote URL did not provide {{request['head']}}, and no source bundle was uploaded")
   subprocess.run(["git", "--git-dir", str(git_dir), "fetch", request["source_bundle"], "+HEAD:refs/heads/synced"], check=True)
-subprocess.run(["git", "--git-dir", str(git_dir), "--work-tree", ".", "checkout", "-f", request["head"]], check=True)
 
-manifest_path = state_dir / "patch.manifest"
-if manifest_path.exists():
-  for line in manifest_path.read_text().splitlines():
-    if line:
-      path = check_path(line)
-      if path.exists() or path.is_symlink():
-        path.unlink()
+previous = previous_installed_files(state_dir, git_dir)
+tmp_dir = state_dir / "tmp"
+tmp_dir.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(prefix="sync-", dir=tmp_dir) as stage:
+  stage_dir = pathlib.Path(stage)
+  subprocess.run([
+    "git", "--git-dir", str(git_dir), "--work-tree", str(stage_dir),
+    "checkout", "-f", request["head"],
+  ], check=True)
+  apply_patch(stage_dir, request["patch"], remote_managed)
+  checkout_manifest_sha256 = install_staged_checkout(state_dir, stage_dir, previous, remote_managed)
 
-deleted = []
-manifest = []
-with zipfile.ZipFile(request["patch"]) as archive:
-  if ".deleted" in archive.namelist():
-    deleted = archive.read(".deleted").decode().splitlines()
-  for line in deleted:
-    if line:
-      if line in remote_managed:
-        continue
-      path = check_path(line)
-      if path.exists() or path.is_symlink():
-        path.unlink()
-  for entry in archive.infolist():
-    name = entry.filename
-    if name == ".deleted" or entry.is_dir():
-      continue
-    if name in remote_managed:
-      continue
-    dst = check_path(name)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with archive.open(entry) as src, dst.open("wb") as out:
-      shutil.copyfileobj(src, out)
-    manifest.append(dst.as_posix())
-
-restore_remote_managed(masked)
-manifest_path.write_text("".join(f"{{path}}\n" for path in sorted(manifest)))
 (state_dir / "patch.sha256").write_text(request["patch_sha256"])
 (state_dir / "sync-state.json").write_text(json.dumps({{
   "head": request["head"],
   "source_bundle_sha256": request["source_bundle_sha256"],
   "patch_sha256": request["patch_sha256"],
+  "checkout_manifest_sha256": checkout_manifest_sha256,
 }}, indent=2, sort_keys=True))
 "#
   )
 }
+
+#[cfg(test)]
+#[path = "protocol_tests.rs"]
+mod sync_tests;
 
 #[cfg(test)]
 mod tests {
