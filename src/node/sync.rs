@@ -335,13 +335,13 @@ fn install_staged_checkout(
   let staged_files = collect_staged_files(stage_dir, remote_managed)?;
   let previous_files = previous_installed_files(state_dir, git_dir)?;
 
-  for path in &staged_files {
-    install_staged_file(stage_dir, path)?;
-  }
   for path in previous_files.difference(&staged_files) {
     if !is_remote_managed(path, remote_managed) {
       remove_worktree_file(Path::new("."), path)?;
     }
+  }
+  for path in &staged_files {
+    install_staged_file(stage_dir, path)?;
   }
   let digest = write_manifest(checkout_manifest_path(state_dir), &staged_files)?;
   let old_patch_manifest = manifest_path(state_dir);
@@ -368,11 +368,17 @@ fn previous_installed_files(state_dir: &Path, git_dir: &Path) -> Result<BTreeSet
     .into_iter()
     .chain(read_manifest(manifest_path(state_dir))?)
     .collect::<BTreeSet<_>>();
-  if checkout_manifest.is_file() {
+  // Legacy SSH syncs can leave a checkout manifest from an earlier node sync.
+  // The state digest distinguishes that stale manifest from the installed set.
+  let state = read_sync_state(state_dir)?;
+  if checkout_manifest.is_file()
+    && state
+      .as_ref()
+      .is_some_and(|state| state.checkout_manifest_sha256.is_some())
+  {
     return Ok(previous_files);
   }
 
-  let state = read_sync_state(state_dir)?;
   if let Some(state) = state {
     previous_files.extend(git_tree_files(git_dir, &state.head)?);
   }
@@ -756,7 +762,49 @@ mod tests {
   }
 
   #[test]
+  fn staged_checkout_replaces_previous_file_with_directory() {
+    let _guard = cwd_lock().lock().expect("cwd lock");
+    let worktree = tempfile::tempdir().expect("worktree tempdir");
+    let state_dir = worktree.path().join(".expri");
+    let stage_dir = state_dir.join("tmp/stage");
+    fs::create_dir_all(stage_dir.join("replaced")).expect("stage directory");
+    fs::write(stage_dir.join("replaced/child.txt"), "new child\n").expect("stage child");
+    fs::write(worktree.path().join("replaced"), "old file\n").expect("previous file");
+    fs::write(worktree.path().join("generated.txt"), "generated\n").expect("generated file");
+    fs::write(checkout_manifest_path(&state_dir), "replaced\n").expect("previous manifest");
+
+    let previous_cwd = env::current_dir().expect("cwd");
+    env::set_current_dir(worktree.path()).expect("set cwd");
+    let result =
+      install_staged_checkout(&state_dir, &state_dir.join("git"), &stage_dir, &[], "patch");
+    env::set_current_dir(previous_cwd).expect("restore cwd");
+    result.expect("install staged checkout");
+
+    assert_eq!(
+      fs::read_to_string(worktree.path().join("replaced/child.txt")).expect("installed child"),
+      "new child\n"
+    );
+    assert_eq!(
+      fs::read_to_string(worktree.path().join("generated.txt")).expect("generated file"),
+      "generated\n"
+    );
+    assert_eq!(
+      fs::read_to_string(checkout_manifest_path(&state_dir)).expect("checkout manifest"),
+      "replaced/child.txt\n"
+    );
+  }
+
+  #[test]
   fn sync_apply_removes_previous_tracked_files_without_checkout_manifest() {
+    assert_sync_apply_removes_previous_tracked_files(false);
+  }
+
+  #[test]
+  fn sync_apply_removes_previous_tracked_files_with_stale_checkout_manifest() {
+    assert_sync_apply_removes_previous_tracked_files(true);
+  }
+
+  fn assert_sync_apply_removes_previous_tracked_files(stale_checkout_manifest: bool) {
     let _guard = cwd_lock().lock().expect("cwd lock");
     let source = tempfile::tempdir().expect("source tempdir");
     run_command_in(source.path(), ["git", "init"]);
@@ -825,6 +873,13 @@ mod tests {
       ),
     )
     .expect("old state");
+    if stale_checkout_manifest {
+      fs::write(
+        worktree.path().join(".expri/checkout.manifest"),
+        "kept.txt\n",
+      )
+      .expect("stale checkout manifest");
+    }
 
     let previous_cwd = env::current_dir().expect("cwd");
     env::set_current_dir(worktree.path()).expect("set cwd");

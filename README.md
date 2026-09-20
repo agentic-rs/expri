@@ -90,9 +90,11 @@ or from inside that repo:
 expri -T runpod sync
 ```
 
-The sync algorithm uploads committed history with a git bundle, checks out
-`HEAD` on the remote, then overlays a zip archive of local dirty and untracked
-files. Remote tool state lives under `.expri/`.
+The sync algorithm uploads committed history with a git bundle, stages `HEAD`
+plus a zip archive of local dirty and untracked files, then installs the staged
+files on the remote. It removes previously synced files absent from the staged
+tree and preserves unrelated remote-generated files. Remote tool state lives
+under `.expri/`.
 
 Use `sync.remote_managed` for repo-relative files that the target should own,
 even if they are tracked by Git or appear in the dirty patch. For example,
