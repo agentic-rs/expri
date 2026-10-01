@@ -1,14 +1,15 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
 
-use super::ssh_sync_apply_script;
+use super::{python_pull_prepare_script, python_sync_apply_script};
 use crate::archive::{build_patch_archive, sha256_file};
 use crate::filter::SyncRules;
 use crate::git;
-use crate::protocol::SyncApplyRequest;
+use crate::protocol::{PullArtifacts, SyncApplyRequest};
 
 struct SyncFixture {
   root: TempDir,
@@ -98,14 +99,14 @@ impl SyncFixture {
     let output = Command::new("python3")
       .current_dir(&self.worktree)
       .arg("-c")
-      .arg(ssh_sync_apply_script(
+      .arg(python_sync_apply_script(
         request_path.to_str().expect("request path"),
       ))
       .output()
-      .expect("run SSH sync script");
+      .expect("run Python sync script");
     assert!(
       output.status.success(),
-      "SSH sync failed:\nstdout: {}\nstderr: {}",
+      "Python sync failed:\nstdout: {}\nstderr: {}",
       String::from_utf8_lossy(&output.stdout),
       String::from_utf8_lossy(&output.stderr)
     );
@@ -162,7 +163,61 @@ fn write_file(path: impl AsRef<Path>, contents: &str) {
 }
 
 #[test]
-fn ssh_sync_keeps_dirty_file_after_it_is_committed() {
+fn python_pull_prepare_packages_head_and_dirty_files() {
+  let fixture = SyncFixture::new(&[
+    (".gitignore", ".expri/\n"),
+    ("tracked.txt", "committed\n"),
+    ("deleted.txt", "remove me\n"),
+  ]);
+  fixture.write_source("tracked.txt", "changed\n");
+  fixture.write_source("untracked.txt", "new\n");
+  fs::remove_file(fixture.source.join("deleted.txt")).expect("delete tracked source");
+
+  let output = Command::new("python3")
+    .current_dir(&fixture.source)
+    .arg("-c")
+    .arg(python_pull_prepare_script())
+    .output()
+    .expect("run Python pull preparation");
+  assert!(
+    output.status.success(),
+    "Python pull preparation failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let artifacts: PullArtifacts = serde_json::from_slice(
+    &fs::read(fixture.source.join(".expri/out/pull-artifacts.json")).expect("read pull artifacts"),
+  )
+  .expect("parse pull artifacts");
+  assert_eq!(artifacts.head, git::head(&fixture.source).unwrap());
+  let bundle = fixture.source.join(&artifacts.source_bundle);
+  assert_eq!(
+    sha256_file(&bundle).unwrap().0,
+    artifacts.source_bundle_sha256
+  );
+  fixture.git(&["bundle", "verify", &artifacts.source_bundle]);
+
+  let patch = fixture.source.join(&artifacts.patch);
+  assert_eq!(sha256_file(&patch).unwrap().0, artifacts.patch_sha256);
+  let mut archive = zip::ZipArchive::new(fs::File::open(patch).unwrap()).unwrap();
+  for (path, expected) in [
+    ("tracked.txt", "changed\n"),
+    ("untracked.txt", "new\n"),
+    (".deleted", "deleted.txt\n"),
+  ] {
+    let mut contents = String::new();
+    archive
+      .by_name(path)
+      .unwrap()
+      .read_to_string(&mut contents)
+      .unwrap();
+    assert_eq!(contents, expected, "pull patch entry {path}");
+  }
+  assert_eq!(archive.len(), 3);
+}
+
+#[test]
+fn python_sync_keeps_dirty_file_after_it_is_committed() {
   let fixture = SyncFixture::new(&[("tracked.txt", "initial\n")]);
   fixture.write_source("tracked.txt", "dirty\n");
   fixture.sync(&[]);
@@ -175,7 +230,7 @@ fn ssh_sync_keeps_dirty_file_after_it_is_committed() {
 }
 
 #[test]
-fn ssh_sync_restores_file_when_local_changes_are_discarded() {
+fn python_sync_restores_file_when_local_changes_are_discarded() {
   let fixture = SyncFixture::new(&[("tracked.txt", "initial\n")]);
   fixture.write_source("tracked.txt", "dirty\n");
   fixture.sync(&[]);
@@ -187,7 +242,7 @@ fn ssh_sync_restores_file_when_local_changes_are_discarded() {
 }
 
 #[test]
-fn ssh_sync_keeps_untracked_file_after_it_is_committed() {
+fn python_sync_keeps_untracked_file_after_it_is_committed() {
   let fixture = SyncFixture::new(&[("tracked.txt", "initial\n")]);
   fixture.write_source("new.txt", "new file\n");
   fixture.sync(&[]);
@@ -200,7 +255,7 @@ fn ssh_sync_keeps_untracked_file_after_it_is_committed() {
 }
 
 #[test]
-fn ssh_sync_removes_stale_files_and_preserves_generated_output() {
+fn python_sync_removes_stale_files_and_preserves_generated_output() {
   let fixture = SyncFixture::new(&[("kept.txt", "kept\n"), ("gone.txt", "gone\n")]);
   fixture.write_source("stale.txt", "untracked\n");
   fixture.sync(&[]);
@@ -222,7 +277,7 @@ fn ssh_sync_removes_stale_files_and_preserves_generated_output() {
 }
 
 #[test]
-fn ssh_sync_preserves_present_and_absent_remote_managed_files() {
+fn python_sync_preserves_present_and_absent_remote_managed_files() {
   let fixture = SyncFixture::new(&[
     ("tracked.txt", "tracked\n"),
     ("present.lock", "from git\n"),
@@ -245,7 +300,7 @@ fn ssh_sync_preserves_present_and_absent_remote_managed_files() {
 }
 
 #[test]
-fn ssh_sync_migrates_legacy_patch_manifest_and_previous_head() {
+fn python_sync_migrates_legacy_patch_manifest_and_previous_head() {
   let fixture = SyncFixture::new(&[("tracked.txt", "initial\n"), ("gone.txt", "gone\n")]);
   fixture.write_source("tracked.txt", "dirty\n");
   fixture.write_source("stale.txt", "untracked\n");
@@ -268,7 +323,7 @@ fn ssh_sync_migrates_legacy_patch_manifest_and_previous_head() {
 }
 
 #[test]
-fn ssh_sync_cleans_files_listed_in_native_checkout_manifest() {
+fn python_sync_cleans_files_listed_in_native_checkout_manifest() {
   let fixture = SyncFixture::new(&[("tracked.txt", "tracked\n")]);
   fixture.write_remote("native-only.txt", "previous native patch\n");
   fixture.write_remote("tracked.txt", "previous checkout\n");
@@ -284,7 +339,7 @@ fn ssh_sync_cleans_files_listed_in_native_checkout_manifest() {
 }
 
 #[test]
-fn ssh_sync_recovers_ownership_when_legacy_ssh_left_native_manifest() {
+fn python_sync_recovers_ownership_when_legacy_python_left_native_manifest() {
   let fixture = SyncFixture::new(&[("tracked.txt", "tracked\n"), ("gone.txt", "gone\n")]);
   fixture.sync(&[]);
   fixture.mark_state_as_legacy();
@@ -306,7 +361,7 @@ fn ssh_sync_recovers_ownership_when_legacy_ssh_left_native_manifest() {
 }
 
 #[test]
-fn ssh_sync_replaces_tracked_file_with_directory() {
+fn python_sync_replaces_tracked_file_with_directory() {
   let fixture = SyncFixture::new(&[("config", "old file\n")]);
   fixture.sync(&[]);
   fixture.assert_remote("config", "old file\n");
@@ -323,7 +378,7 @@ fn ssh_sync_replaces_tracked_file_with_directory() {
 
 #[cfg(unix)]
 #[test]
-fn ssh_sync_replaces_tracked_symlink_with_directory_without_writing_through_it() {
+fn python_sync_replaces_tracked_symlink_with_directory_without_writing_through_it() {
   use std::os::unix::fs::symlink;
 
   let fixture = SyncFixture::new(&[("tracked.txt", "tracked\n")]);
@@ -354,7 +409,7 @@ fn ssh_sync_replaces_tracked_symlink_with_directory_without_writing_through_it()
 
 #[cfg(unix)]
 #[test]
-fn ssh_sync_preserves_tracked_executable_and_symlink() {
+fn python_sync_preserves_tracked_executable_and_symlink() {
   use std::os::unix::fs::{PermissionsExt, symlink};
 
   let fixture = SyncFixture::new(&[("run.sh", "#!/bin/sh\necho initial\n")]);

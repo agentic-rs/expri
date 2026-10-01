@@ -78,7 +78,7 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     options.dry_run,
     options.verbosity,
     options.quiet,
-  );
+  )?;
   if options.verbosity > 0 && !options.quiet {
     if let Some(project_name) = &options.project_name {
       eprintln!("project: {project_name}");
@@ -87,8 +87,8 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     eprintln!("target: {}", options.target_name);
     eprintln!("repo root: {}", options.repo_root.display());
   }
-  let _opened_master = remote.open_master()?;
-  remote.ssh(&format!(
+  remote.connect()?;
+  remote.execute(&format!(
     "cd {} && {}",
     remote.quoted_remote_dir(),
     shell::join(&argv)

@@ -50,8 +50,47 @@ expri -T runpod sync --config cs336-assignment5-alignment/expri.toml
 See `examples/cs336.toml` for a CS336-shaped starting point.
 
 Targets default to `protocol = "auto"`, which tries `expri node sync-apply`
-first and falls back to the SSH protocol. Set `protocol = "expri-node"` to
-require the node binary, or `protocol = "ssh"` for the fallback path.
+first and falls back to the Python sync protocol. Set `protocol = "expri-node"`
+to require the node binary, or `protocol = "python"` for the fallback path.
+`protocol = "ssh"` remains an alias for `"python"`. The protocol chooses how
+sync is applied on the target; the transport chooses how commands and files
+reach it.
+
+## Transport
+
+Targets use SSH by default. Set `transport = "ctl"` on an individual target to
+use [ctl](https://github.com/tokn-ai/ctl):
+
+```toml
+# expri.target.toml
+[target.work]
+transport = "ctl"
+host = "work"
+remote_dir = "~/my-project"
+protocol = "auto"
+# ctl_bin = "/path/to/ctl/target/debug/ctl"
+# ctl_method = "vpn"
+```
+
+`host` selects a saved ctl host name or ID, or an SSH alias/destination.
+Use the saved host ID if its name contains `:` or `/`, since rsync uses these
+characters to parse destinations. For IPv6, configure the address in a saved ctl
+host or SSH alias, then use its name, ID, or alias here.
+`ctl_bin` defaults to `ctl` on your `PATH`; set it to a binary built from a local
+ctl checkout if needed. `ctl_method` optionally selects a connection method
+name or ID; otherwise ctl uses the saved host's preferred method.
+
+Remote commands run through `ctl ssh`, and transfers retain rsync with
+`rsync -e 'ctl ssh'` (including the configured binary and method). Expri does
+not need `ctl-agent` for this transport. Rsync must be installed locally and on
+the target. The target still needs a Unix shell and the usual tools required by
+the selected sync protocol and commands.
+
+The `[ssh]` control settings apply only to the SSH transport. With ctl, ctl
+manages connections and reuse. A target's explicit `port` is passed as `-p`;
+ctl treats that as a connection override and skips broker connection reuse.
+Prefer a saved host with its account configured in ctl. With GNU rsync, a
+`user@host` destination also overrides the account and skips broker reuse.
 
 ## Task
 
@@ -132,4 +171,4 @@ Pass mapping names after `--` to download a subset:
 expri -T runpod download -- wandb
 ```
 
-Use `--dry-run` to print the SSH/rsync commands without executing them.
+Use `--dry-run` to print the selected transport's commands without executing them.

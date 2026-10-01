@@ -1,20 +1,31 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::config::TargetConfig;
+use crate::config::{TargetConfig, TransportKind};
 use crate::error::{ExpriError, Result};
 use crate::shell;
 
 #[derive(Clone, Debug)]
 pub struct Remote {
-  pub host: String,
+  host: String,
   pub remote_dir: String,
-  pub control_path: String,
-  pub control_persist: String,
-  pub port: Option<u16>,
+  transport: Transport,
+  port: Option<u16>,
   pub dry_run: bool,
   pub verbosity: u8,
   pub quiet: bool,
+}
+
+#[derive(Clone, Debug)]
+enum Transport {
+  Ssh {
+    control_path: String,
+    control_persist: String,
+  },
+  Ctl {
+    bin: String,
+    method: Option<String>,
+  },
 }
 
 impl Remote {
@@ -25,18 +36,60 @@ impl Remote {
     dry_run: bool,
     verbosity: u8,
     quiet: bool,
-  ) -> Self {
-    let (host, parsed_port) = parse_host_port(&target.host);
-    Self {
+  ) -> Result<Self> {
+    if target.host.is_empty() || target.host.starts_with('-') {
+      return Err(ExpriError::Message(
+        "target host must be nonempty and must not start with '-'".to_string(),
+      ));
+    }
+    let (transport, host, port) = match target.transport {
+      TransportKind::Ssh => {
+        if target.ctl_bin.is_some() || target.ctl_method.is_some() {
+          return Err(ExpriError::Message(
+            "ctl_bin and ctl_method require transport = \"ctl\"".to_string(),
+          ));
+        }
+        let (host, parsed_port) = parse_host_port(&target.host);
+        (
+          Transport::Ssh {
+            control_path,
+            control_persist,
+          },
+          host,
+          target.port.or(parsed_port),
+        )
+      }
+      TransportKind::Ctl => {
+        if !rsync_host_compatible(&target.host) {
+          return Err(ExpriError::Message(
+            "ctl host cannot contain ':' or '/'; use a saved host ID or SSH alias and configure port separately".to_string(),
+          ));
+        }
+        let bin = target.ctl_bin.unwrap_or_else(|| "ctl".to_string());
+        if bin.is_empty() || target.ctl_method.as_deref() == Some("") {
+          return Err(ExpriError::Message(
+            "ctl_bin and ctl_method must be nonempty when configured".to_string(),
+          ));
+        }
+        (
+          Transport::Ctl {
+            bin,
+            method: target.ctl_method,
+          },
+          target.host,
+          target.port,
+        )
+      }
+    };
+    Ok(Self {
       host,
       remote_dir: target.remote_dir,
-      control_path,
-      control_persist,
-      port: target.port.or(parsed_port),
+      transport,
+      port,
       dry_run,
       verbosity,
       quiet,
-    }
+    })
   }
 
   pub fn quoted_remote_dir(&self) -> String {
@@ -51,43 +104,49 @@ impl Remote {
     self.verbosity > 0 || self.dry_run
   }
 
-  pub fn ssh(&self, remote_command: &str) -> Result<()> {
+  pub fn execute(&self, remote_command: &str) -> Result<()> {
     self.run(
-      "ssh",
-      self.ssh_args(&format!(
-        "[ -f ~/.profile ] && source ~/.profile; {remote_command}"
-      )),
+      self.command_program(),
+      self.command_args(&profile_command(remote_command)),
     )
   }
 
-  pub fn ssh_success(&self, remote_command: &str) -> Result<bool> {
-    let args = self.ssh_args(remote_command);
-    if self.show_commands() && !self.quiet {
-      print_command("ssh", &args);
-    }
+  pub fn execute_success(&self, remote_command: &str) -> Result<bool> {
+    // Keep a remote predicate's false result separate from a transport failure.
+    // The shell emits the result only after ctl/SSH establishes the connection.
+    let output = self.capture_bytes(&format!(
+      "if (\n{}\n) >/dev/null 2>&1; then printf 1; else printf 0; fi",
+      profile_command(remote_command),
+    ))?;
     if self.dry_run {
       return Ok(true);
     }
-    let status = Command::new("ssh")
-      .args(args)
-      .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .status()?;
-    Ok(status.success())
+    match output.as_slice() {
+      b"1" => Ok(true),
+      b"0" => Ok(false),
+      _ => Err(ExpriError::Message(
+        "remote predicate returned unexpected output".to_string(),
+      )),
+    }
   }
 
-  pub fn ssh_capture_bytes(&self, remote_command: &str) -> Result<Vec<u8>> {
-    let args = self.ssh_args(remote_command);
+  pub fn capture_bytes(&self, remote_command: &str) -> Result<Vec<u8>> {
+    let program = self.command_program();
+    let args = self.command_args(remote_command);
     if self.show_commands() && !self.quiet {
-      print_command("ssh", &args);
+      print_command(program, &args);
     }
     if self.dry_run {
       return Ok(Vec::new());
     }
-    let output = Command::new("ssh").args(args).output()?;
+    let output = Command::new(program)
+      .args(args)
+      .stderr(Stdio::inherit())
+      .output()
+      .map_err(|source| command_launch_error(program, source))?;
     if !output.status.success() {
       return Err(ExpriError::CommandFailed {
-        program: "ssh".to_string(),
+        program: program.to_string(),
         code: output.status.code(),
       });
     }
@@ -177,81 +236,105 @@ impl Remote {
     self.run("rsync", args)
   }
 
-  pub fn open_master(&self) -> Result<bool> {
-    if self.master_running()? {
+  pub fn connect(&self) -> Result<()> {
+    let Transport::Ssh {
+      control_path,
+      control_persist,
+    } = &self.transport
+    else {
+      // ctl resolves the selected host/method and owns connection reuse.
+      return Ok(());
+    };
+    let mut check_args = vec![
+      "-S".to_string(),
+      control_path.clone(),
+      "-O".to_string(),
+      "check".to_string(),
+    ];
+    self.append_port(&mut check_args);
+    check_args.push(self.host.clone());
+    if self.status_success("ssh", self.with_verbosity(check_args), false)? {
       if self.verbosity > 0 && !self.quiet {
         eprintln!("reusing existing ssh master");
       }
-      return Ok(false);
+      return Ok(());
     }
     let mut args = Vec::new();
     args.push("-M".to_string());
     args.push("-S".to_string());
-    args.push(self.control_path.clone());
+    args.push(control_path.clone());
     args.push("-o".to_string());
-    args.push(format!("ControlPersist={}", self.control_persist));
+    args.push(format!("ControlPersist={control_persist}"));
     args.push("-fN".to_string());
-    if let Some(port) = self.port {
-      args.push("-p".to_string());
-      args.push(port.to_string());
-    }
+    self.append_port(&mut args);
     args.push(self.host.clone());
-    self.run("ssh", self.with_verbosity(args))?;
-    Ok(true)
+    self.run("ssh", self.with_verbosity(args))
   }
 
-  fn master_running(&self) -> Result<bool> {
-    let args = self.ssh_control_args("check");
+  fn status_success(&self, program: &str, args: Vec<String>, dry_success: bool) -> Result<bool> {
     if self.show_commands() && !self.quiet {
-      print_command("ssh", &args);
+      print_command(program, &args);
     }
     if self.dry_run {
-      return Ok(false);
+      return Ok(dry_success);
     }
-    let status = Command::new("ssh")
+    let status = Command::new(program)
       .args(args)
       .stdout(Stdio::null())
       .stderr(Stdio::null())
-      .status()?;
+      .status()
+      .map_err(|source| command_launch_error(program, source))?;
     Ok(status.success())
   }
 
-  fn ssh_control_args(&self, operation: &str) -> Vec<String> {
-    let mut args = vec![
-      "-S".to_string(),
-      self.control_path.clone(),
-      "-O".to_string(),
-      operation.to_string(),
-    ];
-    if let Some(port) = self.port {
-      args.push("-p".to_string());
-      args.push(port.to_string());
+  fn command_program(&self) -> &str {
+    match &self.transport {
+      Transport::Ssh { .. } => "ssh",
+      Transport::Ctl { bin, .. } => bin,
     }
-    args.push(self.host.clone());
-    self.with_verbosity(args)
   }
 
-  fn ssh_args(&self, remote_command: &str) -> Vec<String> {
-    let mut args = self.ssh_base_args();
+  fn command_args(&self, remote_command: &str) -> Vec<String> {
+    let mut args = self.remote_shell_args();
+    args.push("--".to_string());
     args.push(self.host.clone());
     args.push(remote_command.to_string());
     args
   }
 
-  fn ssh_base_args(&self) -> Vec<String> {
-    let mut args = vec![
-      "-S".to_string(),
-      self.control_path.clone(),
-      "-o".to_string(),
-      "ControlMaster=auto".to_string(),
-      "-o".to_string(),
-      format!("ControlPersist={}", self.control_persist),
-    ];
+  fn remote_shell_args(&self) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut ssh_args = match &self.transport {
+      Transport::Ssh {
+        control_path,
+        control_persist,
+      } => vec![
+        "-S".to_string(),
+        control_path.clone(),
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        format!("ControlPersist={control_persist}"),
+      ],
+      Transport::Ctl { method, .. } => {
+        if let Some(method) = method {
+          args.push("--method".to_string());
+          args.push(method.clone());
+        }
+        args.push("ssh".to_string());
+        Vec::new()
+      }
+    };
+    self.append_port(&mut ssh_args);
+    args.extend(self.with_verbosity(ssh_args));
+    args
+  }
+
+  fn append_port(&self, args: &mut Vec<String>) {
     if let Some(port) = self.port {
       args.push("-p".to_string());
       args.push(port.to_string());
     }
-    self.with_verbosity(args)
   }
 
   fn rsync_base_args(&self) -> Vec<String> {
@@ -260,9 +343,9 @@ impl Remote {
       "--no-owner".to_string(),
       "--no-group".to_string(),
       "-e".to_string(),
-      shell::join(&{
-        let mut args = vec!["ssh".to_string()];
-        args.extend(self.ssh_base_args());
+      join_rsync_shell(&{
+        let mut args = vec![self.command_program().to_string()];
+        args.extend(self.remote_shell_args());
         args
       }),
     ];
@@ -279,7 +362,10 @@ impl Remote {
     if self.dry_run {
       return Ok(());
     }
-    let status = Command::new(program).args(args).status()?;
+    let status = Command::new(program)
+      .args(args)
+      .status()
+      .map_err(|source| command_launch_error(program, source))?;
     if !status.success() {
       return Err(ExpriError::CommandFailed {
         program: program.to_string(),
@@ -300,6 +386,34 @@ impl Remote {
     }
     args
   }
+}
+
+fn profile_command(remote_command: &str) -> String {
+  format!("[ -f ~/.profile ] && . ~/.profile; {remote_command}")
+}
+
+fn rsync_host_compatible(value: &str) -> bool {
+  // rsync treats these delimiters as a path or remote-spec separator. Its
+  // bracketed IPv6 parsing also varies by implementation; use a host ID/alias.
+  !value.contains([':', '/'])
+}
+
+fn command_launch_error(program: &str, source: std::io::Error) -> ExpriError {
+  ExpriError::IoContext {
+    action: "launch",
+    path: program.to_string(),
+    source,
+  }
+}
+
+// rsync parses -e itself. It escapes a quote by doubling it, not by using
+// POSIX shell backslashes. This preserves paths and method names verbatim.
+fn join_rsync_shell(parts: &[String]) -> String {
+  parts
+    .iter()
+    .map(|part| format!("'{}'", part.replace('\'', "''")))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn parse_host_port(value: &str) -> (String, Option<u16>) {
@@ -328,3 +442,7 @@ fn ensure_trailing_slash(value: &str) -> String {
     format!("{value}/")
   }
 }
+
+#[cfg(test)]
+#[path = "transport_tests.rs"]
+mod tests;

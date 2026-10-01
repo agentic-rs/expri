@@ -35,9 +35,21 @@ pub struct SshConfig {
 pub struct TargetConfig {
   pub host: String,
   pub remote_dir: String,
+  #[serde(default)]
+  pub transport: TransportKind,
   pub port: Option<u16>,
   pub protocol: Option<String>,
   pub node_bin: Option<String>,
+  pub ctl_bin: Option<String>,
+  pub ctl_method: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+  #[default]
+  Ssh,
+  Ctl,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -243,6 +255,76 @@ fn target_config_path(path: &Path) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn target_defaults_to_ssh_transport() {
+    let target: TargetConfig = toml::from_str(
+      r#"
+host = "user@example.com"
+remote_dir = "~/project"
+"#,
+    )
+    .expect("parse target");
+
+    assert_eq!(target.transport, TransportKind::Ssh);
+    assert_eq!(target.ctl_bin, None);
+    assert_eq!(target.ctl_method, None);
+  }
+
+  #[test]
+  fn target_parses_ctl_transport_with_optional_settings() {
+    let target: TargetConfig = toml::from_str(
+      r#"
+host = "work"
+remote_dir = "~/project"
+transport = "ctl"
+ctl_bin = "/opt/ctl/bin/ctl"
+ctl_method = "vpn"
+port = 2222
+protocol = "python"
+node_bin = "./expri"
+"#,
+    )
+    .expect("parse ctl target");
+
+    assert_eq!(target.transport, TransportKind::Ctl);
+    assert_eq!(target.host, "work");
+    assert_eq!(target.ctl_bin.as_deref(), Some("/opt/ctl/bin/ctl"));
+    assert_eq!(target.ctl_method.as_deref(), Some("vpn"));
+    assert_eq!(target.port, Some(2222));
+    assert_eq!(target.protocol.as_deref(), Some("python"));
+    assert_eq!(target.node_bin.as_deref(), Some("./expri"));
+  }
+
+  #[test]
+  fn target_allows_ctl_transport_without_optional_settings() {
+    let target: TargetConfig = toml::from_str(
+      r#"
+host = "work"
+remote_dir = "~/project"
+transport = "ctl"
+"#,
+    )
+    .expect("parse minimal ctl target");
+
+    assert_eq!(target.transport, TransportKind::Ctl);
+    assert_eq!(target.ctl_bin, None);
+    assert_eq!(target.ctl_method, None);
+  }
+
+  #[test]
+  fn target_rejects_unknown_transport() {
+    let result = toml::from_str::<TargetConfig>(
+      r#"
+host = "work"
+remote_dir = "~/project"
+transport = "ct1"
+"#,
+    );
+
+    let error = result.expect_err("unknown transport must fail");
+    assert!(error.to_string().contains("unknown variant `ct1`"));
+  }
 
   #[test]
   fn load_merges_sibling_target_file() {

@@ -6,7 +6,9 @@ use serde::Deserialize;
 
 use crate::archive::{PatchArchive, build_patch_archive, sha256_file};
 use crate::config::TargetConfig;
-use crate::controller::protocol::{ProtocolPreference, apply_sync_with_preference};
+use crate::controller::protocol::{
+  ProtocolPreference, apply_sync_with_preference, prepare_pull_with_preference,
+};
 use crate::controller::transport::Remote;
 use crate::error::Result;
 use crate::filter::SyncRules;
@@ -51,7 +53,7 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     options.dry_run,
     options.verbosity,
     options.quiet,
-  );
+  )?;
   if !options.paths.is_empty() {
     return sync_paths(options, remote);
   }
@@ -66,7 +68,7 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     eprintln!("repo root: {}", options.repo_root.display());
   }
 
-  let _opened_master = remote.open_master()?;
+  remote.connect()?;
   let head = git::head(&options.repo_root)?;
   let remote_sync_state = if options.force {
     None
@@ -127,7 +129,7 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
 }
 
 fn read_remote_sync_state(remote: &Remote) -> Result<Option<RemoteSyncState>> {
-  let raw = remote.ssh_capture_bytes(&format!(
+  let raw = remote.capture_bytes(&format!(
     "cat {}/sync-state.json 2>/dev/null || true",
     remote.meta_dir()
   ))?;
@@ -164,7 +166,7 @@ fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
     }
   }
   validate_sync_paths(&options.paths)?;
-  let _opened_master = remote.open_master()?;
+  remote.connect()?;
   let list = if options.pull {
     remote_git_ls_files(&remote, &options.paths)?
   } else {
@@ -193,7 +195,7 @@ fn remote_git_ls_files(remote: &Remote, paths: &[PathBuf]) -> Result<Vec<u8>> {
     command.push(' ');
     command.push_str(&shell::quote(path.to_string_lossy()));
   }
-  remote.ssh_capture_bytes(&command)
+  remote.capture_bytes(&command)
 }
 
 fn validate_sync_paths(paths: &[PathBuf]) -> Result<()> {
@@ -225,8 +227,8 @@ fn pull_target(
     eprintln!("pull target: {}", options.target_name);
     eprintln!("repo root: {}", options.repo_root.display());
   }
-  let _opened_master = remote.open_master()?;
-  prepare_remote_pull(&remote, preference, node_bin)?;
+  remote.connect()?;
+  prepare_pull_with_preference(&remote, preference, node_bin)?;
 
   let local_dir = options
     .repo_root
@@ -278,25 +280,6 @@ fn pull_target(
   Ok(())
 }
 
-fn prepare_remote_pull(
-  remote: &Remote,
-  preference: ProtocolPreference,
-  node_bin: &str,
-) -> Result<()> {
-  match preference {
-    ProtocolPreference::ExpriNode | ProtocolPreference::Auto => remote.ssh(&format!(
-      "cd {} && {} node pull-prepare",
-      remote.quoted_remote_dir(),
-      shell::quote(node_bin)
-    )),
-    ProtocolPreference::Ssh => remote.ssh(&format!(
-      "cd {} && python3 - <<'PY'\n{}\nPY",
-      remote.quoted_remote_dir(),
-      pull_prepare_script()
-    )),
-  }
-}
-
 fn verify_download(path: &Path, expected: &str, label: &str) -> Result<()> {
   let (actual, _) = sha256_file(path)?;
   if actual != expected {
@@ -305,47 +288,6 @@ fn verify_download(path: &Path, expected: &str, label: &str) -> Result<()> {
     )));
   }
   Ok(())
-}
-
-fn pull_prepare_script() -> String {
-  r#"import hashlib, json, pathlib, subprocess, zipfile
-
-def sha256(path):
-  h = hashlib.sha256()
-  with open(path, "rb") as f:
-    for chunk in iter(lambda: f.read(1024 * 1024), b""):
-      h.update(chunk)
-  return h.hexdigest()
-
-out = pathlib.Path(".expri/out")
-out.mkdir(parents=True, exist_ok=True)
-head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-bundle = out / "pull-source.bundle"
-patch = out / "pull-patch.zip"
-subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], check=True)
-changed = subprocess.check_output(["git", "diff", "--name-only", "-z", "HEAD", "--"])
-untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
-paths = sorted({p for p in (changed + untracked).decode().split("\0") if p})
-with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-  deleted = []
-  for path in paths:
-    p = pathlib.Path(path)
-    if p.is_file():
-      archive.write(p, path)
-    else:
-      deleted.append(path)
-  archive.writestr(".deleted", "".join(f"{path}\n" for path in deleted))
-artifacts = {
-  "head": head,
-  "source_bundle": ".expri/out/pull-source.bundle",
-  "source_bundle_sha256": sha256(bundle),
-  "patch": ".expri/out/pull-patch.zip",
-  "patch_sha256": sha256(patch),
-  "state_dir": ".expri",
-}
-(out / "pull-artifacts.json").write_text(json.dumps(artifacts, indent=2, sort_keys=True))
-"#
-  .to_string()
 }
 
 fn build_source_bundle_for_remote(
@@ -388,7 +330,7 @@ struct UploadApplyRequest<'a> {
 fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) -> Result<()> {
   let request_id = request_id(apply.head, &apply.patch.digest);
   let remote_request_dir = format!("{}/inbox/{request_id}", remote.meta_dir());
-  remote.ssh(&format!("mkdir -p {remote_request_dir}"))?;
+  remote.execute(&format!("mkdir -p {remote_request_dir}"))?;
 
   let request_dir = tempfile::Builder::new()
     .prefix("expri-request-")

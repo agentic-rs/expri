@@ -40,7 +40,7 @@ pub fn setup_target(options: SetupOptions) -> Result<()> {
     options.dry_run,
     options.verbosity,
     options.quiet,
-  );
+  )?;
   if options.verbosity > 0 && !options.quiet {
     if let Some(project_name) = &options.project_name {
       eprintln!("project: {project_name}");
@@ -50,9 +50,9 @@ pub fn setup_target(options: SetupOptions) -> Result<()> {
     eprintln!("setup step count: {}", options.steps.len());
   }
 
-  let _opened_master = remote.open_master()?;
+  remote.connect()?;
   let inbox = format!("{}/inbox", remote.meta_dir());
-  remote.ssh(&format!("mkdir -p {inbox}"))?;
+  remote.execute(&format!("mkdir -p {inbox}"))?;
   let request = SetupRequest {
     state_dir: ".expri".to_string(),
     force: options.force,

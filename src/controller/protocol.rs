@@ -2,13 +2,11 @@ use crate::controller::transport::Remote;
 use crate::error::{ExpriError, Result};
 use crate::shell;
 
-pub trait SyncProtocol {
+trait RemoteProtocol {
   fn name(&self) -> &'static str;
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()>;
-}
-
-pub trait SetupProtocol {
   fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()>;
+  fn prepare_pull(&self, remote: &Remote) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -22,62 +20,74 @@ impl ExpriNodeProtocol {
   }
 
   pub fn available(&self, remote: &Remote) -> Result<bool> {
-    remote.ssh_success(&format!(
+    remote.execute_success(&format!(
       "command -v {} >/dev/null 2>&1",
       shell::quote(&self.node_bin)
     ))
   }
 }
 
-impl SyncProtocol for ExpriNodeProtocol {
+impl RemoteProtocol for ExpriNodeProtocol {
   fn name(&self) -> &'static str {
     "expri-node"
   }
 
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()> {
-    remote.ssh(&format!(
+    remote.execute(&format!(
       "cd {} && {} node sync-apply --request {}",
       remote.quoted_remote_dir(),
       shell::quote(&self.node_bin),
       shell::quote(request_path)
     ))
   }
-}
 
-impl SetupProtocol for ExpriNodeProtocol {
   fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()> {
-    remote.ssh(&format!(
+    remote.execute(&format!(
       "cd {} && {} node setup --request {}",
       remote.quoted_remote_dir(),
       shell::quote(&self.node_bin),
       shell::quote(request_path)
     ))
   }
-}
 
-#[derive(Debug, Default)]
-pub struct SshProtocol;
-
-impl SyncProtocol for SshProtocol {
-  fn name(&self) -> &'static str {
-    "ssh"
-  }
-
-  fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()> {
-    let script = ssh_sync_apply_script(request_path);
-    remote.ssh(&format!(
-      "cd {} && python3 - <<'PY'\n{script}\nPY",
-      remote.quoted_remote_dir()
+  fn prepare_pull(&self, remote: &Remote) -> Result<()> {
+    remote.execute(&format!(
+      "cd {} && {} node pull-prepare",
+      remote.quoted_remote_dir(),
+      shell::quote(&self.node_bin)
     ))
   }
 }
 
-impl SetupProtocol for SshProtocol {
-  fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()> {
-    let script = ssh_setup_script(request_path);
-    remote.ssh(&format!(
+#[derive(Debug, Default)]
+pub struct PythonProtocol;
+
+impl RemoteProtocol for PythonProtocol {
+  fn name(&self) -> &'static str {
+    "python"
+  }
+
+  fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()> {
+    let script = python_sync_apply_script(request_path);
+    remote.execute(&format!(
       "cd {} && python3 - <<'PY'\n{script}\nPY",
       remote.quoted_remote_dir()
+    ))
+  }
+
+  fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()> {
+    let script = python_setup_script(request_path);
+    remote.execute(&format!(
+      "cd {} && python3 - <<'PY'\n{script}\nPY",
+      remote.quoted_remote_dir()
+    ))
+  }
+
+  fn prepare_pull(&self, remote: &Remote) -> Result<()> {
+    remote.execute(&format!(
+      "cd {} && python3 - <<'PY'\n{}\nPY",
+      remote.quoted_remote_dir(),
+      python_pull_prepare_script()
     ))
   }
 }
@@ -86,7 +96,7 @@ impl SetupProtocol for SshProtocol {
 pub enum ProtocolPreference {
   Auto,
   ExpriNode,
-  Ssh,
+  Python,
 }
 
 impl ProtocolPreference {
@@ -94,9 +104,9 @@ impl ProtocolPreference {
     match value.unwrap_or("auto") {
       "auto" => Ok(Self::Auto),
       "expri" | "expri-node" => Ok(Self::ExpriNode),
-      "ssh" => Ok(Self::Ssh),
+      "python" | "ssh" => Ok(Self::Python),
       value => Err(ExpriError::Message(format!(
-        "unknown sync protocol {value:?}; expected auto, expri-node, or ssh"
+        "unknown protocol {value:?}; expected auto, expri-node, or python (ssh is an alias)"
       ))),
     }
   }
@@ -108,24 +118,7 @@ pub fn apply_sync_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<()> {
-  let expri = ExpriNodeProtocol::new(node_bin.to_string());
-  let ssh = SshProtocol;
-  match preference {
-    ProtocolPreference::ExpriNode => expri.apply_sync(remote, request_path),
-    ProtocolPreference::Ssh => ssh.apply_sync(remote, request_path),
-    ProtocolPreference::Auto => {
-      if expri.available(remote)? {
-        if remote.verbosity > 0 && !remote.quiet {
-          eprintln!("using sync protocol: {}", expri.name());
-        }
-        return expri.apply_sync(remote, request_path);
-      }
-      if remote.verbosity > 0 && !remote.quiet {
-        eprintln!("using sync protocol: {}", ssh.name());
-      }
-      ssh.apply_sync(remote, request_path)
-    }
-  }
+  protocol_with_preference(remote, preference, node_bin, "sync")?.apply_sync(remote, request_path)
 }
 
 pub fn apply_setup_with_preference(
@@ -134,27 +127,59 @@ pub fn apply_setup_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<()> {
-  let expri = ExpriNodeProtocol::new(node_bin.to_string());
-  let ssh = SshProtocol;
+  protocol_with_preference(remote, preference, node_bin, "setup")?.apply_setup(remote, request_path)
+}
+
+pub fn prepare_pull_with_preference(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  protocol_with_preference(remote, preference, node_bin, "pull")?.prepare_pull(remote)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectedProtocol {
+  ExpriNode,
+  Python,
+}
+
+fn select_protocol(
+  preference: ProtocolPreference,
+  node_available: impl FnOnce() -> Result<bool>,
+) -> Result<SelectedProtocol> {
   match preference {
-    ProtocolPreference::ExpriNode => expri.apply_setup(remote, request_path),
-    ProtocolPreference::Ssh => ssh.apply_setup(remote, request_path),
+    ProtocolPreference::ExpriNode => Ok(SelectedProtocol::ExpriNode),
+    ProtocolPreference::Python => Ok(SelectedProtocol::Python),
     ProtocolPreference::Auto => {
-      if expri.available(remote)? {
-        if remote.verbosity > 0 && !remote.quiet {
-          eprintln!("using setup protocol: {}", expri.name());
-        }
-        return expri.apply_setup(remote, request_path);
+      if node_available()? {
+        Ok(SelectedProtocol::ExpriNode)
+      } else {
+        Ok(SelectedProtocol::Python)
       }
-      if remote.verbosity > 0 && !remote.quiet {
-        eprintln!("using setup protocol: {}", ssh.name());
-      }
-      ssh.apply_setup(remote, request_path)
     }
   }
 }
 
-fn ssh_setup_script(request_path: &str) -> String {
+fn protocol_with_preference(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+  operation: &str,
+) -> Result<Box<dyn RemoteProtocol>> {
+  let expri = ExpriNodeProtocol::new(node_bin.to_string());
+  let protocol: Box<dyn RemoteProtocol> =
+    match select_protocol(preference, || expri.available(remote))? {
+      SelectedProtocol::ExpriNode => Box::new(expri),
+      SelectedProtocol::Python => Box::new(PythonProtocol),
+    };
+  if preference == ProtocolPreference::Auto && remote.verbosity > 0 && !remote.quiet {
+    eprintln!("using {operation} protocol: {}", protocol.name());
+  }
+  Ok(protocol)
+}
+
+fn python_setup_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
@@ -190,7 +215,7 @@ for step in request["steps"]:
   )
 }
 
-fn ssh_sync_apply_script(request_path: &str) -> String {
+fn python_sync_apply_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
@@ -338,6 +363,47 @@ with tempfile.TemporaryDirectory(prefix="sync-", dir=tmp_dir) as stage:
   )
 }
 
+fn python_pull_prepare_script() -> String {
+  r#"import hashlib, json, pathlib, subprocess, zipfile
+
+def sha256(path):
+  h = hashlib.sha256()
+  with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+      h.update(chunk)
+  return h.hexdigest()
+
+out = pathlib.Path(".expri/out")
+out.mkdir(parents=True, exist_ok=True)
+head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+bundle = out / "pull-source.bundle"
+patch = out / "pull-patch.zip"
+subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], check=True)
+changed = subprocess.check_output(["git", "diff", "--name-only", "-z", "HEAD", "--"])
+untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
+paths = sorted({p for p in (changed + untracked).decode().split("\0") if p})
+with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+  deleted = []
+  for path in paths:
+    p = pathlib.Path(path)
+    if p.is_file():
+      archive.write(p, path)
+    else:
+      deleted.append(path)
+  archive.writestr(".deleted", "".join(f"{path}\n" for path in deleted))
+artifacts = {
+  "head": head,
+  "source_bundle": ".expri/out/pull-source.bundle",
+  "source_bundle_sha256": sha256(bundle),
+  "patch": ".expri/out/pull-patch.zip",
+  "patch_sha256": sha256(patch),
+  "state_dir": ".expri",
+}
+(out / "pull-artifacts.json").write_text(json.dumps(artifacts, indent=2, sort_keys=True))
+"#
+  .to_string()
+}
+
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod sync_tests;
@@ -347,8 +413,58 @@ mod tests {
   use super::*;
 
   #[test]
-  fn ssh_sync_apply_script_quotes_request_path_as_python_string() {
-    let script = ssh_sync_apply_script(".expri/inbox/sync-request.json");
+  fn protocol_preference_accepts_python_and_legacy_ssh_alias() {
+    for value in ["python", "ssh"] {
+      assert_eq!(
+        ProtocolPreference::parse(Some(value)).unwrap(),
+        ProtocolPreference::Python
+      );
+    }
+    assert_eq!(
+      ProtocolPreference::parse(None).unwrap(),
+      ProtocolPreference::Auto
+    );
+    assert!(ProtocolPreference::parse(Some("ctl")).is_err());
+  }
+
+  #[test]
+  fn auto_protocol_uses_python_when_node_is_unavailable() {
+    assert_eq!(
+      select_protocol(ProtocolPreference::Auto, || Ok(false)).unwrap(),
+      SelectedProtocol::Python
+    );
+    assert_eq!(
+      select_protocol(ProtocolPreference::Auto, || Ok(true)).unwrap(),
+      SelectedProtocol::ExpriNode
+    );
+  }
+
+  #[test]
+  fn explicit_protocol_does_not_probe_node_availability() {
+    for (preference, expected) in [
+      (ProtocolPreference::ExpriNode, SelectedProtocol::ExpriNode),
+      (ProtocolPreference::Python, SelectedProtocol::Python),
+    ] {
+      assert_eq!(
+        select_protocol(preference, || panic!("explicit protocol must not probe")).unwrap(),
+        expected
+      );
+    }
+  }
+
+  #[test]
+  fn auto_protocol_preserves_availability_probe_errors() {
+    let result = select_protocol(ProtocolPreference::Auto, || {
+      Err(ExpriError::Message("transport unavailable".to_string()))
+    });
+    assert!(
+      matches!(result, Err(ExpriError::Message(message)) if message == "transport unavailable")
+    );
+  }
+
+  #[test]
+  fn python_sync_apply_script_quotes_request_path_as_python_string() {
+    let script = python_sync_apply_script(".expri/inbox/sync-request.json");
     assert!(script.contains(r#"pathlib.Path(".expri/inbox/sync-request.json").read_text()"#));
     assert!(!script.contains("pathlib.Path(.expri/inbox"));
     assert!(script.contains(r#"request["head"] + "^{commit}""#));

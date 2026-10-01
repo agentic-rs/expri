@@ -44,7 +44,7 @@ pub fn download_target(options: DownloadOptions) -> Result<()> {
     options.dry_run,
     options.verbosity,
     options.quiet,
-  );
+  )?;
 
   if options.verbosity > 0 && !options.quiet {
     if let Some(project_name) = &options.project_name {
@@ -58,7 +58,7 @@ pub fn download_target(options: DownloadOptions) -> Result<()> {
     }
   }
 
-  let _opened_master = remote.open_master()?;
+  remote.connect()?;
   for mapping in mappings {
     let remote_path = safe_relative_path(&mapping.remote_path, "download remote path")?;
     let local_path = safe_relative_path(&mapping.local_path, "download local path")?;
@@ -162,7 +162,7 @@ fn join_remote_path(remote_dir: &str, relative_path: &Path) -> String {
 }
 
 fn remote_path_exists(remote: &Remote, relative_path: &Path) -> Result<bool> {
-  remote.ssh_success(&format!(
+  remote.execute_success(&format!(
     "cd {} && [ -e {} ]",
     remote.quoted_remote_dir(),
     shell::quote(relative_path.to_string_lossy())
