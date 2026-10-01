@@ -3,3 +3,12 @@ host = "user@example.com"
 remote_dir = "~/cs336-assignment5-alignment"
 protocol = "auto"
 node_bin = "expri"
+
+# To use ctl, opt in on a target and select a saved host name or ID:
+# [target.work]
+# transport = "ctl"
+# host = "work"
+# remote_dir = "~/cs336-assignment5-alignment"
+# protocol = "auto"
+# ctl_bin = "/path/to/ctl/target/debug/ctl"
+# ctl_method = "vpn"
