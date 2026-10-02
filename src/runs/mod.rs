@@ -14,7 +14,15 @@ const METADATA_LIMIT: u64 = 256 * 1024;
 const DETAIL_LIMIT: u64 = 16 * 1024 * 1024;
 const EXCLUDED_COMPONENTS: [&str; 6] =
   [".venv", ".expri", ".git", ".cache", "cache", "__pycache__"];
-const STATUSES: [&str; 5] = ["preparing", "running", "completed", "failed", "unknown"];
+const STATUSES: [&str; 7] = [
+  "preparing",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "lost",
+  "unknown",
+];
 const METADATA_FILES: [&str; 3] = [
   "run-state.json",
   "snapshot.json",
@@ -269,7 +277,7 @@ fn record(run_dir: &Path) -> Record {
       if let Some(status) = object
         .get("status")
         .and_then(Value::as_str)
-        .filter(|status| STATUSES[..4].contains(status))
+        .filter(|status| *status != "unknown" && STATUSES.contains(status))
       {
         summary["status"] = json!(status);
       } else {
@@ -281,7 +289,10 @@ fn record(run_dir: &Path) -> Record {
       } else {
         field_warning(&mut warnings, &run_id, "started_at");
       }
-      let terminal = matches!(summary["status"].as_str(), Some("completed" | "failed"));
+      let terminal = matches!(
+        summary["status"].as_str(),
+        Some("completed" | "failed" | "cancelled")
+      );
       if object
         .get("finished_at")
         .and_then(parse_timestamp)

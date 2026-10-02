@@ -15,6 +15,7 @@ pub struct LocalTaskOptions {
   pub task: TaskConfig,
   pub args: Vec<String>,
   pub dry_run: bool,
+  pub detach: bool,
   pub verbosity: u8,
   pub quiet: bool,
   pub environment: Option<EnvironmentConfig>,
@@ -34,6 +35,7 @@ pub struct RemoteTaskOptions {
   pub task: TaskConfig,
   pub args: Vec<String>,
   pub dry_run: bool,
+  pub detach: bool,
   pub verbosity: u8,
   pub quiet: bool,
   pub remote_managed: Vec<String>,
@@ -54,6 +56,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       extras: options.extras,
       sync_args: options.sync_args,
       expected_sync: None,
+      detach: options.detach,
     };
     if options.dry_run {
       if !options.quiet {
@@ -62,6 +65,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       return Ok(());
     }
     return crate::node::run::apply_request_at(&request, &options.repo_root);
+  }
+  if options.detach {
+    return Err(ExpriError::Message(
+      "--detach requires a configured environment".to_string(),
+    ));
   }
   let argv = task_argv(&options.task, &options.args)?;
   if options.verbosity > 0 && !options.quiet {
@@ -111,6 +119,7 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       extras: options.extras,
       sync_args: options.sync_args,
       expected_sync: options.expected_sync,
+      detach: options.detach,
     };
     let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
     let node_bin = options
@@ -125,7 +134,8 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       options.dry_run,
       options.verbosity,
       options.quiet,
-    )?;
+    )?
+    .with_diagnostic_stdout(options.detach);
     remote.connect()?;
     let request_dir = tempfile::Builder::new().prefix("expri-run-").tempdir()?;
     let request_path = request_dir.path().join("run-request.json");
@@ -136,14 +146,20 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       .expect("request directory name")
       .to_string_lossy();
     let inbox = format!("{}/inbox/{request_id}", remote.meta_dir());
-    remote.execute(&format!("mkdir -p {inbox}"))?;
+    // Inbox creation needs no login profile; keep profile banners off the
+    // detached start receipt's stdout before dispatching the run.
+    remote.execute_stream(&format!("mkdir -p {inbox}"))?;
     remote.upload_file(&request_path, &format!("{inbox}/run-request.json"))?;
-    return apply_run_with_preference(
-      &remote,
-      &format!(".expri/inbox/{request_id}/run-request.json"),
-      preference,
-      &node_bin,
-    );
+    let request_path = format!(".expri/inbox/{request_id}/run-request.json");
+    if options.detach {
+      return super::jobs::start_with_preference(&remote, &request_path, preference, &node_bin);
+    }
+    return apply_run_with_preference(&remote, &request_path, preference, &node_bin);
+  }
+  if options.detach {
+    return Err(ExpriError::Message(
+      "--detach requires a configured target environment".to_string(),
+    ));
   }
   let argv = task_argv(&options.task, &options.args)?;
   let remote = Remote::new(

@@ -39,6 +39,8 @@ pub struct RunRequest {
   pub command: Vec<String>,
   pub environment: EnvironmentConfig,
   #[serde(default)]
+  pub detach: bool,
+  #[serde(default)]
   pub remote_managed: Vec<String>,
   #[serde(default)]
   pub extras: Vec<String>,
@@ -46,6 +48,34 @@ pub struct RunRequest {
   pub sync_args: Vec<String>,
   #[serde(default)]
   pub expected_sync: Option<SyncIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum JobRequest {
+  Status {
+    run_id: String,
+  },
+  Logs {
+    run_id: String,
+    #[serde(default = "default_log_stream")]
+    stream: String,
+    #[serde(default)]
+    follow: bool,
+    #[serde(default = "default_log_tail")]
+    tail: usize,
+  },
+  Cancel {
+    run_id: String,
+  },
+}
+
+fn default_log_stream() -> String {
+  "stdout".to_string()
+}
+
+fn default_log_tail() -> usize {
+  100
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

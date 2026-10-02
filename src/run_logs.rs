@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::Path;
-use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -13,6 +13,9 @@ pub const STDERR_LOG: &str = "logs/stderr.log";
 pub struct RunLogs {
   stdout: File,
   stderr: File,
+  cancel_path: Option<PathBuf>,
+  mirror: bool,
+  cancelled: Arc<AtomicBool>,
 }
 
 pub struct LoggedOutput {
@@ -24,6 +27,11 @@ pub struct LoggedOutput {
 struct Drained {
   captured: Vec<u8>,
   error: Option<io::Error>,
+}
+
+enum StopSignal {
+  Terminate,
+  Kill,
 }
 
 trait PipeRead: Read {
@@ -43,6 +51,14 @@ impl PipeRead for ChildStderr {
 }
 impl RunLogs {
   pub fn create(run_dir: &Path) -> io::Result<Self> {
+    Self::create_mode(run_dir, false)
+  }
+
+  pub fn create_detached(run_dir: &Path) -> io::Result<Self> {
+    Self::create_mode(run_dir, true)
+  }
+
+  fn create_mode(run_dir: &Path, detached: bool) -> io::Result<Self> {
     let mut directory = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -63,28 +79,58 @@ impl RunLogs {
     Ok(Self {
       stdout: open(run_dir.join(STDOUT_LOG))?,
       stderr: open(run_dir.join(STDERR_LOG))?,
+      cancel_path: detached.then(|| run_dir.join(".cancel-request")),
+      mirror: !detached,
+      cancelled: Arc::new(AtomicBool::new(false)),
     })
   }
 
   pub fn task(&self, command: &mut Command) -> io::Result<LoggedOutput> {
-    execute(
+    execute_controlled(
       command,
       Some(self.stdout.try_clone()?),
       self.stderr.try_clone()?,
-      Some(Box::new(io::stdout())),
-      Box::new(io::stderr()),
+      self
+        .mirror
+        .then(|| Box::new(io::stdout()) as Box<dyn Write + Send>),
+      self.stderr_terminal(),
+      self.cancel_path.as_deref(),
+      Some(&self.cancelled),
     )
   }
 
   /// The environment helper's stdout is its private JSON response.
   pub fn helper(&self, command: &mut Command) -> io::Result<LoggedOutput> {
-    execute(
+    execute_controlled(
       command,
       None,
       self.stderr.try_clone()?,
       None,
-      Box::new(io::stderr()),
+      self.stderr_terminal(),
+      self.cancel_path.as_deref(),
+      Some(&self.cancelled),
     )
+  }
+
+  pub fn cancel_requested(&self) -> io::Result<bool> {
+    self
+      .cancel_path
+      .as_deref()
+      .map(cancel_requested)
+      .transpose()
+      .map(|value| value.unwrap_or(false))
+  }
+
+  pub fn was_cancelled(&self) -> bool {
+    self.cancelled.load(Ordering::Acquire)
+  }
+
+  fn stderr_terminal(&self) -> Box<dyn Write + Send> {
+    if self.mirror {
+      Box::new(io::stderr())
+    } else {
+      Box::new(io::sink())
+    }
   }
 }
 
@@ -100,6 +146,7 @@ fn unbuffered_if_absent(command: &mut Command) {
   }
 }
 
+#[cfg(all(test, unix))]
 fn execute(
   command: &mut Command,
   stdout_log: Option<File>,
@@ -107,6 +154,42 @@ fn execute(
   stdout_terminal: Option<Box<dyn Write + Send>>,
   stderr_terminal: Box<dyn Write + Send>,
 ) -> io::Result<LoggedOutput> {
+  execute_controlled(
+    command,
+    stdout_log,
+    stderr_log,
+    stdout_terminal,
+    stderr_terminal,
+    None,
+    None,
+  )
+}
+
+fn execute_controlled(
+  command: &mut Command,
+  stdout_log: Option<File>,
+  stderr_log: File,
+  stdout_terminal: Option<Box<dyn Write + Send>>,
+  stderr_terminal: Box<dyn Write + Send>,
+  cancel_path: Option<&Path>,
+  cancelled: Option<&AtomicBool>,
+) -> io::Result<LoggedOutput> {
+  if let Some(path) = cancel_path {
+    if cancel_requested(path)? {
+      if let Some(cancelled) = cancelled {
+        cancelled.store(true, Ordering::Release);
+      }
+      return Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "run cancellation requested",
+      ));
+    }
+    #[cfg(unix)]
+    {
+      use std::os::unix::process::CommandExt;
+      command.process_group(0);
+    }
+  }
   unbuffered_if_absent(command);
   let capture_stdout = stdout_log.is_none();
   let mut child = command
@@ -156,8 +239,18 @@ fn execute(
       return Err(error);
     }
   };
-  let status = child.wait();
+  let status = wait_child(
+    &mut child,
+    cancel_path,
+    cancelled,
+    &finished,
+    &stdout_reader,
+    &stderr_reader,
+  );
   if status.is_err() {
+    if cancel_path.is_some() {
+      let _ = signal_group(&mut child, StopSignal::Kill);
+    }
     let _ = child.kill();
     let _ = child.wait();
   }
@@ -171,6 +264,123 @@ fn execute(
     stdout: stdout.captured,
     log_error: stdout.error.or(stderr.error),
   })
+}
+
+/// Cancellation is a request to this supervisor, never a PID read from a record.
+fn cancel_requested(path: &Path) -> io::Result<bool> {
+  match fs::symlink_metadata(path) {
+    Ok(metadata)
+      if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 0 =>
+    {
+      Ok(true)
+    }
+    Ok(_) => Err(io::Error::other(
+      "cancellation request must be an empty regular file",
+    )),
+    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+    Err(error) => Err(error),
+  }
+}
+
+fn wait_child(
+  child: &mut Child,
+  cancel_path: Option<&Path>,
+  cancelled: Option<&AtomicBool>,
+  finished: &AtomicBool,
+  stdout: &JoinHandle<Drained>,
+  stderr: &JoinHandle<Drained>,
+) -> io::Result<ExitStatus> {
+  let Some(cancel_path) = cancel_path else {
+    return child.wait();
+  };
+  let mut deadline = None;
+  let mut cancellation_started = false;
+  loop {
+    if !cancellation_started && cancel_requested(cancel_path)? {
+      cancellation_started = true;
+      if let Some(cancelled) = cancelled {
+        cancelled.store(true, Ordering::Release);
+      }
+      signal_group(child, StopSignal::Terminate)?;
+      deadline = Some(Instant::now() + Duration::from_secs(2));
+      finished.store(false, Ordering::Release);
+    }
+    if let Some(expires_at) = deadline
+      && Instant::now() >= expires_at
+    {
+      // Keep the direct child unreaped during the grace period. Its reserved
+      // PID prevents this process group ID from being reused before escalation.
+      signal_group(child, StopSignal::Kill)?;
+      deadline = None;
+    }
+    if deadline.is_none() && child_exit_pending(child)? {
+      finished.store(true, Ordering::Release);
+      stdout.thread().unpark();
+      stderr.thread().unpark();
+      if stdout.is_finished() && stderr.is_finished() {
+        // Keep PID ownership through log draining, including descendants that
+        // hold a pipe open. Only reap after the last possible group signal.
+        return child.wait();
+      }
+    }
+    thread::sleep(Duration::from_millis(25));
+  }
+}
+
+#[cfg(unix)]
+fn child_exit_pending(child: &mut Child) -> io::Result<bool> {
+  let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+  let result = unsafe {
+    libc::waitid(
+      libc::P_PID,
+      child.id(),
+      &mut info,
+      libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+    )
+  };
+  if result < 0 {
+    return Err(io::Error::last_os_error());
+  }
+  Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(not(unix))]
+fn child_exit_pending(child: &mut Child) -> io::Result<bool> {
+  Ok(child.try_wait()?.is_some())
+}
+
+#[cfg(unix)]
+fn signal_group(child: &mut Child, signal: StopSignal) -> io::Result<()> {
+  let signal = match signal {
+    StopSignal::Terminate => libc::SIGTERM,
+    StopSignal::Kill => libc::SIGKILL,
+  };
+  // This ID comes from our own live child, not from persisted user-editable state.
+  let result = unsafe { libc::kill(-(child.id() as i32), signal) };
+  if result == 0 {
+    return Ok(());
+  }
+  let error = io::Error::last_os_error();
+  #[cfg(target_os = "macos")]
+  if error.raw_os_error() == Some(libc::EPERM) {
+    // Darwin excludes zombies from killpg and returns EPERM for a group with
+    // no live members. The unreaped child still reserves this PID; signaling
+    // it directly succeeds for that case while retaining real permission errors.
+    if unsafe { libc::kill(child.id() as i32, signal) } == 0 {
+      return Ok(());
+    }
+    return Err(io::Error::last_os_error());
+  }
+  if error.raw_os_error() == Some(libc::ESRCH) {
+    Ok(())
+  } else {
+    Err(error)
+  }
+}
+
+#[cfg(not(unix))]
+fn signal_group(child: &mut Child, _: StopSignal) -> io::Result<()> {
+  child.kill()
 }
 
 #[cfg(unix)]

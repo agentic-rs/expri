@@ -44,6 +44,17 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
 }
 
 pub fn sync_target_with_receipt(options: SyncOptions) -> Result<Option<SyncIdentity>> {
+  sync_target_with_output(options, false)
+}
+
+pub fn sync_target_with_diagnostic_receipt(options: SyncOptions) -> Result<Option<SyncIdentity>> {
+  sync_target_with_output(options, true)
+}
+
+fn sync_target_with_output(
+  options: SyncOptions,
+  diagnostic_stdout: bool,
+) -> Result<Option<SyncIdentity>> {
   let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
   let node_bin = options
     .target
@@ -57,7 +68,8 @@ pub fn sync_target_with_receipt(options: SyncOptions) -> Result<Option<SyncIdent
     options.dry_run,
     options.verbosity,
     options.quiet,
-  )?;
+  )?
+  .with_diagnostic_stdout(diagnostic_stdout);
   if !options.paths.is_empty() {
     return sync_paths(options, remote).map(|_| None);
   }

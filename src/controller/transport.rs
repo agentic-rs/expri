@@ -14,6 +14,7 @@ pub struct Remote {
   pub dry_run: bool,
   pub verbosity: u8,
   pub quiet: bool,
+  diagnostic_stdout: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -89,7 +90,15 @@ impl Remote {
       dry_run,
       verbosity,
       quiet,
+      diagnostic_stdout: false,
     })
+  }
+
+  /// Keep startup diagnostics separate from a detached run's JSON receipt.
+  /// Captured command output remains available to protocol queries.
+  pub fn with_diagnostic_stdout(mut self, enabled: bool) -> Self {
+    self.diagnostic_stdout = enabled;
+    self
   }
 
   pub fn quoted_remote_dir(&self) -> String {
@@ -109,6 +118,11 @@ impl Remote {
       self.command_program(),
       self.command_args(&profile_command(remote_command)),
     )
+  }
+
+  /// Stream a command whose caller has already selected its profile handling.
+  pub fn execute_stream(&self, remote_command: &str) -> Result<()> {
+    self.run(self.command_program(), self.command_args(remote_command))
   }
 
   pub fn execute_success(&self, remote_command: &str) -> Result<bool> {
@@ -320,7 +334,7 @@ impl Remote {
     }
   }
 
-  fn command_args(&self, remote_command: &str) -> Vec<String> {
+  pub(super) fn command_args(&self, remote_command: &str) -> Vec<String> {
     let mut args = self.remote_shell_args();
     args.push("--".to_string());
     args.push(self.host.clone());
@@ -392,9 +406,12 @@ impl Remote {
     if self.dry_run {
       return Ok(());
     }
-    let status = Command::new(program)
-      .args(args)
-      .envs(env.iter().copied())
+    let mut command = Command::new(program);
+    command.args(args).envs(env.iter().copied());
+    if self.diagnostic_stdout {
+      command.stdout(stderr_stdio()?);
+    }
+    let status = command
       .status()
       .map_err(|source| command_launch_error(program, source))?;
     if !status.success() {
@@ -416,6 +433,28 @@ impl Remote {
       );
     }
     args
+  }
+}
+
+fn stderr_stdio() -> std::io::Result<Stdio> {
+  #[cfg(unix)]
+  {
+    use std::os::fd::AsFd;
+    Ok(Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?))
+  }
+  #[cfg(windows)]
+  {
+    use std::os::windows::io::AsHandle;
+    Ok(Stdio::from(
+      std::io::stderr().as_handle().try_clone_to_owned()?,
+    ))
+  }
+  #[cfg(not(any(unix, windows)))]
+  {
+    Err(std::io::Error::new(
+      std::io::ErrorKind::Unsupported,
+      "diagnostic stdout redirection is unsupported on this platform",
+    ))
   }
 }
 

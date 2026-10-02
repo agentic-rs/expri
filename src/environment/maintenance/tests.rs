@@ -176,7 +176,7 @@ fn preview_is_read_only_and_apply_keeps_newest_existing_environment() {
 fn unknown_stale_or_unowned_states_are_preserved() {
   let (_temporary, root) = fixture_root();
   let mut directories = Vec::new();
-  for status in ["preparing", "running", "cancelled", "unknown"] {
+  for status in ["preparing", "running", "lost", "unknown"] {
     directories.push(run(
       &root,
       &format!("run-{status}"),
@@ -221,6 +221,24 @@ fn unknown_stale_or_unowned_states_are_preserved() {
       "uncertain states need no new lock file"
     );
   }
+}
+
+#[test]
+fn cancelled_runs_are_prunable_after_their_supervisor_releases_the_lease() {
+  let (_temporary, root) = fixture_root();
+  let directory = run(&root, "run-cancelled", "cancelled", "2026-10-03T00:00:00Z");
+  let lease = lock::run_lock(&directory).unwrap();
+  assert_eq!(prune(&root, &request(true, 0)).unwrap().pruned_runs, 0);
+  assert_eq!(python_prune(&root, true, 0)["pruned_runs"], 0);
+  drop(lease);
+  let preview = prune(&root, &request(false, 0)).unwrap();
+  assert_eq!(
+    serde_json::to_value(preview).unwrap(),
+    python_prune(&root, false, 0)
+  );
+  assert_eq!(prune(&root, &request(true, 0)).unwrap().pruned_runs, 1);
+  assert!(!directory.join("environment/.venv").exists());
+  assert!(directory.join("outputs/metrics.json").exists());
 }
 
 #[test]

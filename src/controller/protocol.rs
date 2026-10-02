@@ -510,87 +510,47 @@ pub(crate) fn python_run_script(request_path: &str) -> String {
     .expect("maintenance script string");
   let run_logs =
     serde_json::to_string(include_str!("../run_logs.py")).expect("run logging script string");
-  format!(
-    r#"import datetime, json, os, pathlib, subprocess, sys
+  let lifecycle = serde_json::to_string(include_str!("../run_lifecycle.py"))
+    .expect("run lifecycle script string");
+  let common = format!(
+    r#"import json, os, pathlib, subprocess, sys
 {preamble}
 snapshot_module = {{"__name__": "expri_snapshot"}}
 exec({snapshot}, snapshot_module)
-request = json.loads(pathlib.Path({request_path}).read_text())
-if not request.get("command"):
-  raise SystemExit("task command must not be empty")
-snapshot = snapshot_module["create_snapshot"](os.getcwd(), request.get("remote_managed", []), request.get("expected_sync"))
 maintenance_module = {{"__name__": "expri_environment_maintenance"}}
 exec({maintenance}, maintenance_module)
 logging_module = {{"__name__": "expri_run_logs"}}
 exec({run_logs}, logging_module)
-run_lease = maintenance_module["acquire_run_lock"](snapshot["run_dir"])
-run_dir = pathlib.Path(snapshot["run_dir"])
-state_path = run_dir / "run-state.json"
-state = {{"schema_version": 1, "run_id": snapshot["run_id"], "task": request["name"], "command": request["command"],
-         "code_dir": snapshot["code_dir"], "output_dir": str(run_dir / "outputs"),
-         "logs": {{"stdout": "logs/stdout.log", "stderr": "logs/stderr.log"}},
-         "status": "preparing", "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}}
-
-def write_state():
-  temporary = state_path.with_suffix(".json.tmp")
-  temporary.write_text(json.dumps(state, indent=2, sort_keys=True))
-  temporary.replace(state_path)
-
-def terminal_message(message):
-  try:
-    print(message, file=sys.stderr, flush=True)
-  except (OSError, ValueError):
-    pass
-
-exit_code = 1
-logs = None
-try:
-  write_state()
-  terminal_message("run: " + snapshot["run_id"])
-  terminal_message("run directory: " + str(run_dir))
-  logs = logging_module["RunLogs"](run_dir)
-  cache_dir = environment_cache_dir(os.getcwd(), request.get("sync_args", []))
-  prepared = prepare_environment(request["environment"], snapshot["code_dir"], str(run_dir),
-                                 request.get("extras", []), request.get("sync_args", []), True,
-                                 cache_dir=cache_dir, process_runner=logs.run)
-  state.update(status="running", environment_manifest=prepared["manifest_path"], python=prepared["python"])
-  write_state()
-  child_env = os.environ.copy()
-  for key in [*ENV_REMOVE, *prepared.get("env_remove", [])]:
-    child_env.pop(key, None)
-  child_env.update(request["environment"].get("env", {{}}))
-  child_env.update(prepared.get("run_env", {{}}))
-  child_env.update(UV_PROJECT_ENVIRONMENT=prepared["environment_path"], PYTHONNOUSERSITE="1",
-                   EXPRI_RUN_ID=snapshot["run_id"], EXPRI_RUN_DIR=str(run_dir), EXPRI_OUTPUT_DIR=str(run_dir / "outputs"))
-  status = logs.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
-                    cwd=snapshot["code_dir"], env=child_env)
-  exit_code = status.returncode if status.returncode >= 0 else 128 - status.returncode
-  state["task_exit_code"] = exit_code
-  if exit_code:
-    state["error"] = "task exited with status " + str(exit_code)
-except subprocess.CalledProcessError as error:
-  exit_code = error.returncode if error.returncode >= 0 else 128 - error.returncode
-  state["error"] = "environment preparation exited with status " + str(exit_code)
-except Exception as error:
-  state["error"] = str(error)
-  terminal_message("error: " + str(error))
-finally:
-  try:
-    if logs is not None:
-      logs.close()
-      if logs.log_error:
-        state["logging_error"] = logs.log_error
-        if exit_code == 0:
-          exit_code = 1
-          state["error"] = "log capture failed: " + logs.log_error
-    state.update(status="completed" if exit_code == 0 else "failed", exit_code=exit_code,
-                 finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
-    write_state()
-  finally:
-    run_lease.close()
-raise SystemExit(exit_code)
+lifecycle_module = {{"__name__": "expri_run_lifecycle"}}
+exec({lifecycle}, lifecycle_module)
+context = {{"create_snapshot": snapshot_module["create_snapshot"],
+           "acquire_run_lock": maintenance_module["acquire_run_lock"],
+           "RunLogs": logging_module["RunLogs"], "ENV_REMOVE": ENV_REMOVE,
+           "environment_cache_dir": environment_cache_dir, "prepare_environment": prepare_environment}}
 "#,
     preamble = python_environment_preamble()
+  );
+  let worker = serde_json::to_string(
+    r#"payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+raise SystemExit(lifecycle_module["execute_worker"](payload, context))
+"#,
+  )
+  .expect("worker script string");
+  let common = serde_json::to_string(&common).expect("run script string");
+  format!(
+    r#"RUN_SOURCE = {common}
+exec(RUN_SOURCE)
+try:
+  request = json.loads(pathlib.Path({request_path}).read_text())
+  report = lifecycle_module["start_run"](os.getcwd(), request, context, RUN_SOURCE + {worker})
+  if isinstance(report, dict):
+    print(json.dumps(report), flush=True)
+  else:
+    raise SystemExit(report)
+except Exception as error:
+  print("error: " + str(error), file=sys.stderr)
+  raise SystemExit(1)
+"#
   )
 }
 
