@@ -145,6 +145,10 @@ the copied code files of an active run. Base packages remain shared when reuse
 is enabled, and uv's cache avoids repeated downloads when it creates each run's
 environment.
 
+Run environments are retained under `.expri/runs/` and are not automatically
+pruned. The uv cache reduces repeated downloads, but snapshots, environments,
+and outputs still accumulate on disk.
+
 Local snapshots include explicit file paths listed in `sync.include_ignored`,
 such as a Git-ignored experiment configuration, alongside the usual tracked,
 dirty, and untracked source files. Other Git-ignored files stay excluded.
@@ -208,9 +212,18 @@ normal uv environment even when the project default reuses base packages.
 
 `base_python` identifies an existing interpreter. `reuse_packages` contains
 package names, without versions or extras, and requires `base_python`. Expri
-checks the installed versions and their dependency closure against the project
-requirements and keeps the base environment unchanged. A mismatch fails with
-an explanation instead of replacing PyTorch or its dependency stack.
+validates their installed dependency closure and requires exact locked versions
+where inherited packages occur in the target's selected lock graph. It then
+validates the combined environment and keeps the base installation unchanged.
+A mismatch fails with an explanation instead of replacing PyTorch or its
+dependency stack. Unrelated Conda packages are not compatibility-certified.
+
+For reuse, point `base_python` at the Conda or system interpreter that owns the
+installed packages. An existing uv virtual environment is not adopted as a base
+or as a run environment; reuse from another virtual environment is rejected.
+Passing a Torch/CUDA smoke test alone does not establish lock compatibility:
+the inherited dependency closure and the combined environment must also pass
+validation against the selected locked requirements.
 
 PyTorch reuse requires a compatible Python distribution graph as well as working
 native libraries. If `uv.lock` selects `nvidia-*` CUDA wheel packages, those
