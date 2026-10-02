@@ -15,6 +15,8 @@ node_bin = "expri"
 #
 # The whole target environment overrides [environment] in cs336.toml.
 # require_cuda defaults to false; set native variables for your installation.
+# Check this stack before setup: expri -T runpod env doctor --json
+# Preview old run environments: expri -T runpod env prune
 
 # To use ctl, opt in on a target and select a saved host name or ID:
 # [target.work]

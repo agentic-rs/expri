@@ -1,16 +1,17 @@
+pub mod maintenance;
 pub mod snapshot;
 
 #[cfg(all(test, unix))]
 mod integration_tests;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::EnvironmentConfig;
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 
 pub const RUNTIME_SCRIPT: &str = include_str!("runtime.py");
 
@@ -58,6 +59,8 @@ pub struct EnvironmentRequest {
   pub extras: Vec<String>,
   pub sync_args: Vec<String>,
   pub install_project: bool,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub cache_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +95,7 @@ pub fn helper_argv(request: &EnvironmentRequest) -> Result<Vec<String>> {
   ])
 }
 
-pub fn prepare(request: &EnvironmentRequest) -> Result<PreparedEnvironment> {
+fn invoke_helper(request: &EnvironmentRequest) -> Result<serde_json::Value> {
   let argv = helper_argv(request)?;
   let mut command = Command::new(&argv[0]);
   command
@@ -103,14 +106,60 @@ pub fn prepare(request: &EnvironmentRequest) -> Result<PreparedEnvironment> {
     command.env_remove(key);
   }
   command.envs(&request.environment.env);
+  if let Some(cache_dir) = &request.cache_dir {
+    command.env("UV_CACHE_DIR", cache_dir);
+  }
+  if request
+    .sync_args
+    .iter()
+    .any(|argument| argument == "--no-cache")
+  {
+    command.env("UV_NO_CACHE", "true");
+  }
   let output = command.output()?;
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
-      program: "uv environment preparation".to_string(),
-      code: output.status.code(),
+      program: "uv environment helper".to_string(),
+      code: command_exit_code(&output.status),
     });
   }
   Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+pub fn prepare(request: &EnvironmentRequest) -> Result<PreparedEnvironment> {
+  Ok(serde_json::from_value(invoke_helper(request)?)?)
+}
+
+pub fn doctor(request: &EnvironmentRequest) -> Result<serde_json::Value> {
+  invoke_helper(request)
+}
+
+/// Resolve cache paths before changing into a run's source snapshot.
+pub fn cache_dir(repo_root: &Path, sync_args: &[String]) -> Result<PathBuf> {
+  let repo_root = repo_root.canonicalize()?;
+  let mut explicit = None;
+  let mut arguments = sync_args.iter();
+  while let Some(argument) = arguments.next() {
+    if argument == "--cache-dir" {
+      let value = arguments
+        .next()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or_else(|| ExpriError::Message("--cache-dir requires a path".to_string()))?;
+      explicit = Some(value.clone());
+    } else if let Some(value) = argument.strip_prefix("--cache-dir=") {
+      explicit = Some(value.to_string());
+    }
+  }
+  let path = explicit
+    .map(PathBuf::from)
+    .or_else(|| std::env::var_os("UV_CACHE_DIR").map(PathBuf::from))
+    .unwrap_or_else(|| repo_root.join(".expri/cache/uv"));
+  if path.as_os_str().is_empty() {
+    return Err(ExpriError::Message(
+      "cache directory must not be empty".to_string(),
+    ));
+  }
+  Ok(std::path::absolute(repo_root.join(path))?)
 }
 
 pub fn execution_env(
@@ -173,5 +222,10 @@ pub fn setup_request(
     extras: extras.to_vec(),
     sync_args: sync_args.to_vec(),
     install_project: false,
+    cache_dir: Some(
+      cache_dir(repo_root, sync_args)?
+        .to_string_lossy()
+        .into_owned(),
+    ),
   })
 }

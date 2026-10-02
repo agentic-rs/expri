@@ -1,5 +1,6 @@
 use crate::controller::transport::Remote;
 use crate::error::{ExpriError, Result};
+use crate::protocol::EnvironmentCommandRequest;
 use crate::shell;
 
 trait RemoteProtocol {
@@ -8,6 +9,7 @@ trait RemoteProtocol {
   fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn apply_run(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn prepare_pull(&self, remote: &Remote) -> Result<()>;
+  fn apply_environment(&self, remote: &Remote, request: &EnvironmentCommandRequest) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -22,16 +24,18 @@ impl ExpriNodeProtocol {
 
   pub fn available(&self, remote: &Remote) -> Result<bool> {
     remote.execute_success(&format!(
-      "command -v {} >/dev/null 2>&1",
+      "cd {} && command -v {} >/dev/null 2>&1",
+      remote.quoted_remote_dir(),
       shell::quote(&self.node_bin)
     ))
   }
 
-  fn supports_uv_environment(&self, remote: &Remote) -> Result<bool> {
+  fn supports_capability(&self, remote: &Remote, capability: &str) -> Result<bool> {
     remote.execute_success(&format!(
-      "{} node capabilities --has {}",
+      "cd {} && {} node capabilities --has {}",
+      remote.quoted_remote_dir(),
       shell::quote(&self.node_bin),
-      shell::quote(crate::node::cli::UV_ENVIRONMENT_CAPABILITY)
+      shell::quote(capability)
     ))
   }
 }
@@ -75,6 +79,15 @@ impl RemoteProtocol for ExpriNodeProtocol {
       shell::quote(request_path)
     ))
   }
+
+  fn apply_environment(&self, remote: &Remote, request: &EnvironmentCommandRequest) -> Result<()> {
+    let request = serde_json::to_string(request)?;
+    remote.execute(&format!(
+      "cd {} && {} node env --request-stdin <<'EXPRI_ENV_REQUEST'\n{request}\nEXPRI_ENV_REQUEST",
+      remote.quoted_remote_dir(),
+      shell::quote(&self.node_bin)
+    ))
+  }
 }
 
 #[derive(Debug, Default)]
@@ -114,6 +127,14 @@ impl RemoteProtocol for PythonProtocol {
       "cd {} && python3 - <<'PY'\n{}\nPY",
       remote.quoted_remote_dir(),
       python_pull_prepare_script()
+    ))
+  }
+
+  fn apply_environment(&self, remote: &Remote, request: &EnvironmentCommandRequest) -> Result<()> {
+    remote.execute(&format!(
+      "cd {} && python3 - <<'PY'\n{}\nPY",
+      remote.quoted_remote_dir(),
+      python_environment_script(request)
     ))
   }
 }
@@ -178,23 +199,54 @@ pub fn apply_run_with_preference(
     .apply_run(remote, request_path)
 }
 
+pub fn apply_environment_with_preference(
+  remote: &Remote,
+  request: &EnvironmentCommandRequest,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  protocol_with_capability(
+    remote,
+    preference,
+    node_bin,
+    "environment",
+    Some(crate::node::cli::ENVIRONMENT_MAINTENANCE_CAPABILITY),
+  )?
+  .apply_environment(remote, request)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectedProtocol {
   ExpriNode,
   Python,
 }
 
+#[cfg(test)]
 fn select_protocol(
   preference: ProtocolPreference,
   requires_environment: bool,
   node_available: impl FnOnce() -> Result<bool>,
 ) -> Result<SelectedProtocol> {
+  select_capability_protocol(
+    preference,
+    requires_environment.then_some(crate::node::cli::UV_ENVIRONMENT_CAPABILITY),
+    node_available,
+  )
+}
+
+fn select_capability_protocol(
+  preference: ProtocolPreference,
+  capability: Option<&str>,
+  node_available: impl FnOnce() -> Result<bool>,
+) -> Result<SelectedProtocol> {
   match preference {
     ProtocolPreference::ExpriNode => {
-      if requires_environment && !node_available()? {
+      if let Some(capability) = capability
+        && !node_available()?
+      {
         return Err(ExpriError::Message(format!(
           "configured expri-node protocol lacks {}; upgrade expri on the target or choose protocol = \"python\"",
-          crate::node::cli::UV_ENVIRONMENT_CAPABILITY
+          capability
         )));
       }
       Ok(SelectedProtocol::ExpriNode)
@@ -217,11 +269,26 @@ fn protocol_with_preference(
   operation: &str,
   requires_environment: bool,
 ) -> Result<Box<dyn RemoteProtocol>> {
+  let capability = requires_environment.then_some(if matches!(operation, "run" | "setup") {
+    crate::node::cli::ENVIRONMENT_MAINTENANCE_CAPABILITY
+  } else {
+    crate::node::cli::UV_ENVIRONMENT_CAPABILITY
+  });
+  protocol_with_capability(remote, preference, node_bin, operation, capability)
+}
+
+fn protocol_with_capability(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+  operation: &str,
+  capability: Option<&str>,
+) -> Result<Box<dyn RemoteProtocol>> {
   let expri = ExpriNodeProtocol::new(node_bin.to_string());
   let protocol: Box<dyn RemoteProtocol> =
-    match select_protocol(preference, requires_environment, || {
-      if requires_environment {
-        expri.supports_uv_environment(remote)
+    match select_capability_protocol(preference, capability, || {
+      if let Some(capability) = capability {
+        expri.supports_capability(remote, capability)
       } else {
         expri.available(remote)
       }
@@ -238,7 +305,7 @@ fn protocol_with_preference(
 pub(crate) fn python_setup_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
-  format!(
+  python_preserve_command_exit_code(format!(
     r#"import json, os, pathlib, subprocess
 {preamble}
 
@@ -294,6 +361,22 @@ if environment is not None and prepared is None:
 (pathlib.Path(request["state_dir"]) / "setup-state.json").write_text(json.dumps(request, indent=2, sort_keys=True))
 "#,
     preamble = python_environment_preamble(),
+  ))
+}
+
+fn python_preserve_command_exit_code(script: String) -> String {
+  let indented = script
+    .lines()
+    .map(|line| format!("  {line}\n"))
+    .collect::<String>();
+  format!(
+    r#"import subprocess, sys
+try:
+{indented}except subprocess.CalledProcessError as error:
+  exit_code = error.returncode if error.returncode >= 0 else 128 - error.returncode
+  print("error: command exited with status " + str(exit_code), file=sys.stderr)
+  raise SystemExit(exit_code)
+"#
   )
 }
 
@@ -307,16 +390,38 @@ fn python_environment_preamble() -> String {
 RUNTIME_SCRIPT = {runtime}
 ENV_REMOVE = {env_remove}
 
-def prepare_environment(environment, repo_root, state_dir, extras, sync_args, install_project):
+def environment_cache_dir(repo_root, sync_args):
+  selected = os.environ.get("UV_CACHE_DIR")
+  for index, argument in enumerate(sync_args):
+    if argument == "--cache-dir":
+      if index + 1 >= len(sync_args) or sync_args[index + 1].startswith("-"):
+        raise ValueError("--cache-dir requires a path")
+      selected = sync_args[index + 1]
+    elif argument.startswith("--cache-dir="):
+      selected = argument.split("=", 1)[1]
+  if selected is None:
+    selected = ".expri/cache/uv"
+  if not selected:
+    raise ValueError("cache directory must not be empty")
+  path = pathlib.Path(selected)
+  if not path.is_absolute():
+    path = pathlib.Path(repo_root) / path
+  return str(path.resolve())
+
+def prepare_environment(environment, repo_root, state_dir, extras, sync_args, install_project, cache_dir=None, operation=None):
+  cache_dir = cache_dir or environment_cache_dir(repo_root, sync_args)
   spec = {{"environment": environment, "repo_root": repo_root, "state_dir": state_dir,
-          "operation": "run" if install_project else "setup", "extras": extras,
-          "sync_args": sync_args, "install_project": install_project}}
+          "operation": operation or ("run" if install_project else "setup"), "extras": extras,
+          "sync_args": sync_args, "install_project": install_project, "cache_dir": cache_dir}}
   cmd = ["uv", "run", "--isolated", "--no-project", "--no-config", "--no-env-file", "--with", "packaging==25.0",
          "--with", "tomli==2.2.1", "python", "-I", "-c", RUNTIME_SCRIPT, json.dumps(spec)]
   child_env = os.environ.copy()
   for key in ENV_REMOVE:
     child_env.pop(key, None)
   child_env.update(environment.get("env", {{}}))
+  child_env["UV_CACHE_DIR"] = cache_dir
+  if "--no-cache" in sync_args:
+    child_env["UV_NO_CACHE"] = "true"
   output = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True, env=child_env)
   return json.loads(output.stdout)
 "#
@@ -327,6 +432,8 @@ pub(crate) fn python_run_script(request_path: &str) -> String {
   let request_path = serde_json::to_string(request_path).expect("request path string");
   let snapshot = serde_json::to_string(include_str!("../environment/snapshot.py"))
     .expect("snapshot script string");
+  let maintenance = serde_json::to_string(include_str!("../environment/maintenance.py"))
+    .expect("maintenance script string");
   format!(
     r#"import datetime, json, os, pathlib, subprocess, sys
 {preamble}
@@ -336,6 +443,9 @@ request = json.loads(pathlib.Path({request_path}).read_text())
 if not request.get("command"):
   raise SystemExit("task command must not be empty")
 snapshot = snapshot_module["create_snapshot"](os.getcwd(), request.get("remote_managed", []), request.get("expected_sync"))
+maintenance_module = {{"__name__": "expri_environment_maintenance"}}
+exec({maintenance}, maintenance_module)
+run_lease = maintenance_module["acquire_run_lock"](snapshot["run_dir"])
 run_dir = pathlib.Path(snapshot["run_dir"])
 state_path = run_dir / "run-state.json"
 state = {{"run_id": snapshot["run_id"], "task": request["name"], "command": request["command"],
@@ -352,8 +462,9 @@ print("run: " + snapshot["run_id"], file=sys.stderr)
 print("run directory: " + str(run_dir), file=sys.stderr)
 exit_code = 1
 try:
+  cache_dir = environment_cache_dir(os.getcwd(), request.get("sync_args", []))
   prepared = prepare_environment(request["environment"], snapshot["code_dir"], str(run_dir),
-                                 request.get("extras", []), request.get("sync_args", []), True)
+                                 request.get("extras", []), request.get("sync_args", []), True, cache_dir=cache_dir)
   state.update(status="running", environment_manifest=prepared["manifest_path"], python=prepared["python"])
   write_state()
   child_env = os.environ.copy()
@@ -369,7 +480,7 @@ try:
   if exit_code:
     state["error"] = "task exited with status " + str(exit_code)
 except subprocess.CalledProcessError as error:
-  exit_code = error.returncode if error.returncode > 0 else 1
+  exit_code = error.returncode if error.returncode >= 0 else 128 - error.returncode
   state["error"] = "environment preparation exited with status " + str(exit_code)
 except Exception as error:
   state["error"] = str(error)
@@ -378,17 +489,72 @@ finally:
   state.update(status="completed" if exit_code == 0 else "failed", exit_code=exit_code,
                finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
   write_state()
+  run_lease.close()
 raise SystemExit(exit_code)
 "#,
     preamble = python_environment_preamble()
   )
 }
 
+pub(crate) fn python_environment_script(request: &EnvironmentCommandRequest) -> String {
+  let request =
+    serde_json::to_string(&serde_json::to_string(request).expect("environment request"))
+      .expect("request string");
+  let maintenance = serde_json::to_string(include_str!("../environment/maintenance.py"))
+    .expect("maintenance script string");
+  python_preserve_command_exit_code(format!(
+    r#"import json, os, pathlib, subprocess, sys
+{preamble}
+request = json.loads({request})
+if request["operation"] == "doctor":
+  report = prepare_environment(request["environment"], os.getcwd(), str(pathlib.Path.cwd() / ".expri"), request.get("extras", []), request.get("sync_args", []), False, operation="doctor")
+elif request["operation"] == "prune":
+  maintenance_module = {{"__name__": "expri_environment_maintenance"}}
+  exec({maintenance}, maintenance_module)
+  report = maintenance_module["prune_environments"](os.getcwd(), request["apply"], request["keep_last"])
+else:
+  raise SystemExit("unsupported environment operation")
+if request.get("json"):
+  print(json.dumps(report, indent=2, sort_keys=True))
+elif "compatible" in report:
+  print("Base and lock preflight: " + ("passed" if report["compatible"] else "failed"))
+  print("Base Python: " + (report.get("base_python") or "unavailable"))
+  print("Reused packages: " + (", ".join(report.get("reused_packages", [])) or "none"))
+  cache = report.get("cache", {{}})
+  print("Cache: " + str(cache.get("directory") or "unavailable") + " (link mode: " + str(cache.get("link_mode") or "uv default") + ")")
+  if cache.get("disabled") is True:
+    print("Cache reuse: disabled")
+  elif cache.get("same_filesystem") is False:
+    print("Cache is on another filesystem; package files may be copied into each environment.")
+  for issue in report.get("issues", []):
+    print("- " + issue["message"])
+  checks = report.get("checks", {{}})
+  print("Prepared environment: " + checks.get("combined_runtime", "pending"))
+  if "prepared_fingerprint" in checks:
+    print("Prepared configuration: " + checks["prepared_fingerprint"])
+  for issue in checks.get("combined_issues", []):
+    print("- Prepared environment: " + issue["message"])
+  print("Each run still validates its combined environment before launch.")
+else:
+  print("Run environment cleanup: " + ("applied" if report["apply"] else "preview"))
+  for run in report["runs"]:
+    print(run["run_id"] + ": " + run["action"] + " (" + run["reason"] + ")")
+  print("Logical environment bytes: " + str(report["logical_bytes"]) + " (physical disk savings depend on cache links and filesystem)")
+  if not report["apply"]:
+    print("Use --apply to prune these environments; code, outputs, and manifests are retained.")
+if report.get("compatible") is False:
+  print("error: environment preflight failed; resolve the reported issues before setup or run", file=sys.stderr)
+  raise SystemExit(1)
+"#,
+    preamble = python_environment_preamble()
+  ))
+}
+
 fn python_sync_apply_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
-    r#"import fcntl, hashlib, json, pathlib, shutil, subprocess, tempfile, zipfile
+    r#"import atexit, fcntl, hashlib, json, pathlib, shutil, subprocess, tempfile, zipfile
 
 def sha256(path):
   h = hashlib.sha256()
@@ -504,6 +670,7 @@ if (state_dir / "worktree.lock").is_symlink():
   raise SystemExit("checkout lock must not be a symlink")
 checkout_lock = (state_dir / "worktree.lock").open("a+b")
 fcntl.flock(checkout_lock, fcntl.LOCK_EX)
+atexit.register(fcntl.flock, checkout_lock, fcntl.LOCK_UN)
 
 if request.get("source_bundle"):
   if sha256(request["source_bundle"]) != request["source_bundle_sha256"]:

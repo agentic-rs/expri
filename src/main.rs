@@ -47,10 +47,51 @@ enum Command {
   Download(DownloadCommand),
   Setup(SetupCommand),
   Run(RunCommand),
+  Env(EnvironmentCommand),
   Node {
     #[command(subcommand)]
     command: NodeCommand,
   },
+}
+
+#[derive(Debug, Args)]
+struct EnvironmentCommand {
+  #[command(subcommand)]
+  command: EnvironmentSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum EnvironmentSubcommand {
+  /// Check the base Python stack against the selected lock without installing project dependencies.
+  Doctor(EnvironmentArgs),
+  /// Preview or remove inactive run virtual environments, retaining experiment records.
+  Prune(PruneCommand),
+}
+
+#[derive(Debug, Args)]
+struct EnvironmentArgs {
+  #[arg(long)]
+  config: Option<PathBuf>,
+  #[arg(long)]
+  repo: Option<PathBuf>,
+  #[arg(long)]
+  control_path: Option<String>,
+  #[arg(long, default_value = "30m")]
+  control_persist: String,
+  #[arg(long)]
+  json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PruneCommand {
+  #[command(flatten)]
+  options: EnvironmentArgs,
+  #[arg(long, conflicts_with = "dry_run")]
+  apply: bool,
+  #[arg(long)]
+  dry_run: bool,
+  #[arg(long, default_value_t = 1)]
+  keep_last: usize,
 }
 
 #[derive(Debug, Args)]
@@ -168,6 +209,9 @@ fn run() -> Result<()> {
     }
     Command::Setup(command) => run_setup(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Run(command) => run_task(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Env(command) => {
+      run_environment(command, cli.target.as_deref(), cli.verbose, cli.quiet)
+    }
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
@@ -177,6 +221,87 @@ fn run() -> Result<()> {
       node::cli::run(command)
     }
   }
+}
+
+fn run_environment(
+  command: EnvironmentCommand,
+  target: Option<&str>,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
+  let (options, prune) = match command.command {
+    EnvironmentSubcommand::Doctor(options) => (options, None),
+    EnvironmentSubcommand::Prune(command) => (
+      command.options,
+      Some(protocol::PruneRequest {
+        apply: command.apply && !command.dry_run,
+        keep_last: command.keep_last,
+      }),
+    ),
+  };
+  let context = CommandContext::load(options.config, options.repo)?;
+  let (extras, sync_args) = environment_selection(&context.config);
+  if target.is_some() {
+    let context = context.into_target(target, options.control_path)?;
+    let action = if let Some(prune) = prune {
+      protocol::EnvironmentAction::Prune(prune)
+    } else {
+      let environment = context.target.environment.clone().ok_or_else(|| {
+        ExpriError::Message("env doctor requires a configured target environment".to_string())
+      })?;
+      protocol::EnvironmentAction::Doctor(protocol::DoctorRequest {
+        environment,
+        extras,
+        sync_args,
+      })
+    };
+    return controller::environment::execute(controller::environment::EnvironmentOptions {
+      target: context.target,
+      control_path: context.control_path,
+      control_persist: options.control_persist,
+      verbosity,
+      quiet,
+      request: protocol::EnvironmentCommandRequest {
+        json: options.json,
+        action,
+      },
+    });
+  }
+  let action = if let Some(prune) = prune {
+    protocol::EnvironmentAction::Prune(prune)
+  } else {
+    let environment = context.config.local_environment()?.ok_or_else(|| {
+      ExpriError::Message("env doctor requires a configured [environment] table".to_string())
+    })?;
+    protocol::EnvironmentAction::Doctor(protocol::DoctorRequest {
+      environment,
+      extras,
+      sync_args,
+    })
+  };
+  node::environment::apply_request_at(
+    &protocol::EnvironmentCommandRequest {
+      json: options.json,
+      action,
+    },
+    &context.repo_root,
+  )
+}
+
+fn environment_selection(config: &config::Config) -> (Vec<String>, Vec<String>) {
+  let mut extras = Vec::new();
+  let mut sync_args = Vec::new();
+  for step in config.setup_steps() {
+    if let protocol::SetupStep::Uv {
+      extras: step_extras,
+      args,
+    } = step
+    {
+      extras.extend(step_extras);
+      sync_args.extend(args);
+    }
+  }
+  (extras, sync_args)
 }
 
 fn run_sync(command: SyncCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
@@ -284,18 +409,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     .as_ref()
     .and_then(|sync| sync.remote_managed.clone())
     .unwrap_or_default();
-  let mut extras = Vec::new();
-  let mut sync_args = Vec::new();
-  for step in context.config.setup_steps() {
-    if let protocol::SetupStep::Uv {
-      extras: step_extras,
-      args,
-    } = step
-    {
-      extras.extend(step_extras);
-      sync_args.extend(args);
-    }
-  }
+  let (extras, sync_args) = environment_selection(&context.config);
   if target.is_some() {
     let context = context.into_target(target, command.control_path)?;
     let expected_sync = if !command.no_sync {

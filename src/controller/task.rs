@@ -4,7 +4,7 @@ use std::process::Command;
 use crate::config::{EnvironmentConfig, TargetConfig, TaskConfig};
 use crate::controller::protocol::{ProtocolPreference, apply_run_with_preference};
 use crate::controller::transport::Remote;
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 use crate::protocol::{RunRequest, SyncIdentity};
 use crate::shell;
 
@@ -93,7 +93,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
   if !status.success() {
     return Err(ExpriError::CommandFailed {
       program: argv[0].clone(),
-      code: status.code(),
+      code: command_exit_code(&status),
     });
   }
   Ok(())

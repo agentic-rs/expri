@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use zip::ZipArchive;
 
 use crate::archive::sha256_file;
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 use crate::git;
 use crate::protocol::{PullArtifacts, SyncApplyRequest};
 
@@ -616,7 +616,7 @@ fn run_git(args: Vec<String>) -> Result<()> {
   if !status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
-      code: status.code(),
+      code: command_exit_code(&status),
     });
   }
   Ok(())
@@ -627,7 +627,7 @@ fn git_capture<const N: usize>(args: [&str; N]) -> Result<String> {
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
-      code: output.status.code(),
+      code: command_exit_code(&output.status),
     });
   }
   Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())

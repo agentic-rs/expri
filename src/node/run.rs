@@ -5,7 +5,7 @@ use std::process::Command;
 use serde_json::json;
 
 use crate::environment::{self, EnvironmentRequest};
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 use crate::protocol::RunRequest;
 
 pub fn apply_request_file(path: &Path) -> Result<()> {
@@ -25,6 +25,7 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
     &request.remote_managed,
     request.expected_sync.as_ref(),
   )?;
+  let _run_lock = crate::lock::run_lock(&snapshot.run_dir)?;
   let state_path = snapshot.run_dir.join("run-state.json");
   let mut state = json!({
     "run_id": snapshot.run_id,
@@ -47,6 +48,11 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
       extras: request.extras.clone(),
       sync_args: request.sync_args.clone(),
       install_project: true,
+      cache_dir: Some(
+        environment::cache_dir(repo_root, &request.sync_args)?
+          .to_string_lossy()
+          .into_owned(),
+      ),
     })?;
     let argv = environment::task_argv(&request.command)?;
     state["status"] = json!("running");
@@ -65,7 +71,7 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
     if !status.success() {
       return Err(ExpriError::CommandFailed {
         program: argv[0].clone(),
-        code: status.code(),
+        code: command_exit_code(&status),
       });
     }
     Ok(())

@@ -6,7 +6,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 use crate::archive::sha256_file;
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 use crate::filter::SyncRules;
 
 #[derive(Debug)]
@@ -173,7 +173,7 @@ pub fn ls_files(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<u8>> {
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
-      code: output.status.code(),
+      code: command_exit_code(&output.status),
     });
   }
   Ok(output.stdout)
@@ -192,7 +192,7 @@ fn git_capture<const N: usize>(repo_root: &Path, args: [&str; N]) -> Result<Stri
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
-      code: output.status.code(),
+      code: command_exit_code(&output.status),
     });
   }
   Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -241,7 +241,7 @@ fn git_capture_bytes<const N: usize>(repo_root: &Path, args: [&str; N]) -> Resul
   if !output.status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
-      code: output.status.code(),
+      code: command_exit_code(&output.status),
     });
   }
   Ok(output.stdout)
@@ -260,7 +260,7 @@ fn git_run<const N: usize>(repo_root: &Path, args: [&OsStr; N]) -> Result<()> {
   if !status.success() {
     return Err(ExpriError::CommandFailed {
       program: "git".to_string(),
-      code: status.code(),
+      code: command_exit_code(&status),
     });
   }
   Ok(())

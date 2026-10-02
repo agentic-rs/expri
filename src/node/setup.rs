@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::environment::{self, PreparedEnvironment};
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 use crate::protocol::{SetupRequest, SetupStep};
 
 pub fn apply_request_file(path: &Path) -> Result<()> {
@@ -146,7 +146,7 @@ fn run_command(
   if !status.success() {
     return Err(ExpriError::CommandFailed {
       program: program.to_string(),
-      code: status.code(),
+      code: command_exit_code(&status),
     });
   }
   Ok(())

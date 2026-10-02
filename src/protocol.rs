@@ -48,6 +48,36 @@ pub struct RunRequest {
   pub expected_sync: Option<SyncIdentity>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct EnvironmentCommandRequest {
+  #[serde(default)]
+  pub json: bool,
+  #[serde(flatten)]
+  pub action: EnvironmentAction,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum EnvironmentAction {
+  Doctor(DoctorRequest),
+  Prune(PruneRequest),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DoctorRequest {
+  pub environment: EnvironmentConfig,
+  #[serde(default)]
+  pub extras: Vec<String>,
+  #[serde(default)]
+  pub sync_args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PruneRequest {
+  pub apply: bool,
+  pub keep_last: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SyncIdentity {
   pub head: String,

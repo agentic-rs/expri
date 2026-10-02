@@ -166,6 +166,106 @@ fn write_file(path: impl AsRef<Path>, contents: &str) {
   fs::write(path, contents).expect("write fixture file");
 }
 
+#[cfg(unix)]
+#[test]
+fn node_probes_resolve_relative_and_absolute_binaries_from_execution_directory() {
+  use std::os::unix::fs::PermissionsExt;
+
+  use super::{ExpriNodeProtocol, ProtocolPreference, protocol_with_capability};
+  use crate::config::{TargetConfig, TransportKind};
+  use crate::controller::transport::Remote;
+  use crate::shell;
+
+  let fixture = tempfile::Builder::new()
+    .prefix("expri node probes ")
+    .tempdir()
+    .expect("node probe fixture");
+  let home = fixture.path().join("login-home");
+  let repo = fixture.path().join("repo with 'quotes'");
+  fs::create_dir(&home).expect("login home");
+  fs::create_dir(&repo).expect("execution directory");
+  let repo = repo.canonicalize().expect("canonical execution directory");
+  let ctl = fixture.path().join("fake-ctl");
+  fs::write(
+    &ctl,
+    format!(
+      r#"#!/bin/sh
+HOME={home}; export HOME
+cd "$HOME" || exit 71
+for argument do remote_command=$argument; done
+exec /bin/sh -c "$remote_command"
+"#,
+      home = shell::quote(home.to_string_lossy())
+    ),
+  )
+  .expect("local transport stub");
+  fs::set_permissions(&ctl, fs::Permissions::from_mode(0o755)).expect("executable transport stub");
+  let relative = repo.join("expri");
+  let absolute = fixture.path().join("absolute node with 'quotes'");
+  let log = fixture.path().join("probe-cwd.log");
+  let node = format!(
+    r#"#!/bin/sh
+[ "$1" = node ] && [ "$2" = capabilities ] && [ "$3" = --has ] && [ "$4" = env-maintenance-v1 ] || exit 72
+printf '%s\n' "$PWD" >> {log}
+[ "$PWD" = {repo} ]
+"#,
+    log = shell::quote(log.to_string_lossy()),
+    repo = shell::quote(repo.to_string_lossy())
+  );
+  for path in [&relative, &absolute] {
+    fs::write(path, &node).expect("node stub");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable node stub");
+  }
+  fs::write(home.join("expri"), "#!/bin/sh\nexit 73\n").expect("wrong login-home node");
+  fs::set_permissions(home.join("expri"), fs::Permissions::from_mode(0o755))
+    .expect("executable login-home node");
+  let remote = Remote::new(
+    TargetConfig {
+      host: "test-host".to_string(),
+      remote_dir: repo.to_string_lossy().into_owned(),
+      transport: TransportKind::Ctl,
+      port: None,
+      protocol: None,
+      node_bin: None,
+      ctl_bin: Some(ctl.to_string_lossy().into_owned()),
+      ctl_method: None,
+      environment: None,
+    },
+    "/tmp/unused-control".to_string(),
+    "10m".to_string(),
+    false,
+    0,
+    false,
+  )
+  .expect("local fake remote");
+  for node_bin in [
+    "./expri".to_string(),
+    absolute.to_string_lossy().into_owned(),
+  ] {
+    let node = ExpriNodeProtocol::new(node_bin.clone());
+    assert!(
+      node.available(&remote).expect("node availability"),
+      "missing {node_bin}"
+    );
+    for preference in [ProtocolPreference::Auto, ProtocolPreference::ExpriNode] {
+      for capability in [None, Some("env-maintenance-v1")] {
+        let protocol = protocol_with_capability(&remote, preference, &node_bin, "test", capability)
+          .expect("select valid configured node");
+        assert_eq!(protocol.name(), "expri-node", "{preference:?}/{node_bin}");
+      }
+    }
+  }
+  let probes = fs::read_to_string(log).expect("capability probe log");
+  assert_eq!(probes.lines().count(), 4);
+  for directory in probes.lines() {
+    assert_eq!(
+      directory,
+      repo.to_string_lossy(),
+      "capability probe used another directory"
+    );
+  }
+}
+
 #[test]
 fn python_pull_prepare_packages_head_and_dirty_files() {
   let fixture = SyncFixture::new(&[

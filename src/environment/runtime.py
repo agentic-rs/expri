@@ -1,5 +1,6 @@
 """Prepare uv environments without modifying an explicitly reused Python stack."""
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -24,6 +25,37 @@ from packaging.version import InvalidVersion, Version
 
 class RuntimeErrorDetail(Exception):
   pass
+
+
+def add_issue(issues, kind, message, package=None):
+  if issues is None:
+    raise RuntimeErrorDetail(message)
+  issue = {"kind": kind, "message": message}
+  if package is not None:
+    issue["package"] = canonicalize_name(package)
+  if issue not in issues:
+    issues.append(issue)
+
+
+def checked_requirement(value, context, issues, package=None):
+  try:
+    return parse_requirement(value, context)
+  except RuntimeErrorDetail as error:
+    add_issue(issues, "metadata", str(error), package)
+    return None
+
+
+def check_python_requirement(package, marker_env, issues):
+  value = package.get("requires_python")
+  if not value:
+    return
+  try:
+    valid = SpecifierSet(value).contains(marker_env["python_full_version"], prereleases=True)
+  except ValueError as error:
+    add_issue(issues, "python_requirement", f"invalid Requires-Python for {package['name']}: {value!r}: {error}", package["name"])
+    return
+  if not valid:
+    add_issue(issues, "python_requirement", f"installed {package['name']} requires Python {value}", package["name"])
 
 
 # This probe deliberately has no third-party dependencies: it runs in the base
@@ -165,12 +197,13 @@ def invoke(argv, *, cwd, env, capture=False):
   if result.returncode:
     if capture and result.stderr:
       sys.stderr.write(result.stderr)
-    raise RuntimeErrorDetail(f"{argv[0]} failed with exit status {result.returncode}")
+    detail = f": {result.stderr.strip()}" if capture and result.stderr else ""
+    raise RuntimeErrorDetail(f"{argv[0]} failed with exit status {result.returncode}{detail}")
   return result.stdout if capture else None
 
 
 def inspect_python(python, repo_root, env, *, isolated=True, modules=(), torch=False, require_cuda=False, include_packages=True):
-  argv = [str(python)]
+  argv = [str(python), "-B"]
   if isolated:
     argv.append("-I")
   argv.extend([
@@ -228,7 +261,7 @@ def require_installed(requirement, packages, context):
     raise RuntimeErrorDetail(f"cannot verify reused URL dependency {requirement} in {context}")
   try:
     valid = requirement.specifier.contains(package["version"], prereleases=True)
-  except InvalidVersion as error:
+  except (InvalidVersion, TypeError) as error:
     raise RuntimeErrorDetail(f"required package {name} has invalid installed version {package['version']!r}") from error
   if not valid:
     raise RuntimeErrorDetail(
@@ -237,26 +270,38 @@ def require_installed(requirement, packages, context):
   return name
 
 
-def inherited_closure(inventory, roots):
+def inherited_closure(inventory, roots, *, issues=None):
   packages = inventory["packages"]
   selected = {}
-  pending = [(parse_requirement(root, "reuse_packages"), False) for root in roots]
+  pending = []
+  for root in roots:
+    requirement = checked_requirement(root, "reuse_packages", issues)
+    if requirement:
+      pending.append((requirement, False))
   while pending:
     requirement, already_selected = pending.pop()
     if not already_selected and not marker_applies(requirement, inventory["marker_env"]):
       continue
-    name = require_installed(requirement, packages, "reused environment")
+    name = canonicalize_name(requirement.name)
+    try:
+      require_installed(requirement, packages, "reused environment")
+    except RuntimeErrorDetail as error:
+      add_issue(issues, "inherited_dependency", str(error), name)
+      if name not in packages:
+        continue
     requested_extras = {canonicalize_name(extra) for extra in requirement.extras}
     package_extras = {canonicalize_name(extra) for extra in packages[name]["extras"]}
     if not requested_extras.issubset(package_extras):
       unknown = ", ".join(sorted(requested_extras - package_extras))
-      raise RuntimeErrorDetail(f"{name} does not declare requested extras: {unknown}")
+      add_issue(issues, "inherited_extra", f"{name} does not declare requested extras: {unknown}", name)
+      requested_extras.intersection_update(package_extras)
     if name in selected and requested_extras.issubset(selected[name]):
       continue
     selected.setdefault(name, set()).update(requested_extras)
+    check_python_requirement(packages[name], inventory["marker_env"], issues)
     for raw in packages[name]["requires"]:
-      dependency = parse_requirement(raw, f"{name} metadata")
-      if marker_applies(dependency, inventory["marker_env"], selected[name]):
+      dependency = checked_requirement(raw, f"{name} metadata", issues, name)
+      if dependency and marker_applies(dependency, inventory["marker_env"], selected[name]):
         pending.append((dependency, True))
   return selected
 
@@ -295,7 +340,7 @@ def normalize_sync_args(args):
   return normalized
 
 
-def exported_requirements(output, marker_env, *, strict=True):
+def exported_requirements(output, marker_env, *, strict=True, issues=None):
   requirements = {}
   for line in output.splitlines():
     line = line.strip()
@@ -304,62 +349,73 @@ def exported_requirements(output, marker_env, *, strict=True):
     if line.startswith("-") or line.endswith("\\"):
       if not strict:
         continue
-      raise RuntimeErrorDetail("reused environments currently require indexed/wheel dependencies, not editable/path lock entries")
+      add_issue(issues, "locked_source", "reused environments currently require indexed/wheel dependencies, not editable/path lock entries")
+      continue
     try:
       requirement = parse_requirement(line, "uv export")
-    except RuntimeErrorDetail:
+    except RuntimeErrorDetail as error:
       if not strict:
         continue
-      raise
+      add_issue(issues, "locked_source", str(error))
+      continue
     if not marker_applies(requirement, marker_env):
       continue
     name = canonicalize_name(requirement.name)
     if name in requirements:
       previous = requirements[name]
       if previous.specifier != requirement.specifier or previous.url != requirement.url:
-        raise RuntimeErrorDetail(f"uv export selected conflicting requirements for {name}")
+        add_issue(issues, "locked_selection", f"uv export selected conflicting requirements for {name}", name)
+        continue
       requirement.extras.update(previous.extras)
     requirements[name] = requirement
   return requirements
 
 
-def validate_locked_reuse(inventory, inherited, requirements):
+def validate_locked_reuse(inventory, inherited, requirements, *, issues=None):
   if "torch" in inherited:
     missing_cuda_wheels = sorted(
       name for name in requirements if name.startswith("nvidia-") and name not in inherited
     )
-    if missing_cuda_wheels:
-      raise RuntimeErrorDetail(
+    for name in missing_cuda_wheels:
+      add_issue(issues, "cuda_wheel",
         "uv.lock requires CUDA wheel distributions outside the reused PyTorch dependency closure: "
-        + ", ".join(missing_cuda_wheels)
+        + name
         + "; conda native CUDA libraries do not establish equivalence to these Python wheel "
         "distributions. Select a compatible lock/base environment profile or explicitly reuse "
-        "matching installed Python distributions; expri will not silently download a second CUDA stack"
+        "matching installed Python distributions; expri will not silently download a second CUDA stack",
+        name,
       )
-  for name in inherited:
+  for name in sorted(inherited):
     requirement = requirements.get(name)
     if requirement is None:
       continue
     pins = list(requirement.specifier)
     if requirement.url or len(pins) != 1 or pins[0].operator != "==" or "*" in pins[0].version:
-      raise RuntimeErrorDetail(f"cannot verify reused {name} against a single exact uv.lock version")
+      add_issue(issues, "locked_version", f"cannot verify reused {name} against a single exact uv.lock version", name)
+      continue
     actual = inventory["packages"][name]["version"]
-    if Version(actual) != Version(pins[0].version):
-      raise RuntimeErrorDetail(
+    try:
+      matches = Version(actual) == Version(pins[0].version)
+    except (InvalidVersion, TypeError) as error:
+      add_issue(issues, "locked_version", f"cannot compare reused {name} with uv.lock: {error}", name)
+      continue
+    if not matches:
+      add_issue(issues, "locked_version",
         f"uv.lock selects {name}=={pins[0].version}, but the reused environment provides "
-        f"{name}=={actual}; use a compatible lockfile or an environment without reuse"
+        f"{name}=={actual}; use a compatible lockfile or an environment without reuse",
+        name,
       )
 
 
-def validate_combined(inventory, requirements, inherited, base, *, project_name=None, project_extras=(), build_requirements=()):
+def validate_combined(inventory, requirements, inherited, base, *, project_name=None, project_extras=(), build_requirements=(), issues=None):
   packages = inventory["packages"]
   activated_extras = {name: set(extras) for name, extras in inherited.items()}
   pending = list(requirements.values())
   for name, requirement in requirements.items():
     package = packages.get(name)
     if package is None:
-      raise RuntimeErrorDetail(f"prepared environment is missing locked dependency {name}")
-    require_installed(parse_requirement(name, "locked dependency"), packages, "locked dependency")
+      add_issue(issues, "combined_dependency", f"prepared environment is missing locked dependency {name}", name)
+      continue
     if requirement.url:
       # uv performed the locked installation; URL identity cannot be inferred
       # from a reused conda distribution, which was rejected before syncing.
@@ -367,9 +423,15 @@ def validate_combined(inventory, requirements, inherited, base, *, project_name=
     else:
       pins = list(requirement.specifier)
       if len(pins) != 1 or pins[0].operator != "==" or "*" in pins[0].version:
-        raise RuntimeErrorDetail(f"locked dependency {name} is not exactly pinned")
-      if Version(package["version"]) != Version(pins[0].version):
-        raise RuntimeErrorDetail(f"prepared {name}=={package['version']} does not match uv.lock {pins[0].version}")
+        add_issue(issues, "combined_version", f"locked dependency {name} is not exactly pinned", name)
+      else:
+        try:
+          matches = Version(package["version"]) == Version(pins[0].version)
+        except (InvalidVersion, TypeError) as error:
+          add_issue(issues, "combined_version", f"cannot compare installed {name} with uv.lock: {error}", name)
+          matches = True
+        if not matches:
+          add_issue(issues, "combined_version", f"prepared {name}=={package['version']} does not match uv.lock {pins[0].version}", name)
     activated_extras.setdefault(name, set()).update(requirement.extras)
   active_names = set(requirements) | set(inherited)
   if project_name:
@@ -378,22 +440,23 @@ def validate_combined(inventory, requirements, inherited, base, *, project_name=
     activated_extras.setdefault(project_name, set()).update(project_extras)
     pending.append(parse_requirement(project_name, "installed project"))
   for raw in build_requirements:
-    requirement = parse_requirement(raw, "build-system.requires")
-    if marker_applies(requirement, inventory["marker_env"]):
+    requirement = checked_requirement(raw, "build-system.requires", issues)
+    if requirement and marker_applies(requirement, inventory["marker_env"]):
       active_names.add(canonicalize_name(requirement.name))
       pending.append(requirement)
-  for name in active_names:
+  for name in sorted(active_names):
     if name not in packages:
-      raise RuntimeErrorDetail(f"prepared environment is missing declared package {name}")
-    require_installed(parse_requirement(name, "declared package"), packages, "declared package")
+      add_issue(issues, "combined_dependency", f"prepared environment is missing declared package {name}", name)
+      continue
+    try:
+      require_installed(parse_requirement(name, "declared package"), packages, "declared package")
+    except RuntimeErrorDetail as error:
+      add_issue(issues, "combined_dependency", str(error), name)
     package = packages[name]
-    if package["requires_python"] and not SpecifierSet(package["requires_python"]).contains(
-      inventory["marker_env"]["python_full_version"], prereleases=True
-    ):
-      raise RuntimeErrorDetail(f"installed {name} requires Python {package['requires_python']}")
+    check_python_requirement(package, inventory["marker_env"], issues)
     for raw in package["requires"]:
-      dependency = parse_requirement(raw, f"{name} metadata")
-      if marker_applies(dependency, inventory["marker_env"], activated_extras.get(name, ())):
+      dependency = checked_requirement(raw, f"{name} metadata", issues, name)
+      if dependency and marker_applies(dependency, inventory["marker_env"], activated_extras.get(name, ())):
         pending.append(dependency)
   checked = set()
   while pending:
@@ -405,35 +468,38 @@ def validate_combined(inventory, requirements, inherited, base, *, project_name=
     name = canonicalize_name(requirement.name)
     if requirement.url and name not in inherited:
       if name not in packages:
-        raise RuntimeErrorDetail(f"missing URL dependency {name}")
+        add_issue(issues, "combined_dependency", f"missing URL dependency {name}", name)
+        continue
     else:
-      require_installed(requirement, packages, "combined environment")
+      try:
+        require_installed(requirement, packages, "combined environment")
+      except RuntimeErrorDetail as error:
+        add_issue(issues, "combined_dependency", str(error), name)
+        if name not in packages:
+          continue
     package = packages[name]
-    if package["requires_python"] and not SpecifierSet(package["requires_python"]).contains(
-      inventory["marker_env"]["python_full_version"], prereleases=True
-    ):
-      raise RuntimeErrorDetail(f"installed {name} requires Python {package['requires_python']}")
+    check_python_requirement(package, inventory["marker_env"], issues)
     before = set(activated_extras.get(name, ()))
     first_visit = name not in active_names
     active_names.add(name)
     activated_extras.setdefault(name, set()).update(requirement.extras)
     if first_visit or activated_extras[name] != before:
       for raw in packages[name]["requires"]:
-        dependency = parse_requirement(raw, f"{name} metadata")
-        if marker_applies(dependency, inventory["marker_env"], activated_extras[name]):
+        dependency = checked_requirement(raw, f"{name} metadata", issues, name)
+        if dependency and marker_applies(dependency, inventory["marker_env"], activated_extras[name]):
           pending.append(dependency)
   for name in inherited:
     actual = packages.get(name)
     expected = base["packages"][name]
     if actual is None or any(actual[key] != expected[key] for key in ("version", "metadata_path")):
-      raise RuntimeErrorDetail(f"overlay shadows reused package {name}; refusing to publish environment")
+      add_issue(issues, "combined_shadow", f"overlay shadows reused package {name}; refusing to publish environment", name)
   for module, origin in base["origins"].items():
     if inventory["origins"].get(module) != origin:
-      raise RuntimeErrorDetail(f"project or overlay shadows reused module {module}")
+      add_issue(issues, "combined_shadow", f"project or overlay shadows reused module {module}", module)
   if base["torch"] and inventory["torch"] != base["torch"]:
-    raise RuntimeErrorDetail("prepared environment does not import the original PyTorch/CUDA stack")
+    add_issue(issues, "combined_torch", "prepared environment does not import the original PyTorch/CUDA stack", "torch")
   if base.get("gpu_driver") is not None and inventory.get("gpu_driver") != base["gpu_driver"]:
-    raise RuntimeErrorDetail("GPU driver inventory changed while preparing the reused stack")
+    add_issue(issues, "combined_driver", "GPU driver inventory changed while preparing the reused stack")
 
 
 def atomic_json(path, value):
@@ -517,6 +583,7 @@ def runtime_env(environment):
     )
   env["UV_PYTHON_DOWNLOADS"] = "never"
   env["PYTHONNOUSERSITE"] = "1"
+  env["PYTHONDONTWRITEBYTECODE"] = "1"
   return env
 
 
@@ -550,9 +617,65 @@ def is_packaged(project):
   return configured if configured is not None else "build-system" in project
 
 
-def _prepare(request):
+def option_value(args, option):
+  values = [args[index + 1] for index, value in enumerate(args[:-1]) if value == option]
+  return values[-1] if values else None
+
+
+def existing_device(path):
+  while not path.exists() and path != path.parent:
+    path = path.parent
+  try:
+    return path.stat().st_dev
+  except OSError:
+    return None
+
+
+def configure_cache(request, repo_root, state_dir, env, sync_args):
+  directory = request.get("cache_dir")
+  if directory is None:
+    directory = option_value(sync_args, "--cache-dir") or env.get("UV_CACHE_DIR")
+  if directory is None:
+    directory = invoke(["uv", "cache", "dir"], cwd=repo_root, env=env, capture=True).strip()
+  if not isinstance(directory, str) or not directory:
+    raise RuntimeErrorDetail("cache_dir must be a nonempty path string")
+  path = Path(directory).expanduser()
+  if not path.is_absolute():
+    path = repo_root / path
+  path = path.resolve()
+  for index, value in enumerate(sync_args[:-1]):
+    if value == "--cache-dir":
+      sync_args[index + 1] = str(path)
+  env["UV_CACHE_DIR"] = str(path)
+  link_mode = option_value(sync_args, "--link-mode") or env.get("UV_LINK_MODE") or "default"
+  disabled = "--no-cache" in sync_args or env.get("UV_NO_CACHE", "").lower() in {"1", "true", "yes"}
+  cache_device = existing_device(path)
+  environment_device = existing_device(state_dir)
+  return {
+    "directory": str(path),
+    "link_mode": link_mode,
+    "same_filesystem": cache_device == environment_device if cache_device is not None and environment_device is not None else None,
+    "disabled": disabled,
+  }
+
+
+def installation_args(sync_args):
+  # Extras/groups select the locked project graph and are not uv pip options.
+  args = []
+  index = 0
+  while index < len(sync_args):
+    option = sync_args[index]
+    if option in COMMON_FLAGS:
+      args.append(option)
+    elif option in COMMON_VALUES:
+      args.extend(sync_args[index:index + 2])
+    index += 2 if option in SELECTION_VALUES | COMMON_VALUES else 1
+  return args
+
+
+def request_options(request):
   operation = request.get("operation", "setup")
-  if operation not in {"setup", "run", "validate"}:
+  if operation not in {"setup", "run", "validate", "doctor"}:
     raise RuntimeErrorDetail(f"unknown environment operation: {operation}")
   repo_root = Path(request["repo_root"]).resolve()
   state_dir = Path(request.get("state_dir", ".expri"))
@@ -560,45 +683,180 @@ def _prepare(request):
     state_dir = repo_root / state_dir
   state_dir = state_dir.resolve()
   environment = request.get("environment", {})
+  if not isinstance(environment, dict):
+    raise RuntimeErrorDetail("environment must be an object")
   roots = environment.get("reuse_packages", [])
   extras = request.get("extras", [])
   if not isinstance(roots, list) or not isinstance(extras, list) or not isinstance(request.get("sync_args", []), list):
     raise RuntimeErrorDetail("reuse_packages, extras, and sync_args must be lists")
+  if any(not isinstance(item, str) for item in [*roots, *extras, *request.get("sync_args", [])]):
+    raise RuntimeErrorDetail("reuse_packages, extras, and sync_args must contain strings")
   sync_args = normalize_sync_args(request.get("sync_args", []))
-  if any(not isinstance(item, str) for item in [*roots, *extras]):
-    raise RuntimeErrorDetail("reuse_packages and extras must contain strings")
   install_project = request.get("install_project", operation == "run")
   require_cuda = environment.get("require_cuda", False)
+  if not isinstance(install_project, bool) or not isinstance(require_cuda, bool):
+    raise RuntimeErrorDetail("install_project and require_cuda must be booleans")
+  return {
+    "operation": operation, "repo_root": repo_root, "state_dir": state_dir,
+    "environment": environment, "roots": roots, "extras": extras, "sync_args": sync_args,
+    "install_project": install_project, "require_cuda": require_cuda,
+  }
+
+
+def analyze(request):
+  plan = request_options(request)
+  repo_root = plan["repo_root"]
+  environment = plan["environment"]
+  roots = plan["roots"]
+  issues = []
+  checks = {
+    "interpreter": "pending", "inherited_dependencies": "pending" if roots else "not_requested",
+    "lock": "pending", "import_origins": "pending" if roots else "not_requested",
+    "torch": "pending" if roots else "not_requested", "cuda": "pending" if plan["require_cuda"] else "not_required",
+    "combined_runtime": "pending",
+  }
+  plan.update({"issues": issues, "checks": checks, "base": None, "interpreter": None, "inherited": {}, "modules": set(), "torch": False, "requirements": {}, "project": {}})
+  env = runtime_env(environment)
+  plan["env"] = env
+  plan["cache"] = configure_cache(request, repo_root, plan["state_dir"], env, plan["sync_args"])
   pyproject = repo_root / "pyproject.toml"
   lockfile = repo_root / "uv.lock"
+  plan.update({"pyproject": pyproject, "lockfile": lockfile})
   if not pyproject.is_file() or not lockfile.is_file():
-    raise RuntimeErrorDetail("uv environment preparation requires pyproject.toml and uv.lock; run uv lock first")
-  with pyproject.open("rb") as handle:
-    project = tomllib.load(handle)
-  lock_sha256 = file_digest(lockfile)
-  pyproject_sha256 = file_digest(pyproject)
-  env = runtime_env(environment)
-  interpreter = base_python(environment, repo_root, env)
-  base = inspect_python(interpreter, repo_root, env, include_packages=bool(roots))
-  inherited = inherited_closure(base, roots)
+    add_issue(issues, "project_metadata", "uv environment preparation requires pyproject.toml and uv.lock; run uv lock first")
+  else:
+    try:
+      with pyproject.open("rb") as handle:
+        plan["project"] = tomllib.load(handle)
+      plan["lock_sha256"] = file_digest(lockfile)
+      plan["pyproject_sha256"] = file_digest(pyproject)
+    except (ValueError, OSError) as error:
+      add_issue(issues, "project_metadata", str(error))
+  try:
+    interpreter = base_python(environment, repo_root, env)
+    plan["interpreter"] = interpreter
+    base = inspect_python(interpreter, repo_root, env, include_packages=bool(roots))
+  except (RuntimeErrorDetail, ValueError, OSError) as error:
+    add_issue(issues, "interpreter", str(error))
+    checks["interpreter"] = "failed"
+    return plan
+  plan["base"] = base
+  checks["interpreter"] = "passed"
+  python_requirement = plan["project"].get("project", {}).get("requires-python")
+  if python_requirement:
+    check_python_requirement({"name": "project", "requires_python": python_requirement}, base["marker_env"], issues)
+  before_closure = len(issues)
+  inherited = inherited_closure(base, roots, issues=issues)
+  plan["inherited"] = inherited
+  if roots:
+    checks["inherited_dependencies"] = "passed" if len(issues) == before_closure else "failed"
   if roots and base["python_prefix"] != base["base_prefix"]:
-    raise RuntimeErrorDetail(
+    add_issue(issues, "base_environment",
       "base_python points to another virtual environment; --system-site-packages inherits its "
       "base installation, not that virtual environment's packages; select conda/system Python"
     )
   torch = "torch" in inherited
   modules = {module for name in inherited for module in base["packages"][name]["modules"]}
-  base = inspect_python(interpreter, repo_root, env, modules=modules, torch=torch, require_cuda=require_cuda and torch, include_packages=bool(roots))
-  arguments = ["uv", "export", "--project", str(repo_root), "--locked", "--format", "requirements.txt", "--no-hashes", "--no-header", "--no-annotate", "--no-emit-project"]
-  arguments.extend(sync_args)
-  for extra in extras:
-    arguments.extend(["--extra", extra])
-  # Selecting the base interpreter ensures uv's locked checks use its Python
-  # version; marker filtering below uses the same interpreter's platform.
-  arguments.extend(["--python", interpreter])
-  exported = invoke(arguments, cwd=repo_root, env=env, capture=True)
-  requirements = exported_requirements(exported, base["marker_env"], strict=bool(inherited))
-  validate_locked_reuse(base, inherited, requirements)
+  plan.update({"modules": modules, "torch": torch})
+  if inherited:
+    try:
+      probe = inspect_python(interpreter, repo_root, env, modules=modules, include_packages=False)
+      base["origins"] = probe["origins"]
+      unavailable = [module for module in modules if base["origins"].get(module) is None or "error" in base["origins"][module]]
+      for module in unavailable:
+        add_issue(issues, "import_unavailable", f"reused module {module} cannot be located in the base environment", module)
+      # Source paths are present during the eventual run, even though the base
+      # inventory deliberately ignores ambient PYTHONPATH and the working dir.
+      source = inspect_python(interpreter, repo_root, env, isolated=False, modules=modules, include_packages=False)
+      mismatches = [module for module, origin in base["origins"].items() if source["origins"].get(module) != origin]
+      for module in mismatches:
+        add_issue(issues, "import_shadow", f"project or configured PYTHONPATH shadows reused module {module}", module)
+      checks["import_origins"] = "failed" if mismatches or unavailable else "passed"
+    except (RuntimeErrorDetail, ValueError, OSError) as error:
+      add_issue(issues, "import_probe", str(error))
+      checks["import_origins"] = "failed"
+    checks["torch"] = "not_requested"
+    if torch:
+      try:
+        probe = inspect_python(interpreter, repo_root, env, torch=True, require_cuda=plan["require_cuda"], include_packages=False)
+        base["torch"] = probe["torch"]
+        base["gpu_driver"] = probe.get("gpu_driver")
+        checks["torch"] = "passed"
+        if plan["require_cuda"]:
+          checks["cuda"] = "passed"
+      except (RuntimeErrorDetail, ValueError, OSError) as error:
+        add_issue(issues, "cuda" if plan["require_cuda"] else "torch_probe", str(error), "torch")
+        checks["torch"] = "failed"
+        if plan["require_cuda"]:
+          checks["cuda"] = "failed"
+  elif roots:
+    checks["import_origins"] = "unavailable"
+    checks["torch"] = "unavailable"
+  if "lock_sha256" in plan:
+    arguments = ["uv", "export", "--project", str(repo_root), "--locked", "--format", "requirements.txt", "--no-hashes", "--no-header", "--no-annotate", "--no-emit-project"]
+    arguments.extend(plan["sync_args"])
+    if plan["operation"] == "doctor":
+      arguments.append("--no-build")
+    for extra in plan["extras"]:
+      arguments.extend(["--extra", extra])
+    arguments.extend(["--python", interpreter])
+    before_lock = len(issues)
+    try:
+      exported = invoke(arguments, cwd=repo_root, env=env, capture=True)
+      requirements = exported_requirements(exported, base["marker_env"], strict=bool(roots), issues=issues)
+      plan["requirements"] = requirements
+      validate_locked_reuse(base, inherited, requirements, issues=issues)
+    except (RuntimeErrorDetail, ValueError, OSError) as error:
+      add_issue(issues, "lock_export", str(error))
+    checks["lock"] = "passed" if len(issues) == before_lock else "failed"
+  else:
+    checks["lock"] = "unavailable"
+  if "lock_sha256" in plan:
+    try:
+      if file_digest(lockfile) != plan["lock_sha256"] or file_digest(pyproject) != plan["pyproject_sha256"]:
+        add_issue(issues, "project_drift", "project metadata or uv.lock changed during preflight; retry with a stable checkout")
+    except OSError as error:
+      add_issue(issues, "project_drift", str(error))
+  return plan
+
+
+def environment_fingerprint(plan):
+  base = plan["base"]
+  return digest({
+    "schema_version": 1,
+    "lock_sha256": plan["lock_sha256"], "pyproject_sha256": plan["pyproject_sha256"],
+    "base_python": base["python"], "marker_env": base["marker_env"],
+    "inherited": {name: base["packages"][name] for name in sorted(plan["inherited"])},
+    "selected_requirements": {name: str(value) for name, value in plan["requirements"].items()},
+    "extras": plan["extras"], "sync_args": plan["sync_args"],
+    "env_sha256": digest(plan["environment"].get("env", {})),
+    "require_cuda": plan["require_cuda"], "install_project": plan["install_project"],
+  })
+
+
+@contextlib.contextmanager
+def preparation_lock(path):
+  with path.open("a") as handle:
+    fcntl.flock(handle, fcntl.LOCK_EX)
+    try:
+      yield handle
+    finally:
+      # Closing alone can retain a lock through inherited or duplicated descriptors.
+      fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _prepare(request):
+  plan = analyze(request)
+  if plan["issues"]:
+    raise RuntimeErrorDetail("\n".join(issue["message"] for issue in plan["issues"]))
+  operation = plan["operation"]
+  repo_root, state_dir = plan["repo_root"], plan["state_dir"]
+  environment, extras, sync_args = plan["environment"], plan["extras"], plan["sync_args"]
+  install_project, require_cuda = plan["install_project"], plan["require_cuda"]
+  project, pyproject, lockfile = plan["project"], plan["pyproject"], plan["lockfile"]
+  lock_sha256, pyproject_sha256 = plan["lock_sha256"], plan["pyproject_sha256"]
+  env, interpreter, base = plan["env"], plan["interpreter"], plan["base"]
+  inherited, modules, torch, requirements = plan["inherited"], plan["modules"], plan["torch"], plan["requirements"]
   environment_dir = state_dir / "environment"
   environment_path = environment_dir / ".venv"
   manifest_path = environment_dir / "environment-state.json"
@@ -608,8 +866,7 @@ def _prepare(request):
   if environment_path.is_relative_to(Path(base["python_prefix"])):
     raise RuntimeErrorDetail("expri environment state must be outside the base Python installation")
   environment_dir.mkdir(parents=True, exist_ok=True)
-  with (environment_dir / ".prepare.lock").open("a") as handle:
-    fcntl.flock(handle, fcntl.LOCK_EX)
+  with preparation_lock(environment_dir / ".prepare.lock"):
     owner = {"schema_version": 1, "repo_root": str(repo_root)}
     if owner_path.exists():
       if json.loads(owner_path.read_text()) != owner:
@@ -620,20 +877,7 @@ def _prepare(request):
       raise RuntimeErrorDetail("environment is not prepared; run expri setup first")
     else:
       atomic_json(owner_path, owner)
-    fingerprint = digest({
-      "schema_version": 1,
-      "lock_sha256": lock_sha256,
-      "pyproject_sha256": pyproject_sha256,
-      "base_python": base["python"],
-      "marker_env": base["marker_env"],
-      "inherited": {name: base["packages"][name] for name in sorted(inherited)},
-      "selected_requirements": {name: str(value) for name, value in requirements.items()},
-      "extras": extras,
-      "sync_args": sync_args,
-      "env_sha256": digest(environment.get("env", {})),
-      "require_cuda": require_cuda,
-      "install_project": install_project,
-    })
+    fingerprint = environment_fingerprint(plan)
     previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
     current = previous and previous.get("fingerprint") == fingerprint and environment_path.is_dir()
     if operation == "validate" and not current:
@@ -676,7 +920,7 @@ def _prepare(request):
         combined = inspect_python(python, repo_root, env)
         ensure_build_requirements(project, combined)
         invoke(
-          ["uv", "pip", "install", "--python", str(python), "--no-deps", "--no-build-isolation", "--editable", str(repo_root)],
+          ["uv", "pip", "install", *installation_args(sync_args), "--python", str(python), "--no-deps", "--no-build-isolation", "--editable", str(repo_root)],
           cwd=repo_root, env=env,
         )
     combined = inspect_python(python, repo_root, env, isolated=False, modules=modules, torch=torch or require_cuda, require_cuda=require_cuda)
@@ -692,7 +936,7 @@ def _prepare(request):
     )
     inherited_entry_points(environment_path, inherited, base, operation)
     # Snapshot the base again to verify the helper never changed its packages.
-    after = inspect_python(interpreter, repo_root, env, include_packages=bool(roots))
+    after = inspect_python(interpreter, repo_root, env, include_packages=bool(plan["roots"]))
     if after["packages"] != base["packages"]:
       manifest_path.unlink(missing_ok=True)
       raise RuntimeErrorDetail("base environment changed while preparing; no runtime manifest was published")
@@ -714,6 +958,7 @@ def _prepare(request):
       "selected_requirements": {name: str(value) for name, value in requirements.items()},
       "install_project": install_project,
       "env_sha256": digest(environment.get("env", {})),
+      "cache": plan["cache"],
     }
     atomic_json(manifest_path, manifest)
     return {
@@ -721,9 +966,11 @@ def _prepare(request):
       "python": str(python),
       "manifest_path": str(manifest_path),
       "reused_packages": sorted(inherited),
+      "cache": plan["cache"],
       "run_env": {
         **environment.get("env", {}),
         "UV_PROJECT_ENVIRONMENT": str(environment_path),
+        "UV_CACHE_DIR": plan["cache"]["directory"],
         "PYTHONNOUSERSITE": "1",
         "PATH": os.pathsep.join([
           str(environment_path / "bin"), str(Path(base["python_prefix"]) / "bin"),
@@ -734,7 +981,116 @@ def _prepare(request):
     }
 
 
+def planned_build_requirements(plan):
+  issues = plan["issues"]
+  checks = plan["checks"]
+  if not plan["inherited"] or not is_packaged(plan["project"]):
+    checks["editable_build"] = "not_requested"
+    return
+  if plan["checks"]["lock"] == "unavailable" or any(issue["kind"] == "lock_export" for issue in issues):
+    checks["editable_build"] = "unavailable"
+    return
+  packages = dict(plan["base"]["packages"])
+  for name, requirement in plan["requirements"].items():
+    if name in plan["inherited"]:
+      continue
+    pins = list(requirement.specifier)
+    if not requirement.url and len(pins) == 1 and pins[0].operator == "==":
+      packages[name] = {"name": name, "version": pins[0].version}
+  before = len(issues)
+  for raw in plan["project"].get("build-system", {}).get("requires", []):
+    requirement = checked_requirement(raw, "build-system.requires", issues)
+    if not requirement or not marker_applies(requirement, plan["base"]["marker_env"]):
+      continue
+    try:
+      require_installed(requirement, packages, "planned editable project build")
+    except RuntimeErrorDetail as error:
+      add_issue(issues, "build_requirement",
+        f"{error}; add a compatible build dependency to the locked project or base environment; "
+        "expri will not download isolated build dependencies in reuse mode",
+        requirement.name,
+      )
+  checks["editable_build"] = "planned" if len(issues) == before else "failed"
+
+
+def inspect_prepared(plan):
+  checks = plan["checks"]
+  environment_dir = plan["state_dir"] / "environment"
+  environment_path = environment_dir / ".venv"
+  owner_path = environment_dir / "owner.json"
+  manifest_path = environment_dir / "environment-state.json"
+  python = environment_path / "bin" / "python"
+  if not python.is_file() or not manifest_path.is_file():
+    checks["combined_runtime"] = "pending"
+    return
+  combined_issues = []
+  checks["combined_issues"] = combined_issues
+  try:
+    if environment_path.is_symlink() or not owner_path.is_file() or json.loads(owner_path.read_text()) != {"schema_version": 1, "repo_root": str(plan["repo_root"])}:
+      checks["combined_runtime"] = "unowned"
+      return
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest, dict):
+      raise RuntimeErrorDetail("prepared environment manifest must be an object")
+    checks["prepared_fingerprint"] = "current" if not plan["issues"] and manifest.get("fingerprint") == environment_fingerprint(plan) else "stale"
+    combined = inspect_python(
+      python, plan["repo_root"], plan["env"], isolated=False, modules=plan["modules"],
+      torch=plan["torch"] or plan["require_cuda"], require_cuda=plan["require_cuda"],
+    )
+    base = plan["base"]
+    if combined["base_prefix"] != base["base_prefix"] or combined["marker_env"] != base["marker_env"]:
+      add_issue(combined_issues, "combined_interpreter", "prepared environment uses a different base interpreter or Python version")
+    own_project = manifest.get("install_project", False) and is_packaged(plan["project"])
+    validate_combined(
+      combined, plan["requirements"], plan["inherited"], base,
+      project_name=plan["project"].get("project", {}).get("name") if own_project else None,
+      project_extras=plan["extras"],
+      build_requirements=plan["project"].get("build-system", {}).get("requires", []) if own_project and plan["inherited"] else (),
+      issues=combined_issues,
+    )
+    inherited_entry_points(environment_path, plan["inherited"], base, "validate")
+    checks["combined_runtime"] = "failed" if combined_issues else "passed"
+  except (RuntimeErrorDetail, ValueError, OSError) as error:
+    add_issue(combined_issues, "combined_runtime", str(error))
+    checks["combined_runtime"] = "failed"
+
+
+def doctor(request):
+  # This path intentionally never calls preparation or its failure invalidator.
+  # uv may use its cache, but project/base/run environment state stays untouched.
+  try:
+    plan = analyze(request)
+    if plan["base"] is not None:
+      planned_build_requirements(plan)
+      checks = plan["checks"]
+      checks["python_version"] = plan["base"]["marker_env"]["python_full_version"]
+      checks["torch_details"] = plan["base"].get("torch")
+      checks["gpu_driver"] = plan["base"].get("gpu_driver")
+      checks["inherited_package_count"] = len(plan["inherited"])
+      checks["locked_package_count"] = len(plan["requirements"])
+      checks["locked_overlap_count"] = len(set(plan["inherited"]) & set(plan["requirements"]))
+      inspect_prepared(plan)
+    return {
+      "compatible": not plan["issues"],
+      "scope": "base_and_lock",
+      "base_python": plan["base"]["python"] if plan["base"] else plan["interpreter"],
+      "reused_packages": sorted(plan["inherited"]),
+      "issues": plan["issues"], "checks": plan["checks"], "cache": plan["cache"],
+    }
+  except (RuntimeErrorDetail, KeyError, ValueError, OSError, TypeError) as error:
+    return {
+      "compatible": False, "scope": "base_and_lock", "base_python": None,
+      "reused_packages": [], "issues": [{"kind": "configuration", "message": str(error)}],
+      "checks": {"combined_runtime": "pending"},
+      "cache": {"directory": request.get("cache_dir"), "link_mode": "default", "same_filesystem": None, "disabled": False},
+    }
+
+
 def prepare(request):
+  if not isinstance(request, dict):
+    raise RuntimeErrorDetail("environment request must be a JSON object")
+  if request.get("operation") == "doctor":
+    return doctor(request)
   try:
     return _prepare(request)
   except Exception:

@@ -7,12 +7,16 @@ use clap::Parser;
 use serde_json::{Value, json};
 
 use crate::config::EnvironmentConfig;
-use crate::protocol::{RunRequest, SetupRequest, SetupStep};
+use crate::protocol::{
+  DoctorRequest, EnvironmentAction, EnvironmentCommandRequest, PruneRequest, RunRequest,
+  SetupRequest, SetupStep,
+};
 
 const FAKE_UV: &str = r#"#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 
@@ -22,7 +26,7 @@ def observation(kind, arguments):
     "argv": arguments,
     "cwd": str(Path.cwd()),
     "env": {key: os.environ.get(key) for key in [
-      "UV_PROJECT_ENVIRONMENT", "PYTHONNOUSERSITE", "CUSTOM_RUNTIME",
+      "UV_PROJECT_ENVIRONMENT", "UV_CACHE_DIR", "PYTHONNOUSERSITE", "CUSTOM_RUNTIME",
       "UV_PROJECT", "UV_PYTHON", "UV_ACTIVE", "VIRTUAL_ENV",
     ]},
   }
@@ -37,6 +41,25 @@ if arguments[:2] == ["run", "--isolated"]:
   run_dir = Path(request["state_dir"]).resolve()
   (run_dir / "helper-request.json").write_text(json.dumps(request))
   (run_dir / "helper-argv.json").write_text(json.dumps(arguments[:-2]))
+  (run_dir / "helper-environment.json").write_text(json.dumps(observation("helper", [])))
+  if os.environ.get("EXPRI_TEST_HELPER_SIGNAL") == "1":
+    os.kill(os.getpid(), signal.SIGTERM)
+  if request["operation"] == "doctor":
+    compatible = os.environ.get("EXPRI_TEST_DOCTOR_FAIL") != "1"
+    print(json.dumps({
+      "compatible": compatible,
+      "scope": "base_and_lock",
+      "base_python": "/opt/conda/bin/python",
+      "reused_packages": ["numpy", "torch"],
+      "issues": [] if compatible else [{
+        "kind": "locked_version_mismatch", "package": "torch",
+        "message": "the base torch version differs from uv.lock",
+      }],
+      "checks": {"lock": True, "base": True},
+      "cache": {"directory": request["cache_dir"], "link_mode": "hardlink",
+                "same_filesystem": True, "disabled": False},
+    }))
+    sys.exit(0)
   if os.environ.get("EXPRI_TEST_PREPARE_FAIL") == "1":
     sys.exit(19)
   environment_path = run_dir / "environment" / ".venv"
@@ -45,6 +68,9 @@ if arguments[:2] == ["run", "--isolated"]:
   (environment_path / "bin" / "python").symlink_to(sys.executable)
   manifest = run_dir / "environment" / "environment-state.json"
   manifest.write_text("{}")
+  (run_dir / "environment" / "owner.json").write_text(json.dumps({
+    "schema_version": 1, "repo_root": request["repo_root"],
+  }))
   if request["operation"] == "run":
     # Simulate a subsequent sync after the code snapshot has been prepared.
     (Path(os.environ["EXPRI_TEST_SOURCE_ROOT"]) / "train.py").write_text("later source")
@@ -56,6 +82,7 @@ if arguments[:2] == ["run", "--isolated"]:
     "manifest_path": str(manifest),
     "run_env": {
       "UV_PROJECT_ENVIRONMENT": str(environment_path), "PYTHONNOUSERSITE": "1",
+      "UV_CACHE_DIR": request.get("cache_dir", ""),
       "PATH": str(environment_path / "bin") + os.pathsep + os.environ["PATH"],
     },
     "env_remove": ["UV_PROJECT", "UV_PYTHON", "UV_ACTIVE", "VIRTUAL_ENV"],
@@ -71,12 +98,14 @@ elif arguments[:4] == ["run", "--no-sync", "--no-env-file", "--"]:
     "cwd": str(Path.cwd()),
     "source": Path("train.py").read_text(),
     "env": {key: os.environ.get(key) for key in [
-      "EXPRI_RUN_ID", "EXPRI_RUN_DIR", "EXPRI_OUTPUT_DIR", "UV_PROJECT_ENVIRONMENT",
+      "EXPRI_RUN_ID", "EXPRI_RUN_DIR", "EXPRI_OUTPUT_DIR", "UV_PROJECT_ENVIRONMENT", "UV_CACHE_DIR",
       "PYTHONNOUSERSITE", "CUSTOM_RUNTIME", "UV_PROJECT", "UV_PYTHON", "UV_ACTIVE", "VIRTUAL_ENV",
     ]},
   }
   output_dir = Path(os.environ["EXPRI_OUTPUT_DIR"])
   (output_dir / "task-observation.json").write_text(json.dumps(result))
+  if os.environ.get("EXPRI_TEST_TASK_SIGNAL") == "1":
+    os.kill(os.getpid(), signal.SIGTERM)
   sys.exit(int(os.environ.get("EXPRI_TEST_TASK_EXIT", "0")))
 else:
   print("unexpected fake uv arguments: " + repr(arguments), file=sys.stderr)
@@ -192,13 +221,17 @@ impl Fixture {
   }
 
   fn command(&self, backend: Backend, setup: bool) -> Command {
+    self.backend_command(backend, if setup { "setup" } else { "run" })
+  }
+
+  fn backend_command(&self, backend: Backend, operation: &str) -> Command {
     let mut command = match backend {
       Backend::Native => {
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
-        let test_name = if setup {
-          "environment::integration_tests::native_setup_child"
-        } else {
-          "environment::integration_tests::native_run_child"
+        let test_name = match operation {
+          "setup" => "environment::integration_tests::native_setup_child",
+          "environment" => "environment::integration_tests::native_environment_child",
+          _ => "environment::integration_tests::native_run_child",
         };
         command.args(["--exact", test_name, "--nocapture"]);
         command.env("EXPRI_TEST_NATIVE_REQUEST", &self.request_path);
@@ -207,10 +240,16 @@ impl Fixture {
       Backend::Python => {
         let mut command = Command::new("python3");
         let request_path = self.request_path.to_str().expect("request path UTF-8");
-        let script = if setup {
-          crate::controller::protocol::python_setup_script(request_path)
-        } else {
-          crate::controller::protocol::python_run_script(request_path)
+        let script = match operation {
+          "setup" => crate::controller::protocol::python_setup_script(request_path),
+          "environment" => {
+            let request: EnvironmentCommandRequest = serde_json::from_slice(
+              &fs::read(&self.request_path).expect("environment command request"),
+            )
+            .expect("environment command request JSON");
+            crate::controller::protocol::python_environment_script(&request)
+          }
+          _ => crate::controller::protocol::python_run_script(request_path),
         };
         command.args(["-c", &script]);
         command
@@ -223,6 +262,8 @@ impl Fixture {
     command
       .current_dir(&self.repo_root)
       .env("PATH", std::env::join_paths(paths).expect("test PATH"))
+      .env_remove("UV_CACHE_DIR")
+      .env_remove("EXPRI_TEST_CLI_CONFIG")
       .env("EXPRI_TEST_SOURCE_ROOT", &self.repo_root)
       .env("UV_PROJECT", "/ambient/wrong-project")
       .env("UV_PYTHON", "/ambient/wrong-python")
@@ -273,6 +314,46 @@ fn assert_helper_argv(path: &Path) {
   );
 }
 
+fn output_report(output: &Output) -> Value {
+  let start = output
+    .stdout
+    .iter()
+    .position(|byte| *byte == b'{')
+    .unwrap_or_else(|| {
+      panic!(
+        "missing JSON report: {}",
+        String::from_utf8_lossy(&output.stdout)
+      )
+    });
+  serde_json::Deserializer::from_slice(&output.stdout[start..])
+    .into_iter::<Value>()
+    .next()
+    .expect("JSON report")
+    .expect("valid JSON report")
+}
+
+fn assert_maintenance_exit(fixture: &Fixture, backend: Backend, output: &Output, expected: i32) {
+  match backend {
+    Backend::Native => {
+      assert!(
+        output.status.success(),
+        "native child: {}",
+        String::from_utf8_lossy(&output.stderr)
+      );
+      assert_eq!(
+        read_json(&fixture.repo_root.join(".expri/maintenance-outcome.json"))["exit_code"],
+        expected
+      );
+    }
+    Backend::Python => assert_eq!(
+      output.status.code(),
+      Some(expected),
+      "Python backend: {}",
+      String::from_utf8_lossy(&output.stderr)
+    ),
+  }
+}
+
 #[test]
 fn native_run_child() {
   let Some(request_path) = std::env::var_os("EXPRI_TEST_NATIVE_REQUEST") else {
@@ -319,7 +400,37 @@ fn native_setup_child() {
     serde_json::from_slice(&fs::read(request_path).expect("child request"))
       .expect("child request JSON");
   let repo_root = PathBuf::from(std::env::var_os("EXPRI_TEST_SOURCE_ROOT").expect("child root"));
-  crate::node::setup::apply_request_at(&request, &repo_root).expect("native setup result");
+  let result = crate::node::setup::apply_request_at(&request, &repo_root);
+  let outcome = match result {
+    Ok(()) => json!({"exit_code": 0}),
+    Err(error) => json!({"exit_code": error.exit_code(), "error": error.to_string()}),
+  };
+  fs::write(
+    repo_root.join(".expri/setup-outcome.json"),
+    serde_json::to_vec(&outcome).unwrap(),
+  )
+  .expect("native setup outcome");
+}
+
+#[test]
+fn native_environment_child() {
+  let Some(request_path) = std::env::var_os("EXPRI_TEST_NATIVE_REQUEST") else {
+    return;
+  };
+  let request: EnvironmentCommandRequest =
+    serde_json::from_slice(&fs::read(request_path).expect("child request"))
+      .expect("child environment command JSON");
+  let repo_root = PathBuf::from(std::env::var_os("EXPRI_TEST_SOURCE_ROOT").expect("child root"));
+  let result = crate::node::environment::apply_request_at(&request, &repo_root);
+  let outcome = match result {
+    Ok(()) => json!({"exit_code": 0}),
+    Err(error) => json!({"exit_code": error.exit_code(), "error": error.to_string()}),
+  };
+  fs::write(
+    repo_root.join(".expri/maintenance-outcome.json"),
+    serde_json::to_vec(&outcome).unwrap(),
+  )
+  .expect("native maintenance outcome");
 }
 
 #[test]
@@ -536,6 +647,60 @@ fn native_and_python_runs_preserve_task_failure_exit_code() {
 }
 
 #[test]
+fn native_and_python_signal_failures_keep_shell_exit_code_and_release_run_lease() {
+  for backend in [Backend::Native, Backend::Python] {
+    let fixture = Fixture::new();
+    let output = fixture
+      .command(backend, false)
+      .env("EXPRI_TEST_TASK_SIGNAL", "1")
+      .output()
+      .expect("signaled task output");
+    match backend {
+      Backend::Native => {
+        assert!(
+          output.status.success(),
+          "native run child: {}",
+          String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+          read_json(&fixture.repo_root.join(".expri/native-outcome.json"))["exit_code"],
+          143
+        );
+      }
+      Backend::Python => assert_eq!(output.status.code(), Some(143)),
+    }
+    let run_dir = fixture.run_dir();
+    let state = read_json(&run_dir.join("run-state.json"));
+    assert_eq!(state["status"], "failed");
+    assert_eq!(state["exit_code"], 143);
+    assert!(state["finished_at"].is_string());
+    assert!(run_dir.join(".run.lock").is_file());
+    let lease =
+      crate::lock::try_lock_file(&run_dir.join(".run.lock"), false).expect("released run lease");
+    let crate::lock::LockAttempt::Acquired(lease) = lease else {
+      panic!("signaled task retained run lease");
+    };
+    drop(lease);
+    let report = crate::environment::maintenance::prune(
+      &fixture.repo_root,
+      &PruneRequest {
+        apply: true,
+        keep_last: 0,
+      },
+    )
+    .expect("prune signaled failed run");
+    assert_eq!(
+      report.pruned_runs, 1,
+      "{backend:?} prune report: {report:?}"
+    );
+    assert!(!run_dir.join("environment/.venv").exists());
+    assert!(run_dir.join("code/train.py").is_file());
+    assert!(run_dir.join("outputs/task-observation.json").is_file());
+    assert_eq!(read_json(&run_dir.join("run-state.json")), state);
+  }
+}
+
+#[test]
 fn native_and_python_runs_record_preparation_failure_without_launching_task() {
   for backend in [Backend::Native, Backend::Python] {
     let fixture = Fixture::new();
@@ -556,6 +721,106 @@ fn native_and_python_runs_record_preparation_failure_without_launching_task() {
         read_json(&fixture.repo_root.join(".expri/native-outcome.json"))["exit_code"],
         19
       );
+    }
+  }
+}
+
+#[test]
+fn native_and_python_preparation_signals_preserve_status_for_run_setup_and_doctor() {
+  for backend in [Backend::Native, Backend::Python] {
+    for operation in ["run", "setup", "doctor"] {
+      let fixture = Fixture::new();
+      match operation {
+        "setup" => {
+          let request = SetupRequest {
+            state_dir: ".expri".to_string(),
+            force: false,
+            environment: Some(fixture.request.environment.clone()),
+            steps: vec![SetupStep::Uv {
+              extras: fixture.request.extras.clone(),
+              args: fixture.request.sync_args.clone(),
+            }],
+          };
+          fs::write(&fixture.request_path, serde_json::to_vec(&request).unwrap())
+            .expect("signaled setup request");
+        }
+        "doctor" => {
+          let request = EnvironmentCommandRequest {
+            json: true,
+            action: EnvironmentAction::Doctor(DoctorRequest {
+              environment: fixture.request.environment.clone(),
+              extras: fixture.request.extras.clone(),
+              sync_args: fixture.request.sync_args.clone(),
+            }),
+          };
+          fs::write(&fixture.request_path, serde_json::to_vec(&request).unwrap())
+            .expect("signaled doctor request");
+        }
+        _ => {}
+      }
+      let output = fixture
+        .backend_command(
+          backend,
+          if operation == "doctor" {
+            "environment"
+          } else {
+            operation
+          },
+        )
+        .env("EXPRI_TEST_HELPER_SIGNAL", "1")
+        .output()
+        .expect("signaled preparation output");
+      match backend {
+        Backend::Native => {
+          assert!(
+            output.status.success(),
+            "native {operation} child: {}",
+            String::from_utf8_lossy(&output.stderr)
+          );
+          let outcome_path = match operation {
+            "setup" => ".expri/setup-outcome.json",
+            "doctor" => ".expri/maintenance-outcome.json",
+            _ => ".expri/native-outcome.json",
+          };
+          assert_eq!(
+            read_json(&fixture.repo_root.join(outcome_path))["exit_code"],
+            143,
+            "{backend:?}/{operation}"
+          );
+        }
+        Backend::Python => assert_eq!(
+          output.status.code(),
+          Some(143),
+          "{backend:?}/{operation}: {}",
+          String::from_utf8_lossy(&output.stderr)
+        ),
+      }
+      let helper_dir = if operation == "run" {
+        let run_dir = fixture.run_dir();
+        let state = read_json(&run_dir.join("run-state.json"));
+        assert_eq!(state["status"], "failed");
+        assert_eq!(state["exit_code"], 143);
+        assert!(state["finished_at"].is_string());
+        assert!(state["error"].is_string());
+        assert!(state["environment_manifest"].is_null());
+        assert!(!run_dir.join("outputs/task-observation.json").exists());
+        let lease = crate::lock::try_lock_file(&run_dir.join(".run.lock"), false)
+          .expect("preparation failure releases run lease");
+        let crate::lock::LockAttempt::Acquired(lease) = lease else {
+          panic!("signaled preparation retained run lease");
+        };
+        drop(lease);
+        run_dir
+      } else {
+        assert!(!fixture.repo_root.join(".expri/runs").exists());
+        assert!(!fixture.repo_root.join(".expri/setup-state.json").exists());
+        fixture.repo_root.join(".expri")
+      };
+      assert_eq!(
+        read_json(&helper_dir.join("helper-request.json"))["operation"],
+        operation
+      );
+      assert!(!helper_dir.join("environment").exists());
     }
   }
 }
@@ -629,4 +894,240 @@ train = ["python", "train.py"]
     "explicit experiment settings"
   );
   assert!(!run_dir.join("code/not-selected.cfg").exists());
+}
+
+#[test]
+fn native_and_python_run_caches_stay_in_original_checkout_across_snapshots() {
+  for backend in [Backend::Native, Backend::Python] {
+    for selection in ["default", "ambient", "explicit"] {
+      let mut fixture = Fixture::new();
+      let expected_cache = fixture.repo_root.join(match selection {
+        "ambient" => "ambient-cache",
+        "explicit" => "explicit-cache",
+        _ => ".expri/cache/uv",
+      });
+      if selection == "explicit" {
+        fixture
+          .request
+          .sync_args
+          .extend(["--cache-dir".to_string(), "explicit-cache".to_string()]);
+        fs::write(
+          &fixture.request_path,
+          serde_json::to_vec(&fixture.request).unwrap(),
+        )
+        .expect("cache request");
+      }
+      for _ in 0..2 {
+        let mut command = fixture.command(backend, false);
+        if selection != "default" {
+          command.env("UV_CACHE_DIR", "ambient-cache");
+        }
+        let output = command.output().expect("cached run output");
+        assert!(
+          output.status.success(),
+          "{backend:?}/{selection}: {}",
+          String::from_utf8_lossy(&output.stderr)
+        );
+      }
+      let runs: Vec<_> = fs::read_dir(fixture.repo_root.join(".expri/runs"))
+        .expect("cache run directories")
+        .map(|entry| entry.expect("run entry").path())
+        .collect();
+      assert_eq!(runs.len(), 2);
+      assert_ne!(runs[0], runs[1]);
+      for run_dir in &runs {
+        assert_eq!(
+          read_json(&run_dir.join("run-state.json"))["status"],
+          "completed"
+        );
+        let helper = read_json(&run_dir.join("helper-request.json"));
+        assert_eq!(
+          helper["cache_dir"],
+          expected_cache.to_string_lossy().as_ref(),
+          "{backend:?}/{selection}"
+        );
+        assert_eq!(
+          read_json(&run_dir.join("helper-environment.json"))["env"]["UV_CACHE_DIR"],
+          helper["cache_dir"]
+        );
+        let task = read_json(&run_dir.join("outputs/task-observation.json"));
+        assert_eq!(task["env"]["UV_CACHE_DIR"], helper["cache_dir"]);
+        assert_eq!(
+          task["env"]["UV_PROJECT_ENVIRONMENT"],
+          run_dir.join("environment/.venv").to_string_lossy().as_ref()
+        );
+      }
+      assert_eq!(
+        read_json(&runs[0].join("helper-request.json"))["cache_dir"],
+        read_json(&runs[1].join("helper-request.json"))["cache_dir"]
+      );
+    }
+  }
+}
+
+#[test]
+fn native_and_python_doctor_preserve_json_report_without_preparing_environment() {
+  for backend in [Backend::Native, Backend::Python] {
+    for compatible in [true, false] {
+      let fixture = Fixture::new();
+      let request = EnvironmentCommandRequest {
+        json: true,
+        action: EnvironmentAction::Doctor(DoctorRequest {
+          environment: fixture.request.environment.clone(),
+          extras: fixture.request.extras.clone(),
+          sync_args: fixture.request.sync_args.clone(),
+        }),
+      };
+      fs::write(&fixture.request_path, serde_json::to_vec(&request).unwrap())
+        .expect("doctor request");
+      let output = fixture
+        .backend_command(backend, "environment")
+        .env("EXPRI_TEST_DOCTOR_FAIL", if compatible { "0" } else { "1" })
+        .output()
+        .expect("doctor output");
+      assert_maintenance_exit(&fixture, backend, &output, if compatible { 0 } else { 1 });
+      let report = output_report(&output);
+      assert_eq!(report["scope"], "base_and_lock");
+      assert_eq!(report["compatible"], compatible);
+      assert_eq!(report["base_python"], "/opt/conda/bin/python");
+      assert_eq!(report["reused_packages"], json!(["numpy", "torch"]));
+      assert_eq!(
+        report["cache"]["directory"],
+        fixture
+          .repo_root
+          .join(".expri/cache/uv")
+          .to_string_lossy()
+          .as_ref()
+      );
+      assert_eq!(
+        report["issues"].as_array().unwrap().len(),
+        if compatible { 0 } else { 1 }
+      );
+      if !compatible {
+        assert_eq!(report["issues"][0]["kind"], "locked_version_mismatch");
+      }
+      let helper = read_json(&fixture.repo_root.join(".expri/helper-request.json"));
+      assert_eq!(helper["operation"], "doctor");
+      assert_eq!(helper["install_project"], false);
+      assert_eq!(helper["extras"], json!(fixture.request.extras));
+      assert_eq!(helper["sync_args"], json!(fixture.request.sync_args));
+      assert_eq!(
+        read_json(&fixture.repo_root.join(".expri/helper-environment.json"))["env"]["UV_CACHE_DIR"],
+        helper["cache_dir"]
+      );
+      assert_helper_argv(&fixture.repo_root.join(".expri/helper-argv.json"));
+      assert!(!fixture.repo_root.join(".expri/environment").exists());
+      assert!(!fixture.repo_root.join(".expri/runs").exists());
+    }
+  }
+}
+
+fn finished_environment(root: &Path, run_id: &str, status: &str, timestamp: &str) -> PathBuf {
+  let run_dir = root.join(".expri/runs").join(run_id);
+  fs::create_dir_all(run_dir.join("code")).expect("prune code directory");
+  fs::create_dir_all(run_dir.join("outputs")).expect("prune output directory");
+  fs::create_dir_all(run_dir.join("environment/.venv")).expect("prune environment directory");
+  fs::write(run_dir.join("code/train.py"), "preserved source").expect("prune source");
+  fs::write(run_dir.join("outputs/checkpoint.bin"), "preserved result").expect("prune output");
+  fs::write(
+    run_dir.join("environment/.venv/package.bin"),
+    "cached package bytes",
+  )
+  .expect("prune package");
+  fs::write(
+    run_dir.join("environment/owner.json"),
+    serde_json::to_vec(&json!({
+      "schema_version": 1, "repo_root": run_dir.join("code"),
+    }))
+    .unwrap(),
+  )
+  .expect("prune owner");
+  fs::write(run_dir.join("run-state.json"), serde_json::to_vec(&json!({
+    "run_id": run_id, "status": status, "code_dir": run_dir.join("code"), "finished_at": timestamp,
+  })).unwrap()).expect("prune run state");
+  run_dir
+}
+
+#[test]
+fn native_and_python_prune_preview_and_apply_preserve_run_artifacts() {
+  let mut reports = Vec::new();
+  for backend in [Backend::Native, Backend::Python] {
+    let fixture = Fixture::new();
+    let old = finished_environment(
+      &fixture.repo_root,
+      "run-old",
+      "completed",
+      "2026-10-02T01:00:00Z",
+    );
+    let newest = finished_environment(
+      &fixture.repo_root,
+      "run-new",
+      "failed",
+      "2026-10-02T02:00:00Z",
+    );
+    let active = finished_environment(
+      &fixture.repo_root,
+      "run-active",
+      "preparing",
+      "2026-10-02T03:00:00Z",
+    );
+    for apply in [false, true] {
+      let request = EnvironmentCommandRequest {
+        json: true,
+        action: EnvironmentAction::Prune(PruneRequest {
+          apply,
+          keep_last: 1,
+        }),
+      };
+      fs::write(&fixture.request_path, serde_json::to_vec(&request).unwrap())
+        .expect("prune request");
+      let output = fixture
+        .backend_command(backend, "environment")
+        .output()
+        .expect("prune output");
+      assert_maintenance_exit(&fixture, backend, &output, 0);
+      let report = output_report(&output);
+      assert_eq!(report["apply"], apply);
+      assert_eq!(report["keep_last"], 1);
+      assert_eq!(report["pruned_runs"], if apply { 1 } else { 0 });
+      let runs = report["runs"].as_array().expect("reported runs");
+      let entry = |id: &str| {
+        runs
+          .iter()
+          .find(|entry| entry["run_id"] == id)
+          .expect("run report")
+      };
+      assert_eq!(
+        entry("run-old")["action"],
+        if apply { "pruned" } else { "preview" }
+      );
+      assert_eq!(entry("run-new")["action"], "kept");
+      assert_eq!(entry("run-active")["action"], "skipped");
+      assert_eq!(report["logical_bytes"], "cached package bytes".len());
+      assert_eq!(old.join("environment/.venv").exists(), !apply);
+      assert!(newest.join("environment/.venv").is_dir());
+      assert!(active.join("environment/.venv").is_dir());
+      for run_dir in [&old, &newest, &active] {
+        assert_eq!(
+          fs::read_to_string(run_dir.join("code/train.py")).unwrap(),
+          "preserved source"
+        );
+        assert_eq!(
+          fs::read_to_string(run_dir.join("outputs/checkpoint.bin")).unwrap(),
+          "preserved result"
+        );
+        assert!(run_dir.join("run-state.json").is_file());
+        assert!(run_dir.join("environment/owner.json").is_file());
+      }
+      reports.push(report);
+    }
+  }
+  assert_eq!(
+    reports[0], reports[2],
+    "prune previews differ between protocols"
+  );
+  assert_eq!(
+    reports[1], reports[3],
+    "prune apply reports differ between protocols"
+  );
 }

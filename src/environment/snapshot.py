@@ -1,5 +1,6 @@
 """Standard-library snapshot implementation for targets without the expri binary."""
 
+import contextlib as _snapshot_contextlib
 import datetime as _snapshot_datetime
 import fcntl as _snapshot_fcntl
 import hashlib as _snapshot_hashlib
@@ -18,12 +19,8 @@ _SNAPSHOT_EXCLUDED_DIRS = {
 }
 
 
-def create_snapshot(repo_root, remote_managed, expected_sync=None):
-  """Return an isolated run directory after locking and verifying the checkout."""
-  root = _snapshot_pathlib.Path(repo_root).resolve(strict=True)
-  state_dir = root / ".expri"
-  _snapshot_private_directory(state_dir)
-  lock_path = state_dir / "worktree.lock"
+@_snapshot_contextlib.contextmanager
+def _snapshot_checkout_lock(lock_path):
   flags = _snapshot_os.O_CREAT | _snapshot_os.O_RDWR
   flags |= getattr(_snapshot_os, "O_NOFOLLOW", 0)
   flags |= getattr(_snapshot_os, "O_CLOEXEC", 0)
@@ -31,6 +28,20 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
     if not _snapshot_stat.S_ISREG(_snapshot_os.fstat(lock.fileno()).st_mode):
       raise RuntimeError("checkout lock must be a regular file: " + str(lock_path))
     _snapshot_fcntl.flock(lock, _snapshot_fcntl.LOCK_EX)
+    try:
+      yield lock
+    finally:
+      # Close alone can leave a lock held by a concurrently inherited descriptor.
+      _snapshot_fcntl.flock(lock, _snapshot_fcntl.LOCK_UN)
+
+
+def create_snapshot(repo_root, remote_managed, expected_sync=None):
+  """Return an isolated run directory after locking and verifying the checkout."""
+  root = _snapshot_pathlib.Path(repo_root).resolve(strict=True)
+  state_dir = root / ".expri"
+  _snapshot_private_directory(state_dir)
+  lock_path = state_dir / "worktree.lock"
+  with _snapshot_checkout_lock(lock_path):
     if expected_sync is not None:
       expected_identity = None
       if isinstance(expected_sync, dict) and all(

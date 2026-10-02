@@ -68,6 +68,8 @@ For configured environments, `auto` also checks whether the installed node
 supports environment preparation and isolated runs. An older node falls back
 to the Python protocol. `protocol = "expri-node"` requires a node with those
 capabilities and reports an error when an upgrade is needed.
+The `env doctor` and `env prune` commands also check for maintenance support
+and use the same automatic fallback for older nodes.
 
 The sync algorithm uploads committed history with a git bundle, stages `HEAD`
 plus a zip archive of local dirty and untracked files, then installs the staged
@@ -145,9 +147,13 @@ the copied code files of an active run. Base packages remain shared when reuse
 is enabled, and uv's cache avoids repeated downloads when it creates each run's
 environment.
 
-Run environments are retained under `.expri/runs/` and are not automatically
-pruned. The uv cache reduces repeated downloads, but snapshots, environments,
-and outputs still accumulate on disk.
+Run environments are retained under `.expri/runs/`. Expri keeps a shared uv
+cache in the original checkout's `.expri/cache/uv`, so each new code snapshot
+uses the same cached packages. An explicit setup `--cache-dir` is resolved from
+the original checkout and remains stable across runs; otherwise an ambient
+`UV_CACHE_DIR` override takes precedence over the project default. Environments,
+snapshots, and outputs still accumulate; use `expri env prune` to review old run
+environments for removal.
 
 Local snapshots include explicit file paths listed in `sync.include_ignored`,
 such as a Git-ignored experiment configuration, alongside the usual tracked,
@@ -246,6 +252,57 @@ uv. Project dependencies are also fetched as needed through uv. Reuse mode
 installs external dependencies from wheels, so missing compatible wheels fail
 explicitly. The current project is installed as an editable package in the run
 environment using compatible build dependencies already available there.
+
+## Environment checks and storage
+
+Before preparing a rented machine's project environment, check its existing
+Python stack against the selected lockfile:
+
+```sh
+expri -T runpod sync
+expri -T runpod env doctor
+expri -T runpod env doctor --json
+```
+
+For a top-level `[environment]`, run `expri env doctor` locally. The report
+identifies the base Python, inherited package closure, failed checks, and cache
+configuration. Its compatibility verdict covers the base stack and selected
+lock graph. It does not certify a rental provider, GPU performance, or a future
+project build. If an owned prepared environment already exists, the report
+checks it separately without rewriting its manifest. Project dependency
+installation and combined-environment validation happen during setup or run
+preparation. The helper may fetch its small pinned dependencies and the lock
+export may need package-index access.
+
+If the report identifies a locked-version mismatch, select a base image and
+lockfile that agree. A missing `nvidia-*` wheel metadata issue means Conda
+native CUDA libraries alone do not describe the requested wheel stack.
+`require_cuda = true` additionally checks GPU availability and a small CUDA
+computation; successful CUDA execution does not waive dependency checks.
+
+The report includes the effective cache directory, link mode, whether the cache
+and run environments share a filesystem, and whether caching is disabled.
+Sharing cached package files through hardlinks or filesystem clones can reduce
+physical disk use on a compatible filesystem. Copy mode, cross-filesystem
+storage, source builds, editable projects, and generated outputs can still add
+per-run bytes. A directory's logical file size is not the amount of disk space
+that pruning will reclaim.
+
+Preview pruning before applying it:
+
+```sh
+expri -T runpod env prune
+expri -T runpod env prune --keep-last 1 --apply
+# Local project:
+expri env prune --keep-last 1 --dry-run
+```
+
+Pruning defaults to a preview and keeps the latest eligible run environment.
+It removes only expri-owned `.venv` directories from finished runs. Active or
+preparing runs, unsafe paths, and unowned environments are skipped. Code
+snapshots, outputs, run records, setup environments, and the shared cache remain
+available. The report lists each run's action and reason, logical bytes, and
+the number of environments removed. Pruning does not happen automatically.
 
 ## Setup
 

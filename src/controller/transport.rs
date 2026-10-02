@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::config::{TargetConfig, TransportKind};
-use crate::error::{ExpriError, Result};
+use crate::error::{ExpriError, Result, command_exit_code};
 use crate::shell;
 
 #[derive(Clone, Debug)]
@@ -147,7 +147,7 @@ impl Remote {
     if !output.status.success() {
       return Err(ExpriError::CommandFailed {
         program: program.to_string(),
-        code: output.status.code(),
+        code: command_exit_code(&output.status),
       });
     }
     Ok(output.stdout)
@@ -369,7 +369,7 @@ impl Remote {
     if !status.success() {
       return Err(ExpriError::CommandFailed {
         program: program.to_string(),
-        code: status.code(),
+        code: command_exit_code(&status),
       });
     }
     Ok(())
