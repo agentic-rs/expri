@@ -164,6 +164,7 @@ expri run dev
 expri run train --epochs 3
 expri -T runpod run train --epochs 3
 expri -T runpod run --no-sync train --epochs 3
+expri -T runpod run --detach train --epochs 3
 ```
 
 When `-T/--target` is provided, `run` syncs the repo to the target before
@@ -192,13 +193,42 @@ the helper's private JSON response stays out of task stdout. Run records include
 the command, timestamps, status, exit code, and log paths. Older run directories
 remain readable when optional records or logs are missing.
 
-Execution remains a foreground process. Saved logs do not make tasks survive
-an SSH disconnect or provide detached-job supervision. A stopped runner can
-leave a preparing or running record; expri preserves that recorded status.
-If a descendant keeps a pipe open after the foreground child exits, logging
-stops waiting after a one-second grace period. This and other capture failures
-are recorded as `logging_error`, while `task_exit_code` preserves the task's
-exit status. Buffered output from closed pipes is drained completely.
+Execution stays in the foreground by default. On Unix, `run --detach <task>`
+starts a separate supervisor session and returns a JSON receipt containing the
+run ID and directory after the supervisor owns the run and can accept requests.
+Environment preparation then continues in the background; inspect status and
+stderr for its progress. The run survives a terminal or SSH disconnect. Detach
+requires a configured environment, including an empty `[environment]` table
+for ordinary uv isolation; legacy tasks are rejected before remote sync.
+
+Detached runs use the same snapshot, environment, outputs, and log layout.
+They do not restart after a machine reboot or a lost supervisor. `runs status`
+reports `lost` when a detached run has an active recorded status but no live
+supervisor. Foreground runs retain their recorded status when their runner is
+stopped. If a descendant keeps a pipe open after the child exits, logging stops
+waiting after a one-second grace period. This and other capture failures are
+recorded as `logging_error`, while `task_exit_code` preserves the task's exit
+status. Buffered output from closed pipes is drained completely.
+
+Check a detached run, follow its saved logs, or request cancellation:
+
+```sh
+expri -T runpod run --detach train --epochs 3
+expri -T runpod runs status run-abc123 --json
+expri -T runpod runs logs run-abc123 --tail 100 --follow
+expri -T runpod runs logs run-abc123 --stream stderr --tail 50
+expri -T runpod runs cancel run-abc123
+```
+
+These commands also work locally without `-T`. `logs` emits the selected log's
+raw bytes, defaults to stdout and the last 100 lines, and stops following once
+the run finishes or its supervisor is lost. `--tail 0 --follow` reads only new
+output. Interrupting or disconnecting a log reader leaves the run running.
+Cancellation requests are asynchronous: the supervisor sends a graceful
+termination signal to its current preparation or task process group, then
+escalates after two seconds if needed. Inspect status again to confirm
+`cancelled`. Cancelling an already finished run leaves its result intact;
+active foreground or lost runs cannot be cancelled through this command.
 
 ## Run records and selective pull
 
@@ -211,7 +241,7 @@ expri -T runpod runs show run-abc123 --json
 ```
 
 `list` defaults to the 20 newest records. Its status filters are `preparing`,
-`running`, `completed`, `failed`, and `unknown`. `show` includes the run state,
+`running`, `completed`, `failed`, `cancelled`, and `unknown`. `show` includes the run state,
 source snapshot provenance, and recorded Python environment when available.
 Missing, malformed, or unsupported records produce warnings; incomplete runs
 can still be inspected. These commands read fixed records rather than scanning

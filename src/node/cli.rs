@@ -7,6 +7,7 @@ use crate::error::{ExpriError, Result};
 pub const UV_ENVIRONMENT_CAPABILITY: &str = "uv-environment-v1";
 pub const ENVIRONMENT_MAINTENANCE_CAPABILITY: &str = "env-maintenance-v1";
 pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
+pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
@@ -15,9 +16,18 @@ pub enum NodeCommand {
   PullPrepare,
   Setup(SetupCommand),
   Run(SetupCommand),
+  #[command(hide = true)]
+  RunWorker(RunWorkerCommand),
   Env(RequestCommand),
   Runs(RequestCommand),
+  Jobs(RequestCommand),
   SyncApply(SyncApplyCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct RunWorkerCommand {
+  #[arg(long)]
+  pub run_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -60,6 +70,7 @@ pub fn run(command: NodeCommand) -> Result<()> {
     NodeCommand::PullPrepare => crate::node::sync::prepare_pull(),
     NodeCommand::Setup(command) => crate::node::setup::apply_request_file(&command.request),
     NodeCommand::Run(command) => crate::node::run::apply_request_file(&command.request),
+    NodeCommand::RunWorker(command) => crate::node::run::worker(&command.run_dir),
     NodeCommand::Env(command) => {
       if let Some(path) = command.request {
         crate::node::environment::apply_request_file(&path)
@@ -74,6 +85,13 @@ pub fn run(command: NodeCommand) -> Result<()> {
         crate::node::runs::apply_request_stdin()
       }
     }
+    NodeCommand::Jobs(command) => {
+      if let Some(path) = command.request {
+        crate::node::jobs::apply_request_file(&path)
+      } else {
+        crate::node::jobs::apply_request_stdin()
+      }
+    }
     NodeCommand::SyncApply(command) => crate::node::sync::apply_request_file(&command.request),
   }
 }
@@ -84,6 +102,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
       UV_ENVIRONMENT_CAPABILITY,
       ENVIRONMENT_MAINTENANCE_CAPABILITY,
       RUN_RECORDS_CAPABILITY,
+      DURABLE_RUNS_CAPABILITY,
     ]
     .contains(&requested.as_str())
     {
@@ -94,7 +113,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
   } else {
     println!(
       "{}",
-      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY]})
+      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY, DURABLE_RUNS_CAPABILITY]})
     );
   }
   Ok(())

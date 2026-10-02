@@ -606,6 +606,35 @@ fn inspection_does_not_require_a_lease_or_mutate_active_records() {
   drop(lease);
 }
 
+#[test]
+fn catalogs_accept_cancelled_and_lost_without_live_probes_in_cached_queries() {
+  let (_directory, root) = fixture();
+  let cached = root.join("results/gpu/runs");
+  for status in ["cancelled", "lost", "running"] {
+    let id = format!("run-{status}");
+    let mut saved = state(&id, status, "2026-10-03T00:00:00Z");
+    saved["detached"] = json!(true);
+    if status == "cancelled" {
+      saved["finished_at"] = json!("2026-10-03T00:01:00Z");
+      saved["exit_code"] = json!(143);
+    }
+    run(&cached, &id, Some(&saved));
+    let report = parity(
+      &cached,
+      &RunQueryRequest::List {
+        task: None,
+        status: Some(status.to_string()),
+        limit: None,
+      },
+      true,
+    );
+    assert_eq!(report["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(report["runs"][0]["status"], status);
+    assert!(report["warnings"].as_array().unwrap().is_empty());
+    assert!(!cached.join(id).join(".run.lock").exists());
+  }
+}
+
 #[cfg(unix)]
 #[test]
 fn normal_repository_aliases_work_without_allowing_catalog_boundary_symlinks() {

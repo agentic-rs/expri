@@ -323,6 +323,99 @@ print("parent done")
     self.assertTrue(children[0].stdout.closed)
     self.assertTrue(children[0].stderr.closed)
 
+  def test_cancel_before_launch_does_not_start_task(self):
+    cancel = self.run_dir / ".cancel-request"
+    cancel.touch()
+    side_effect = self.run_dir / "started"
+    with self.logs(cancel_path=cancel) as logs:
+      result = logs.run(python("import pathlib, sys; pathlib.Path(sys.argv[1]).touch()", side_effect))
+    self.assertTrue(result.cancelled)
+    self.assertEqual(result.returncode, -signal.SIGTERM)
+    self.assertFalse(side_effect.exists())
+
+  def test_cancel_is_checked_after_child_closes_output_pipes(self):
+    cancel = self.run_dir / ".cancel-request"
+    ready = self.run_dir / "ready"
+    code = "import os, pathlib, sys, time; os.close(1); os.close(2); pathlib.Path(sys.argv[1]).touch(); time.sleep(20)"
+    def request_cancel():
+      deadline = time.monotonic() + 3
+      while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+      cancel.touch()
+    requester = threading.Thread(target=request_cancel)
+    requester.start()
+    try:
+      with self.logs(cancel_path=cancel, cancel_grace=0.1) as logs:
+        result = logs.run(python(code, ready))
+    finally:
+      requester.join(4)
+    self.assertTrue(ready.exists())
+    self.assertTrue(result.cancelled)
+    self.assertEqual(result.returncode, -signal.SIGTERM)
+
+  def test_cancel_escalates_for_descendants_after_direct_child_exits(self):
+    cancel = self.run_dir / ".cancel-request"
+    ready = self.run_dir / "ready"
+    descendant_code = "import pathlib, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(sys.argv[1]).touch(); print('descendant ready', flush=True); time.sleep(20)"
+    code = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); time.sleep(20)"
+    def request_cancel():
+      deadline = time.monotonic() + 3
+      while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+      cancel.touch()
+    requester = threading.Thread(target=request_cancel)
+    requester.start()
+    started = time.monotonic()
+    try:
+      with self.logs(cancel_path=cancel, cancel_grace=0.2) as logs:
+        result = logs.run(python(code, descendant_code, ready))
+    finally:
+      requester.join(4)
+    self.assertTrue(result.cancelled)
+    self.assertEqual(result.returncode, -signal.SIGTERM)
+    self.assertIsNone(result.log_error)
+    self.assertLess(time.monotonic() - started, 3)
+    self.assertEqual(self.read_log("stdout"), b"descendant ready\n")
+
+  def test_detached_logging_does_not_mirror_to_terminal(self):
+    with self.logs(mirror=False) as logs:
+      result = logs.run(python("import os; os.write(1, b'output'); os.write(2, b'error')"))
+    self.assertEqual(result.returncode, 0)
+    self.assertEqual(self.stdout.getvalue(), b"")
+    self.assertEqual(self.stderr.getvalue(), b"")
+    self.assertEqual(self.read_log("stdout"), b"output")
+    self.assertEqual(self.read_log("stderr"), b"error")
+
+  def test_cancel_during_natural_exit_drain_stops_surviving_descendant(self):
+    cancel = self.run_dir / ".cancel-request"
+    ready = self.run_dir / "ready"
+    observed_exit = threading.Event()
+    descendant_code = "import pathlib, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(sys.argv[1]).touch(); print('descendant ready', flush=True); time.sleep(20)"
+    code = "import pathlib, subprocess, sys, time; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]]); exec('while not pathlib.Path(sys.argv[2]).exists():\\n  time.sleep(0.01)'); print('parent done', flush=True)"
+    real_exited = run_logs._RunChildExit.exited
+    def remember_exit(observer):
+      done = real_exited(observer)
+      if done:
+        observed_exit.set()
+      return done
+    def request_cancel():
+      if observed_exit.wait(3):
+        cancel.touch()
+    requester = threading.Thread(target=request_cancel)
+    requester.start()
+    try:
+      with self.logs(cancel_path=cancel, cancel_grace=0.2, drain_grace=1) as logs:
+        with patch.object(run_logs._RunChildExit, "exited", remember_exit):
+          result = logs.run(python(code, descendant_code, ready))
+    finally:
+      requester.join(4)
+    self.assertTrue(observed_exit.is_set())
+    self.assertTrue(result.cancelled)
+    self.assertEqual(result.returncode, 0)
+    self.assertIsNone(result.log_error)
+    self.assertIn(b"descendant ready\n", self.read_log("stdout"))
+    self.assertIn(b"parent done\n", self.read_log("stdout"))
+
 
 if __name__ == "__main__":
   unittest.main()

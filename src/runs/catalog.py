@@ -11,7 +11,7 @@ import stat as _catalog_stat
 _CATALOG_METADATA_LIMIT = 256 * 1024
 _CATALOG_DETAIL_LIMIT = 16 * 1024 * 1024
 _CATALOG_EXCLUDED_COMPONENTS = {".venv", ".expri", ".git", ".cache", "cache", "__pycache__"}
-_CATALOG_STATUSES = {"preparing", "running", "completed", "failed", "unknown"}
+_CATALOG_STATUSES = {"preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"}
 _CATALOG_METADATA_FILES = (
   "run-state.json", "snapshot.json", "environment/environment-state.json",
 )
@@ -191,12 +191,12 @@ def _catalog_summary(run_id, state, warnings):
       summary["finished_at"] = finished_at
     else:
       _catalog_warning(warnings, run_id, "run-state.json has invalid or missing finished_at")
-  elif summary["status"] in {"completed", "failed"}:
+  elif summary["status"] in {"completed", "failed", "cancelled"}:
     _catalog_warning(warnings, run_id, "run-state.json has invalid or missing finished_at")
   exit_code = state.get("exit_code")
   if type(exit_code) is int and -(2 ** 31) <= exit_code < 2 ** 31:
     summary["exit_code"] = exit_code
-  elif "exit_code" in state or summary["status"] in {"completed", "failed"}:
+  elif "exit_code" in state or summary["status"] in {"completed", "failed", "cancelled"}:
     _catalog_warning(warnings, run_id, "run-state.json has invalid or missing exit_code")
   return summary, timestamp
 

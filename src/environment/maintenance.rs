@@ -203,7 +203,7 @@ fn inspect_finished(run_dir: &Path) -> std::result::Result<FinishedRun, String> 
     .get("status")
     .and_then(Value::as_str)
     .unwrap_or_default();
-  if !matches!(status, "completed" | "failed") {
+  if !matches!(status, "completed" | "failed" | "cancelled") {
     return Err("run has not verifiably finished".to_string());
   }
   let finished_at = state

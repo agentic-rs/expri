@@ -20,10 +20,16 @@ enum RunsSubcommand {
   Show(RunsShowCommand),
   /// Download remote metadata and logs, with optional artifacts.
   Pull(RunsPullCommand),
+  /// Check recorded status and detached supervisor liveness.
+  Status(RunsJobCommand),
+  /// Read saved stdout or stderr, optionally following a running task.
+  Logs(RunsLogsCommand),
+  /// Request graceful cancellation of a detached run.
+  Cancel(RunsJobCommand),
 }
 
 #[derive(Debug, Args)]
-struct RunsArgs {
+struct ConnectionArgs {
   #[arg(long)]
   config: Option<PathBuf>,
   #[arg(long)]
@@ -32,8 +38,35 @@ struct RunsArgs {
   control_path: Option<String>,
   #[arg(long, default_value = "30m")]
   control_persist: String,
+}
+
+#[derive(Debug, Args)]
+struct RunsArgs {
+  #[command(flatten)]
+  connection: ConnectionArgs,
   #[arg(long)]
   json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunsJobCommand {
+  #[command(flatten)]
+  options: RunsArgs,
+  run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct RunsLogsCommand {
+  #[command(flatten)]
+  connection: ConnectionArgs,
+  run_id: String,
+  #[arg(long, default_value = "stdout", value_parser = ["stdout", "stderr"])]
+  stream: String,
+  /// Number of trailing lines to show before following; zero starts at the end.
+  #[arg(long, default_value_t = 100)]
+  tail: usize,
+  #[arg(long)]
+  follow: bool,
 }
 
 #[derive(Debug, Args)]
@@ -45,7 +78,7 @@ struct RunsListCommand {
   cached: bool,
   #[arg(long)]
   task: Option<String>,
-  #[arg(long, value_parser = ["preparing", "running", "completed", "failed", "unknown"])]
+  #[arg(long, value_parser = ["preparing", "running", "completed", "failed", "cancelled", "unknown"])]
   status: Option<String>,
   #[arg(long, default_value_t = 20)]
   limit: usize,
@@ -78,6 +111,45 @@ struct RunsPullCommand {
 
 pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let (options, cached, request, dry_run) = match command.command {
+    RunsSubcommand::Status(command) => {
+      return run_job(
+        command.options,
+        protocol::JobRequest::Status {
+          run_id: command.run_id,
+        },
+        target,
+        verbosity,
+        quiet,
+      );
+    }
+    RunsSubcommand::Cancel(command) => {
+      return run_job(
+        command.options,
+        protocol::JobRequest::Cancel {
+          run_id: command.run_id,
+        },
+        target,
+        verbosity,
+        quiet,
+      );
+    }
+    RunsSubcommand::Logs(command) => {
+      return run_job(
+        RunsArgs {
+          connection: command.connection,
+          json: false,
+        },
+        protocol::JobRequest::Logs {
+          run_id: command.run_id,
+          stream: command.stream,
+          follow: command.follow,
+          tail: command.tail,
+        },
+        target,
+        verbosity,
+        quiet,
+      );
+    }
     RunsSubcommand::List(command) => (
       command.options,
       command.cached,
@@ -121,7 +193,7 @@ pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: boo
       "--cached requires --target (-T)".to_string(),
     ));
   }
-  let context = CommandContext::load(options.config, options.repo)?;
+  let context = CommandContext::load(options.connection.config, options.connection.repo)?;
   let report = if let Some(target) = target {
     controller::run_pull::validate_component(target, "target name")?;
     let results_dir = context.config.download_results_dir();
@@ -130,14 +202,14 @@ pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: boo
       let cache = controller::run_pull::cached_runs_dir(&context.repo_root, &results_dir, target)?;
       runs::query_directory(&cache, &request)?
     } else {
-      let context = context.into_target(Some(target), options.control_path)?;
+      let context = context.into_target(Some(target), options.connection.control_path)?;
       controller::runs::execute(controller::runs::RunOptions {
         repo_root: context.repo_root,
         target_name: context.target_name,
         target: context.target,
         results_dir,
         control_path: context.control_path,
-        control_persist: options.control_persist,
+        control_persist: options.connection.control_persist,
         verbosity,
         quiet,
         dry_run,
@@ -153,6 +225,61 @@ pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: boo
     print_runs_report(&report, &request);
   }
   Ok(())
+}
+
+fn run_job(
+  options: RunsArgs,
+  request: protocol::JobRequest,
+  target: Option<&str>,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
+  let context = CommandContext::load(options.connection.config, options.connection.repo)?;
+  let report = if target.is_some() {
+    let context = context.into_target(target, options.connection.control_path)?;
+    controller::jobs::execute(controller::jobs::JobOptions {
+      target: context.target,
+      control_path: context.control_path,
+      control_persist: options.connection.control_persist,
+      verbosity,
+      quiet,
+      request,
+    })?
+  } else if matches!(request, protocol::JobRequest::Logs { .. }) {
+    crate::jobs::execute_at(&request, &context.repo_root)?;
+    None
+  } else {
+    Some(crate::jobs::query_at(&request, &context.repo_root)?)
+  };
+  if let Some(report) = report {
+    if options.json {
+      println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !quiet {
+      print_job_report(&report);
+    }
+  }
+  Ok(())
+}
+
+fn print_job_report(report: &serde_json::Value) {
+  for (label, value) in [
+    ("Run", &report["run_id"]),
+    ("Status", &report["status"]),
+    ("Detached", &report["detached"]),
+    ("Supervisor alive", &report["alive"]),
+    ("Cancellation requested", &report["cancel_requested"]),
+    ("Exit code", &report["state"]["exit_code"]),
+  ] {
+    let value = match value {
+      serde_json::Value::String(value) => value.clone(),
+      serde_json::Value::Null => "-".to_string(),
+      value => value.to_string(),
+    };
+    println!("{label}: {value}");
+  }
+  if report["already_finished"] == true {
+    println!("The run already finished; no cancellation was needed.");
+  }
 }
 
 fn print_runs_report(report: &serde_json::Value, request: &protocol::RunQueryRequest) {
@@ -345,6 +472,45 @@ mod tests {
       };
       let error = run(command, None, 0, true).unwrap_err();
       assert!(error.to_string().contains("requires --target"));
+    }
+  }
+
+  #[test]
+  fn job_commands_parse_log_defaults_and_explicit_controls() {
+    let cli = Cli::try_parse_from(["expri", "runs", "logs", "run-123"]).unwrap();
+    let Command::Runs(RunsCommand {
+      command: RunsSubcommand::Logs(command),
+    }) = cli.command
+    else {
+      panic!("expected runs logs");
+    };
+    assert_eq!(command.stream, "stdout");
+    assert_eq!(command.tail, 100);
+    assert!(!command.follow);
+    let cli = Cli::try_parse_from([
+      "expri", "-T", "gpu", "runs", "logs", "run-123", "--stream", "stderr", "--tail", "0",
+      "--follow",
+    ])
+    .unwrap();
+    let Command::Runs(RunsCommand {
+      command: RunsSubcommand::Logs(command),
+    }) = cli.command
+    else {
+      panic!("expected runs logs");
+    };
+    assert_eq!(command.stream, "stderr");
+    assert_eq!(command.tail, 0);
+    assert!(command.follow);
+    for name in ["status", "cancel"] {
+      assert!(Cli::try_parse_from(["expri", "runs", name, "run-123", "--json"]).is_ok());
+    }
+    for args in [
+      vec!["expri", "runs", "logs", "run-123", "--stream", "combined"],
+      vec!["expri", "runs", "logs", "run-123", "--tail", "-1"],
+      vec!["expri", "runs", "logs", "run-123", "--json"],
+      vec!["expri", "runs", "status", "run-123", "--cached"],
+    ] {
+      assert!(Cli::try_parse_from(args).is_err());
     }
   }
 }

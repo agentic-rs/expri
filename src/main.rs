@@ -6,6 +6,7 @@ mod environment;
 mod error;
 mod filter;
 mod git;
+mod jobs;
 mod lock;
 mod node;
 mod protocol;
@@ -21,7 +22,9 @@ use clap::{Args, Parser, Subcommand};
 use crate::context::CommandContext;
 use crate::controller::download::{DownloadOptions, download_target};
 use crate::controller::setup::{SetupOptions, setup_target};
-use crate::controller::sync::{SyncOptions, sync_target, sync_target_with_receipt};
+use crate::controller::sync::{
+  SyncOptions, sync_target, sync_target_with_diagnostic_receipt, sync_target_with_receipt,
+};
 use crate::controller::task::{
   LocalTaskOptions, RemoteTaskOptions, run_local_task, run_remote_task,
 };
@@ -187,6 +190,10 @@ struct RunCommand {
 
   #[arg(long)]
   no_sync: bool,
+
+  /// Start an isolated run in the background and return its run identifier.
+  #[arg(long)]
+  detach: bool,
 
   #[arg(
     value_name = "TASK",
@@ -418,9 +425,19 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   let (extras, sync_args) = environment_selection(&context.config);
   if target.is_some() {
     let context = context.into_target(target, command.control_path)?;
+    if command.detach && context.target.environment.is_none() {
+      return Err(ExpriError::Message(
+        "--detach requires a configured target environment".to_string(),
+      ));
+    }
     let expected_sync = if !command.no_sync {
       let sync = context.config.sync_rules()?;
-      sync_target_with_receipt(SyncOptions {
+      let sync_with_receipt = if command.detach {
+        sync_target_with_diagnostic_receipt
+      } else {
+        sync_target_with_receipt
+      };
+      sync_with_receipt(SyncOptions {
         repo_root: context.repo_root.clone(),
         project_name: context.project_name.clone(),
         target_name: context.target_name.clone(),
@@ -455,6 +472,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
       extras,
       sync_args,
       expected_sync,
+      detach: command.detach,
     });
   }
 
@@ -475,6 +493,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     task,
     args,
     dry_run: command.dry_run,
+    detach: command.detach,
     verbosity,
     quiet,
     environment,
@@ -495,6 +514,7 @@ mod tests {
       "run",
       "--dry-run",
       "--no-sync",
+      "--detach",
       "train",
       "--model",
       "tiny",
@@ -508,6 +528,7 @@ mod tests {
     assert_eq!(command.task[0], "train");
     assert!(command.dry_run);
     assert!(command.no_sync);
+    assert!(command.detach);
     assert_eq!(command.task[1..], ["--model", "tiny"]);
   }
 
@@ -518,6 +539,7 @@ mod tests {
       "run",
       "train",
       "--dry-run",
+      "--detach",
       "--config",
       "task-config.toml",
     ])
@@ -529,10 +551,47 @@ mod tests {
 
     assert_eq!(command.task[0], "train");
     assert!(!command.dry_run);
+    assert!(!command.detach);
     assert!(command.config.is_none());
     assert_eq!(
       command.task[1..],
-      ["--dry-run", "--config", "task-config.toml"]
+      ["--dry-run", "--detach", "--config", "task-config.toml"]
     );
+  }
+
+  #[test]
+  fn detached_legacy_remote_tasks_fail_before_sync_or_transport() {
+    let fixture = tempfile::tempdir().unwrap();
+    let config = fixture.path().join("expri.toml");
+    std::fs::write(
+      &config,
+      r#"[tasks]
+train = ["python", "train.py"]
+[target.gpu]
+host = "gpu"
+remote_dir = "/tmp/unused-expri"
+transport = "ctl"
+ctl_bin = "/missing-must-not-launch-ctl"
+"#,
+    )
+    .unwrap();
+    let cli = Cli::try_parse_from([
+      "expri",
+      "run",
+      "--config",
+      config.to_str().unwrap(),
+      "--detach",
+      "train",
+    ])
+    .unwrap();
+    let Command::Run(command) = cli.command else {
+      panic!("expected run command");
+    };
+    let error = run_task(command, Some("gpu"), 0, true).unwrap_err();
+    assert_eq!(
+      error.to_string(),
+      "--detach requires a configured target environment"
+    );
+    assert!(!fixture.path().join(".expri").exists());
   }
 }

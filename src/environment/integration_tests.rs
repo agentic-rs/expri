@@ -193,6 +193,7 @@ impl Fixture {
     std::os::unix::fs::symlink(python.trim(), bin_dir.join("python"))
       .expect("ambient Python alias");
     let request = RunRequest {
+      detach: false,
       name: "train".to_string(),
       command: vec![
         "python".to_string(),

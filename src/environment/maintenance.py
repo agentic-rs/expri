@@ -152,7 +152,7 @@ def _maintenance_finished(run_dir):
   if not isinstance(state, dict) or state.get("run_id") != run_dir.name or state.get("code_dir") != str(run_dir / "code"):
     raise RuntimeError("run state does not match its directory")
   status = state.get("status")
-  if status not in ("completed", "failed"):
+  if status not in ("completed", "failed", "cancelled"):
     raise RuntimeError("run has not verifiably finished")
   timestamp = state.get("finished_at")
   try:

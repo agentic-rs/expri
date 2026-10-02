@@ -1,5 +1,6 @@
 pub mod download;
 pub mod environment;
+pub mod jobs;
 pub mod protocol;
 pub mod run_pull;
 pub mod runs;
