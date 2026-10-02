@@ -22,7 +22,7 @@ pub struct SetupOptions {
 }
 
 pub fn setup_target(options: SetupOptions) -> Result<()> {
-  if options.steps.is_empty() {
+  if options.steps.is_empty() && options.target.environment.is_none() {
     return Err(ExpriError::Message(
       "no setup steps configured in expri.toml".to_string(),
     ));
@@ -33,6 +33,7 @@ pub fn setup_target(options: SetupOptions) -> Result<()> {
     .node_bin
     .clone()
     .unwrap_or_else(|| "expri".to_string());
+  let environment = options.target.environment.clone();
   let remote = Remote::new(
     options.target,
     options.control_path,
@@ -51,21 +52,28 @@ pub fn setup_target(options: SetupOptions) -> Result<()> {
   }
 
   remote.connect()?;
-  let inbox = format!("{}/inbox", remote.meta_dir());
-  remote.execute(&format!("mkdir -p {inbox}"))?;
   let request = SetupRequest {
     state_dir: ".expri".to_string(),
     force: options.force,
     steps: options.steps,
+    environment,
   };
   let request_dir = tempfile::Builder::new().prefix("expri-setup-").tempdir()?;
+  let request_id = request_dir
+    .path()
+    .file_name()
+    .expect("request directory name")
+    .to_string_lossy();
+  let inbox = format!("{}/inbox/{request_id}", remote.meta_dir());
+  remote.execute(&format!("mkdir -p {inbox}"))?;
   let request_path = request_dir.path().join("setup-request.json");
   fs::write(&request_path, serde_json::to_string_pretty(&request)?)?;
   remote.upload_file(&request_path, &format!("{inbox}/setup-request.json"))?;
   apply_setup_with_preference(
     &remote,
-    ".expri/inbox/setup-request.json",
+    &format!(".expri/inbox/{request_id}/setup-request.json"),
     preference,
     &node_bin,
+    request.environment.is_some(),
   )
 }

@@ -1,7 +1,23 @@
 use std::fmt::{self, Display};
 use std::io;
+use std::process::ExitStatus;
 
 pub type Result<T> = std::result::Result<T, ExpriError>;
+
+/// Preserve shell-style signal exit codes alongside ordinary process exits.
+pub fn command_exit_code(status: &ExitStatus) -> Option<i32> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::ExitStatusExt;
+    status
+      .code()
+      .or_else(|| status.signal().map(|signal| 128 + signal))
+  }
+  #[cfg(not(unix))]
+  {
+    status.code()
+  }
+}
 
 #[derive(Debug)]
 pub enum ExpriError {

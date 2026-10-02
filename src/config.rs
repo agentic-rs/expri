@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ExpriError, Result};
 use crate::filter::{DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES, SyncRules};
@@ -19,6 +19,8 @@ pub struct Config {
   pub sync: Option<SyncConfig>,
   pub setup: Option<SetupConfig>,
   pub download: Option<DownloadConfig>,
+  #[serde(default)]
+  pub environment: Option<EnvironmentConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +44,102 @@ pub struct TargetConfig {
   pub node_bin: Option<String>,
   pub ctl_bin: Option<String>,
   pub ctl_method: Option<String>,
+  #[serde(default)]
+  pub environment: Option<EnvironmentConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentConfig {
+  pub base_python: Option<String>,
+  #[serde(default)]
+  pub reuse_packages: Vec<String>,
+  #[serde(default)]
+  pub require_cuda: bool,
+  #[serde(default)]
+  pub env: BTreeMap<String, String>,
+}
+
+impl EnvironmentConfig {
+  pub fn validate(&self) -> Result<()> {
+    if let Some(base_python) = &self.base_python
+      && base_python.trim().is_empty()
+    {
+      return Err(ExpriError::Message(
+        "environment.base_python must not be empty".to_string(),
+      ));
+    }
+    for package in &self.reuse_packages {
+      if !valid_package_name(package) {
+        return Err(ExpriError::Message(format!(
+          "invalid environment.reuse_packages name: {package:?}; use a package name without versions or extras"
+        )));
+      }
+    }
+    if !self.reuse_packages.is_empty() && self.base_python.is_none() {
+      return Err(ExpriError::Message(
+        "environment.reuse_packages requires environment.base_python".to_string(),
+      ));
+    }
+    if self.require_cuda
+      && !self
+        .reuse_packages
+        .iter()
+        .any(|package| normalize_package_name(package) == "torch")
+    {
+      return Err(ExpriError::Message(
+        "environment.require_cuda requires torch in environment.reuse_packages".to_string(),
+      ));
+    }
+    for name in self.env.keys() {
+      if !valid_environment_name(name) {
+        return Err(ExpriError::Message(format!(
+          "invalid environment.env variable name: {name:?}; use a POSIX variable name"
+        )));
+      }
+      if name.starts_with("UV_") || matches!(name.as_str(), "PYTHONHOME" | "VIRTUAL_ENV") {
+        return Err(ExpriError::Message(format!(
+          "environment.env cannot override expri's Python/environment selection: {name}"
+        )));
+      }
+    }
+    Ok(())
+  }
+}
+
+pub fn normalize_package_name(name: &str) -> String {
+  let mut normalized = String::with_capacity(name.len());
+  let mut previous_separator = false;
+  for character in name.chars() {
+    if matches!(character, '-' | '_' | '.') {
+      if !previous_separator {
+        normalized.push('-');
+      }
+      previous_separator = true;
+    } else {
+      normalized.push(character.to_ascii_lowercase());
+      previous_separator = false;
+    }
+  }
+  normalized
+}
+
+fn valid_package_name(name: &str) -> bool {
+  let bytes = name.as_bytes();
+  !bytes.is_empty()
+    && bytes[0].is_ascii_alphanumeric()
+    && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+    && bytes
+      .iter()
+      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn valid_environment_name(name: &str) -> bool {
+  let mut bytes = name.bytes();
+  bytes
+    .next()
+    .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+    && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -111,6 +209,10 @@ impl Config {
       let target_config = Self::load_file(&target_path)?;
       config.target.extend(target_config.target);
     }
+    config.local_environment()?;
+    for name in config.target.keys() {
+      config.target(name)?;
+    }
     Ok(config)
   }
 
@@ -146,11 +248,27 @@ impl Config {
   }
 
   pub fn target(&self, name: &str) -> Result<TargetConfig> {
-    self
+    let mut target = self
       .target
       .get(name)
       .cloned()
-      .ok_or_else(|| ExpriError::Message(format!("unknown target: {name}")))
+      .ok_or_else(|| ExpriError::Message(format!("unknown target: {name}")))?;
+    if target.environment.is_none() {
+      target.environment = self.environment.clone();
+    }
+    if let Some(environment) = &target.environment {
+      environment
+        .validate()
+        .map_err(|error| ExpriError::Message(format!("target {name:?}: {error}")))?;
+    }
+    Ok(target)
+  }
+
+  pub fn local_environment(&self) -> Result<Option<EnvironmentConfig>> {
+    if let Some(environment) = &self.environment {
+      environment.validate()?;
+    }
+    Ok(self.environment.clone())
   }
 
   pub fn task(&self, name: &str) -> Result<TaskConfig> {
@@ -324,6 +442,243 @@ transport = "ct1"
 
     let error = result.expect_err("unknown transport must fail");
     assert!(error.to_string().contains("unknown variant `ct1`"));
+  }
+
+  #[test]
+  fn environment_defaults_to_uv_without_inherited_packages() {
+    let environment: EnvironmentConfig = toml::from_str("").expect("parse empty environment");
+    environment.validate().expect("validate empty environment");
+    assert_eq!(environment.base_python, None);
+    assert!(environment.reuse_packages.is_empty());
+    assert!(!environment.require_cuda);
+    assert!(environment.env.is_empty());
+  }
+
+  #[test]
+  fn environment_validates_package_names_and_normalized_torch() {
+    let environment: EnvironmentConfig = toml::from_str(
+      r#"
+base_python = "/opt/conda/bin/python"
+reuse_packages = ["Torch", "nvidia-cuda-runtime-cu12", "some_package.name"]
+require_cuda = true
+
+[env]
+LD_LIBRARY_PATH = "/opt/conda/lib"
+CUDA_VISIBLE_DEVICES = "0"
+"#,
+    )
+    .expect("parse inherited environment");
+    environment
+      .validate()
+      .expect("validate inherited environment");
+    assert_eq!(
+      normalize_package_name("NVIDIA__Cuda.Runtime-CU12"),
+      "nvidia-cuda-runtime-cu12"
+    );
+  }
+
+  #[test]
+  fn environment_rejects_unknown_settings() {
+    let error = toml::from_str::<EnvironmentConfig>("reuse_package = [\"torch\"]")
+      .expect_err("typo must fail");
+    assert!(error.to_string().contains("unknown field `reuse_package`"));
+  }
+
+  #[test]
+  fn environment_rejects_empty_base_python() {
+    let environment: EnvironmentConfig =
+      toml::from_str("base_python = '  '").expect("parse empty interpreter");
+    let error = environment
+      .validate()
+      .expect_err("empty interpreter must fail");
+    assert!(error.to_string().contains("base_python must not be empty"));
+  }
+
+  #[test]
+  fn environment_requires_base_python_to_reuse_packages() {
+    let environment: EnvironmentConfig =
+      toml::from_str("reuse_packages = ['torch']").expect("parse reuse without interpreter");
+    let error = environment
+      .validate()
+      .expect_err("reuse needs base interpreter");
+    assert!(
+      error
+        .to_string()
+        .contains("reuse_packages requires environment.base_python")
+    );
+  }
+
+  #[test]
+  fn environment_rejects_package_requirements_and_malformed_names() {
+    for package in [
+      "",
+      "-torch",
+      "torch-",
+      "torch>=2",
+      "torch[extra]",
+      "torch; bad",
+      "pýtorch",
+    ] {
+      let environment = EnvironmentConfig {
+        base_python: Some("python".to_string()),
+        reuse_packages: vec![package.to_string()],
+        require_cuda: false,
+        env: BTreeMap::new(),
+      };
+      let error = environment
+        .validate()
+        .expect_err("invalid package name must fail");
+      assert!(
+        error
+          .to_string()
+          .contains("invalid environment.reuse_packages name")
+      );
+    }
+  }
+
+  #[test]
+  fn environment_requires_torch_when_cuda_is_required() {
+    let environment: EnvironmentConfig =
+      toml::from_str("base_python = 'python'\nreuse_packages = ['numpy']\nrequire_cuda = true")
+        .expect("parse CUDA without torch");
+    let error = environment
+      .validate()
+      .expect_err("CUDA requirement needs torch");
+    assert!(error.to_string().contains("require_cuda requires torch"));
+  }
+
+  #[test]
+  fn environment_rejects_non_posix_variable_names() {
+    for name in ["", "1PATH", "LD-LIBRARY-PATH", "A=B", "日本語"] {
+      let environment = EnvironmentConfig {
+        base_python: None,
+        reuse_packages: Vec::new(),
+        require_cuda: false,
+        env: BTreeMap::from([(name.to_string(), "value".to_string())]),
+      };
+      let error = environment
+        .validate()
+        .expect_err("invalid variable name must fail");
+      assert!(
+        error
+          .to_string()
+          .contains("invalid environment.env variable name")
+      );
+    }
+  }
+
+  #[test]
+  fn environment_rejects_environment_selection_overrides() {
+    for name in [
+      "UV_PROJECT_ENVIRONMENT",
+      "UV_PYTHON",
+      "UV_NEW_OPTION",
+      "PYTHONHOME",
+      "VIRTUAL_ENV",
+    ] {
+      let environment = EnvironmentConfig {
+        base_python: None,
+        reuse_packages: Vec::new(),
+        require_cuda: false,
+        env: BTreeMap::from([(name.to_string(), "value".to_string())]),
+      };
+      let error = environment
+        .validate()
+        .expect_err("environment selection must be owned by expri");
+      assert!(
+        error
+          .to_string()
+          .contains("cannot override expri's Python/environment selection")
+      );
+    }
+  }
+
+  #[test]
+  fn target_inherits_whole_environment_or_overrides_it() {
+    let config: Config = toml::from_str(
+      r#"
+[environment]
+base_python = "/opt/conda/bin/python"
+reuse_packages = ["torch"]
+require_cuda = true
+
+[target.inherited]
+host = "gpu.example"
+remote_dir = "~/project"
+
+[target.overridden]
+host = "cpu.example"
+remote_dir = "~/project"
+
+[target.overridden.environment]
+"#,
+    )
+    .expect("parse defaults and overrides");
+    let inherited = config.target("inherited").expect("inherit environment");
+    assert_eq!(inherited.environment, config.environment);
+    let overridden = config.target("overridden").expect("override environment");
+    let environment = overridden.environment.expect("explicit empty environment");
+    assert!(environment.reuse_packages.is_empty());
+    assert_eq!(environment.base_python, None);
+    assert!(!environment.require_cuda);
+  }
+
+  #[test]
+  fn direct_config_access_validates_environment() {
+    let config: Config = toml::from_str(
+      r#"
+[environment]
+base_python = ""
+
+[target.gpu]
+host = "gpu.example"
+remote_dir = "~/project"
+"#,
+    )
+    .expect("deserialize invalid environment for validation");
+    assert!(config.local_environment().is_err());
+    assert!(config.target("gpu").is_err());
+  }
+
+  #[test]
+  fn load_validates_target_environment_from_sibling_file() {
+    let temp_dir = tempfile::Builder::new()
+      .prefix("expri-config-")
+      .tempdir()
+      .expect("create temp dir");
+    let config_path = temp_dir.path().join("expri.toml");
+    fs::write(&config_path, "").expect("write project config");
+    fs::write(
+      temp_dir.path().join("expri.target.toml"),
+      r#"
+[target.gpu]
+host = "gpu.example"
+remote_dir = "~/project"
+
+[target.gpu.environment]
+reuse_packages = ["torch"]
+"#,
+    )
+    .expect("write invalid target config");
+    let error = Config::load(&config_path).expect_err("invalid target must fail on load");
+    assert!(error.to_string().contains("target \"gpu\""));
+    assert!(
+      error
+        .to_string()
+        .contains("reuse_packages requires environment.base_python")
+    );
+  }
+
+  #[test]
+  fn environment_can_round_trip_through_serialization() {
+    let environment: EnvironmentConfig = toml::from_str(
+      "base_python = '/opt/conda/bin/python'\nreuse_packages = ['torch']\nrequire_cuda = true",
+    )
+    .expect("parse environment");
+    let encoded = serde_json::to_string(&environment).expect("serialize environment");
+    let decoded: EnvironmentConfig =
+      serde_json::from_str(&encoded).expect("deserialize environment");
+    assert_eq!(decoded, environment);
   }
 
   #[test]
