@@ -36,6 +36,10 @@ remote_managed = [
 [tasks]
 train = { command = ["python", "scripts/train.py"], uv = true }
 
+# Enable isolated run records and saved logs with an environment configuration.
+# An empty project table selects ordinary uv; a target can configure reuse instead.
+# [environment]
+
 [download]
 ignore = ["*.pt"]
 

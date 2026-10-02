@@ -42,6 +42,8 @@ if arguments[:2] == ["run", "--isolated"]:
   (run_dir / "helper-request.json").write_text(json.dumps(request))
   (run_dir / "helper-argv.json").write_text(json.dumps(arguments[:-2]))
   (run_dir / "helper-environment.json").write_text(json.dumps(observation("helper", [])))
+  if request["operation"] == "run":
+    os.write(2, b"preparation stderr\x00\xff\n")
   if os.environ.get("EXPRI_TEST_HELPER_SIGNAL") == "1":
     os.kill(os.getpid(), signal.SIGTERM)
   if request["operation"] == "doctor":
@@ -100,10 +102,13 @@ elif arguments[:4] == ["run", "--no-sync", "--no-env-file", "--"]:
     "env": {key: os.environ.get(key) for key in [
       "EXPRI_RUN_ID", "EXPRI_RUN_DIR", "EXPRI_OUTPUT_DIR", "UV_PROJECT_ENVIRONMENT", "UV_CACHE_DIR",
       "PYTHONNOUSERSITE", "CUSTOM_RUNTIME", "UV_PROJECT", "UV_PYTHON", "UV_ACTIVE", "VIRTUAL_ENV",
+      "PYTHONUNBUFFERED",
     ]},
   }
   output_dir = Path(os.environ["EXPRI_OUTPUT_DIR"])
   (output_dir / "task-observation.json").write_text(json.dumps(result))
+  os.write(1, b"task stdout\x00\xff\n")
+  os.write(2, b"task stderr\x80\x00\n")
   if os.environ.get("EXPRI_TEST_TASK_SIGNAL") == "1":
     os.kill(os.getpid(), signal.SIGTERM)
   sys.exit(int(os.environ.get("EXPRI_TEST_TASK_EXIT", "0")))
@@ -263,6 +268,7 @@ impl Fixture {
       .current_dir(&self.repo_root)
       .env("PATH", std::env::join_paths(paths).expect("test PATH"))
       .env_remove("UV_CACHE_DIR")
+      .env_remove("PYTHONUNBUFFERED")
       .env_remove("EXPRI_TEST_CLI_CONFIG")
       .env("EXPRI_TEST_SOURCE_ROOT", &self.repo_root)
       .env("UV_PROJECT", "/ambient/wrong-project")
@@ -569,6 +575,38 @@ fn native_and_python_runs_preserve_snapshot_request_environment_and_outputs() {
     let state = read_json(&run_dir.join("run-state.json"));
     assert_eq!(state["status"], "completed");
     assert_eq!(state["exit_code"], 0);
+    assert_eq!(state["task_exit_code"], 0);
+    assert_eq!(state["schema_version"], 1);
+    assert_eq!(
+      state["logs"],
+      json!({"stdout": "logs/stdout.log", "stderr": "logs/stderr.log"})
+    );
+    assert_eq!(
+      fs::read(run_dir.join("logs/stdout.log")).unwrap(),
+      b"task stdout\x00\xff\n"
+    );
+    assert_eq!(
+      fs::read(run_dir.join("logs/stderr.log")).unwrap(),
+      b"preparation stderr\x00\xff\ntask stderr\x80\x00\n"
+    );
+    assert!(
+      output
+        .stdout
+        .windows(b"task stdout\x00\xff\n".len())
+        .any(|bytes| bytes == b"task stdout\x00\xff\n")
+    );
+    assert!(
+      output
+        .stderr
+        .windows(b"preparation stderr\x00\xff\n".len())
+        .any(|bytes| bytes == b"preparation stderr\x00\xff\n")
+    );
+    assert!(
+      output
+        .stderr
+        .windows(b"task stderr\x80\x00\n".len())
+        .any(|bytes| bytes == b"task stderr\x80\x00\n")
+    );
     assert!(state["finished_at"].is_string());
     let helper = read_json(&run_dir.join("helper-request.json"));
     assert_helper_argv(&run_dir.join("helper-argv.json"));
@@ -618,6 +656,7 @@ fn native_and_python_runs_preserve_snapshot_request_environment_and_outputs() {
     );
     assert_eq!(env["PYTHONNOUSERSITE"], "1");
     assert_eq!(env["CUSTOM_RUNTIME"], "active");
+    assert_eq!(env["PYTHONUNBUFFERED"], "1");
     for key in ["UV_PROJECT", "UV_PYTHON", "UV_ACTIVE", "VIRTUAL_ENV"] {
       assert!(env[key].is_null(), "{backend:?} leaked {key}");
     }
@@ -635,6 +674,7 @@ fn native_and_python_runs_preserve_task_failure_exit_code() {
     let state = read_json(&fixture.run_dir().join("run-state.json"));
     assert_eq!(state["status"], "failed");
     assert_eq!(state["exit_code"], 7);
+    assert_eq!(state["task_exit_code"], 7);
     assert!(state["error"].is_string());
     assert!(state["finished_at"].is_string());
     if matches!(backend, Backend::Native) {
@@ -643,6 +683,31 @@ fn native_and_python_runs_preserve_task_failure_exit_code() {
         7
       );
     }
+  }
+}
+
+#[test]
+fn native_and_python_runs_preserve_configured_python_buffering() {
+  for backend in [Backend::Native, Backend::Python] {
+    let mut fixture = Fixture::new();
+    fixture
+      .request
+      .environment
+      .env
+      .insert("PYTHONUNBUFFERED".to_string(), "0".to_string());
+    fs::write(
+      &fixture.request_path,
+      serde_json::to_vec(&fixture.request).unwrap(),
+    )
+    .expect("configured buffering request");
+    let output = fixture.execute(backend, 0, false);
+    assert!(
+      output.status.success(),
+      "{backend:?}: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let observation = read_json(&fixture.run_dir().join("outputs/task-observation.json"));
+    assert_eq!(observation["env"]["PYTHONUNBUFFERED"], "0");
   }
 }
 
@@ -673,6 +738,15 @@ fn native_and_python_signal_failures_keep_shell_exit_code_and_release_run_lease(
     let state = read_json(&run_dir.join("run-state.json"));
     assert_eq!(state["status"], "failed");
     assert_eq!(state["exit_code"], 143);
+    assert_eq!(state["task_exit_code"], 143);
+    assert_eq!(
+      fs::read(run_dir.join("logs/stdout.log")).unwrap(),
+      b"task stdout\x00\xff\n"
+    );
+    assert_eq!(
+      fs::read(run_dir.join("logs/stderr.log")).unwrap(),
+      b"preparation stderr\x00\xff\ntask stderr\x80\x00\n"
+    );
     assert!(state["finished_at"].is_string());
     assert!(run_dir.join(".run.lock").is_file());
     let lease =
@@ -716,6 +790,28 @@ fn native_and_python_runs_record_preparation_failure_without_launching_task() {
     assert!(state["error"].is_string());
     assert!(!run_dir.join("outputs/task-observation.json").exists());
     assert!(state["environment_manifest"].is_null());
+    assert!(state["task_exit_code"].is_null());
+    assert!(
+      fs::read(run_dir.join("logs/stdout.log"))
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(
+      fs::read(run_dir.join("logs/stderr.log")).unwrap(),
+      b"preparation stderr\x00\xff\n"
+    );
+    assert!(
+      output
+        .stderr
+        .windows(b"preparation stderr\x00\xff\n".len())
+        .any(|bytes| bytes == b"preparation stderr\x00\xff\n")
+    );
+    let lease = crate::lock::try_lock_file(&run_dir.join(".run.lock"), false)
+      .expect("released preparation lease");
+    let crate::lock::LockAttempt::Acquired(lease) = lease else {
+      panic!("failed preparation retained run lease");
+    };
+    drop(lease);
     if matches!(backend, Backend::Native) {
       assert_eq!(
         read_json(&fixture.repo_root.join(".expri/native-outcome.json"))["exit_code"],

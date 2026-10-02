@@ -9,6 +9,9 @@ mod git;
 mod lock;
 mod node;
 mod protocol;
+mod run_logs;
+mod runs;
+mod runs_cli;
 mod shell;
 
 use std::path::PathBuf;
@@ -24,6 +27,7 @@ use crate::controller::task::{
 };
 use crate::error::{ExpriError, Result};
 use crate::node::cli::NodeCommand;
+use crate::runs_cli::RunsCommand;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Repo-local remote workflow tools")]
@@ -48,6 +52,7 @@ enum Command {
   Setup(SetupCommand),
   Run(RunCommand),
   Env(EnvironmentCommand),
+  Runs(RunsCommand),
   Node {
     #[command(subcommand)]
     command: NodeCommand,
@@ -212,6 +217,7 @@ fn run() -> Result<()> {
     Command::Env(command) => {
       run_environment(command, cli.target.as_deref(), cli.verbose, cli.quiet)
     }
+    Command::Runs(command) => runs_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(

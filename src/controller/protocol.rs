@@ -1,6 +1,6 @@
 use crate::controller::transport::Remote;
 use crate::error::{ExpriError, Result};
-use crate::protocol::EnvironmentCommandRequest;
+use crate::protocol::{EnvironmentCommandRequest, RunQueryRequest};
 use crate::shell;
 
 trait RemoteProtocol {
@@ -10,6 +10,7 @@ trait RemoteProtocol {
   fn apply_run(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn prepare_pull(&self, remote: &Remote) -> Result<()>;
   fn apply_environment(&self, remote: &Remote, request: &EnvironmentCommandRequest) -> Result<()>;
+  fn query_runs(&self, remote: &Remote, request: &RunQueryRequest) -> Result<serde_json::Value>;
 }
 
 #[derive(Debug)]
@@ -88,6 +89,18 @@ impl RemoteProtocol for ExpriNodeProtocol {
       shell::quote(&self.node_bin)
     ))
   }
+
+  fn query_runs(&self, remote: &Remote, request: &RunQueryRequest) -> Result<serde_json::Value> {
+    let request = serde_json::to_string(request)?;
+    capture_run_report(
+      remote,
+      &format!(
+        "cd {} && {} node runs --request-stdin <<'EXPRI_RUN_QUERY'\n{request}\nEXPRI_RUN_QUERY",
+        remote.quoted_remote_dir(),
+        shell::quote(&self.node_bin)
+      ),
+    )
+  }
 }
 
 #[derive(Debug, Default)]
@@ -137,6 +150,44 @@ impl RemoteProtocol for PythonProtocol {
       python_environment_script(request)
     ))
   }
+
+  fn query_runs(&self, remote: &Remote, request: &RunQueryRequest) -> Result<serde_json::Value> {
+    capture_run_report(
+      remote,
+      &format!(
+        "cd {} && python3 - <<'PY'\n{}\nPY",
+        remote.quoted_remote_dir(),
+        python_runs_script(request)
+      ),
+    )
+  }
+}
+
+fn capture_run_report(remote: &Remote, command: &str) -> Result<serde_json::Value> {
+  // A login profile may set the node/Python path and print a banner. Keep the banner off JSON stdout.
+  let bytes = remote.capture_bytes(&format!(
+    "if [ -f ~/.profile ]; then . ~/.profile >&2; fi\n{command}"
+  ))?;
+  serde_json::from_slice(&bytes)
+    .map_err(|error| ExpriError::Message(format!("invalid remote run report: {error}")))
+}
+
+fn python_runs_script(request: &RunQueryRequest) -> String {
+  format!(
+    r#"import json, os, sys
+namespace = {{"__name__": "expri_runs_catalog"}}
+exec({catalog}, namespace)
+try:
+  report = namespace["query_runs"](os.getcwd(), json.loads({request}))
+  print(json.dumps(report))
+except (OSError, ValueError) as error:
+  print(str(error), file=sys.stderr)
+  sys.exit(1)
+"#,
+    catalog = serde_json::to_string(crate::runs::CATALOG_SCRIPT).expect("catalog script"),
+    request = serde_json::to_string(&serde_json::to_string(request).expect("run query"))
+      .expect("query string"),
+  )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,6 +266,22 @@ pub fn apply_environment_with_preference(
   .apply_environment(remote, request)
 }
 
+pub fn query_runs_with_preference(
+  remote: &Remote,
+  request: &RunQueryRequest,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<serde_json::Value> {
+  protocol_with_capability(
+    remote,
+    preference,
+    node_bin,
+    "runs",
+    Some(crate::node::cli::RUN_RECORDS_CAPABILITY),
+  )?
+  .query_runs(remote, request)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectedProtocol {
   ExpriNode,
@@ -269,10 +336,10 @@ fn protocol_with_preference(
   operation: &str,
   requires_environment: bool,
 ) -> Result<Box<dyn RemoteProtocol>> {
-  let capability = requires_environment.then_some(if matches!(operation, "run" | "setup") {
-    crate::node::cli::ENVIRONMENT_MAINTENANCE_CAPABILITY
-  } else {
-    crate::node::cli::UV_ENVIRONMENT_CAPABILITY
+  let capability = requires_environment.then_some(match operation {
+    "run" => crate::node::cli::RUN_RECORDS_CAPABILITY,
+    "setup" => crate::node::cli::ENVIRONMENT_MAINTENANCE_CAPABILITY,
+    _ => crate::node::cli::UV_ENVIRONMENT_CAPABILITY,
   });
   protocol_with_capability(remote, preference, node_bin, operation, capability)
 }
@@ -408,7 +475,7 @@ def environment_cache_dir(repo_root, sync_args):
     path = pathlib.Path(repo_root) / path
   return str(path.resolve())
 
-def prepare_environment(environment, repo_root, state_dir, extras, sync_args, install_project, cache_dir=None, operation=None):
+def prepare_environment(environment, repo_root, state_dir, extras, sync_args, install_project, cache_dir=None, operation=None, process_runner=None):
   cache_dir = cache_dir or environment_cache_dir(repo_root, sync_args)
   spec = {{"environment": environment, "repo_root": repo_root, "state_dir": state_dir,
           "operation": operation or ("run" if install_project else "setup"), "extras": extras,
@@ -422,7 +489,14 @@ def prepare_environment(environment, repo_root, state_dir, extras, sync_args, in
   child_env["UV_CACHE_DIR"] = cache_dir
   if "--no-cache" in sync_args:
     child_env["UV_NO_CACHE"] = "true"
-  output = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True, env=child_env)
+  if process_runner is None:
+    output = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True, env=child_env)
+  else:
+    output = process_runner(cmd, env=child_env, capture_stdout=True)
+    if output.returncode != 0:
+      raise subprocess.CalledProcessError(output.returncode, cmd, output=output.stdout)
+    if output.log_error:
+      raise OSError(output.log_error)
   return json.loads(output.stdout)
 "#
   )
@@ -434,6 +508,8 @@ pub(crate) fn python_run_script(request_path: &str) -> String {
     .expect("snapshot script string");
   let maintenance = serde_json::to_string(include_str!("../environment/maintenance.py"))
     .expect("maintenance script string");
+  let run_logs =
+    serde_json::to_string(include_str!("../run_logs.py")).expect("run logging script string");
   format!(
     r#"import datetime, json, os, pathlib, subprocess, sys
 {preamble}
@@ -445,11 +521,14 @@ if not request.get("command"):
 snapshot = snapshot_module["create_snapshot"](os.getcwd(), request.get("remote_managed", []), request.get("expected_sync"))
 maintenance_module = {{"__name__": "expri_environment_maintenance"}}
 exec({maintenance}, maintenance_module)
+logging_module = {{"__name__": "expri_run_logs"}}
+exec({run_logs}, logging_module)
 run_lease = maintenance_module["acquire_run_lock"](snapshot["run_dir"])
 run_dir = pathlib.Path(snapshot["run_dir"])
 state_path = run_dir / "run-state.json"
-state = {{"run_id": snapshot["run_id"], "task": request["name"], "command": request["command"],
+state = {{"schema_version": 1, "run_id": snapshot["run_id"], "task": request["name"], "command": request["command"],
          "code_dir": snapshot["code_dir"], "output_dir": str(run_dir / "outputs"),
+         "logs": {{"stdout": "logs/stdout.log", "stderr": "logs/stderr.log"}},
          "status": "preparing", "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}}
 
 def write_state():
@@ -457,14 +536,23 @@ def write_state():
   temporary.write_text(json.dumps(state, indent=2, sort_keys=True))
   temporary.replace(state_path)
 
-write_state()
-print("run: " + snapshot["run_id"], file=sys.stderr)
-print("run directory: " + str(run_dir), file=sys.stderr)
+def terminal_message(message):
+  try:
+    print(message, file=sys.stderr, flush=True)
+  except (OSError, ValueError):
+    pass
+
 exit_code = 1
+logs = None
 try:
+  write_state()
+  terminal_message("run: " + snapshot["run_id"])
+  terminal_message("run directory: " + str(run_dir))
+  logs = logging_module["RunLogs"](run_dir)
   cache_dir = environment_cache_dir(os.getcwd(), request.get("sync_args", []))
   prepared = prepare_environment(request["environment"], snapshot["code_dir"], str(run_dir),
-                                 request.get("extras", []), request.get("sync_args", []), True, cache_dir=cache_dir)
+                                 request.get("extras", []), request.get("sync_args", []), True,
+                                 cache_dir=cache_dir, process_runner=logs.run)
   state.update(status="running", environment_manifest=prepared["manifest_path"], python=prepared["python"])
   write_state()
   child_env = os.environ.copy()
@@ -474,9 +562,10 @@ try:
   child_env.update(prepared.get("run_env", {{}}))
   child_env.update(UV_PROJECT_ENVIRONMENT=prepared["environment_path"], PYTHONNOUSERSITE="1",
                    EXPRI_RUN_ID=snapshot["run_id"], EXPRI_RUN_DIR=str(run_dir), EXPRI_OUTPUT_DIR=str(run_dir / "outputs"))
-  status = subprocess.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
-                          cwd=snapshot["code_dir"], env=child_env)
+  status = logs.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
+                    cwd=snapshot["code_dir"], env=child_env)
   exit_code = status.returncode if status.returncode >= 0 else 128 - status.returncode
+  state["task_exit_code"] = exit_code
   if exit_code:
     state["error"] = "task exited with status " + str(exit_code)
 except subprocess.CalledProcessError as error:
@@ -484,12 +573,21 @@ except subprocess.CalledProcessError as error:
   state["error"] = "environment preparation exited with status " + str(exit_code)
 except Exception as error:
   state["error"] = str(error)
-  print("error: " + str(error), file=sys.stderr)
+  terminal_message("error: " + str(error))
 finally:
-  state.update(status="completed" if exit_code == 0 else "failed", exit_code=exit_code,
-               finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
-  write_state()
-  run_lease.close()
+  try:
+    if logs is not None:
+      logs.close()
+      if logs.log_error:
+        state["logging_error"] = logs.log_error
+        if exit_code == 0:
+          exit_code = 1
+          state["error"] = "log capture failed: " + logs.log_error
+    state.update(status="completed" if exit_code == 0 else "failed", exit_code=exit_code,
+                 finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    write_state()
+  finally:
+    run_lease.close()
 raise SystemExit(exit_code)
 "#,
     preamble = python_environment_preamble()
@@ -766,6 +864,10 @@ artifacts = {
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod sync_tests;
+
+#[cfg(test)]
+#[path = "run_protocol_tests.rs"]
+mod run_tests;
 
 #[cfg(test)]
 mod tests {

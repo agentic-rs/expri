@@ -58,3 +58,6 @@ jobs:
 
       - name: Run dependency graph and offline uv integration tests
         run: python3 -B src/environment/runtime_tests.py
+
+      - name: Run binary and live subprocess logging tests
+        run: python3 -B src/run_logs_tests.py
