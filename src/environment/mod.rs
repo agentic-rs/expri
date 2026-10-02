@@ -95,7 +95,10 @@ pub fn helper_argv(request: &EnvironmentRequest) -> Result<Vec<String>> {
   ])
 }
 
-fn invoke_helper(request: &EnvironmentRequest) -> Result<serde_json::Value> {
+fn invoke_helper(
+  request: &EnvironmentRequest,
+  logs: Option<&crate::run_logs::RunLogs>,
+) -> Result<serde_json::Value> {
   let argv = helper_argv(request)?;
   let mut command = Command::new(&argv[0]);
   command
@@ -116,22 +119,43 @@ fn invoke_helper(request: &EnvironmentRequest) -> Result<serde_json::Value> {
   {
     command.env("UV_NO_CACHE", "true");
   }
-  let output = command.output()?;
-  if !output.status.success() {
+  let (status, stdout, log_error) = if let Some(logs) = logs {
+    let output = logs.helper(&mut command)?;
+    (output.status, output.stdout, output.log_error)
+  } else {
+    let output = command.output()?;
+    (output.status, output.stdout, None)
+  };
+  if !status.success() {
+    let program = if let Some(error) = log_error {
+      format!("uv environment helper (log capture failed: {error})")
+    } else {
+      "uv environment helper".to_string()
+    };
     return Err(ExpriError::CommandFailed {
-      program: "uv environment helper".to_string(),
-      code: command_exit_code(&output.status),
+      program,
+      code: command_exit_code(&status),
     });
   }
-  Ok(serde_json::from_slice(&output.stdout)?)
+  if let Some(error) = log_error {
+    return Err(error.into());
+  }
+  Ok(serde_json::from_slice(&stdout)?)
 }
 
 pub fn prepare(request: &EnvironmentRequest) -> Result<PreparedEnvironment> {
-  Ok(serde_json::from_value(invoke_helper(request)?)?)
+  Ok(serde_json::from_value(invoke_helper(request, None)?)?)
+}
+
+pub fn prepare_logged(
+  request: &EnvironmentRequest,
+  logs: &crate::run_logs::RunLogs,
+) -> Result<PreparedEnvironment> {
+  Ok(serde_json::from_value(invoke_helper(request, Some(logs))?)?)
 }
 
 pub fn doctor(request: &EnvironmentRequest) -> Result<serde_json::Value> {
-  invoke_helper(request)
+  invoke_helper(request, None)
 }
 
 /// Resolve cache paths before changing into a run's source snapshot.

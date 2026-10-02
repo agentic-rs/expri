@@ -17,6 +17,10 @@ node_bin = "expri"
 # require_cuda defaults to false; set native variables for your installation.
 # Check this stack before setup: expri -T runpod env doctor --json
 # Preview old run environments: expri -T runpod env prune
+# Inspect recorded runs: expri -T runpod runs list --task train
+# Pull metadata and logs: expri -T runpod runs pull <run_id>
+# Pull task outputs selectively: expri -T runpod runs pull <run_id> --artifact code/out/jobs
+# Inspect pulled records offline: expri -T runpod runs list --cached
 
 # To use ctl, opt in on a target and select a saved host name or ID:
 # [target.work]

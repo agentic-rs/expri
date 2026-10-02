@@ -48,6 +48,27 @@ pub struct RunRequest {
   pub expected_sync: Option<SyncIdentity>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum RunQueryRequest {
+  List {
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+  },
+  Show {
+    run_id: String,
+  },
+  Files {
+    run_id: String,
+    #[serde(default)]
+    artifacts: Vec<String>,
+  },
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct EnvironmentCommandRequest {
   #[serde(default)]

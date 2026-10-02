@@ -203,17 +203,43 @@ impl Remote {
     local_root: &Path,
     files_from: &Path,
   ) -> Result<()> {
+    let args =
+      self.download_files_from_args(&ensure_trailing_slash(remote_dir), local_root, files_from);
+    self.run("rsync", args)
+  }
+
+  /// Run pulls validate their selection and received staging tree before
+  /// publishing. Limit legacy argument handling to that guarded transfer path.
+  pub fn download_run_files_from(
+    &self,
+    remote_dir: &str,
+    local_root: &Path,
+    files_from: &Path,
+  ) -> Result<()> {
+    let source = shell::quote(ensure_trailing_slash(remote_dir));
+    let args = self.download_files_from_args(&source, local_root, files_from);
+    // This quoting works with older rsync too. Modern rsync must avoid escaping
+    // the source a second time; old implementations ignore these variables.
+    self.run_with_env(
+      "rsync",
+      args,
+      &[("RSYNC_OLD_ARGS", "1"), ("RSYNC_PROTECT_ARGS", "0")],
+    )
+  }
+
+  fn download_files_from_args(
+    &self,
+    remote_source: &str,
+    local_root: &Path,
+    files_from: &Path,
+  ) -> Vec<String> {
     let mut args = self.rsync_base_args();
     args.push("--from0".to_string());
     args.push("--files-from".to_string());
     args.push(files_from.to_string_lossy().to_string());
-    args.push(format!(
-      "{}:{}",
-      self.host,
-      ensure_trailing_slash(remote_dir)
-    ));
+    args.push(format!("{}:{remote_source}", self.host));
     args.push(ensure_trailing_slash(&local_root.to_string_lossy()));
-    self.run("rsync", args)
+    args
   }
 
   pub fn download_dir_with_excludes(
@@ -356,6 +382,10 @@ impl Remote {
   }
 
   fn run(&self, program: &str, args: Vec<String>) -> Result<()> {
+    self.run_with_env(program, args, &[])
+  }
+
+  fn run_with_env(&self, program: &str, args: Vec<String>, env: &[(&str, &str)]) -> Result<()> {
     if self.show_commands() && !self.quiet {
       print_command(program, &args);
     }
@@ -364,6 +394,7 @@ impl Remote {
     }
     let status = Command::new(program)
       .args(args)
+      .envs(env.iter().copied())
       .status()
       .map_err(|source| command_launch_error(program, source))?;
     if !status.success() {

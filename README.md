@@ -183,7 +183,78 @@ The task's working directory is its code snapshot. Relative output paths such
 as `outputs/checkpoint.pt` therefore live under the snapshot. Have the task
 write to `EXPRI_OUTPUT_DIR` when you want all outputs in the dedicated output
 directory. The existing `download` mappings still resolve from the target repo
-root; there is no run-specific download command or dashboard yet.
+root. Use `runs pull` for files stored within an individual run.
+
+Configured-environment runs save task stdout and stderr to
+`.expri/runs/<run_id>/logs/stdout.log` and `logs/stderr.log` while streaming both
+to the terminal. Environment-preparation diagnostics also go to the stderr log;
+the helper's private JSON response stays out of task stdout. Run records include
+the command, timestamps, status, exit code, and log paths. Older run directories
+remain readable when optional records or logs are missing.
+
+Execution remains a foreground process. Saved logs do not make tasks survive
+an SSH disconnect or provide detached-job supervision. A stopped runner can
+leave a preparing or running record; expri preserves that recorded status.
+If a descendant keeps a pipe open after the foreground child exits, logging
+stops waiting after a one-second grace period. This and other capture failures
+are recorded as `logging_error`, while `task_exit_code` preserves the task's
+exit status. Buffered output from closed pipes is drained completely.
+
+## Run records and selective pull
+
+List local runs or inspect the configured target directly:
+
+```sh
+expri runs list
+expri -T runpod runs list --task train --status failed --limit 5
+expri -T runpod runs show run-abc123 --json
+```
+
+`list` defaults to the 20 newest records. Its status filters are `preparing`,
+`running`, `completed`, `failed`, and `unknown`. `show` includes the run state,
+source snapshot provenance, and recorded Python environment when available.
+Missing, malformed, or unsupported records produce warnings; incomplete runs
+can still be inspected. These commands read fixed records rather than scanning
+an environment's installed packages.
+
+Pull a target run's available metadata and logs into
+`results/<target>/runs/<run_id>/`:
+
+```sh
+expri -T runpod runs pull run-abc123
+expri -T runpod runs pull run-abc123 --outputs --dry-run
+expri -T runpod runs pull run-abc123 --artifact 'outputs/model one.pt'
+expri -T runpod runs pull run-abc123 --artifact code/out/jobs
+```
+
+The default selection contains `run-state.json`, `snapshot.json`, the
+environment-state manifest, and regular files under `logs/`. Outputs and files
+under the code snapshot are opt-in: `--outputs` selects the dedicated output
+directory, and repeatable `--artifact` selects a file or directory beneath
+`outputs/` or `code/`. Expri excludes environments, caches, and symlinked files
+or directories from these transfers. Explicit selections into excluded paths
+fail. The configured `[download].results_dir` replaces the default `results`
+directory.
+
+A pull stages the selected files before updating its owned destination and
+writes `pull-state.json` after publication. Repeating a metadata-only pull
+refreshes the records and logs while retaining artifacts downloaded earlier.
+A failed transfer leaves the previous cache intact. Missing optional metadata
+is skipped, so partial records can still be pulled.
+
+`runs pull --dry-run` contacts the target to query the actual selection, then
+prints the destination and files without writing locally or transferring them.
+Use cached inspection to review previously pulled records without contacting
+the target:
+
+```sh
+expri -T runpod runs list --cached
+expri -T runpod runs show run-abc123 --cached --json
+```
+
+With `protocol = "auto"`, run queries and logging use capability checks and
+fall back to Python on older nodes. Requiring `protocol = "expri-node"` reports
+an upgrade error when the installed node lacks the requested capability.
 
 ## Python environment
 

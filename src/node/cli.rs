@@ -6,6 +6,7 @@ use crate::error::{ExpriError, Result};
 
 pub const UV_ENVIRONMENT_CAPABILITY: &str = "uv-environment-v1";
 pub const ENVIRONMENT_MAINTENANCE_CAPABILITY: &str = "env-maintenance-v1";
+pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
@@ -14,7 +15,8 @@ pub enum NodeCommand {
   PullPrepare,
   Setup(SetupCommand),
   Run(SetupCommand),
-  Env(EnvironmentCommand),
+  Env(RequestCommand),
+  Runs(RequestCommand),
   SyncApply(SyncApplyCommand),
 }
 
@@ -25,7 +27,7 @@ pub struct CapabilitiesCommand {
 }
 
 #[derive(Debug, Args)]
-pub struct EnvironmentCommand {
+pub struct RequestCommand {
   #[arg(
     long,
     required_unless_present = "request_stdin",
@@ -65,6 +67,13 @@ pub fn run(command: NodeCommand) -> Result<()> {
         crate::node::environment::apply_request_stdin()
       }
     }
+    NodeCommand::Runs(command) => {
+      if let Some(path) = command.request {
+        crate::node::runs::apply_request_file(&path)
+      } else {
+        crate::node::runs::apply_request_stdin()
+      }
+    }
     NodeCommand::SyncApply(command) => crate::node::sync::apply_request_file(&command.request),
   }
 }
@@ -74,6 +83,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     if ![
       UV_ENVIRONMENT_CAPABILITY,
       ENVIRONMENT_MAINTENANCE_CAPABILITY,
+      RUN_RECORDS_CAPABILITY,
     ]
     .contains(&requested.as_str())
     {
@@ -84,7 +94,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
   } else {
     println!(
       "{}",
-      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY]})
+      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY]})
     );
   }
   Ok(())
