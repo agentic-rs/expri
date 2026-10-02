@@ -9,7 +9,7 @@ use super::{python_pull_prepare_script, python_sync_apply_script};
 use crate::archive::{build_patch_archive, sha256_file};
 use crate::filter::SyncRules;
 use crate::git;
-use crate::protocol::{PullArtifacts, SyncApplyRequest};
+use crate::protocol::{PullArtifacts, SyncApplyRequest, SyncIdentity};
 
 struct SyncFixture {
   root: TempDir,
@@ -75,6 +75,16 @@ impl SyncFixture {
   }
 
   fn sync(&self, remote_managed: &[&str]) {
+    let output = self.sync_result(remote_managed);
+    assert!(
+      output.status.success(),
+      "Python sync failed:\nstdout: {}\nstderr: {}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
+
+  fn sync_result(&self, remote_managed: &[&str]) -> std::process::Output {
     let bundle = git::build_source_bundle(&self.source, None).expect("source bundle");
     let rules = SyncRules::defaults().expect("sync rules");
     let dirty = git::dirty_paths(&self.source, &rules).expect("dirty paths");
@@ -96,20 +106,14 @@ impl SyncFixture {
       serde_json::to_vec(&request).expect("serialize sync request"),
     )
     .expect("write sync request");
-    let output = Command::new("python3")
+    Command::new("python3")
       .current_dir(&self.worktree)
       .arg("-c")
       .arg(python_sync_apply_script(
         request_path.to_str().expect("request path"),
       ))
       .output()
-      .expect("run Python sync script");
-    assert!(
-      output.status.success(),
-      "Python sync failed:\nstdout: {}\nstderr: {}",
-      String::from_utf8_lossy(&output.stdout),
-      String::from_utf8_lossy(&output.stderr)
-    );
+      .expect("run Python sync script")
   }
 
   fn assert_remote(&self, path: &str, contents: &str) {
@@ -336,6 +340,57 @@ fn python_sync_cleans_files_listed_in_native_checkout_manifest() {
   fixture.assert_remote("tracked.txt", "tracked\n");
   fixture.assert_remote("generated.txt", "remote output\n");
   fixture.assert_manifest("tracked.txt\n");
+}
+
+#[test]
+fn python_sync_invalidates_receipt_on_partial_install_and_recovers_owned_files() {
+  for legacy in [false, true] {
+    let fixture = SyncFixture::new(&[("a.py", "source a\n"), ("old-only.py", "owned by a\n")]);
+    fixture.sync(&[]);
+    let old_head = git::head(&fixture.source).expect("head a");
+    let old_receipt: SyncIdentity = serde_json::from_slice(
+      &fs::read(fixture.worktree.join(".expri/sync-state.json")).expect("state a"),
+    )
+    .expect("receipt a");
+    if legacy {
+      fs::remove_file(fixture.worktree.join(".expri/checkout.manifest"))
+        .expect("remove checkout manifest for legacy ownership");
+      fixture.mark_state_as_legacy();
+    }
+    fixture.write_source("a.py", "source b\n");
+    fixture.git(&["rm", "--quiet", "old-only.py"]);
+    fixture.write_source("b-only.py", "partial b\n");
+    fixture.write_source("z/file.py", "will fail\n");
+    fixture.commit();
+    fixture.write_remote("z", "unrelated remote file\n");
+
+    let failed = fixture.sync_result(&[]);
+    assert!(
+      !failed.status.success(),
+      "partial install unexpectedly succeeded"
+    );
+    fixture.assert_remote("a.py", "source b\n");
+    fixture.assert_remote("b-only.py", "partial b\n");
+    fixture.assert_absent(".expri/sync-state.json");
+    let recovery = fs::read_to_string(fixture.worktree.join(".expri/patch.manifest"))
+      .expect("recovery ownership manifest");
+    assert!(recovery.lines().any(|line| line == "old-only.py"));
+    assert!(recovery.lines().any(|line| line == "b-only.py"));
+    assert!(
+      crate::environment::snapshot::create_expected(&fixture.worktree, &[], Some(&old_receipt),)
+        .expect_err("old receipt must not launch partial b")
+        .to_string()
+        .contains("target checkout changed after sync; retry run")
+    );
+
+    fixture.git(&["reset", "--hard", "--quiet", &old_head]);
+    fixture.sync(&[]);
+    fixture.assert_remote("a.py", "source a\n");
+    fixture.assert_remote("old-only.py", "owned by a\n");
+    fixture.assert_absent("b-only.py");
+    fixture.assert_remote("z", "unrelated remote file\n");
+    fixture.assert_manifest("a.py\nold-only.py\n");
+  }
 }
 
 #[test]

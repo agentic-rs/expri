@@ -2,9 +2,11 @@ mod archive;
 mod config;
 mod context;
 mod controller;
+mod environment;
 mod error;
 mod filter;
 mod git;
+mod lock;
 mod node;
 mod protocol;
 mod shell;
@@ -16,7 +18,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::context::CommandContext;
 use crate::controller::download::{DownloadOptions, download_target};
 use crate::controller::setup::{SetupOptions, setup_target};
-use crate::controller::sync::{SyncOptions, sync_target};
+use crate::controller::sync::{SyncOptions, sync_target, sync_target_with_receipt};
 use crate::controller::task::{
   LocalTaskOptions, RemoteTaskOptions, run_local_task, run_remote_task,
 };
@@ -234,9 +236,24 @@ fn run_setup(
   verbosity: u8,
   quiet: bool,
 ) -> Result<()> {
-  let context = CommandContext::load(command.config, command.repo)?
-    .into_target(target, command.control_path)?;
+  let context = CommandContext::load(command.config, command.repo)?;
   let steps = context.config.setup_steps();
+  if target.is_none() && context.config.environment.is_some() {
+    let request = protocol::SetupRequest {
+      state_dir: ".expri".to_string(),
+      force: command.force,
+      steps,
+      environment: context.config.local_environment()?,
+    };
+    if command.dry_run {
+      if !quiet {
+        eprintln!("local setup: {}", serde_json::to_string(&request)?);
+      }
+      return Ok(());
+    }
+    return node::setup::apply_request_at(&request, &context.repo_root);
+  }
+  let context = context.into_target(target, command.control_path)?;
 
   setup_target(SetupOptions {
     repo_root: context.repo_root,
@@ -261,11 +278,29 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     .expect("clap requires at least one task argument");
   let args = task_parts.collect::<Vec<_>>();
   let task = context.config.task(&name)?;
+  let remote_managed = context
+    .config
+    .sync
+    .as_ref()
+    .and_then(|sync| sync.remote_managed.clone())
+    .unwrap_or_default();
+  let mut extras = Vec::new();
+  let mut sync_args = Vec::new();
+  for step in context.config.setup_steps() {
+    if let protocol::SetupStep::Uv {
+      extras: step_extras,
+      args,
+    } = step
+    {
+      extras.extend(step_extras);
+      sync_args.extend(args);
+    }
+  }
   if target.is_some() {
     let context = context.into_target(target, command.control_path)?;
-    if !command.no_sync {
+    let expected_sync = if !command.no_sync {
       let sync = context.config.sync_rules()?;
-      sync_target(SyncOptions {
+      sync_target_with_receipt(SyncOptions {
         repo_root: context.repo_root.clone(),
         project_name: context.project_name.clone(),
         target_name: context.target_name.clone(),
@@ -279,8 +314,10 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
         paths: Vec::new(),
         verbosity,
         quiet,
-      })?;
-    }
+      })?
+    } else {
+      None
+    };
     return run_remote_task(RemoteTaskOptions {
       repo_root: context.repo_root,
       project_name: context.project_name,
@@ -294,9 +331,23 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
       dry_run: command.dry_run,
       verbosity,
       quiet,
+      remote_managed,
+      extras,
+      sync_args,
+      expected_sync,
     });
   }
 
+  let environment = context.config.local_environment()?;
+  let mut local_sources = remote_managed;
+  if let Some(paths) = context
+    .config
+    .sync
+    .as_ref()
+    .and_then(|sync| sync.include_ignored.as_ref())
+  {
+    local_sources.extend(paths.iter().cloned());
+  }
   run_local_task(LocalTaskOptions {
     repo_root: context.repo_root,
     project_name: context.project_name,
@@ -306,6 +357,10 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     dry_run: command.dry_run,
     verbosity,
     quiet,
+    environment,
+    remote_managed: local_sources,
+    extras,
+    sync_args,
   })
 }
 

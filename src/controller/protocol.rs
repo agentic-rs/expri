@@ -6,6 +6,7 @@ trait RemoteProtocol {
   fn name(&self) -> &'static str;
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()>;
+  fn apply_run(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn prepare_pull(&self, remote: &Remote) -> Result<()>;
 }
 
@@ -23,6 +24,14 @@ impl ExpriNodeProtocol {
     remote.execute_success(&format!(
       "command -v {} >/dev/null 2>&1",
       shell::quote(&self.node_bin)
+    ))
+  }
+
+  fn supports_uv_environment(&self, remote: &Remote) -> Result<bool> {
+    remote.execute_success(&format!(
+      "{} node capabilities --has {}",
+      shell::quote(&self.node_bin),
+      shell::quote(crate::node::cli::UV_ENVIRONMENT_CAPABILITY)
     ))
   }
 }
@@ -57,6 +66,15 @@ impl RemoteProtocol for ExpriNodeProtocol {
       shell::quote(&self.node_bin)
     ))
   }
+
+  fn apply_run(&self, remote: &Remote, request_path: &str) -> Result<()> {
+    remote.execute(&format!(
+      "cd {} && {} node run --request {}",
+      remote.quoted_remote_dir(),
+      shell::quote(&self.node_bin),
+      shell::quote(request_path)
+    ))
+  }
 }
 
 #[derive(Debug, Default)]
@@ -80,6 +98,14 @@ impl RemoteProtocol for PythonProtocol {
     remote.execute(&format!(
       "cd {} && python3 - <<'PY'\n{script}\nPY",
       remote.quoted_remote_dir()
+    ))
+  }
+
+  fn apply_run(&self, remote: &Remote, request_path: &str) -> Result<()> {
+    remote.execute(&format!(
+      "cd {} && python3 - <<'PY'\n{}\nPY",
+      remote.quoted_remote_dir(),
+      python_run_script(request_path)
     ))
   }
 
@@ -117,8 +143,10 @@ pub fn apply_sync_with_preference(
   request_path: &str,
   preference: ProtocolPreference,
   node_bin: &str,
+  requires_environment: bool,
 ) -> Result<()> {
-  protocol_with_preference(remote, preference, node_bin, "sync")?.apply_sync(remote, request_path)
+  protocol_with_preference(remote, preference, node_bin, "sync", requires_environment)?
+    .apply_sync(remote, request_path)
 }
 
 pub fn apply_setup_with_preference(
@@ -126,8 +154,10 @@ pub fn apply_setup_with_preference(
   request_path: &str,
   preference: ProtocolPreference,
   node_bin: &str,
+  requires_environment: bool,
 ) -> Result<()> {
-  protocol_with_preference(remote, preference, node_bin, "setup")?.apply_setup(remote, request_path)
+  protocol_with_preference(remote, preference, node_bin, "setup", requires_environment)?
+    .apply_setup(remote, request_path)
 }
 
 pub fn prepare_pull_with_preference(
@@ -135,7 +165,17 @@ pub fn prepare_pull_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<()> {
-  protocol_with_preference(remote, preference, node_bin, "pull")?.prepare_pull(remote)
+  protocol_with_preference(remote, preference, node_bin, "pull", false)?.prepare_pull(remote)
+}
+
+pub fn apply_run_with_preference(
+  remote: &Remote,
+  request_path: &str,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  protocol_with_preference(remote, preference, node_bin, "run", true)?
+    .apply_run(remote, request_path)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,10 +186,19 @@ enum SelectedProtocol {
 
 fn select_protocol(
   preference: ProtocolPreference,
+  requires_environment: bool,
   node_available: impl FnOnce() -> Result<bool>,
 ) -> Result<SelectedProtocol> {
   match preference {
-    ProtocolPreference::ExpriNode => Ok(SelectedProtocol::ExpriNode),
+    ProtocolPreference::ExpriNode => {
+      if requires_environment && !node_available()? {
+        return Err(ExpriError::Message(format!(
+          "configured expri-node protocol lacks {}; upgrade expri on the target or choose protocol = \"python\"",
+          crate::node::cli::UV_ENVIRONMENT_CAPABILITY
+        )));
+      }
+      Ok(SelectedProtocol::ExpriNode)
+    }
     ProtocolPreference::Python => Ok(SelectedProtocol::Python),
     ProtocolPreference::Auto => {
       if node_available()? {
@@ -166,10 +215,17 @@ fn protocol_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
   operation: &str,
+  requires_environment: bool,
 ) -> Result<Box<dyn RemoteProtocol>> {
   let expri = ExpriNodeProtocol::new(node_bin.to_string());
   let protocol: Box<dyn RemoteProtocol> =
-    match select_protocol(preference, || expri.available(remote))? {
+    match select_protocol(preference, requires_environment, || {
+      if requires_environment {
+        expri.supports_uv_environment(remote)
+      } else {
+        expri.available(remote)
+      }
+    })? {
       SelectedProtocol::ExpriNode => Box::new(expri),
       SelectedProtocol::Python => Box::new(PythonProtocol),
     };
@@ -179,11 +235,12 @@ fn protocol_with_preference(
   Ok(protocol)
 }
 
-fn python_setup_script(request_path: &str) -> String {
+pub(crate) fn python_setup_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
-    r#"import json, pathlib, subprocess
+    r#"import json, os, pathlib, subprocess
+{preamble}
 
 def check_path(path):
   p = pathlib.PurePosixPath(path)
@@ -193,25 +250,137 @@ def check_path(path):
 
 request = json.loads(pathlib.Path({request_path}).read_text())
 pathlib.Path(request["state_dir"]).mkdir(parents=True, exist_ok=True)
+environment = request.get("environment")
+prepared = None
 for step in request["steps"]:
   kind = step["kind"]
   if kind == "uv":
+    if environment is not None:
+      prepared = prepare_environment(environment, os.getcwd(), request["state_dir"], step.get("extras", []), step.get("args", []), False)
+      continue
     cmd = ["uv", "sync"]
     for extra in step.get("extras", []):
       cmd.extend(["--extra", extra])
     cmd.extend(step.get("args", []))
   elif kind == "hf":
-    cmd = ["uv", "run", "hf", "download", step["repo"]]
+    if environment is not None and prepared is None:
+      prepared = prepare_environment(environment, os.getcwd(), request["state_dir"], [], [], False)
+    cmd = ["uv", "run"]
+    if prepared is not None:
+      cmd.extend(["--no-sync", "--no-env-file"])
+    cmd.extend(["hf", "download", step["repo"]])
     if step.get("revision"):
       cmd.extend(["--revision", step["revision"]])
     cmd.extend(step.get("args", []))
   elif kind == "script":
     cmd = ["bash", check_path(step["path"]), *step.get("args", [])]
+    if prepared is not None:
+      cmd = ["uv", "run", "--no-sync", "--no-env-file", "--", *cmd]
   else:
     raise SystemExit(f"unknown setup step kind: {{kind}}")
-  subprocess.run(cmd, check=True)
+  child_env = os.environ.copy()
+  if prepared is not None:
+    for key in [*ENV_REMOVE, *prepared.get("env_remove", [])]:
+      child_env.pop(key, None)
+  if environment is not None:
+    child_env.update(environment.get("env", {{}}))
+  if prepared is not None:
+    child_env.update(prepared.get("run_env", {{}}))
+    child_env["UV_PROJECT_ENVIRONMENT"] = prepared["environment_path"]
+    child_env["PYTHONNOUSERSITE"] = "1"
+  subprocess.run(cmd, check=True, env=child_env)
+if environment is not None and prepared is None:
+  prepare_environment(environment, os.getcwd(), request["state_dir"], [], [], False)
 (pathlib.Path(request["state_dir"]) / "setup-state.json").write_text(json.dumps(request, indent=2, sort_keys=True))
+"#,
+    preamble = python_environment_preamble(),
+  )
+}
+
+fn python_environment_preamble() -> String {
+  let runtime =
+    serde_json::to_string(crate::environment::RUNTIME_SCRIPT).expect("runtime script string");
+  let env_remove =
+    serde_json::to_string(crate::environment::ENV_REMOVE).expect("environment variable names");
+  format!(
+    r#"
+RUNTIME_SCRIPT = {runtime}
+ENV_REMOVE = {env_remove}
+
+def prepare_environment(environment, repo_root, state_dir, extras, sync_args, install_project):
+  spec = {{"environment": environment, "repo_root": repo_root, "state_dir": state_dir,
+          "operation": "run" if install_project else "setup", "extras": extras,
+          "sync_args": sync_args, "install_project": install_project}}
+  cmd = ["uv", "run", "--isolated", "--no-project", "--no-config", "--no-env-file", "--with", "packaging==25.0",
+         "--with", "tomli==2.2.1", "python", "-I", "-c", RUNTIME_SCRIPT, json.dumps(spec)]
+  child_env = os.environ.copy()
+  for key in ENV_REMOVE:
+    child_env.pop(key, None)
+  child_env.update(environment.get("env", {{}}))
+  output = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, text=True, env=child_env)
+  return json.loads(output.stdout)
 "#
+  )
+}
+
+pub(crate) fn python_run_script(request_path: &str) -> String {
+  let request_path = serde_json::to_string(request_path).expect("request path string");
+  let snapshot = serde_json::to_string(include_str!("../environment/snapshot.py"))
+    .expect("snapshot script string");
+  format!(
+    r#"import datetime, json, os, pathlib, subprocess, sys
+{preamble}
+snapshot_module = {{"__name__": "expri_snapshot"}}
+exec({snapshot}, snapshot_module)
+request = json.loads(pathlib.Path({request_path}).read_text())
+if not request.get("command"):
+  raise SystemExit("task command must not be empty")
+snapshot = snapshot_module["create_snapshot"](os.getcwd(), request.get("remote_managed", []), request.get("expected_sync"))
+run_dir = pathlib.Path(snapshot["run_dir"])
+state_path = run_dir / "run-state.json"
+state = {{"run_id": snapshot["run_id"], "task": request["name"], "command": request["command"],
+         "code_dir": snapshot["code_dir"], "output_dir": str(run_dir / "outputs"),
+         "status": "preparing", "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}}
+
+def write_state():
+  temporary = state_path.with_suffix(".json.tmp")
+  temporary.write_text(json.dumps(state, indent=2, sort_keys=True))
+  temporary.replace(state_path)
+
+write_state()
+print("run: " + snapshot["run_id"], file=sys.stderr)
+print("run directory: " + str(run_dir), file=sys.stderr)
+exit_code = 1
+try:
+  prepared = prepare_environment(request["environment"], snapshot["code_dir"], str(run_dir),
+                                 request.get("extras", []), request.get("sync_args", []), True)
+  state.update(status="running", environment_manifest=prepared["manifest_path"], python=prepared["python"])
+  write_state()
+  child_env = os.environ.copy()
+  for key in [*ENV_REMOVE, *prepared.get("env_remove", [])]:
+    child_env.pop(key, None)
+  child_env.update(request["environment"].get("env", {{}}))
+  child_env.update(prepared.get("run_env", {{}}))
+  child_env.update(UV_PROJECT_ENVIRONMENT=prepared["environment_path"], PYTHONNOUSERSITE="1",
+                   EXPRI_RUN_ID=snapshot["run_id"], EXPRI_RUN_DIR=str(run_dir), EXPRI_OUTPUT_DIR=str(run_dir / "outputs"))
+  status = subprocess.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
+                          cwd=snapshot["code_dir"], env=child_env)
+  exit_code = status.returncode if status.returncode >= 0 else 128 - status.returncode
+  if exit_code:
+    state["error"] = "task exited with status " + str(exit_code)
+except subprocess.CalledProcessError as error:
+  exit_code = error.returncode if error.returncode > 0 else 1
+  state["error"] = "environment preparation exited with status " + str(exit_code)
+except Exception as error:
+  state["error"] = str(error)
+  print("error: " + str(error), file=sys.stderr)
+finally:
+  state.update(status="completed" if exit_code == 0 else "failed", exit_code=exit_code,
+               finished_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+  write_state()
+raise SystemExit(exit_code)
+"#,
+    preamble = python_environment_preamble()
   )
 }
 
@@ -219,7 +388,7 @@ fn python_sync_apply_script(request_path: &str) -> String {
   let request_path =
     serde_json::to_string(request_path).expect("request path string is serializable");
   format!(
-    r#"import hashlib, json, pathlib, shutil, subprocess, tempfile, zipfile
+    r#"import fcntl, hashlib, json, pathlib, shutil, subprocess, tempfile, zipfile
 
 def sha256(path):
   h = hashlib.sha256()
@@ -243,6 +412,17 @@ def read_manifest(path):
   if not path.is_file():
     return set()
   return {{check_path(line) for line in path.read_text().splitlines() if line}}
+
+def atomic_write(path, raw):
+  temporary_path = None
+  try:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as temporary:
+      temporary_path = pathlib.Path(temporary.name)
+      temporary.write(raw)
+    temporary_path.replace(path)
+  finally:
+    if temporary_path is not None:
+      temporary_path.unlink(missing_ok=True)
 
 def previous_installed_files(state_dir, git_dir):
   checkout_manifest = state_dir / "checkout.manifest"
@@ -288,6 +468,12 @@ def install_staged_checkout(state_dir, stage_dir, previous, remote_managed):
     path.relative_to(stage_dir) for path in stage_dir.rglob("*")
     if path.is_file() or path.is_symlink()
   }} - remote_managed
+  # Persist ownership before invalidating the old success receipt, including
+  # paths this attempt may add before an interrupted or failed installation.
+  atomic_write(state_dir / "patch.manifest", "".join(
+    f"{{path.as_posix()}}\n" for path in sorted(previous | desired)
+  ))
+  (state_dir / "sync-state.json").unlink(missing_ok=True)
   # A previous overlay may now be in HEAD; only remove paths absent from the
   # complete desired checkout. Clear these first so files can become directories.
   for path in sorted(previous - desired - remote_managed):
@@ -303,7 +489,7 @@ def install_staged_checkout(state_dir, stage_dir, previous, remote_managed):
       remove_worktree_file(pathlib.Path("."), path)
     shutil.copy2(stage_dir / path, path, follow_symlinks=False)
   checkout_manifest = state_dir / "checkout.manifest"
-  checkout_manifest.write_text("".join(f"{{path.as_posix()}}\n" for path in sorted(desired)))
+  atomic_write(checkout_manifest, "".join(f"{{path.as_posix()}}\n" for path in sorted(desired)))
   manifest_path = state_dir / "patch.manifest"
   if manifest_path.exists():
     manifest_path.unlink()
@@ -311,7 +497,13 @@ def install_staged_checkout(state_dir, stage_dir, previous, remote_managed):
 
 request = json.loads(pathlib.Path({request_path}).read_text())
 state_dir = pathlib.Path(request["state_dir"])
+if state_dir.is_symlink():
+  raise SystemExit("sync state directory must not be a symlink")
 state_dir.mkdir(parents=True, exist_ok=True)
+if (state_dir / "worktree.lock").is_symlink():
+  raise SystemExit("checkout lock must not be a symlink")
+checkout_lock = (state_dir / "worktree.lock").open("a+b")
+fcntl.flock(checkout_lock, fcntl.LOCK_EX)
 
 if request.get("source_bundle"):
   if sha256(request["source_bundle"]) != request["source_bundle_sha256"]:
@@ -353,7 +545,7 @@ with tempfile.TemporaryDirectory(prefix="sync-", dir=tmp_dir) as stage:
   checkout_manifest_sha256 = install_staged_checkout(state_dir, stage_dir, previous, remote_managed)
 
 (state_dir / "patch.sha256").write_text(request["patch_sha256"])
-(state_dir / "sync-state.json").write_text(json.dumps({{
+atomic_write(state_dir / "sync-state.json", json.dumps({{
   "head": request["head"],
   "source_bundle_sha256": request["source_bundle_sha256"],
   "patch_sha256": request["patch_sha256"],
@@ -430,11 +622,11 @@ mod tests {
   #[test]
   fn auto_protocol_uses_python_when_node_is_unavailable() {
     assert_eq!(
-      select_protocol(ProtocolPreference::Auto, || Ok(false)).unwrap(),
+      select_protocol(ProtocolPreference::Auto, false, || Ok(false)).unwrap(),
       SelectedProtocol::Python
     );
     assert_eq!(
-      select_protocol(ProtocolPreference::Auto, || Ok(true)).unwrap(),
+      select_protocol(ProtocolPreference::Auto, false, || Ok(true)).unwrap(),
       SelectedProtocol::ExpriNode
     );
   }
@@ -446,7 +638,10 @@ mod tests {
       (ProtocolPreference::Python, SelectedProtocol::Python),
     ] {
       assert_eq!(
-        select_protocol(preference, || panic!("explicit protocol must not probe")).unwrap(),
+        select_protocol(preference, false, || panic!(
+          "explicit protocol must not probe"
+        ))
+        .unwrap(),
         expected
       );
     }
@@ -454,11 +649,38 @@ mod tests {
 
   #[test]
   fn auto_protocol_preserves_availability_probe_errors() {
-    let result = select_protocol(ProtocolPreference::Auto, || {
+    let result = select_protocol(ProtocolPreference::Auto, false, || {
       Err(ExpriError::Message("transport unavailable".to_string()))
     });
     assert!(
       matches!(result, Err(ExpriError::Message(message)) if message == "transport unavailable")
+    );
+  }
+
+  #[test]
+  fn configured_environment_falls_back_for_older_node_capabilities() {
+    assert_eq!(
+      select_protocol(ProtocolPreference::Auto, true, || Ok(false)).expect("Python fallback"),
+      SelectedProtocol::Python
+    );
+    assert_eq!(
+      select_protocol(ProtocolPreference::Auto, true, || Ok(true)).expect("capable node"),
+      SelectedProtocol::ExpriNode
+    );
+  }
+
+  #[test]
+  fn explicit_environment_node_requires_capability_but_python_does_not_probe() {
+    let error = select_protocol(ProtocolPreference::ExpriNode, true, || Ok(false))
+      .expect_err("old node should not receive environment request");
+    assert!(error.to_string().contains("uv-environment-v1"));
+    assert!(error.to_string().contains("upgrade expri on the target"));
+    assert_eq!(
+      select_protocol(ProtocolPreference::Python, true, || panic!(
+        "Python must not probe"
+      ))
+      .expect("explicit Python"),
+      SelectedProtocol::Python
     );
   }
 

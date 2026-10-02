@@ -10,6 +10,7 @@ fn target(transport: TransportKind) -> TargetConfig {
     node_bin: None,
     ctl_bin: None,
     ctl_method: None,
+    environment: None,
   }
 }
 

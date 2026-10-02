@@ -4,6 +4,18 @@ remote_dir = "~/cs336-assignment5-alignment"
 protocol = "auto"
 node_bin = "expri"
 
+# Reuse a GPU machine's existing PyTorch stack with uv:
+# [target.runpod.environment]
+# base_python = "/opt/conda/bin/python"
+# reuse_packages = ["torch"]
+# require_cuda = true
+#
+# [target.runpod.environment.env]
+# LD_LIBRARY_PATH = "/opt/conda/lib"
+#
+# The whole target environment overrides [environment] in cs336.toml.
+# require_cuda defaults to false; set native variables for your installation.
+
 # To use ctl, opt in on a target and select a saved host name or ID:
 # [target.work]
 # transport = "ctl"

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,6 +49,7 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
     path: state_dir.display().to_string(),
     source,
   })?;
+  let _checkout_lock = crate::lock::worktree_lock(state_dir)?;
 
   if !request.force && sync_is_current(state_dir, request)? {
     println!("node sync is current");
@@ -216,12 +217,7 @@ fn write_state(
   };
   let path = state_path(state_dir);
   let raw = serde_json::to_string_pretty(&state)?;
-  fs::write(&path, raw).map_err(|source| ExpriError::IoContext {
-    action: "write",
-    path: path.display().to_string(),
-    source,
-  })?;
-  Ok(())
+  atomic_write(&path, raw.as_bytes())
 }
 
 fn state_path(state_dir: &Path) -> PathBuf {
@@ -334,6 +330,12 @@ fn install_staged_checkout(
 ) -> Result<String> {
   let staged_files = collect_staged_files(stage_dir, remote_managed)?;
   let previous_files = previous_installed_files(state_dir, git_dir)?;
+
+  // Record every path this install may touch so a failed install can be cleaned
+  // up on retry, including files recovered from a legacy checkout's Git HEAD.
+  let recovery_files = previous_files.union(&staged_files).cloned().collect();
+  write_manifest(manifest_path(state_dir), &recovery_files)?;
+  invalidate_state(state_dir)?;
 
   for path in previous_files.difference(&staged_files) {
     if !is_remote_managed(path, remote_managed) {
@@ -545,12 +547,46 @@ fn write_manifest(path: PathBuf, manifest: &BTreeSet<PathBuf>) -> Result<String>
     raw.push_str(&path.to_string_lossy());
     raw.push('\n');
   }
-  fs::write(&path, raw).map_err(|source| ExpriError::IoContext {
-    action: "write",
-    path: path.display().to_string(),
-    source,
-  })?;
+  atomic_write(&path, raw.as_bytes())?;
   sha256_file(&path).map(|(digest, _)| digest)
+}
+
+fn invalidate_state(state_dir: &Path) -> Result<()> {
+  let path = state_path(state_dir);
+  match fs::remove_file(&path) {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+    Err(source) => Err(ExpriError::IoContext {
+      action: "invalidate sync state",
+      path: path.display().to_string(),
+      source,
+    }),
+  }
+}
+
+fn atomic_write(path: &Path, raw: &[u8]) -> Result<()> {
+  let parent = path.parent().ok_or_else(|| {
+    ExpriError::Message(format!(
+      "sync metadata path has no parent: {}",
+      path.display()
+    ))
+  })?;
+  let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+  temporary
+    .write_all(raw)
+    .map_err(|source| ExpriError::IoContext {
+      action: "write sync metadata",
+      path: path.display().to_string(),
+      source,
+    })?;
+  temporary
+    .persist(path)
+    .map_err(|error| ExpriError::IoContext {
+      action: "publish sync metadata",
+      path: path.display().to_string(),
+      source: error.error,
+    })?;
+  Ok(())
 }
 
 fn manifest_path(state_dir: &Path) -> PathBuf {
@@ -928,6 +964,134 @@ mod tests {
     };
 
     assert!(sync_is_current(state_dir.path(), &request).expect("current"));
+  }
+
+  #[test]
+  fn partial_install_invalidates_receipt_and_preserves_recovery_ownership() {
+    let _guard = cwd_lock().lock().expect("cwd lock");
+    for legacy in [false, true] {
+      let source = tempfile::tempdir().expect("source repository");
+      run_command_in(source.path(), ["git", "init", "--quiet"]);
+      fs::write(source.path().join("a.py"), "source a\n").expect("source a");
+      fs::write(source.path().join("old-only.py"), "owned by a\n").expect("old owned source");
+      run_command_in(source.path(), ["git", "add", "."]);
+      run_command_in(
+        source.path(),
+        [
+          "git",
+          "-c",
+          "user.name=Expri",
+          "-c",
+          "user.email=expri@example.com",
+          "-c",
+          "commit.gpgsign=false",
+          "commit",
+          "--quiet",
+          "-m",
+          "source a",
+        ],
+      );
+      let head = command_output_in(source.path(), ["git", "rev-parse", "HEAD"]);
+      let root = tempfile::tempdir().expect("target");
+      let state_dir = root.path().join(".expri");
+      let stage_b = state_dir.join("tmp/stage-b");
+      fs::create_dir_all(stage_b.join("z")).expect("stage b");
+      fs::write(stage_b.join("a.py"), "source b\n").expect("changed b source");
+      fs::write(stage_b.join("b-only.py"), "partial b\n").expect("new b source");
+      fs::write(stage_b.join("z/file.py"), "will fail\n").expect("blocked b source");
+      fs::write(root.path().join("a.py"), "source a\n").expect("target a");
+      fs::write(root.path().join("old-only.py"), "owned by a\n").expect("target old source");
+      fs::write(root.path().join("z"), "unrelated remote file\n").expect("blocking target file");
+      if !legacy {
+        fs::write(checkout_manifest_path(&state_dir), "a.py\nold-only.py\n")
+          .expect("checkout ownership");
+      }
+      fs::write(
+        state_path(&state_dir),
+        serde_json::to_vec(&SyncState {
+          head: head.clone(),
+          source_bundle_sha256: None,
+          patch_sha256: "patch-a".to_string(),
+          checkout_manifest_sha256: (!legacy).then(|| "manifest-a".to_string()),
+        })
+        .expect("state a JSON"),
+      )
+      .expect("state a");
+      let expected = crate::protocol::SyncIdentity {
+        head: head.clone(),
+        patch_sha256: "patch-a".to_string(),
+      };
+      let request_a = SyncApplyRequest {
+        head,
+        remote_url: None,
+        source_bundle: None,
+        source_bundle_sha256: None,
+        patch: "unused".to_string(),
+        patch_sha256: "patch-a".to_string(),
+        state_dir: ".expri".to_string(),
+        remote_managed: Vec::new(),
+        force: false,
+      };
+      let previous_cwd = env::current_dir().expect("cwd");
+      env::set_current_dir(root.path()).expect("target cwd");
+      let failed = install_staged_checkout(
+        &state_dir,
+        &source.path().join(".git"),
+        &stage_b,
+        &[],
+        "patch-b",
+      );
+      env::set_current_dir(&previous_cwd).expect("restore cwd");
+
+      assert!(failed.is_err(), "partial install unexpectedly succeeded");
+      assert_eq!(
+        fs::read_to_string(root.path().join("a.py")).expect("partial a"),
+        "source b\n"
+      );
+      assert!(root.path().join("b-only.py").is_file());
+      assert!(!state_path(&state_dir).exists());
+      assert!(!sync_is_current(&state_dir, &request_a).expect("stale sync must not skip"));
+      let recovery = read_manifest(manifest_path(&state_dir)).expect("recovery ownership");
+      assert!(recovery.contains(Path::new("old-only.py")));
+      assert!(recovery.contains(Path::new("b-only.py")));
+      assert!(
+        crate::environment::snapshot::create_expected(root.path(), &[], Some(&expected))
+          .expect_err("old receipt must not launch partial b")
+          .to_string()
+          .contains("target checkout changed after sync; retry run")
+      );
+
+      let stage_a = state_dir.join("tmp/stage-a");
+      fs::create_dir(&stage_a).expect("stage a");
+      fs::write(stage_a.join("a.py"), "source a\n").expect("recovery source a");
+      fs::write(stage_a.join("old-only.py"), "owned by a\n").expect("recovery old source");
+      env::set_current_dir(root.path()).expect("recovery target cwd");
+      let recovered = install_staged_checkout(
+        &state_dir,
+        &source.path().join(".git"),
+        &stage_a,
+        &[],
+        "patch-a",
+      );
+      env::set_current_dir(previous_cwd).expect("restore recovery cwd");
+      write_state(&state_dir, &request_a, recovered.expect("recovery install"))
+        .expect("publish recovery state");
+      assert!(sync_is_current(&state_dir, &request_a).expect("recovered sync is current"));
+      assert_eq!(
+        fs::read_to_string(root.path().join("a.py")).expect("recovered a"),
+        "source a\n"
+      );
+      assert_eq!(
+        fs::read_to_string(root.path().join("old-only.py")).expect("recovered old source"),
+        "owned by a\n"
+      );
+      assert!(!root.path().join("b-only.py").exists());
+      assert_eq!(
+        fs::read_to_string(root.path().join("z")).expect("unrelated file"),
+        "unrelated remote file\n"
+      );
+      assert!(!manifest_path(&state_dir).exists());
+    }
   }
 
   fn write_test_patch(path: &Path) {

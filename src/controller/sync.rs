@@ -13,7 +13,7 @@ use crate::controller::transport::Remote;
 use crate::error::Result;
 use crate::filter::SyncRules;
 use crate::git::{self, RemoteCandidate, SourceBundle};
-use crate::protocol::{PullArtifacts, SyncApplyRequest};
+use crate::protocol::{PullArtifacts, SyncApplyRequest, SyncIdentity};
 use crate::shell;
 
 pub struct SyncOptions {
@@ -40,6 +40,10 @@ struct RemoteSyncState {
 }
 
 pub fn sync_target(options: SyncOptions) -> Result<()> {
+  sync_target_with_receipt(options).map(|_| ())
+}
+
+pub fn sync_target_with_receipt(options: SyncOptions) -> Result<Option<SyncIdentity>> {
   let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
   let node_bin = options
     .target
@@ -55,10 +59,10 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     options.quiet,
   )?;
   if !options.paths.is_empty() {
-    return sync_paths(options, remote);
+    return sync_paths(options, remote).map(|_| None);
   }
   if options.pull {
-    return pull_target(options, remote, preference, &node_bin);
+    return pull_target(options, remote, preference, &node_bin).map(|_| None);
   }
   if options.verbosity > 0 && !options.quiet {
     if let Some(project_name) = &options.project_name {
@@ -92,6 +96,10 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
   }
   let dirty = git::dirty_paths(&options.repo_root, &options.sync)?;
   let patch = build_patch_archive(&options.repo_root, &dirty)?;
+  let identity = SyncIdentity {
+    head: head.clone(),
+    patch_sha256: patch.digest.clone(),
+  };
   print_digest("patch zip", &patch.digest, patch.size, options.quiet);
   if options.verbosity > 0 && !options.quiet {
     eprintln!(
@@ -103,7 +111,7 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     if !options.quiet {
       eprintln!("sync skipped: target already has HEAD and patch");
     }
-    return Ok(());
+    return Ok(Some(identity));
   }
 
   let bundle = build_source_bundle_for_remote(
@@ -123,9 +131,10 @@ pub fn sync_target(options: SyncOptions) -> Result<()> {
     force: options.force,
     preference,
     node_bin: &node_bin,
+    requires_environment: options.target.environment.is_some(),
   };
   upload_artifacts_and_apply(&remote, apply_request)?;
-  Ok(())
+  Ok(Some(identity))
 }
 
 fn read_remote_sync_state(remote: &Remote) -> Result<Option<RemoteSyncState>> {
@@ -325,6 +334,7 @@ struct UploadApplyRequest<'a> {
   force: bool,
   preference: ProtocolPreference,
   node_bin: &'a str,
+  requires_environment: bool,
 }
 
 fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) -> Result<()> {
@@ -366,6 +376,7 @@ fn upload_artifacts_and_apply(remote: &Remote, apply: UploadApplyRequest<'_>) ->
     &format!(".expri/inbox/{request_id}/request.json"),
     apply.preference,
     apply.node_bin,
+    apply.requires_environment,
   )
 }
 
@@ -377,7 +388,7 @@ fn request_id(head: &str, patch_digest: &str) -> String {
 }
 
 fn utc_timestamp() -> String {
-  Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+  Utc::now().format("%Y%m%dT%H%M%S%fZ").to_string()
 }
 
 fn print_digest(label: &str, digest: &str, size: u64, quiet: bool) {
