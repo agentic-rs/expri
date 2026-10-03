@@ -2,12 +2,18 @@ FROM ghcr.io/astral-sh/uv:0.8.15 AS uv
 
 FROM rust:1.89-slim-bookworm AS builder
 WORKDIR /build
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends cmake \
+  && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY tests/container_workflow.rs tests/container_workflow.rs
 COPY python/expri_metrics.py python/expri_metrics.py
 COPY dashboard_web/index.html dashboard_web/styles.css dashboard_web/app.js dashboard_web/
-RUN cargo build --release --locked --bin expri \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+  --mount=type=cache,target=/build/target \
+  cargo build --release --locked --bin expri \
+  && rm -f target/release/deps/container_workflow-* \
   && cargo test --release --locked --test container_workflow --no-run \
   && mkdir /artifacts \
   && cp target/release/expri /artifacts/expri \
@@ -55,3 +61,7 @@ COPY --from=builder /artifacts/expri-container-tests /usr/local/bin/expri-contai
 COPY --chmod=755 tests/containers/host-entrypoint.sh /usr/local/bin/host-entrypoint
 ENV EXPRI_TEST_BIN=/usr/local/bin/expri
 ENTRYPOINT ["/usr/local/bin/host-entrypoint"]
+
+FROM common AS service
+USER tester
+ENTRYPOINT ["/usr/local/bin/expri", "service", "serve"]

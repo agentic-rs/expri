@@ -422,6 +422,18 @@ pnpm --dir dashboard_web build
 Commit the generated `dashboard_web/app.js` with its TypeScript source. CI checks
 that rebuilding it produces the checked-in asset.
 
+## Optional self-hosted storage
+
+Use `expri service` to forward run metadata, metrics and logs to a service backed
+by S3-compatible storage, publish private input files, and download selected
+checkpoints into the local review cache. A separate `push --watch` process retries
+outages while training continues. Uploads keep durable multipart receipts; pulls
+verify file SHA256 digests before publishing downloaded files.
+
+See the [self-hosted service guide](docs/self-hosted-service.md) for server and
+worker configuration, input files, selective downloads, and offline dashboard
+review. This initial version uses explicit CLI commands alongside `expri run`.
+
 ## Python environment
 
 Configure uv for local tasks and as the default for targets with a top-level
@@ -614,3 +626,12 @@ tests/containers/run.sh
 Image builds require internet; test execution uses an internal fixture index.
 The fake GPU API tests workflow decisions and metadata, without verifying real
 GPU computation or PyTorch/CUDA binary compatibility.
+
+The [self-hosted S3 suite](docs/self-hosted-service.md#acceptance-tests) additionally
+tests private inputs, service outages during training, lost multipart
+acknowledgments, restart recovery, selective checkpoint downloads and offline
+review through separate service, S3, host and worker containers:
+
+```sh
+python3 -B tests/containers/service_workflow.py
+```

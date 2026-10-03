@@ -17,6 +17,7 @@ mod protocol;
 mod run_logs;
 mod runs;
 mod runs_cli;
+mod service;
 mod shell;
 
 use std::path::PathBuf;
@@ -62,6 +63,8 @@ enum Command {
   Runs(RunsCommand),
   /// Browse local and cached experiment results in a local dashboard.
   Dashboard(dashboard::DashboardCommand),
+  /// Sync experiments and private files through an optional self-hosted S3 service.
+  Service(service::ServiceCommand),
   Node {
     #[command(subcommand)]
     command: NodeCommand,
@@ -232,6 +235,7 @@ fn run() -> Result<()> {
     }
     Command::Runs(command) => runs_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Dashboard(command) => dashboard::run(command, cli.target.as_deref()),
+    Command::Service(command) => service::run(command, cli.target.as_deref()),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
