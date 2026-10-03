@@ -127,6 +127,92 @@ fn selected_files(report: &Value) -> BTreeSet<&str> {
 }
 
 #[test]
+fn metric_selection_reads_fixed_files_without_logs_checkpoints_or_environment_contents() {
+  let (_directory, root) = fixture();
+  let directory = run(
+    &root.join(".expri/runs"),
+    "run-metrics",
+    Some(&state("run-metrics", "completed", "2026-10-02T12:00:00Z")),
+  );
+  fs::create_dir_all(directory.join("outputs/checkpoints")).unwrap();
+  fs::create_dir_all(directory.join("logs")).unwrap();
+  fs::write(
+    directory.join("outputs/metrics.jsonl"),
+    b"{\"step\":0,\"metrics\":{\"loss\":1}}\n",
+  )
+  .unwrap();
+  fs::write(
+    directory.join("outputs/params.json"),
+    b"{\"learning_rate\":0.01}",
+  )
+  .unwrap();
+  fs::write(
+    directory.join("outputs/checkpoints/model.pt"),
+    b"heavy checkpoint",
+  )
+  .unwrap();
+  fs::write(directory.join("logs/stdout.log"), b"bulk output").unwrap();
+  let report = parity(
+    &root,
+    &RunQueryRequest::Files {
+      run_id: "run-metrics".to_string(),
+      artifacts: Vec::new(),
+      metrics: true,
+    },
+    false,
+  );
+  assert_eq!(
+    selected_files(&report),
+    BTreeSet::from([
+      "run-state.json",
+      "outputs/metrics.jsonl",
+      "outputs/params.json"
+    ])
+  );
+  assert!(report["warnings"].as_array().unwrap().is_empty());
+  let explicit = parity(
+    &root,
+    &RunQueryRequest::Files {
+      run_id: "run-metrics".to_string(),
+      artifacts: vec!["outputs/checkpoints/model.pt".to_string()],
+      metrics: true,
+    },
+    false,
+  );
+  assert!(selected_files(&explicit).contains("outputs/checkpoints/model.pt"));
+  assert!(!selected_files(&explicit).contains("logs/stdout.log"));
+  fs::remove_file(directory.join("outputs/metrics.jsonl")).unwrap();
+  fs::remove_file(directory.join("outputs/params.json")).unwrap();
+  let missing = parity(
+    &root,
+    &RunQueryRequest::Files {
+      run_id: "run-metrics".to_string(),
+      artifacts: Vec::new(),
+      metrics: true,
+    },
+    false,
+  );
+  assert_eq!(selected_files(&missing), BTreeSet::from(["run-state.json"]));
+  assert_eq!(missing["warnings"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn legacy_file_requests_default_to_logs_and_reject_nonboolean_metric_selection() {
+  let request: RunQueryRequest =
+    serde_json::from_value(json!({"operation":"files", "run_id":"run-old"})).unwrap();
+  assert!(matches!(
+    request,
+    RunQueryRequest::Files { metrics: false, .. }
+  ));
+  assert!(
+    serde_json::from_value::<RunQueryRequest>(
+      json!({"operation":"files", "run_id":"run-old", "metrics":"yes"})
+    )
+    .is_err()
+  );
+}
+
+#[test]
 fn catalog_lists_other_runs_despite_corrupted_missing_and_future_records() {
   let (_directory, root) = fixture();
   let runs = root.join(".expri/runs");
@@ -366,6 +452,7 @@ fn files_select_metadata_logs_and_explicit_artifacts_without_environments_or_cac
     &RunQueryRequest::Files {
       run_id: "run-files".to_string(),
       artifacts: Vec::new(),
+      metrics: false,
     },
     false,
   );
@@ -385,6 +472,7 @@ fn files_select_metadata_logs_and_explicit_artifacts_without_environments_or_cac
     &RunQueryRequest::Files {
       run_id: "run-files".to_string(),
       artifacts: vec!["outputs/checkpoint.bin".to_string(), "code/out".to_string()],
+      metrics: false,
     },
     false,
   );
@@ -396,6 +484,7 @@ fn files_select_metadata_logs_and_explicit_artifacts_without_environments_or_cac
     &RunQueryRequest::Files {
       run_id: "run-files".to_string(),
       artifacts: vec!["outputs/".to_string(), "code".to_string()],
+      metrics: false,
     },
     false,
   );
@@ -459,6 +548,7 @@ fn catalog_rejects_symlink_boundaries_and_selected_artifact_links() {
     &RunQueryRequest::Files {
       run_id: "run-links".to_string(),
       artifacts: Vec::new(),
+      metrics: false,
     },
     false,
   );
@@ -470,6 +560,7 @@ fn catalog_rejects_symlink_boundaries_and_selected_artifact_links() {
       &RunQueryRequest::Files {
         run_id: "run-links".to_string(),
         artifacts: vec![artifact.to_string()],
+        metrics: false,
       },
       false,
     );
@@ -528,7 +619,8 @@ fn requests_reject_unsafe_ids_filters_and_artifact_selectors() {
         &root,
         &RunQueryRequest::Files {
           run_id: "run-safe".to_string(),
-          artifacts: vec![artifact.to_string()]
+          artifacts: vec![artifact.to_string()],
+          metrics: false,
         },
         false
       )
@@ -589,6 +681,7 @@ fn inspection_does_not_require_a_lease_or_mutate_active_records() {
     &RunQueryRequest::Files {
       run_id: "run-active".to_string(),
       artifacts: Vec::new(),
+      metrics: false,
     },
     false,
   );
@@ -659,6 +752,7 @@ fn normal_repository_aliases_work_without_allowing_catalog_boundary_symlinks() {
     &RunQueryRequest::Files {
       run_id: "run-alias".to_string(),
       artifacts: Vec::new(),
+      metrics: false,
     },
     true,
   );
@@ -687,6 +781,12 @@ fn protocol_defaults_and_node_request_options_match_the_query_contract() {
   assert_eq!(
     serde_json::to_value(files).unwrap(),
     json!({"operation":"files", "run_id":"run-a", "artifacts":[]})
+  );
+  let metric_files: RunQueryRequest =
+    serde_json::from_value(json!({"operation":"files", "run_id":"run-a", "metrics":true})).unwrap();
+  assert_eq!(
+    serde_json::to_value(metric_files).unwrap(),
+    json!({"operation":"files", "run_id":"run-a", "artifacts":[], "metrics":true}),
   );
   assert!(crate::Cli::try_parse_from(["expri", "node", "runs"]).is_err());
   assert!(

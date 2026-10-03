@@ -272,14 +272,13 @@ pub fn query_runs_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<serde_json::Value> {
-  protocol_with_capability(
-    remote,
-    preference,
-    node_bin,
-    "runs",
-    Some(crate::node::cli::RUN_RECORDS_CAPABILITY),
-  )?
-  .query_runs(remote, request)
+  let capability = if matches!(request, RunQueryRequest::Files { metrics: true, .. }) {
+    crate::node::cli::RUN_METRICS_CAPABILITY
+  } else {
+    crate::node::cli::RUN_RECORDS_CAPABILITY
+  };
+  protocol_with_capability(remote, preference, node_bin, "runs", Some(capability))?
+    .query_runs(remote, request)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

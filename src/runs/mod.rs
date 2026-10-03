@@ -36,6 +36,36 @@ struct Record {
   warnings: Vec<Value>,
 }
 
+/// Read the fixed run summary without loading the source or environment inventory.
+pub fn summary_directory(runs_dir: &Path, run_id: &str) -> Result<Value> {
+  validate_id(run_id)?;
+  let runs_dir = std::path::absolute(runs_dir)?;
+  let metadata = fs::symlink_metadata(&runs_dir)?;
+  if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    return Err(message("run catalog directory must be a real directory"));
+  }
+  if runs_dir
+    .parent()
+    .is_some_and(|parent| parent.ends_with(".expri"))
+  {
+    let metadata = fs::symlink_metadata(runs_dir.parent().unwrap())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+      return Err(message(
+        "run catalog directory has an unsafe parent directory",
+      ));
+    }
+  }
+  let run_dir = fs::canonicalize(runs_dir.parent().unwrap())?
+    .join(runs_dir.file_name().unwrap())
+    .join(run_id);
+  let metadata = fs::symlink_metadata(&run_dir)?;
+  if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    return Err(message("run directory must be a real directory"));
+  }
+  let record = record(&run_dir);
+  Ok(json!({"run": record.summary, "warnings": record.warnings}))
+}
+
 /// Inspect fixed run records without taking leases or reading package inventories.
 pub fn query(repo_root: &Path, request: &RunQueryRequest) -> Result<Value> {
   let root = fs::canonicalize(repo_root)?;
@@ -94,7 +124,9 @@ pub fn query_directory(runs_dir: &Path, request: &RunQueryRequest) -> Result<Val
   }
   match request {
     RunQueryRequest::Show { .. } => Ok(show(&run_dir)),
-    RunQueryRequest::Files { artifacts, .. } => files(&run_dir, artifacts),
+    RunQueryRequest::Files {
+      artifacts, metrics, ..
+    } => files(&run_dir, artifacts, *metrics),
     RunQueryRequest::List { .. } => unreachable!(),
   }
 }
@@ -114,7 +146,9 @@ fn validate_request(request: &RunQueryRequest) -> Result<()> {
       }
     }
     RunQueryRequest::Show { run_id } => validate_id(run_id)?,
-    RunQueryRequest::Files { run_id, artifacts } => {
+    RunQueryRequest::Files {
+      run_id, artifacts, ..
+    } => {
       validate_id(run_id)?;
       for artifact in artifacts {
         validate_artifact(artifact)?;
@@ -457,7 +491,7 @@ fn safe_path(run_dir: &Path, relative: &str) -> std::result::Result<Option<PathB
   Ok(Some(current.join(parts.last().unwrap())))
 }
 
-fn files(run_dir: &Path, artifacts: &[String]) -> Result<Value> {
+fn files(run_dir: &Path, artifacts: &[String], metrics: bool) -> Result<Value> {
   let mut selected = BTreeSet::new();
   let mut warnings = Vec::new();
   for relative in METADATA_FILES {
@@ -470,7 +504,28 @@ fn files(run_dir: &Path, artifacts: &[String]) -> Result<Value> {
       false,
     )?;
   }
-  collect_files(run_dir, "logs", &mut selected, &mut warnings, false, true)?;
+  if metrics {
+    for relative in ["outputs/metrics.jsonl", "outputs/params.json"] {
+      let warnings_before = warnings.len();
+      collect_files(
+        run_dir,
+        relative,
+        &mut selected,
+        &mut warnings,
+        false,
+        false,
+      )?;
+      if !selected.contains(relative) && warnings.len() == warnings_before {
+        warn(
+          &mut warnings,
+          &run_dir.file_name().unwrap().to_string_lossy(),
+          format!("{relative} is missing"),
+        );
+      }
+    }
+  } else {
+    collect_files(run_dir, "logs", &mut selected, &mut warnings, false, true)?;
+  }
   for artifact in artifacts {
     collect_files(
       run_dir,

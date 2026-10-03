@@ -54,7 +54,7 @@ def query_runs_directory(runs_dir, request):
     raise ValueError("run is missing: " + run_id)
   if operation == "show":
     return _catalog_show(run_dir)
-  return _catalog_files(run_dir, request.get("artifacts", []))
+  return _catalog_files(run_dir, request.get("artifacts", []), request.get("metrics", False))
 
 
 def _catalog_validate_request(request):
@@ -76,6 +76,8 @@ def _catalog_validate_request(request):
   else:
     _catalog_validate_id(request.get("run_id"))
     if operation == "files":
+      if type(request.get("metrics", False)) is not bool:
+        raise ValueError("metrics must be boolean")
       artifacts = request.get("artifacts", [])
       if not isinstance(artifacts, list):
         raise ValueError("artifacts must be an array")
@@ -286,12 +288,19 @@ def _catalog_invalid_json_constant(_):
   raise _catalog_json.JSONDecodeError("invalid JSON constant", "", 0)
 
 
-def _catalog_files(run_dir, artifacts):
+def _catalog_files(run_dir, artifacts, metrics=False):
   warnings = []
   files = set()
   for relative in _CATALOG_METADATA_FILES:
     _catalog_collect_files(run_dir, relative, files, warnings, explicit=False, recurse=False)
-  _catalog_collect_files(run_dir, "logs", files, warnings, explicit=False)
+  if metrics:
+    for relative in ("outputs/metrics.jsonl", "outputs/params.json"):
+      warnings_before = len(warnings)
+      _catalog_collect_files(run_dir, relative, files, warnings, explicit=False, recurse=False)
+      if relative not in files and len(warnings) == warnings_before:
+        _catalog_warning(warnings, run_dir.name, relative + " is missing")
+  else:
+    _catalog_collect_files(run_dir, "logs", files, warnings, explicit=False)
   for artifact in artifacts:
     _catalog_collect_files(run_dir, artifact, files, warnings, explicit=True)
   return {"run_id": run_dir.name, "run_dir": str(run_dir), "files": sorted(files), "warnings": warnings}

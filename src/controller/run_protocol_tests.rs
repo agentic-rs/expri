@@ -69,6 +69,42 @@ python3 -c 'import json,sys; request=json.load(sys.stdin); print(json.dumps({"na
       .unwrap();
   assert_eq!(python["runs"][0]["run_id"], "run-old");
   assert_eq!(python["runs"][0]["schema_version"], 0);
+  fs::create_dir_all(repo.join(".expri/runs/run-old/outputs")).unwrap();
+  fs::write(
+    repo.join(".expri/runs/run-old/outputs/metrics.jsonl"),
+    b"{\"step\":0,\"metrics\":{\"loss\":1}}\n",
+  )
+  .unwrap();
+  fs::write(repo.join(".expri/runs/run-old/outputs/params.json"), b"{}").unwrap();
+  let metric_request = RunQueryRequest::Files {
+    run_id: "run-old".to_string(),
+    artifacts: Vec::new(),
+    metrics: true,
+  };
+  // A node with run-records-v1 must not silently ignore the new file-selection flag.
+  let metric_fallback = query_runs_with_preference(
+    &remote,
+    &metric_request,
+    ProtocolPreference::Auto,
+    "./node-stub",
+  )
+  .unwrap();
+  assert_eq!(
+    metric_fallback["files"],
+    serde_json::json!([
+      "outputs/metrics.jsonl",
+      "outputs/params.json",
+      "run-state.json"
+    ])
+  );
+  let metric_error = query_runs_with_preference(
+    &remote,
+    &metric_request,
+    ProtocolPreference::ExpriNode,
+    "./node-stub",
+  )
+  .unwrap_err();
+  assert!(metric_error.to_string().contains("run-metrics-v1"));
   fs::write(
     &node,
     "#!/bin/sh\n[ \"$2\" = capabilities ] && [ \"$4\" = env-maintenance-v1 ]\n",
