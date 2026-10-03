@@ -62,6 +62,18 @@ pub(super) struct Store<S> {
   _lease: crate::lock::FileLock,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DashboardSource {
+  pub project_id: String,
+  pub origin: String,
+}
+
+pub(super) struct DashboardPage<T> {
+  pub items: Vec<T>,
+  pub total_count: usize,
+  pub legacy_order: bool,
+}
+
 impl<S: ObjectStorage> Store<S> {
   pub fn open(directory: &Path, storage: S) -> crate::error::Result<Self> {
     fs::create_dir_all(directory)?;
@@ -131,6 +143,19 @@ impl<S: ObjectStorage> Store<S> {
       CREATE TABLE IF NOT EXISTS chunks (
         target TEXT NOT NULL, offset INTEGER NOT NULL, data BLOB NOT NULL,
         PRIMARY KEY(target, offset));
+      CREATE TABLE IF NOT EXISTS dashboard_overviews (
+        target TEXT PRIMARY KEY, version TEXT NOT NULL, record TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS dashboard_run_activity (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL, origin TEXT NOT NULL, run_id TEXT NOT NULL,
+        legacy_order INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(project_id,origin,run_id));
+      INSERT OR IGNORE INTO dashboard_run_activity(project_id,origin,run_id,legacy_order)
+        SELECT json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'),1
+        FROM (SELECT target,sequence FROM files UNION ALL SELECT target,0 AS sequence FROM streams)
+        WHERE json_extract(target,'$.kind')='run'
+        GROUP BY json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id')
+        ORDER BY MAX(sequence),json_extract(target,'$.scope.run_id');
       PRAGMA user_version=1;",
       )
       .map_err(|_| {
@@ -149,6 +174,218 @@ impl<S: ObjectStorage> Store<S> {
       .connection
       .lock()
       .map_err(|_| ApiError::new(503, "service metadata unavailable"))
+  }
+
+  /// Discover only run scopes. Private inputs and incomplete uploads are not
+  /// dashboard sources, and database pagination never materializes the catalog.
+  pub fn dashboard_sources(
+    &self,
+    limit: usize,
+    offset: usize,
+  ) -> ApiResult<DashboardPage<DashboardSource>> {
+    dashboard_page_bounds(limit, offset)?;
+    let db = self.db()?;
+    let selection = "SELECT DISTINCT json_extract(target,'$.scope.project_id') AS project_id, json_extract(target,'$.scope.origin') AS origin FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run'";
+    let total_count = db
+      .query_row(&format!("SELECT COUNT(*) FROM ({selection})"), [], |row| {
+        row.get(0)
+      })
+      .map_err(database)?;
+    let mut statement = db
+      .prepare(&format!(
+        "{selection} ORDER BY project_id,origin LIMIT ?1 OFFSET ?2"
+      ))
+      .map_err(database)?;
+    let rows = statement
+      .query_map(params![limit, offset], |row| {
+        Ok(DashboardSource {
+          project_id: row.get(0)?,
+          origin: row.get(1)?,
+        })
+      })
+      .map_err(database)?;
+    let mut items = Vec::with_capacity(limit);
+    for row in rows {
+      let source = row.map_err(database)?;
+      for component in [&source.project_id, &source.origin] {
+        validate_component(component)
+          .map_err(|_| ApiError::new(500, "invalid stored run scope"))?;
+      }
+      items.push(source);
+    }
+    Ok(DashboardPage {
+      items,
+      total_count,
+      legacy_order: false,
+    })
+  }
+
+  /// A source may exceed the sync CLI's original 500-run convenience listing.
+  /// Dashboard readers select a bounded, deterministic page directly in SQLite.
+  pub fn dashboard_runs(
+    &self,
+    project_id: &str,
+    origin: &str,
+    limit: usize,
+    offset: usize,
+  ) -> ApiResult<DashboardPage<RunScope>> {
+    validate_component(project_id).map_err(bad)?;
+    validate_component(origin).map_err(bad)?;
+    dashboard_page_bounds(limit, offset)?;
+    let db = self.db()?;
+    let selection = "SELECT DISTINCT json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2";
+    let total_count = db
+      .query_row(
+        &format!("SELECT COUNT(*) FROM ({selection})"),
+        params![project_id, origin],
+        |row| row.get(0),
+      )
+      .map_err(database)?;
+    let mut statement = db
+      .prepare(&format!(
+        "SELECT discovered.run_id, COALESCE(activity.legacy_order,1) FROM ({selection}) AS discovered LEFT JOIN dashboard_run_activity AS activity ON activity.project_id=?1 AND activity.origin=?2 AND activity.run_id=discovered.run_id ORDER BY COALESCE(activity.sequence,0) DESC,discovered.run_id DESC LIMIT ?3 OFFSET ?4"
+      ))
+      .map_err(database)?;
+    let rows = statement
+      .query_map(params![project_id, origin, limit, offset], |row| {
+        Ok((
+          RunScope {
+            project_id: project_id.into(),
+            origin: origin.into(),
+            run_id: row.get(0)?,
+          },
+          row.get::<_, bool>(1)?,
+        ))
+      })
+      .map_err(database)?;
+    let mut items = Vec::with_capacity(limit);
+    let mut legacy_order = false;
+    for row in rows {
+      let (scope, legacy) = row.map_err(database)?;
+      legacy_order |= legacy;
+      validate_scope(&scope).map_err(|_| ApiError::new(500, "invalid stored run scope"))?;
+      items.push(scope);
+    }
+    Ok(DashboardPage {
+      items,
+      total_count,
+      legacy_order,
+    })
+  }
+
+  pub fn dashboard_artifact(&self, scope: &RunScope, path: &str) -> ApiResult<Option<FileRecord>> {
+    let target = FileTarget::Run {
+      scope: scope.clone(),
+      path: path.into(),
+    };
+    match self.file(&target) {
+      Ok(record) => Ok(Some(record)),
+      Err(error) if error.status == 404 => Ok(None),
+      Err(error) => Err(error),
+    }
+  }
+
+  pub fn dashboard_run_exists(&self, scope: &RunScope) -> ApiResult<bool> {
+    validate_scope(scope).map_err(bad)?;
+    self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM (SELECT target FROM files UNION ALL SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3)", params![scope.project_id, scope.origin, scope.run_id], |row| row.get(0)).map_err(database)
+  }
+
+  pub fn dashboard_stream_range(
+    &self,
+    scope: &RunScope,
+    path: &str,
+    offset: u64,
+    limit: usize,
+  ) -> ApiResult<(Vec<u8>, u64)> {
+    let target = target_json(&stream_target(scope.clone(), path.into())?)?;
+    if limit > STREAM_BATCH {
+      return Err(ApiError::new(413, "stream reads are limited to 64 KiB"));
+    }
+    let db = self.db()?;
+    let size = db
+      .query_row(
+        "SELECT size FROM streams WHERE target=?1",
+        [&target],
+        |row| row.get::<_, u64>(0),
+      )
+      .optional()
+      .map_err(database)?
+      .ok_or_else(|| ApiError::new(409, "stream changed; refresh the run"))?;
+    if offset > size {
+      return Err(ApiError::new(409, "stream changed; refresh the run"));
+    }
+    let length = limit.min(usize::try_from(size - offset).unwrap_or(usize::MAX));
+    Ok((read_bytes(&db, &target, offset, length)?, size))
+  }
+
+  pub fn dashboard_download_url(&self, target: &FileTarget) -> ApiResult<String> {
+    match self.execute(Request::DownloadUrl {
+      target: target.clone(),
+    })? {
+      Response::Url { url } => Ok(url),
+      _ => Err(ApiError::new(500, "invalid object storage response")),
+    }
+  }
+
+  /// This disposable cache stores normalized previews, never private inputs or
+  /// full inventories. Its version is the existing completed artifact digest.
+  pub fn dashboard_cached_overview(
+    &self,
+    scope: &RunScope,
+    version: &str,
+  ) -> ApiResult<Option<serde_json::Value>> {
+    validate_scope(scope).map_err(bad)?;
+    let key = target_json(&FileTarget::Run {
+      scope: scope.clone(),
+      path: "run-state.json".into(),
+    })?;
+    let raw: Option<String> = self
+      .db()?
+      .query_row(
+        "SELECT record FROM dashboard_overviews WHERE target=?1 AND version=?2",
+        params![key, version],
+        |row| row.get(0),
+      )
+      .optional()
+      .map_err(database)?;
+    Ok(
+      raw
+        .filter(|raw| raw.len() <= 16 * 1024)
+        .and_then(|raw| serde_json::from_str(&raw).ok()),
+    )
+  }
+
+  pub fn dashboard_cache_overview(
+    &self,
+    scope: &RunScope,
+    version: &str,
+    record: &serde_json::Value,
+  ) -> ApiResult<()> {
+    validate_scope(scope).map_err(bad)?;
+    if version.len() > 96 {
+      return Err(ApiError::new(400, "invalid overview version"));
+    }
+    let raw = serde_json::to_string(record)
+      .map_err(|_| ApiError::new(500, "cannot encode run overview"))?;
+    if raw.len() > 16 * 1024 {
+      return Err(ApiError::new(413, "run overview exceeds its cache limit"));
+    }
+    let key = target_json(&FileTarget::Run {
+      scope: scope.clone(),
+      path: "run-state.json".into(),
+    })?;
+    let mut db = self.db()?;
+    let transaction = db.transaction().map_err(database)?;
+    transaction
+      .execute(
+        "INSERT OR REPLACE INTO dashboard_overviews(target,version,record) VALUES(?1,?2,?3)",
+        params![key, version, raw],
+      )
+      .map_err(database)?;
+    transaction
+      .execute("DELETE FROM dashboard_overviews WHERE rowid NOT IN (SELECT rowid FROM dashboard_overviews ORDER BY rowid DESC LIMIT 4096)", [])
+      .map_err(database)?;
+    transaction.commit().map_err(database)
   }
 
   fn upload_gate(&self, id: &str) -> ApiResult<Arc<Mutex<()>>> {
@@ -468,6 +705,9 @@ impl<S: ObjectStorage> Store<S> {
       transaction
         .execute("DELETE FROM streams WHERE target=?1", [&target])
         .map_err(database)?;
+      if let FileTarget::Run { scope, .. } = &upload.target {
+        record_run_activity(&transaction, scope)?;
+      }
     }
     transaction
       .execute("UPDATE uploads SET complete=1 WHERE upload_id=?1", [id])
@@ -630,12 +870,13 @@ impl<S: ObjectStorage> Store<S> {
     if finalized {
       return Err(ApiError::new(409, "stream has been finalized as an object"));
     }
-    transaction
+    let initialized = transaction
       .execute(
         "INSERT OR IGNORE INTO streams(target,size) VALUES(?1,0)",
         [&encoded],
       )
-      .map_err(database)?;
+      .map_err(database)?
+      != 0;
     let size: u64 = transaction
       .query_row(
         "SELECT size FROM streams WHERE target=?1",
@@ -670,6 +911,12 @@ impl<S: ObjectStorage> Store<S> {
           params![encoded, end],
         )
         .map_err(database)?;
+    }
+    if initialized || end > size {
+      let FileTarget::Run { scope, .. } = &target else {
+        unreachable!("stream targets are runs")
+      };
+      record_run_activity(&transaction, scope)?;
     }
     transaction.commit().map_err(database)?;
     Ok(Response::Acknowledged { offset: end })
@@ -740,6 +987,18 @@ fn object_key(target: &FileTarget, upload_id: &str) -> String {
       input_id,
     } => format!("projects/{project_id}/inputs/{input_id}/objects/{upload_id}"),
   }
+}
+
+fn dashboard_page_bounds(limit: usize, offset: usize) -> ApiResult<()> {
+  if !(1..=1000).contains(&limit) || i64::try_from(offset).is_err() {
+    return Err(ApiError::new(400, "invalid dashboard pagination"));
+  }
+  Ok(())
+}
+
+fn record_run_activity(db: &Connection, scope: &RunScope) -> ApiResult<()> {
+  db.execute("INSERT OR REPLACE INTO dashboard_run_activity(project_id,origin,run_id,legacy_order) VALUES(?1,?2,?3,0)", params![scope.project_id,scope.origin,scope.run_id]).map_err(database)?;
+  Ok(())
 }
 
 fn target_json(target: &FileTarget) -> ApiResult<String> {
@@ -1277,5 +1536,241 @@ pub(super) mod tests {
         .unwrap(),
       Response::File { file } if file.size == 4 && matches!(file.storage, FileStorage::Object)
     ));
+  }
+
+  #[test]
+  fn dashboard_scope_pages_are_distinct_bounded_and_exclude_private_inputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let db = store.db().unwrap();
+    for index in 0..1205 {
+      let scope = RunScope {
+        project_id: "project".into(),
+        origin: "worker".into(),
+        run_id: format!("run-{index:04}"),
+      };
+      for path in ["logs/stdout.log", "outputs/metrics.jsonl"] {
+        let target = target_json(&FileTarget::Run {
+          scope: scope.clone(),
+          path: path.into(),
+        })
+        .unwrap();
+        db.execute("INSERT INTO streams(target,size) VALUES(?1,0)", [target])
+          .unwrap();
+      }
+    }
+    let input = FileTarget::Input {
+      project_id: "private-project".into(),
+      input_id: "private-dataset".into(),
+    };
+    let input_record = FileRecord {
+      target: input.clone(),
+      size: 999_000,
+      sha256: Some("a".repeat(64)),
+      storage: FileStorage::Object,
+    };
+    db.execute(
+      "INSERT INTO files(target,record,object_key,sequence) VALUES(?1,?2,'private-object',1)",
+      params![
+        target_json(&input).unwrap(),
+        serde_json::to_string(&input_record).unwrap()
+      ],
+    )
+    .unwrap();
+    let second = FileTarget::Run {
+      scope: RunScope {
+        project_id: "other-project".into(),
+        origin: "rental".into(),
+        run_id: "other-run".into(),
+      },
+      path: "logs/stderr.log".into(),
+    };
+    db.execute(
+      "INSERT INTO streams(target,size) VALUES(?1,0)",
+      [target_json(&second).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let sources = store.dashboard_sources(1, 0).unwrap();
+    assert_eq!(sources.total_count, 2);
+    assert_eq!(sources.items.len(), 1);
+    assert_eq!(sources.items[0].project_id, "other-project");
+    let sources = store.dashboard_sources(1, 1).unwrap();
+    assert_eq!(sources.items[0].project_id, "project");
+    let first = store.dashboard_runs("project", "worker", 1000, 0).unwrap();
+    assert_eq!(first.total_count, 1205);
+    assert_eq!(first.items.len(), 1000);
+    assert_eq!(first.items[0].run_id, "run-1204");
+    let rest = store
+      .dashboard_runs("project", "worker", 1000, 1000)
+      .unwrap();
+    assert_eq!(rest.items.len(), 205);
+    assert_eq!(rest.items[0].run_id, "run-0204");
+    assert_eq!(rest.items[204].run_id, "run-0000");
+    assert!(
+      store
+        .dashboard_runs("project", "rental", 10, 0)
+        .unwrap()
+        .items
+        .is_empty()
+    );
+    assert!(store.dashboard_sources(0, 0).is_err());
+    assert!(store.dashboard_sources(1001, 0).is_err());
+    assert!(store.dashboard_runs("../project", "worker", 1, 0).is_err());
+  }
+
+  #[test]
+  fn dashboard_stream_ranges_read_only_the_requested_extent() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    store
+      .execute(append_request(0, b"first\nsecond\n"))
+      .unwrap();
+    let (bytes, size) = store
+      .dashboard_stream_range(&scope(), "outputs/metrics.jsonl", 6, 6)
+      .unwrap();
+    assert_eq!(bytes, b"second");
+    assert_eq!(size, 13);
+    assert_eq!(
+      store
+        .dashboard_stream_range(&scope(), "outputs/metrics.jsonl", 0, STREAM_BATCH + 1)
+        .unwrap_err()
+        .status,
+      413
+    );
+    assert_eq!(
+      store
+        .dashboard_stream_range(&scope(), "outputs/metrics.jsonl", 14, 1)
+        .unwrap_err()
+        .status,
+      409
+    );
+    assert!(
+      store
+        .dashboard_artifact(&scope(), "run-state.json")
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn dashboard_overview_cache_is_versioned_persistent_and_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = MockStorage::default();
+    let store = Store::open(directory.path(), backend.clone()).unwrap();
+    let record =
+      serde_json::json!({"run": {"run_id": "run-one", "status": "running"}, "warnings": []});
+    store
+      .dashboard_cache_overview(&scope(), "old-digest", &record)
+      .unwrap();
+    assert_eq!(
+      store
+        .dashboard_cached_overview(&scope(), "old-digest")
+        .unwrap(),
+      Some(record.clone())
+    );
+    assert!(
+      store
+        .dashboard_cached_overview(&scope(), "new-digest")
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(
+      store
+        .dashboard_cache_overview(
+          &scope(),
+          "new-digest",
+          &serde_json::json!({"oversized": "x".repeat(16 * 1024)})
+        )
+        .unwrap_err()
+        .status,
+      413
+    );
+    {
+      let mut db = store.db().unwrap();
+      let transaction = db.transaction().unwrap();
+      for index in 0..4096 {
+        transaction
+          .execute(
+            "INSERT INTO dashboard_overviews(target,version,record) VALUES(?1,'old','{}')",
+            [format!("cache-{index}")],
+          )
+          .unwrap();
+      }
+      transaction.commit().unwrap();
+    }
+    store
+      .dashboard_cache_overview(&scope(), "new-digest", &record)
+      .unwrap();
+    assert_eq!(
+      store
+        .db()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM dashboard_overviews", [], |row| row
+          .get::<_, usize>(
+          0
+        ))
+        .unwrap(),
+      4096
+    );
+    drop(store);
+    let reopened = Store::open(directory.path(), backend).unwrap();
+    assert_eq!(
+      reopened
+        .dashboard_cached_overview(&scope(), "new-digest")
+        .unwrap(),
+      Some(record)
+    );
+    assert!(
+      reopened
+        .dashboard_cached_overview(&scope(), "old-digest")
+        .unwrap()
+        .is_none()
+    );
+  }
+
+  #[test]
+  fn dashboard_activity_order_uses_received_updates_and_duplicate_appends_do_not_bump_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = MockStorage::default();
+    let store = Store::open(directory.path(), backend.clone()).unwrap();
+    let append = |run_id: &str, offset, data: &[u8]| Request::AppendStream {
+      scope: RunScope {
+        project_id: "project".into(),
+        origin: "worker".into(),
+        run_id: run_id.into(),
+      },
+      path: "outputs/metrics.jsonl".into(),
+      offset,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+    };
+    store.execute(append("run-zzz", 0, b"x")).unwrap();
+    store.execute(append("run-aaa", 0, b"x")).unwrap();
+    let latest = store.dashboard_runs("project", "worker", 1, 0).unwrap();
+    assert_eq!(latest.items[0].run_id, "run-aaa");
+    assert!(!latest.legacy_order);
+    store.execute(append("run-zzz", 0, b"x")).unwrap();
+    assert_eq!(
+      store
+        .dashboard_runs("project", "worker", 1, 0)
+        .unwrap()
+        .items[0]
+        .run_id,
+      "run-aaa"
+    );
+    store.execute(append("run-zzz", 1, b"y")).unwrap();
+    assert_eq!(
+      store
+        .dashboard_runs("project", "worker", 1, 0)
+        .unwrap()
+        .items[0]
+        .run_id,
+      "run-zzz"
+    );
+    drop(store);
+    let reopened = Store::open(directory.path(), backend).unwrap();
+    let latest = reopened.dashboard_runs("project", "worker", 1, 0).unwrap();
+    assert_eq!(latest.items[0].run_id, "run-zzz");
+    assert!(!latest.legacy_order);
   }
 }

@@ -15,6 +15,7 @@
         <a class="brand" href="/" aria-label="expri dashboard"><span class="brand-mark" aria-hidden="true">e</span>expri</a>
         <span class="project-name" id="project-name">Experiment workspace</span>
         <span class="read-only">Read only</span>
+        <form id="logout-form" class="session-actions" method="post" action="/logout" hidden><button class="text-button" type="submit">Sign out</button></form>
       </div>
     </header>
     <main>
@@ -72,7 +73,7 @@
           <p class="chart-footnote muted">The chart uses the recorded results from this source.</p>
         </section>
       </section>
-      <footer><span>expri · Local experiment review</span><span id="updated-at">Refresh to read the latest files.</span></footer>
+      <footer><span id="dashboard-kind">expri · Local experiment review</span><span id="updated-at">Refresh to read the latest files.</span></footer>
     </main>
     <div id="live-status" class="sr-only" role="status" aria-live="polite"></div>
   </body>

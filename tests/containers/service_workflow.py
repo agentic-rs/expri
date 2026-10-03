@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
@@ -26,14 +27,18 @@ watch = None
 fixture_env = dict(os.environ)
 fixture_env.update({
   'EXPRI_OWNER_TOKEN': secrets.token_hex(24), 'EXPRI_WORKER_TOKEN': secrets.token_hex(24),
+  'EXPRI_DASHBOARD_PASSWORD': secrets.token_hex(24),
   'AWS_ACCESS_KEY_ID': 'expri-ci', 'AWS_SECRET_ACCESS_KEY': secrets.token_hex(24),
 })
 fixture_env['MINIO_ROOT_USER'] = fixture_env['AWS_ACCESS_KEY_ID']
 fixture_env['MINIO_ROOT_PASSWORD'] = fixture_env['AWS_SECRET_ACCESS_KEY']
+browser_secrets = []
 
 def redact(text):
-  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'AWS_SECRET_ACCESS_KEY']:
+  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD', 'AWS_SECRET_ACCESS_KEY']:
     text = text.replace(fixture_env[key], '[redacted]')
+  for cookie in browser_secrets:
+    text = text.replace(cookie, '[redacted]')
   return re.sub(r'(https?://[^\s"<>?]+)\?[^\s"<>]+', r'\1?[redacted]', text)
 
 def command(args, *, timeout=90, check=True):
@@ -95,6 +100,130 @@ def client(container, action, *args, check=True):
   config = '/tmp/worker.toml' if container == worker else '/tmp/owner.toml'
   return execute(container, 'expri', 'service', *action.split(), '--config', config, *args, check=check)
 
+def browser(path, *, method='GET', cookie=None, bearer_env=None, password_env=None,
+    origin='https://expri.example.net', payload=None, limit=512 * 1024):
+  # Simulate the TLS reverse proxy inside the private Docker network. The Secure
+  # cookie is sent explicitly, without an HTTP cookie jar or published host port.
+  code = f'''
+import http.client
+import json
+import os
+from urllib.parse import urlencode
+headers = {{'Host': 'expri.example.net', 'Origin': {origin!r}, 'Sec-Fetch-Site': 'same-origin'}}
+cookie = {cookie!r}
+bearer_env = {bearer_env!r}
+password_env = {password_env!r}
+payload = {payload!r}
+body = None
+if cookie is not None:
+  headers['Cookie'] = cookie
+if bearer_env is not None:
+  headers['Authorization'] = 'Bearer ' + os.environ[bearer_env]
+if password_env is not None:
+  headers['Content-Type'] = 'application/x-www-form-urlencoded'
+  body = urlencode({{'password': os.environ[password_env]}}).encode()
+elif payload is not None:
+  headers['Content-Type'] = 'application/json'
+  body = json.dumps(payload).encode()
+connection = http.client.HTTPConnection('service', 8787, timeout=40)
+try:
+  connection.request({method!r}, {path!r}, body=body, headers=headers)
+  response = connection.getresponse()
+  data = response.read({limit} + 1)
+  if len(data) > {limit}:
+    raise RuntimeError('hosted dashboard response exceeded its size limit')
+  print(json.dumps({{'status': response.status, 'headers': dict(response.getheaders()), 'body': data.decode('utf-8')}}))
+finally:
+  connection.close()
+'''
+  result = json.loads(execute(host, 'python3', '-c', code, timeout=45).stdout)
+  result['headers'] = {name.lower(): value for name, value in result['headers'].items()}
+  return result
+
+def browser_json(path, cookie):
+  result = browser(path, cookie=cookie)
+  assert result['status'] == 200, f'hosted dashboard request failed ({result["status"]})'
+  assert result['headers']['content-type'].startswith('application/json')
+  return json.loads(result['body'])
+
+def dashboard_login():
+  result = browser('/login', method='POST', password_env='EXPRI_DASHBOARD_PASSWORD')
+  assert result['status'] == 303 and result['headers'].get('location') == '/', 'dashboard password login failed'
+  header = result['headers']['set-cookie']
+  cookie = header.split(';', 1)[0]
+  browser_secrets.extend([cookie, cookie.split('=', 1)[1]])
+  attributes = [attribute.strip().lower() for attribute in header.split(';')[1:]]
+  assert cookie.startswith('__Host-expri_session='), 'dashboard session is not host scoped'
+  assert {'secure', 'httponly', 'samesite=strict', 'path=/'} <= set(attributes), 'dashboard session cookie flags are incomplete'
+  assert not any(attribute.startswith('domain=') for attribute in attributes), 'dashboard cookie unexpectedly sets Domain'
+  return cookie
+
+def dashboard_public_checks():
+  result = browser('/')
+  assert result['status'] == 303 and result['headers'].get('location') == '/login', 'public dashboard root did not redirect to login'
+  assert browser('/api/catalog')['status'] == 401, 'unauthenticated dashboard API exposed data'
+  login = browser('/login')
+  assert login['status'] == 200 and 'autocomplete="current-password"' in login['body'], 'public login form is unavailable'
+  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD']:
+    assert fixture_env[key] not in login['body'], 'public login page exposed a fixture credential'
+  assert browser('/login', method='POST', password_env='EXPRI_OWNER_TOKEN')['status'] == 401, 'owner API token replaced the dedicated dashboard password'
+  for token in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN']:
+    assert browser('/api/catalog', bearer_env=token)['status'] == 401, 'service bearer token authorized the browser dashboard'
+  cookie = dashboard_login()
+  catalog = browser_json('/api/catalog', cookie)
+  assert catalog['access_mode'] == 'hosted' and catalog['sources'] == [], 'new hosted catalog did not begin empty'
+  assert browser('/v1/request', method='POST', cookie=cookie, payload={
+    'action': 'list_runs', 'project_id': 'demo', 'origin': 'worker',
+  })['status'] == 401, 'browser session authorized the writable CLI API'
+  return cookie
+
+def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
+  assert browser('/api/catalog', cookie=previous_cookie)['status'] == 401, 'service restart preserved an old browser session'
+  cookie = dashboard_login()
+  page = browser('/', cookie=cookie)
+  assert page['status'] == 200 and 'id="logout-form"' in page['body'], 'authenticated dashboard HTML is unavailable'
+  assert "frame-ancestors 'none'" in page['headers']['content-security-policy'], 'private dashboard can be framed'
+  catalog = browser_json('/api/catalog', cookie)
+  assert catalog['access_mode'] == 'hosted', 'dashboard catalog is missing hosted access mode'
+  matching = [source for source in catalog['sources'] if source['project_id'] == 'demo' and source['origin'] == 'worker']
+  assert len(matching) == 1 and matching[0]['kind'] == 'service', 'uploaded worker source is missing from the hosted catalog'
+  source_id = matching[0]['source_id']
+  listing = browser_json('/api/runs?' + urlencode({
+    'source': source_id, 'status': 'completed', 'task': 'train', 'search': run_id, 'limit': 20, 'offset': 0,
+  }), cookie)
+  assert listing['source']['source_id'] == source_id and isinstance(listing['warnings'], list), 'hosted listing changed its UI shape'
+  assert any(run['run_id'] == run_id and run['status'] == 'completed' for run in listing['runs']), 'hosted filters did not find the uploaded completed run'
+  detail = browser_json('/api/run?' + urlencode({'source': source_id, 'run_id': run_id}), cookie)
+  assert detail['run']['run_id'] == run_id and detail['metrics_error'] is None, 'hosted detail could not review the uploaded run'
+  assert detail['params']['learning_rate'] == 0.001 and detail['params']['input_id'] == 'dataset-v1', 'hosted parameters differ from uploaded data'
+  assert detail['metrics']['loss']['count'] == 80 and detail['metrics']['loss']['last']['step'] == 79, 'hosted metric summaries differ from uploaded data'
+  stdout = browser_json('/api/log?' + urlencode({'source': source_id, 'run_id': run_id, 'stream': 'stdout', 'tail': 100}), cookie)
+  assert stdout['stream'] == 'stdout' and not stdout['missing'], 'hosted stdout log is unavailable'
+  assert 'step=79' in stdout['content'] and 'training complete' in stdout['content'], 'hosted stdout does not contain the uploaded task output'
+  assert stdout['truncated'] and len(stdout['content'].encode()) <= 64 * 1024, 'hosted huge-log preview is unbounded'
+  stderr = browser_json('/api/log?' + urlencode({'source': source_id, 'run_id': run_id, 'stream': 'stderr', 'tail': 100}), cookie)
+  assert stderr['stream'] == 'stderr' and not stderr['missing'] and len(stderr['content'].encode()) <= 64 * 1024, 'hosted stderr preview is unavailable or unbounded'
+  chart = browser('/api/chart?' + urlencode({'source': source_id, 'run_id': run_id, 'metric': 'loss'}), cookie=cookie, limit=2 * 1024 * 1024)
+  assert chart['status'] == 200 and chart['headers']['content-type'].startswith('text/html'), 'hosted metric chart is unavailable'
+  assert '<svg' in chart['body'] and 'loss' in chart['body'] and run_id in chart['body'], 'hosted chart does not render uploaded metric data'
+  assert 'X-Amz-Signature' not in chart['body'], 'hosted chart exposes an object-store credential'
+  all_runs = browser_json('/api/runs?' + urlencode({'source': source_id, 'limit': 20}), cookie)['runs']
+  compared_ids = [run_id, second_run_id]
+  assert set(compared_ids) <= {run['run_id'] for run in all_runs}, 'hosted catalog did not retain both uploaded experiments'
+  comparison = browser_json('/api/compare?' + urlencode([
+    ('source', source_id), *[('run_id', value) for value in compared_ids], ('metric', 'loss'), ('reduction', 'last'),
+  ]), cookie)['comparison']
+  assert {run['run_id'] for run in comparison['runs']} == set(compared_ids), 'hosted comparison changed the selected runs'
+  assert 'loss' in comparison['metric_names'], 'hosted comparison omitted uploaded metrics'
+  assert all(run['values']['loss']['step'] == 79 and run['values']['loss']['value'] == 1 / 80
+    for run in comparison['runs']), 'hosted comparison values differ from uploaded metrics'
+  assert browser('/logout', method='POST', cookie=cookie, origin='https://outside.invalid')['status'] == 403, 'cross-origin logout was accepted'
+  browser_json('/api/catalog', cookie)
+  logout = browser('/logout', method='POST', cookie=cookie)
+  assert logout['status'] == 303 and logout['headers'].get('location') == '/login', 'dashboard logout did not redirect to login'
+  assert 'Max-Age=0' in logout['headers']['set-cookie'], 'dashboard logout did not clear its cookie'
+  assert browser('/api/catalog', cookie=cookie)['status'] == 401, 'dashboard logout did not revoke its session'
+
 try:
   if not options.no_build:
     for target in ['worker', 'host', 'service']:
@@ -117,6 +246,9 @@ try:
 project_id = "demo"
 origin = "worker"
 token_env = "EXPRI_WORKER_TOKEN"
+[dashboard]
+public_url = "https://expri.example.net"
+password_env = "EXPRI_DASHBOARD_PASSWORD"
 [storage]
 endpoint = "http://s3:9000"
 bucket = "expri-ci"
@@ -127,9 +259,9 @@ prefix = "acceptance"
   (state / 'owner.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_OWNER_TOKEN"\n')
   (state / 'worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_WORKER_TOKEN"\n')
   service = create('service', 'expri-ci-service', ['--config', '/tmp/server.toml', '--listen', '0.0.0.0:8787',
-    '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN'])
+    '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
   copy(server_config, service, '/tmp/server.toml')
-  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN'], entrypoint='sleep')
+  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
   worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
   proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
   copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
@@ -144,6 +276,7 @@ prefix = "acceptance"
   wait_for(lambda: docker('exec', worker, 'test', '-f', '/tmp/expri-worker.ready', check=False).returncode == 0, 'worker not ready')
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service not ready')
   wait_for(lambda: api_proxy('/test/state') is not None, 'fault proxy not ready')
+  initial_session = dashboard_public_checks()
   python(host, "from pathlib import Path;Path('/home/tester/private.bin').write_bytes(b'private-input-fixture'*1024)")
   client(host, 'input put', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/queue')
   client(worker, 'input get', '--project-id', 'demo', '--input-id', 'dataset-v1', '--destination', '/home/tester/private.bin')
@@ -183,6 +316,10 @@ prefix = "acceptance"
   client(worker, 'push', *push_args, '--artifact', 'outputs/checkpoint.pt')
   counts = api_proxy('/test/state')['part_urls']
   assert counts.get('1') == 1 and counts.get('2') == 1 and counts.get('3') == 1, counts
+  second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /home/tester/private.bin').stdout)
+  assert second['run_id'] != run_id, 'second experiment reused the first run identity'
+  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
+  client(worker, 'push', '--run-dir', second['run_dir'], '--project-id', 'demo', '--origin', 'worker', '--queue-dir', '/home/tester/queue')
   python(host, "from pathlib import Path;p=Path('/home/tester/review');p.mkdir();(p/'expri.toml').write_text('[project]\\nname=\"Offline service review\"\\n[download]\\nresults_dir=\"results\"\\n')")
   pull_args = ['--project-id', 'demo', '--origin', 'worker', '--run-id', run_id, '--repo', '/home/tester/review', '--source', 'service']
   client(host, 'pull', *pull_args)
@@ -196,13 +333,14 @@ prefix = "acceptance"
   client(host, 'pull', *pull_args, '--artifact', 'outputs/checkpoint.pt')
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
   assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
+  dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
   docker('stop', '--time', '1', service, s3)
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
   def review():
     return python(host, "import json;from pathlib import Path;from urllib.request import urlopen;url=Path('/tmp/dashboard.log').read_text().strip().split('Dashboard: ')[1];catalog=json.load(urlopen(url+'/api/catalog',timeout=2));print(catalog['initial_source'])") == 'cached:service'
   wait_for(review, 'offline dashboard did not recognize service cache')
-  print('Service workflow passed: inputs, offline metrics, restart, multipart resume, selective pulls, offline review.', flush=True)
+  print('Service workflow passed: inputs, offline metrics, restart, multipart resume, selective pulls, authenticated hosted dashboard, offline review.', flush=True)
 finally:
   if watch is not None and watch.poll() is None:
     watch.terminate()

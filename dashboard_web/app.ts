@@ -4,7 +4,7 @@ type Source = { source_id: string; label: string; kind: string; target_name: str
 type Run = { run_id: string; task: string | null; status: string; started_at: string | null; finished_at: string | null; exit_code: number | null };
 type Point = { step: number; value: number; timestamp?: string };
 type Metric = { count: number; last: Point; min: Point; max: Point };
-type Catalog = { project_name: string; initial_source: string; sources: Source[]; warnings: Warning[] };
+type Catalog = { project_name: string; initial_source: string; sources: Source[]; warnings: Warning[]; access_mode?: "local" | "hosted" };
 type RunList = { source: Source; runs: Run[]; warnings: Warning[]; total_count: number; offset: number; next_offset: number | null };
 type Detail = { source: Source; run: Run; state: Json; snapshot: Json; environment: Json; params: Json; params_truncated: boolean; metadata_truncated: boolean; metrics: Record<string, Metric>; metric_count: number; metrics_truncated: boolean; metrics_error: string | null; warnings: Warning[]; cache: Json };
 type Log = { content: string; stream: string; missing: boolean; truncated: boolean };
@@ -50,6 +50,11 @@ export class RequestLane {
     const timeout = setTimeout(() => controller.abort(), 30_000);
     try {
       const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+      if (generation !== this.generation) return undefined;
+      if (response.status === 401) {
+        if (typeof location !== "undefined") location.assign("/login");
+        return undefined;
+      }
       const value: unknown = await response.json();
       if (generation !== this.generation) return undefined;
       if (!response.ok) {
@@ -106,7 +111,7 @@ function card(title: string): HTMLElement {
 }
 function jsonObject(value: Json): Record<string, Json> { return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 
-function startDashboard(): void {
+export function startDashboard(): void {
   const source_select = required<HTMLSelectElement>("source-select");
   const refresh_button = required<HTMLButtonElement>("refresh-button");
   const search_input = required<HTMLInputElement>("search-input");
@@ -123,6 +128,8 @@ function startDashboard(): void {
   const compare_lane = new RequestLane();
   let sources: Source[] = [];
   let source_id = "local";
+  let access_mode: "local" | "hosted" = "local";
+  let page_size = 100;
   let runs: Run[] = [];
   let offset = 0;
   let next_offset: number | null = null;
@@ -133,6 +140,23 @@ function startDashboard(): void {
   const detail_cache = new Map<string, Detail>();
 
   function announce(message: string): void { required("live-status").textContent = message; }
+  function showEmptyRuns(filtered: boolean, source?: Source): void {
+    const synced = access_mode === "hosted" || source?.kind === "service";
+    const empty = required("list-empty"); empty.hidden = false;
+    const title = synced && !filtered ? "No synced runs yet" : "No runs found";
+    const message = filtered ? "Try changing the filters."
+      : synced ? "Sync results from a worker to see them here."
+      : source?.kind === "cached" ? "Pull results with expri runs pull, then Refresh."
+      : "Start an experiment with expri run to record results here.";
+    empty.replaceChildren(element("span", "◌", "empty-mark"), element("h3", title), element("p", message));
+    if (synced && !filtered) {
+      const paragraph = element("p", "", "setup-guide");
+      const link = element("a", "Set up result syncing");
+      link.href = "https://github.com/agentic-rs/expri/blob/codex/self-hosted-s3-sync/docs/self-hosted-service.md";
+      link.target = "_blank"; link.rel = "noopener noreferrer";
+      paragraph.append(link); empty.append(paragraph);
+    }
+  }
   function syncSelection(): void {
     required("selection-count").textContent = selected.size ? `${selected.size} of 8 runs selected` : "Select runs to compare";
     const chips = required("selected-runs"); chips.replaceChildren();
@@ -167,21 +191,22 @@ function startDashboard(): void {
     }
   }
   async function loadRuns(): Promise<void> {
+    if (!source_id) return;
     global_error.hidden = true; required("runs-region").setAttribute("aria-busy", "true");
     for (const control of rows.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button")) control.disabled = true;
     previous_page.disabled = true; next_page.disabled = true;
     required("run-count").textContent = "Loading run history…";
     try {
-      const result = await list_lane.run<RunList>(apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: 100, offset }));
+      const result = await list_lane.run<RunList>(apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }));
       if (!result) return;
       runs = result.runs; offset = result.offset; next_offset = result.next_offset;
       renderRows(); warnings(required("list-warnings"), result.warnings);
       required("run-count").textContent = result.total_count ? `${offset + 1}–${offset + runs.length} of ${result.total_count.toLocaleString()} runs` : "No matching runs";
-      required("page-label").textContent = `Page ${Math.floor(offset / 100) + 1}`;
+      required("page-label").textContent = `Page ${Math.floor(offset / page_size) + 1}`;
       previous_page.disabled = offset === 0; next_page.disabled = next_offset === null;
       const empty = required("list-empty"); empty.hidden = runs.length > 0;
       if (!runs.length) {
-        empty.replaceChildren(element("span", "◌", "empty-mark"), element("h3", "No runs found"), element("p", search_input.value || task_input.value || status_select.value ? "Try changing the filters." : result.source.kind === "cached" ? "Pull results with expri runs pull, then Refresh." : "Start an experiment with expri run to record results here."));
+        showEmptyRuns(Boolean(search_input.value || task_input.value || status_select.value), result.source);
       }
       const options = required("task-options"); options.replaceChildren();
       for (const task of [...new Set(runs.map(run => run.task).filter((task): task is string => task !== null))].sort()) {
@@ -337,23 +362,43 @@ function startDashboard(): void {
   }
   function sourceNote(): void {
     const source = sources.find(item => item.source_id === source_id);
-    const note = required("source-note"); note.hidden = false;
-    note.textContent = source?.kind === "cached" ? "Cached remote results · Recorded status may be older than the remote run. Pull updated results with expri runs pull, then Refresh here." : "Local results · Status comes from recorded run files. Refresh to read the latest changes.";
+    const note = required("source-note"); note.hidden = !source;
+    note.textContent = source?.kind === "service" ? "Synced results · Updates arrive from workers. Refresh to read the latest synced files."
+      : source?.kind === "cached" ? "Cached remote results · Recorded status may be older than the remote run. Pull updated results with expri runs pull, then Refresh here."
+      : "Local results · Status comes from recorded run files. Refresh to read the latest changes.";
   }
   async function refresh(): Promise<void> {
     refresh_button.disabled = true; global_error.hidden = true;
     try {
       const catalog = await catalog_lane.run<Catalog>("/api/catalog"); if (!catalog) return;
       sources = catalog.sources;
+      access_mode = catalog.access_mode ?? "local";
+      page_size = access_mode === "hosted" ? 20 : 100;
+      required("logout-form").hidden = access_mode !== "hosted";
+      required("dashboard-kind").textContent = access_mode === "hosted" ? "expri · Synced experiment review" : "expri · Local experiment review";
       const previous_source = source_id;
-      if (!sources.some(source => source.source_id === source_id)) source_id = catalog.initial_source;
-      if (!source_select.dataset.initialized) { source_id = catalog.initial_source; source_select.dataset.initialized = "true"; }
+      if (!sources.some(source => source.source_id === source_id) || !source_select.dataset.initialized) {
+        source_id = sources.some(source => source.source_id === catalog.initial_source) ? catalog.initial_source : sources[0]?.source_id ?? "";
+      }
+      source_select.dataset.initialized = "true";
       if (source_id !== previous_source) { runs = []; selected.clear(); closeReview(); syncSelection(); }
       source_select.replaceChildren();
-      for (const source of sources) { const option = element("option", source.label); option.value = source.source_id; source_select.append(option); }
-      source_select.value = source_id; source_select.disabled = false;
+      for (const source of sources) { const option = element("option", source.kind === "service" ? `${source.label} · Synced` : source.label); option.value = source.source_id; source_select.append(option); }
+      if (!sources.length) { const option = element("option", "No synced sources"); option.value = ""; source_select.append(option); }
+      source_select.value = source_id; source_select.disabled = !sources.length;
+      for (const control of [search_input, task_input, status_select, required<HTMLButtonElement>("clear-filters")]) control.disabled = !sources.length;
       required("project-name").textContent = catalog.project_name; document.title = `expri · ${catalog.project_name}`;
       warnings(required("catalog-warnings"), catalog.warnings); sourceNote(); detail_cache.clear(); offset = 0;
+      if (!source_id) {
+        list_lane.cancel(); runs = []; next_offset = null; renderRows();
+        previous_page.disabled = true; next_page.disabled = true;
+        required("run-count").textContent = "No synced runs yet"; required("page-label").textContent = "Page 1";
+        required("task-options").replaceChildren(); warnings(required("list-warnings"), []);
+        required("runs-region").setAttribute("aria-busy", "false"); required("review-empty").hidden = true;
+        showEmptyRuns(false); announce("No synced runs yet");
+        required("updated-at").textContent = "Refresh after syncing your first run.";
+        return;
+      }
       const current_review = review;
       const current_source = source_id;
       await loadRuns();
@@ -369,7 +414,7 @@ function startDashboard(): void {
   for (const input of [search_input, task_input]) input.addEventListener("input", () => { clearTimeout(search_timeout); search_timeout = setTimeout(filtersChanged, 250); });
   status_select.addEventListener("change", filtersChanged);
   required("clear-filters").addEventListener("click", () => { search_input.value = ""; task_input.value = ""; status_select.value = ""; clearTimeout(search_timeout); filtersChanged(); });
-  previous_page.addEventListener("click", () => { offset = Math.max(0, offset - 100); void loadRuns(); });
+  previous_page.addEventListener("click", () => { offset = Math.max(0, offset - page_size); void loadRuns(); });
   next_page.addEventListener("click", () => { if (next_offset !== null) { offset = next_offset; void loadRuns(); } });
   source_select.addEventListener("change", () => { catalog_lane.cancel(); clearTimeout(search_timeout); source_id = source_select.value; runs = []; offset = 0; selected.clear(); detail_cache.clear(); closeReview(); syncSelection(); sourceNote(); void loadRuns(); });
   refresh_button.addEventListener("click", () => { clearTimeout(search_timeout); void refresh(); });

@@ -266,11 +266,11 @@ fn write_response(stream: &mut impl Write, reply: Reply, head: bool) -> std::io:
   stream.flush()
 }
 
-struct Reply {
-  status: u16,
-  content_type: &'static str,
-  body: Vec<u8>,
-  chart: bool,
+pub(crate) struct Reply {
+  pub status: u16,
+  pub content_type: &'static str,
+  pub body: Vec<u8>,
+  pub chart: bool,
 }
 
 impl Reply {
@@ -472,13 +472,27 @@ fn route(
 }
 
 fn route_checked(
-  dashboard: &Dashboard,
+  dashboard: &impl super::DashboardView,
   authority: &str,
   method: &str,
   url: &str,
   headers: &[(&str, &str)],
 ) -> std::result::Result<Reply, Reply> {
   validate_boundary(authority, method, url, headers)?;
+  route_content_checked(dashboard, url)
+}
+
+/// The caller supplies its own authentication and request boundary.
+pub(crate) fn route_content(dashboard: &impl super::DashboardView, url: &str) -> Reply {
+  match route_content_checked(dashboard, url) {
+    Ok(reply) | Err(reply) => reply,
+  }
+}
+
+fn route_content_checked(
+  dashboard: &impl super::DashboardView,
+  url: &str,
+) -> std::result::Result<Reply, Reply> {
   let (path, raw_query) = url.split_once('?').unwrap_or((url, ""));
   let query = Query::parse(raw_query)?;
   let source = query.optional("source").unwrap_or("local");

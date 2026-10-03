@@ -430,8 +430,12 @@ checkpoints into the local review cache. A separate `push --watch` process retri
 outages while training continues. Uploads keep durable multipart receipts; pulls
 verify file SHA256 digests before publishing downloaded files.
 
+An optional hosted dashboard reviews synced runs through HTTPS with a separate
+dashboard password and read-only browser sessions. The local dashboard remains
+available for offline review after downloading results.
+
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and
-worker configuration, input files, selective downloads, and offline dashboard
+worker configuration, browser sign-in, input files, selective downloads, and offline dashboard
 review. This initial version uses explicit CLI commands alongside `expri run`.
 
 ## Python environment

@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use http::{HeaderName, HeaderValue, Request as HttpRequest};
+use http::{HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResponse};
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
+use super::browser_auth::BrowserAuth;
+use super::dashboard_data::HostedDashboard;
 use super::storage::{ObjectStorage, S3Storage};
 use super::store::{ApiError, ApiResult, Store};
 use super::types::{self, FileTarget, Request, ServerConfig, WorkerAuth};
@@ -21,6 +23,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 struct Auth {
   owner: Vec<u8>,
   workers: Vec<(Vec<u8>, WorkerAuth)>,
+  browser: Option<BrowserAuth>,
 }
 
 impl Auth {
@@ -42,7 +45,40 @@ impl Auth {
       }
       workers.push((value, worker.clone()));
     }
-    Ok(Self { owner, workers })
+    let browser = config
+      .dashboard
+      .as_ref()
+      .map(|dashboard| {
+        let password = std::env::var(&dashboard.password_env).map_err(|_| {
+          ExpriError::Message(format!(
+            "dashboard password environment variable is missing: {}",
+            dashboard.password_env
+          ))
+        })?;
+        if !(16..=256).contains(&password.len())
+          || !password.bytes().all(|byte| (32..=126).contains(&byte))
+        {
+          return Err(ExpriError::Message(
+            "dashboard password must contain 16 to 256 printable ASCII bytes".into(),
+          ));
+        }
+        if constant_eq(password.as_bytes(), &owner)
+          || workers
+            .iter()
+            .any(|(token, _)| constant_eq(password.as_bytes(), token))
+        {
+          return Err(ExpriError::Message(
+            "dashboard password must be distinct from service bearer tokens".into(),
+          ));
+        }
+        BrowserAuth::new(&dashboard.public_url, password.as_bytes())
+      })
+      .transpose()?;
+    Ok(Self {
+      owner,
+      workers,
+      browser,
+    })
   }
 
   fn role(&self, request: &HttpRequest<Vec<u8>>) -> ApiResult<Option<&WorkerAuth>> {
@@ -145,6 +181,11 @@ pub fn serve(
     storage.create_bucket()?;
   }
   let store = Store::open(&data_dir, storage)?;
+  let dashboard = auth
+    .browser
+    .as_ref()
+    .map(|_| HostedDashboard::new(&store))
+    .transpose()?;
   let listener = TcpListener::bind(listen)?;
   let address = listener.local_addr()?;
   println!("Service: http://{address}");
@@ -156,6 +197,7 @@ pub fn serve(
       let receiver = &receiver;
       let auth = &auth;
       let store = &store;
+      let dashboard = dashboard.as_ref();
       scope.spawn(move || {
         loop {
           let stream = receiver
@@ -163,7 +205,7 @@ pub fn serve(
             .expect("service connection queue lock")
             .recv();
           match stream {
-            Ok(stream) => respond(store, auth, stream),
+            Ok(stream) => respond(store, auth, dashboard, stream),
             Err(_) => break,
           }
         }
@@ -189,8 +231,35 @@ pub fn serve(
   })
 }
 
-fn respond<S: ObjectStorage>(store: &Store<S>, auth: &Auth, mut stream: TcpStream) {
-  let reply = read_request(&mut stream).and_then(|request| route(store, auth, request));
+fn respond<S: ObjectStorage>(
+  store: &Store<S>,
+  auth: &Auth,
+  dashboard: Option<&HostedDashboard<'_, S>>,
+  mut stream: TcpStream,
+) {
+  let mut head = false;
+  let reply = match read_request(&mut stream) {
+    Ok(request) => {
+      head = request.method() == "HEAD";
+      if let Some(browser) = &auth.browser
+        && !matches!(request.uri().path(), "/health" | "/v1/request")
+      {
+        super::browser::handle(
+          dashboard.expect("configured browser dashboard"),
+          browser,
+          &request,
+        )
+      } else {
+        api_reply(route(store, auth, request))
+      }
+    }
+    Err(error) => api_reply(Err(error)),
+  };
+  let _ = write_response(&mut stream, reply, head);
+  let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn api_reply(reply: ApiResult<Vec<u8>>) -> HttpResponse<Vec<u8>> {
   let (status, body) = match reply {
     Ok(body) => (200, body),
     Err(error) => (
@@ -198,8 +267,7 @@ fn respond<S: ObjectStorage>(store: &Store<S>, auth: &Auth, mut stream: TcpStrea
       serde_json::to_vec(&json!({"error": error.message})).unwrap_or_default(),
     ),
   };
-  let _ = write_reply(&mut stream, status, &body);
-  let _ = stream.shutdown(Shutdown::Both);
+  super::browser::response(status, "application/json", body)
 }
 
 fn route<S: ObjectStorage>(
@@ -388,16 +456,30 @@ fn parse_headers(bytes: &[u8]) -> ApiResult<Option<(HttpRequest<Vec<u8>>, usize)
   Ok(Some((request, length)))
 }
 
-fn write_reply(stream: &mut TcpStream, status: u16, body: &[u8]) -> std::io::Result<()> {
-  let reason = http::StatusCode::from_u16(status)
-    .ok()
-    .and_then(|code| code.canonical_reason())
-    .unwrap_or("Error");
-  let headers = format!(
-    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
-    body.len()
+fn write_response(
+  stream: &mut TcpStream,
+  reply: HttpResponse<Vec<u8>>,
+  head: bool,
+) -> std::io::Result<()> {
+  let status = reply.status();
+  let mut headers = format!(
+    "HTTP/1.1 {} {}\r\n",
+    status.as_u16(),
+    status.canonical_reason().unwrap_or("Error")
   );
+  for (name, value) in reply.headers() {
+    headers.push_str(name.as_str());
+    headers.push_str(": ");
+    headers.push_str(value.to_str().expect("validated response header"));
+    headers.push_str("\r\n");
+  }
+  headers.push_str("\r\n");
   let deadline = Instant::now() + IO_TIMEOUT;
+  let body = if head {
+    &[][..]
+  } else {
+    reply.body().as_slice()
+  };
   for mut bytes in [headers.as_bytes(), body] {
     while !bytes.is_empty() {
       let remaining = deadline.saturating_duration_since(Instant::now());
@@ -433,6 +515,7 @@ mod tests {
   fn auth() -> Auth {
     Auth {
       owner: b"owner-token-with-at-least-24-characters".to_vec(),
+      browser: None,
       workers: vec![(
         b"worker-token-with-at-least-24-characters".to_vec(),
         WorkerAuth {
@@ -548,6 +631,66 @@ mod tests {
       HeaderValue::from_static("Bearer owner-token-with-at-least-24-characters"),
     );
     assert_eq!(route(&store, &auth, duplicate).unwrap_err().status, 401);
+  }
+
+  #[test]
+  fn dashboard_session_cannot_authorize_service_api_uploads() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let mut auth = auth();
+    auth.browser = Some(
+      BrowserAuth::new(
+        "https://expri.example.com",
+        b"a-dedicated-dashboard-password",
+      )
+      .unwrap(),
+    );
+    let browser = auth.browser.as_ref().unwrap();
+    let login = HttpRequest::builder()
+      .method("POST")
+      .uri("/login")
+      .header("Host", "expri.example.com")
+      .header("Origin", "https://expri.example.com")
+      .body(Vec::<u8>::new())
+      .unwrap();
+    let issued = browser
+      .login(&login, b"a-dedicated-dashboard-password")
+      .unwrap();
+    let cookie = issued.split(';').next().unwrap();
+    let upload = Request::BeginUpload {
+      upload_id: "browser-upload".into(),
+      target: FileTarget::Input {
+        project_id: "project".into(),
+        input_id: "private-input".into(),
+      },
+      size: 1,
+      sha256: "a".repeat(64),
+    };
+    for bearer in [None, Some("a-dedicated-dashboard-password")] {
+      let mut write = request(bearer, &upload);
+      write
+        .headers_mut()
+        .insert("Cookie", cookie.parse().unwrap());
+      write
+        .headers_mut()
+        .insert("Host", "expri.example.com".parse().unwrap());
+      write
+        .headers_mut()
+        .insert("Origin", "https://expri.example.com".parse().unwrap());
+      assert_eq!(route(&store, &auth, write).unwrap_err().status, 401);
+      assert_eq!(
+        store.upload_target("browser-upload").unwrap_err().status,
+        404
+      );
+    }
+    let mut owner = request(
+      Some("owner-token-with-at-least-24-characters"),
+      &Request::ListFiles { scope: scope() },
+    );
+    owner
+      .headers_mut()
+      .insert("Cookie", cookie.parse().unwrap());
+    assert!(route(&store, &auth, owner).is_ok());
   }
 
   #[test]

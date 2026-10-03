@@ -1,4 +1,7 @@
+mod browser;
+mod browser_auth;
 mod client;
+mod dashboard_data;
 mod server;
 mod storage;
 mod store;

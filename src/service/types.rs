@@ -14,7 +14,15 @@ pub struct ServerConfig {
   pub owner_token_env: String,
   #[serde(default)]
   pub workers: Vec<WorkerAuth>,
+  #[serde(default)]
+  pub dashboard: Option<DashboardConfig>,
   pub storage: super::storage::S3Config,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DashboardConfig {
+  pub public_url: String,
+  pub password_env: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

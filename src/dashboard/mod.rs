@@ -1,6 +1,6 @@
 mod artifacts;
-mod preview;
-mod server;
+pub(crate) mod preview;
+pub(crate) mod server;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use artifacts::{cache_record, open_fixed, optional_metadata, real_prefix};
-use preview::{bounded_warnings, preview, projection};
+use preview::{bounded_warnings, preview};
 
 use crate::context::CommandContext;
 use crate::controller::run_pull;
@@ -56,6 +56,65 @@ pub struct Dashboard {
   results_dir: String,
   targets: BTreeSet<String>,
   initial_source: String,
+}
+
+/// Shared dashboard views keep local and hosted routes on the same API contract.
+pub(crate) trait DashboardView {
+  fn catalog(&self) -> Result<Value>;
+  fn list(
+    &self,
+    source: &str,
+    search: Option<&str>,
+    task: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+    offset: usize,
+  ) -> Result<Value>;
+  fn detail(&self, source: &str, run_id: &str) -> Result<Value>;
+  fn log(&self, source: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value>;
+  fn compare(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    reduction: Reduction,
+  ) -> Result<Value>;
+  fn chart(&self, source: &str, run_ids: &[String], filters: &[String]) -> Result<String>;
+}
+
+impl DashboardView for Dashboard {
+  fn catalog(&self) -> Result<Value> {
+    Dashboard::catalog(self)
+  }
+  fn list(
+    &self,
+    source: &str,
+    search: Option<&str>,
+    task: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+    offset: usize,
+  ) -> Result<Value> {
+    Dashboard::list(self, source, search, task, status, limit, offset)
+  }
+  fn detail(&self, source: &str, run_id: &str) -> Result<Value> {
+    Dashboard::detail(self, source, run_id)
+  }
+  fn log(&self, source: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value> {
+    Dashboard::log(self, source, run_id, stream, tail)
+  }
+  fn compare(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    reduction: Reduction,
+  ) -> Result<Value> {
+    Dashboard::compare(self, source, run_ids, filters, reduction)
+  }
+  fn chart(&self, source: &str, run_ids: &[String], filters: &[String]) -> Result<String> {
+    Dashboard::chart(self, source, run_ids, filters)
+  }
 }
 
 impl Dashboard {
@@ -264,81 +323,10 @@ impl Dashboard {
       warnings.push(json!({"run_id": run_id, "message": "Showing the first 50 metric summaries; enter an exact metric name to chart another series."}));
     }
     let mut metadata_truncated = false;
-    let state = projection(
-      &record["state"],
-      &[
-        "schema_version",
-        "run_id",
-        "task",
-        "command",
-        "status",
-        "started_at",
-        "finished_at",
-        "exit_code",
-        "task_exit_code",
-        "detached",
-        "logging_error",
-      ],
-      &mut metadata_truncated,
-    );
-    let mut snapshot = projection(
-      &record["snapshot"],
-      &["schema_version", "run_id", "created_at"],
-      &mut metadata_truncated,
-    );
-    if snapshot.is_object() {
-      snapshot["source"] = projection(
-        &record["snapshot"]["source"],
-        &[
-          "kind",
-          "git_head",
-          "checkout_manifest_sha256",
-          "sync_state_sha256",
-        ],
-        &mut metadata_truncated,
-      );
-      snapshot["file_count"] = json!(record["snapshot"]["files"].as_array().map(Vec::len));
-    }
-    let mut environment = projection(
-      &record["environment"],
-      &[
-        "schema_version",
-        "base_python",
-        "python",
-        "environment_path",
-        "reuse_packages",
-        "reuse_extras",
-        "fingerprint",
-        "lock_sha256",
-        "pyproject_sha256",
-        "install_project",
-        "cache",
-      ],
-      &mut metadata_truncated,
-    );
-    if environment.is_object() {
-      for field in ["base_manifest", "combined_manifest"] {
-        environment[field] = projection(
-          &record["environment"][field],
-          &[
-            "python",
-            "python_prefix",
-            "base_prefix",
-            "marker_env",
-            "torch",
-            "gpu_driver",
-          ],
-          &mut metadata_truncated,
-        );
-        if environment[field].is_object() {
-          environment[field]["package_count"] = json!(
-            record["environment"][field]["packages"]
-              .as_object()
-              .map(serde_json::Map::len)
-          );
-        }
-      }
-    }
+    let metadata = preview::run_metadata(&record, &mut metadata_truncated);
+    let state = metadata["state"].clone();
+    let snapshot = metadata["snapshot"].clone();
+    let environment = metadata["environment"].clone();
     let run = preview(&record["run"], &mut metadata_truncated);
     let run_dir = runs_dir.join(run_id);
     let cache = if source.kind == "cached" {

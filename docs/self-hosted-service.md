@@ -58,6 +58,52 @@ be reachable from the workers and laptops.
 The optional object prefix is limited to 512 bytes to leave room for scoped IDs
 within S3's object-key limit.
 
+## Hosted dashboard
+
+Enable browser review in the server configuration:
+
+```toml
+[dashboard]
+public_url = "https://expri.example.net"
+password_env = "EXPRI_DASHBOARD_PASSWORD"
+```
+
+Provide a strong, separate `EXPRI_DASHBOARD_PASSWORD` containing 16 to 256
+printable ASCII bytes. It must differ from all owner and worker bearer tokens.
+Open the configured HTTPS URL and sign in with this dashboard password.
+The dashboard discovers synced project/worker sources and provides run details,
+parameters, metric comparisons, charts, and bounded log tails. Workers must push
+a run before it appears. Private inputs and checkpoint contents are not loaded
+by the dashboard; continue to use the CLI for uploads and selected downloads.
+
+Browser access is read-only. Sign-in issues an eight-hour Secure, HttpOnly,
+SameSite=Strict cookie; the browser never receives an owner/worker API token.
+Logout revokes the session. Restart the service after changing its password;
+restarts invalidate existing sessions. The CLI continues to use its existing
+bearer authentication.
+
+Keep the backend on loopback behind HTTPS. The reverse proxy must preserve the
+browser's `Host`, `Origin`, `Cookie`, and `Sec-Fetch-Site` headers. If forwarding
+an explicit header list, also retain `Authorization` and `Content-Type` for CLI
+requests. Buffer request bodies, use HTTP/1.0 upstream, and strip `Expect` so
+the service receives fixed-length requests. Configure per-client rate limiting
+for `/login`; a limit of ten requests per minute with a small burst is suitable
+for this single-user setup. Do not cache authenticated responses or log request
+bodies, credentials, or signed S3 URL queries.
+
+Hosted previews are bounded for small servers: the source catalog shows up to
+1,000 project/worker sources, browsing and filters cover the 500 runs most
+recently updated in the service per source, and cold overview reads have a
+30-second time budget. Within that selection, runs are displayed by their start
+time. Existing catalogs reconstruct update order from upload records and show a
+warning until fresh uploads establish service activity. Overview records are
+cached against the existing run-state file digest. Warnings identify missing
+or incomplete previews; refresh to retry. Hosted metric files are limited to
+16 MiB per run; larger files require local review. Charts retain bounded sampled
+points, and log tails read at most 64 KiB. Last/min/max summaries use every point
+in a supported metric file.
+The local CLI remains available for complete files and older runs.
+
 ## Worker uploads
 
 Create a client configuration on the worker, outside the synced source repo:
