@@ -555,7 +555,7 @@ fn source_record(project_id: &str, origin: &str) -> Source {
   Source {
     source_id: format!("hosted:{project_id}:{origin}"),
     label: format!("{project_id} / {origin}"),
-    kind: "hosted",
+    kind: "service",
     target_name: None,
     project_id: project_id.into(),
     origin: origin.into(),

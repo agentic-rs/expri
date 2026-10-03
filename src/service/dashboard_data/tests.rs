@@ -281,6 +281,7 @@ fn hosted_catalog_filters_cached_overviews_and_refreshes_changed_states() {
   let catalog = dashboard.catalog().unwrap();
   assert_eq!(catalog["access_mode"], "hosted");
   assert_eq!(catalog["sources"].as_array().unwrap().len(), 1);
+  assert_eq!(catalog["sources"][0]["kind"], "service");
   let rows = dashboard
     .list(
       "hosted:project:worker",

@@ -186,7 +186,8 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   catalog = browser_json('/api/catalog', cookie)
   assert catalog['access_mode'] == 'hosted', 'dashboard catalog is missing hosted access mode'
   matching = [source for source in catalog['sources'] if source['project_id'] == 'demo' and source['origin'] == 'worker']
-  assert len(matching) == 1 and matching[0]['kind'] == 'service', 'uploaded worker source is missing from the hosted catalog'
+  assert len(matching) == 1, 'uploaded worker source is missing from the hosted catalog'
+  assert matching[0]['kind'] == 'service', 'hosted source kind must match the service frontend contract'
   source_id = matching[0]['source_id']
   listing = browser_json('/api/runs?' + urlencode({
     'source': source_id, 'status': 'completed', 'task': 'train', 'search': run_id, 'limit': 20, 'offset': 0,
