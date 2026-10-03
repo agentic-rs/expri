@@ -68,6 +68,29 @@ jobs:
           pnpm --dir dashboard_web build
           git diff --exit-code -- dashboard_web/app.js
 
+  container-workflow:
+    name: Host and worker workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run real uv and SSH workflows with installed Torch fixtures
+        env:
+          EXPRI_CONTAINER_ARTIFACTS: ${{ runner.temp }}/expri-containers
+        run: tests/containers/run.sh
+
+      - name: Save bounded workflow and image build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-workflow-logs
+          path: ${{ runner.temp }}/expri-containers/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   python-runtime:
     name: Python runtime
     runs-on: ubuntu-latest
@@ -99,3 +122,6 @@ jobs:
 
       - name: Run metrics producer tests
         run: python3 -B python/expri_metrics_tests.py
+
+      - name: Verify installed-package fixture wheels
+        run: python3 -B tests/containers/fixtures_tests.py

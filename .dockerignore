@@ -1,0 +1,11 @@
+.git
+.agents
+.github/_pr_
+target
+**/node_modules
+.pnpm-store
+.expri
+results
+*assignment*
+**/*.target.toml
+**/.env*
