@@ -1,0 +1,513 @@
+mod artifacts;
+mod preview;
+mod server;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+
+use clap::Args;
+use serde::Serialize;
+use serde_json::{Value, json};
+
+use artifacts::{cache_record, open_fixed, optional_metadata, real_prefix};
+use preview::{bounded_warnings, preview, projection};
+
+use crate::context::CommandContext;
+use crate::controller::run_pull;
+use crate::error::{ExpriError, Result};
+use crate::metrics::{self, MetricSummary, Reduction};
+use crate::protocol::RunQueryRequest;
+use crate::runs;
+
+// Even control bytes expand to at most six bytes when JSON-escaped; this
+// leaves ample room inside the transport's 512 KiB JSON response limit.
+const LOG_LIMIT: u64 = 64 * 1024;
+const METRIC_PREVIEW_LIMIT: usize = 50;
+
+#[derive(Debug, Args)]
+pub struct DashboardCommand {
+  #[arg(long)]
+  config: Option<PathBuf>,
+  #[arg(long)]
+  repo: Option<PathBuf>,
+  /// Local listening port; zero selects an available port.
+  #[arg(long, default_value_t = 8765)]
+  port: u16,
+}
+
+pub fn run(command: DashboardCommand, target: Option<&str>) -> Result<()> {
+  let context = CommandContext::load(command.config, command.repo)?;
+  server::serve(Dashboard::new(context, target)?, command.port)
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Source {
+  source_id: String,
+  label: String,
+  kind: &'static str,
+  target_name: Option<String>,
+}
+
+pub struct Dashboard {
+  repo_root: PathBuf,
+  project_name: String,
+  results_dir: String,
+  targets: BTreeSet<String>,
+  initial_source: String,
+}
+
+impl Dashboard {
+  pub fn new(context: CommandContext, target: Option<&str>) -> Result<Self> {
+    let repo_root = fs::canonicalize(context.repo_root)?;
+    let project_name = context.project_name.unwrap_or_else(|| {
+      repo_root
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+    });
+    let results_dir = context.config.download_results_dir();
+    run_pull::validate_results_dir(&results_dir)?;
+    let mut targets: BTreeSet<_> = context.config.target.into_keys().collect();
+    let initial_source = if let Some(target) = target {
+      run_pull::validate_component(target, "target name")?;
+      targets.insert(target.to_string());
+      format!("cached:{target}")
+    } else {
+      "local".to_string()
+    };
+    let dashboard = Self {
+      repo_root,
+      project_name,
+      results_dir,
+      targets,
+      initial_source,
+    };
+    dashboard.local_runs_dir()?;
+    dashboard.sources()?;
+    Ok(dashboard)
+  }
+
+  pub fn catalog(&self) -> Result<Value> {
+    let (sources, warnings) = self.sources()?;
+    Ok(
+      json!({"project_name": self.project_name, "initial_source": self.initial_source,
+      "sources": sources, "warnings": bounded_warnings(&warnings)}),
+    )
+  }
+
+  fn sources(&self) -> Result<(Vec<Source>, Vec<Value>)> {
+    let mut labels = self.targets.clone();
+    let mut warnings = Vec::new();
+    let prefix = self
+      .repo_root
+      .join(run_pull::validate_results_dir(&self.results_dir)?);
+    real_prefix(&self.repo_root, &prefix)?;
+    if optional_metadata(&prefix)?.is_some() {
+      for entry in fs::read_dir(&prefix)? {
+        let entry = entry?;
+        let Some(label) = entry.file_name().to_str().map(str::to_string) else {
+          continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+          warnings
+            .push(json!({"message": format!("cached source {label:?} is a symlink; skipped")}));
+        } else if metadata.is_dir() && run_pull::validate_component(&label, "target name").is_ok() {
+          labels.insert(label);
+        }
+      }
+    }
+    let mut sources = vec![Source {
+      source_id: "local".into(),
+      label: "Local runs".into(),
+      kind: "local",
+      target_name: None,
+    }];
+    for label in labels {
+      match run_pull::cached_runs_dir(&self.repo_root, &self.results_dir, &label) {
+        Ok(_) => sources.push(Source {
+          source_id: format!("cached:{label}"),
+          label: format!("{label} · cached"),
+          kind: "cached",
+          target_name: Some(label),
+        }),
+        Err(error) => {
+          warnings.push(json!({"message": format!("cached source {label:?}: {error}; skipped")}))
+        }
+      }
+    }
+    Ok((sources, warnings))
+  }
+
+  fn local_runs_dir(&self) -> Result<PathBuf> {
+    let directory = self.repo_root.join(".expri/runs");
+    real_prefix(&self.repo_root, &directory)?;
+    Ok(directory)
+  }
+
+  fn source(&self, source_id: &str) -> Result<(Source, PathBuf)> {
+    let source = self
+      .sources()?
+      .0
+      .into_iter()
+      .find(|source| source.source_id == source_id)
+      .ok_or_else(|| message(format!("unknown source: {source_id}")))?;
+    let runs_dir = match &source.target_name {
+      None => self.local_runs_dir()?,
+      Some(target) => run_pull::cached_runs_dir(&self.repo_root, &self.results_dir, target)?,
+    };
+    Ok((source, runs_dir))
+  }
+
+  pub fn list(
+    &self,
+    source_id: &str,
+    search: Option<&str>,
+    task: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+    offset: usize,
+  ) -> Result<Value> {
+    if !(1..=1000).contains(&limit) {
+      return Err(message("limit must be between 1 and 1000"));
+    }
+    let (source, runs_dir) = self.source(source_id)?;
+    let report = runs::query_directory(
+      &runs_dir,
+      &RunQueryRequest::List {
+        task: task.map(str::to_string),
+        status: status.map(str::to_string),
+        limit: None,
+      },
+    )?;
+    let search = search.unwrap_or_default().to_lowercase();
+    let records: Vec<Value> = report["runs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .filter(|run| {
+        search.is_empty()
+          || ["run_id", "task", "status"].iter().any(|field| {
+            run[field]
+              .as_str()
+              .unwrap_or_default()
+              .to_lowercase()
+              .contains(&search)
+          })
+      })
+      .cloned()
+      .collect();
+    let total_count = records.len();
+    let mut metadata_truncated = false;
+    let records: Vec<_> = records
+      .into_iter()
+      .skip(offset)
+      .take(limit)
+      .map(|record| preview(&record, &mut metadata_truncated))
+      .collect();
+    let next_offset = offset.saturating_add(records.len());
+    let next_offset = (next_offset < total_count).then_some(next_offset);
+    Ok(
+      json!({"source": source, "runs": records, "warnings": bounded_warnings(report["warnings"].as_array().unwrap()), "total_count": total_count, "limit": limit, "offset": offset, "next_offset": next_offset, "metadata_truncated": metadata_truncated}),
+    )
+  }
+
+  pub fn detail(&self, source_id: &str, run_id: &str) -> Result<Value> {
+    let (source, runs_dir) = self.source(source_id)?;
+    let record = runs::query_directory(
+      &runs_dir,
+      &RunQueryRequest::Show {
+        run_id: run_id.into(),
+      },
+    )?;
+    let mut warnings = record["warnings"].as_array().cloned().unwrap_or_default();
+    let mut params = Value::Null;
+    let mut params_truncated = false;
+    let mut summaries = BTreeMap::<String, MetricSummary>::new();
+    let mut metric_count = 0;
+    let mut metrics_error = None;
+    match metrics::read_summaries(&runs_dir, run_id, &[]) {
+      Ok(metrics) => {
+        metric_count = metrics.metrics.len();
+        summaries = metrics
+          .metrics
+          .into_iter()
+          .take(METRIC_PREVIEW_LIMIT)
+          .map(|(name, series)| (name, series.summary))
+          .collect();
+        if let Some(value) = metrics.params {
+          params = preview(&value, &mut params_truncated);
+        }
+        for warning in metrics.warnings {
+          if !warnings.contains(&warning) {
+            warnings.push(warning);
+          }
+        }
+      }
+      Err(error) => {
+        metrics_error = Some(error.to_string());
+        // A broken metric artifact must not hide otherwise valid parameters.
+        match metrics::read_parameters(&runs_dir, run_id) {
+          Ok(Some(value)) => params = preview(&value, &mut params_truncated),
+          Ok(None) => {}
+          Err(error) => warnings.push(json!({"run_id": run_id, "message": error.to_string()})),
+        }
+      }
+    }
+    if params_truncated {
+      warnings.push(json!({"run_id": run_id, "message": "Parameter preview is limited; original parameters remain in outputs/params.json."}));
+    }
+    if metric_count > METRIC_PREVIEW_LIMIT {
+      warnings.push(json!({"run_id": run_id, "message": "Showing the first 50 metric summaries; enter an exact metric name to chart another series."}));
+    }
+    let mut metadata_truncated = false;
+    let state = projection(
+      &record["state"],
+      &[
+        "schema_version",
+        "run_id",
+        "task",
+        "command",
+        "status",
+        "started_at",
+        "finished_at",
+        "exit_code",
+        "task_exit_code",
+        "detached",
+        "logging_error",
+      ],
+      &mut metadata_truncated,
+    );
+    let mut snapshot = projection(
+      &record["snapshot"],
+      &["schema_version", "run_id", "created_at"],
+      &mut metadata_truncated,
+    );
+    if snapshot.is_object() {
+      snapshot["source"] = projection(
+        &record["snapshot"]["source"],
+        &[
+          "kind",
+          "git_head",
+          "checkout_manifest_sha256",
+          "sync_state_sha256",
+        ],
+        &mut metadata_truncated,
+      );
+      snapshot["file_count"] = json!(record["snapshot"]["files"].as_array().map(Vec::len));
+    }
+    let mut environment = projection(
+      &record["environment"],
+      &[
+        "schema_version",
+        "base_python",
+        "python",
+        "environment_path",
+        "reuse_packages",
+        "reuse_extras",
+        "fingerprint",
+        "lock_sha256",
+        "pyproject_sha256",
+        "install_project",
+        "cache",
+      ],
+      &mut metadata_truncated,
+    );
+    if environment.is_object() {
+      for field in ["base_manifest", "combined_manifest"] {
+        environment[field] = projection(
+          &record["environment"][field],
+          &[
+            "python",
+            "python_prefix",
+            "base_prefix",
+            "marker_env",
+            "torch",
+            "gpu_driver",
+          ],
+          &mut metadata_truncated,
+        );
+        if environment[field].is_object() {
+          environment[field]["package_count"] = json!(
+            record["environment"][field]["packages"]
+              .as_object()
+              .map(serde_json::Map::len)
+          );
+        }
+      }
+    }
+    let run = preview(&record["run"], &mut metadata_truncated);
+    let run_dir = runs_dir.join(run_id);
+    let cache = if source.kind == "cached" {
+      match cache_record(&run_dir, &mut metadata_truncated) {
+        Ok(value) => value,
+        Err(error) => {
+          warnings.push(json!({"run_id": run_id, "message": error.to_string()}));
+          Value::Null
+        }
+      }
+    } else {
+      Value::Null
+    };
+    if metadata_truncated {
+      warnings.push(json!({"run_id": run_id, "message": "Metadata previews are limited; original records remain in the run directory."}));
+    }
+    Ok(
+      json!({"source": source, "run": run, "state": state, "snapshot": snapshot,
+      "environment": environment, "metadata_truncated": metadata_truncated,
+      "params": params, "params_truncated": params_truncated, "metrics": summaries,
+      "metric_count": metric_count, "metrics_truncated": metric_count > METRIC_PREVIEW_LIMIT,
+      "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": cache}),
+    )
+  }
+
+  pub fn log(&self, source_id: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value> {
+    if !matches!(stream, "stdout" | "stderr") || tail > 1000 {
+      return Err(message(
+        "stream must be stdout or stderr and tail must be at most 1000",
+      ));
+    }
+    let (_, runs_dir) = self.source(source_id)?;
+    runs::summary_directory(&runs_dir, run_id)?;
+    let Some(mut file) = open_fixed(&runs_dir.join(run_id), &format!("logs/{stream}.log"))? else {
+      return Ok(json!({"content": "", "stream": stream, "missing": true, "truncated": false}));
+    };
+    let size = file.metadata()?.len();
+    let start = size.saturating_sub(LOG_LIMIT);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(size - start).read_to_end(&mut bytes)?;
+    if start > 0
+      && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
+      && newline + 1 < bytes.len()
+    {
+      bytes.drain(..=newline);
+    }
+    let lines: Vec<_> = bytes.split_inclusive(|byte| *byte == b'\n').collect();
+    let content: Vec<u8> = lines
+      .iter()
+      .skip(lines.len().saturating_sub(tail))
+      .flat_map(|line| line.iter().copied())
+      .collect();
+    Ok(
+      json!({"content": String::from_utf8_lossy(&content), "stream": stream,
+      "missing": false, "truncated": start > 0}),
+    )
+  }
+
+  pub fn compare(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+    reduction: Reduction,
+  ) -> Result<Value> {
+    let (source, _) = self.source(source_id)?;
+    let runs = self.read_metrics(source_id, run_ids, filters, 2, false)?;
+    let (filters, omitted) = selected_metrics(&runs, filters)?;
+    let mut comparison = metrics::compare(&runs, &filters, reduction)?;
+    // Parameters appear in the bounded chart preview; the value table needs no
+    // duplicate parameter payload or full metric arrays.
+    for run in &mut comparison.runs {
+      run.params = None;
+      run.run = preview(&run.run, &mut false);
+    }
+    comparison.warnings = bounded_warnings(&comparison.warnings);
+    if omitted {
+      comparison.warnings.push(json!({"message": "Showing the first four metrics; select exact metric names to compare other series."}));
+    }
+    Ok(json!({"source": source, "comparison": comparison}))
+  }
+
+  pub fn chart(&self, source_id: &str, run_ids: &[String], filters: &[String]) -> Result<String> {
+    let runs = if filters.is_empty() {
+      let summaries = self.read_metrics(source_id, run_ids, &[], 1, false)?;
+      let (selected, _) = selected_metrics(&summaries, &[])?;
+      if selected.is_empty() {
+        summaries
+      } else {
+        let mut curves = self.read_metrics(source_id, run_ids, &selected, 1, true)?;
+        let available_count = summaries
+          .iter()
+          .flat_map(|run| run.metrics.keys())
+          .collect::<BTreeSet<_>>()
+          .len();
+        if available_count > selected.len() {
+          curves[0].warnings.push(json!({"message": format!("Showing the first {} of {available_count} metrics; select up to six exact metric names to chart other series.", selected.len())}));
+        }
+        curves
+      }
+    } else {
+      self.read_metrics(source_id, run_ids, filters, 1, true)?
+    };
+    crate::metric_charts::render_dashboard_chart(&runs, filters)
+  }
+
+  fn read_metrics(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+    minimum: usize,
+    retain_points: bool,
+  ) -> Result<Vec<metrics::RunMetrics>> {
+    if !(minimum..=8).contains(&run_ids.len())
+      || run_ids.iter().collect::<BTreeSet<_>>().len() != run_ids.len()
+    {
+      return Err(message(format!("select {minimum} to 8 distinct runs")));
+    }
+    if filters.len() > 6 {
+      return Err(message(
+        "select at most six metrics for a dashboard comparison",
+      ));
+    }
+    let (_, runs_dir) = self.source(source_id)?;
+    run_ids
+      .iter()
+      .map(|id| {
+        if retain_points {
+          metrics::read(&runs_dir, id, filters)
+        } else {
+          metrics::read_summaries(&runs_dir, id, filters)
+        }
+      })
+      .collect()
+  }
+}
+
+fn selected_metrics(
+  runs: &[metrics::RunMetrics],
+  filters: &[String],
+) -> Result<(Vec<String>, bool)> {
+  let available: BTreeSet<_> = runs
+    .iter()
+    .flat_map(|run| run.metrics.keys().cloned())
+    .collect();
+  if filters.is_empty() {
+    let omitted = available.len() > 4;
+    Ok((available.into_iter().take(4).collect(), omitted))
+  } else {
+    let filters: Vec<_> = filters
+      .iter()
+      .collect::<BTreeSet<_>>()
+      .into_iter()
+      .cloned()
+      .collect();
+    if filters.len() > 6 {
+      return Err(message(
+        "select at most six metrics for a dashboard comparison",
+      ));
+    }
+    Ok((filters, false))
+  }
+}
+
+fn message(value: impl Into<String>) -> ExpriError {
+  ExpriError::Message(value.into())
+}
+
+#[cfg(test)]
+mod tests;

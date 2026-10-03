@@ -372,6 +372,56 @@ points per run; select fewer metrics if the point limit is reached. Inspection
 reads the file extent present when it opens, so a live writer cannot prolong
 the read indefinitely.
 
+
+## Local dashboard
+
+Start the read-only run dashboard from your project:
+
+```sh
+expri dashboard
+expri dashboard --port 0             # Choose an available local port
+expri -T runpod dashboard            # Open the cached runpod source first
+```
+
+Open the printed `http://127.0.0.1:<port>` URL. The dashboard lists local runs
+from `.expri/runs/` and downloaded runs from `results/<target>/runs/` (or your
+configured results directory). Cached sources remain available without target
+credentials. It never contacts a target or changes run files. Use the CLI to
+pull remote metrics and logs, then press **Refresh** in the dashboard:
+
+```sh
+expri -T runpod runs pull run-abc123 --metrics --logs
+```
+
+Search and filter the paged run list, open a run for its command, provenance,
+parameters, metric summaries, and stdout/stderr tails, or select two to eight
+runs from one source to compare. Compare the last, minimum, or maximum metric
+values and view the curves with parameter differences. Status reflects the
+saved records; `runs status` remains the live check.
+
+Browser responses stay bounded: details preview large parameters and metadata,
+show up to 50 metric summaries, and omit package/source-file inventories. Log
+tails read at most 64 KiB and 1,000 lines. Charts initially show four metrics;
+enter up to six exact metric names to choose others. Curves retain extrema with
+at most 600 points per run/metric and 4,800 points across the chart. JSON responses
+are capped at 512 KiB and charts at 2 MiB; an oversized response reports an error
+so you can narrow the selection. Original artifacts stay intact. Summary tables
+do not retain point arrays; chart reads retain the existing 128 MiB file and
+1,000,000 selected-point limits.
+
+The Rust binary embeds the dashboard assets, so viewing runs requires no Node.js,
+CDN, or hosted service. For frontend development:
+
+```sh
+pnpm --dir dashboard_web install --frozen-lockfile
+pnpm --dir dashboard_web check
+pnpm --dir dashboard_web test
+pnpm --dir dashboard_web build
+```
+
+Commit the generated `dashboard_web/app.js` with its TypeScript source. CI checks
+that rebuilding it produces the checked-in asset.
+
 ## Python environment
 
 Configure uv for local tasks and as the default for targets with a top-level

@@ -2,6 +2,7 @@ mod archive;
 mod config;
 mod context;
 mod controller;
+mod dashboard;
 mod environment;
 mod error;
 mod filter;
@@ -59,6 +60,8 @@ enum Command {
   Run(RunCommand),
   Env(EnvironmentCommand),
   Runs(RunsCommand),
+  /// Browse local and cached experiment results in a local dashboard.
+  Dashboard(dashboard::DashboardCommand),
   Node {
     #[command(subcommand)]
     command: NodeCommand,
@@ -228,6 +231,7 @@ fn run() -> Result<()> {
       run_environment(command, cli.target.as_deref(), cli.verbose, cli.quiet)
     }
     Command::Runs(command) => runs_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Dashboard(command) => dashboard::run(command, cli.target.as_deref()),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
