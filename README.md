@@ -595,3 +595,22 @@ expri -T runpod download -- wandb
 ```
 
 Use `--dry-run` to print the selected transport's commands without executing them.
+
+## Testing
+
+Run Rust checks with `cargo test --all-targets --all-features --locked`. CI also
+runs the Python runtime/metrics tests and dashboard frontend checks.
+
+The [host and worker suite](tests/containers/README.md) runs real uv, SSH and
+rsync between isolated Docker containers with different installed fake Torch
+versions. It covers dependency reuse and incompatibility, detached runs,
+snapshot isolation, pruning, cancellation, selective pulls and cached dashboard
+review across native and Python protocols. Run it from the repository root:
+
+```sh
+tests/containers/run.sh
+```
+
+Image builds require internet; test execution uses an internal fixture index.
+The fake GPU API tests workflow decisions and metadata, without verifying real
+GPU computation or PyTorch/CUDA binary compatibility.

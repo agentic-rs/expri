@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -147,6 +147,7 @@ impl Fixture {
 struct Server {
   child: Child,
   address: SocketAddr,
+  response_timeout: Duration,
 }
 
 impl Server {
@@ -205,7 +206,16 @@ impl Server {
       address.ip(),
       std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     );
-    Self { child, address }
+    Self {
+      child,
+      address,
+      response_timeout: Duration::from_secs(5),
+    }
+  }
+
+  fn with_response_timeout(mut self, timeout: Duration) -> Self {
+    self.response_timeout = timeout;
+    self
   }
 
   fn request(&self, method: &str, path: &str) -> Response {
@@ -221,7 +231,7 @@ impl Server {
   fn raw(&self, request: &[u8]) -> Option<Response> {
     let mut connection = TcpStream::connect(self.address).unwrap();
     connection
-      .set_read_timeout(Some(Duration::from_secs(5)))
+      .set_read_timeout(Some(self.response_timeout))
       .unwrap();
     connection
       .set_write_timeout(Some(Duration::from_secs(5)))
@@ -238,7 +248,14 @@ impl Server {
       {
         return None;
       }
-      panic!("read HTTP response: {error}");
+      let first_line = String::from_utf8_lossy(request)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect::<String>();
+      panic!("read HTTP response to {first_line}: {error}");
     }
     if response.is_empty() {
       return None;
@@ -332,6 +349,23 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Entry> {
   );
   visit(root, root, &mut output);
   output
+}
+
+fn assert_tree_unchanged(root: &Path, expected: &BTreeMap<PathBuf, Entry>) {
+  let current = tree(root);
+  let changed: BTreeSet<_> = current
+    .keys()
+    .chain(expected.keys())
+    .filter(|path| current.get(*path) != expected.get(*path))
+    .collect();
+  // A failed read-only check should identify paths without printing saved logs,
+  // parameter files, and metric arrays into the CI output.
+  assert!(
+    changed.is_empty(),
+    "inspection changed {} filesystem entries: {:?}",
+    changed.len(),
+    changed.into_iter().take(10).collect::<Vec<_>>()
+  );
 }
 
 #[test]
@@ -432,7 +466,7 @@ fn dashboard_reviews_local_and_cached_runs_refreshes_data_and_never_writes_to_th
   let head = server.request("HEAD", "/");
   assert_eq!(head.status, 200);
   assert!(head.body.is_empty());
-  assert_eq!(tree(&fixture.repo), initial);
+  assert_tree_unchanged(&fixture.repo, &initial);
 
   let run = fixture.runs_dir("local").join("run.shared");
   let mut metrics = fs::OpenOptions::new()
@@ -452,7 +486,7 @@ fn dashboard_reviews_local_and_cached_runs_refreshes_data_and_never_writes_to_th
     0.125
   );
   assert_eq!(server.json("/api/runs?source=local")["total_count"], 3);
-  assert_eq!(tree(&fixture.repo), changed);
+  assert_tree_unchanged(&fixture.repo, &changed);
 }
 
 #[test]
@@ -468,14 +502,14 @@ fn cached_initial_source_and_empty_projects_need_no_environment_or_target_creden
       .len(),
     2
   );
-  assert_eq!(tree(&fixture.repo), before);
+  assert_tree_unchanged(&fixture.repo, &before);
   drop(server);
   let empty = Fixture::new(false);
   let before = tree(&empty.repo);
   let server = Server::start(&empty, None);
   assert_eq!(server.json("/api/runs?source=local")["runs"], json!([]));
   assert!(!empty.repo.join(".expri").exists());
-  assert_eq!(tree(&empty.repo), before);
+  assert_tree_unchanged(&empty.repo, &before);
 }
 
 #[test]
@@ -582,7 +616,7 @@ fn dashboard_rejects_unsafe_paths_mutations_and_malformed_requests_and_bounds_lo
     );
   }
   assert_eq!(server.json("/api/catalog")["initial_source"], "local");
-  assert_eq!(tree(&fixture.repo), before);
+  assert_tree_unchanged(&fixture.repo, &before);
 }
 
 #[test]
@@ -636,7 +670,10 @@ fn dashboard_previews_bound_large_records_and_exact_metric_filters_keep_full_sum
   )
   .unwrap();
   let before = tree(&fixture.repo);
-  let server = Server::start(&fixture, None);
+  // This checks payload bounds and summaries over one million values, rather
+  // than throughput. Debug builds on shared CI runners need extra processing
+  // time; ordinary requests retain their five-second client deadline.
+  let server = Server::start(&fixture, None).with_response_timeout(Duration::from_secs(60));
   let response = server.request("GET", "/api/run?source=local&run_id=run.shared");
   assert_eq!(
     response.status,
@@ -698,5 +735,5 @@ fn dashboard_previews_bound_large_records_and_exact_metric_filters_keep_full_sum
       assert!(html.contains("<td>17000</td><td>16999</td>"));
     }
   }
-  assert_eq!(tree(&fixture.repo), before);
+  assert_tree_unchanged(&fixture.repo, &before);
 }
