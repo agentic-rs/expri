@@ -96,7 +96,13 @@ pub enum RunQueryRequest {
     run_id: String,
     #[serde(default)]
     artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    metrics: bool,
   },
+}
+
+fn is_false(value: &bool) -> bool {
+  !*value
 }
 
 #[derive(Debug, Deserialize, Serialize)]

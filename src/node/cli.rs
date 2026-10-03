@@ -7,6 +7,7 @@ use crate::error::{ExpriError, Result};
 pub const UV_ENVIRONMENT_CAPABILITY: &str = "uv-environment-v1";
 pub const ENVIRONMENT_MAINTENANCE_CAPABILITY: &str = "env-maintenance-v1";
 pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
+pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +103,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
       UV_ENVIRONMENT_CAPABILITY,
       ENVIRONMENT_MAINTENANCE_CAPABILITY,
       RUN_RECORDS_CAPABILITY,
+      RUN_METRICS_CAPABILITY,
       DURABLE_RUNS_CAPABILITY,
     ]
     .contains(&requested.as_str())
@@ -113,7 +115,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
   } else {
     println!(
       "{}",
-      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY, DURABLE_RUNS_CAPABILITY]})
+      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY, DURABLE_RUNS_CAPABILITY, RUN_METRICS_CAPABILITY]})
     );
   }
   Ok(())

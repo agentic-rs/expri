@@ -252,6 +252,7 @@ Pull a target run's available metadata and logs into
 
 ```sh
 expri -T runpod runs pull run-abc123
+expri -T runpod runs pull run-abc123 --metrics
 expri -T runpod runs pull run-abc123 --outputs --dry-run
 expri -T runpod runs pull run-abc123 --artifact 'outputs/model one.pt'
 expri -T runpod runs pull run-abc123 --artifact code/out/jobs
@@ -285,6 +286,91 @@ expri -T runpod runs show run-abc123 --cached --json
 With `protocol = "auto"`, run queries and logging use capability checks and
 fall back to Python on older nodes. Requiring `protocol = "expri-node"` reports
 an upgrade error when the installed node lacks the requested capability.
+
+## Metrics and comparison charts
+
+Copy [python/expri_metrics.py](python/expri_metrics.py) into your experiment's
+source directory. The helper uses the Python standard library and works in the
+run's uv environment. Log effective parameters after applying configuration
+defaults and command-line overrides, then record scalar metrics during training:
+
+```python
+from expri_metrics import MetricsLogger
+
+with MetricsLogger() as logger:
+  logger.params({"learning_rate": 0.001, "batch_size": 64, "seed": 42})
+  for step in range(100):
+    loss, accuracy = train_step()
+    logger.log(step, {"train/loss": loss, "train/accuracy": accuracy})
+```
+
+By default, the helper writes `metrics.jsonl` and optional `params.json` into
+`EXPRI_OUTPUT_DIR`: `.expri/runs/<run_id>/outputs/`. Outside a managed run, pass
+an explicit directory to `MetricsLogger("outputs")`. Parameters are immutable:
+repeating identical values is allowed, while changing saved parameters fails.
+Each event is flushed before `log()` returns. For distributed training, log from
+rank 0 and create the logger within that process. See [python/README.md](python/README.md)
+for the complete producer contract.
+
+Inspect one run or compare runs locally:
+
+```sh
+expri runs metrics run-abc123
+expri runs metrics run-abc123 --metric train/loss --json
+expri runs compare run-abc123 run-def456 --metric train/loss --reduction min
+expri runs compare run-abc123 run-def456 --chart .expri/charts/comparison.html
+```
+
+`metrics` reports each series' sample count, last value, minimum, maximum, and
+last step. `compare` uses the last recorded value by default; `--reduction min`
+or `max` selects an extremum. Missing metrics remain explicit rather than
+becoming zero. Repeat `--metric` to select several names, or omit it to include
+all recorded metrics. JSON output includes parameters, warnings, and metric
+points for further analysis.
+
+The chart is a standalone local HTML document with inline SVG curves, run
+metadata, parameter differences, and full-series summaries. Open it in a local
+browser; it works offline. Curves preserve logging order, including repeated
+steps and step resets. For long series, the plot keeps at most 2,000 points per
+run and metric using minimum/maximum buckets; summaries still use all samples.
+
+Remote inspection fetches only the fixed metric files and run metadata into
+the existing `results/<target>/runs/<run_id>/` cache. It skips logs and other
+outputs, including checkpoints. `[download].results_dir` can change the cache
+location. Use `--cached` to read that cache without contacting the target:
+
+```sh
+expri -T runpod runs metrics run-abc123 --json
+expri -T runpod runs compare run-abc123 run-def456 --chart .expri/charts/remote.html
+expri -T runpod runs pull run-abc123 --metrics
+expri -T runpod runs compare run-abc123 run-def456 --cached --metric train/loss
+```
+
+`runs pull --metrics` selects metadata, `outputs/metrics.jsonl`, and
+`outputs/params.json`. Combine it with `--outputs` or `--artifact` when additional
+files are needed. Selective pulls retain artifacts downloaded earlier. Online
+inspection ignores retained metric files absent from the current remote
+selection; cached inspection reads the retained files. Recorded status in a
+chart or cached response is a snapshot; use `runs status` for a live check.
+Older nodes automatically fall back to the Python catalog for metric selection
+when the target uses `protocol = "auto"`.
+
+Existing trainers can write the same files without the helper. Each JSONL row
+has this shape (`schema_version` and `timestamp` may be omitted):
+
+```json
+{"schema_version":1,"step":12,"timestamp":"2026-10-03T01:00:00Z","metrics":{"train/loss":0.42}}
+```
+
+Steps must be nonnegative 64-bit integers, and metric values must be finite
+numbers. Optional timestamps must be RFC3339 strings of at most 128 bytes.
+`params.json` holds `{"schema_version":1,"params":{...}}`; a plain
+parameter object is also accepted. Readers report malformed rows or incomplete
+final writes and preserve valid samples. Each row and parameter file is limited
+to 1 MiB. A metrics file is limited to 128 MiB, with at most 1,000,000 selected
+points per run; select fewer metrics if the point limit is reached. Inspection
+reads the file extent present when it opens, so a live writer cannot prolong
+the read indefinitely.
 
 ## Python environment
 

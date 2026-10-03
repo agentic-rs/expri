@@ -26,18 +26,22 @@ enum RunsSubcommand {
   Logs(RunsLogsCommand),
   /// Request graceful cancellation of a detached run.
   Cancel(RunsJobCommand),
+  /// Fetch and inspect a run's scalar metrics and experiment parameters.
+  Metrics(crate::metrics_cli::MetricsCommand),
+  /// Compare scalar metrics across runs, with an optional local chart.
+  Compare(crate::metrics_cli::CompareCommand),
 }
 
 #[derive(Debug, Args)]
-struct ConnectionArgs {
+pub(crate) struct ConnectionArgs {
   #[arg(long)]
-  config: Option<PathBuf>,
+  pub config: Option<PathBuf>,
   #[arg(long)]
-  repo: Option<PathBuf>,
+  pub repo: Option<PathBuf>,
   #[arg(long)]
-  control_path: Option<String>,
+  pub control_path: Option<String>,
   #[arg(long, default_value = "30m")]
-  control_persist: String,
+  pub control_persist: String,
 }
 
 #[derive(Debug, Args)]
@@ -104,6 +108,9 @@ struct RunsPullCommand {
   /// Include the entire outputs/ directory.
   #[arg(long)]
   outputs: bool,
+  /// Pull metrics and parameters with metadata, without logs or checkpoints.
+  #[arg(long)]
+  metrics: bool,
   /// Inspect the remote selection and preview its download without writing locally.
   #[arg(long)]
   dry_run: bool,
@@ -111,6 +118,12 @@ struct RunsPullCommand {
 
 pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let (options, cached, request, dry_run) = match command.command {
+    RunsSubcommand::Metrics(command) => {
+      return crate::metrics_cli::run_metrics(command, target, verbosity, quiet);
+    }
+    RunsSubcommand::Compare(command) => {
+      return crate::metrics_cli::run_compare(command, target, verbosity, quiet);
+    }
     RunsSubcommand::Status(command) => {
       return run_job(
         command.options,
@@ -183,6 +196,7 @@ pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: boo
         protocol::RunQueryRequest::Files {
           run_id: command.run_id,
           artifacts: command.artifact,
+          metrics: command.metrics,
         },
         command.dry_run,
       )
@@ -455,8 +469,35 @@ mod tests {
       ["outputs/model one.pt", "code/out/metrics.json"]
     );
     assert!(command.outputs && command.dry_run);
+    assert!(!command.metrics);
     assert!(Cli::try_parse_from(["expri", "runs", "list", "--status", "success"]).is_err());
     assert!(Cli::try_parse_from(["expri", "runs", "pull", "run-123", "--cached"]).is_err());
+  }
+
+  #[test]
+  fn metric_pulls_can_include_explicit_outputs_and_artifacts() {
+    let cli = Cli::try_parse_from([
+      "expri",
+      "-T",
+      "gpu",
+      "runs",
+      "pull",
+      "run-one",
+      "--metrics",
+      "--outputs",
+      "--artifact",
+      "code/out/evaluation.json",
+      "--dry-run",
+    ])
+    .unwrap();
+    let Command::Runs(RunsCommand {
+      command: RunsSubcommand::Pull(command),
+    }) = cli.command
+    else {
+      panic!("expected runs pull");
+    };
+    assert!(command.metrics && command.outputs && command.dry_run);
+    assert_eq!(command.artifact, ["code/out/evaluation.json"]);
   }
 
   #[test]
