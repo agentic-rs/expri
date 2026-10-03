@@ -165,7 +165,7 @@ fn downsampling_bounds_points_preserves_extrema_and_full_series_summary() {
   points[5000].value = -99_999.0;
   points[5001].value = 99_999.0;
   let references = points.iter().collect::<Vec<_>>();
-  let chosen = plot_points(&references);
+  let chosen = plot_points(&references, POINT_BUDGET);
   assert!(chosen.len() <= POINT_BUDGET);
   assert!(std::ptr::eq(chosen[0], &points[0]));
   assert!(std::ptr::eq(
@@ -183,6 +183,141 @@ fn downsampling_bounds_points_preserves_extrema_and_full_series_summary() {
   assert!(html.contains("<td>10000</td><td>9999</td>"));
   assert!(html.contains(">-99999</td><td title=\"99999.0\">99999</td>"));
   assert_eq!(serde_json::to_value(&run).unwrap(), before);
+}
+
+#[test]
+fn dashboard_sampling_keeps_extrema_and_complete_statistics_with_a_smaller_budget() {
+  let mut points: Vec<_> = (0..10_000)
+    .map(|step| point(step, (step % 13) as f64))
+    .collect();
+  points[5000].value = -99_999.0;
+  points[5001].value = 99_999.0;
+  let references = points.iter().collect::<Vec<_>>();
+  let chosen = plot_points(&references, DASHBOARD_POINT_BUDGET);
+  assert!(chosen.len() <= DASHBOARD_POINT_BUDGET);
+  assert!(std::ptr::eq(chosen[0], &points[0]));
+  assert!(std::ptr::eq(
+    chosen[chosen.len() - 1],
+    points.last().unwrap()
+  ));
+  assert!(chosen.iter().any(|point| point.step == 5000));
+  assert!(chosen.iter().any(|point| point.step == 5001));
+  assert!(chosen.windows(2).all(|pair| pair[0].step < pair[1].step));
+  let html = render_dashboard_chart(&[run("run-long", points)], &[]).unwrap();
+  assert!(html.matches("<circle ").count() <= DASHBOARD_POINT_BUDGET);
+  assert!(html.contains("at most 600 points per run"));
+  assert!(html.contains("<td>10000</td><td>9999</td>"));
+  assert!(html.contains(">-99999</td><td title=\"99999.0\">99999</td>"));
+}
+
+#[test]
+fn dashboard_metric_selection_is_bounded_and_cli_export_keeps_every_metric() {
+  let mut selected = run("run-many", vec![]);
+  let names: Vec<_> = (0..7).map(|index| format!("metric_{index:02}")).collect();
+  for name in &names {
+    selected
+      .metrics
+      .insert(name.clone(), series(vec![point(0, 1.0)]));
+  }
+  let html = render_dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
+  assert_eq!(html.matches("<svg ").count(), 4);
+  assert!(html.contains("Showing the first 4 of 7 metrics"));
+  assert!(!html.contains("metric_04"));
+  let explicit = render_dashboard_chart(std::slice::from_ref(&selected), &names[..6]).unwrap();
+  assert_eq!(explicit.matches("<svg ").count(), 6);
+  assert!(render_dashboard_chart(std::slice::from_ref(&selected), &names).is_err());
+  let full = render_chart(&[selected], &[]).unwrap();
+  assert_eq!(full.matches("<svg ").count(), 7);
+  assert!(!full.contains("Showing the first"));
+}
+
+#[test]
+fn dashboard_aggregate_sampling_keeps_supported_large_comparisons_below_the_html_cap() {
+  let names: Vec<_> = (0..6).map(|index| format!("metric_{index:02}")).collect();
+  let mut runs = Vec::new();
+  for index in 0..8 {
+    let mut selected = run(&format!("{}{index:02}", "r".repeat(30)), vec![]);
+    for name in &names {
+      selected.metrics.insert(
+        name.clone(),
+        series(
+          (0..10_000)
+            .map(|step| point(step, (step % 13) as f64))
+            .collect(),
+        ),
+      );
+    }
+    runs.push(selected);
+  }
+  for (filters, plots) in [(&[][..], 4), (names.as_slice(), 6)] {
+    let html = render_dashboard_chart(&runs, filters).unwrap();
+    assert!(html.len() < 2 * 1024 * 1024);
+    assert_eq!(html.matches("<svg ").count(), plots);
+    assert!(html.matches("<circle ").count() <= DASHBOARD_TOTAL_POINT_BUDGET);
+    assert_eq!(
+      html.matches("<td>10000</td><td>9999</td>").count(),
+      plots * 8
+    );
+  }
+}
+
+#[test]
+fn dashboard_parameter_preview_is_bounded_but_differences_use_complete_values() {
+  let mut first = run("run-a", vec![]);
+  let mut params = serde_json::Map::new();
+  for index in 0..30 {
+    params.insert(format!("key-{index:02}"), json!("λ".repeat(10_000)));
+  }
+  params.insert(
+    "key-00".to_string(),
+    json!(format!("{}END_A", "λ".repeat(10_000))),
+  );
+  first.params = Some(Value::Object(params));
+  let mut second = first.clone();
+  second.run_id = "run-b".to_string();
+  second.params.as_mut().unwrap()["key-00"] = json!(format!("{}END_B", "λ".repeat(10_000)));
+  let runs = [first, second];
+  let before = serde_json::to_value(&runs).unwrap();
+  let preview = render_dashboard_chart(&runs, &[]).unwrap();
+  assert!(preview.contains("Dashboard parameter preview"));
+  assert!(preview.contains("first 24 keys"));
+  assert!(preview.contains("1000 characters"));
+  assert_eq!(preview.matches("<tr class=diff>").count(), 1);
+  assert!(preview.contains("key-23"));
+  assert!(!preview.contains("key-24"));
+  assert!(!preview.contains("END_A") && !preview.contains("END_B"));
+  assert!(preview.len() < 160 * 1024);
+  let text = preview_text(&"猫".repeat(1001), Some(1000));
+  assert_eq!(text.chars().count(), 1000);
+  assert!(text.ends_with('…'));
+  assert_eq!(preview_text("unchanged", Some(1000)), "unchanged");
+  let full = render_chart(&runs, &[]).unwrap();
+  assert!(full.contains("key-29") && full.contains("END_A") && full.contains("END_B"));
+  assert!(!full.contains("Dashboard parameter preview"));
+  assert_eq!(serde_json::to_value(&runs).unwrap(), before);
+}
+
+#[test]
+fn dashboard_bounds_metadata_notes_and_repeated_point_labels() {
+  let mut selected = run(&"r".repeat(240), vec![]);
+  selected.run["task"] = json!(format!("{}TASK_END", "猫".repeat(100_000)));
+  selected
+    .warnings
+    .push(json!({"message":format!("{}WARNING_END", "<".repeat(100_000))}));
+  let name = "<".repeat(256);
+  selected.metrics.insert(
+    name.clone(),
+    series((0..10_000).map(|step| point(step, step as f64)).collect()),
+  );
+  let preview = render_dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
+  assert!(preview.len() < 512 * 1024);
+  assert!(!preview.contains("TASK_END") && !preview.contains("WARNING_END"));
+  assert!(preview.contains("Dashboard text previews may shorten"));
+  assert!(preview.contains("Run 1 · step"));
+  assert!(preview.contains(&escape(&name)));
+  let full = render_chart(&[selected], &[]).unwrap();
+  assert!(full.contains("TASK_END") && full.contains("WARNING_END"));
+  assert!(!full.contains("Dashboard text previews may shorten"));
 }
 
 #[test]

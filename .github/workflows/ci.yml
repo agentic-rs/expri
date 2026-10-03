@@ -38,6 +38,36 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --all-features --locked
 
+  dashboard-web:
+    name: Dashboard web
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install pnpm
+        run: npm install --global pnpm@10.30.3
+
+      - name: Install frontend dependencies
+        run: pnpm --dir dashboard_web install --frozen-lockfile
+
+      - name: Check frontend types and behavior
+        run: |
+          pnpm --dir dashboard_web check
+          pnpm --dir dashboard_web test
+
+      - name: Verify embedded frontend asset
+        run: |
+          pnpm --dir dashboard_web build
+          git diff --exit-code -- dashboard_web/app.js
+
   python-runtime:
     name: Python runtime
     runs-on: ubuntu-latest

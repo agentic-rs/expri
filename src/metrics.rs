@@ -96,6 +96,31 @@ pub fn read_with_files(
   filters: &[String],
   files: MetricFiles,
 ) -> Result<RunMetrics> {
+  read_mode(runs_dir, run_id, filters, files, true)
+}
+
+/// Read complete scalar summaries without retaining metric point arrays.
+/// Dashboard tables do not need curves; the file/row limits still bound reads.
+pub fn read_summaries(runs_dir: &Path, run_id: &str, filters: &[String]) -> Result<RunMetrics> {
+  read_mode(
+    runs_dir,
+    run_id,
+    filters,
+    MetricFiles {
+      metrics: true,
+      params: true,
+    },
+    false,
+  )
+}
+
+fn read_mode(
+  runs_dir: &Path,
+  run_id: &str,
+  filters: &[String],
+  files: MetricFiles,
+  retain_points: bool,
+) -> Result<RunMetrics> {
   validate_filters(filters)?;
   let report = crate::runs::summary_directory(runs_dir, run_id)?;
   let runs_dir = fs::canonicalize(runs_dir)?;
@@ -116,7 +141,7 @@ pub fn read_with_files(
   if files.metrics {
     let file = open_output(&run_dir, "metrics.jsonl")?;
     if let Some(file) = file {
-      read_events(file, &mut result, filters)?;
+      read_events(file, &mut result, filters, retain_points)?;
     } else {
       warning(
         &mut result,
@@ -199,6 +224,12 @@ pub fn compare(
       .flat_map(|run| run.warnings.iter().cloned())
       .collect(),
   })
+}
+
+/// Inspect parameters independently when a metric artifact cannot be read.
+pub fn read_parameters(runs_dir: &Path, run_id: &str) -> Result<Option<Value>> {
+  crate::runs::summary_directory(runs_dir, run_id)?;
+  read_params(&fs::canonicalize(runs_dir)?.join(run_id))
 }
 
 fn read_params(run_dir: &Path) -> Result<Option<Value>> {
@@ -288,7 +319,12 @@ fn optional_metadata(path: &Path) -> std::io::Result<Option<fs::Metadata>> {
   }
 }
 
-fn read_events(file: File, result: &mut RunMetrics, filters: &[String]) -> Result<()> {
+fn read_events(
+  file: File,
+  result: &mut RunMetrics,
+  filters: &[String],
+  retain_points: bool,
+) -> Result<()> {
   let size = file.metadata()?.len();
   if size > METRICS_FILE_LIMIT {
     return Err(message(
@@ -347,7 +383,7 @@ fn read_events(file: File, result: &mut RunMetrics, filters: &[String]) -> Resul
             continue;
           }
           points += 1;
-          if points > POINT_LIMIT {
+          if retain_points && points > POINT_LIMIT {
             return Err(message(
               "metrics exceed the 1,000,000 selected point limit; select fewer metrics",
             ));
@@ -360,6 +396,7 @@ fn read_events(file: File, result: &mut RunMetrics, filters: &[String]) -> Resul
               value,
               timestamp: timestamp.clone(),
             },
+            retain_points,
           );
         }
       }
@@ -442,7 +479,7 @@ fn event(value: Value) -> std::result::Result<ParsedEvent, String> {
   Ok((step, timestamp, values))
 }
 
-fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint) {
+fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint, retain_points: bool) {
   match run.metrics.entry(name) {
     std::collections::btree_map::Entry::Vacant(entry) => {
       entry.insert(MetricSeries {
@@ -452,7 +489,11 @@ fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint) {
           min: point.clone(),
           max: point.clone(),
         },
-        points: vec![point],
+        points: if retain_points {
+          vec![point]
+        } else {
+          Vec::new()
+        },
       });
     }
     std::collections::btree_map::Entry::Occupied(mut entry) => {
@@ -465,7 +506,9 @@ fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint) {
       if point.value > series.summary.max.value {
         series.summary.max = point.clone();
       }
-      series.points.push(point);
+      if retain_points {
+        series.points.push(point);
+      }
     }
   }
 }

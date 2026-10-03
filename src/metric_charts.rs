@@ -9,6 +9,8 @@ use crate::error::{ExpriError, Result};
 use crate::metrics::{MetricPoint, RunMetrics};
 
 const POINT_BUDGET: usize = 2000;
+const DASHBOARD_POINT_BUDGET: usize = 600;
+const DASHBOARD_TOTAL_POINT_BUDGET: usize = 4800;
 const COLORS: [&str; 10] = [
   "#4056b4", "#087f8c", "#c05a25", "#894caa", "#bd416c", "#577c30", "#9a6717", "#306a94",
   "#78594e", "#59616e",
@@ -17,6 +19,22 @@ const LEFT: f64 = 86.0;
 const TOP: f64 = 28.0;
 const WIDTH: f64 = 864.0;
 const HEIGHT: f64 = 246.0;
+
+#[derive(Clone, Copy)]
+struct ParameterPreview {
+  keys: usize,
+  characters: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ChartOptions {
+  point_budget: usize,
+  total_point_budget: Option<usize>,
+  default_metric_limit: Option<usize>,
+  selected_metric_limit: Option<usize>,
+  parameter_preview: Option<ParameterPreview>,
+  text_preview: Option<usize>,
+}
 
 /// Produce a portable, offline comparison without external assets or scripts.
 pub fn write_chart(path: &Path, runs: &[RunMetrics], filters: &[String]) -> Result<()> {
@@ -42,12 +60,50 @@ pub fn write_chart(path: &Path, runs: &[RunMetrics], filters: &[String]) -> Resu
   Ok(())
 }
 
-fn render_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
+pub(crate) fn render_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
+  render_with_options(
+    runs,
+    filters,
+    ChartOptions {
+      point_budget: POINT_BUDGET,
+      total_point_budget: None,
+      default_metric_limit: None,
+      selected_metric_limit: None,
+      parameter_preview: None,
+      text_preview: None,
+    },
+  )
+}
+
+/// Keep browser previews compact while the exported CLI chart retains all data.
+pub(crate) fn render_dashboard_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
+  render_with_options(
+    runs,
+    filters,
+    ChartOptions {
+      point_budget: DASHBOARD_POINT_BUDGET,
+      total_point_budget: Some(DASHBOARD_TOTAL_POINT_BUDGET),
+      default_metric_limit: Some(4),
+      selected_metric_limit: Some(6),
+      parameter_preview: Some(ParameterPreview {
+        keys: 24,
+        characters: 1000,
+      }),
+      text_preview: Some(512),
+    },
+  )
+}
+
+fn render_with_options(
+  runs: &[RunMetrics],
+  filters: &[String],
+  options: ChartOptions,
+) -> Result<String> {
   let available: BTreeSet<&str> = runs
     .iter()
     .flat_map(|run| run.metrics.keys().map(String::as_str))
     .collect();
-  let names = if filters.is_empty() {
+  let mut names = if filters.is_empty() {
     available.iter().copied().collect::<Vec<_>>()
   } else {
     let mut seen = BTreeSet::new();
@@ -64,30 +120,73 @@ fn render_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
     }
     names
   };
+  let available_count = names.len();
+  if filters.is_empty()
+    && let Some(limit) = options.default_metric_limit
+  {
+    names.truncate(limit);
+  } else if !filters.is_empty()
+    && let Some(limit) = options.selected_metric_limit
+    && names.len() > limit
+  {
+    return Err(message(format!(
+      "dashboard charts support at most {limit} metrics; select fewer metrics"
+    )));
+  }
+  let curves = names
+    .iter()
+    .map(|name| {
+      runs
+        .iter()
+        .filter(|run| run.metrics.contains_key(*name))
+        .count()
+    })
+    .sum::<usize>();
+  let point_budget = options
+    .total_point_budget
+    .map_or(options.point_budget, |total| {
+      options.point_budget.min((total / curves.max(1)).max(4))
+    });
   let mut html = String::from(HTML_HEAD);
   html.push_str(&format!("<header><p class=eyebrow>expri / experiment review</p><h1>Run comparison</h1><p class=muted>{} selected run{}. Curves follow logging order; repeated steps and step resets stay visible.</p></header>", runs.len(), if runs.len() == 1 { "" } else { "s" }));
-  render_runs(&mut html, runs);
-  render_params(&mut html, runs);
-  render_warnings(&mut html, runs);
+  if available_count > names.len() {
+    html.push_str(&format!("<p class=muted>Showing the first {} of {available_count} metrics to keep the dashboard chart compact. Select up to {} metrics to change this preview.</p>", names.len(), options.selected_metric_limit.unwrap_or(names.len())));
+  }
+  render_runs(&mut html, runs, options.text_preview);
+  render_params(&mut html, runs, options.parameter_preview);
+  render_warnings(&mut html, runs, options.text_preview);
   if names.is_empty() {
     html.push_str("<section class=card><h2>No scalar metrics</h2><p class=muted>No metric series are available in these run records.</p></section>");
   }
   for (index, name) in names.iter().enumerate() {
-    render_metric(&mut html, runs, name, index);
+    render_metric(
+      &mut html,
+      runs,
+      name,
+      index,
+      ChartOptions {
+        point_budget,
+        ..options
+      },
+    );
   }
   html.push_str("<footer>Generated locally by expri. This document works offline.</footer></main></body></html>");
   Ok(html)
 }
 
-fn render_runs(html: &mut String, runs: &[RunMetrics]) {
-  html.push_str("<section class=card><h2>Selected runs</h2><div class=table-scroll><table><thead><tr><th>Run</th><th>Task</th><th>Recorded status</th><th>Started</th><th>Exit code</th></tr></thead><tbody>");
+fn render_runs(html: &mut String, runs: &[RunMetrics], text_preview: Option<usize>) {
+  html.push_str("<section class=card><h2>Selected runs</h2><div class=table-scroll><table>");
+  if text_preview.is_some() {
+    html.push_str("<caption class=muted>Dashboard text previews may shorten long metadata and notes. Full records remain in the run directory.</caption>");
+  }
+  html.push_str("<thead><tr><th>Run</th><th>Task</th><th>Recorded status</th><th>Started</th><th>Exit code</th></tr></thead><tbody>");
   for (index, run) in runs.iter().enumerate() {
-    html.push_str(&format!("<tr><th scope=row><span class=swatch style=\"background:{}\"></span><code>{}</code></th><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", color(index), escape(&run.run_id), escape(&field(&run.run, "task")), escape(&field(&run.run, "status")), escape(&field(&run.run, "started_at")), escape(&field(&run.run, "exit_code"))));
+    html.push_str(&format!("<tr><th scope=row><span class=swatch style=\"background:{}\"></span><code>{}</code></th><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>", color(index), escape(&run.run_id), escape(&preview_text(&field(&run.run, "task"), text_preview)), escape(&preview_text(&field(&run.run, "status"), text_preview)), escape(&preview_text(&field(&run.run, "started_at"), text_preview)), escape(&preview_text(&field(&run.run, "exit_code"), text_preview))));
   }
   html.push_str("</tbody></table></div></section>");
 }
 
-fn render_params(html: &mut String, runs: &[RunMetrics]) {
+fn render_params(html: &mut String, runs: &[RunMetrics], preview: Option<ParameterPreview>) {
   let keys: BTreeSet<&str> = runs
     .iter()
     .filter_map(|run| run.params.as_ref()?.as_object())
@@ -99,12 +198,18 @@ fn render_params(html: &mut String, runs: &[RunMetrics]) {
       .push_str("<p class=muted>No effective parameters were saved for these runs.</p></section>");
     return;
   }
+  if let Some(preview) = preview {
+    html.push_str(&format!("<p class=muted>Dashboard parameter preview: the first {} keys are shown, with names and values limited to {} characters. Highlighted rows compare complete saved values.</p>", preview.keys, preview.characters));
+  }
   html.push_str("<p class=muted>Highlighted rows differ between runs. A dash means the parameter was not recorded.</p><div class=table-scroll><table class=params><thead><tr><th>Parameter</th>");
   for run in runs {
     html.push_str(&format!("<th><code>{}</code></th>", escape(&run.run_id)));
   }
   html.push_str("</tr></thead><tbody>");
-  for key in keys {
+  for key in keys
+    .into_iter()
+    .take(preview.map_or(usize::MAX, |preview| preview.keys))
+  {
     let values: Vec<_> = runs
       .iter()
       .map(|run| run.params.as_ref().and_then(|params| params.get(key)))
@@ -113,7 +218,10 @@ fn render_params(html: &mut String, runs: &[RunMetrics]) {
     html.push_str(&format!(
       "<tr{}><th scope=row><code>{}</code>{}</th>",
       if differs { " class=diff" } else { "" },
-      escape(key),
+      escape(&preview_text(
+        key,
+        preview.map(|preview| preview.characters)
+      )),
       if differs {
         "<span class=diff-label>differs</span>"
       } else {
@@ -124,7 +232,10 @@ fn render_params(html: &mut String, runs: &[RunMetrics]) {
       match value {
         Some(value) => html.push_str(&format!(
           "<td><pre>{}</pre></td>",
-          escape(&serde_json::to_string_pretty(value).expect("JSON value serialization"))
+          escape(&preview_text(
+            &serde_json::to_string_pretty(value).expect("JSON value serialization"),
+            preview.map(|preview| preview.characters),
+          ))
         )),
         None => html.push_str("<td class=muted>—</td>"),
       }
@@ -134,7 +245,7 @@ fn render_params(html: &mut String, runs: &[RunMetrics]) {
   html.push_str("</tbody></table></div></section>");
 }
 
-fn render_warnings(html: &mut String, runs: &[RunMetrics]) {
+fn render_warnings(html: &mut String, runs: &[RunMetrics], text_preview: Option<usize>) {
   if !runs.iter().any(|run| !run.warnings.is_empty()) {
     return;
   }
@@ -149,14 +260,20 @@ fn render_warnings(html: &mut String, runs: &[RunMetrics]) {
       html.push_str(&format!(
         "<li><code>{}</code>: {}</li>",
         escape(&run.run_id),
-        escape(&note)
+        escape(&preview_text(&note, text_preview))
       ));
     }
   }
   html.push_str("</ul></section>");
 }
 
-fn render_metric(html: &mut String, runs: &[RunMetrics], name: &str, index: usize) {
+fn render_metric(
+  html: &mut String,
+  runs: &[RunMetrics],
+  name: &str,
+  index: usize,
+  options: ChartOptions,
+) {
   html.push_str(&format!("<section class=card><h2>{}</h2>", escape(name)));
   let all_points = runs
     .iter()
@@ -164,7 +281,7 @@ fn render_metric(html: &mut String, runs: &[RunMetrics], name: &str, index: usiz
     .flat_map(|series| series.points.iter())
     .filter(|point| point.value.is_finite());
   if let Some(domain) = Domain::new(all_points) {
-    render_plot(html, runs, name, index, &domain);
+    render_plot(html, runs, name, index, &domain, options);
   } else {
     html.push_str("<p class=muted>No finite samples are available to plot.</p>");
   }
@@ -196,7 +313,16 @@ fn render_metric(html: &mut String, runs: &[RunMetrics], name: &str, index: usiz
   html.push_str("</tbody></table></div></section>");
 }
 
-fn render_plot(html: &mut String, runs: &[RunMetrics], name: &str, index: usize, domain: &Domain) {
+fn render_plot(
+  html: &mut String,
+  runs: &[RunMetrics],
+  name: &str,
+  index: usize,
+  domain: &Domain,
+  options: ChartOptions,
+) {
+  let point_budget = options.point_budget;
+  let text_preview = options.text_preview;
   html.push_str(&format!("<svg viewBox=\"0 0 1000 340\" role=img aria-labelledby=\"plot-title-{index} plot-desc-{index}\"><title id=\"plot-title-{index}\">{}</title><desc id=\"plot-desc-{index}\">Metric values by global step. Each color represents one run. Samples remain in logging order; the table below lists statistics from all samples.</desc>", escape(name)));
   for (value, fraction) in domain.value_ticks() {
     let y = TOP + (1.0 - fraction) * HEIGHT;
@@ -230,7 +356,7 @@ fn render_plot(html: &mut String, runs: &[RunMetrics], name: &str, index: usize,
       .iter()
       .filter(|point| point.value.is_finite())
       .collect();
-    let chosen = plot_points(&points);
+    let chosen = plot_points(&points, point_budget);
     sampled |= chosen.len() < points.len();
     let coordinates = chosen
       .iter()
@@ -249,23 +375,37 @@ fn render_plot(html: &mut String, runs: &[RunMetrics], name: &str, index: usize,
       ));
     }
     for point in chosen {
-      let label = format!(
-        "{} · {} · step {} · value {}",
-        run.run_id,
-        name,
-        point.step,
-        precise_number(point.value)
-      );
+      let label = if text_preview.is_some() {
+        format!(
+          "Run {} · step {} · value {}",
+          run_index + 1,
+          point.step,
+          precise_number(point.value)
+        )
+      } else {
+        format!(
+          "{} · {} · step {} · value {}",
+          run.run_id,
+          name,
+          point.step,
+          precise_number(point.value)
+        )
+      };
       html.push_str(&format!("<circle class=point cx=\"{:.2}\" cy=\"{:.2}\" r=2 fill=\"{}\" aria-label=\"{}\"><title>{}</title></circle>", domain.x(point.step), domain.y(point.value), color(run_index), escape(&label), escape(&label)));
     }
   }
   html.push_str("</svg><ul class=legend>");
   for (run_index, run) in runs.iter().enumerate() {
-    html.push_str(&format!("<li><span class=swatch style=\"background:{}\"></span><code>{}</code><span class=muted>{} · {}</span>{}</li>", color(run_index), escape(&run.run_id), escape(&field(&run.run, "task")), escape(&field(&run.run, "status")), if run_index >= COLORS.len() { "<span class=muted>(dashed)</span>" } else { "" }));
+    let label = if text_preview.is_some() {
+      format!("<span>Run {}</span>", run_index + 1)
+    } else {
+      String::new()
+    };
+    html.push_str(&format!("<li><span class=swatch style=\"background:{}\"></span>{label}<code>{}</code><span class=muted>{} · {}</span>{}</li>", color(run_index), escape(&run.run_id), escape(&preview_text(&field(&run.run, "task"), text_preview)), escape(&preview_text(&field(&run.run, "status"), text_preview)), if run_index >= COLORS.len() { "<span class=muted>(dashed)</span>" } else { "" }));
   }
   html.push_str("</ul>");
   if sampled {
-    html.push_str(&format!("<p class=muted>Curves are downsampled to at most {POINT_BUDGET} points per run, preserving endpoints and bucket minima/maxima. Statistics below use every logged sample.</p>"));
+    html.push_str(&format!("<p class=muted>Curves are downsampled to at most {point_budget} points per run, preserving endpoints and bucket minima/maxima. Statistics below use every logged sample.</p>"));
   }
 }
 
@@ -346,13 +486,13 @@ impl Domain {
 }
 
 /// Emit bucket extrema in source order, retaining both endpoints separately.
-fn plot_points<'a>(points: &[&'a MetricPoint]) -> Vec<&'a MetricPoint> {
-  if points.len() <= POINT_BUDGET {
+fn plot_points<'a>(points: &[&'a MetricPoint], point_budget: usize) -> Vec<&'a MetricPoint> {
+  if points.len() <= point_budget {
     return points.to_vec();
   }
-  let buckets = (POINT_BUDGET - 2) / 2;
+  let buckets = (point_budget - 2) / 2;
   let interior = points.len() - 2;
-  let mut selected = Vec::with_capacity(POINT_BUDGET);
+  let mut selected = Vec::with_capacity(point_budget);
   selected.push(points[0]);
   for bucket in 0..buckets {
     let start = 1 + (interior * bucket) / buckets;
@@ -373,6 +513,22 @@ fn plot_points<'a>(points: &[&'a MetricPoint]) -> Vec<&'a MetricPoint> {
   }
   selected.push(points[points.len() - 1]);
   selected
+}
+
+fn preview_text(text: &str, limit: Option<usize>) -> String {
+  let Some(limit) = limit else {
+    return text.to_string();
+  };
+  if limit == 0 {
+    return String::new();
+  }
+  let Some((boundary, _)) = text.char_indices().nth(limit) else {
+    return text.to_string();
+  };
+  let mut preview = text[..boundary].to_string();
+  preview.pop();
+  preview.push('…');
+  preview
 }
 
 fn number(value: f64) -> String {
