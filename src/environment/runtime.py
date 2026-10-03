@@ -85,10 +85,15 @@ for distribution in importlib.metadata.distributions() if sys.argv[4] == "1" els
   if not name:
     continue
   top_level = distribution.read_text("top_level.txt")
-  modules = set(top_level.split()) if top_level else set()
+  modules = set()
+  for declared in (top_level or "").split():
+    # Native wheels may declare nested namespaces as paths rather than imports.
+    module = declared.replace("\\", ".").replace("/", ".")
+    if all(component.isidentifier() for component in module.split(".")):
+      modules.add(module)
   if not modules:
     for file in distribution.files or []:
-      first = str(file).split("/")[0]
+      first = str(file).replace("\\", "/").split("/")[0]
       if first.endswith(".py"):
         first = first[:-3]
       elif first.endswith((".so", ".pyd")):

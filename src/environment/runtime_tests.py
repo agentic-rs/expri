@@ -58,6 +58,100 @@ def locked(text):
   return runtime.exported_requirements(text, MARKERS)
 
 
+class InventoryMetadataTests(unittest.TestCase):
+  def setUp(self):
+    temporary = tempfile.TemporaryDirectory(prefix="expri-inventory-tests-")
+    self.addCleanup(temporary.cleanup)
+    self.root = Path(temporary.name).resolve()
+    self.site = self.root / "base"
+    self.repo = self.root / "repo"
+    self.overlay = self.root / "overlay"
+    for directory in (self.site, self.repo, self.overlay):
+      directory.mkdir()
+    (self.site / "fixture_namespace" / "native").mkdir(parents=True)
+    (self.site / "fixture_namespace" / "native" / "lib.so").touch()
+    for filename in ("plain_module.py", "extension.cpython-312.so", "windows_extension.pyd"):
+      (self.site / filename).touch()
+    (self.site / "__pycache__").mkdir()
+    (self.site / "__pycache__" / "ignored.pyc").touch()
+    self.metadata = self.site / "fixture_native-1.0.dist-info"
+    self.metadata.mkdir()
+    (self.metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: fixture-native\nVersion: 1.0\n")
+    (self.metadata / "RECORD").write_text("fixture_namespace/native/lib.so,,\nfixture_native-1.0.dist-info/METADATA,,\n")
+
+  def inspect(self, paths, modules=()):
+    # Simulate base/overlay site-packages without installing into the interpreter.
+    # The actual embedded inventory and importlib probes still run in a subprocess.
+    script = "import sys\nsys.path[:0] = " + repr([str(path) for path in paths]) + "\n" + runtime.INVENTORY_SCRIPT
+    with patch("runtime.INVENTORY_SCRIPT", script):
+      return runtime.inspect_python(sys.executable, self.repo, runtime.runtime_env({}), modules=modules)
+
+  def test_namespace_metadata_paths_are_normalized_deduplicated_and_probed(self):
+    for namespace in ("_native_2", "native_μ"):
+      (self.site / "fixture_namespace" / namespace).mkdir()
+    (self.metadata / "top_level.txt").write_text(
+      " fixture_namespace/native\nfixture_namespace\\native\nfixture_namespace.native\n"
+      "fixture_namespace/_native_2\nfixture_namespace/native_μ\nplain_module\n"
+      "../invalid\nfixture_namespace//invalid\ninvalid-name\n"
+    )
+    base = self.inspect([self.site])
+    modules = base["packages"]["fixture-native"]["modules"]
+    self.assertEqual(modules, [
+      "fixture_namespace._native_2", "fixture_namespace.native", "fixture_namespace.native_μ", "plain_module",
+    ])
+    origins = self.inspect([self.site], modules)["origins"]
+    self.assertEqual(origins["fixture_namespace.native"], {
+      "origin": None, "search_locations": [str(self.site / "fixture_namespace" / "native")],
+    })
+
+  def test_invalid_or_missing_declared_names_keep_record_based_inference(self):
+    declarations = [None, "", " \n", "../escape\n/absolute\nfixture_namespace/\nfixture_namespace..native\n"
+      "fixture_namespace//native\nfixture_namespace-native\nC:\\fixture_namespace\\native\n"]
+    for declared in declarations:
+      for separator in ("/", "\\"):
+        with self.subTest(declared=declared, separator=separator):
+          top_level = self.metadata / "top_level.txt"
+          if declared is None:
+            top_level.unlink(missing_ok=True)
+          else:
+            top_level.write_text(declared)
+          namespace_file = separator.join(("fixture_namespace", "native", "lib.so"))
+          (self.site / namespace_file).touch()
+          (self.metadata / "RECORD").write_text(
+            namespace_file + ",,\n"
+            "plain_module.py,,\nextension.cpython-312.so,,\nwindows_extension.pyd,,\n"
+            "__pycache__/ignored.pyc,,\nfixture_native-1.0.dist-info/METADATA,,\n"
+          )
+          base = self.inspect([self.site])
+          self.assertEqual(base["packages"]["fixture-native"]["modules"], [
+            "extension", "fixture_namespace", "plain_module", "windows_extension",
+          ])
+
+  def test_normalized_nested_namespaces_still_detect_source_and_overlay_shadowing(self):
+    (self.metadata / "top_level.txt").write_text("fixture_namespace/native\n")
+    base = self.inspect([self.site])
+    modules = base["packages"]["fixture-native"]["modules"]
+    self.assertEqual(modules, ["fixture_namespace.native"])
+    base["origins"] = self.inspect([self.site], modules)["origins"]
+    runtime.validate_combined(base, {}, {"fixture-native": set()}, base)
+    for shadow in (self.repo, self.overlay):
+      with self.subTest(shadow=shadow):
+        (shadow / "fixture_namespace" / "native").mkdir(parents=True)
+        combined = self.inspect([shadow, self.site], modules)
+        # Parent remains a namespace and package metadata remains inherited;
+        # the nested namespace gains a source/overlay search location.
+        self.assertIsNone(self.inspect([shadow, self.site], ["fixture_namespace"])["origins"]["fixture_namespace"]["origin"])
+        self.assertEqual(combined["packages"]["fixture-native"]["metadata_path"], base["packages"]["fixture-native"]["metadata_path"])
+        with self.assertRaisesRegex(runtime.RuntimeErrorDetail, "shadows reused module fixture_namespace.native"):
+          runtime.validate_combined(combined, {}, {"fixture-native": set()}, base)
+        (shadow / "fixture_namespace" / "native" / "__init__.py").write_text("# Shadow nested namespace with a regular package.\n")
+        combined = self.inspect([shadow, self.site], modules)
+        self.assertEqual(combined["origins"]["fixture_namespace.native"]["origin"], str(shadow / "fixture_namespace" / "native" / "__init__.py"))
+        with self.assertRaisesRegex(runtime.RuntimeErrorDetail, "shadows reused module fixture_namespace.native"):
+          runtime.validate_combined(combined, {}, {"fixture-native": set()}, base)
+        shutil.rmtree(shadow / "fixture_namespace")
+
+
 class PreparationLockTests(unittest.TestCase):
   def assert_lock_released_with_open_duplicate(self, exceptional):
     contender = '''
