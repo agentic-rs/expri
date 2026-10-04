@@ -87,9 +87,8 @@ browser's `Host`, `Origin`, `Cookie`, and `Sec-Fetch-Site` headers. Keep the
 dashboard's `Referrer-Policy: same-origin` response header: `no-referrer` makes
 native login/logout forms send `Origin: null`, which the service rejects.
 If forwarding an explicit header list, also retain `Authorization` and
-`Content-Type` for CLI
-requests. Buffer request bodies, use HTTP/1.0 upstream, and strip `Expect` so
-the service receives fixed-length requests. Configure per-client rate limiting
+`Content-Type` for CLI requests. Buffer request bodies, use HTTP/1.0 upstream,
+and strip `Expect` so the service receives fixed-length requests. Configure per-client rate limiting
 for `/login`; a limit of ten requests per minute with a small burst is suitable
 for this single-user setup. Do not cache authenticated responses or log request
 bodies, credentials, or signed S3 URL queries.
@@ -202,7 +201,7 @@ python3 -B tests/containers/service_workflow.py
 python3 -B tests/containers/service_workflow.py --no-build
 ```
 
-The acceptance suite uses separate host, worker, service, S3 and fault-proxy
+The acceptance suite uses separate host, worker, service, S3, browser and fault-proxy
 containers on an internal network. No host ports or project volumes are shared.
 The fixture builds pinned official MinIO source; set `EXPRI_TEST_S3_IMAGE` to use
 an existing compatible MinIO image instead. Image builds require network access;
@@ -210,3 +209,9 @@ the acceptance workflow itself uses only the internal network.
 It runs an actual uv experiment with fake installed Torch and a private input,
 interrupts the service during training, loses metric and multipart part acknowledgements,
 restarts the service, resumes the checkpoint, and reviews downloaded data offline.
+An isolated Firefox image submits the native login and logout forms over an
+internal HTTPS fixture. It reproduces the rejected null origins under
+`no-referrer`, then checks successful forms under `same-origin`, secure cookie
+flags and session revocation. The test browser accepts the generated certificate
+through its test-only WebDriver configuration. Browser request logs contain method, path, origin, status and
+response policy, without credentials or cookies.

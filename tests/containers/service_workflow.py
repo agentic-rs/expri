@@ -227,7 +227,7 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
 
 try:
   if not options.no_build:
-    for target in ['worker', 'host', 'service']:
+    for target in ['worker', 'host', 'service', 'browser']:
       logged(f'build-{target}.log', ['docker', 'build', '--target', target, '--tag', f'expri-ci-{target}',
         '--file', 'tests/containers/Dockerfile', '.'], timeout=900)
   s3_image = os.environ.get('EXPRI_TEST_S3_IMAGE', 'expri-ci-s3')
@@ -265,6 +265,7 @@ prefix = "acceptance"
   host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
   worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
   proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
+  firefox = create('browser', 'expri-ci-browser', alias='expri.example.net', env=['EXPRI_DASHBOARD_PASSWORD'])
   copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
   copy(ROOT / 'tests/containers/service_proxy.py', proxy, '/tmp/proxy.py')
   copy(state / 'owner.toml', host, '/tmp/owner.toml')
@@ -277,6 +278,10 @@ prefix = "acceptance"
   wait_for(lambda: docker('exec', worker, 'test', '-f', '/tmp/expri-worker.ready', check=False).returncode == 0, 'worker not ready')
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service not ready')
   wait_for(lambda: api_proxy('/test/state') is not None, 'fault proxy not ready')
+  docker('start', firefox)
+  wait_for(lambda: python(firefox, "import ssl;from urllib.request import urlopen;print(urlopen('https://expri.example.net/login',context=ssl._create_unverified_context(),timeout=2).status)") == '200', 'Firefox HTTPS proxy not ready')
+  logged('browser-forms.log', ['docker', 'exec', '--user', 'tester', firefox,
+    'python3', '/opt/expri-browser/browser_forms.py'], timeout=180)
   initial_session = dashboard_public_checks()
   python(host, "from pathlib import Path;Path('/home/tester/private.bin').write_bytes(b'private-input-fixture'*1024)")
   client(host, 'input put', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/queue')
@@ -341,7 +346,7 @@ prefix = "acceptance"
   def review():
     return python(host, "import json;from pathlib import Path;from urllib.request import urlopen;url=Path('/tmp/dashboard.log').read_text().strip().split('Dashboard: ')[1];catalog=json.load(urlopen(url+'/api/catalog',timeout=2));print(catalog['initial_source'])") == 'cached:service'
   wait_for(review, 'offline dashboard did not recognize service cache')
-  print('Service workflow passed: inputs, offline metrics, restart, multipart resume, selective pulls, authenticated hosted dashboard, offline review.', flush=True)
+  print('Service workflow passed: Firefox native forms, inputs, offline metrics, restart, multipart resume, selective pulls, authenticated hosted dashboard, offline review.', flush=True)
 finally:
   if watch is not None and watch.poll() is None:
     watch.terminate()
@@ -352,6 +357,8 @@ finally:
       watch.wait()
   for container in containers:
     try:
+      if container.endswith('-browser'):
+        docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
