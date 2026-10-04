@@ -83,8 +83,11 @@ restarts invalidate existing sessions. The CLI continues to use its existing
 bearer authentication.
 
 Keep the backend on loopback behind HTTPS. The reverse proxy must preserve the
-browser's `Host`, `Origin`, `Cookie`, and `Sec-Fetch-Site` headers. If forwarding
-an explicit header list, also retain `Authorization` and `Content-Type` for CLI
+browser's `Host`, `Origin`, `Cookie`, and `Sec-Fetch-Site` headers. Keep the
+dashboard's `Referrer-Policy: same-origin` response header: `no-referrer` makes
+native login/logout forms send `Origin: null`, which the service rejects.
+If forwarding an explicit header list, also retain `Authorization` and
+`Content-Type` for CLI
 requests. Buffer request bodies, use HTTP/1.0 upstream, and strip `Expect` so
 the service receives fixed-length requests. Configure per-client rate limiting
 for `/login`; a limit of ten requests per minute with a small burst is suitable

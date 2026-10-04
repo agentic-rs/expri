@@ -17,7 +17,8 @@ pub(super) fn response(status: u16, content_type: &str, body: Vec<u8>) -> HttpRe
     .header("Connection", "close")
     .header("Cache-Control", "no-store")
     .header("X-Content-Type-Options", "nosniff")
-    .header("Referrer-Policy", "no-referrer")
+    // Native login/logout form POSTs must retain their same-origin Origin.
+    .header("Referrer-Policy", "same-origin")
     .header("Content-Security-Policy", MAIN_CSP)
     .body(body)
     .expect("static response headers")
@@ -192,6 +193,10 @@ mod tests {
     )
     .unwrap();
     assert_eq!(
+      handle(&store, &auth, &request("GET", "/login", b"")).headers()["Referrer-Policy"],
+      "same-origin"
+    );
+    assert_eq!(
       handle(&store, &auth, &request("GET", "/", b"")).status(),
       303
     );
@@ -227,6 +232,12 @@ mod tests {
     assert_eq!(
       serde_json::from_slice::<serde_json::Value>(reply.body()).unwrap()["access_mode"],
       "hosted"
+    );
+    let mut page = request("GET", "/", b"");
+    page.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    assert_eq!(
+      handle(&store, &auth, &page).headers()["Referrer-Policy"],
+      "same-origin"
     );
     let mut logout = request("POST", "/logout", b"");
     logout
@@ -287,6 +298,7 @@ mod tests {
       "/api/chart?run_id=run-1",
     ] {
       for (header, value) in [
+        ("Origin", "null"),
         ("Origin", "https://hostile.example.net"),
         ("Sec-Fetch-Site", "cross-site"),
         ("Sec-Fetch-Site", "same-site"),
