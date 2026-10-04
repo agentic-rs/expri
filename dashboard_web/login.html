@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>expri · Sign in</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/login" aria-label="expri sign in"><span class="brand-mark" aria-hidden="true">e</span>expri</a>
+      </div>
+    </header>
+    <main class="login-main">
+      <section class="card login-card" aria-labelledby="login-heading">
+        <p class="eyebrow">Private workspace</p>
+        <h1 id="login-heading">Sign in</h1>
+        <p class="subheading">Enter the dashboard password to review synced experiments.</p>
+        <!-- LOGIN_ERROR -->
+        <form class="login-form" method="post" action="/login">
+          <label class="field" for="password">Dashboard password<input id="password" name="password" type="password" autocomplete="current-password" required autofocus></label>
+          <button class="button primary" type="submit">Sign in</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

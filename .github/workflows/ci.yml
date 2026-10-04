@@ -91,6 +91,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  service-workflow:
+    name: Self-hosted S3 workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Test private inputs, offline runs, resumable checkpoints and local review
+        env:
+          EXPRI_CONTAINER_ARTIFACTS: ${{ runner.temp }}/expri-service-containers
+        run: python3 -B tests/containers/service_workflow.py
+
+      - name: Save service workflow and image build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: service-workflow-logs
+          path: ${{ runner.temp }}/expri-service-containers/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   python-runtime:
     name: Python runtime
     runs-on: ubuntu-latest

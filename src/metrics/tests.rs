@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use serde_json::json;
@@ -349,4 +350,87 @@ fn point_limit_counts_selected_metrics_and_filtering_can_read_large_runs() {
   let filtered = read(&fixture.runs, "run-a", &["metric-0".to_string()]).unwrap();
   assert_eq!(filtered.metrics.len(), 1);
   assert_eq!(filtered.metrics["metric-0"].summary.count, rows);
+}
+
+#[test]
+fn hosted_reader_bounds_curves_without_changing_complete_reductions() {
+  let mut bytes = Vec::new();
+  for step in 0..10000 {
+    writeln!(
+      &mut bytes,
+      "{}",
+      json!({"step": step, "metrics": {"loss": step}})
+    )
+    .unwrap();
+  }
+  let mut run = RunMetrics {
+    run_id: "preview".into(),
+    run: json!({"run_id": "preview"}),
+    params: None,
+    metrics: BTreeMap::new(),
+    warnings: Vec::new(),
+  };
+  read_event_data(
+    bytes.as_slice(),
+    bytes.len() as u64,
+    &mut run,
+    &["loss".into()],
+    true,
+    Some(16),
+  )
+  .unwrap();
+  let series = &run.metrics["loss"];
+  assert!(series.points.len() <= 16);
+  assert_eq!(series.points.first().unwrap().step, 0);
+  assert_eq!(series.points.last().unwrap().step, 9999);
+  assert_eq!(series.summary.count, 10000);
+  assert_eq!(series.summary.min.value, 0.0);
+  assert_eq!(series.summary.max.value, 9999.0);
+  assert_eq!(series.summary.last.value, 9999.0);
+  assert!(run.warnings.iter().any(|warning| {
+    warning["message"]
+      .as_str()
+      .unwrap_or_default()
+      .contains("sampled")
+  }));
+}
+
+#[test]
+fn hosted_reader_bounds_distinct_series_and_selection_can_read_another_metric() {
+  let names: BTreeMap<_, _> = (0..2001)
+    .map(|index| (format!("metric-{index}"), index))
+    .collect();
+  let bytes = serde_json::to_vec(&json!({"step": 0, "metrics": names})).unwrap();
+  let mut run = RunMetrics {
+    run_id: "preview".into(),
+    run: json!({}),
+    params: None,
+    metrics: BTreeMap::new(),
+    warnings: Vec::new(),
+  };
+  assert!(
+    read_event_data(
+      bytes.as_slice(),
+      bytes.len() as u64,
+      &mut run,
+      &[],
+      false,
+      Some(2000)
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("2000-series")
+  );
+  run.metrics.clear();
+  read_event_data(
+    bytes.as_slice(),
+    bytes.len() as u64,
+    &mut run,
+    &["metric-2000".into()],
+    true,
+    Some(2000),
+  )
+  .unwrap();
+  assert_eq!(run.metrics.len(), 1);
+  assert_eq!(run.metrics["metric-2000"].summary.last.value, 2000.0);
 }

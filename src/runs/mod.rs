@@ -252,6 +252,20 @@ fn record(run_dir: &Path) -> Record {
   let run_id = run_dir.file_name().unwrap().to_string_lossy();
   let mut warnings = Vec::new();
   let state = optional_json(run_dir, "run-state.json", &mut warnings, true);
+  let mut record = record_from_state(&run_id, state);
+  warnings.append(&mut record.warnings);
+  record.warnings = warnings;
+  record
+}
+
+/// Apply the same catalog validation to locally saved and hosted run states.
+pub(crate) fn summary_from_state(run_id: &str, state: Option<Value>) -> Value {
+  let record = record_from_state(run_id, state);
+  json!({"run": record.summary, "state": record.state, "warnings": record.warnings})
+}
+
+fn record_from_state(run_id: &str, state: Option<Value>) -> Record {
+  let mut warnings = Vec::new();
   let mut summary = json!({
     "run_id": run_id, "task": null, "status": "unknown", "started_at": null,
     "finished_at": null, "exit_code": null, "schema_version": 0,
@@ -262,7 +276,7 @@ fn record(run_dir: &Path) -> Record {
       let Some(object) = state.as_object() else {
         warn(
           &mut warnings,
-          &run_id,
+          run_id,
           "run-state.json must contain a JSON object",
         );
         return;
@@ -275,7 +289,7 @@ fn record(run_dir: &Path) -> Record {
             summary["schema_version"] = Value::Null;
             warn(
               &mut warnings,
-              &run_id,
+              run_id,
               "run-state.json has invalid schema_version",
             );
             return;
@@ -286,15 +300,15 @@ fn record(run_dir: &Path) -> Record {
       if schema > 1 {
         warn(
           &mut warnings,
-          &run_id,
+          run_id,
           format!("run-state.json uses unsupported schema_version {schema}"),
         );
         return;
       }
-      if object.get("run_id").and_then(Value::as_str) != Some(&run_id) {
+      if object.get("run_id").and_then(Value::as_str) != Some(run_id) {
         warn(
           &mut warnings,
-          &run_id,
+          run_id,
           "run-state.json run_id does not match its directory",
         );
         return;
@@ -306,7 +320,7 @@ fn record(run_dir: &Path) -> Record {
       {
         summary["task"] = json!(task);
       } else {
-        field_warning(&mut warnings, &run_id, "task");
+        field_warning(&mut warnings, run_id, "task");
       }
       if let Some(status) = object
         .get("status")
@@ -315,13 +329,13 @@ fn record(run_dir: &Path) -> Record {
       {
         summary["status"] = json!(status);
       } else {
-        field_warning(&mut warnings, &run_id, "status");
+        field_warning(&mut warnings, run_id, "status");
       }
       started_at = object.get("started_at").and_then(parse_timestamp);
       if started_at.is_some() {
         summary["started_at"] = object["started_at"].clone();
       } else {
-        field_warning(&mut warnings, &run_id, "started_at");
+        field_warning(&mut warnings, run_id, "started_at");
       }
       let terminal = matches!(
         summary["status"].as_str(),
@@ -334,7 +348,7 @@ fn record(run_dir: &Path) -> Record {
       {
         summary["finished_at"] = object["finished_at"].clone();
       } else if object.contains_key("finished_at") || terminal {
-        field_warning(&mut warnings, &run_id, "finished_at");
+        field_warning(&mut warnings, run_id, "finished_at");
       }
       if let Some(exit_code) = object
         .get("exit_code")
@@ -343,7 +357,7 @@ fn record(run_dir: &Path) -> Record {
       {
         summary["exit_code"] = json!(exit_code);
       } else if object.contains_key("exit_code") || terminal {
-        field_warning(&mut warnings, &run_id, "exit_code");
+        field_warning(&mut warnings, run_id, "exit_code");
       }
     };
     validate();

@@ -244,7 +244,15 @@ fn read_params(run_dir: &Path) -> Result<Option<Value>> {
   if raw.len() > LINE_LIMIT {
     return Err(message("outputs/params.json exceeds the 1 MiB size limit"));
   }
-  let value: Value = serde_json::from_slice(&raw).map_err(|error| {
+  parse_parameters(&raw).map(Some)
+}
+
+/// Parse the same parameter envelope for local files and bounded hosted reads.
+pub(crate) fn parse_parameters(raw: &[u8]) -> Result<Value> {
+  if raw.len() > LINE_LIMIT {
+    return Err(message("outputs/params.json exceeds the 1 MiB size limit"));
+  }
+  let value: Value = serde_json::from_slice(raw).map_err(|error| {
     message(format!(
       "outputs/params.json contains invalid JSON: {error}"
     ))
@@ -262,10 +270,10 @@ fn read_params(run_dir: &Path) -> Result<Option<Value>> {
       .get("params")
       .filter(|params| params.is_object())
       .ok_or_else(|| message("outputs/params.json params must be an object"))?;
-    Ok(Some(params.clone()))
+    Ok(params.clone())
   } else {
     // Plain parameter objects remain easy to write from an existing trainer.
-    Ok(Some(value))
+    Ok(value)
   }
 }
 
@@ -331,13 +339,37 @@ fn read_events(
       "outputs/metrics.jsonl exceeds the 128 MiB read limit",
     ));
   }
+  read_event_data(file, size, result, filters, retain_points, None)
+}
+
+/// Hosted readers keep complete scalar summaries while bounding retained curve
+/// data independently of the input length. Local CLI reads retain their existing
+/// point limit and exported chart behavior.
+pub(crate) fn read_event_data(
+  reader: impl Read,
+  size: u64,
+  result: &mut RunMetrics,
+  filters: &[String],
+  retain_points: bool,
+  preview_point_limit: Option<usize>,
+) -> Result<()> {
+  validate_filters(filters)?;
+  if size > METRICS_FILE_LIMIT {
+    return Err(message(
+      "outputs/metrics.jsonl exceeds the 128 MiB read limit",
+    ));
+  }
+  if preview_point_limit.is_some_and(|limit| limit < 4) {
+    return Err(message("metric preview point limit must be at least four"));
+  }
   // Inspect the file extent at open time. A busy writer cannot extend this read
   // indefinitely, and a partly written final row is reported rather than guessed.
-  let mut reader = BufReader::new(file.take(size));
+  let mut reader = BufReader::new(reader.take(size));
   let mut line_number = 0;
   let mut previous_step = None;
   let mut warned_steps = false;
   let mut points = 0;
+  let mut sampled = false;
   let mut raw = Vec::new();
   while let Some((complete, oversized)) = read_line(&mut reader, &mut raw)? {
     line_number += 1;
@@ -383,14 +415,22 @@ fn read_events(
             continue;
           }
           points += 1;
-          if retain_points && points > POINT_LIMIT {
+          if preview_point_limit.is_some()
+            && !result.metrics.contains_key(&name)
+            && result.metrics.len() >= 2000
+          {
+            return Err(message(
+              "hosted metric preview exceeds the 2000-series limit",
+            ));
+          }
+          if retain_points && preview_point_limit.is_none() && points > POINT_LIMIT {
             return Err(message(
               "metrics exceed the 1,000,000 selected point limit; select fewer metrics",
             ));
           }
           add_point(
             result,
-            name,
+            name.clone(),
             MetricPoint {
               step,
               value,
@@ -398,6 +438,17 @@ fn read_events(
             },
             retain_points,
           );
+          if retain_points && let Some(limit) = preview_point_limit {
+            let series = result.metrics.get_mut(&name).expect("metric just inserted");
+            if series.points.len() > limit {
+              sampled = true;
+              // Repeated thinning keeps the first and most recent point while
+              // bounding memory for long runs. Full reductions remain exact.
+              let last = series.points.pop().unwrap();
+              series.points = series.points.drain(..).step_by(2).collect();
+              series.points.push(last);
+            }
+          }
         }
       }
       Err(error) => warning(
@@ -405,6 +456,12 @@ fn read_events(
         format!("metrics.jsonl line {line_number}: {error}; skipped"),
       ),
     }
+  }
+  if sampled {
+    warning(
+      result,
+      "Hosted chart curves are sampled to bound memory; last/min/max summaries use every recorded point.",
+    );
   }
   Ok(())
 }

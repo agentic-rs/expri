@@ -1,6 +1,86 @@
 use serde_json::{Value, json};
 
-pub(super) fn projection(value: &Value, fields: &[&str], truncated: &mut bool) -> Value {
+/// Keep the metadata shape identical for filesystem and hosted dashboards.
+pub(crate) fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
+  let state = projection(
+    &record["state"],
+    &[
+      "schema_version",
+      "run_id",
+      "task",
+      "command",
+      "status",
+      "started_at",
+      "finished_at",
+      "exit_code",
+      "task_exit_code",
+      "detached",
+      "logging_error",
+    ],
+    truncated,
+  );
+  let mut snapshot = projection(
+    &record["snapshot"],
+    &["schema_version", "run_id", "created_at"],
+    truncated,
+  );
+  if snapshot.is_object() {
+    snapshot["source"] = projection(
+      &record["snapshot"]["source"],
+      &[
+        "kind",
+        "git_head",
+        "checkout_manifest_sha256",
+        "sync_state_sha256",
+      ],
+      truncated,
+    );
+    snapshot["file_count"] = json!(record["snapshot"]["files"].as_array().map(Vec::len));
+  }
+  let mut environment = projection(
+    &record["environment"],
+    &[
+      "schema_version",
+      "base_python",
+      "python",
+      "environment_path",
+      "reuse_packages",
+      "reuse_extras",
+      "fingerprint",
+      "lock_sha256",
+      "pyproject_sha256",
+      "install_project",
+      "cache",
+    ],
+    truncated,
+  );
+  if environment.is_object() {
+    for field in ["base_manifest", "combined_manifest"] {
+      environment[field] = projection(
+        &record["environment"][field],
+        &[
+          "python",
+          "python_prefix",
+          "base_prefix",
+          "marker_env",
+          "torch",
+          "gpu_driver",
+        ],
+        truncated,
+      );
+      if environment[field].is_object() {
+        environment[field]["package_count"] = json!(
+          record["environment"][field]["packages"]
+            .as_object()
+            .map(serde_json::Map::len)
+        );
+      }
+    }
+  }
+  json!({"state": state, "snapshot": snapshot, "environment": environment})
+}
+
+pub(crate) fn projection(value: &Value, fields: &[&str], truncated: &mut bool) -> Value {
   if !value.is_object() {
     return Value::Null;
   }
@@ -15,7 +95,7 @@ pub(super) fn projection(value: &Value, fields: &[&str], truncated: &mut bool) -
   preview(&Value::Object(fields), truncated)
 }
 
-pub(super) fn bounded_warnings(warnings: &[Value]) -> Vec<Value> {
+pub(crate) fn bounded_warnings(warnings: &[Value]) -> Vec<Value> {
   let mut output: Vec<_> = warnings
     .iter()
     .take(100)
@@ -30,7 +110,7 @@ pub(super) fn bounded_warnings(warnings: &[Value]) -> Vec<Value> {
 }
 
 /// Small previews keep browser responses bounded even for unusually large params.
-pub(super) fn preview(value: &Value, truncated: &mut bool) -> Value {
+pub(crate) fn preview(value: &Value, truncated: &mut bool) -> Value {
   preview_inner(value, 0, &mut (16 * 1024), truncated).unwrap_or(Value::Null)
 }
 
