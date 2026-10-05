@@ -110,7 +110,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: service-workflow-logs
-          path: ${{ runner.temp }}/expri-service-containers/*.log
+          path: |
+            ${{ runner.temp }}/expri-service-containers/*.log
+            ${{ runner.temp }}/expri-service-containers/*.png
           if-no-files-found: ignore
           retention-days: 7
 

@@ -9,7 +9,9 @@ type RunList = { source: Source; runs: Run[]; warnings: Warning[]; total_count: 
 type Detail = { source: Source; run: Run; state: Json; snapshot: Json; environment: Json; params: Json; params_truncated: boolean; metadata_truncated: boolean; metrics: Record<string, Metric>; metric_count: number; metrics_truncated: boolean; metrics_error: string | null; warnings: Warning[]; cache: Json };
 type Log = { content: string; stream: string; missing: boolean; truncated: boolean };
 type Comparison = { source: Source; comparison: { reduction: string; metric_names: string[]; runs: { run_id: string; run: Run; values: Record<string, Point | null> }[]; warnings: Warning[] } };
-type Review = { kind: "run" | "compare"; run_ids: string[]; metric_names: string[] };
+type ReviewTab = "charts" | "overview" | "logs";
+type Review = { kind: "run" | "compare"; origin: "inspection" | "selection"; run_ids: string[]; metric_names: string[]; metric_selection_set: boolean; tab: ReviewTab; log_stream: "stdout" | "stderr" };
+type LogView = { run_id: string; stream: string; output: HTMLElement; note: HTMLElement; loaded: boolean; pending: boolean };
 
 export function apiUrl(path: string, fields: Record<string, string | number | string[] | null>): string {
   const query = new URLSearchParams();
@@ -136,8 +138,14 @@ export function startDashboard(): void {
   let review: Review | null = null;
   let metric_names: string[] = [];
   let search_timeout: ReturnType<typeof setTimeout> | undefined;
+  let selection_timeout: ReturnType<typeof setTimeout> | undefined;
+  let refresh_generation = 0;
+  let log_view: LogView | null = null;
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
+  const row_checks = new Map<string, HTMLInputElement>();
+  const row_buttons = new Map<string, HTMLButtonElement>();
+  const review_tabs: ReviewTab[] = ["charts", "overview", "logs"];
 
   function announce(message: string): void { required("live-status").textContent = message; }
   function showEmptyRuns(filtered: boolean, source?: Source): void {
@@ -152,7 +160,7 @@ export function startDashboard(): void {
     if (synced && !filtered) {
       const paragraph = element("p", "", "setup-guide");
       const link = element("a", "Set up result syncing");
-      link.href = "https://github.com/agentic-rs/expri/blob/codex/self-hosted-s3-sync/docs/self-hosted-service.md";
+      link.href = "https://github.com/agentic-rs/expri/blob/main/docs/self-hosted-service.md";
       link.target = "_blank"; link.rel = "noopener noreferrer";
       paragraph.append(link); empty.append(paragraph);
     }
@@ -163,13 +171,15 @@ export function startDashboard(): void {
     for (const id of selected) {
       const button = element("button", `${id} ×`, "selection-chip"); button.type = "button";
       button.setAttribute("aria-label", `Remove ${id} from comparison`);
-      button.addEventListener("click", () => { selected.delete(id); syncSelection(); renderRows(); }); chips.append(button);
+      button.addEventListener("click", () => { selected.delete(id); selectionChanged(); }); chips.append(button);
     }
     required<HTMLButtonElement>("compare-button").disabled = selected.size < 2;
     required("clear-selection").hidden = selected.size === 0;
   }
   function renderRows(): void {
-    rows.replaceChildren();
+    const focused_check = [...row_checks].find(([, node]) => node === document.activeElement)?.[0];
+    const focused_button = [...row_buttons].find(([, node]) => node === document.activeElement)?.[0];
+    rows.replaceChildren(); row_checks.clear(); row_buttons.clear();
     for (const run of runs) {
       const row = element("tr");
       row.classList.toggle("selected", selected.has(run.run_id));
@@ -178,27 +188,36 @@ export function startDashboard(): void {
       const checkbox = element("input"); checkbox.type = "checkbox"; checkbox.checked = selected.has(run.run_id);
       checkbox.disabled = selected.size >= 8 && !checkbox.checked;
       checkbox.setAttribute("aria-label", `Select ${run.run_id} for comparison`);
-      checkbox.addEventListener("change", () => { checkbox.checked ? selected.add(run.run_id) : selected.delete(run.run_id); syncSelection(); renderRows(); });
+      checkbox.addEventListener("change", () => {
+        checkbox.checked ? selected.add(run.run_id) : selected.delete(run.run_id);
+        selectionChanged();
+      }); row_checks.set(run.run_id, checkbox);
       check_cell.append(checkbox);
-      const run_cell = element("td"); const button = element("button", run.run_id, "run-link"); button.type = "button";
-      button.addEventListener("click", () => { void openRun(run.run_id); }); run_cell.append(button);
+      const run_cell = element("td", "", "run-cell"); const button = element("button", run.run_id, "run-link"); button.type = "button";
+      row_buttons.set(run.run_id, button);
+      button.addEventListener("click", () => { cancelRefresh(); clearTimeout(selection_timeout); void openRun(run.run_id); });
+      const metadata = [dateText(run.started_at), formatDuration(run)].filter(value => value !== "—");
+      if (run.exit_code !== null && run.exit_code !== 0) metadata.push(`exit ${run.exit_code}`);
+      run_cell.append(button, element("div", run.task ?? "No task recorded", "run-task"), element("div", metadata.join(" · "), "run-meta"));
       const status_cell = element("td");
       const badge = element("span", run.status, "status");
       if (["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(run.status)) badge.classList.add(run.status);
       status_cell.append(badge);
-      row.append(check_cell, run_cell, element("td", run.task ?? "—"), status_cell, element("td", dateText(run.started_at)), element("td", formatDuration(run)), element("td", run.exit_code === null ? "—" : String(run.exit_code), "number"));
+      row.append(check_cell, run_cell, status_cell);
       rows.append(row);
     }
+    if (focused_check) row_checks.get(focused_check)?.focus();
+    else if (focused_button) row_buttons.get(focused_button)?.focus();
   }
-  async function loadRuns(): Promise<void> {
-    if (!source_id) return;
+  async function loadRuns(): Promise<boolean> {
+    if (!source_id) return false;
     global_error.hidden = true; required("runs-region").setAttribute("aria-busy", "true");
     for (const control of rows.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button")) control.disabled = true;
     previous_page.disabled = true; next_page.disabled = true;
     required("run-count").textContent = "Loading run history…";
     try {
       const result = await list_lane.run<RunList>(apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }));
-      if (!result) return;
+      if (!result) return false;
       runs = result.runs; offset = result.offset; next_offset = result.next_offset;
       renderRows(); warnings(required("list-warnings"), result.warnings);
       required("run-count").textContent = result.total_count ? `${offset + 1}–${offset + runs.length} of ${result.total_count.toLocaleString()} runs` : "No matching runs";
@@ -213,22 +232,64 @@ export function startDashboard(): void {
         const option = element("option"); option.value = task; options.append(option);
       }
       required("runs-region").setAttribute("aria-busy", "false"); announce(`${result.total_count} matching runs`);
-    } catch (error) { showError(global_error, error); renderRows(); required("runs-region").setAttribute("aria-busy", "false"); required("run-count").textContent = "Could not read run history"; }
+      return true;
+    } catch (error) { showError(global_error, error); renderRows(); required("runs-region").setAttribute("aria-busy", "false"); required("run-count").textContent = "Could not read run history"; return false; }
   }
-  function closeReview(): void {
+  function cancelRefresh(): void { refresh_generation++; catalog_lane.cancel(); refresh_button.disabled = false; }
+  function hideReview(): void {
+    clearTimeout(selection_timeout);
     review_lane.cancel(); log_lane.cancel(); compare_lane.cancel(); review = null;
+    log_view = null;
     required("review-section").hidden = true; required("review-empty").hidden = false;
     required<HTMLIFrameElement>("chart-frame").removeAttribute("src"); renderRows();
   }
-  function beginReview(kind: "run" | "compare", ids: string[]): void {
+  function closeReview(): void { cancelRefresh(); showSelection(false); }
+  function selectionChanged(): void {
+    cancelRefresh(); syncSelection(); showSelection(true);
+  }
+  function showSelection(debounce: boolean): void {
+    clearTimeout(selection_timeout);
+    const ids = [...selected];
+    if (!ids.length) { hideReview(); announce("Selection cleared"); return; }
+    beginReview(ids.length === 1 ? "run" : "compare", ids, "selection");
+    const pending_review = review;
+    metric_names = [...new Set(ids.flatMap(id => Object.keys(detail_cache.get(id)?.metrics ?? {})))].sort();
+    const open = () => {
+      if (review !== pending_review) return;
+      if (ids.length === 1 && ids[0]) void loadRun(ids[0]); else void loadComparison();
+    };
+    if (debounce) selection_timeout = setTimeout(open, 180);
+    else open();
+  }
+  function beginReview(kind: "run" | "compare", ids: string[], origin: Review["origin"] = "inspection"): void {
+    clearTimeout(selection_timeout);
     review_lane.cancel(); log_lane.cancel(); compare_lane.cancel();
-    review = { kind, run_ids: ids, metric_names: [] }; metric_names = [];
+    review = { kind, origin, run_ids: ids, metric_names: [], metric_selection_set: false, tab: "charts", log_stream: "stdout" }; metric_names = []; log_view = null;
     required("review-section").hidden = false; required("review-empty").hidden = true;
     required("review-title").textContent = kind === "run" ? ids[0] ?? "Run" : `${ids.length} runs`;
     required("review-eyebrow").textContent = kind === "run" ? "Run details" : "Experiment comparison";
     required("review-loading").hidden = false; required("review-error").hidden = true;
     required("run-detail").hidden = true; required("compare-detail").hidden = true;
-    required("chart-card").hidden = true; warnings(required("review-warnings"), []); renderRows();
+    required("run-metric-controls").hidden = true; required("run-logs").replaceChildren();
+    required("chart-card").hidden = true; required<HTMLIFrameElement>("chart-frame").removeAttribute("src");
+    const close = required<HTMLButtonElement>("close-review"); close.hidden = origin === "selection";
+    close.textContent = selected.size ? "Back to selection" : "Close review";
+    warnings(required("review-warnings"), []); syncReviewTabs(); renderRows();
+  }
+  function syncReviewTabs(): void {
+    for (const tab of review_tabs) {
+      const button = required<HTMLButtonElement>(`review-tab-${tab}`);
+      const active = review?.tab === tab;
+      button.disabled = review?.kind === "compare" && tab !== "charts";
+      button.setAttribute("aria-selected", String(active)); button.tabIndex = active ? 0 : -1;
+      required(`review-panel-${tab}`).hidden = !active;
+    }
+  }
+  function selectReviewTab(tab: ReviewTab): void {
+    if (!review || (review.kind === "compare" && tab !== "charts")) return;
+    review.tab = tab; syncReviewTabs();
+    if (tab === "logs") ensureLog();
+    else { log_lane.cancel(); if (log_view) log_view.pending = false; }
   }
   function updateChart(): void {
     if (!review) return;
@@ -247,6 +308,7 @@ export function startDashboard(): void {
       input.disabled = chosen.length >= 6 && !input.checked;
       input.addEventListener("change", () => {
         if (!review) return;
+        cancelRefresh(); review.metric_selection_set = true;
         review.metric_names = input.checked ? [...review.metric_names, name] : review.metric_names.filter(item => item !== name);
         metricPicker(parent, known, on_change); on_change();
       }); label.append(input, document.createTextNode(name)); choices.append(label);
@@ -258,19 +320,27 @@ export function startDashboard(): void {
     form.addEventListener("submit", event => {
       event.preventDefault(); const name = input.value.trim();
       if (!review || !name || review.metric_names.length >= 6) return;
+      cancelRefresh(); review.metric_selection_set = true;
       if (!review.metric_names.includes(name)) review.metric_names.push(name);
       metric_names = [...new Set([...metric_names, name])]; metricPicker(parent, metric_names, on_change); on_change();
     }); form.append(label, button); parent.append(choices, form);
     parent.append(element("p", chosen.length ? "Select up to six metrics. Enter a name to include a metric outside this preview." : "No selection uses the first four recorded metric names.", "muted metric-hint"));
   }
-  async function loadLog(id: string, stream: string, output: HTMLElement, note: HTMLElement): Promise<void> {
+  async function loadLog(view: LogView): Promise<void> {
+    const { run_id: id, stream, output, note } = view;
     output.textContent = "Loading log tail…"; note.textContent = "";
+    view.pending = true;
     try {
       const log = await log_lane.run<Log>(apiUrl("/api/log", { source: source_id, run_id: id, stream, tail: 100 }));
-      if (!log) return;
+      if (!log || log_view !== view) return;
       output.textContent = log.missing ? "This log has not been recorded or pulled." : log.content || "The log is empty.";
       note.textContent = log.truncated ? "Showing the last 100 lines, capped at 64 KiB. Use expri runs logs for more output." : "Last 100 lines. Refresh to read updated output.";
-    } catch (error) { output.textContent = errorText(error); note.textContent = "Could not read this log."; }
+      view.loaded = true;
+    } catch (error) { if (log_view === view) { output.textContent = errorText(error); note.textContent = "Could not read this log."; } }
+    finally { if (log_view === view) view.pending = false; }
+  }
+  function ensureLog(): void {
+    if (review?.kind === "run" && review.tab === "logs" && log_view && !log_view.loaded && !log_view.pending) void loadLog(log_view);
   }
   function renderDetail(detail: Detail): void {
     const parent = required("run-detail"); parent.replaceChildren(); parent.hidden = false;
@@ -299,29 +369,49 @@ export function startDashboard(): void {
       for (const name of names) { const metric = detail.metrics[name]; if (!metric) continue; const row = element("tr"); row.append(element("td", name), element("td", String(metric.count), "number"), element("td", formatNumber(metric.last.value), "number"), element("td", formatNumber(metric.min.value), "number"), element("td", formatNumber(metric.max.value), "number")); body.append(row); }
       table.append(body); scroll.append(table); metrics.append(scroll);
     } else metrics.append(element("p", "No metric summaries are available. Record metrics in outputs/metrics.jsonl or pull remote metrics.", "muted"));
-    if (detail.metrics_truncated) metrics.append(element("p", `Showing ${names.length} of ${detail.metric_count} summaries. Enter an exact metric name below to chart another series.`, "muted"));
-    const picker = element("fieldset", "", "metric-picker"); const legend = element("legend", "Chart metrics"); const options = element("div"); picker.append(legend, options); metrics.append(picker);
-    metric_names = names; if (review) review.metric_names = names.slice(0, 4);
-    metricPicker(options, names, updateChart); parent.append(metrics);
+    if (detail.metrics_truncated) metrics.append(element("p", `Showing ${names.length} of ${detail.metric_count} summaries. Use Chart metrics to select another series by its exact name.`, "muted"));
+    parent.append(metrics); metric_names = names;
+    if (review && !review.metric_selection_set) { review.metric_names = names.slice(0, 4); review.metric_selection_set = true; }
+    metricPicker(required("run-metric-options"), names, updateChart); required("run-metric-controls").hidden = false;
     const logs = card("Log tail"); const tabs = element("div", "", "log-tabs"); tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "Log stream");
     const output = element("pre", "", "log-content"); output.id = "log-output"; output.setAttribute("role", "tabpanel");
     const note = element("p", "", "log-note muted");
     const buttons: HTMLButtonElement[] = [];
-    for (const stream of ["stdout", "stderr"]) {
-      const button = element("button", stream, "log-tab"); button.type = "button"; button.id = `log-tab-${stream}`; button.setAttribute("role", "tab"); button.setAttribute("aria-controls", output.id); button.setAttribute("aria-selected", String(stream === "stdout")); button.tabIndex = stream === "stdout" ? 0 : -1;
-      button.addEventListener("click", () => { for (const item of buttons) { item.setAttribute("aria-selected", String(item === button)); item.tabIndex = item === button ? 0 : -1; } output.setAttribute("aria-labelledby", button.id); void loadLog(detail.run.run_id, stream, output, note); });
-      button.addEventListener("keydown", event => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); const next = buttons.find(item => item !== button); next?.focus(); next?.click(); } });
+    const selected_stream = review?.log_stream ?? "stdout";
+    for (const stream of ["stdout", "stderr"] as const) {
+      const button = element("button", stream, "log-tab"); button.type = "button"; button.id = `log-tab-${stream}`; button.setAttribute("role", "tab"); button.setAttribute("aria-controls", output.id); button.setAttribute("aria-selected", String(stream === selected_stream)); button.tabIndex = stream === selected_stream ? 0 : -1;
+      button.addEventListener("click", () => {
+        log_lane.cancel();
+        if (review) review.log_stream = stream;
+        for (const item of buttons) { item.setAttribute("aria-selected", String(item === button)); item.tabIndex = item === button ? 0 : -1; }
+        output.setAttribute("aria-labelledby", button.id);
+        log_view = { run_id: detail.run.run_id, stream, output, note, loaded: false, pending: false }; ensureLog();
+      });
+      button.addEventListener("keydown", event => {
+        if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+          event.preventDefault();
+          const next = event.key === "Home" ? buttons[0] : event.key === "End" ? buttons.at(-1) : buttons.find(item => item !== button);
+          next?.focus(); next?.click();
+        }
+      });
       buttons.push(button); tabs.append(button);
     }
-    output.setAttribute("aria-labelledby", "log-tab-stdout"); logs.append(tabs, output, note); parent.append(logs);
-    void loadLog(detail.run.run_id, "stdout", output, note); updateChart();
+    output.setAttribute("aria-labelledby", `log-tab-${selected_stream}`); logs.append(tabs, output, note); required("run-logs").replaceChildren(logs);
+    log_view = { run_id: detail.run.run_id, stream: selected_stream, output, note, loaded: false, pending: false };
+    ensureLog(); updateChart();
   }
-  async function openRun(id: string): Promise<void> {
-    beginReview("run", [id]);
+  async function openRun(id: string, origin: Review["origin"] = "inspection", previous?: Review): Promise<void> {
+    beginReview("run", [id], origin);
+    if (previous && review) { review.metric_names = [...previous.metric_names]; review.metric_selection_set = previous.metric_selection_set; review.tab = previous.tab; review.log_stream = previous.log_stream; syncReviewTabs(); }
+    await loadRun(id);
+  }
+  async function loadRun(id: string): Promise<void> {
     try {
       const detail = await review_lane.run<Detail>(apiUrl("/api/run", { source: source_id, run_id: id }));
       if (!detail) return;
-      detail_cache.set(id, detail); required("review-loading").hidden = true;
+      detail_cache.delete(id); detail_cache.set(id, detail);
+      while (detail_cache.size > 9) { const oldest = detail_cache.keys().next().value; if (oldest === undefined) break; detail_cache.delete(oldest); }
+      required("review-loading").hidden = true;
       warnings(required("review-warnings"), detail.warnings); renderDetail(detail); announce(`Opened ${id}`);
     } catch (error) { required("review-loading").hidden = true; showError(required("review-error"), error); }
   }
@@ -348,7 +438,7 @@ export function startDashboard(): void {
       const result = await compare_lane.run<Comparison>(apiUrl("/api/compare", { source: source_id, run_id: review.run_ids, metric: review.metric_names, reduction: required<HTMLSelectElement>("reduction-select").value }));
       if (!result || !review || review.kind !== "compare") return;
       metric_names = [...new Set([...metric_names, ...result.comparison.metric_names])].sort();
-      if (!review.metric_names.length) review.metric_names = result.comparison.metric_names.slice(0, 4);
+      if (!review.metric_selection_set) { review.metric_names = result.comparison.metric_names.slice(0, 4); review.metric_selection_set = true; }
       required("review-loading").hidden = true; required("compare-detail").hidden = false;
       renderComparison(result); required("comparison-values").setAttribute("aria-busy", "false");
       metricPicker(required("compare-metric-options"), metric_names, () => { void loadComparison(); }); updateChart();
@@ -356,7 +446,7 @@ export function startDashboard(): void {
   }
   function openComparison(): void {
     const ids = [...selected]; if (ids.length < 2 || ids.length > 8) return;
-    beginReview("compare", ids);
+    beginReview("compare", ids, "selection");
     metric_names = [...new Set(ids.flatMap(id => Object.keys(detail_cache.get(id)?.metrics ?? {})))].sort();
     void loadComparison();
   }
@@ -368,9 +458,11 @@ export function startDashboard(): void {
       : "Local results · Status comes from recorded run files. Refresh to read the latest changes.";
   }
   async function refresh(): Promise<void> {
+    const generation = ++refresh_generation;
     refresh_button.disabled = true; global_error.hidden = true;
     try {
       const catalog = await catalog_lane.run<Catalog>("/api/catalog"); if (!catalog) return;
+      if (generation !== refresh_generation) return;
       sources = catalog.sources;
       access_mode = catalog.access_mode ?? "local";
       page_size = access_mode === "hosted" ? 20 : 100;
@@ -381,7 +473,7 @@ export function startDashboard(): void {
         source_id = sources.some(source => source.source_id === catalog.initial_source) ? catalog.initial_source : sources[0]?.source_id ?? "";
       }
       source_select.dataset.initialized = "true";
-      if (source_id !== previous_source) { runs = []; selected.clear(); closeReview(); syncSelection(); }
+      if (source_id !== previous_source) { runs = []; selected.clear(); hideReview(); syncSelection(); }
       source_select.replaceChildren();
       for (const source of sources) { const option = element("option", source.kind === "service" ? `${source.label} · Synced` : source.label); option.value = source.source_id; source_select.append(option); }
       if (!sources.length) { const option = element("option", "No synced sources"); option.value = ""; source_select.append(option); }
@@ -401,27 +493,46 @@ export function startDashboard(): void {
       }
       const current_review = review;
       const current_source = source_id;
-      await loadRuns();
+      if (!await loadRuns() || generation !== refresh_generation) return;
       if (current_review === review && current_source === source_id) {
-        if (current_review?.kind === "run") { const id = current_review.run_ids[0]; if (id) await openRun(id); }
+        if (current_review?.kind === "run") { const id = current_review.run_ids[0]; if (id) await openRun(id, current_review.origin, current_review); }
         else if (current_review?.kind === "compare") await loadComparison();
       }
-      required("updated-at").textContent = `Read at ${new Date().toLocaleTimeString()}. Refresh for updates.`;
-    } catch (error) { showError(global_error, error); }
-    finally { refresh_button.disabled = false; }
+      if (generation === refresh_generation) required("updated-at").textContent = `Last checked at ${new Date().toLocaleTimeString()}. Refresh for updates.`;
+    } catch (error) { if (generation === refresh_generation) { showError(global_error, error); required("review-loading").hidden = true; } }
+    finally { if (generation === refresh_generation) refresh_button.disabled = false; }
   }
-  function filtersChanged(): void { offset = 0; void loadRuns(); }
-  for (const input of [search_input, task_input]) input.addEventListener("input", () => { clearTimeout(search_timeout); search_timeout = setTimeout(filtersChanged, 250); });
+  function resetFilters(): void {
+    cancelRefresh(); list_lane.cancel(); clearTimeout(search_timeout); offset = 0;
+    selected.clear(); syncSelection(); hideReview(); runs = []; renderRows();
+    required("list-empty").hidden = true; required("run-count").textContent = "Applying filters…";
+    required("runs-region").setAttribute("aria-busy", "true"); previous_page.disabled = true; next_page.disabled = true;
+  }
+  function filtersChanged(): void { resetFilters(); void loadRuns(); }
+  for (const input of [search_input, task_input]) input.addEventListener("input", () => { resetFilters(); search_timeout = setTimeout(() => { void loadRuns(); }, 250); });
   status_select.addEventListener("change", filtersChanged);
   required("clear-filters").addEventListener("click", () => { search_input.value = ""; task_input.value = ""; status_select.value = ""; clearTimeout(search_timeout); filtersChanged(); });
-  previous_page.addEventListener("click", () => { offset = Math.max(0, offset - page_size); void loadRuns(); });
-  next_page.addEventListener("click", () => { if (next_offset !== null) { offset = next_offset; void loadRuns(); } });
-  source_select.addEventListener("change", () => { catalog_lane.cancel(); clearTimeout(search_timeout); source_id = source_select.value; runs = []; offset = 0; selected.clear(); detail_cache.clear(); closeReview(); syncSelection(); sourceNote(); void loadRuns(); });
+  previous_page.addEventListener("click", () => { cancelRefresh(); offset = Math.max(0, offset - page_size); void loadRuns(); });
+  next_page.addEventListener("click", () => { if (next_offset !== null) { cancelRefresh(); offset = next_offset; void loadRuns(); } });
+  source_select.addEventListener("change", () => { cancelRefresh(); clearTimeout(search_timeout); source_id = source_select.value; runs = []; offset = 0; selected.clear(); detail_cache.clear(); hideReview(); syncSelection(); sourceNote(); void loadRuns(); });
   refresh_button.addEventListener("click", () => { clearTimeout(search_timeout); void refresh(); });
-  required("clear-selection").addEventListener("click", () => { selected.clear(); syncSelection(); renderRows(); });
-  required("compare-button").addEventListener("click", openComparison);
+  required("clear-selection").addEventListener("click", () => { selected.clear(); selectionChanged(); });
+  required("compare-button").addEventListener("click", () => { cancelRefresh(); clearTimeout(selection_timeout); openComparison(); });
   required("close-review").addEventListener("click", closeReview);
-  required("reduction-select").addEventListener("change", () => { void loadComparison(); });
+  required("reduction-select").addEventListener("change", () => { cancelRefresh(); void loadComparison(); });
+  for (const tab of review_tabs) {
+    const button = required<HTMLButtonElement>(`review-tab-${tab}`);
+    button.addEventListener("click", () => { selectReviewTab(tab); });
+    button.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) || !review) return;
+      event.preventDefault();
+      const available = review.kind === "compare" ? ["charts"] as ReviewTab[] : review_tabs;
+      const index = available.indexOf(tab);
+      const next = event.key === "Home" ? available[0] : event.key === "End" ? available.at(-1)
+        : available[(index + (event.key === "ArrowRight" ? 1 : available.length - 1)) % available.length];
+      if (next) { selectReviewTab(next); required<HTMLButtonElement>(`review-tab-${next}`).focus(); }
+    });
+  }
   void refresh();
 }
 

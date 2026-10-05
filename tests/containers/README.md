@@ -94,3 +94,10 @@ security flags and session revocation. The test browser accepts the fixture's
 certificate through its test-only WebDriver configuration. `browser-forms.log` records assertions;
 `browser-requests.log` records method, path, origin, status and response policy
 without passwords, cookies or request bodies.
+
+After the worker uploads two runs, Firefox checks the workspace against those
+results: selecting runs updates charts, tabs support the keyboard, logs load on
+demand, Refresh preserves the comparison, and filters clear it. The suite checks
+desktop columns and overflow at a verified 500 CSS pixel viewport, saving
+`workspace-desktop.png` and `workspace-narrow.png` with the CI diagnostics.
+The Firefox check covers a narrow layout rather than 320/360 pixel mobile widths.

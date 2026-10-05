@@ -1,9 +1,11 @@
 """Drive native hosted forms in isolated Firefox through W3C WebDriver."""
 import http.client
+import base64
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 ORIGIN = 'https://expri.example.net'
@@ -173,5 +175,80 @@ def forms():
       browser.close()
 
 
+def workspace(run_id, second_run_id):
+  browser = Firefox()
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def visible(selector):
+    return evaluate('const node = document.querySelector(arguments[0]); return !!node && node.getClientRects().length > 0;', selector)
+  def check_selection(expected):
+    return evaluate('''const frame = document.querySelector('#chart-frame');
+      if (!frame || !frame.getAttribute('src')) return [];
+      return new URL(frame.src).searchParams.getAll('run_id').sort();''') == sorted(expected)
+  def capture(name):
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  try:
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.navigate('/login')
+    browser.login()
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
+    start = len(trace_records())
+    browser.click(f'input[aria-label="Select {run_id} for comparison"]')
+    wait_for(lambda: check_selection([run_id]), 'selecting one run did not open its charts')
+    assert visible('#review-panel-charts') and not visible('#review-panel-overview'), 'inspection did not open Charts first'
+    assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'chart review eagerly fetched logs'
+    browser.call('POST', '/element/' + browser.element('#review-tab-charts') + '/value', {'text': '\ue014'})
+    wait_for(lambda: visible('#review-panel-overview'), 'review tabs do not support ArrowRight')
+    assert 'learning_rate' in evaluate("return document.querySelector('#run-detail').textContent;"), 'Overview omitted parameters'
+    assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'Overview eagerly fetched logs'
+    browser.click('#review-tab-logs')
+    wait_for(lambda: 'training complete' in evaluate("return document.querySelector('#run-logs').textContent;"), 'Logs did not load the uploaded stdout')
+    browser.click('#review-tab-charts')
+    browser.click(f'input[aria-label="Select {second_run_id} for comparison"]')
+    wait_for(lambda: check_selection([run_id, second_run_id]), 'selecting a second run did not compare automatically')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'comparison summary lost selected runs')
+    frame = browser.element('#chart-frame')
+    browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+    try:
+      wait_for(lambda: evaluate("return document.querySelectorAll('svg').length;") > 0, 'embedded curves did not load')
+      assert not evaluate("return !!document.querySelector('h1');"), 'embedded charts duplicated report heading'
+      assert evaluate("return !!document.querySelector('details.parameter-comparison:not([open])');"), 'parameter differences are missing or displace the charts'
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    assert evaluate('''const list = document.querySelector('.runs-card').getBoundingClientRect();
+      const review = document.querySelector('#review-section').getBoundingClientRect();
+      return list.right <= review.left + 1;'''), 'desktop runs and charts are not side by side'
+    capture('workspace-desktop')
+    browser.click('#refresh-button')
+    wait_for(lambda: not evaluate("return document.querySelector('#refresh-button').disabled;"), 'Refresh did not finish')
+    assert check_selection([run_id, second_run_id]), 'Refresh lost the selected comparison'
+    browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+    assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
+    assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow dashboard overflows horizontally'
+    assert evaluate('''return ['#source-select', '#refresh-button', '#search-input'].every(selector => {
+      const box = document.querySelector(selector).getBoundingClientRect();
+      return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
+    });'''), 'narrow controls are clipped'
+    evaluate("document.querySelector('#review-section').scrollIntoView();")
+    capture('workspace-narrow')
+    search = browser.element('#search-input')
+    browser.call('POST', '/element/' + search + '/value', {'text': run_id})
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'run search did not apply')
+    assert not visible('#review-section'), 'filtering left an unrelated comparison visible'
+    assert evaluate("return document.querySelectorAll('#run-rows input:checked').length;") == 0, 'filtering left an implicit selection'
+    browser.click('#clear-filters')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'Clear filters did not restore the runs')
+    browser.click(f'input[aria-label="Select {run_id} for comparison"]')
+    wait_for(lambda: check_selection([run_id]), 'selection did not recover after filtering')
+    browser.click('#clear-selection')
+    assert not visible('#review-section') and visible('#review-empty'), 'Clear selection did not reset the workspace'
+    print('Firefox workspace passed: direct comparison, chart-first tabs, lazy logs, refresh, filters, desktop/narrow layout.', flush=True)
+  finally:
+    browser.close()
+
+
 if __name__ == '__main__':
-  forms()
+  if len(sys.argv) == 4 and sys.argv[1] == '--workspace':
+    workspace(sys.argv[2], sys.argv[3])
+  else:
+    forms()

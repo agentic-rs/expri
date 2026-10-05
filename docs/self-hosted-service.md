@@ -213,5 +213,10 @@ An isolated Firefox image submits the native login and logout forms over an
 internal HTTPS fixture. It reproduces the rejected null origins under
 `no-referrer`, then checks successful forms under `same-origin`, secure cookie
 flags and session revocation. The test browser accepts the generated certificate
-through its test-only WebDriver configuration. Browser request logs contain method, path, origin, status and
-response policy, without credentials or cookies.
+through its test-only WebDriver configuration. The browser also reviews the
+uploaded runs: direct selection/comparison, keyboard tabs, deferred log loading,
+refresh and filters. It checks the desktop layout and a narrow layout at a
+verified 500 CSS pixel viewport, saving screenshots for diagnostics. This Firefox
+check does not cover 320/360 pixel mobile widths.
+Browser request logs contain method, path, origin, status and response policy,
+without credentials or cookies.

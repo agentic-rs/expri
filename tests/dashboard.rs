@@ -726,13 +726,14 @@ fn dashboard_previews_bound_large_records_and_exact_metric_filters_keep_full_sum
     assert_eq!(html.matches("<svg ").count(), plots);
     assert!(html.matches("<circle ").count() <= plots * 600);
     assert!(html.contains("at most 600 points per run"));
-    assert!(html.contains("Dashboard parameter preview"));
+    assert!(!html.contains("<h2>Selected runs</h2>"));
+    assert!(!html.contains("<h2>Effective parameters</h2>"));
     assert!(!html.contains("parameter_24"));
     if query.is_empty() {
       assert!(html.contains("Showing the first 4 of 60 metrics"));
     } else {
       assert!(html.contains("metric_59"));
-      assert!(html.contains("<td>17000</td><td>16999</td>"));
+      assert!(html.contains("17000"));
     }
   }
   assert_tree_unchanged(&fixture.repo, &before);

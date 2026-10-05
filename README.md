@@ -393,11 +393,15 @@ pull remote metrics and logs, then press **Refresh** in the dashboard:
 expri -T runpod runs pull run-abc123 --metrics --logs
 ```
 
-Search and filter the paged run list, open a run for its command, provenance,
-parameters, metric summaries, and stdout/stderr tails, or select two to eight
-runs from one source to compare. Compare the last, minimum, or maximum metric
-values and view the curves with parameter differences. Status reflects the
-saved records; `runs status` remains the live check.
+The run browser stays beside the review workspace on desktop and stacks above
+it on narrow screens. Opening a run starts with its curves. **Overview** holds
+its command, provenance, parameters and metric summaries; **Logs** loads
+stdout/stderr tails when opened. Selecting runs updates the charts directly:
+one run opens its curves, and two to eight runs from one source show a comparison.
+Compare last, minimum or maximum metric values, and expand parameter differences
+below the curves. Changing search/task/status filters clears the selection;
+paging and Refresh preserve it. Status reflects the saved records;
+`runs status` remains the live check.
 
 Browser responses stay bounded: details preview large parameters and metadata,
 show up to 50 metric summaries, and omit package/source-file inventories. Log
