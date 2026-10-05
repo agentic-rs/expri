@@ -65,3 +65,25 @@ ENTRYPOINT ["/usr/local/bin/host-entrypoint"]
 FROM common AS service
 USER tester
 ENTRYPOINT ["/usr/local/bin/expri", "service", "serve"]
+
+# Independent test-only browser: worker/host runtime images stay browser-free.
+FROM python:3.12-slim-bookworm AS browser
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends firefox-esr curl ca-certificates openssl \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --create-home --uid 1000 --user-group --shell /bin/bash tester
+# Mozilla v0.36.0 release artifacts, pinned by SHA256 for both CI architectures.
+RUN case "$(dpkg --print-architecture)" in \
+    amd64) platform=linux64; digest=0bde38707eb0a686a20c6bd50f4adcc7d60d4f73c60eb83ee9e0db8f65823e04 ;; \
+    arm64) platform=linux-aarch64; digest=b5fd13fc8f05ca99292700896d43fa986747a01b5fdc77f7bfc88a3707dc4241 ;; \
+    *) exit 1 ;; \
+  esac \
+  && curl --fail --show-error --silent --location --max-time 90 \
+    "https://github.com/mozilla/geckodriver/releases/download/v0.36.0/geckodriver-v0.36.0-${platform}.tar.gz" \
+    --output /tmp/geckodriver.tar.gz \
+  && printf '%s  /tmp/geckodriver.tar.gz\n' "$digest" | sha256sum --check \
+  && tar --extract --gzip --file /tmp/geckodriver.tar.gz --directory /usr/local/bin \
+  && rm /tmp/geckodriver.tar.gz
+COPY tests/containers/browser_proxy.py tests/containers/browser_forms.py /opt/expri-browser/
+ENV HOME=/home/tester PYTHONDONTWRITEBYTECODE=1
+ENTRYPOINT ["python3", "/opt/expri-browser/browser_proxy.py"]

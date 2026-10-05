@@ -78,9 +78,19 @@ the project/cache file contents, modes and modification times.
 The fake Torch probe models availability, a one-element tensor operation and
 device metadata. It performs no GPU computation and does not cover real
 PyTorch binaries, CUDA drivers, ABI compatibility or Conda installations. This
-suite does not exercise browser DOM interactions. The separate
+host/worker suite does not exercise browser DOM interactions. The separate
 [self-hosted service acceptance suite](../../docs/self-hosted-service.md#acceptance-tests)
 injects service outages and lost multipart acknowledgments, using these same
-host and worker images plus a service, a pinned MinIO fixture and a fault proxy.
+host and worker images plus a service, a pinned MinIO fixture, a fault proxy and
+an independent Firefox image. The browser image uses Debian Firefox ESR and
+SHA256-pinned Mozilla geckodriver 0.36.0 release artifacts for amd64 and arm64.
 It checks immutable private inputs, upload recovery, selective downloads and
 offline review without shared project directories or published ports.
+
+The service suite also submits real browser login and logout forms over a
+generated internal HTTPS certificate. It reproduces `Origin: null` failures
+under `no-referrer`, then verifies successful forms under `same-origin`, cookie
+security flags and session revocation. The test browser accepts the fixture's
+certificate through its test-only WebDriver configuration. `browser-forms.log` records assertions;
+`browser-requests.log` records method, path, origin, status and response policy
+without passwords, cookies or request bodies.
