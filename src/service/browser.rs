@@ -1,6 +1,7 @@
 use http::{Request as HttpRequest, Response as HttpResponse};
 use serde_json::json;
 
+use super::browser_assets::{Asset, DashboardAssets};
 use super::browser_auth::BrowserAuth;
 use super::dashboard_data::HostedDashboard;
 use super::storage::ObjectStorage;
@@ -27,9 +28,10 @@ pub(super) fn response(status: u16, content_type: &str, body: Vec<u8>) -> HttpRe
 pub(super) fn handle<S: ObjectStorage>(
   dashboard: &HostedDashboard<'_, S>,
   auth: &BrowserAuth,
+  assets: &DashboardAssets,
   request: &HttpRequest<Vec<u8>>,
 ) -> HttpResponse<Vec<u8>> {
-  match route(dashboard, auth, request) {
+  match route(dashboard, auth, assets, request) {
     Ok(reply) => reply,
     Err(error) => response(
       error.status,
@@ -37,6 +39,17 @@ pub(super) fn handle<S: ObjectStorage>(
       serde_json::to_vec(&json!({"error": error.message})).unwrap_or_default(),
     ),
   }
+}
+
+fn asset_response(status: u16, asset: Asset) -> HttpResponse<Vec<u8>> {
+  let mut reply = response(status, asset.content_type, asset.body);
+  if let Some(revision) = asset.revision {
+    reply.headers_mut().insert(
+      "X-Expri-Revision",
+      revision.parse().expect("validated git commit"),
+    );
+  }
+  reply
 }
 
 fn redirect(location: &'static str, cookie: Option<String>) -> HttpResponse<Vec<u8>> {
@@ -53,19 +66,18 @@ fn redirect(location: &'static str, cookie: Option<String>) -> HttpResponse<Vec<
   reply
 }
 
-fn login_page(incorrect: bool) -> HttpResponse<Vec<u8>> {
+fn login_page(assets: &DashboardAssets, incorrect: bool) -> ApiResult<HttpResponse<Vec<u8>>> {
   let message = if incorrect {
     "<p class=\"login-error\" role=\"alert\">The dashboard password is incorrect.</p>"
   } else {
     ""
   };
-  let html =
-    include_str!("../../dashboard_web/login.html").replace("<!-- LOGIN_ERROR -->", message);
-  response(
-    if incorrect { 401 } else { 200 },
-    "text/html; charset=utf-8",
-    html.into_bytes(),
-  )
+  let mut page = assets.page("login.html")?;
+  let html = String::from_utf8(page.body)
+    .expect("validated UTF-8 login page")
+    .replace("<!-- LOGIN_ERROR -->", message);
+  page.body = html.into_bytes();
+  Ok(asset_response(if incorrect { 401 } else { 200 }, page))
 }
 
 fn password(request: &HttpRequest<Vec<u8>>) -> ApiResult<Vec<u8>> {
@@ -97,6 +109,7 @@ fn password(request: &HttpRequest<Vec<u8>>) -> ApiResult<Vec<u8>> {
 fn route<S: ObjectStorage>(
   dashboard: &HostedDashboard<'_, S>,
   auth: &BrowserAuth,
+  assets: &DashboardAssets,
   request: &HttpRequest<Vec<u8>>,
 ) -> ApiResult<HttpResponse<Vec<u8>>> {
   auth.check_host(request)?;
@@ -113,7 +126,7 @@ fn route<S: ObjectStorage>(
       if request.uri().query().is_some() {
         return Err(ApiError::new(400, "login does not accept query parameters"));
       }
-      return Ok(login_page(false));
+      return login_page(assets, false);
     }
     ("POST", "/login") => {
       if request.uri().query().is_some() {
@@ -122,7 +135,7 @@ fn route<S: ObjectStorage>(
       auth.check_boundary(request, true)?;
       return match auth.login(request, &password(request)?) {
         Ok(cookie) => Ok(redirect("/", Some(cookie))),
-        Err(error) if error.status == 401 => Ok(login_page(true)),
+        Err(error) if error.status == 401 => login_page(assets, true),
         Err(error) => Err(error),
       };
     }
@@ -143,8 +156,25 @@ fn route<S: ObjectStorage>(
       Err(error) if error.status == 401 => return Ok(redirect("/login", None)),
       Err(error) => return Err(error),
     }
-  } else if !matches!(path, "/styles.css" | "/app.js") {
+  } else if !matches!(path, "/styles.css" | "/app.js")
+    && !(assets.is_external() && path.starts_with("/assets/"))
+  {
     auth.authorized(request)?;
+  }
+  if matches!(path, "/" | "/index.html" | "/styles.css" | "/app.js") || path.starts_with("/assets/")
+  {
+    if request.uri().query().is_some() {
+      return Err(ApiError::new(
+        400,
+        "dashboard pages and assets do not accept query parameters",
+      ));
+    }
+    if matches!(path, "/" | "/index.html") {
+      return Ok(asset_response(200, assets.page("index.html")?));
+    }
+    if let Some(asset) = assets.asset(path)? {
+      return Ok(asset_response(200, asset));
+    }
   }
   let uri = request
     .uri()
@@ -152,6 +182,12 @@ fn route<S: ObjectStorage>(
     .map_or("/", |uri| uri.as_str());
   let reply = crate::dashboard::server::route_content(dashboard, uri);
   let mut result = response(reply.status, reply.content_type, reply.body);
+  if let Some(revision) = assets.current_revision()? {
+    result.headers_mut().insert(
+      "X-Expri-Revision",
+      revision.parse().expect("validated git commit"),
+    );
+  }
   if reply.chart {
     result
       .headers_mut()
@@ -171,7 +207,12 @@ mod tests {
     auth: &BrowserAuth,
     request: &HttpRequest<Vec<u8>>,
   ) -> HttpResponse<Vec<u8>> {
-    super::handle(&HostedDashboard::new(store).unwrap(), auth, request)
+    super::handle(
+      &HostedDashboard::new(store).unwrap(),
+      auth,
+      &DashboardAssets::embedded(),
+      request,
+    )
   }
 
   fn request(method: &str, path: &str, body: &[u8]) -> HttpRequest<Vec<u8>> {
@@ -258,7 +299,7 @@ mod tests {
       "application/x-www-form-urlencoded".parse().unwrap(),
     );
     assert_eq!(password(&req).unwrap_err().status, 400);
-    let page = login_page(true);
+    let page = login_page(&DashboardAssets::embedded(), true).unwrap();
     assert!(
       !String::from_utf8(page.body().clone())
         .unwrap()
@@ -398,5 +439,152 @@ mod tests {
         );
       }
     }
+  }
+}
+
+#[cfg(all(test, unix))]
+mod external_tests {
+  use super::*;
+  use crate::service::store::Store;
+  use crate::service::store::tests::MockStorage;
+  use std::fs;
+  use std::os::unix::fs::symlink;
+  use std::path::Path;
+
+  const FIRST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const SECOND: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+  fn bundle(root: &Path, commit: &str) {
+    let directory = root.join("releases").join(commit);
+    fs::create_dir_all(&directory).unwrap();
+    for (name, content) in [
+      (
+        "index.html",
+        "<main><script src=\"/app.js\"></script><link href=\"/styles.css\"><footer></footer></main>",
+      ),
+      (
+        "login.html",
+        "<main><link href=\"/styles.css\"><!-- LOGIN_ERROR --></main>",
+      ),
+      ("app.js", commit),
+      ("styles.css", commit),
+    ] {
+      fs::write(directory.join(name), content).unwrap();
+    }
+    fs::write(
+      directory.join("deployment.json"),
+      serde_json::to_vec(&json!({"commit": commit, "branch": "codex/preview"})).unwrap(),
+    )
+    .unwrap();
+  }
+
+  fn request(method: &str, path: &str, cookie: Option<&str>) -> HttpRequest<Vec<u8>> {
+    let mut builder = HttpRequest::builder()
+      .method(method)
+      .uri(path)
+      .header("Host", "ab.expri.example.com");
+    if let Some(cookie) = cookie {
+      builder = builder.header("Cookie", cookie);
+    }
+    builder.body(Vec::new()).unwrap()
+  }
+
+  #[test]
+  fn external_index_login_and_versioned_assets_preserve_auth_and_revision() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("assets");
+    bundle(&root, FIRST);
+    bundle(&root, SECOND);
+    symlink(format!("releases/{FIRST}"), root.join("current")).unwrap();
+    let assets = DashboardAssets::external(root.clone()).unwrap();
+    let store = Store::open(&temporary.path().join("store"), MockStorage::default()).unwrap();
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let auth = BrowserAuth::new(
+      "https://ab.expri.example.com",
+      b"a-preview-dashboard-password",
+    )
+    .unwrap();
+    let handle =
+      |request: &HttpRequest<Vec<u8>>| super::handle(&dashboard, &auth, &assets, request);
+    assert_eq!(handle(&request("GET", "/", None)).status(), 303);
+    assert_eq!(handle(&request("GET", "/api/catalog", None)).status(), 401);
+    let login = handle(&request("GET", "/login", None));
+    assert_eq!(login.status(), 200);
+    assert_eq!(login.headers()["X-Expri-Revision"], FIRST);
+    assert!(
+      String::from_utf8(login.body().clone())
+        .unwrap()
+        .contains(&format!("/assets/{FIRST}/styles.css"))
+    );
+    assert!(
+      login.headers()["Content-Security-Policy"]
+        .to_str()
+        .unwrap()
+        .contains("form-action 'self'")
+    );
+    let mut incorrect = request("POST", "/login", None);
+    incorrect
+      .headers_mut()
+      .insert("Origin", "https://ab.expri.example.com".parse().unwrap());
+    incorrect.headers_mut().insert(
+      "Content-Type",
+      "application/x-www-form-urlencoded".parse().unwrap(),
+    );
+    *incorrect.body_mut() = b"password=incorrect".to_vec();
+    let reply = handle(&incorrect);
+    assert_eq!(reply.status(), 401);
+    assert_eq!(reply.headers()["X-Expri-Revision"], FIRST);
+    assert!(
+      String::from_utf8(reply.body().clone())
+        .unwrap()
+        .contains("password is incorrect")
+    );
+    let cookie = auth
+      .login(&incorrect, b"a-preview-dashboard-password")
+      .unwrap();
+    let cookie = cookie.split(';').next().unwrap();
+    let index = handle(&request("GET", "/index.html", Some(cookie)));
+    assert_eq!(index.status(), 200);
+    assert_eq!(index.headers()["X-Expri-Revision"], FIRST);
+    assert!(
+      String::from_utf8(index.body().clone())
+        .unwrap()
+        .contains(&format!("/assets/{FIRST}/app.js"))
+    );
+    assert_eq!(
+      handle(&request("GET", "/api/catalog", Some(cookie))).headers()["X-Expri-Revision"],
+      FIRST
+    );
+    fs::remove_file(root.join("current")).unwrap();
+    symlink(format!("releases/{SECOND}"), root.join("current")).unwrap();
+    assert_eq!(
+      handle(&request("GET", "/login", None)).headers()["X-Expri-Revision"],
+      SECOND
+    );
+    let retained = handle(&request("GET", &format!("/assets/{FIRST}/app.js"), None));
+    assert_eq!(retained.status(), 200);
+    assert_eq!(retained.headers()["X-Expri-Revision"], FIRST);
+    assert_eq!(retained.body(), FIRST.as_bytes());
+    for path in [
+      "/assets/../app.js",
+      "/assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/deployment.json",
+      "/assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/app.js?unexpected=1",
+    ] {
+      assert!(
+        handle(&request("GET", path, None))
+          .status()
+          .is_client_error(),
+        "{path}"
+      );
+    }
+    let mut hostile = request("GET", &format!("/assets/{FIRST}/app.js"), None);
+    hostile
+      .headers_mut()
+      .insert("Host", "hostile.example.com".parse().unwrap());
+    assert_eq!(handle(&hostile).status(), 403);
+    assert_eq!(
+      handle(&request("POST", "/app.js", Some(cookie))).status(),
+      405
+    );
   }
 }

@@ -46,8 +46,13 @@ class Proxy(BaseHTTPRequestHandler):
         policy = POLICY_OVERRIDE.read_text().strip()
       record = {
         'method': self.command, 'path': urlsplit(self.path).path,
+        'host': self.headers.get('Host'),
         'origin': self.headers.get('Origin'), 'status': response.status,
         'referrer_policy': policy,
+        'session_cookie_count': sum(
+          pair.strip().split('=', 1)[0] == '__Host-expri_session'
+          for header in self.headers.get_all('Cookie', []) for pair in header.split(';')
+        ),
       }
       with TRACE_LOCK:
         with TRACE.open('a') as trace:
@@ -74,7 +79,7 @@ if __name__ == '__main__':
     key = Path(directory) / 'key.pem'
     subprocess.run([
       'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
-      '-subj', '/CN=expri.example.net', '-addext', 'subjectAltName=DNS:expri.example.net',
+      '-subj', '/CN=expri.example.net', '-addext', 'subjectAltName=DNS:expri.example.net,DNS:ab.expri.example.net',
       '-keyout', str(key), '-out', str(cert),
     ], check=True, timeout=20, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

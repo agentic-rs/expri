@@ -64,7 +64,10 @@ def logged(name, args, timeout=600):
 
 def create(name, image, args=(), env=(), alias=None, entrypoint=None):
   full = f'{network}-{name}'
-  flags = ['create', '--name', full, '--network', network, '--network-alias', alias or name]
+  flags = ['create', '--name', full, '--network', network]
+  aliases = alias if isinstance(alias, list) else [alias or name]
+  for item in aliases:
+    flags += ['--network-alias', item]
   for item in env:
     flags += ['--env', item]
   if entrypoint:
@@ -250,6 +253,9 @@ token_env = "EXPRI_WORKER_TOKEN"
 [dashboard]
 public_url = "https://expri.example.net"
 password_env = "EXPRI_DASHBOARD_PASSWORD"
+[[dashboard.previews]]
+public_url = "https://ab.expri.example.net"
+assets_dir = "/home/tester/preview"
 [storage]
 endpoint = "http://s3:9000"
 bucket = "expri-ci"
@@ -262,10 +268,19 @@ prefix = "acceptance"
   service = create('service', 'expri-ci-service', ['--config', '/tmp/server.toml', '--listen', '0.0.0.0:8787',
     '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
   copy(server_config, service, '/tmp/server.toml')
+  preview = state / 'preview'
+  revision = 'a' * 40
+  release = preview / 'releases' / revision
+  release.mkdir(parents=True)
+  for name in ['index.html', 'login.html', 'app.js', 'styles.css']:
+    shutil.copyfile(ROOT / 'dashboard_web' / name, release / name)
+  (release / 'deployment.json').write_text(json.dumps({'commit': revision, 'branch': 'fixture/ab'}))
+  (preview / 'current').symlink_to('releases/' + revision)
+  copy(preview, service, '/home/tester/preview')
   host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
   worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
   proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
-  firefox = create('browser', 'expri-ci-browser', alias='expri.example.net', env=['EXPRI_DASHBOARD_PASSWORD'])
+  firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
   copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
   copy(ROOT / 'tests/containers/service_proxy.py', proxy, '/tmp/proxy.py')
   copy(state / 'owner.toml', host, '/tmp/owner.toml')
@@ -342,6 +357,8 @@ prefix = "acceptance"
   dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
   logged('browser-workspace.log', ['docker', 'exec', '--user', 'tester', firefox,
     'python3', '/opt/expri-browser/browser_forms.py', '--workspace', run_id, second['run_id']], timeout=180)
+  logged('browser-previews.log', ['docker', 'exec', '--user', 'tester', firefox,
+    'python3', '/opt/expri-browser/browser_forms.py', '--previews', run_id, second['run_id']], timeout=180)
   docker('stop', '--time', '1', service, s3)
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
@@ -361,7 +378,7 @@ finally:
     try:
       if container.endswith('-browser'):
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
-        for name in ['workspace-desktop', 'workspace-narrow']:
+        for name in ['workspace-desktop', 'workspace-narrow', 'workspace-ab']:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)

@@ -1,4 +1,5 @@
 mod browser;
+mod browser_assets;
 mod browser_auth;
 mod client;
 mod dashboard_data;

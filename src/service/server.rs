@@ -8,22 +8,30 @@ use http::{HeaderName, HeaderValue, Request as HttpRequest, Response as HttpResp
 use serde_json::json;
 use subtle::ConstantTimeEq;
 
+use super::browser_assets::DashboardAssets;
 use super::browser_auth::BrowserAuth;
 use super::dashboard_data::HostedDashboard;
 use super::storage::{ObjectStorage, S3Storage};
 use super::store::{ApiError, ApiResult, Store};
-use super::types::{self, FileTarget, Request, ServerConfig, WorkerAuth};
+use super::types::{self, DashboardConfig, FileTarget, Request, ServerConfig, WorkerAuth};
 use crate::error::{ExpriError, Result};
 
 const HEADER_LIMIT: usize = 16 * 1024;
 const WORKERS: usize = 4;
 const QUEUE: usize = 16;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const PREVIEW_LIMIT: usize = 8;
+
+struct DashboardSite {
+  auth: BrowserAuth,
+  assets: DashboardAssets,
+  preview: bool,
+}
 
 struct Auth {
   owner: Vec<u8>,
   workers: Vec<(Vec<u8>, WorkerAuth)>,
-  browser: Option<BrowserAuth>,
+  sites: Vec<DashboardSite>,
 }
 
 impl Auth {
@@ -45,7 +53,7 @@ impl Auth {
       }
       workers.push((value, worker.clone()));
     }
-    let browser = config
+    let sites = config
       .dashboard
       .as_ref()
       .map(|dashboard| {
@@ -71,14 +79,58 @@ impl Auth {
             "dashboard password must be distinct from service bearer tokens".into(),
           ));
         }
-        BrowserAuth::new(&dashboard.public_url, password.as_bytes())
+        dashboard_sites(dashboard, password.as_bytes())
       })
-      .transpose()?;
+      .transpose()?
+      .unwrap_or_default();
     Ok(Self {
       owner,
       workers,
-      browser,
+      sites,
     })
+  }
+
+  fn site<T>(&self, request: &HttpRequest<T>) -> ApiResult<Option<&DashboardSite>> {
+    let host = request_host(request)?;
+    Ok(
+      self
+        .sites
+        .iter()
+        .find(|site| Some(site.auth.authority()) == host),
+    )
+  }
+
+  fn reject_preview_api<T>(&self, request: &HttpRequest<T>) -> ApiResult<()> {
+    if self.sites.is_empty() {
+      return Ok(());
+    }
+    let Some(host) = request_host(request)? else {
+      return Ok(());
+    };
+    let Ok(url) = reqwest::Url::parse(&format!("https://{host}")) else {
+      return Ok(());
+    };
+    if !url.username().is_empty()
+      || url.password().is_some()
+      || url.path() != "/"
+      || url.query().is_some()
+      || url.fragment().is_some()
+    {
+      return Ok(());
+    }
+    let origin = url.origin().ascii_serialization();
+    let authority = origin.strip_prefix("https://");
+    if self
+      .sites
+      .iter()
+      .any(|site| site.preview && Some(site.auth.authority()) == authority)
+    {
+      return Err(ApiError::new(
+        403,
+        "preview dashboards cannot access the service API",
+      ));
+    }
+    Ok(())
   }
 
   fn role(&self, request: &HttpRequest<Vec<u8>>) -> ApiResult<Option<&WorkerAuth>> {
@@ -103,6 +155,56 @@ impl Auth {
       .map(|(_, worker)| Some(worker))
       .ok_or_else(|| ApiError::new(401, "bearer authentication required"))
   }
+}
+
+fn dashboard_sites(config: &DashboardConfig, credential: &[u8]) -> Result<Vec<DashboardSite>> {
+  if config.previews.len() > PREVIEW_LIMIT {
+    return Err(ExpriError::Message(
+      "dashboard supports at most 8 preview sites".into(),
+    ));
+  }
+  let main = BrowserAuth::new(&config.public_url, credential)?;
+  let mut previews = Vec::with_capacity(config.previews.len());
+  for preview in &config.previews {
+    let auth = BrowserAuth::new(&preview.public_url, credential)?;
+    if main.authority() == auth.authority()
+      || previews
+        .iter()
+        .any(|previous: &BrowserAuth| previous.authority() == auth.authority())
+    {
+      return Err(ExpriError::Message(
+        "dashboard public_url authorities must be distinct".into(),
+      ));
+    }
+    previews.push(auth);
+  }
+  let mut sites = Vec::with_capacity(previews.len() + 1);
+  sites.push(DashboardSite {
+    auth: main,
+    assets: DashboardAssets::embedded(),
+    preview: false,
+  });
+  for (auth, config) in previews.into_iter().zip(&config.previews) {
+    sites.push(DashboardSite {
+      auth,
+      assets: DashboardAssets::external(config.assets_dir.clone())?,
+      preview: true,
+    });
+  }
+  Ok(sites)
+}
+
+fn request_host<T>(request: &HttpRequest<T>) -> ApiResult<Option<&str>> {
+  let mut hosts = request.headers().get_all("host").iter();
+  let host = hosts
+    .next()
+    .map(|host| host.to_str())
+    .transpose()
+    .map_err(|_| ApiError::new(403, "dashboard request header is invalid"))?;
+  if hosts.next().is_some() {
+    return Err(ApiError::new(403, "dashboard request header is ambiguous"));
+  }
+  Ok(host)
 }
 
 fn token(name: &str) -> Result<Vec<u8>> {
@@ -181,11 +283,11 @@ pub fn serve(
     storage.create_bucket()?;
   }
   let store = Store::open(&data_dir, storage)?;
-  let dashboard = auth
-    .browser
-    .as_ref()
-    .map(|_| HostedDashboard::new(&store))
-    .transpose()?;
+  let dashboard = if auth.sites.is_empty() {
+    None
+  } else {
+    Some(HostedDashboard::new(&store)?)
+  };
   let listener = TcpListener::bind(listen)?;
   let address = listener.local_addr()?;
   println!("Service: http://{address}");
@@ -241,22 +343,33 @@ fn respond<S: ObjectStorage>(
   let reply = match read_request(&mut stream) {
     Ok(request) => {
       head = request.method() == "HEAD";
-      if let Some(browser) = &auth.browser
-        && !matches!(request.uri().path(), "/health" | "/v1/request")
-      {
-        super::browser::handle(
-          dashboard.expect("configured browser dashboard"),
-          browser,
-          &request,
-        )
-      } else {
-        api_reply(route(store, auth, request))
-      }
+      dispatch(store, auth, dashboard, request)
     }
     Err(error) => api_reply(Err(error)),
   };
   let _ = write_response(&mut stream, reply, head);
   let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn dispatch<S: ObjectStorage>(
+  store: &Store<S>,
+  auth: &Auth,
+  dashboard: Option<&HostedDashboard<'_, S>>,
+  request: HttpRequest<Vec<u8>>,
+) -> HttpResponse<Vec<u8>> {
+  if !auth.sites.is_empty() && !matches!(request.uri().path(), "/health" | "/v1/request") {
+    return match auth.site(&request) {
+      Ok(Some(site)) => super::browser::handle(
+        dashboard.expect("configured browser dashboard"),
+        &site.auth,
+        &site.assets,
+        &request,
+      ),
+      Ok(None) => api_reply(Err(ApiError::new(403, "dashboard host is not allowed"))),
+      Err(error) => api_reply(Err(error)),
+    };
+  }
+  api_reply(route(store, auth, request))
 }
 
 fn api_reply(reply: ApiResult<Vec<u8>>) -> HttpResponse<Vec<u8>> {
@@ -285,6 +398,7 @@ fn route<S: ObjectStorage>(
   if request.uri().path() != "/v1/request" || request.uri().query().is_some() {
     return Err(ApiError::new(404, "service endpoint is missing"));
   }
+  auth.reject_preview_api(&request)?;
   if request.method() != "POST" {
     return Err(ApiError::new(405, "service requests require POST"));
   }
@@ -510,12 +624,52 @@ fn write_response(
 mod tests {
   use super::*;
   use crate::service::store::tests::{MockStorage, scope};
-  use crate::service::types::{FileTarget, Response, RunScope, STREAM_BATCH};
+  use crate::service::types::{
+    DashboardPreviewConfig, FileTarget, Response, RunScope, STREAM_BATCH,
+  };
+
+  const MAIN_AUTHORITY: &str = "expri.example.test";
+  const PREVIEW_AUTHORITY: &str = "preview.example.test";
+  const DASHBOARD_PASSWORD: &[u8] = b"a-dedicated-dashboard-password";
+
+  fn dashboard_config(previews: &[&str]) -> DashboardConfig {
+    DashboardConfig {
+      public_url: format!("https://{MAIN_AUTHORITY}"),
+      password_env: "unused".into(),
+      previews: previews
+        .iter()
+        .map(|public_url| DashboardPreviewConfig {
+          public_url: (*public_url).into(),
+          assets_dir: "/missing/preview/assets".into(),
+        })
+        .collect(),
+    }
+  }
+
+  fn dashboard_auth() -> Auth {
+    let mut auth = auth();
+    for (authority, preview) in [(MAIN_AUTHORITY, false), (PREVIEW_AUTHORITY, true)] {
+      auth.sites.push(DashboardSite {
+        auth: BrowserAuth::new(&format!("https://{authority}"), DASHBOARD_PASSWORD).unwrap(),
+        assets: DashboardAssets::embedded(),
+        preview,
+      });
+    }
+    auth
+  }
+
+  fn browser_request(host: Option<&str>, path: &str) -> HttpRequest<Vec<u8>> {
+    let mut request = HttpRequest::builder().uri(path);
+    if let Some(host) = host {
+      request = request.header("host", host);
+    }
+    request.body(Vec::new()).unwrap()
+  }
 
   fn auth() -> Auth {
     Auth {
       owner: b"owner-token-with-at-least-24-characters".to_vec(),
-      browser: None,
+      sites: Vec::new(),
       workers: vec![(
         b"worker-token-with-at-least-24-characters".to_vec(),
         WorkerAuth {
@@ -538,6 +692,271 @@ mod tests {
     request
       .body(serde_json::to_vec(operation).unwrap())
       .unwrap()
+  }
+
+  #[test]
+  fn configured_sites_reject_duplicate_authorities_invalid_origins_and_too_many_previews() {
+    let main = dashboard_sites(&dashboard_config(&[]), DASHBOARD_PASSWORD).unwrap();
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0].auth.authority(), MAIN_AUTHORITY);
+    assert!(!main[0].preview);
+    for previews in [
+      vec!["https://expri.example.test"],
+      vec!["https://EXPRI.example.test:443/"],
+      vec![
+        "https://preview.example.test",
+        "https://PREVIEW.example.test:443/",
+      ],
+    ] {
+      let error = dashboard_sites(&dashboard_config(&previews), DASHBOARD_PASSWORD)
+        .err()
+        .unwrap();
+      assert!(error.to_string().contains("authorities must be distinct"));
+    }
+    for invalid in [
+      "http://preview.example.test",
+      "https://preview.example.test/path",
+      "https://user@preview.example.test",
+      "https://*.expri.example.net",
+    ] {
+      assert!(dashboard_sites(&dashboard_config(&[invalid]), DASHBOARD_PASSWORD).is_err());
+    }
+    let config = dashboard_config(&["https://preview.example.test"; PREVIEW_LIMIT + 1]);
+    let error = dashboard_sites(&config, DASHBOARD_PASSWORD).err().unwrap();
+    assert!(error.to_string().contains("at most 8"));
+    assert!(
+      dashboard_sites(
+        &dashboard_config(&["https://preview.example.test"]),
+        DASHBOARD_PASSWORD,
+      )
+      .is_err()
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn configured_preview_serves_external_assets_while_main_stays_embedded() {
+    let directory = tempfile::tempdir().unwrap();
+    let assets = directory.path().join("assets");
+    let commit = "b".repeat(40);
+    let release = assets.join("releases").join(&commit);
+    std::fs::create_dir_all(&release).unwrap();
+    for (filename, content) in [
+      ("index.html", "<main>preview dashboard</main>"),
+      (
+        "login.html",
+        "<main>preview login<!-- LOGIN_ERROR --></main>",
+      ),
+      ("app.js", "console.log('preview bundle');"),
+      ("styles.css", "body { color: teal; }"),
+    ] {
+      std::fs::write(release.join(filename), content).unwrap();
+    }
+    std::fs::write(
+      release.join("deployment.json"),
+      serde_json::to_vec(&json!({"commit": commit, "branch": "codex/preview"})).unwrap(),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(format!("releases/{commit}"), assets.join("current")).unwrap();
+    let mut config = dashboard_config(&["https://preview.example.test"]);
+    config.previews[0].assets_dir = assets;
+    let mut auth = auth();
+    auth.sites = dashboard_sites(&config, DASHBOARD_PASSWORD).unwrap();
+    let store = Store::open(&directory.path().join("store"), MockStorage::default()).unwrap();
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let preview = dispatch(
+      &store,
+      &auth,
+      Some(&dashboard),
+      browser_request(Some(PREVIEW_AUTHORITY), "/login"),
+    );
+    assert_eq!(preview.status(), 200);
+    assert_eq!(preview.headers()["x-expri-revision"], commit);
+    assert!(
+      String::from_utf8(preview.into_body())
+        .unwrap()
+        .contains("preview login")
+    );
+    let main = dispatch(
+      &store,
+      &auth,
+      Some(&dashboard),
+      browser_request(Some(MAIN_AUTHORITY), "/login"),
+    );
+    assert_eq!(main.status(), 200);
+    assert!(!main.headers().contains_key("x-expri-revision"));
+    assert!(
+      !String::from_utf8(main.into_body())
+        .unwrap()
+        .contains("preview login")
+    );
+    let script = dispatch(
+      &store,
+      &auth,
+      Some(&dashboard),
+      browser_request(Some(PREVIEW_AUTHORITY), &format!("/assets/{commit}/app.js")),
+    );
+    assert_eq!(script.status(), 200);
+    assert_eq!(script.body(), b"console.log('preview bundle');");
+  }
+
+  #[test]
+  fn browser_dispatch_selects_exact_host_and_rejects_unknown_or_ambiguous_hosts() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let auth = dashboard_auth();
+    for authority in [MAIN_AUTHORITY, PREVIEW_AUTHORITY] {
+      let request = browser_request(Some(authority), "/login");
+      assert_eq!(
+        auth.site(&request).unwrap().unwrap().auth.authority(),
+        authority
+      );
+      assert_eq!(
+        dispatch(&store, &auth, Some(&dashboard), request).status(),
+        200
+      );
+      assert_eq!(
+        dispatch(
+          &store,
+          &auth,
+          Some(&dashboard),
+          browser_request(Some(authority), "/api/catalog"),
+        )
+        .status(),
+        401
+      );
+    }
+    for host in [
+      None,
+      Some("localhost:8787"),
+      Some("EXPRI.example.test"),
+      Some("evil.test"),
+    ] {
+      for path in ["/", "/login", "/app.js", "/api/catalog"] {
+        assert_eq!(
+          dispatch(&store, &auth, Some(&dashboard), browser_request(host, path)).status(),
+          403,
+          "{host:?} {path}",
+        );
+      }
+    }
+    let mut duplicate = browser_request(Some(MAIN_AUTHORITY), "/login");
+    duplicate
+      .headers_mut()
+      .append("host", PREVIEW_AUTHORITY.parse().unwrap());
+    assert_eq!(
+      dispatch(&store, &auth, Some(&dashboard), duplicate).status(),
+      403
+    );
+  }
+
+  #[test]
+  fn preview_hosts_deny_bearer_api_without_breaking_existing_service_addresses() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = dashboard_auth();
+    let operation = Request::ListFiles { scope: scope() };
+    for host in [
+      PREVIEW_AUTHORITY,
+      "PREVIEW.example.test",
+      "preview.example.test:443",
+    ] {
+      for bearer in [None, Some("owner-token-with-at-least-24-characters")] {
+        let mut request = request(bearer, &operation);
+        request.headers_mut().insert("host", host.parse().unwrap());
+        assert_eq!(route(&store, &auth, request).unwrap_err().status, 403);
+      }
+    }
+    for host in [
+      None,
+      Some(MAIN_AUTHORITY),
+      Some("localhost:8787"),
+      Some("service.internal"),
+    ] {
+      let mut request = request(Some("owner-token-with-at-least-24-characters"), &operation);
+      if let Some(host) = host {
+        request.headers_mut().insert("host", host.parse().unwrap());
+      }
+      assert!(route(&store, &auth, request).is_ok(), "{host:?}");
+    }
+    let health = browser_request(Some(PREVIEW_AUTHORITY), "/health");
+    assert!(route(&store, &auth, health).is_ok());
+  }
+
+  #[test]
+  fn dispatch_keeps_host_sessions_and_origins_isolated() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let auth = dashboard_auth();
+    let mut cookies = Vec::new();
+    for authority in [MAIN_AUTHORITY, PREVIEW_AUTHORITY] {
+      let login = HttpRequest::builder()
+        .method("POST")
+        .uri("/login")
+        .header("host", authority)
+        .header("origin", format!("https://{authority}"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(b"password=a-dedicated-dashboard-password".to_vec())
+        .unwrap();
+      let reply = dispatch(&store, &auth, Some(&dashboard), login);
+      assert_eq!(reply.status(), 303);
+      cookies.push(
+        reply.headers()["set-cookie"]
+          .to_str()
+          .unwrap()
+          .split(';')
+          .next()
+          .unwrap()
+          .to_owned(),
+      );
+    }
+    for (index, authority) in [MAIN_AUTHORITY, PREVIEW_AUTHORITY].into_iter().enumerate() {
+      for (cookie_index, cookie) in cookies.iter().enumerate() {
+        let mut request = browser_request(Some(authority), "/api/catalog");
+        request
+          .headers_mut()
+          .insert("cookie", cookie.parse().unwrap());
+        assert_eq!(
+          dispatch(&store, &auth, Some(&dashboard), request).status(),
+          if index == cookie_index { 200 } else { 401 },
+        );
+      }
+      let mut request = browser_request(Some(authority), "/api/catalog");
+      request
+        .headers_mut()
+        .insert("cookie", cookies[index].parse().unwrap());
+      request
+        .headers_mut()
+        .insert("origin", "https://evil.example.test".parse().unwrap());
+      assert_eq!(
+        dispatch(&store, &auth, Some(&dashboard), request).status(),
+        403
+      );
+      let hostile_login = HttpRequest::builder()
+        .method("POST")
+        .uri("/login")
+        .header("host", authority)
+        .header(
+          "origin",
+          format!(
+            "https://{}",
+            if index == 0 {
+              PREVIEW_AUTHORITY
+            } else {
+              MAIN_AUTHORITY
+            }
+          ),
+        )
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(b"password=a-dedicated-dashboard-password".to_vec())
+        .unwrap();
+      assert_eq!(
+        dispatch(&store, &auth, Some(&dashboard), hostile_login).status(),
+        403
+      );
+    }
   }
 
   #[test]
@@ -638,14 +1057,16 @@ mod tests {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), MockStorage::default()).unwrap();
     let mut auth = auth();
-    auth.browser = Some(
-      BrowserAuth::new(
+    auth.sites.push(DashboardSite {
+      auth: BrowserAuth::new(
         "https://expri.example.com",
         b"a-dedicated-dashboard-password",
       )
       .unwrap(),
-    );
-    let browser = auth.browser.as_ref().unwrap();
+      assets: DashboardAssets::embedded(),
+      preview: false,
+    });
+    let browser = &auth.sites[0].auth;
     let login = HttpRequest::builder()
       .method("POST")
       .uri("/login")
