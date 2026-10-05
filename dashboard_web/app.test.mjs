@@ -113,15 +113,24 @@ class TestElement {
     this.value = "";
     this.hidden = false;
     this.disabled = false;
-    this.classList = { toggle() {}, add() {} };
+    this.classes = new Set();
+    this.classList = {
+      toggle: (name, enabled) => enabled ? this.classes.add(name) : this.classes.delete(name),
+      add: (...names) => names.forEach(name => this.classes.add(name)),
+    };
   }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
   setAttribute(name, value) { this.attributes[name] = value; }
-  removeAttribute(name) { delete this.attributes[name]; }
-  querySelectorAll() { return []; }
+  removeAttribute(name) { delete this.attributes[name]; if (name === "src") this.src = ""; }
+  querySelectorAll(selector) {
+    const tags = selector.split(",").map(tag => tag.trim().toUpperCase());
+    return this.children.flatMap(child => [child, ...child.querySelectorAll(selector)]).filter(child => tags.includes(child.tagName));
+  }
   addEventListener(name, listener) { (this.listeners[name] ??= []).push(listener); }
-  emit(name) { for (const listener of this.listeners[name] ?? []) listener({ type: name }); }
+  emit(name, fields = {}) { for (const listener of this.listeners[name] ?? []) listener({ type: name, preventDefault() {}, ...fields }); }
+  focus() { globalThis.document.activeElement = this; }
+  click() { if (!this.disabled) { this.focus(); this.emit("click"); } }
 }
 
 function dashboard(t) {
@@ -138,14 +147,15 @@ function dashboard(t) {
     title: "expri",
     getElementById: id => nodes.get(id) ?? null,
     createElement: tag => new TestElement(tag),
+    createTextNode: value => { const node = new TestElement("text"); node.textContent = value; return node; },
   };
   return nodes;
 }
 
 async function settled(predicate) {
-  for (let attempt = 0; attempt < 30; attempt++) {
+  for (let attempt = 0; attempt < 100; attempt++) {
     if (predicate()) return;
-    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setTimeout(resolve, 10));
   }
   assert.fail("dashboard did not finish its pending request");
 }
@@ -153,6 +163,251 @@ async function settled(predicate) {
 function text(node) {
   return [node.textContent, ...node.children.map(child => text(child))].join(" ");
 }
+function findElement(node, id) {
+  if (node.id === id) return node;
+  for (const child of node.children) { const found = findElement(child, id); if (found) return found; }
+}
+
+function detailRecord(source, run) {
+  const metric = { count: 2, last: { step: 1, value: 0.5 }, min: { step: 1, value: 0.5 }, max: { step: 0, value: 1 } };
+  return { source, run, state: { command: "python train.py" }, snapshot: null, environment: null, cache: null, params: { learning_rate: 0.1 }, params_truncated: false, metadata_truncated: false, metrics: { accuracy: metric, loss: metric }, metric_count: 2, metrics_truncated: false, metrics_error: null, warnings: [] };
+}
+
+function reviewFixture(t, { count = 3, hosted = false, sources } = {}) {
+  const nodes = dashboard(t);
+  sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
+  const runs = Array.from({ length: count }, (_, index) => ({
+    run_id: `run-${index}`, task: "train", status: "completed",
+    started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
+  }));
+  const model = { nodes, sources, runs, requests: [], override: null, failed_list: false };
+  globalThis.fetch = async (url, options) => {
+    model.requests.push(url);
+    const parsed = new URL(url, "http://localhost");
+    const query = parsed.searchParams;
+    const overridden = model.override?.(parsed, options);
+    if (overridden !== undefined && overridden !== null) return overridden;
+    if (parsed.pathname === "/api/catalog") return response({ project_name: "Experiments", sources, initial_source: sources[0].source_id, warnings: [], access_mode: hosted ? "hosted" : "local" });
+    const source = sources.find(item => item.source_id === query.get("source"));
+    assert.ok(source, "all requests must remain in a known source");
+    if (parsed.pathname === "/api/runs") {
+      if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
+      const visible = runs.filter(run => !query.get("search") || run.run_id.includes(query.get("search")));
+      const offset = Number(query.get("offset"));
+      const limit = Number(query.get("limit"));
+      return response({ source, runs: visible.slice(offset, offset + limit), warnings: [], total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
+    }
+    const metric = { count: 2, last: { step: 1, value: 0.5 }, min: { step: 1, value: 0.5 }, max: { step: 0, value: 1 } };
+    if (parsed.pathname === "/api/run") {
+      const run = runs.find(item => item.run_id === query.get("run_id"));
+      assert.ok(run);
+      return response(detailRecord(source, run));
+    }
+    if (parsed.pathname === "/api/log") return response({ content: `${query.get("stream")} training complete`, stream: query.get("stream"), missing: false, truncated: false });
+    if (parsed.pathname === "/api/compare") {
+      const metric_names = query.getAll("metric").length ? query.getAll("metric") : ["accuracy", "loss"];
+      return response({ source, comparison: { reduction: query.get("reduction"), metric_names, runs: query.getAll("run_id").map(run_id => ({ run_id, run: runs.find(item => item.run_id === run_id), values: Object.fromEntries(metric_names.map(name => [name, metric.last])) })), warnings: [] } });
+    }
+    assert.fail(`Unexpected dashboard request: ${url}`);
+  };
+  startDashboard();
+  return model;
+}
+
+function selectRow(nodes, index, checked = true) {
+  const input = nodes.get("run-rows").children[index].children[0].children[0];
+  assert.equal(input.disabled, false, "the row must be selectable");
+  input.focus(); input.checked = checked; input.emit("change");
+}
+function chartQuery(nodes) {
+  return new URL(nodes.get("chart-frame").src || "/", "http://localhost").searchParams;
+}
+function comparisonRows(nodes) {
+  return nodes.get("comparison-values").children[0]?.children[1]?.children ?? [];
+}
+
+test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
+  const { nodes, requests } = reviewFixture(t);
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 3);
+  assert.match(text(nodes.get("run-rows").children[0].children[1]), /train.*3s/);
+  nodes.get("run-rows").children[0].children[1].children[0].click();
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  assert.equal(nodes.get("review-tab-charts").attributes["aria-selected"], "true");
+  assert.equal(nodes.get("review-panel-charts").hidden, false);
+  assert.equal(nodes.get("review-panel-overview").hidden, true);
+  assert.equal(nodes.get("review-panel-logs").hidden, true);
+  assert.equal(requests.some(url => url.startsWith("/api/log")), false);
+  nodes.get("review-tab-charts").emit("keydown", { key: "ArrowRight" });
+  assert.equal(nodes.get("review-panel-overview").hidden, false);
+  assert.equal(globalThis.document.activeElement, nodes.get("review-tab-overview"));
+  assert.match(text(nodes.get("run-detail")), /learning_rate.*0\.1/);
+  assert.equal(requests.some(url => url.startsWith("/api/log")), false);
+  nodes.get("review-tab-overview").emit("keydown", { key: "End" });
+  await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
+  assert.equal(nodes.get("review-panel-logs").hidden, false);
+  assert.equal(nodes.get("review-tab-logs").tabIndex, 0);
+  assert.equal(nodes.get("review-tab-charts").tabIndex, -1);
+  nodes.get("review-tab-logs").emit("keydown", { key: "Home" });
+  nodes.get("review-tab-charts").emit("keydown", { key: "ArrowLeft" });
+  assert.equal(nodes.get("review-panel-logs").hidden, false);
+  assert.equal(requests.filter(url => url.startsWith("/api/log")).length, 1, "returning to a loaded log must reuse that bounded tail");
+});
+
+test("selection updates charts, caps eight runs, and inspection returns to the selection", async t => {
+  const { nodes, requests } = reviewFixture(t, { count: 9 });
+  await settled(() => nodes.get("run-rows").children.length === 9);
+  selectRow(nodes, 0);
+  assert.equal(nodes.get("review-section").hidden, false);
+  await settled(() => chartQuery(nodes).getAll("run_id").length === 1);
+  assert.equal(globalThis.document.activeElement, nodes.get("run-rows").children[0].children[0].children[0], "keyboard checkbox focus must survive the debounced review request");
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0"]);
+  assert.equal(nodes.get("close-review").hidden, true);
+  selectRow(nodes, 1);
+  await settled(() => comparisonRows(nodes).length === 2);
+  assert.equal(globalThis.document.activeElement, nodes.get("run-rows").children[1].children[0].children[0]);
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-1"]);
+  assert.equal(nodes.get("review-tab-overview").disabled, true);
+  assert.equal(nodes.get("review-tab-logs").disabled, true);
+  const before = requests.filter(url => url.startsWith("/api/compare")).length;
+  for (let index = 2; index < 8; index++) selectRow(nodes, index);
+  await settled(() => comparisonRows(nodes).length === 8);
+  assert.equal(requests.filter(url => url.startsWith("/api/compare")).length, before + 1, "rapid selection changes should make one final comparison request");
+  assert.equal(nodes.get("run-rows").children[8].children[0].children[0].disabled, true);
+  nodes.get("selected-runs").children[2].click();
+  await settled(() => comparisonRows(nodes).length === 7);
+  assert.equal(chartQuery(nodes).getAll("run_id").includes("run-2"), false);
+  nodes.get("run-rows").children[8].children[1].children[0].click();
+  await settled(() => chartQuery(nodes).get("run_id") === "run-8");
+  assert.equal(nodes.get("selected-runs").children.length, 7);
+  assert.equal(nodes.get("close-review").textContent, "Back to selection");
+  nodes.get("close-review").click();
+  await settled(() => chartQuery(nodes).getAll("run_id").length === 7);
+  nodes.get("clear-selection").click();
+  assert.equal(nodes.get("review-section").hidden, true);
+  assert.equal(nodes.get("review-empty").hidden, false);
+  assert.equal(nodes.get("selected-runs").children.length, 0);
+  assert.equal(chartQuery(nodes).getAll("run_id").length, 0);
+});
+
+test("pagination preserves explicit selected IDs while edited filters immediately clear the review", async t => {
+  const { nodes, requests } = reviewFixture(t, { count: 40, hosted: true });
+  await settled(() => nodes.get("run-rows").children.length === 20);
+  selectRow(nodes, 0);
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  nodes.get("next-page").click();
+  await settled(() => nodes.get("page-label").textContent === "Page 2");
+  assert.match(text(nodes.get("selected-runs")), /run-0/);
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0"]);
+  selectRow(nodes, 0);
+  await settled(() => comparisonRows(nodes).length === 2);
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-20"]);
+  nodes.get("search-input").value = "missing";
+  nodes.get("search-input").emit("input");
+  assert.equal(nodes.get("selected-runs").children.length, 0);
+  assert.equal(nodes.get("review-section").hidden, true);
+  assert.equal(chartQuery(nodes).getAll("run_id").length, 0);
+  await settled(() => nodes.get("run-count").textContent === "No matching runs");
+  const query = new URL(requests.at(-1), "http://localhost").searchParams;
+  assert.equal(query.get("search"), "missing");
+  assert.equal(query.get("offset"), "0");
+});
+
+test("late comparison and catalog responses cannot restore an old source after a source change", async t => {
+  const sources = [
+    { source_id: "worker&A", label: "Worker A", kind: "service", target_name: null },
+    { source_id: "worker&B", label: "Worker B", kind: "service", target_name: null },
+  ];
+  const model = reviewFixture(t, { sources, hosted: true });
+  const { nodes } = model;
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  const old_comparison = deferred();
+  let comparison_started = false;
+  model.override = parsed => {
+    if (parsed.pathname === "/api/compare") { comparison_started = true; return old_comparison.promise; }
+  };
+  selectRow(nodes, 0); selectRow(nodes, 1);
+  await settled(() => comparison_started);
+  const old_catalog = deferred();
+  model.override = parsed => parsed.pathname === "/api/catalog" ? old_catalog.promise : undefined;
+  nodes.get("refresh-button").click();
+  nodes.get("source-select").value = sources[1].source_id;
+  nodes.get("source-select").emit("change");
+  await settled(() => nodes.get("runs-region").attributes["aria-busy"] === "false");
+  nodes.get("run-rows").children[0].children[1].children[0].click();
+  await settled(() => chartQuery(nodes).get("source") === sources[1].source_id);
+  old_comparison.resolve(response({ source: sources[0], comparison: { metric_names: [], runs: [], warnings: [] } }));
+  old_catalog.resolve(response({ project_name: "Stale source", sources: [sources[0]], initial_source: sources[0].source_id, warnings: [], access_mode: "hosted" }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(nodes.get("source-select").value, sources[1].source_id);
+  assert.equal(chartQuery(nodes).get("source"), sources[1].source_id);
+  assert.equal(nodes.get("project-name").textContent, "Experiments");
+  assert.equal(nodes.get("selected-runs").children.length, 0);
+  assert.equal(nodes.get("review-title").textContent, "run-0");
+  assert.equal(nodes.get("refresh-button").disabled, false);
+});
+
+test("manual Refresh preserves the review tab and metrics and only updates Last checked after success", async t => {
+  const model = reviewFixture(t);
+  const { nodes, requests } = model;
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  nodes.get("run-rows").children[0].children[1].children[0].click();
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  const accuracy = nodes.get("run-metric-options").children[0].children[0].children[0];
+  accuracy.checked = false; accuracy.emit("change");
+  assert.deepEqual(chartQuery(nodes).getAll("metric"), ["loss"]);
+  nodes.get("review-tab-overview").click();
+  nodes.get("refresh-button").click();
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(nodes.get("review-panel-overview").hidden, false);
+  assert.deepEqual(chartQuery(nodes).getAll("metric"), ["loss"]);
+  assert.equal(requests.some(url => url.startsWith("/api/log")), false);
+  assert.match(nodes.get("updated-at").textContent, /^Last checked at /);
+  nodes.get("review-tab-logs").click();
+  await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
+  findElement(nodes.get("run-logs"), "log-tab-stderr").click();
+  await settled(() => text(nodes.get("run-logs")).includes("stderr training complete"));
+  nodes.get("refresh-button").click();
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(nodes.get("review-panel-logs").hidden, false);
+  assert.equal(requests.filter(url => url.startsWith("/api/log")).length, 3);
+  assert.match(text(nodes.get("run-logs")), /stderr training complete/);
+  assert.equal(findElement(nodes.get("run-logs"), "log-tab-stderr").attributes["aria-selected"], "true");
+  nodes.get("updated-at").textContent = "Previous successful check";
+  model.failed_list = true;
+  nodes.get("refresh-button").click();
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(nodes.get("updated-at").textContent, "Previous successful check");
+  assert.match(nodes.get("global-error").textContent, /Results are unavailable/);
+});
+
+test("a tab change during Refresh does not strand an unfinished initial run review", async t => {
+  const model = reviewFixture(t);
+  const { nodes } = model;
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  const initial_detail = deferred();
+  const refresh_catalog = deferred();
+  let detail_started = false;
+  model.override = parsed => {
+    if (parsed.pathname === "/api/run") { detail_started = true; return initial_detail.promise; }
+    if (parsed.pathname === "/api/catalog") return refresh_catalog.promise;
+  };
+  selectRow(nodes, 0);
+  await settled(() => detail_started);
+  nodes.get("refresh-button").click();
+  nodes.get("review-tab-charts").emit("keydown", { key: "ArrowRight" });
+  assert.equal(nodes.get("review-panel-overview").hidden, false);
+  initial_detail.resolve(response(detailRecord(model.sources[0], model.runs[0])));
+  refresh_catalog.resolve(response({ project_name: "Late refresh", sources: model.sources, initial_source: "local", warnings: [] }));
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(nodes.get("review-loading").hidden, true);
+  assert.match(text(nodes.get("run-detail")), /learning_rate.*0\.1/);
+  assert.equal(nodes.get("review-panel-overview").hidden, false);
+  assert.equal(nodes.get("project-name").textContent, "Late refresh");
+  assert.match(nodes.get("updated-at").textContent, /^Last checked at /);
+  assert.equal(nodes.get("refresh-button").disabled, false);
+  assert.equal(model.requests.some(url => url.startsWith("/api/log")), false);
+});
 
 test("empty hosted catalog refreshes into synced runs with opaque source IDs and 20-row pagination", async t => {
   const nodes = dashboard(t);
