@@ -257,6 +257,122 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn hosted_update_probes_skip_storage_reads_and_separate_changed_resources() {
+  let fixture = Fixture::new();
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let empty = dashboard.updates("", &[]).unwrap();
+  assert_eq!(
+    empty,
+    json!({"catalog_revision":"0","source_revision":null,"runs":[]})
+  );
+  fixture.publish(
+    FileTarget::Input {
+      project_id: "private-project".into(),
+      input_id: "dataset".into(),
+    },
+    b"private input".to_vec(),
+  );
+  assert_eq!(dashboard.updates("", &[]).unwrap(), empty);
+
+  // Both invalid state JSON and oversized scalar data remain cheap hints;
+  // these files would fail a detail read and must never be parsed by a poll.
+  fixture.run_file("run-one", "run-state.json", b"{invalid".to_vec());
+  fixture.append("run-one", "outputs/metrics.jsonl", b"not metric JSON");
+  fixture.append("run-one", "logs/stdout.log", b"first log\n");
+  fixture.run_file("other-run", "outputs/model.pt", b"checkpoint".to_vec());
+  fixture.publish_size(
+    FileTarget::Run {
+      scope: Fixture::scope("other-run"),
+      path: "outputs/metrics.jsonl".into(),
+    },
+    b"invalid oversized metrics".to_vec(),
+    METRICS_LIMIT + 1,
+  );
+  let ids = vec!["run-one".into(), "removed".into(), "other-run".into()];
+  let first = dashboard.updates("hosted:project:worker", &ids).unwrap();
+  assert_eq!(first["runs"][0]["missing"], false);
+  assert_eq!(first["runs"][0]["metrics_revision"], "stream:15");
+  assert_eq!(first["runs"][1]["missing"], true);
+  assert!(first["runs"][2]["metrics_revision"].is_string());
+  assert_eq!(
+    dashboard.updates("hosted:project:worker", &ids).unwrap(),
+    first
+  );
+
+  fixture.append(
+    "run-one",
+    "outputs/metrics.jsonl",
+    b"not metric JSON plus new data",
+  );
+  let growth = dashboard.updates("hosted:project:worker", &ids).unwrap();
+  assert_ne!(growth["source_revision"], first["source_revision"]);
+  assert_ne!(growth["catalog_revision"], first["catalog_revision"]);
+  assert_ne!(
+    growth["runs"][0]["metrics_revision"],
+    first["runs"][0]["metrics_revision"]
+  );
+  assert_eq!(
+    growth["runs"][0]["metadata_revision"],
+    first["runs"][0]["metadata_revision"]
+  );
+  assert_eq!(
+    growth["runs"][0]["stdout_revision"],
+    first["runs"][0]["stdout_revision"]
+  );
+  fixture.append(
+    "run-one",
+    "outputs/metrics.jsonl",
+    b"not metric JSON plus new data",
+  );
+  assert_eq!(
+    dashboard.updates("hosted:project:worker", &ids).unwrap(),
+    growth
+  );
+
+  fixture.run_file("run-one", "run-state.json", b"{changed".to_vec());
+  let state = dashboard.updates("hosted:project:worker", &ids).unwrap();
+  assert_ne!(
+    state["runs"][0]["metadata_revision"],
+    growth["runs"][0]["metadata_revision"]
+  );
+  assert_eq!(
+    state["runs"][0]["metrics_revision"],
+    growth["runs"][0]["metrics_revision"]
+  );
+  fixture.run_file(
+    "run-one",
+    "outputs/metrics.jsonl",
+    b"not metric JSON plus new data".to_vec(),
+  );
+  let finalized = dashboard.updates("hosted:project:worker", &ids).unwrap();
+  assert!(
+    finalized["runs"][0]["metrics_revision"]
+      .as_str()
+      .unwrap()
+      .starts_with("object:")
+  );
+  assert_ne!(
+    finalized["runs"][0]["metrics_revision"],
+    state["runs"][0]["metrics_revision"]
+  );
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  assert!(serde_json::to_vec(&finalized).unwrap().len() < 4096);
+  assert!(dashboard.updates("", &ids).is_err());
+  assert!(
+    dashboard
+      .updates("hosted:project:worker", &["../outside".into()])
+      .is_err()
+  );
+
+  fixture.run_file("-service-run", "snapshot.json", b"invalid JSON".to_vec());
+  let identifier = dashboard
+    .updates("hosted:project:worker", &["-service-run".into()])
+    .unwrap();
+  assert_eq!(identifier["runs"][0]["missing"], false);
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+}
+
+#[test]
 fn hosted_catalog_filters_cached_overviews_and_refreshes_changed_states() {
   let fixture = Fixture::new();
   let dashboard = HostedDashboard::new(&fixture.store).unwrap();

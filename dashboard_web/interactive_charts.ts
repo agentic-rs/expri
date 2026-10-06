@@ -3,6 +3,19 @@ export type ChartPoint = ParsedChartPoint & { x: number; y: number };
 export type StepRange = { start_step: string; end_step: string };
 type PlotPoint = ChartPoint & { circle: SVGCircleElement };
 type Series = { run_index: number; run_id: string; points: PlotPoint[]; polyline: SVGPolylineElement | null; button: HTMLButtonElement; visible: boolean };
+type KeyboardAnchor = { run_id: string; step: string; value_text: string; occurrence: number };
+type PlotState = {
+  metric_name: string;
+  range: StepRange | null;
+  hidden_run_ids: string[];
+  keyboard_anchor: KeyboardAnchor | null;
+  focus: string | null;
+  scroll_left: number;
+  scroll_top: number;
+};
+type PlotController = { dispose(): void; isInteracting(): boolean; capture(): PlotState; restore(state: PlotState): void };
+export type ChartPreviewStatus = "ready" | "loading" | "invalid";
+export type ChartController = { dispose(): void; isInteracting(): boolean; previewStatus(): ChartPreviewStatus; replacePreview(html: string): boolean };
 const MAX_STEP = 18446744073709551615n;
 const FRACTION_SCALE = 1_000_000_000_000n;
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -55,6 +68,13 @@ export function zoomChartRange(range: StepRange, full_range: StepRange, factor: 
   if (next_start + span > full_end) next_start = full_end - span;
   return { start_step: String(next_start), end_step: String(next_start + span) };
 }
+export function restoreChartRange(range: StepRange | null, full_range: StepRange): StepRange {
+  const [full_start, full_end] = steps(full_range);
+  if (range === null) return full_range;
+  const [start, end] = steps(range);
+  const clamp = (value: bigint) => value < full_start ? full_start : value > full_end ? full_end : value;
+  return { start_step: String(clamp(start)), end_step: String(clamp(end)) };
+}
 export function nearestChartPoint<T extends ChartPoint>(points: readonly T[], x: number, y?: number, preferred?: T): T | null {
   if (preferred && points.includes(preferred) && preferred.x === x && (y === undefined || preferred.y === y)) return preferred;
   let nearest: T | null = null, distance = Infinity, tie_distance = Infinity;
@@ -76,42 +96,164 @@ function svgNode<K extends keyof SVGElementTagNameMap>(document: Document, tag: 
   return node;
 }
 
-export function attachChartInteractions(frame: HTMLIFrameElement): () => void {
-  let dispose: (() => void) | null = null;
-  const enhance = () => {
-    dispose?.(); dispose = null;
-    try {
-      const document = frame.contentDocument;
-      if (!document?.querySelectorAll || document.querySelectorAll("circle.point").length > 4800) return;
-      if (document.URL && frame.src && new URL(document.URL).href !== new URL(frame.src, frame.ownerDocument?.baseURI).href) return;
-      const cleanups: (() => void)[] = [];
-      for (const svg of document.querySelectorAll<SVGSVGElement>(".plot-scroll > svg")) {
-        const cleanup = enhancePlot(document, svg);
-        if (cleanup) cleanups.push(cleanup);
-      }
-      dispose = () => { for (const cleanup of cleanups) cleanup(); };
-    } catch { /* A navigation outside the chart origin leaves its content untouched. */ }
-  };
-  frame.addEventListener("load", enhance);
-  const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => { dispose?.(); dispose = null; });
-  observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
-  enhance();
-  return () => { frame.removeEventListener("load", enhance); observer?.disconnect(); dispose?.(); dispose = null; };
+function plotRange(svg: SVGSVGElement): StepRange | null {
+  const tick_steps = [...svg.querySelectorAll<SVGTextElement>("text.tick")]
+    .filter(node => Number(node.getAttribute("y")) >= BOTTOM + 12)
+    .map(node => node.textContent?.trim() ?? "").filter(value => /^\d{1,20}$/.test(value));
+  if (!tick_steps.length) return null;
+  const values = tick_steps.map(value => BigInt(value)).sort((first, second) => first < second ? -1 : first > second ? 1 : 0);
+  const start = values[0], end = values[values.length - 1];
+  if (start === undefined || end === undefined || end > MAX_STEP) return null;
+  return { start_step: String(start), end_step: String(end) };
 }
 
-function enhancePlot(document: Document, svg: SVGSVGElement): (() => void) | null {
+const PREVIEW_HTML_TAGS = new Set("html head body meta title style main p section h2 div ul li span code pre details summary table thead tbody tr th td".split(" "));
+const PREVIEW_SVG_TAGS = new Set("svg title desc line text polyline circle".split(" "));
+const PREVIEW_ATTRIBUTES = new Set("lang charset name content class id role aria-label aria-labelledby tabindex viewBox x y x1 x2 y1 y2 cx cy r fill stroke stroke-width stroke-dasharray points text-anchor transform style scope".split(" "));
+
+function isDashboardPreview(document: Document): boolean {
+  if (document.title !== "Run comparison · expri" || !document.querySelector("body > main > .chart-summary")) return false;
+  if (document.querySelectorAll("circle.point").length > 4800 || document.querySelectorAll(".plot-scroll > svg").length > 6) return false;
+  for (const svg of document.querySelectorAll<SVGSVGElement>(".plot-scroll > svg")) {
+    const section = svg.closest("section.card"), metric = section?.querySelector("h2")?.textContent;
+    const run_ids = [...(section?.querySelectorAll("ul.legend li code") ?? [])].map(node => node.textContent ?? "");
+    const circles = svg.querySelectorAll("circle.point");
+    if (!metric || !run_ids.length || run_ids.length > 8 || new Set(run_ids).size !== run_ids.length || run_ids.some(id => !id) || !plotRange(svg) || !circles.length) return false;
+    for (const circle of circles) {
+      const point = parseChartPointLabel(circle.getAttribute("aria-label") ?? "");
+      if (!point || point.run_index > run_ids.length) return false;
+      for (const attribute of ["cx", "cy"]) {
+        const value = circle.getAttribute(attribute);
+        if (value === null || !Number.isFinite(Number(value))) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function parseDashboardPreview(markup: string): Document | null {
+  // Refuse resource-bearing tags before parsing: even an inert DOMParser document
+  // can request images and frames. The generated preview contains neither.
+  if (markup.length > 2 * 1024 * 1024 || new TextEncoder().encode(markup).byteLength > 2 * 1024 * 1024) return null;
+  for (const match of markup.matchAll(/<\s*([a-z][a-z0-9:-]*)\b/gi)) {
+    const tag = match[1]?.toLowerCase();
+    if (!tag || (!PREVIEW_HTML_TAGS.has(tag) && !PREVIEW_SVG_TAGS.has(tag))) return null;
+  }
+  const document = new DOMParser().parseFromString(markup, "text/html");
+  for (const node of document.querySelectorAll("*")) {
+    const allowed = node.namespaceURI === SVG_NS ? PREVIEW_SVG_TAGS : PREVIEW_HTML_TAGS;
+    if (![SVG_NS, "http://www.w3.org/1999/xhtml"].includes(node.namespaceURI ?? "") || !allowed.has(node.localName)) return null;
+    for (const attribute of node.attributes) if (!PREVIEW_ATTRIBUTES.has(attribute.name)) return null;
+    if (node.localName === "meta" && !(node.hasAttribute("charset") || node.getAttribute("name") === "viewport")) return null;
+    const style = node.localName === "style" ? node.textContent ?? "" : node.getAttribute("style") ?? "";
+    if (/(?:url\s*\(|@import|expression\s*\()/i.test(style)) return null;
+  }
+  return isDashboardPreview(document) ? document : null;
+}
+
+export function createChartController(frame: HTMLIFrameElement): ChartController {
+  let plots: PlotController[] = [], current_document: Document | null = null, disposed = false;
+  let completed_source: string | null = null;
+  const clear = () => { for (const plot of plots) plot.dispose(); plots = []; current_document = null; };
+  function currentSource(): URL | null {
+    if (!frame.src || !frame.ownerDocument?.baseURI) return null;
+    const source = new URL(frame.src, frame.ownerDocument.baseURI), owner = new URL(frame.ownerDocument.baseURI);
+    return source.origin === owner.origin ? source : null;
+  }
+  function loadedDocument(): Document | null {
+    try {
+      const document = frame.contentDocument;
+      const source = currentSource();
+      if (!document?.querySelectorAll || !source || document.readyState !== "complete") return null;
+      return document.URL === source.href && isDashboardPreview(document) ? document : null;
+    } catch { return null; }
+  }
+  function enhanceDocument(document: Document): void {
+    current_document = document;
+    for (const svg of document.querySelectorAll<SVGSVGElement>(".plot-scroll > svg")) {
+      const plot = enhancePlot(document, svg);
+      if (plot) plots.push(plot);
+    }
+  }
+  const enhance = (completed = false) => {
+    clear();
+    if (disposed) return;
+    try {
+      const source = currentSource(), child = frame.contentDocument;
+      if (source && ((completed && !child) || (child?.readyState === "complete" && (child.URL === source.href || child.URL.startsWith("about:neterror"))))) completed_source = source.href;
+      const document = loadedDocument();
+      if (document) enhanceDocument(document);
+    } catch { /* A navigation outside the chart origin leaves its content untouched. */ }
+  };
+  const loaded = () => enhance(true);
+  frame.addEventListener("load", loaded);
+  const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => { completed_source = null; clear(); });
+  observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
+  enhance();
+  return {
+    dispose() { disposed = true; frame.removeEventListener("load", loaded); observer?.disconnect(); clear(); },
+    isInteracting() { return plots.some(plot => plot.isInteracting()); },
+    previewStatus() {
+      if (disposed) return "loading";
+      try {
+        const source = currentSource(); if (!source) return "loading";
+        if (current_document && loadedDocument() === current_document) return "ready";
+        return completed_source === source.href ? "invalid" : "loading";
+      } catch { return "loading"; }
+    },
+    replacePreview(markup) {
+      if (disposed || plots.some(plot => plot.isInteracting())) return false;
+      const document = loadedDocument();
+      if (!document || document !== current_document) return false;
+      let next: Document | null;
+      try { next = parseDashboardPreview(markup); } catch { return false; }
+      if (!next) return false;
+      const frame_focused = frame.ownerDocument.activeElement === frame;
+      const states = new Map(plots.map(plot => {
+        const state = plot.capture();
+        if (!frame_focused) state.focus = null;
+        return [state.metric_name, state];
+      }));
+      const window = document.defaultView, parent = frame.ownerDocument.defaultView;
+      const scroll = { x: window?.scrollX ?? 0, y: window?.scrollY ?? 0, parent_x: parent?.scrollX ?? 0, parent_y: parent?.scrollY ?? 0 };
+      const previous_details = document.querySelector<HTMLDetailsElement>("details.parameter-comparison");
+      const details_open = previous_details?.open ?? false, details_focused = frame_focused && document.activeElement === previous_details?.querySelector("summary");
+      const parameter_scroll = previous_details?.querySelector<HTMLElement>(".table-scroll")?.scrollLeft ?? 0;
+      const head = [...next.head.childNodes].map(node => document.importNode(node, true));
+      const body = [...next.body.childNodes].map(node => document.importNode(node, true));
+      clear();
+      // Keep the existing document, HTTP CSP and iframe sandbox. New server samples
+      // form one coherent bounded snapshot; sampled points are never appended.
+      document.head.replaceChildren(...head); document.body.replaceChildren(...body);
+      enhanceDocument(document);
+      for (const plot of plots) { const state = states.get(plot.capture().metric_name); if (state) plot.restore(state); }
+      const details = document.querySelector<HTMLDetailsElement>("details.parameter-comparison");
+      if (details) {
+        details.open = details_open;
+        if (details_focused) details.querySelector("summary")?.focus({ preventScroll: true });
+        const table = details.querySelector<HTMLElement>(".table-scroll"); if (table) table.scrollLeft = parameter_scroll;
+      }
+      window?.scrollTo(scroll.x, scroll.y); parent?.scrollTo(scroll.parent_x, scroll.parent_y);
+      return true;
+    },
+  };
+}
+
+export function attachChartInteractions(frame: HTMLIFrameElement): () => void {
+  const controller = createChartController(frame);
+  return () => controller.dispose();
+}
+
+function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | null {
   const section = svg.closest<HTMLElement>("section.card");
   const region = svg.parentElement;
   const legend = section?.querySelector<HTMLUListElement>("ul.legend");
   if (!section || !region || !legend || section.hasAttribute("data-interactive-chart")) return null;
   const x_ticks = [...svg.querySelectorAll<SVGTextElement>("text.tick")].filter(node => Number(node.getAttribute("y")) >= BOTTOM + 12);
-  const tick_steps = x_ticks.map(node => node.textContent?.trim() ?? "").filter(value => /^\d{1,20}$/.test(value));
-  if (!tick_steps.length) return null;
-  const sorted_steps = tick_steps.map(value => BigInt(value)).sort((first, second) => first < second ? -1 : first > second ? 1 : 0);
-  if ((sorted_steps[sorted_steps.length - 1] ?? MAX_STEP + 1n) > MAX_STEP) return null;
-  const full_range: StepRange = { start_step: String(sorted_steps[0]), end_step: String(sorted_steps[sorted_steps.length - 1]) };
-  steps(full_range);
-  let range = full_range, keyboard_index = -1;
+  const parsed_range = plotRange(svg);
+  if (!parsed_range) return null;
+  const full_range: StepRange = parsed_range;
+  let range = full_range, follow_full = true, keyboard_index = -1, keyboard_anchor: PlotPoint | null = null;
   let drag_start: { x: number; screen_x: number; pointer_id: number } | null = null;
   const listeners: (() => void)[] = [];
   const original_nodes = [...svg.childNodes];
@@ -201,6 +343,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): (() => void) | nul
     const position = Math.max(LEFT, Math.min(RIGHT, x));
     crosshair.setAttribute("display", ""); crosshair.setAttribute("x1", String(position)); crosshair.setAttribute("x2", String(position));
     readout.setAttribute("aria-live", announce ? "polite" : "off"); readout_values.replaceChildren(); clearHighlights();
+    keyboard_anchor = announce && anchor ? anchor : null;
     let first = true;
     for (const item of series.values()) {
       if (!item.visible || !item.points.length) continue;
@@ -244,12 +387,16 @@ function enhancePlot(document: Document, svg: SVGSVGElement): (() => void) | nul
     range_label.setAttribute("data-start-step", range.start_step); range_label.setAttribute("data-end-step", range.end_step);
     zoom_in.disabled = start === end || span <= 1n;
     zoom_out.disabled = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
-    reset.disabled = zoom_out.disabled;
+    reset.disabled = zoom_out.disabled && follow_full;
     crosshair.setAttribute("display", "none"); clearHighlights();
     readout_values.replaceChildren(html(document, "span", "Hover or use arrow keys to inspect displayed samples."));
     keyboard_index = -1;
+    keyboard_anchor = null;
   }
-  function applyRange(next: StepRange): void { range = next; selection.setAttribute("display", "none"); draw(); }
+  function applyRange(next: StepRange): void {
+    range = next; follow_full = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
+    selection.setAttribute("display", "none"); draw();
+  }
   function coordinates(event: PointerEvent): { x: number; y: number } | null {
     const matrix = svg.getScreenCTM(); if (!matrix) return null;
     const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY;
@@ -282,6 +429,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): (() => void) | nul
     if (hit.hasPointerCapture?.(pointer.pointerId)) hit.releasePointerCapture(pointer.pointerId);
   });
   listen(hit, "pointercancel", event => { if (!drag_start || (event as PointerEvent).pointerId === drag_start.pointer_id) { drag_start = null; selection.setAttribute("display", "none"); } });
+  listen(hit, "lostpointercapture", event => { if (drag_start?.pointer_id === (event as PointerEvent).pointerId) { drag_start = null; selection.setAttribute("display", "none"); } });
   listen(hit, "pointerleave", () => { if (!drag_start) crosshair.setAttribute("display", "none"); });
   listen(region, "keydown", event => {
     const key = event as KeyboardEvent;
@@ -298,14 +446,46 @@ function enhancePlot(document: Document, svg: SVGSVGElement): (() => void) | nul
     }
   });
   draw();
-  return () => {
-    for (const remove of listeners) remove();
-    for (const [item, children] of original_legends) item.replaceChildren(...children);
-    for (const [node, attributes] of original_attributes) {
-      for (const [name, value] of Object.entries(attributes)) value === null ? node.removeAttribute(name) : node.setAttribute(name, value);
-    }
-    svg.replaceChildren(...original_nodes); styles.remove(); controls.remove(); hint.remove(); readout.remove();
-    if (original_description === null) region.removeAttribute("aria-describedby"); else region.setAttribute("aria-describedby", original_description);
-    section.removeAttribute("data-interactive-chart");
+  return {
+    isInteracting() { return drag_start !== null; },
+    capture() {
+      const active = document.activeElement;
+      let focus: string | null = active === region ? "plot" : active === zoom_in ? "zoom-in" : active === zoom_out ? "zoom-out" : active === reset ? "reset" : null;
+      for (const item of series.values()) if (active === item.button) focus = `run:${item.run_id}`;
+      const anchored = keyboard_anchor, item = anchored && series.get(anchored.run_index);
+      const anchor = anchored && item ? {
+        run_id: item.run_id, step: anchored.step, value_text: anchored.value_text,
+        occurrence: item.points.filter(point => point.step === anchored.step && point.value_text === anchored.value_text).indexOf(anchored),
+      } : null;
+      return {
+        metric_name, range: follow_full ? null : { ...range },
+        hidden_run_ids: [...series.values()].filter(item => !item.visible).map(item => item.run_id), keyboard_anchor: anchor,
+        focus, scroll_left: region.scrollLeft, scroll_top: region.scrollTop,
+      };
+    },
+    restore(state) {
+      range = restoreChartRange(state.range, full_range);
+      follow_full = state.range === null;
+      for (const item of series.values()) item.visible = !state.hidden_run_ids.includes(item.run_id);
+      draw();
+      const anchor = state.keyboard_anchor, item = anchor && [...series.values()].find(item => item.run_id === anchor.run_id);
+      const point = anchor && item && available(item).filter(point => point.step === anchor.step && point.value_text === anchor.value_text)[anchor.occurrence];
+      if (point) { showAt(point.x, point.y, false, point); keyboard_anchor = point; }
+      const focus = state.focus;
+      const focused = focus === "plot" ? region : focus === "zoom-in" ? zoom_in : focus === "zoom-out" ? zoom_out : focus === "reset" ? reset : [...series.values()].find(item => focus === `run:${item.run_id}`)?.button;
+      if (focused && !(focused.tagName === "BUTTON" && (focused as HTMLButtonElement).disabled)) focused.focus({ preventScroll: true });
+      else if (focus) region.focus({ preventScroll: true });
+      region.scrollLeft = state.scroll_left; region.scrollTop = state.scroll_top;
+    },
+    dispose() {
+      for (const remove of listeners) remove();
+      for (const [item, children] of original_legends) item.replaceChildren(...children);
+      for (const [node, attributes] of original_attributes) {
+        for (const [name, value] of Object.entries(attributes)) value === null ? node.removeAttribute(name) : node.setAttribute(name, value);
+      }
+      svg.replaceChildren(...original_nodes); styles.remove(); controls.remove(); hint.remove(); readout.remove();
+      if (original_description === null) region.removeAttribute("aria-describedby"); else region.setAttribute("aria-describedby", original_description);
+      section.removeAttribute("data-interactive-chart");
+    },
   };
 }

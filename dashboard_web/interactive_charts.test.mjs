@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attachChartInteractions, parseChartPointLabel, chartStepFraction, dragChartRange, zoomChartRange, nearestChartPoint } from "./app.js";
+import { attachChartInteractions, createChartController, parseChartPointLabel, chartStepFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./app.js";
 
 const MAX_STEP = 18446744073709551615n;
 function range(first, last) { return { start_step: String(first), end_step: String(last) }; }
@@ -51,6 +51,16 @@ test("zoom is bounded by the original domain and never invents fractional steps"
   for (const factor of [NaN, Infinity, 0, -1]) assert.deepEqual(zoomChartRange(full, full, factor), full);
 });
 
+test("refresh follows the full domain and keeps zoom at exact absolute steps", () => {
+  assert.deepEqual(restoreChartRange(null, range(0n, 200n)), range(0n, 200n), "full-range views follow incoming samples");
+  assert.deepEqual(restoreChartRange(range(20n, 80n), range(0n, 200n)), range(20n, 80n), "a growing domain does not move an inspected range");
+  assert.deepEqual(restoreChartRange(range(20n, 80n), range(30n, 60n)), range(30n, 60n), "removed samples clamp the zoom to the remaining domain");
+  assert.deepEqual(restoreChartRange(range(20n, 80n), range(90n, 100n)), range(90n, 90n));
+  assert.deepEqual(restoreChartRange(range(20n, 80n), range(0n, 10n)), range(10n, 10n));
+  assert.deepEqual(restoreChartRange(range(MAX_STEP - 2n, MAX_STEP), range(MAX_STEP - 1n, MAX_STEP)), range(MAX_STEP - 1n, MAX_STEP));
+  assert.throws(() => restoreChartRange(range(2n, 1n), range(0n, 3n)), /Invalid chart step range/);
+});
+
 test("nearest sample uses displayed points without interpolating or collapsing reset steps", () => {
   const logged = [point(10, 100, 100, "1"), point(0, 0, 200, "2"), point(10, 100, 140, "1.5"), point(10, 100, 140, "1.5"), point(20, 200, 10, "9")];
   const order = [...logged];
@@ -71,4 +81,51 @@ test("frame lifecycle is safe before a document exists and removes its load hand
   assert.doesNotThrow(() => handlers.get("load")());
   cleanup();
   assert.equal(handlers.size, 0);
+});
+
+test("chart refresh refuses unloaded frames and remains inert after disposal", () => {
+  const handlers = new Map();
+  const frame = { contentDocument: undefined, addEventListener: (name, callback) => handlers.set(name, callback), removeEventListener: (name, callback) => { if (handlers.get(name) === callback) handlers.delete(name); } };
+  const controller = createChartController(frame);
+  assert.equal(controller.isInteracting(), false);
+  assert.equal(controller.previewStatus(), "loading");
+  assert.equal(controller.replacePreview("<html></html>"), false);
+  controller.dispose();
+  assert.equal(controller.replacePreview("<html></html>"), false);
+  assert.equal(handlers.size, 0);
+  assert.doesNotThrow(() => controller.dispose());
+});
+
+test("preview status separates slow navigation, completed errors and stale loads", t => {
+  const previous_observer = globalThis.MutationObserver;
+  let changed;
+  globalThis.MutationObserver = class { constructor(callback) { changed = callback; } observe() {} disconnect() {} };
+  t.after(() => { globalThis.MutationObserver = previous_observer; });
+  const handlers = new Map();
+  const frame = {
+    ownerDocument: { baseURI: "https://expri.example.net/" }, src: "https://expri.example.net/api/chart?run_id=A", contentDocument: null,
+    addEventListener: (name, callback) => handlers.set(name, callback),
+    removeEventListener: (name, callback) => { if (handlers.get(name) === callback) handlers.delete(name); },
+  };
+  const controller = createChartController(frame); t.after(() => controller.dispose());
+  assert.equal(controller.previewStatus(), "loading", "inaccessible content before load can still be pending");
+  handlers.get("load")();
+  assert.equal(controller.previewStatus(), "invalid", "a completed native error page can be retried");
+  frame.src = "https://expri.example.net/api/chart?run_id=B";
+  assert.equal(controller.previewStatus(), "loading", "a new source is not the completed old request");
+  changed();
+  frame.contentDocument = { URL: "https://expri.example.net/api/chart?run_id=A", readyState: "complete", title: "", querySelectorAll: () => [], querySelector: () => null };
+  handlers.get("load")();
+  assert.equal(controller.previewStatus(), "loading", "a stale load never restarts the pending current source");
+  frame.contentDocument.URL = frame.src;
+  handlers.get("load")();
+  assert.equal(controller.previewStatus(), "invalid", "a completed current HTTP error is distinguishable from pending");
+  changed();
+  assert.equal(controller.previewStatus(), "loading", "same-source reload waits for its own completion");
+  frame.contentDocument.title = "Run comparison · expri";
+  frame.contentDocument.querySelector = () => ({});
+  handlers.get("load")();
+  assert.equal(controller.previewStatus(), "ready", "a valid no-metrics preview is ready too");
+  frame.src = "https://other.example.net/chart"; changed(); handlers.get("load")();
+  assert.equal(controller.previewStatus(), "loading", "foreign frames are never offered for automatic reload");
 });

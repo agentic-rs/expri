@@ -150,6 +150,9 @@ impl<S: ObjectStorage> Store<S> {
         project_id TEXT NOT NULL, origin TEXT NOT NULL, run_id TEXT NOT NULL,
         legacy_order INTEGER NOT NULL DEFAULT 0,
         UNIQUE(project_id,origin,run_id));
+      CREATE INDEX IF NOT EXISTS dashboard_activity_source ON dashboard_run_activity(project_id,origin,sequence);
+      CREATE INDEX IF NOT EXISTS dashboard_files_scope ON files(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'));
+      CREATE INDEX IF NOT EXISTS dashboard_streams_scope ON streams(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'));
       INSERT OR IGNORE INTO dashboard_run_activity(project_id,origin,run_id,legacy_order)
         SELECT json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'),1
         FROM (SELECT target,sequence FROM files UNION ALL SELECT target,0 AS sequence FROM streams)
@@ -288,6 +291,81 @@ impl<S: ObjectStorage> Store<S> {
   pub fn dashboard_run_exists(&self, scope: &RunScope) -> ApiResult<bool> {
     validate_scope(scope).map_err(bad)?;
     self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM (SELECT target FROM files UNION ALL SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3)", params![scope.project_id, scope.origin, scope.run_id], |row| row.get(0)).map_err(database)
+  }
+
+  /// A bounded poll reads only publication sequences and saved stream lengths.
+  /// It neither parses artifacts nor contacts object storage. One database lock
+  /// keeps source activity and the requested artifact hints in the same view.
+  pub fn dashboard_updates(
+    &self,
+    source: Option<&DashboardSource>,
+    run_ids: &[String],
+  ) -> ApiResult<serde_json::Value> {
+    use crate::dashboard::updates::{self, RunUpdate};
+
+    updates::validate_selection(if source.is_some() { "selected" } else { "" }, run_ids)
+      .map_err(bad)?;
+    if let Some(source) = source {
+      validate_component(&source.project_id).map_err(bad)?;
+      validate_component(&source.origin).map_err(bad)?;
+    }
+    for run_id in run_ids {
+      validate_component(run_id).map_err(bad)?;
+    }
+    let db = self.db()?;
+    let catalog_revision = db
+      .query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM dashboard_run_activity",
+        [],
+        |row| row.get::<_, i64>(0),
+      )
+      .map_err(database)?
+      .to_string();
+    let source_revision = source
+      .map(|source| {
+        db.query_row(
+          "SELECT COALESCE(MAX(sequence),0) FROM dashboard_run_activity WHERE project_id=?1 AND origin=?2",
+          params![source.project_id, source.origin],
+          |row| row.get::<_, i64>(0),
+        )
+        .map(|sequence| sequence.to_string())
+        .map_err(database)
+      })
+      .transpose()?;
+    let mut runs = Vec::with_capacity(run_ids.len());
+    if let Some(source) = source {
+      for run_id in run_ids {
+        let scope = RunScope {
+          project_id: source.project_id.clone(),
+          origin: source.origin.clone(),
+          run_id: run_id.clone(),
+        };
+        let exists: bool = db
+          .query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3 UNION ALL SELECT 1 FROM streams WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3)",
+            params![scope.project_id, scope.origin, scope.run_id],
+            |row| row.get(0),
+          )
+          .map_err(database)?;
+        if !exists {
+          runs.push(RunUpdate::missing(run_id));
+          continue;
+        }
+        let metadata_revision = updates::METADATA_PATHS
+          .iter()
+          .map(|path| dashboard_artifact_revision(&db, &scope, path))
+          .collect::<ApiResult<Vec<_>>>()?;
+        runs.push(RunUpdate {
+          run_id: run_id.clone(),
+          metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
+          metrics_revision: dashboard_artifact_revision(&db, &scope, "outputs/metrics.jsonl")?,
+          stdout_revision: dashboard_artifact_revision(&db, &scope, "logs/stdout.log")?,
+          stderr_revision: dashboard_artifact_revision(&db, &scope, "logs/stderr.log")?,
+          missing: false,
+        });
+      }
+    }
+    updates::response(Some(catalog_revision), source_revision, runs).map_err(bad)
   }
 
   pub fn dashboard_stream_range(
@@ -996,6 +1074,36 @@ fn dashboard_page_bounds(limit: usize, offset: usize) -> ApiResult<()> {
   Ok(())
 }
 
+fn dashboard_artifact_revision(
+  db: &Connection,
+  scope: &RunScope,
+  path: &str,
+) -> ApiResult<Option<String>> {
+  let target = target_json(&FileTarget::Run {
+    scope: scope.clone(),
+    path: path.into(),
+  })?;
+  let object = db
+    .query_row(
+      "SELECT sequence FROM files WHERE target=?1",
+      [&target],
+      |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(database)?;
+  if let Some(sequence) = object {
+    return Ok(Some(format!("object:{sequence}")));
+  }
+  db.query_row(
+    "SELECT size FROM streams WHERE target=?1",
+    [&target],
+    |row| row.get::<_, u64>(0),
+  )
+  .optional()
+  .map(|size| size.map(|size| format!("stream:{size}")))
+  .map_err(database)
+}
+
 fn record_run_activity(db: &Connection, scope: &RunScope) -> ApiResult<()> {
   db.execute("INSERT OR REPLACE INTO dashboard_run_activity(project_id,origin,run_id,legacy_order) VALUES(?1,?2,?3,0)", params![scope.project_id,scope.origin,scope.run_id]).map_err(database)?;
   Ok(())
@@ -1650,6 +1758,71 @@ pub(super) mod tests {
         .dashboard_artifact(&scope(), "run-state.json")
         .unwrap()
         .is_none()
+    );
+  }
+
+  #[test]
+  fn dashboard_update_hints_track_scoped_activity_and_missing_membership() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let source = DashboardSource {
+      project_id: "project".into(),
+      origin: "worker".into(),
+    };
+    let ids = vec!["run-1".into(), "not-yet-synced".into()];
+    let empty = store.dashboard_updates(Some(&source), &ids).unwrap();
+    assert_eq!(empty["source_revision"], "0");
+    assert!(
+      empty["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|run| run["missing"] == true)
+    );
+    store
+      .execute(append_request(0, b"unparsed metrics"))
+      .unwrap();
+    let first = store.dashboard_updates(Some(&source), &ids).unwrap();
+    assert_eq!(first["runs"][0]["metrics_revision"], "stream:16");
+    let mut other = scope();
+    other.origin = "other-worker".into();
+    store
+      .execute(Request::AppendStream {
+        scope: other,
+        path: "logs/stdout.log".into(),
+        offset: 0,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(b"private to other scope"),
+      })
+      .unwrap();
+    let scoped = store.dashboard_updates(Some(&source), &ids).unwrap();
+    assert_ne!(scoped["catalog_revision"], first["catalog_revision"]);
+    assert_eq!(scoped["source_revision"], first["source_revision"]);
+    assert_eq!(scoped["runs"], first["runs"]);
+    let target = target_json(&FileTarget::Run {
+      scope: scope(),
+      path: "outputs/metrics.jsonl".into(),
+    })
+    .unwrap();
+    store
+      .db()
+      .unwrap()
+      .execute("DELETE FROM streams WHERE target=?1", [&target])
+      .unwrap();
+    let deleted = store.dashboard_updates(Some(&source), &ids).unwrap();
+    assert_eq!(deleted["runs"][0]["missing"], true);
+    assert_eq!(
+      deleted["runs"][0]["metrics_revision"],
+      serde_json::Value::Null
+    );
+    assert!(
+      store
+        .dashboard_updates(Some(&source), &["run-1".into(), "run-1".into()])
+        .is_err()
+    );
+    assert!(
+      store
+        .dashboard_updates(Some(&source), &["..".into()])
+        .is_err()
     );
   }
 

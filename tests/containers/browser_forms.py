@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 ORIGIN = 'https://expri.example.net'
 POLICY_OVERRIDE = Path('/tmp/expri-browser-policy')
 TRACE = Path('/tmp/expri-browser-requests.jsonl')
+REFRESH_COORDINATION = Path('/tmp/expri-refresh-coordination.json')
 ELEMENT = 'element-6066-11e4-a52e-4f735466cecf'
 
 
@@ -84,7 +85,7 @@ class Firefox:
   def keys(self, selector, text, using='css selector'):
     self.call('POST', '/element/' + self.element(selector, using) + '/value', {'text': text})
 
-  def pointer(self, selector, fraction, drag_to=None, using='css selector'):
+  def pointer(self, selector, fraction, drag_to=None, using='css selector', hold=False):
     element = self.element(selector, using)
     # Position the viewport, then use native input; never synthesize DOM events.
     geometry = self.call('POST', '/execute/sync', {'script': '''const node = arguments[0];
@@ -122,8 +123,18 @@ class Firefox:
     actions = [move(fraction, 100)]
     if drag_to is not None:
       actions += [{'type': 'pointerDown', 'button': 0}, move(drag_to, 300), {'type': 'pointerUp', 'button': 0}]
+    elif hold:
+      actions += [{'type': 'pointerDown', 'button': 0}]
     self.call('POST', '/actions', {'actions': [{
       'type': 'pointer', 'id': 'chart-pointer', 'parameters': {'pointerType': 'mouse'}, 'actions': actions,
+    }]})
+    if not hold:
+      self.call('DELETE', '/actions')
+
+  def release_pointer(self):
+    self.call('POST', '/actions', {'actions': [{
+      'type': 'pointer', 'id': 'chart-pointer', 'parameters': {'pointerType': 'mouse'},
+      'actions': [{'type': 'pointerUp', 'button': 0}],
     }]})
     self.call('DELETE', '/actions')
 
@@ -355,6 +366,7 @@ def workspace(run_id, second_run_id):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
+    browser.click('#auto-refresh-toggle')
     start = len(trace_records())
     browser.click(f'input[aria-label="Select {run_id} for comparison"]')
     wait_for(lambda: check_selection([run_id]), 'selecting one run did not open its charts')
@@ -384,10 +396,12 @@ def workspace(run_id, second_run_id):
       return list.right <= review.left + 1;'''), 'desktop runs and charts are not side by side'
     capture('workspace-desktop')
     remember_chart_document(browser)
+    evaluate("window.__acceptance_previous_plots = [...document.querySelector('#chart-frame').contentDocument.querySelectorAll('[data-interactive-chart]')];")
     browser.click('#refresh-button')
     wait_for(lambda: not evaluate("return document.querySelector('#refresh-button').disabled;"), 'Refresh did not finish')
     assert check_selection([run_id, second_run_id]), 'Refresh lost the selected comparison'
-    assert_chart_document_cleaned(browser)
+    wait_for(lambda: evaluate("return window.__acceptance_previous_plots.every(node => !node.isConnected);") , 'Refresh did not dispose the previous chart nodes')
+    assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__acceptance_chart_document;"), 'Refresh replaced the chart document and its HTTP security policy'
     wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'Refresh lost or duplicated chart interaction layers')
     browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
     assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
@@ -470,6 +484,7 @@ def previews(run_id, second_run_id):
     assert not browser.cookies(), 'preview unexpectedly stored its own session before login'
     browser.login()
     wait_for(lambda: browser.catalog()['status'] == 200, 'preview native login did not complete')
+    browser.click('#auto-refresh-toggle')
     catalog_with_wire_check(browser, 200, 1)
     ab_cookie = browser.cookies()[0]
     assert ab_cookie['value'] != main_cookie['value'], 'preview reused the main session'
@@ -510,10 +525,177 @@ def previews(run_id, second_run_id):
     browser.close()
 
 
+def automatic_refresh(run_id, updated_run_id):
+  browser = Firefox()
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def phase(name):
+    REFRESH_COORDINATION.write_text(json.dumps({'phase': name}))
+  def probes_since(start):
+    return [record for record in trace_records()[start:]
+      if record['path'] == '/api/updates' and record['status'] == 200]
+  def data_counts():
+    return {path: sum(record['path'] == path for record in trace_records())
+      for path in ['/api/chart', '/api/run', '/api/compare']}
+  def loss_state():
+    return evaluate('''const doc = document.querySelector('#chart-frame').contentDocument;
+      const card = [...(doc?.querySelectorAll('[data-interactive-chart]') ?? [])].find(node => node.querySelector('h2').textContent === 'loss');
+      if (!card) return null;
+      const range = card.querySelector('[data-chart-range]');
+      return {range: [range.dataset.startStep, range.dataset.endStep],
+        hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent),
+        samples: [...card.querySelectorAll('[data-chart-run]')].map(node => ({run_id: node.querySelector('code').textContent, text: node.textContent})),
+        point_labels: [...card.querySelectorAll('circle.point')].map(node => node.getAttribute('aria-label'))};''')
+  def last_comparison_step():
+    return evaluate('''const row = [...document.querySelectorAll('#comparison-values tbody tr')].find(node => node.querySelector('th').textContent === arguments[0]);
+      const headings = [...document.querySelectorAll('#comparison-values thead th')].map(node => node.textContent);
+      return row?.children[headings.indexOf('loss')]?.querySelector('.cell-step')?.textContent;''', updated_run_id)
+  def selection():
+    return evaluate("return [...document.querySelectorAll('#run-rows input:checked')].map(node => node.getAttribute('aria-label'));")
+  def wait_phase(name):
+    wait_for(lambda: json.loads(REFRESH_COORDINATION.read_text()).get('phase') == name,
+      'worker publication did not finish: ' + name, timeout=90)
+  try:
+    REFRESH_COORDINATION.unlink(missing_ok=True)
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.navigate('/login')
+    browser.login()
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'auto-refresh fixture runs did not load')
+    browser.keys('#task-input', 'train')
+    wait_for(lambda: evaluate("return document.querySelector('#task-input').value;") == 'train' and
+      evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'auto-refresh task filter did not apply')
+    for selected_run in [run_id, updated_run_id]:
+      browser.click(f'input[aria-label="Select {selected_run} for comparison"]')
+    wait_for(lambda: loss_state() is not None and last_comparison_step() == 'step 79', 'auto-refresh comparison did not load its initial samples')
+    # Let the initial revision baseline settle before proving a later unchanged
+    # poll does not fetch chart/summary snapshots again.
+    baseline = len(trace_records())
+    wait_for(lambda: len(probes_since(baseline)) >= 2, 'five-second change probes did not run', timeout=25)
+    counts = data_counts()
+    unchanged = len(trace_records())
+    wait_for(lambda: len(probes_since(unchanged)) >= 1, 'unchanged change probe did not run', timeout=15)
+    time.sleep(.3)
+    assert data_counts() == counts, 'unchanged auto poll refetched chart or scalar summaries'
+
+    frame = browser.element('#chart-frame')
+    browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+    loss_prefix = '//section[@data-interactive-chart][h2="loss"]'
+    try:
+      browser.click(loss_prefix + '//button[code="' + run_id + '"]', using='xpath')
+      browser.pointer(loss_prefix + '//*[@data-chart-hit]', .2, .65, using='xpath')
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    before = loss_state()
+    assert before['hidden'] == [run_id], 'fixture did not hide the requested actual run'
+    assert 0 < int(before['range'][0]) < int(before['range'][1]) < 79, 'fixture did not establish an absolute zoom'
+    selected_labels = selection()
+    evaluate("window.__refresh_original_document = document.querySelector('#chart-frame').contentDocument;")
+    # Keep one native pointer gesture active while the worker publishes. The
+    # chart must defer replacement until pointerup, then catch up automatically.
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+    try:
+      evaluate("window.__acceptance_pointerup = 0; document.addEventListener('pointerup', () => { window.__acceptance_pointerup++; }, {capture: true});")
+      browser.pointer(loss_prefix + '//*[@data-chart-hit]', .5, using='xpath', hold=True)
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    phase('publish-80')
+    wait_phase('published-80')
+    held = len(trace_records())
+    wait_for(lambda: len(probes_since(held)) >= 1, 'change probe did not inspect the active pointer gesture', timeout=15)
+    time.sleep(.3)
+    assert not any(item['run_id'] == updated_run_id and '81 samples' in item['text']
+      for item in loss_state()['samples']), 'chart replacement interrupted an active pointer gesture'
+    # WebDriver dispatches native actions in its current browsing context.
+    # Release inside the child where the gesture began; a parent-context
+    # pointerup leaves Gecko's child pointer capture active.
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+    try:
+      browser.release_pointer()
+      wait_for(lambda: evaluate("return window.__acceptance_pointerup;") > 0,
+        'native pointer release did not reach the chart iframe')
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    wait_for(lambda: last_comparison_step() == 'step 80' and any(
+      item['run_id'] == updated_run_id and '81 samples' in item['text'] for item in (loss_state() or {}).get('samples', [])),
+      'new worker samples did not reach the selected chart and summary automatically', timeout=25)
+    after = loss_state()
+    assert after['range'] == before['range'], 'automatic replacement shifted the absolute zoom range'
+    assert after['hidden'] == [run_id], 'automatic replacement forgot the hidden actual run ID'
+    assert any('step 80 · value 0.005' in label for label in after['point_labels']), 'replacement omitted the new exact metric sample'
+    assert selection() == selected_labels, 'automatic update changed selected runs'
+    assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'automatic update changed the task filter'
+    assert evaluate("return document.querySelector('#review-tab-charts').getAttribute('aria-selected');") == 'true', 'automatic update changed the active tab'
+    assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__refresh_original_document;"), 'automatic replacement changed the HTTP chart document'
+    assert evaluate("return document.querySelector('#chart-frame').getAttribute('sandbox');").split() == ['allow-same-origin'], 'automatic replacement weakened the iframe sandbox'
+
+    # Parent-owned controls continue working, while content scripts and inline
+    # event handlers remain blocked after the server snapshot is replaced.
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+    try:
+      evaluate('''const script = document.createElement('script'); script.textContent = "document.documentElement.dataset.refreshScript = 'ran'"; document.body.append(script);
+        document.querySelector('[data-chart-hit]').setAttribute('onclick', "document.documentElement.dataset.refreshHandler = 'ran'");''')
+      browser.click('[data-chart-hit]')
+      assert evaluate("return document.documentElement.dataset.refreshScript ?? null;") is None, 'replaced chart executed injected script content'
+      assert evaluate("return document.documentElement.dataset.refreshHandler ?? null;") is None, 'replaced chart executed an injected inline handler'
+      evaluate("document.querySelector('[data-chart-hit]').removeAttribute('onclick');")
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    Path('/tmp/workspace-auto-refresh.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+
+    browser.click('#auto-refresh-toggle')
+    wait_for(lambda: 'Auto updates off' in evaluate("return document.querySelector('#updated-at').textContent;"), 'pause control did not report its state')
+    paused = len(trace_records())
+    phase('publish-81')
+    wait_phase('published-81')
+    time.sleep(6)
+    assert not probes_since(paused), 'paused automatic refresh continued polling'
+    assert last_comparison_step() == 'step 80', 'paused automatic refresh changed the visible summary'
+    browser.click('#auto-refresh-toggle')
+    wait_for(lambda: last_comparison_step() == 'step 81' and any(
+      item['run_id'] == updated_run_id and '82 samples' in item['text'] for item in (loss_state() or {}).get('samples', [])),
+      'resuming automatic refresh did not catch up with the worker publication', timeout=25)
+    assert loss_state()['range'] == before['range'] and loss_state()['hidden'] == [run_id], 'pause/resume lost chart exploration state'
+
+    # Inspect the updated run's logs; another real publication must update this
+    # tab alone and leave its selection and filter intact.
+    browser.click('#clear-selection')
+    browser.click(f'input[aria-label="Select {updated_run_id} for comparison"]')
+    wait_for(lambda: evaluate("return document.querySelector('#review-title').textContent;") == updated_run_id, 'updated run did not open individually')
+    browser.click('#review-tab-logs')
+    wait_for(lambda: 'training complete' in evaluate("return document.querySelector('#run-logs').textContent;"), 'updated run log tail did not load')
+    phase('publish-log')
+    wait_phase('published-log')
+    wait_for(lambda: 'automatic refresh log fixture' in evaluate("return document.querySelector('#run-logs').textContent;"), 'new worker log bytes did not refresh the active Logs tab', timeout=25)
+    assert evaluate("return document.querySelector('#review-tab-logs').getAttribute('aria-selected');") == 'true', 'log refresh changed the active tab'
+    assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'log refresh changed the task filter'
+    phase('complete')
+    print('Firefox auto refresh passed: real finalized worker publications, five-second probes, unchanged snapshots skipped, active drag deferred, exact samples/summary, absolute zoom and hidden run preserved, pause/resume, live Logs tab, sandbox/CSP retained.', flush=True)
+  except Exception:
+    try:
+      browser.call('POST', '/frame', {'id': None})
+      state = loss_state()
+      if state:
+        state['point_count'] = len(state['point_labels'])
+        state['point_labels'] = state['point_labels'][-4:]
+      print('Firefox auto refresh failure state: ' + json.dumps({
+        'last_comparison_step': last_comparison_step(), 'loss_state': state,
+        'freshness': evaluate("return document.querySelector('#updated-at')?.textContent;"),
+        'request_counts': data_counts(),
+      }), flush=True)
+      Path('/tmp/workspace-auto-refresh.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+    except Exception:
+      print('Firefox auto refresh failure state was unavailable.', flush=True)
+    raise
+  finally:
+    browser.close()
+
+
 if __name__ == '__main__':
   if len(sys.argv) == 4 and sys.argv[1] == '--workspace':
     workspace(sys.argv[2], sys.argv[3])
   elif len(sys.argv) == 4 and sys.argv[1] == '--previews':
     previews(sys.argv[2], sys.argv[3])
+  elif len(sys.argv) == 4 and sys.argv[1] == '--auto-refresh':
+    automatic_refresh(sys.argv[2], sys.argv[3])
   else:
     forms()

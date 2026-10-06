@@ -52,6 +52,13 @@ function zoomChartRange(range, full_range, factor, center_fraction = 0.5) {
   if (next_start + span > full_end) next_start = full_end - span;
   return { start_step: String(next_start), end_step: String(next_start + span) };
 }
+function restoreChartRange(range, full_range) {
+  const [full_start, full_end] = steps(full_range);
+  if (range === null) return full_range;
+  const [start, end] = steps(range);
+  const clamp = (value) => value < full_start ? full_start : value > full_end ? full_end : value;
+  return { start_step: String(clamp(start)), end_step: String(clamp(end)) };
+}
 function nearestChartPoint(points, x, y, preferred) {
   if (preferred && points.includes(preferred) && preferred.x === x && (y === void 0 || preferred.y === y)) return preferred;
   let nearest = null, distance = Infinity, tie_distance = Infinity;
@@ -75,39 +82,171 @@ function svgNode(document2, tag, attrs) {
   for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
   return node;
 }
-function attachChartInteractions(frame) {
-  let dispose = null;
-  const enhance = () => {
-    dispose?.();
-    dispose = null;
+function plotRange(svg) {
+  const tick_steps = [...svg.querySelectorAll("text.tick")].filter((node) => Number(node.getAttribute("y")) >= BOTTOM + 12).map((node) => node.textContent?.trim() ?? "").filter((value) => /^\d{1,20}$/.test(value));
+  if (!tick_steps.length) return null;
+  const values = tick_steps.map((value) => BigInt(value)).sort((first, second) => first < second ? -1 : first > second ? 1 : 0);
+  const start = values[0], end = values[values.length - 1];
+  if (start === void 0 || end === void 0 || end > MAX_STEP) return null;
+  return { start_step: String(start), end_step: String(end) };
+}
+var PREVIEW_HTML_TAGS = new Set("html head body meta title style main p section h2 div ul li span code pre details summary table thead tbody tr th td".split(" "));
+var PREVIEW_SVG_TAGS = new Set("svg title desc line text polyline circle".split(" "));
+var PREVIEW_ATTRIBUTES = new Set("lang charset name content class id role aria-label aria-labelledby tabindex viewBox x y x1 x2 y1 y2 cx cy r fill stroke stroke-width stroke-dasharray points text-anchor transform style scope".split(" "));
+function isDashboardPreview(document2) {
+  if (document2.title !== "Run comparison \xB7 expri" || !document2.querySelector("body > main > .chart-summary")) return false;
+  if (document2.querySelectorAll("circle.point").length > 4800 || document2.querySelectorAll(".plot-scroll > svg").length > 6) return false;
+  for (const svg of document2.querySelectorAll(".plot-scroll > svg")) {
+    const section = svg.closest("section.card"), metric = section?.querySelector("h2")?.textContent;
+    const run_ids = [...section?.querySelectorAll("ul.legend li code") ?? []].map((node) => node.textContent ?? "");
+    const circles = svg.querySelectorAll("circle.point");
+    if (!metric || !run_ids.length || run_ids.length > 8 || new Set(run_ids).size !== run_ids.length || run_ids.some((id) => !id) || !plotRange(svg) || !circles.length) return false;
+    for (const circle of circles) {
+      const point = parseChartPointLabel(circle.getAttribute("aria-label") ?? "");
+      if (!point || point.run_index > run_ids.length) return false;
+      for (const attribute of ["cx", "cy"]) {
+        const value = circle.getAttribute(attribute);
+        if (value === null || !Number.isFinite(Number(value))) return false;
+      }
+    }
+  }
+  return true;
+}
+function parseDashboardPreview(markup) {
+  if (markup.length > 2 * 1024 * 1024 || new TextEncoder().encode(markup).byteLength > 2 * 1024 * 1024) return null;
+  for (const match of markup.matchAll(/<\s*([a-z][a-z0-9:-]*)\b/gi)) {
+    const tag = match[1]?.toLowerCase();
+    if (!tag || !PREVIEW_HTML_TAGS.has(tag) && !PREVIEW_SVG_TAGS.has(tag)) return null;
+  }
+  const document2 = new DOMParser().parseFromString(markup, "text/html");
+  for (const node of document2.querySelectorAll("*")) {
+    const allowed = node.namespaceURI === SVG_NS ? PREVIEW_SVG_TAGS : PREVIEW_HTML_TAGS;
+    if (![SVG_NS, "http://www.w3.org/1999/xhtml"].includes(node.namespaceURI ?? "") || !allowed.has(node.localName)) return null;
+    for (const attribute of node.attributes) if (!PREVIEW_ATTRIBUTES.has(attribute.name)) return null;
+    if (node.localName === "meta" && !(node.hasAttribute("charset") || node.getAttribute("name") === "viewport")) return null;
+    const style = node.localName === "style" ? node.textContent ?? "" : node.getAttribute("style") ?? "";
+    if (/(?:url\s*\(|@import|expression\s*\()/i.test(style)) return null;
+  }
+  return isDashboardPreview(document2) ? document2 : null;
+}
+function createChartController(frame) {
+  let plots = [], current_document = null, disposed = false;
+  let completed_source = null;
+  const clear = () => {
+    for (const plot of plots) plot.dispose();
+    plots = [];
+    current_document = null;
+  };
+  function currentSource() {
+    if (!frame.src || !frame.ownerDocument?.baseURI) return null;
+    const source = new URL(frame.src, frame.ownerDocument.baseURI), owner = new URL(frame.ownerDocument.baseURI);
+    return source.origin === owner.origin ? source : null;
+  }
+  function loadedDocument() {
     try {
       const document2 = frame.contentDocument;
-      if (!document2?.querySelectorAll || document2.querySelectorAll("circle.point").length > 4800) return;
-      if (document2.URL && frame.src && new URL(document2.URL).href !== new URL(frame.src, frame.ownerDocument?.baseURI).href) return;
-      const cleanups = [];
-      for (const svg of document2.querySelectorAll(".plot-scroll > svg")) {
-        const cleanup = enhancePlot(document2, svg);
-        if (cleanup) cleanups.push(cleanup);
-      }
-      dispose = () => {
-        for (const cleanup of cleanups) cleanup();
-      };
+      const source = currentSource();
+      if (!document2?.querySelectorAll || !source || document2.readyState !== "complete") return null;
+      return document2.URL === source.href && isDashboardPreview(document2) ? document2 : null;
+    } catch {
+      return null;
+    }
+  }
+  function enhanceDocument(document2) {
+    current_document = document2;
+    for (const svg of document2.querySelectorAll(".plot-scroll > svg")) {
+      const plot = enhancePlot(document2, svg);
+      if (plot) plots.push(plot);
+    }
+  }
+  const enhance = (completed = false) => {
+    clear();
+    if (disposed) return;
+    try {
+      const source = currentSource(), child = frame.contentDocument;
+      if (source && (completed && !child || child?.readyState === "complete" && (child.URL === source.href || child.URL.startsWith("about:neterror")))) completed_source = source.href;
+      const document2 = loadedDocument();
+      if (document2) enhanceDocument(document2);
     } catch {
     }
   };
-  frame.addEventListener("load", enhance);
+  const loaded = () => enhance(true);
+  frame.addEventListener("load", loaded);
   const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => {
-    dispose?.();
-    dispose = null;
+    completed_source = null;
+    clear();
   });
   observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
   enhance();
-  return () => {
-    frame.removeEventListener("load", enhance);
-    observer?.disconnect();
-    dispose?.();
-    dispose = null;
+  return {
+    dispose() {
+      disposed = true;
+      frame.removeEventListener("load", loaded);
+      observer?.disconnect();
+      clear();
+    },
+    isInteracting() {
+      return plots.some((plot) => plot.isInteracting());
+    },
+    previewStatus() {
+      if (disposed) return "loading";
+      try {
+        const source = currentSource();
+        if (!source) return "loading";
+        if (current_document && loadedDocument() === current_document) return "ready";
+        return completed_source === source.href ? "invalid" : "loading";
+      } catch {
+        return "loading";
+      }
+    },
+    replacePreview(markup) {
+      if (disposed || plots.some((plot) => plot.isInteracting())) return false;
+      const document2 = loadedDocument();
+      if (!document2 || document2 !== current_document) return false;
+      let next;
+      try {
+        next = parseDashboardPreview(markup);
+      } catch {
+        return false;
+      }
+      if (!next) return false;
+      const frame_focused = frame.ownerDocument.activeElement === frame;
+      const states = new Map(plots.map((plot) => {
+        const state = plot.capture();
+        if (!frame_focused) state.focus = null;
+        return [state.metric_name, state];
+      }));
+      const window2 = document2.defaultView, parent = frame.ownerDocument.defaultView;
+      const scroll = { x: window2?.scrollX ?? 0, y: window2?.scrollY ?? 0, parent_x: parent?.scrollX ?? 0, parent_y: parent?.scrollY ?? 0 };
+      const previous_details = document2.querySelector("details.parameter-comparison");
+      const details_open = previous_details?.open ?? false, details_focused = frame_focused && document2.activeElement === previous_details?.querySelector("summary");
+      const parameter_scroll = previous_details?.querySelector(".table-scroll")?.scrollLeft ?? 0;
+      const head = [...next.head.childNodes].map((node) => document2.importNode(node, true));
+      const body = [...next.body.childNodes].map((node) => document2.importNode(node, true));
+      clear();
+      document2.head.replaceChildren(...head);
+      document2.body.replaceChildren(...body);
+      enhanceDocument(document2);
+      for (const plot of plots) {
+        const state = states.get(plot.capture().metric_name);
+        if (state) plot.restore(state);
+      }
+      const details = document2.querySelector("details.parameter-comparison");
+      if (details) {
+        details.open = details_open;
+        if (details_focused) details.querySelector("summary")?.focus({ preventScroll: true });
+        const table = details.querySelector(".table-scroll");
+        if (table) table.scrollLeft = parameter_scroll;
+      }
+      window2?.scrollTo(scroll.x, scroll.y);
+      parent?.scrollTo(scroll.parent_x, scroll.parent_y);
+      return true;
+    }
   };
+}
+function attachChartInteractions(frame) {
+  const controller = createChartController(frame);
+  return () => controller.dispose();
 }
 function enhancePlot(document2, svg) {
   const section = svg.closest("section.card");
@@ -115,13 +254,10 @@ function enhancePlot(document2, svg) {
   const legend = section?.querySelector("ul.legend");
   if (!section || !region || !legend || section.hasAttribute("data-interactive-chart")) return null;
   const x_ticks = [...svg.querySelectorAll("text.tick")].filter((node) => Number(node.getAttribute("y")) >= BOTTOM + 12);
-  const tick_steps = x_ticks.map((node) => node.textContent?.trim() ?? "").filter((value) => /^\d{1,20}$/.test(value));
-  if (!tick_steps.length) return null;
-  const sorted_steps = tick_steps.map((value) => BigInt(value)).sort((first, second) => first < second ? -1 : first > second ? 1 : 0);
-  if ((sorted_steps[sorted_steps.length - 1] ?? MAX_STEP + 1n) > MAX_STEP) return null;
-  const full_range = { start_step: String(sorted_steps[0]), end_step: String(sorted_steps[sorted_steps.length - 1]) };
-  steps(full_range);
-  let range = full_range, keyboard_index = -1;
+  const parsed_range = plotRange(svg);
+  if (!parsed_range) return null;
+  const full_range = parsed_range;
+  let range = full_range, follow_full = true, keyboard_index = -1, keyboard_anchor = null;
   let drag_start = null;
   const listeners = [];
   const original_nodes = [...svg.childNodes];
@@ -255,6 +391,7 @@ function enhancePlot(document2, svg) {
     readout.setAttribute("aria-live", announce ? "polite" : "off");
     readout_values.replaceChildren();
     clearHighlights();
+    keyboard_anchor = announce && anchor ? anchor : null;
     let first = true;
     for (const item of series.values()) {
       if (!item.visible || !item.points.length) continue;
@@ -309,14 +446,16 @@ function enhancePlot(document2, svg) {
     range_label.setAttribute("data-end-step", range.end_step);
     zoom_in.disabled = start === end || span <= 1n;
     zoom_out.disabled = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
-    reset.disabled = zoom_out.disabled;
+    reset.disabled = zoom_out.disabled && follow_full;
     crosshair.setAttribute("display", "none");
     clearHighlights();
     readout_values.replaceChildren(html(document2, "span", "Hover or use arrow keys to inspect displayed samples."));
     keyboard_index = -1;
+    keyboard_anchor = null;
   }
   function applyRange(next) {
     range = next;
+    follow_full = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
     selection.setAttribute("display", "none");
     draw();
   }
@@ -372,6 +511,12 @@ function enhancePlot(document2, svg) {
       selection.setAttribute("display", "none");
     }
   });
+  listen(hit, "lostpointercapture", (event) => {
+    if (drag_start?.pointer_id === event.pointerId) {
+      drag_start = null;
+      selection.setAttribute("display", "none");
+    }
+  });
   listen(hit, "pointerleave", () => {
     if (!drag_start) crosshair.setAttribute("display", "none");
   });
@@ -394,22 +539,188 @@ function enhancePlot(document2, svg) {
     }
   });
   draw();
-  return () => {
-    for (const remove of listeners) remove();
-    for (const [item, children] of original_legends) item.replaceChildren(...children);
-    for (const [node, attributes] of original_attributes) {
-      for (const [name, value] of Object.entries(attributes)) value === null ? node.removeAttribute(name) : node.setAttribute(name, value);
+  return {
+    isInteracting() {
+      return drag_start !== null;
+    },
+    capture() {
+      const active = document2.activeElement;
+      let focus = active === region ? "plot" : active === zoom_in ? "zoom-in" : active === zoom_out ? "zoom-out" : active === reset ? "reset" : null;
+      for (const item2 of series.values()) if (active === item2.button) focus = `run:${item2.run_id}`;
+      const anchored = keyboard_anchor, item = anchored && series.get(anchored.run_index);
+      const anchor = anchored && item ? {
+        run_id: item.run_id,
+        step: anchored.step,
+        value_text: anchored.value_text,
+        occurrence: item.points.filter((point) => point.step === anchored.step && point.value_text === anchored.value_text).indexOf(anchored)
+      } : null;
+      return {
+        metric_name,
+        range: follow_full ? null : { ...range },
+        hidden_run_ids: [...series.values()].filter((item2) => !item2.visible).map((item2) => item2.run_id),
+        keyboard_anchor: anchor,
+        focus,
+        scroll_left: region.scrollLeft,
+        scroll_top: region.scrollTop
+      };
+    },
+    restore(state) {
+      range = restoreChartRange(state.range, full_range);
+      follow_full = state.range === null;
+      for (const item2 of series.values()) item2.visible = !state.hidden_run_ids.includes(item2.run_id);
+      draw();
+      const anchor = state.keyboard_anchor, item = anchor && [...series.values()].find((item2) => item2.run_id === anchor.run_id);
+      const point = anchor && item && available(item).filter((point2) => point2.step === anchor.step && point2.value_text === anchor.value_text)[anchor.occurrence];
+      if (point) {
+        showAt(point.x, point.y, false, point);
+        keyboard_anchor = point;
+      }
+      const focus = state.focus;
+      const focused = focus === "plot" ? region : focus === "zoom-in" ? zoom_in : focus === "zoom-out" ? zoom_out : focus === "reset" ? reset : [...series.values()].find((item2) => focus === `run:${item2.run_id}`)?.button;
+      if (focused && !(focused.tagName === "BUTTON" && focused.disabled)) focused.focus({ preventScroll: true });
+      else if (focus) region.focus({ preventScroll: true });
+      region.scrollLeft = state.scroll_left;
+      region.scrollTop = state.scroll_top;
+    },
+    dispose() {
+      for (const remove of listeners) remove();
+      for (const [item, children] of original_legends) item.replaceChildren(...children);
+      for (const [node, attributes] of original_attributes) {
+        for (const [name, value] of Object.entries(attributes)) value === null ? node.removeAttribute(name) : node.setAttribute(name, value);
+      }
+      svg.replaceChildren(...original_nodes);
+      styles.remove();
+      controls.remove();
+      hint.remove();
+      readout.remove();
+      if (original_description === null) region.removeAttribute("aria-describedby");
+      else region.setAttribute("aria-describedby", original_description);
+      section.removeAttribute("data-interactive-chart");
     }
-    svg.replaceChildren(...original_nodes);
-    styles.remove();
-    controls.remove();
-    hint.remove();
-    readout.remove();
-    if (original_description === null) region.removeAttribute("aria-describedby");
-    else region.setAttribute("aria-describedby", original_description);
-    section.removeAttribute("data-interactive-chart");
   };
 }
+
+// auto_refresh.ts
+var AutoRefresh = class {
+  constructor(options) {
+    this.options = options;
+    this.clock = options.clock ?? { now: () => Date.now(), set_timeout: (callback, delay) => setTimeout(callback, delay), clear_timeout: (timer) => clearTimeout(timer) };
+    this.interval_ms = options.interval_ms ?? 5e3;
+    this.retry_ms = this.interval_ms;
+    this.previous_availability = options.availability();
+  }
+  options;
+  clock;
+  timer = null;
+  enabled = true;
+  disposed = false;
+  running = false;
+  generation = 0;
+  interval_ms;
+  retry_ms;
+  failed = false;
+  resume_immediately = false;
+  previous_availability;
+  start() {
+    this.schedule(this.interval_ms);
+  }
+  setEnabled(enabled) {
+    if (this.disposed || this.enabled === enabled) return;
+    this.enabled = enabled;
+    this.interrupt();
+    if (enabled && this.running) this.resume_immediately = true;
+    if (enabled && !this.running) this.schedule(0);
+  }
+  setInterval(delay_ms) {
+    this.interval_ms = delay_ms;
+    if (!this.failed) this.retry_ms = delay_ms;
+  }
+  interrupt() {
+    this.generation++;
+    this.clearTimer();
+    this.options.cancel();
+    if (!this.running) this.schedule(this.retry_ms);
+    else this.publish();
+  }
+  availabilityChanged() {
+    const availability = this.options.availability();
+    const was_paused = this.previous_availability === "hidden" || this.previous_availability === "offline";
+    this.previous_availability = availability;
+    if (availability === "hidden" || availability === "offline") this.interrupt();
+    else if (was_paused) {
+      this.resume_immediately = true;
+      this.clearTimer();
+      if (!this.running) {
+        this.resume_immediately = false;
+        this.schedule(0);
+      } else this.publish();
+    } else this.publish();
+  }
+  refreshCompleted(success) {
+    if (success) {
+      this.failed = false;
+      this.retry_ms = this.interval_ms;
+    }
+    this.clearTimer();
+    if (!this.running) this.schedule(this.retry_ms);
+    else this.publish();
+  }
+  dispose() {
+    this.disposed = true;
+    this.enabled = false;
+    this.generation++;
+    this.clearTimer();
+    this.options.cancel();
+  }
+  clearTimer() {
+    if (this.timer !== null) this.clock.clear_timeout(this.timer);
+    this.timer = null;
+  }
+  publish() {
+    this.options.on_state({ enabled: this.enabled, availability: this.options.availability(), running: this.running, interval_ms: this.interval_ms, retry_ms: this.retry_ms, failed: this.failed });
+  }
+  schedule(delay_ms) {
+    this.clearTimer();
+    if (this.disposed) return;
+    const availability = this.options.availability();
+    this.previous_availability = availability;
+    if (this.enabled && !this.running && availability !== "hidden" && availability !== "offline") this.timer = this.clock.set_timeout(() => {
+      this.timer = null;
+      void this.tick();
+    }, delay_ms);
+    this.publish();
+  }
+  async tick() {
+    if (this.disposed || !this.enabled || this.running) return;
+    if (this.options.availability() !== "ready") {
+      this.schedule(this.retry_ms);
+      return;
+    }
+    this.running = true;
+    const generation = this.generation;
+    this.publish();
+    let outcome;
+    try {
+      outcome = await this.options.run();
+    } catch {
+      outcome = "failure";
+    }
+    this.running = false;
+    if (this.disposed) return;
+    if (generation === this.generation) {
+      if (outcome === "success") {
+        this.failed = false;
+        this.retry_ms = this.interval_ms;
+      } else if (outcome === "failure") {
+        this.failed = true;
+        this.retry_ms = Math.min(6e4, Math.max(this.interval_ms, this.retry_ms * 2));
+      }
+    }
+    const delay = this.resume_immediately ? 0 : this.retry_ms;
+    this.resume_immediately = false;
+    this.schedule(delay);
+  }
+};
 
 // app.ts
 function apiUrl(path, fields) {
@@ -435,15 +746,57 @@ function formatDuration(run) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 }
+var RequestError = class extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+  status;
+};
+async function boundedText(response, maximum_bytes) {
+  const declared = response.headers?.get("content-length");
+  if (declared && Number(declared) > maximum_bytes) throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+  if (!response.body?.getReader) {
+    const value2 = await response.text();
+    if (new TextEncoder().encode(value2).length > maximum_bytes) throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+    return value2;
+  }
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let length = 0, value = "";
+  try {
+    for (; ; ) {
+      const part = await reader.read();
+      if (part.done) break;
+      length += part.value.byteLength;
+      if (length > maximum_bytes) {
+        await reader.cancel();
+        throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+      }
+      value += decoder.decode(part.value, { stream: true });
+    }
+    return value + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
 var RequestLane = class {
   controller = null;
   generation = 0;
+  get pending() {
+    return this.controller !== null;
+  }
   cancel() {
     this.controller?.abort();
     this.controller = null;
     this.generation++;
   }
-  async run(url) {
+  run(url) {
+    return this.request(url, (response) => response.json());
+  }
+  runText(url, maximum_bytes = 2 * 1024 * 1024) {
+    return this.request(url, (response) => boundedText(response, maximum_bytes));
+  }
+  async request(url, parse) {
     this.cancel();
     const generation = this.generation;
     const controller = new AbortController();
@@ -456,19 +809,25 @@ var RequestLane = class {
         if (typeof location !== "undefined") location.assign("/login");
         return void 0;
       }
-      const value = await response.json();
-      if (generation !== this.generation) return void 0;
       if (!response.ok) {
-        const error = value;
-        throw new Error(error.error ?? `Request failed (${response.status})`);
+        let message = `Request failed (${response.status})`;
+        try {
+          const error = await response.json();
+          message = error.error ?? message;
+        } catch {
+        }
+        if (generation !== this.generation) return void 0;
+        throw new RequestError(message, response.status);
       }
-      return value;
+      const value = await parse(response);
+      return generation === this.generation ? value : void 0;
     } catch (error) {
       if (generation !== this.generation) return void 0;
       if (controller.signal.aborted) throw new Error("The request timed out. Try Refresh when the connection is available.");
       throw error;
     } finally {
       clearTimeout(timeout);
+      if (this.controller === controller) this.controller = null;
     }
   }
 };
@@ -523,9 +882,11 @@ function card(title) {
 function jsonObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
-function startDashboard() {
+function startDashboard(options = {}) {
+  const page_document = document;
+  const page_window = typeof window === "undefined" ? null : window;
   const source_select = required("source-select");
-  attachChartInteractions(required("chart-frame"));
+  const chart_controller = options.chart_controller ?? createChartController(required("chart-frame"));
   const refresh_button = required("refresh-button");
   const search_input = required("search-input");
   const task_input = required("task-input");
@@ -539,6 +900,30 @@ function startDashboard() {
   const review_lane = new RequestLane();
   const log_lane = new RequestLane();
   const compare_lane = new RequestLane();
+  const chart_lane = new RequestLane();
+  const quiet_lanes = { updates: new RequestLane(), catalog: new RequestLane(), list: new RequestLane(), detail: new RequestLane(), comparison: new RequestLane(), log: new RequestLane(), chart: new RequestLane() };
+  const foreground_lanes = [catalog_lane, list_lane, review_lane, log_lane, compare_lane, chart_lane];
+  const now = options.refresh_clock?.now ?? (() => Date.now());
+  const auto_toggle = required("auto-refresh-toggle");
+  auto_toggle.checked = true;
+  let auto_refresh = null;
+  let quiet_generation = 0;
+  let updates_supported = true;
+  let catalog_revision;
+  const source_revisions = /* @__PURE__ */ new Map();
+  const detail_revisions = /* @__PURE__ */ new Map();
+  const chart_revisions = /* @__PURE__ */ new Map();
+  const log_revisions = /* @__PURE__ */ new Map();
+  let comparison_revision = null;
+  let last_catalog = null;
+  let last_run_list = null;
+  let last_run_list_context = "";
+  let list_ready = false;
+  let last_catalog_snapshot = -Infinity;
+  let last_list_snapshot = -Infinity;
+  let last_full_snapshot = -Infinity;
+  let last_checked = null;
+  let cached_chart = null;
   let sources = [];
   let source_id = "local";
   let access_mode = "local";
@@ -547,16 +932,63 @@ function startDashboard() {
   let offset = 0;
   let next_offset = null;
   let review = null;
+  let missing_review = null;
   let metric_names = [];
   let search_timeout;
   let selection_timeout;
   let refresh_generation = 0;
   let log_view = null;
+  let rendered_detail = null;
+  let rendered_comparison = null;
   const selected = /* @__PURE__ */ new Set();
   const detail_cache = /* @__PURE__ */ new Map();
   const row_checks = /* @__PURE__ */ new Map();
   const row_buttons = /* @__PURE__ */ new Map();
   const review_tabs = ["charts", "overview", "logs"];
+  function abortQuietRequests() {
+    quiet_generation++;
+    for (const lane of Object.values(quiet_lanes)) lane.cancel();
+  }
+  function cancelQuietRefresh() {
+    if (auto_refresh) auto_refresh.interrupt();
+    else abortQuietRequests();
+  }
+  function availability() {
+    if (document.visibilityState === "hidden") return "hidden";
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return "offline";
+    return foreground_lanes.some((lane) => lane.pending) || search_timeout !== void 0 || selection_timeout !== void 0 ? "busy" : "ready";
+  }
+  function showFreshness(state) {
+    const checked = last_checked === null ? "Waiting for updates" : `Last checked at ${new Date(last_checked).toLocaleTimeString()}`;
+    const activity = !state.enabled ? "Auto updates off" : state.availability === "hidden" ? "Auto updates paused while hidden" : state.availability === "offline" ? "Offline \xB7 updates resume when connected" : state.failed ? `Updates unavailable \xB7 retrying in ${state.retry_ms / 1e3}s` : `Auto updates every ${state.interval_ms / 1e3}s`;
+    required("updated-at").textContent = `${checked} \xB7 ${activity}`;
+  }
+  function listUrl() {
+    return apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset });
+  }
+  function chartUrl() {
+    return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [] });
+  }
+  function comparisonUrl() {
+    return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction: required("reduction-select").value });
+  }
+  function boundedSet(cache, key, value) {
+    cache.delete(key);
+    cache.set(key, value);
+    while (cache.size > 16) {
+      const oldest = cache.keys().next().value;
+      if (oldest === void 0) break;
+      cache.delete(oldest);
+    }
+  }
+  function clearSearchTimeout() {
+    clearTimeout(search_timeout);
+    search_timeout = void 0;
+  }
+  function clearSelectionTimeout() {
+    clearTimeout(selection_timeout);
+    selection_timeout = void 0;
+  }
   function announce(message) {
     required("live-status").textContent = message;
   }
@@ -622,7 +1054,7 @@ function startDashboard() {
       row_buttons.set(run.run_id, button);
       button.addEventListener("click", () => {
         cancelRefresh();
-        clearTimeout(selection_timeout);
+        clearSelectionTimeout();
         void openRun(run.run_id);
       });
       const metadata = [dateText(run.started_at), formatDuration(run)].filter((value) => value !== "\u2014");
@@ -635,11 +1067,46 @@ function startDashboard() {
       row.append(check_cell, run_cell, status_cell);
       rows.append(row);
     }
-    if (focused_check) row_checks.get(focused_check)?.focus();
-    else if (focused_button) row_buttons.get(focused_button)?.focus();
+    if (focused_check) row_checks.get(focused_check)?.focus({ preventScroll: true });
+    else if (focused_button) row_buttons.get(focused_button)?.focus({ preventScroll: true });
+  }
+  function applyRunList(result, context, quiet = false) {
+    const unchanged = last_run_list_context === context && JSON.stringify(last_run_list) === JSON.stringify(result);
+    const was_ready = list_ready;
+    list_ready = true;
+    last_run_list = result;
+    last_run_list_context = context;
+    last_list_snapshot = now();
+    if (quiet && unchanged && was_ready) return;
+    runs = result.runs;
+    offset = result.offset;
+    next_offset = result.next_offset;
+    if (!quiet || !unchanged) {
+      renderRows();
+      warnings(required("list-warnings"), result.warnings);
+    }
+    required("run-count").textContent = result.total_count ? `${offset + 1}\u2013${offset + runs.length} of ${result.total_count.toLocaleString()} runs` : "No matching runs";
+    required("page-label").textContent = `Page ${Math.floor(offset / page_size) + 1}`;
+    previous_page.disabled = offset === 0;
+    next_page.disabled = next_offset === null;
+    const empty = required("list-empty");
+    empty.hidden = runs.length > 0;
+    if (!runs.length) {
+      showEmptyRuns(Boolean(search_input.value || task_input.value || status_select.value), result.source);
+    }
+    const options2 = required("task-options");
+    options2.replaceChildren();
+    for (const task of [...new Set(runs.map((run) => run.task).filter((task2) => task2 !== null))].sort()) {
+      const option = element("option");
+      option.value = task;
+      options2.append(option);
+    }
+    required("runs-region").setAttribute("aria-busy", "false");
+    announce(`${result.total_count} matching runs`);
   }
   async function loadRuns() {
     if (!source_id) return false;
+    list_ready = false;
     global_error.hidden = true;
     required("runs-region").setAttribute("aria-busy", "true");
     for (const control of rows.querySelectorAll("input, button")) control.disabled = true;
@@ -647,31 +1114,10 @@ function startDashboard() {
     next_page.disabled = true;
     required("run-count").textContent = "Loading run history\u2026";
     try {
-      const result = await list_lane.run(apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }));
+      const url = listUrl();
+      const result = await list_lane.run(url);
       if (!result) return false;
-      runs = result.runs;
-      offset = result.offset;
-      next_offset = result.next_offset;
-      renderRows();
-      warnings(required("list-warnings"), result.warnings);
-      required("run-count").textContent = result.total_count ? `${offset + 1}\u2013${offset + runs.length} of ${result.total_count.toLocaleString()} runs` : "No matching runs";
-      required("page-label").textContent = `Page ${Math.floor(offset / page_size) + 1}`;
-      previous_page.disabled = offset === 0;
-      next_page.disabled = next_offset === null;
-      const empty = required("list-empty");
-      empty.hidden = runs.length > 0;
-      if (!runs.length) {
-        showEmptyRuns(Boolean(search_input.value || task_input.value || status_select.value), result.source);
-      }
-      const options = required("task-options");
-      options.replaceChildren();
-      for (const task of [...new Set(runs.map((run) => run.task).filter((task2) => task2 !== null))].sort()) {
-        const option = element("option");
-        option.value = task;
-        options.append(option);
-      }
-      required("runs-region").setAttribute("aria-busy", "false");
-      announce(`${result.total_count} matching runs`);
+      applyRunList(result, url);
       return true;
     } catch (error) {
       showError(global_error, error);
@@ -682,16 +1128,18 @@ function startDashboard() {
     }
   }
   function cancelRefresh() {
+    cancelQuietRefresh();
     refresh_generation++;
     catalog_lane.cancel();
     refresh_button.disabled = false;
   }
   function hideReview() {
-    clearTimeout(selection_timeout);
+    clearSelectionTimeout();
     review_lane.cancel();
     log_lane.cancel();
     compare_lane.cancel();
     review = null;
+    missing_review = null;
     log_view = null;
     required("review-section").hidden = true;
     required("review-empty").hidden = false;
@@ -708,7 +1156,7 @@ function startDashboard() {
     showSelection(true);
   }
   function showSelection(debounce) {
-    clearTimeout(selection_timeout);
+    clearSelectionTimeout();
     const ids = [...selected];
     if (!ids.length) {
       hideReview();
@@ -719,6 +1167,7 @@ function startDashboard() {
     const pending_review = review;
     metric_names = [...new Set(ids.flatMap((id) => Object.keys(detail_cache.get(id)?.metrics ?? {})))].sort();
     const open = () => {
+      selection_timeout = void 0;
       if (review !== pending_review) return;
       if (ids.length === 1 && ids[0]) void loadRun(ids[0]);
       else void loadComparison();
@@ -727,13 +1176,21 @@ function startDashboard() {
     else open();
   }
   function beginReview(kind, ids, origin = "inspection") {
-    clearTimeout(selection_timeout);
+    clearSelectionTimeout();
     review_lane.cancel();
     log_lane.cancel();
     compare_lane.cancel();
+    detail_revisions.clear();
+    chart_revisions.clear();
+    log_revisions.clear();
+    comparison_revision = null;
+    missing_review = null;
     review = { kind, origin, run_ids: ids, metric_names: [], metric_selection_set: false, tab: "charts", log_stream: "stdout" };
     metric_names = [];
     log_view = null;
+    rendered_detail = null;
+    rendered_comparison = null;
+    cached_chart = null;
     required("review-section").hidden = false;
     required("review-empty").hidden = true;
     required("review-title").textContent = kind === "run" ? ids[0] ?? "Run" : `${ids.length} runs`;
@@ -765,6 +1222,7 @@ function startDashboard() {
   }
   function selectReviewTab(tab) {
     if (!review || review.kind === "compare" && tab !== "charts") return;
+    cancelQuietRefresh();
     review.tab = tab;
     syncReviewTabs();
     if (tab === "logs") ensureLog();
@@ -775,8 +1233,13 @@ function startDashboard() {
   }
   function updateChart() {
     if (!review) return;
-    const url = apiUrl("/api/chart", { source: source_id, run_id: review.run_ids, metric: review.metric_names });
-    required("chart-frame").src = url;
+    const url = chartUrl();
+    const frame = required("chart-frame");
+    if (frame.getAttribute("src") !== url) {
+      frame.src = url;
+      chart_revisions.delete(url);
+      cached_chart = null;
+    }
     required("open-chart").href = url;
     required("chart-card").hidden = false;
     required("chart-note").textContent = review.metric_names.length ? `${review.metric_names.length} selected metrics \xB7 at most 600 chart points per series` : "First four recorded metrics \xB7 at most 600 chart points per series";
@@ -848,10 +1311,15 @@ function startDashboard() {
     }
   }
   function ensureLog() {
-    if (review?.kind === "run" && review.tab === "logs" && log_view && !log_view.loaded && !log_view.pending) void loadLog(log_view);
+    if (review?.kind === "run" && review !== missing_review && review.tab === "logs" && log_view && !log_view.loaded && !log_view.pending) void loadLog(log_view);
   }
-  function renderDetail(detail) {
+  function containsFocus(parent) {
+    return parent.contains(document.activeElement);
+  }
+  function renderOverview(detail) {
     const parent = required("run-detail");
+    const expanded = new Set([...parent.querySelectorAll("details")].filter((node) => node.open).map((node) => node.querySelectorAll("summary")[0]?.textContent));
+    const focused = [...parent.querySelectorAll("summary")].find((node) => node === document.activeElement)?.textContent;
     parent.replaceChildren();
     parent.hidden = false;
     const grid = element("div", "", "detail-grid");
@@ -911,13 +1379,26 @@ function startDashboard() {
     } else metrics.append(element("p", "No metric summaries are available. Record metrics in outputs/metrics.jsonl or pull remote metrics.", "muted"));
     if (detail.metrics_truncated) metrics.append(element("p", `Showing ${names.length} of ${detail.metric_count} summaries. Use Chart metrics to select another series by its exact name.`, "muted"));
     parent.append(metrics);
+    for (const node of parent.querySelectorAll("details")) {
+      const summary = node.querySelectorAll("summary")[0];
+      node.open = expanded.has(summary?.textContent);
+      if (focused && summary?.textContent === focused) summary.focus({ preventScroll: true });
+    }
+  }
+  function renderDetail(detail, preserve = false) {
+    const names = Object.keys(detail.metrics).sort(), picker = required("run-metric-options");
+    const choices_changed = JSON.stringify(metric_names) !== JSON.stringify(names);
+    if (preserve && choices_changed && containsFocus(picker)) return false;
+    if (!preserve || JSON.stringify(rendered_detail) !== JSON.stringify(detail)) renderOverview(detail);
+    rendered_detail = detail;
     metric_names = names;
     if (review && !review.metric_selection_set) {
       review.metric_names = names.slice(0, 4);
       review.metric_selection_set = true;
     }
-    metricPicker(required("run-metric-options"), names, updateChart);
+    if (!preserve || choices_changed) metricPicker(picker, names, updateChart);
     required("run-metric-controls").hidden = false;
+    if (preserve && log_view?.run_id === detail.run.run_id) return true;
     const logs = card("Log tail");
     const tabs = element("div", "", "log-tabs");
     tabs.setAttribute("role", "tablist");
@@ -937,6 +1418,7 @@ function startDashboard() {
       button.setAttribute("aria-selected", String(stream === selected_stream));
       button.tabIndex = stream === selected_stream ? 0 : -1;
       button.addEventListener("click", () => {
+        cancelQuietRefresh();
         log_lane.cancel();
         if (review) review.log_stream = stream;
         for (const item of buttons) {
@@ -963,7 +1445,8 @@ function startDashboard() {
     required("run-logs").replaceChildren(logs);
     log_view = { run_id: detail.run.run_id, stream: selected_stream, output, note, loaded: false, pending: false };
     ensureLog();
-    updateChart();
+    if (!preserve || !required("chart-frame").src) updateChart();
+    return true;
   }
   async function openRun(id, origin = "inspection", previous) {
     beginReview("run", [id], origin);
@@ -976,10 +1459,10 @@ function startDashboard() {
     }
     await loadRun(id);
   }
-  async function loadRun(id) {
+  async function loadRun(id, preserve = false) {
     try {
       const detail = await review_lane.run(apiUrl("/api/run", { source: source_id, run_id: id }));
-      if (!detail) return;
+      if (!detail) return false;
       detail_cache.delete(id);
       detail_cache.set(id, detail);
       while (detail_cache.size > 9) {
@@ -989,14 +1472,18 @@ function startDashboard() {
       }
       required("review-loading").hidden = true;
       warnings(required("review-warnings"), detail.warnings);
-      renderDetail(detail);
-      announce(`Opened ${id}`);
+      if (!renderDetail(detail, preserve)) return false;
+      if (!preserve) announce(`Opened ${id}`);
+      return true;
     } catch (error) {
       required("review-loading").hidden = true;
       showError(required("review-error"), error);
+      return false;
     }
   }
   function renderComparison(result) {
+    if (JSON.stringify(rendered_comparison) === JSON.stringify(result)) return;
+    rendered_comparison = result;
     const comparison = result.comparison;
     const parent = required("comparison-values");
     parent.replaceChildren();
@@ -1026,15 +1513,17 @@ function startDashboard() {
     if (!comparison.metric_names.length) parent.append(element("p", "No recorded metrics match this selection.", "muted"));
     warnings(required("review-warnings"), comparison.warnings);
   }
-  async function loadComparison() {
-    if (!review || review.kind !== "compare") return;
+  async function loadComparison(preserve = false) {
+    if (!review || review.kind !== "compare") return false;
     required("review-error").hidden = true;
     required("comparison-values").setAttribute("aria-busy", "true");
-    required("chart-card").hidden = true;
+    if (!rendered_comparison) required("chart-card").hidden = true;
     try {
-      const result = await compare_lane.run(apiUrl("/api/compare", { source: source_id, run_id: review.run_ids, metric: review.metric_names, reduction: required("reduction-select").value }));
-      if (!result || !review || review.kind !== "compare") return;
-      metric_names = [.../* @__PURE__ */ new Set([...metric_names, ...result.comparison.metric_names])].sort();
+      const result = await compare_lane.run(comparisonUrl());
+      if (!result || !review || review.kind !== "compare") return false;
+      const names = [.../* @__PURE__ */ new Set([...metric_names, ...result.comparison.metric_names])].sort();
+      const choices_changed = JSON.stringify(names) !== JSON.stringify(metric_names), initial = !rendered_comparison;
+      metric_names = names;
       if (!review.metric_selection_set) {
         review.metric_names = result.comparison.metric_names.slice(0, 4);
         review.metric_selection_set = true;
@@ -1043,14 +1532,16 @@ function startDashboard() {
       required("compare-detail").hidden = false;
       renderComparison(result);
       required("comparison-values").setAttribute("aria-busy", "false");
-      metricPicker(required("compare-metric-options"), metric_names, () => {
+      if (!preserve || initial || choices_changed) metricPicker(required("compare-metric-options"), metric_names, () => {
         void loadComparison();
       });
-      updateChart();
+      if (!preserve || !required("chart-frame").src) updateChart();
+      return true;
     } catch (error) {
       required("review-loading").hidden = true;
       required("comparison-values").setAttribute("aria-busy", "false");
       showError(required("review-error"), error);
+      return false;
     }
   }
   function openComparison() {
@@ -1064,93 +1555,295 @@ function startDashboard() {
     const source = sources.find((item) => item.source_id === source_id);
     const note = required("source-note");
     note.hidden = !source;
-    note.textContent = source?.kind === "service" ? "Synced results \xB7 Updates arrive from workers. Refresh to read the latest synced files." : source?.kind === "cached" ? "Cached remote results \xB7 Recorded status may be older than the remote run. Pull updated results with expri runs pull, then Refresh here." : "Local results \xB7 Status comes from recorded run files. Refresh to read the latest changes.";
+    note.textContent = source?.kind === "service" ? "Synced results \xB7 Updates arrive when workers sync their recorded files." : source?.kind === "cached" ? "Cached remote results \xB7 Pull updated results with expri runs pull; this dashboard watches the local cache." : "Local results \xB7 Status and updates come from recorded run files.";
+  }
+  function applyCatalog(catalog, quiet = false) {
+    last_catalog_snapshot = now();
+    if (quiet && JSON.stringify(last_catalog) === JSON.stringify(catalog)) return;
+    last_catalog = catalog;
+    sources = catalog.sources;
+    access_mode = catalog.access_mode ?? "local";
+    page_size = access_mode === "hosted" ? 20 : 100;
+    required("logout-form").hidden = access_mode !== "hosted";
+    required("dashboard-kind").textContent = access_mode === "hosted" ? "expri \xB7 Synced experiment review" : "expri \xB7 Local experiment review";
+    const previous_source = source_id;
+    if (!sources.some((source) => source.source_id === source_id) || !source_select.dataset.initialized) {
+      source_id = sources.some((source) => source.source_id === catalog.initial_source) ? catalog.initial_source : sources[0]?.source_id ?? "";
+    }
+    source_select.dataset.initialized = "true";
+    if (source_id !== previous_source) {
+      offset = 0;
+      runs = [];
+      selected.clear();
+      detail_cache.clear();
+      hideReview();
+      syncSelection();
+    }
+    source_select.replaceChildren();
+    for (const source of sources) {
+      const option = element("option", source.kind === "service" ? `${source.label} \xB7 Synced` : source.label);
+      option.value = source.source_id;
+      source_select.append(option);
+    }
+    if (!sources.length) {
+      const option = element("option", "No synced sources");
+      option.value = "";
+      source_select.append(option);
+    }
+    source_select.value = source_id;
+    source_select.disabled = !sources.length;
+    for (const control of [search_input, task_input, status_select, required("clear-filters")]) control.disabled = !sources.length;
+    required("project-name").textContent = catalog.project_name;
+    document.title = `expri \xB7 ${catalog.project_name}`;
+    warnings(required("catalog-warnings"), catalog.warnings);
+    sourceNote();
+  }
+  function emptyCatalog() {
+    list_lane.cancel();
+    runs = [];
+    next_offset = null;
+    renderRows();
+    previous_page.disabled = true;
+    next_page.disabled = true;
+    required("run-count").textContent = "No synced runs yet";
+    required("page-label").textContent = "Page 1";
+    required("task-options").replaceChildren();
+    warnings(required("list-warnings"), []);
+    required("runs-region").setAttribute("aria-busy", "false");
+    required("review-empty").hidden = true;
+    showEmptyRuns(false);
+  }
+  async function refreshCurrentChart(lane) {
+    if (!review || review.tab !== "charts") return "applied";
+    if (chart_controller.isInteracting()) return "deferred";
+    const current_review = review, source = source_id, url = chartUrl(), status = chart_controller.previewStatus();
+    if (status === "loading") return "deferred";
+    if (status === "invalid") {
+      required("chart-frame").src = url;
+      chart_revisions.delete(url);
+      cached_chart = null;
+      throw new Error("The chart preview could not load. Retrying when the connection is available.");
+    }
+    const html2 = await lane.runText(url);
+    if (html2 === void 0 || review !== current_review || source_id !== source || chartUrl() !== url) return "cancelled";
+    if (cached_chart?.context === url && cached_chart.html === html2) return "applied";
+    if (!chart_controller.replacePreview(html2)) return "deferred";
+    cached_chart = { context: url, html: html2 };
+    return "applied";
+  }
+  function applyLog(view, log) {
+    const content = log.missing ? "This log has not been recorded or pulled." : log.content || "The log is empty.";
+    const output = view.output;
+    if (output.textContent !== content) {
+      const scroll_top = output.scrollTop, at_bottom = output.scrollHeight - output.clientHeight - scroll_top <= 4;
+      output.textContent = content;
+      output.scrollTop = at_bottom ? output.scrollHeight : scroll_top;
+    }
+    view.note.textContent = log.truncated ? "Showing the last 100 lines, capped at 64 KiB. Use expri runs logs for more output." : "Last 100 lines \xB7 updates arrive automatically while auto updates are on.";
+    view.loaded = true;
+  }
+  async function refreshCurrentLog(lane) {
+    const view = log_view;
+    if (review?.tab !== "logs" || !view) return true;
+    const log = await lane.run(apiUrl("/api/log", { source: source_id, run_id: view.run_id, stream: view.stream, tail: 100 }));
+    if (!log || log_view !== view || review?.tab !== "logs") return false;
+    applyLog(view, log);
+    return true;
   }
   async function refresh() {
+    cancelQuietRefresh();
     const generation = ++refresh_generation;
     refresh_button.disabled = true;
     global_error.hidden = true;
+    let successful = false;
     try {
       const catalog = await catalog_lane.run("/api/catalog");
-      if (!catalog) return;
-      if (generation !== refresh_generation) return;
-      sources = catalog.sources;
-      access_mode = catalog.access_mode ?? "local";
-      page_size = access_mode === "hosted" ? 20 : 100;
-      required("logout-form").hidden = access_mode !== "hosted";
-      required("dashboard-kind").textContent = access_mode === "hosted" ? "expri \xB7 Synced experiment review" : "expri \xB7 Local experiment review";
-      const previous_source = source_id;
-      if (!sources.some((source) => source.source_id === source_id) || !source_select.dataset.initialized) {
-        source_id = sources.some((source) => source.source_id === catalog.initial_source) ? catalog.initial_source : sources[0]?.source_id ?? "";
-      }
-      source_select.dataset.initialized = "true";
-      if (source_id !== previous_source) {
-        runs = [];
-        selected.clear();
-        hideReview();
-        syncSelection();
-      }
-      source_select.replaceChildren();
-      for (const source of sources) {
-        const option = element("option", source.kind === "service" ? `${source.label} \xB7 Synced` : source.label);
-        option.value = source.source_id;
-        source_select.append(option);
-      }
-      if (!sources.length) {
-        const option = element("option", "No synced sources");
-        option.value = "";
-        source_select.append(option);
-      }
-      source_select.value = source_id;
-      source_select.disabled = !sources.length;
-      for (const control of [search_input, task_input, status_select, required("clear-filters")]) control.disabled = !sources.length;
-      required("project-name").textContent = catalog.project_name;
-      document.title = `expri \xB7 ${catalog.project_name}`;
-      warnings(required("catalog-warnings"), catalog.warnings);
-      sourceNote();
-      detail_cache.clear();
-      offset = 0;
+      if (!catalog || generation !== refresh_generation) return;
+      applyCatalog(catalog);
       if (!source_id) {
-        list_lane.cancel();
-        runs = [];
-        next_offset = null;
-        renderRows();
-        previous_page.disabled = true;
-        next_page.disabled = true;
-        required("run-count").textContent = "No synced runs yet";
-        required("page-label").textContent = "Page 1";
-        required("task-options").replaceChildren();
-        warnings(required("list-warnings"), []);
-        required("runs-region").setAttribute("aria-busy", "false");
-        required("review-empty").hidden = true;
-        showEmptyRuns(false);
-        announce("No synced runs yet");
-        required("updated-at").textContent = "Refresh after syncing your first run.";
-        return;
+        emptyCatalog();
+        successful = true;
+      } else {
+        const current_review = review, current_source = source_id;
+        if (!await loadRuns() || generation !== refresh_generation) return;
+        if (current_review === review && current_source === source_id && current_review) {
+          if (current_review.kind === "run") {
+            const id = current_review.run_ids[0];
+            if (id && !await loadRun(id, true)) return;
+          } else if (!await loadComparison(true)) return;
+          if (generation !== refresh_generation || current_review !== review) return;
+          if (!await refreshCurrentLog(log_lane) || await refreshCurrentChart(chart_lane) !== "applied") return;
+        }
+        successful = generation === refresh_generation;
       }
-      const current_review = review;
-      const current_source = source_id;
-      if (!await loadRuns() || generation !== refresh_generation) return;
-      if (current_review === review && current_source === source_id) {
-        if (current_review?.kind === "run") {
-          const id = current_review.run_ids[0];
-          if (id) await openRun(id, current_review.origin, current_review);
-        } else if (current_review?.kind === "compare") await loadComparison();
+      if (successful) {
+        last_checked = now();
+        last_full_snapshot = now();
       }
-      if (generation === refresh_generation) required("updated-at").textContent = `Last checked at ${(/* @__PURE__ */ new Date()).toLocaleTimeString()}. Refresh for updates.`;
     } catch (error) {
       if (generation === refresh_generation) {
         showError(global_error, error);
         required("review-loading").hidden = true;
       }
     } finally {
-      if (generation === refresh_generation) refresh_button.disabled = false;
+      if (generation === refresh_generation) {
+        refresh_button.disabled = false;
+        auto_refresh?.refreshCompleted(successful);
+      }
+    }
+  }
+  async function quietRefresh() {
+    if (availability() !== "ready") return "cancelled";
+    const generation = quiet_generation;
+    const current = () => generation === quiet_generation && availability() === "ready";
+    const acknowledgements = [];
+    const deferChart = () => {
+      if (current()) for (const acknowledge of acknowledgements) acknowledge();
+      return "cancelled";
+    };
+    const full_snapshot = now() - last_full_snapshot >= 5 * 6e4;
+    const complete = () => {
+      if (!current()) return "cancelled";
+      for (const acknowledge of acknowledgements) acknowledge();
+      if (full_snapshot || !updates_supported) last_full_snapshot = now();
+      last_checked = now();
+      global_error.hidden = true;
+      return "success";
+    };
+    let updates;
+    const probed_source = source_id;
+    try {
+      if (updates_supported) {
+        try {
+          updates = await quiet_lanes.updates.run(apiUrl("/api/updates", { source: last_catalog ? source_id : "", run_id: review?.run_ids ?? [] }));
+        } catch (error) {
+          if (!(error instanceof RequestError) || error.status !== 404) throw error;
+          updates_supported = false;
+          auto_refresh?.setInterval(3e4);
+        }
+        if (!current() || updates_supported && !updates) return "cancelled";
+      }
+      const catalog_changed = updates?.catalog_revision !== null && updates?.catalog_revision !== void 0 && catalog_revision !== updates.catalog_revision;
+      if (!updates_supported || full_snapshot || catalog_changed || updates?.catalog_revision === null && now() - last_catalog_snapshot >= 3e4) {
+        const catalog = await quiet_lanes.catalog.run("/api/catalog");
+        if (!catalog || !current()) return "cancelled";
+        applyCatalog(catalog, true);
+        if (updates?.catalog_revision !== null && updates?.catalog_revision !== void 0) {
+          const revision2 = updates.catalog_revision;
+          acknowledgements.push(() => {
+            catalog_revision = revision2;
+          });
+        }
+      }
+      const source_changed = source_id !== probed_source;
+      const revision = source_changed ? void 0 : updates?.source_revision;
+      const list_changed = revision !== null && revision !== void 0 && source_revisions.get(source_id) !== revision;
+      if (!source_id) emptyCatalog();
+      else if (!updates_supported || full_snapshot || source_changed || !list_ready || last_run_list_context !== listUrl() || list_changed || revision === null && now() - last_list_snapshot >= 3e4) {
+        const url = listUrl(), result = await quiet_lanes.list.run(url);
+        if (!result || !current() || listUrl() !== url) return "cancelled";
+        applyRunList(result, url, true);
+        if (revision !== null && revision !== void 0) {
+          const source = source_id;
+          acknowledgements.push(() => boundedSet(source_revisions, source, revision));
+        }
+      }
+      const current_review = review;
+      if (current_review && !source_changed) {
+        const revisions = current_review.run_ids.map((id) => updates?.runs.find((item) => item.run_id === id));
+        if (revisions.some((item) => item?.missing)) {
+          const message = "Some selected runs are no longer available in this source. Showing the last successful preview.";
+          const notice = required("review-error");
+          if (notice.hidden || notice.textContent !== message) showError(notice, message);
+          required("review-loading").hidden = true;
+          missing_review = current_review;
+          return complete();
+        }
+        if (missing_review === current_review && revisions.every((item) => item !== void 0 && !item.missing)) {
+          missing_review = null;
+          required("review-error").hidden = true;
+          detail_revisions.clear();
+          chart_revisions.clear();
+          log_revisions.clear();
+          comparison_revision = null;
+        }
+        if (current_review.tab === "charts" && required("chart-frame").src && chart_controller.previewStatus() !== "ready") {
+          const outcome = await refreshCurrentChart(quiet_lanes.chart);
+          return outcome === "deferred" ? deferChart() : "cancelled";
+        }
+        const view_revision = JSON.stringify(revisions.map((item) => [item?.run_id, item?.metadata_revision, item?.metrics_revision, item?.missing]));
+        const force = !updates_supported || full_snapshot || revisions.some((item) => item === void 0);
+        if (current_review.kind === "run" && (current_review.tab !== "logs" || !log_view)) {
+          const id = current_review.run_ids[0];
+          if (id) {
+            const context = apiUrl("/api/run", { source: source_id, run_id: id });
+            if (force || detail_revisions.get(context) !== view_revision) {
+              const detail = await quiet_lanes.detail.run(context);
+              if (!detail || !current() || review !== current_review) return "cancelled";
+              const warnings_changed = JSON.stringify(rendered_detail?.warnings) !== JSON.stringify(detail.warnings);
+              if (!renderDetail(detail, true)) return "cancelled";
+              boundedSet(detail_cache, id, detail);
+              if (warnings_changed) warnings(required("review-warnings"), detail.warnings);
+              required("review-loading").hidden = true;
+              required("review-error").hidden = true;
+              if (!current()) return "cancelled";
+              acknowledgements.push(() => boundedSet(detail_revisions, context, view_revision));
+            }
+          }
+        } else if (current_review.kind === "compare") {
+          const context = comparisonUrl();
+          if (force || comparison_revision?.context !== context || comparison_revision.revision !== view_revision) {
+            const result = await quiet_lanes.comparison.run(context);
+            if (!result || !current() || review !== current_review || comparisonUrl() !== context) return "cancelled";
+            const names = [.../* @__PURE__ */ new Set([...metric_names, ...result.comparison.metric_names])].sort();
+            const names_changed = JSON.stringify(names) !== JSON.stringify(metric_names), picker = required("compare-metric-options");
+            if (names_changed && containsFocus(picker)) return "cancelled";
+            metric_names = names;
+            if (!current_review.metric_selection_set) {
+              current_review.metric_names = result.comparison.metric_names.slice(0, 4);
+              current_review.metric_selection_set = true;
+            }
+            renderComparison(result);
+            required("review-loading").hidden = true;
+            required("compare-detail").hidden = false;
+            required("review-error").hidden = true;
+            if (names_changed || !picker.children.length) metricPicker(picker, metric_names, () => {
+              void loadComparison();
+            });
+            if (!required("chart-frame").src) updateChart();
+            acknowledgements.push(() => {
+              comparison_revision = { context, revision: view_revision };
+            });
+          }
+        }
+        if (current_review.tab === "charts") {
+          const context = chartUrl();
+          if (force || chart_revisions.get(context) !== view_revision) {
+            const outcome = await refreshCurrentChart(quiet_lanes.chart);
+            if (outcome === "deferred") return deferChart();
+            if (outcome === "cancelled") return "cancelled";
+            if (!current() || review !== current_review) return "cancelled";
+            acknowledgements.push(() => boundedSet(chart_revisions, context, view_revision));
+          }
+        } else if (current_review.tab === "logs" && log_view) {
+          const view = log_view, context = apiUrl("/api/log", { source: source_id, run_id: view.run_id, stream: view.stream, tail: 100 });
+          const item = revisions[0], log_revision = view.stream === "stderr" ? item?.stderr_revision : item?.stdout_revision;
+          if (force || log_revision === void 0 || !log_revisions.has(context) || log_revisions.get(context) !== log_revision) {
+            if (!await refreshCurrentLog(quiet_lanes.log) || !current() || log_view !== view) return "cancelled";
+            if (log_revision !== void 0) acknowledgements.push(() => boundedSet(log_revisions, context, log_revision));
+          }
+        }
+      }
+      return complete();
+    } catch {
+      if (!current()) return "cancelled";
+      return "failure";
     }
   }
   function resetFilters() {
     cancelRefresh();
     list_lane.cancel();
-    clearTimeout(search_timeout);
+    clearSearchTimeout();
     offset = 0;
     selected.clear();
     syncSelection();
@@ -1170,6 +1863,7 @@ function startDashboard() {
   for (const input of [search_input, task_input]) input.addEventListener("input", () => {
     resetFilters();
     search_timeout = setTimeout(() => {
+      search_timeout = void 0;
       void loadRuns();
     }, 250);
   });
@@ -1178,7 +1872,7 @@ function startDashboard() {
     search_input.value = "";
     task_input.value = "";
     status_select.value = "";
-    clearTimeout(search_timeout);
+    clearSearchTimeout();
     filtersChanged();
   });
   previous_page.addEventListener("click", () => {
@@ -1195,7 +1889,7 @@ function startDashboard() {
   });
   source_select.addEventListener("change", () => {
     cancelRefresh();
-    clearTimeout(search_timeout);
+    clearSearchTimeout();
     source_id = source_select.value;
     runs = [];
     offset = 0;
@@ -1207,7 +1901,7 @@ function startDashboard() {
     void loadRuns();
   });
   refresh_button.addEventListener("click", () => {
-    clearTimeout(search_timeout);
+    clearSearchTimeout();
     void refresh();
   });
   required("clear-selection").addEventListener("click", () => {
@@ -1216,7 +1910,7 @@ function startDashboard() {
   });
   required("compare-button").addEventListener("click", () => {
     cancelRefresh();
-    clearTimeout(selection_timeout);
+    clearSelectionTimeout();
     openComparison();
   });
   required("close-review").addEventListener("click", closeReview);
@@ -1241,20 +1935,45 @@ function startDashboard() {
       }
     });
   }
+  auto_refresh = new AutoRefresh({ run: quietRefresh, availability, cancel: abortQuietRequests, on_state: showFreshness, ...options.refresh_clock ? { clock: options.refresh_clock } : {} });
+  auto_toggle.addEventListener("change", () => auto_refresh?.setEnabled(auto_toggle.checked));
+  const resume = () => auto_refresh?.availabilityChanged();
+  document.addEventListener?.("visibilitychange", resume);
+  if (typeof window !== "undefined") {
+    window.addEventListener("online", resume);
+    window.addEventListener("offline", resume);
+  }
+  auto_refresh.start();
   void refresh();
+  return () => {
+    auto_refresh?.dispose();
+    chart_controller.dispose();
+    for (const lane of foreground_lanes) lane.cancel();
+    clearSearchTimeout();
+    clearSelectionTimeout();
+    page_document.removeEventListener?.("visibilitychange", resume);
+    if (page_window) {
+      page_window.removeEventListener("online", resume);
+      page_window.removeEventListener("offline", resume);
+    }
+  };
 }
 if (typeof document !== "undefined") startDashboard();
 export {
+  AutoRefresh,
+  RequestError,
   RequestLane,
   apiUrl,
   attachChartInteractions,
   chartStepFraction,
+  createChartController,
   dragChartRange,
   formatDuration,
   formatNumber,
   formatValue,
   nearestChartPoint,
   parseChartPointLabel,
+  restoreChartRange,
   startDashboard,
   zoomChartRange
 };

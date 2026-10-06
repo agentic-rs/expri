@@ -1,5 +1,7 @@
-import { attachChartInteractions } from "./interactive_charts";
+import { createChartController, type ChartController } from "./interactive_charts";
+import { AutoRefresh, type RefreshAvailability, type RefreshClock, type RefreshOutcome, type RefreshState } from "./auto_refresh";
 export * from "./interactive_charts";
+export * from "./auto_refresh";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Warning = { run_id?: string; message: string };
@@ -15,6 +17,10 @@ type Comparison = { source: Source; comparison: { reduction: string; metric_name
 type ReviewTab = "charts" | "overview" | "logs";
 type Review = { kind: "run" | "compare"; origin: "inspection" | "selection"; run_ids: string[]; metric_names: string[]; metric_selection_set: boolean; tab: ReviewTab; log_stream: "stdout" | "stderr" };
 type LogView = { run_id: string; stream: string; output: HTMLElement; note: HTMLElement; loaded: boolean; pending: boolean };
+type RunRevision = { run_id: string; metadata_revision: string | null; metrics_revision: string | null; stdout_revision: string | null; stderr_revision: string | null; missing: boolean };
+type Updates = { catalog_revision: string | null; source_revision: string | null; runs: RunRevision[] };
+type ChartRefreshOutcome = "applied" | "deferred" | "cancelled";
+export type DashboardOptions = { refresh_clock?: RefreshClock; chart_controller?: ChartController };
 
 export function apiUrl(path: string, fields: Record<string, string | number | string[] | null>): string {
   const query = new URLSearchParams();
@@ -43,11 +49,39 @@ export function formatDuration(run: Run): string {
   return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
 }
 
+export class RequestError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
+async function boundedText(response: Response, maximum_bytes: number): Promise<string> {
+  const declared = response.headers?.get("content-length");
+  if (declared && Number(declared) > maximum_bytes) throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+  if (!response.body?.getReader) {
+    const value = await response.text();
+    if (new TextEncoder().encode(value).length > maximum_bytes) throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+    return value;
+  }
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let length = 0, value = "";
+  try {
+    for (;;) {
+      const part = await reader.read(); if (part.done) break;
+      length += part.value.byteLength;
+      if (length > maximum_bytes) { await reader.cancel(); throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics."); }
+      value += decoder.decode(part.value, { stream: true });
+    }
+    return value + decoder.decode();
+  } finally { reader.releaseLock(); }
+}
+
 export class RequestLane {
   private controller: AbortController | null = null;
   private generation = 0;
+  get pending(): boolean { return this.controller !== null; }
   cancel(): void { this.controller?.abort(); this.controller = null; this.generation++; }
-  async run<T>(url: string): Promise<T | undefined> {
+  run<T>(url: string): Promise<T | undefined> { return this.request(url, response => response.json() as Promise<T>); }
+  runText(url: string, maximum_bytes = 2 * 1024 * 1024): Promise<string | undefined> { return this.request(url, response => boundedText(response, maximum_bytes)); }
+  private async request<T>(url: string, parse: (response: Response) => Promise<T>): Promise<T | undefined> {
     this.cancel();
     const generation = this.generation;
     const controller = new AbortController();
@@ -60,18 +94,19 @@ export class RequestLane {
         if (typeof location !== "undefined") location.assign("/login");
         return undefined;
       }
-      const value: unknown = await response.json();
-      if (generation !== this.generation) return undefined;
       if (!response.ok) {
-        const error = value as { error?: string };
-        throw new Error(error.error ?? `Request failed (${response.status})`);
+        let message = `Request failed (${response.status})`;
+        try { const error = await response.json() as { error?: string }; message = error.error ?? message; } catch { /* Error pages need not be JSON. */ }
+        if (generation !== this.generation) return undefined;
+        throw new RequestError(message, response.status);
       }
-      return value as T;
+      const value = await parse(response);
+      return generation === this.generation ? value : undefined;
     } catch (error) {
       if (generation !== this.generation) return undefined;
       if (controller.signal.aborted) throw new Error("The request timed out. Try Refresh when the connection is available.");
       throw error;
-    } finally { clearTimeout(timeout); }
+    } finally { clearTimeout(timeout); if (this.controller === controller) this.controller = null; }
   }
 }
 
@@ -116,9 +151,11 @@ function card(title: string): HTMLElement {
 }
 function jsonObject(value: Json): Record<string, Json> { return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 
-export function startDashboard(): void {
+export function startDashboard(options: DashboardOptions = {}): () => void {
+  const page_document = document;
+  const page_window = typeof window === "undefined" ? null : window;
   const source_select = required<HTMLSelectElement>("source-select");
-  attachChartInteractions(required<HTMLIFrameElement>("chart-frame"));
+  const chart_controller = options.chart_controller ?? createChartController(required<HTMLIFrameElement>("chart-frame"));
   const refresh_button = required<HTMLButtonElement>("refresh-button");
   const search_input = required<HTMLInputElement>("search-input");
   const task_input = required<HTMLInputElement>("task-input");
@@ -132,6 +169,30 @@ export function startDashboard(): void {
   const review_lane = new RequestLane();
   const log_lane = new RequestLane();
   const compare_lane = new RequestLane();
+  const chart_lane = new RequestLane();
+  const quiet_lanes = { updates: new RequestLane(), catalog: new RequestLane(), list: new RequestLane(), detail: new RequestLane(), comparison: new RequestLane(), log: new RequestLane(), chart: new RequestLane() };
+  const foreground_lanes = [catalog_lane, list_lane, review_lane, log_lane, compare_lane, chart_lane];
+  const now = options.refresh_clock?.now ?? (() => Date.now());
+  const auto_toggle = required<HTMLInputElement>("auto-refresh-toggle");
+  auto_toggle.checked = true;
+  let auto_refresh: AutoRefresh | null = null;
+  let quiet_generation = 0;
+  let updates_supported = true;
+  let catalog_revision: string | undefined;
+  const source_revisions = new Map<string, string>();
+  const detail_revisions = new Map<string, string>();
+  const chart_revisions = new Map<string, string>();
+  const log_revisions = new Map<string, string | null>();
+  let comparison_revision: { context: string; revision: string } | null = null;
+  let last_catalog: Catalog | null = null;
+  let last_run_list: RunList | null = null;
+  let last_run_list_context = "";
+  let list_ready = false;
+  let last_catalog_snapshot = -Infinity;
+  let last_list_snapshot = -Infinity;
+  let last_full_snapshot = -Infinity;
+  let last_checked: number | null = null;
+  let cached_chart: { context: string; html: string } | null = null;
   let sources: Source[] = [];
   let source_id = "local";
   let access_mode: "local" | "hosted" = "local";
@@ -140,17 +201,46 @@ export function startDashboard(): void {
   let offset = 0;
   let next_offset: number | null = null;
   let review: Review | null = null;
+  let missing_review: Review | null = null;
   let metric_names: string[] = [];
   let search_timeout: ReturnType<typeof setTimeout> | undefined;
   let selection_timeout: ReturnType<typeof setTimeout> | undefined;
   let refresh_generation = 0;
   let log_view: LogView | null = null;
+  let rendered_detail: Detail | null = null;
+  let rendered_comparison: Comparison | null = null;
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
   const row_checks = new Map<string, HTMLInputElement>();
   const row_buttons = new Map<string, HTMLButtonElement>();
   const review_tabs: ReviewTab[] = ["charts", "overview", "logs"];
 
+  function abortQuietRequests(): void { quiet_generation++; for (const lane of Object.values(quiet_lanes)) lane.cancel(); }
+  function cancelQuietRefresh(): void { if (auto_refresh) auto_refresh.interrupt(); else abortQuietRequests(); }
+  function availability(): RefreshAvailability {
+    if (document.visibilityState === "hidden") return "hidden";
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return "offline";
+    return foreground_lanes.some(lane => lane.pending) || search_timeout !== undefined || selection_timeout !== undefined ? "busy" : "ready";
+  }
+  function showFreshness(state: RefreshState): void {
+    const checked = last_checked === null ? "Waiting for updates" : `Last checked at ${new Date(last_checked).toLocaleTimeString()}`;
+    const activity = !state.enabled ? "Auto updates off"
+      : state.availability === "hidden" ? "Auto updates paused while hidden"
+      : state.availability === "offline" ? "Offline · updates resume when connected"
+      : state.failed ? `Updates unavailable · retrying in ${state.retry_ms / 1_000}s`
+      : `Auto updates every ${state.interval_ms / 1_000}s`;
+    required("updated-at").textContent = `${checked} · ${activity}`;
+  }
+  function listUrl(): string { return apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }); }
+  function chartUrl(): string { return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [] }); }
+  function comparisonUrl(): string { return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction: required<HTMLSelectElement>("reduction-select").value }); }
+  function boundedSet<T>(cache: Map<string, T>, key: string, value: T): void {
+    cache.delete(key); cache.set(key, value);
+    while (cache.size > 16) { const oldest = cache.keys().next().value; if (oldest === undefined) break; cache.delete(oldest); }
+  }
+
+  function clearSearchTimeout(): void { clearTimeout(search_timeout); search_timeout = undefined; }
+  function clearSelectionTimeout(): void { clearTimeout(selection_timeout); selection_timeout = undefined; }
   function announce(message: string): void { required("live-status").textContent = message; }
   function showEmptyRuns(filtered: boolean, source?: Source): void {
     const synced = access_mode === "hosted" || source?.kind === "service";
@@ -199,7 +289,7 @@ export function startDashboard(): void {
       check_cell.append(checkbox);
       const run_cell = element("td", "", "run-cell"); const button = element("button", run.run_id, "run-link"); button.type = "button";
       row_buttons.set(run.run_id, button);
-      button.addEventListener("click", () => { cancelRefresh(); clearTimeout(selection_timeout); void openRun(run.run_id); });
+      button.addEventListener("click", () => { cancelRefresh(); clearSelectionTimeout(); void openRun(run.run_id); });
       const metadata = [dateText(run.started_at), formatDuration(run)].filter(value => value !== "—");
       if (run.exit_code !== null && run.exit_code !== 0) metadata.push(`exit ${run.exit_code}`);
       run_cell.append(button, element("div", run.task ?? "No task recorded", "run-task"), element("div", metadata.join(" · "), "run-meta"));
@@ -210,39 +300,49 @@ export function startDashboard(): void {
       row.append(check_cell, run_cell, status_cell);
       rows.append(row);
     }
-    if (focused_check) row_checks.get(focused_check)?.focus();
-    else if (focused_button) row_buttons.get(focused_button)?.focus();
+    if (focused_check) row_checks.get(focused_check)?.focus({ preventScroll: true });
+    else if (focused_button) row_buttons.get(focused_button)?.focus({ preventScroll: true });
+  }
+  function applyRunList(result: RunList, context: string, quiet = false): void {
+    const unchanged = last_run_list_context === context && JSON.stringify(last_run_list) === JSON.stringify(result);
+    const was_ready = list_ready;
+    list_ready = true;
+    last_run_list = result; last_run_list_context = context; last_list_snapshot = now();
+    if (quiet && unchanged && was_ready) return;
+    runs = result.runs; offset = result.offset; next_offset = result.next_offset;
+    if (!quiet || !unchanged) { renderRows(); warnings(required("list-warnings"), result.warnings); }
+    required("run-count").textContent = result.total_count ? `${offset + 1}–${offset + runs.length} of ${result.total_count.toLocaleString()} runs` : "No matching runs";
+    required("page-label").textContent = `Page ${Math.floor(offset / page_size) + 1}`;
+    previous_page.disabled = offset === 0; next_page.disabled = next_offset === null;
+    const empty = required("list-empty"); empty.hidden = runs.length > 0;
+    if (!runs.length) {
+      showEmptyRuns(Boolean(search_input.value || task_input.value || status_select.value), result.source);
+    }
+    const options = required("task-options"); options.replaceChildren();
+    for (const task of [...new Set(runs.map(run => run.task).filter((task): task is string => task !== null))].sort()) {
+      const option = element("option"); option.value = task; options.append(option);
+    }
+    required("runs-region").setAttribute("aria-busy", "false"); announce(`${result.total_count} matching runs`);
   }
   async function loadRuns(): Promise<boolean> {
     if (!source_id) return false;
+    list_ready = false;
     global_error.hidden = true; required("runs-region").setAttribute("aria-busy", "true");
     for (const control of rows.querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button")) control.disabled = true;
     previous_page.disabled = true; next_page.disabled = true;
     required("run-count").textContent = "Loading run history…";
     try {
-      const result = await list_lane.run<RunList>(apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }));
+      const url = listUrl();
+      const result = await list_lane.run<RunList>(url);
       if (!result) return false;
-      runs = result.runs; offset = result.offset; next_offset = result.next_offset;
-      renderRows(); warnings(required("list-warnings"), result.warnings);
-      required("run-count").textContent = result.total_count ? `${offset + 1}–${offset + runs.length} of ${result.total_count.toLocaleString()} runs` : "No matching runs";
-      required("page-label").textContent = `Page ${Math.floor(offset / page_size) + 1}`;
-      previous_page.disabled = offset === 0; next_page.disabled = next_offset === null;
-      const empty = required("list-empty"); empty.hidden = runs.length > 0;
-      if (!runs.length) {
-        showEmptyRuns(Boolean(search_input.value || task_input.value || status_select.value), result.source);
-      }
-      const options = required("task-options"); options.replaceChildren();
-      for (const task of [...new Set(runs.map(run => run.task).filter((task): task is string => task !== null))].sort()) {
-        const option = element("option"); option.value = task; options.append(option);
-      }
-      required("runs-region").setAttribute("aria-busy", "false"); announce(`${result.total_count} matching runs`);
+      applyRunList(result, url);
       return true;
     } catch (error) { showError(global_error, error); renderRows(); required("runs-region").setAttribute("aria-busy", "false"); required("run-count").textContent = "Could not read run history"; return false; }
   }
-  function cancelRefresh(): void { refresh_generation++; catalog_lane.cancel(); refresh_button.disabled = false; }
+  function cancelRefresh(): void { cancelQuietRefresh(); refresh_generation++; catalog_lane.cancel(); refresh_button.disabled = false; }
   function hideReview(): void {
-    clearTimeout(selection_timeout);
-    review_lane.cancel(); log_lane.cancel(); compare_lane.cancel(); review = null;
+    clearSelectionTimeout();
+    review_lane.cancel(); log_lane.cancel(); compare_lane.cancel(); review = null; missing_review = null;
     log_view = null;
     required("review-section").hidden = true; required("review-empty").hidden = false;
     required<HTMLIFrameElement>("chart-frame").removeAttribute("src"); renderRows();
@@ -252,13 +352,14 @@ export function startDashboard(): void {
     cancelRefresh(); syncSelection(); showSelection(true);
   }
   function showSelection(debounce: boolean): void {
-    clearTimeout(selection_timeout);
+    clearSelectionTimeout();
     const ids = [...selected];
     if (!ids.length) { hideReview(); announce("Selection cleared"); return; }
     beginReview(ids.length === 1 ? "run" : "compare", ids, "selection");
     const pending_review = review;
     metric_names = [...new Set(ids.flatMap(id => Object.keys(detail_cache.get(id)?.metrics ?? {})))].sort();
     const open = () => {
+      selection_timeout = undefined;
       if (review !== pending_review) return;
       if (ids.length === 1 && ids[0]) void loadRun(ids[0]); else void loadComparison();
     };
@@ -266,9 +367,11 @@ export function startDashboard(): void {
     else open();
   }
   function beginReview(kind: "run" | "compare", ids: string[], origin: Review["origin"] = "inspection"): void {
-    clearTimeout(selection_timeout);
+    clearSelectionTimeout();
     review_lane.cancel(); log_lane.cancel(); compare_lane.cancel();
-    review = { kind, origin, run_ids: ids, metric_names: [], metric_selection_set: false, tab: "charts", log_stream: "stdout" }; metric_names = []; log_view = null;
+    detail_revisions.clear(); chart_revisions.clear(); log_revisions.clear(); comparison_revision = null;
+    missing_review = null;
+    review = { kind, origin, run_ids: ids, metric_names: [], metric_selection_set: false, tab: "charts", log_stream: "stdout" }; metric_names = []; log_view = null; rendered_detail = null; rendered_comparison = null; cached_chart = null;
     required("review-section").hidden = false; required("review-empty").hidden = true;
     required("review-title").textContent = kind === "run" ? ids[0] ?? "Run" : `${ids.length} runs`;
     required("review-eyebrow").textContent = kind === "run" ? "Run details" : "Experiment comparison";
@@ -291,14 +394,16 @@ export function startDashboard(): void {
   }
   function selectReviewTab(tab: ReviewTab): void {
     if (!review || (review.kind === "compare" && tab !== "charts")) return;
-    review.tab = tab; syncReviewTabs();
+    cancelQuietRefresh(); review.tab = tab; syncReviewTabs();
     if (tab === "logs") ensureLog();
     else { log_lane.cancel(); if (log_view) log_view.pending = false; }
   }
   function updateChart(): void {
     if (!review) return;
-    const url = apiUrl("/api/chart", { source: source_id, run_id: review.run_ids, metric: review.metric_names });
-    required<HTMLIFrameElement>("chart-frame").src = url; required<HTMLAnchorElement>("open-chart").href = url;
+    const url = chartUrl();
+    const frame = required<HTMLIFrameElement>("chart-frame");
+    if (frame.getAttribute("src") !== url) { frame.src = url; chart_revisions.delete(url); cached_chart = null; }
+    required<HTMLAnchorElement>("open-chart").href = url;
     required("chart-card").hidden = false;
     required("chart-note").textContent = review.metric_names.length ? `${review.metric_names.length} selected metrics · at most 600 chart points per series` : "First four recorded metrics · at most 600 chart points per series";
   }
@@ -344,10 +449,14 @@ export function startDashboard(): void {
     finally { if (log_view === view) view.pending = false; }
   }
   function ensureLog(): void {
-    if (review?.kind === "run" && review.tab === "logs" && log_view && !log_view.loaded && !log_view.pending) void loadLog(log_view);
+    if (review?.kind === "run" && review !== missing_review && review.tab === "logs" && log_view && !log_view.loaded && !log_view.pending) void loadLog(log_view);
   }
-  function renderDetail(detail: Detail): void {
-    const parent = required("run-detail"); parent.replaceChildren(); parent.hidden = false;
+  function containsFocus(parent: HTMLElement): boolean { return parent.contains(document.activeElement); }
+  function renderOverview(detail: Detail): void {
+    const parent = required("run-detail");
+    const expanded = new Set([...parent.querySelectorAll<HTMLDetailsElement>("details")].filter(node => node.open).map(node => node.querySelectorAll("summary")[0]?.textContent));
+    const focused = [...parent.querySelectorAll("summary")].find(node => node === document.activeElement)?.textContent;
+    parent.replaceChildren(); parent.hidden = false;
     const grid = element("div", "", "detail-grid"); const overview = card("Overview");
     overview.append(facts([["Task", detail.run.task ?? "—"], ["Status", detail.run.status], ["Started", dateText(detail.run.started_at)], ["Finished", dateText(detail.run.finished_at)], ["Duration", formatDuration(detail.run)], ["Exit code", formatValue(detail.run.exit_code)]]));
     const command = jsonObject(detail.state)["command"];
@@ -374,9 +483,23 @@ export function startDashboard(): void {
       table.append(body); scroll.append(table); metrics.append(scroll);
     } else metrics.append(element("p", "No metric summaries are available. Record metrics in outputs/metrics.jsonl or pull remote metrics.", "muted"));
     if (detail.metrics_truncated) metrics.append(element("p", `Showing ${names.length} of ${detail.metric_count} summaries. Use Chart metrics to select another series by its exact name.`, "muted"));
-    parent.append(metrics); metric_names = names;
+    parent.append(metrics);
+    for (const node of parent.querySelectorAll<HTMLDetailsElement>("details")) {
+      const summary = node.querySelectorAll<HTMLElement>("summary")[0];
+      node.open = expanded.has(summary?.textContent);
+      if (focused && summary?.textContent === focused) summary.focus({ preventScroll: true });
+    }
+  }
+  function renderDetail(detail: Detail, preserve = false): boolean {
+    const names = Object.keys(detail.metrics).sort(), picker = required("run-metric-options");
+    const choices_changed = JSON.stringify(metric_names) !== JSON.stringify(names);
+    if (preserve && choices_changed && containsFocus(picker)) return false;
+    if (!preserve || JSON.stringify(rendered_detail) !== JSON.stringify(detail)) renderOverview(detail);
+    rendered_detail = detail; metric_names = names;
     if (review && !review.metric_selection_set) { review.metric_names = names.slice(0, 4); review.metric_selection_set = true; }
-    metricPicker(required("run-metric-options"), names, updateChart); required("run-metric-controls").hidden = false;
+    if (!preserve || choices_changed) metricPicker(picker, names, updateChart);
+    required("run-metric-controls").hidden = false;
+    if (preserve && log_view?.run_id === detail.run.run_id) return true;
     const logs = card("Log tail"); const tabs = element("div", "", "log-tabs"); tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "Log stream");
     const output = element("pre", "", "log-content"); output.id = "log-output"; output.setAttribute("role", "tabpanel");
     const note = element("p", "", "log-note muted");
@@ -385,7 +508,7 @@ export function startDashboard(): void {
     for (const stream of ["stdout", "stderr"] as const) {
       const button = element("button", stream, "log-tab"); button.type = "button"; button.id = `log-tab-${stream}`; button.setAttribute("role", "tab"); button.setAttribute("aria-controls", output.id); button.setAttribute("aria-selected", String(stream === selected_stream)); button.tabIndex = stream === selected_stream ? 0 : -1;
       button.addEventListener("click", () => {
-        log_lane.cancel();
+        cancelQuietRefresh(); log_lane.cancel();
         if (review) review.log_stream = stream;
         for (const item of buttons) { item.setAttribute("aria-selected", String(item === button)); item.tabIndex = item === button ? 0 : -1; }
         output.setAttribute("aria-labelledby", button.id);
@@ -402,24 +525,30 @@ export function startDashboard(): void {
     }
     output.setAttribute("aria-labelledby", `log-tab-${selected_stream}`); logs.append(tabs, output, note); required("run-logs").replaceChildren(logs);
     log_view = { run_id: detail.run.run_id, stream: selected_stream, output, note, loaded: false, pending: false };
-    ensureLog(); updateChart();
+    ensureLog(); if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
+    return true;
   }
   async function openRun(id: string, origin: Review["origin"] = "inspection", previous?: Review): Promise<void> {
     beginReview("run", [id], origin);
     if (previous && review) { review.metric_names = [...previous.metric_names]; review.metric_selection_set = previous.metric_selection_set; review.tab = previous.tab; review.log_stream = previous.log_stream; syncReviewTabs(); }
     await loadRun(id);
   }
-  async function loadRun(id: string): Promise<void> {
+  async function loadRun(id: string, preserve = false): Promise<boolean> {
     try {
       const detail = await review_lane.run<Detail>(apiUrl("/api/run", { source: source_id, run_id: id }));
-      if (!detail) return;
+      if (!detail) return false;
       detail_cache.delete(id); detail_cache.set(id, detail);
       while (detail_cache.size > 9) { const oldest = detail_cache.keys().next().value; if (oldest === undefined) break; detail_cache.delete(oldest); }
       required("review-loading").hidden = true;
-      warnings(required("review-warnings"), detail.warnings); renderDetail(detail); announce(`Opened ${id}`);
-    } catch (error) { required("review-loading").hidden = true; showError(required("review-error"), error); }
+      warnings(required("review-warnings"), detail.warnings);
+      if (!renderDetail(detail, preserve)) return false;
+      if (!preserve) announce(`Opened ${id}`);
+      return true;
+    } catch (error) { required("review-loading").hidden = true; showError(required("review-error"), error); return false; }
   }
   function renderComparison(result: Comparison): void {
+    if (JSON.stringify(rendered_comparison) === JSON.stringify(result)) return;
+    rendered_comparison = result;
     const comparison = result.comparison;
     const parent = required("comparison-values"); parent.replaceChildren();
     const table = element("table", "", "comparison-table"); const head = element("thead"); const headings = element("tr"); headings.append(element("th", "Run"));
@@ -434,19 +563,23 @@ export function startDashboard(): void {
     if (!comparison.metric_names.length) parent.append(element("p", "No recorded metrics match this selection.", "muted"));
     warnings(required("review-warnings"), comparison.warnings);
   }
-  async function loadComparison(): Promise<void> {
-    if (!review || review.kind !== "compare") return;
+  async function loadComparison(preserve = false): Promise<boolean> {
+    if (!review || review.kind !== "compare") return false;
     required("review-error").hidden = true; required("comparison-values").setAttribute("aria-busy", "true");
-    required("chart-card").hidden = true;
+    if (!rendered_comparison) required("chart-card").hidden = true;
     try {
-      const result = await compare_lane.run<Comparison>(apiUrl("/api/compare", { source: source_id, run_id: review.run_ids, metric: review.metric_names, reduction: required<HTMLSelectElement>("reduction-select").value }));
-      if (!result || !review || review.kind !== "compare") return;
-      metric_names = [...new Set([...metric_names, ...result.comparison.metric_names])].sort();
+      const result = await compare_lane.run<Comparison>(comparisonUrl());
+      if (!result || !review || review.kind !== "compare") return false;
+      const names = [...new Set([...metric_names, ...result.comparison.metric_names])].sort();
+      const choices_changed = JSON.stringify(names) !== JSON.stringify(metric_names), initial = !rendered_comparison;
+      metric_names = names;
       if (!review.metric_selection_set) { review.metric_names = result.comparison.metric_names.slice(0, 4); review.metric_selection_set = true; }
       required("review-loading").hidden = true; required("compare-detail").hidden = false;
       renderComparison(result); required("comparison-values").setAttribute("aria-busy", "false");
-      metricPicker(required("compare-metric-options"), metric_names, () => { void loadComparison(); }); updateChart();
-    } catch (error) { required("review-loading").hidden = true; required("comparison-values").setAttribute("aria-busy", "false"); showError(required("review-error"), error); }
+      if (!preserve || initial || choices_changed) metricPicker(required("compare-metric-options"), metric_names, () => { void loadComparison(); });
+      if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
+      return true;
+    } catch (error) { required("review-loading").hidden = true; required("comparison-values").setAttribute("aria-busy", "false"); showError(required("review-error"), error); return false; }
   }
   function openComparison(): void {
     const ids = [...selected]; if (ids.length < 2 || ids.length > 8) return;
@@ -457,71 +590,247 @@ export function startDashboard(): void {
   function sourceNote(): void {
     const source = sources.find(item => item.source_id === source_id);
     const note = required("source-note"); note.hidden = !source;
-    note.textContent = source?.kind === "service" ? "Synced results · Updates arrive from workers. Refresh to read the latest synced files."
-      : source?.kind === "cached" ? "Cached remote results · Recorded status may be older than the remote run. Pull updated results with expri runs pull, then Refresh here."
-      : "Local results · Status comes from recorded run files. Refresh to read the latest changes.";
+    note.textContent = source?.kind === "service" ? "Synced results · Updates arrive when workers sync their recorded files."
+      : source?.kind === "cached" ? "Cached remote results · Pull updated results with expri runs pull; this dashboard watches the local cache."
+      : "Local results · Status and updates come from recorded run files.";
+  }
+  function applyCatalog(catalog: Catalog, quiet = false): void {
+    last_catalog_snapshot = now();
+    if (quiet && JSON.stringify(last_catalog) === JSON.stringify(catalog)) return;
+    last_catalog = catalog;
+    sources = catalog.sources;
+    access_mode = catalog.access_mode ?? "local";
+    page_size = access_mode === "hosted" ? 20 : 100;
+    required("logout-form").hidden = access_mode !== "hosted";
+    required("dashboard-kind").textContent = access_mode === "hosted" ? "expri · Synced experiment review" : "expri · Local experiment review";
+    const previous_source = source_id;
+    if (!sources.some(source => source.source_id === source_id) || !source_select.dataset.initialized) {
+      source_id = sources.some(source => source.source_id === catalog.initial_source) ? catalog.initial_source : sources[0]?.source_id ?? "";
+    }
+    source_select.dataset.initialized = "true";
+    if (source_id !== previous_source) { offset = 0; runs = []; selected.clear(); detail_cache.clear(); hideReview(); syncSelection(); }
+    source_select.replaceChildren();
+    for (const source of sources) { const option = element("option", source.kind === "service" ? `${source.label} · Synced` : source.label); option.value = source.source_id; source_select.append(option); }
+    if (!sources.length) { const option = element("option", "No synced sources"); option.value = ""; source_select.append(option); }
+    source_select.value = source_id; source_select.disabled = !sources.length;
+    for (const control of [search_input, task_input, status_select, required<HTMLButtonElement>("clear-filters")]) control.disabled = !sources.length;
+    required("project-name").textContent = catalog.project_name; document.title = `expri · ${catalog.project_name}`;
+    warnings(required("catalog-warnings"), catalog.warnings); sourceNote();
+  }
+  function emptyCatalog(): void {
+    list_lane.cancel(); runs = []; next_offset = null; renderRows();
+    previous_page.disabled = true; next_page.disabled = true;
+    required("run-count").textContent = "No synced runs yet"; required("page-label").textContent = "Page 1";
+    required("task-options").replaceChildren(); warnings(required("list-warnings"), []);
+    required("runs-region").setAttribute("aria-busy", "false"); required("review-empty").hidden = true;
+    showEmptyRuns(false);
+  }
+  async function refreshCurrentChart(lane: RequestLane): Promise<ChartRefreshOutcome> {
+    if (!review || review.tab !== "charts") return "applied";
+    if (chart_controller.isInteracting()) return "deferred";
+    const current_review = review, source = source_id, url = chartUrl(), status = chart_controller.previewStatus();
+    if (status === "loading") return "deferred";
+    if (status === "invalid") {
+      required<HTMLIFrameElement>("chart-frame").src = url;
+      chart_revisions.delete(url); cached_chart = null;
+      throw new Error("The chart preview could not load. Retrying when the connection is available.");
+    }
+    const html = await lane.runText(url);
+    if (html === undefined || review !== current_review || source_id !== source || chartUrl() !== url) return "cancelled";
+    if (cached_chart?.context === url && cached_chart.html === html) return "applied";
+    if (!chart_controller.replacePreview(html)) return "deferred";
+    cached_chart = { context: url, html }; return "applied";
+  }
+  function applyLog(view: LogView, log: Log): void {
+    const content = log.missing ? "This log has not been recorded or pulled." : log.content || "The log is empty.";
+    const output = view.output;
+    if (output.textContent !== content) {
+      const scroll_top = output.scrollTop, at_bottom = output.scrollHeight - output.clientHeight - scroll_top <= 4;
+      output.textContent = content;
+      output.scrollTop = at_bottom ? output.scrollHeight : scroll_top;
+    }
+    view.note.textContent = log.truncated ? "Showing the last 100 lines, capped at 64 KiB. Use expri runs logs for more output." : "Last 100 lines · updates arrive automatically while auto updates are on.";
+    view.loaded = true;
+  }
+  async function refreshCurrentLog(lane: RequestLane): Promise<boolean> {
+    const view = log_view;
+    if (review?.tab !== "logs" || !view) return true;
+    const log = await lane.run<Log>(apiUrl("/api/log", { source: source_id, run_id: view.run_id, stream: view.stream, tail: 100 }));
+    if (!log || log_view !== view || review?.tab !== "logs") return false;
+    applyLog(view, log); return true;
   }
   async function refresh(): Promise<void> {
+    cancelQuietRefresh();
     const generation = ++refresh_generation;
     refresh_button.disabled = true; global_error.hidden = true;
+    let successful = false;
     try {
-      const catalog = await catalog_lane.run<Catalog>("/api/catalog"); if (!catalog) return;
-      if (generation !== refresh_generation) return;
-      sources = catalog.sources;
-      access_mode = catalog.access_mode ?? "local";
-      page_size = access_mode === "hosted" ? 20 : 100;
-      required("logout-form").hidden = access_mode !== "hosted";
-      required("dashboard-kind").textContent = access_mode === "hosted" ? "expri · Synced experiment review" : "expri · Local experiment review";
-      const previous_source = source_id;
-      if (!sources.some(source => source.source_id === source_id) || !source_select.dataset.initialized) {
-        source_id = sources.some(source => source.source_id === catalog.initial_source) ? catalog.initial_source : sources[0]?.source_id ?? "";
+      const catalog = await catalog_lane.run<Catalog>("/api/catalog");
+      if (!catalog || generation !== refresh_generation) return;
+      applyCatalog(catalog);
+      if (!source_id) { emptyCatalog(); successful = true; }
+      else {
+        const current_review = review, current_source = source_id;
+        if (!await loadRuns() || generation !== refresh_generation) return;
+        if (current_review === review && current_source === source_id && current_review) {
+          if (current_review.kind === "run") {
+            const id = current_review.run_ids[0];
+            if (id && !await loadRun(id, true)) return;
+          } else if (!await loadComparison(true)) return;
+          if (generation !== refresh_generation || current_review !== review) return;
+          if (!await refreshCurrentLog(log_lane) || await refreshCurrentChart(chart_lane) !== "applied") return;
+        }
+        successful = generation === refresh_generation;
       }
-      source_select.dataset.initialized = "true";
-      if (source_id !== previous_source) { runs = []; selected.clear(); hideReview(); syncSelection(); }
-      source_select.replaceChildren();
-      for (const source of sources) { const option = element("option", source.kind === "service" ? `${source.label} · Synced` : source.label); option.value = source.source_id; source_select.append(option); }
-      if (!sources.length) { const option = element("option", "No synced sources"); option.value = ""; source_select.append(option); }
-      source_select.value = source_id; source_select.disabled = !sources.length;
-      for (const control of [search_input, task_input, status_select, required<HTMLButtonElement>("clear-filters")]) control.disabled = !sources.length;
-      required("project-name").textContent = catalog.project_name; document.title = `expri · ${catalog.project_name}`;
-      warnings(required("catalog-warnings"), catalog.warnings); sourceNote(); detail_cache.clear(); offset = 0;
-      if (!source_id) {
-        list_lane.cancel(); runs = []; next_offset = null; renderRows();
-        previous_page.disabled = true; next_page.disabled = true;
-        required("run-count").textContent = "No synced runs yet"; required("page-label").textContent = "Page 1";
-        required("task-options").replaceChildren(); warnings(required("list-warnings"), []);
-        required("runs-region").setAttribute("aria-busy", "false"); required("review-empty").hidden = true;
-        showEmptyRuns(false); announce("No synced runs yet");
-        required("updated-at").textContent = "Refresh after syncing your first run.";
-        return;
+      if (successful) { last_checked = now(); last_full_snapshot = now(); }
+    } catch (error) { if (generation === refresh_generation) { showError(global_error, error); required("review-loading").hidden = true; } }
+    finally {
+      if (generation === refresh_generation) { refresh_button.disabled = false; auto_refresh?.refreshCompleted(successful); }
+    }
+  }
+  async function quietRefresh(): Promise<RefreshOutcome> {
+    if (availability() !== "ready") return "cancelled";
+    const generation = quiet_generation;
+    const current = () => generation === quiet_generation && availability() === "ready";
+    const acknowledgements: (() => void)[] = [];
+    const deferChart = (): RefreshOutcome => {
+      if (current()) for (const acknowledge of acknowledgements) acknowledge();
+      return "cancelled";
+    };
+    const full_snapshot = now() - last_full_snapshot >= 5 * 60_000;
+    const complete = (): RefreshOutcome => {
+      if (!current()) return "cancelled";
+      for (const acknowledge of acknowledgements) acknowledge();
+      if (full_snapshot || !updates_supported) last_full_snapshot = now();
+      last_checked = now(); global_error.hidden = true;
+      return "success";
+    };
+    let updates: Updates | undefined;
+    const probed_source = source_id;
+    try {
+      if (updates_supported) {
+        try {
+          updates = await quiet_lanes.updates.run<Updates>(apiUrl("/api/updates", { source: last_catalog ? source_id : "", run_id: review?.run_ids ?? [] }));
+        } catch (error) {
+          if (!(error instanceof RequestError) || error.status !== 404) throw error;
+          updates_supported = false; auto_refresh?.setInterval(30_000);
+        }
+        if (!current() || (updates_supported && !updates)) return "cancelled";
+      }
+      const catalog_changed = updates?.catalog_revision !== null && updates?.catalog_revision !== undefined && catalog_revision !== updates.catalog_revision;
+      if (!updates_supported || full_snapshot || catalog_changed || (updates?.catalog_revision === null && now() - last_catalog_snapshot >= 30_000)) {
+        const catalog = await quiet_lanes.catalog.run<Catalog>("/api/catalog");
+        if (!catalog || !current()) return "cancelled";
+        applyCatalog(catalog, true);
+        if (updates?.catalog_revision !== null && updates?.catalog_revision !== undefined) {
+          const revision = updates.catalog_revision; acknowledgements.push(() => { catalog_revision = revision; });
+        }
+      }
+      const source_changed = source_id !== probed_source;
+      const revision = source_changed ? undefined : updates?.source_revision;
+      const list_changed = revision !== null && revision !== undefined && source_revisions.get(source_id) !== revision;
+      if (!source_id) emptyCatalog();
+      else if (!updates_supported || full_snapshot || source_changed || !list_ready || last_run_list_context !== listUrl() || list_changed || (revision === null && now() - last_list_snapshot >= 30_000)) {
+        const url = listUrl(), result = await quiet_lanes.list.run<RunList>(url);
+        if (!result || !current() || listUrl() !== url) return "cancelled";
+        applyRunList(result, url, true);
+        if (revision !== null && revision !== undefined) {
+          const source = source_id; acknowledgements.push(() => boundedSet(source_revisions, source, revision));
+        }
       }
       const current_review = review;
-      const current_source = source_id;
-      if (!await loadRuns() || generation !== refresh_generation) return;
-      if (current_review === review && current_source === source_id) {
-        if (current_review?.kind === "run") { const id = current_review.run_ids[0]; if (id) await openRun(id, current_review.origin, current_review); }
-        else if (current_review?.kind === "compare") await loadComparison();
+      if (current_review && !source_changed) {
+        const revisions = current_review.run_ids.map(id => updates?.runs.find(item => item.run_id === id));
+        if (revisions.some(item => item?.missing)) {
+          const message = "Some selected runs are no longer available in this source. Showing the last successful preview.";
+          const notice = required("review-error");
+          if (notice.hidden || notice.textContent !== message) showError(notice, message);
+          required("review-loading").hidden = true; missing_review = current_review;
+          return complete();
+        }
+        if (missing_review === current_review && revisions.every(item => item !== undefined && !item.missing)) {
+          missing_review = null; required("review-error").hidden = true;
+          detail_revisions.clear(); chart_revisions.clear(); log_revisions.clear(); comparison_revision = null;
+        }
+        if (current_review.tab === "charts" && required<HTMLIFrameElement>("chart-frame").src && chart_controller.previewStatus() !== "ready") {
+          const outcome = await refreshCurrentChart(quiet_lanes.chart);
+          return outcome === "deferred" ? deferChart() : "cancelled";
+        }
+        const view_revision = JSON.stringify(revisions.map(item => [item?.run_id, item?.metadata_revision, item?.metrics_revision, item?.missing]));
+        const force = !updates_supported || full_snapshot || revisions.some(item => item === undefined);
+        if (current_review.kind === "run" && (current_review.tab !== "logs" || !log_view)) {
+          const id = current_review.run_ids[0];
+          if (id) {
+            const context = apiUrl("/api/run", { source: source_id, run_id: id });
+            if (force || detail_revisions.get(context) !== view_revision) {
+              const detail = await quiet_lanes.detail.run<Detail>(context);
+              if (!detail || !current() || review !== current_review) return "cancelled";
+              const warnings_changed = JSON.stringify(rendered_detail?.warnings) !== JSON.stringify(detail.warnings);
+              if (!renderDetail(detail, true)) return "cancelled";
+              boundedSet(detail_cache, id, detail);
+              if (warnings_changed) warnings(required("review-warnings"), detail.warnings);
+              required("review-loading").hidden = true; required("review-error").hidden = true;
+              if (!current()) return "cancelled";
+              acknowledgements.push(() => boundedSet(detail_revisions, context, view_revision));
+            }
+          }
+        } else if (current_review.kind === "compare") {
+          const context = comparisonUrl();
+          if (force || comparison_revision?.context !== context || comparison_revision.revision !== view_revision) {
+            const result = await quiet_lanes.comparison.run<Comparison>(context);
+            if (!result || !current() || review !== current_review || comparisonUrl() !== context) return "cancelled";
+            const names = [...new Set([...metric_names, ...result.comparison.metric_names])].sort();
+            const names_changed = JSON.stringify(names) !== JSON.stringify(metric_names), picker = required("compare-metric-options");
+            if (names_changed && containsFocus(picker)) return "cancelled";
+            metric_names = names;
+            if (!current_review.metric_selection_set) { current_review.metric_names = result.comparison.metric_names.slice(0, 4); current_review.metric_selection_set = true; }
+            renderComparison(result); required("review-loading").hidden = true; required("compare-detail").hidden = false; required("review-error").hidden = true;
+            if (names_changed || !picker.children.length) metricPicker(picker, metric_names, () => { void loadComparison(); });
+            if (!required<HTMLIFrameElement>("chart-frame").src) updateChart();
+            acknowledgements.push(() => { comparison_revision = { context, revision: view_revision }; });
+          }
+        }
+        if (current_review.tab === "charts") {
+          const context = chartUrl();
+          if (force || chart_revisions.get(context) !== view_revision) {
+            const outcome = await refreshCurrentChart(quiet_lanes.chart);
+            if (outcome === "deferred") return deferChart();
+            if (outcome === "cancelled") return "cancelled";
+            if (!current() || review !== current_review) return "cancelled";
+            acknowledgements.push(() => boundedSet(chart_revisions, context, view_revision));
+          }
+        } else if (current_review.tab === "logs" && log_view) {
+          const view = log_view, context = apiUrl("/api/log", { source: source_id, run_id: view.run_id, stream: view.stream, tail: 100 });
+          const item = revisions[0], log_revision = view.stream === "stderr" ? item?.stderr_revision : item?.stdout_revision;
+          if (force || log_revision === undefined || !log_revisions.has(context) || log_revisions.get(context) !== log_revision) {
+            if (!await refreshCurrentLog(quiet_lanes.log) || !current() || log_view !== view) return "cancelled";
+            if (log_revision !== undefined) acknowledgements.push(() => boundedSet(log_revisions, context, log_revision));
+          }
+        }
       }
-      if (generation === refresh_generation) required("updated-at").textContent = `Last checked at ${new Date().toLocaleTimeString()}. Refresh for updates.`;
-    } catch (error) { if (generation === refresh_generation) { showError(global_error, error); required("review-loading").hidden = true; } }
-    finally { if (generation === refresh_generation) refresh_button.disabled = false; }
+      return complete();
+    } catch {
+      if (!current()) return "cancelled";
+      // Keep the last successful preview visible; the scheduler reports recovery.
+      return "failure";
+    }
   }
   function resetFilters(): void {
-    cancelRefresh(); list_lane.cancel(); clearTimeout(search_timeout); offset = 0;
+    cancelRefresh(); list_lane.cancel(); clearSearchTimeout(); offset = 0;
     selected.clear(); syncSelection(); hideReview(); runs = []; renderRows();
     required("list-empty").hidden = true; required("run-count").textContent = "Applying filters…";
     required("runs-region").setAttribute("aria-busy", "true"); previous_page.disabled = true; next_page.disabled = true;
   }
   function filtersChanged(): void { resetFilters(); void loadRuns(); }
-  for (const input of [search_input, task_input]) input.addEventListener("input", () => { resetFilters(); search_timeout = setTimeout(() => { void loadRuns(); }, 250); });
+  for (const input of [search_input, task_input]) input.addEventListener("input", () => { resetFilters(); search_timeout = setTimeout(() => { search_timeout = undefined; void loadRuns(); }, 250); });
   status_select.addEventListener("change", filtersChanged);
-  required("clear-filters").addEventListener("click", () => { search_input.value = ""; task_input.value = ""; status_select.value = ""; clearTimeout(search_timeout); filtersChanged(); });
+  required("clear-filters").addEventListener("click", () => { search_input.value = ""; task_input.value = ""; status_select.value = ""; clearSearchTimeout(); filtersChanged(); });
   previous_page.addEventListener("click", () => { cancelRefresh(); offset = Math.max(0, offset - page_size); void loadRuns(); });
   next_page.addEventListener("click", () => { if (next_offset !== null) { cancelRefresh(); offset = next_offset; void loadRuns(); } });
-  source_select.addEventListener("change", () => { cancelRefresh(); clearTimeout(search_timeout); source_id = source_select.value; runs = []; offset = 0; selected.clear(); detail_cache.clear(); hideReview(); syncSelection(); sourceNote(); void loadRuns(); });
-  refresh_button.addEventListener("click", () => { clearTimeout(search_timeout); void refresh(); });
+  source_select.addEventListener("change", () => { cancelRefresh(); clearSearchTimeout(); source_id = source_select.value; runs = []; offset = 0; selected.clear(); detail_cache.clear(); hideReview(); syncSelection(); sourceNote(); void loadRuns(); });
+  refresh_button.addEventListener("click", () => { clearSearchTimeout(); void refresh(); });
   required("clear-selection").addEventListener("click", () => { selected.clear(); selectionChanged(); });
-  required("compare-button").addEventListener("click", () => { cancelRefresh(); clearTimeout(selection_timeout); openComparison(); });
+  required("compare-button").addEventListener("click", () => { cancelRefresh(); clearSelectionTimeout(); openComparison(); });
   required("close-review").addEventListener("click", closeReview);
   required("reduction-select").addEventListener("change", () => { cancelRefresh(); void loadComparison(); });
   for (const tab of review_tabs) {
@@ -537,7 +846,20 @@ export function startDashboard(): void {
       if (next) { selectReviewTab(next); required<HTMLButtonElement>(`review-tab-${next}`).focus(); }
     });
   }
+  auto_refresh = new AutoRefresh({ run: quietRefresh, availability, cancel: abortQuietRequests, on_state: showFreshness, ...(options.refresh_clock ? { clock: options.refresh_clock } : {}) });
+  auto_toggle.addEventListener("change", () => auto_refresh?.setEnabled(auto_toggle.checked));
+  const resume = () => auto_refresh?.availabilityChanged();
+  document.addEventListener?.("visibilitychange", resume);
+  if (typeof window !== "undefined") { window.addEventListener("online", resume); window.addEventListener("offline", resume); }
+  auto_refresh.start();
   void refresh();
+  return () => {
+    auto_refresh?.dispose(); chart_controller.dispose();
+    for (const lane of foreground_lanes) lane.cancel();
+    clearSearchTimeout(); clearSelectionTimeout();
+    page_document.removeEventListener?.("visibilitychange", resume);
+    if (page_window) { page_window.removeEventListener("online", resume); page_window.removeEventListener("offline", resume); }
+  };
 }
 
 if (typeof document !== "undefined") startDashboard();
