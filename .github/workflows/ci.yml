@@ -150,3 +150,6 @@ jobs:
 
       - name: Verify installed-package fixture wheels
         run: python3 -B tests/containers/fixtures_tests.py
+
+      - name: Verify branch deployment and rollback
+        run: python3 -B tests/deployment_tests.py

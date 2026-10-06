@@ -35,6 +35,7 @@ impl BrowserAuth {
       .map_err(|_| ExpriError::Message("dashboard public_url must be an HTTPS origin".into()))?;
     if url.scheme() != "https"
       || url.host_str().is_none()
+      || url.host_str().is_some_and(|host| host.contains('*'))
       || !url.username().is_empty()
       || url.password().is_some()
       || url.path() != "/"
@@ -42,7 +43,7 @@ impl BrowserAuth {
       || url.fragment().is_some()
     {
       return Err(ExpriError::Message(
-        "dashboard public_url must be an HTTPS origin without credentials, a path, query, or fragment"
+        "dashboard public_url must be an exact HTTPS origin without wildcards, credentials, a path, query, or fragment"
           .into(),
       ));
     }
@@ -62,6 +63,10 @@ impl BrowserAuth {
       credential: credential.to_vec(),
       sessions: Mutex::new(VecDeque::new()),
     })
+  }
+
+  pub fn authority(&self) -> &str {
+    &self.host
   }
 
   /// Use the configured public authority rather than trusting forwarded headers.
@@ -261,6 +266,8 @@ mod tests {
       "https://expri.example.test/dashboard",
       "https://expri.example.test/?query=yes",
       "https://expri.example.test/#fragment",
+      "https://*.expri.example.net",
+      "https://%2A.expri.example.net",
       "not a URL",
     ] {
       assert!(BrowserAuth::new(invalid, CREDENTIAL).is_err());
@@ -273,6 +280,70 @@ mod tests {
       .body(())
       .unwrap();
     assert!(auth.check_boundary(&request, true).is_ok());
+    assert_eq!(auth.authority(), "expri.example.test:8443");
+    assert_eq!(
+      BrowserAuth::new("https://EXPRI.example.test:443/", CREDENTIAL)
+        .unwrap()
+        .authority(),
+      "expri.example.test"
+    );
+  }
+
+  #[test]
+  fn different_dashboard_hosts_have_independent_sessions_and_logout() {
+    let main = auth();
+    let preview = BrowserAuth::new("https://preview.example.test", CREDENTIAL).unwrap();
+    let make_request = |authority: &str, origin: &str, session: Option<&str>| {
+      let mut request = HttpRequest::builder()
+        .header("host", authority)
+        .header("origin", origin);
+      if let Some(session) = session {
+        request = request.header("cookie", session);
+      }
+      request.body(()).unwrap()
+    };
+    let main_session = main
+      .login(&request(Some(PUBLIC_URL), None), CREDENTIAL)
+      .unwrap();
+    let preview_request = make_request(
+      "preview.example.test",
+      "https://preview.example.test",
+      Some(cookie(&main_session)),
+    );
+    assert_eq!(
+      preview.authorized(&preview_request).unwrap_err().status,
+      401
+    );
+    let preview_session = preview.login(&preview_request, CREDENTIAL).unwrap();
+    assert!(
+      main
+        .authorized(&request(None, Some(cookie(&main_session))))
+        .is_ok()
+    );
+    assert_eq!(
+      main
+        .authorized(&request(None, Some(cookie(&preview_session))))
+        .unwrap_err()
+        .status,
+      401
+    );
+    let preview_request = make_request(
+      "preview.example.test",
+      "https://preview.example.test",
+      Some(cookie(&preview_session)),
+    );
+    assert!(preview.authorized(&preview_request).is_ok());
+    main
+      .logout(&request(Some(PUBLIC_URL), Some(cookie(&main_session))))
+      .unwrap();
+    assert!(preview.authorized(&preview_request).is_ok());
+    assert_eq!(
+      main
+        .authorized(&request(None, Some(cookie(&main_session))))
+        .unwrap_err()
+        .status,
+      401
+    );
   }
 
   #[test]

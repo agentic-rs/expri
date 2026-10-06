@@ -106,6 +106,8 @@ points, and log tails read at most 64 KiB. Last/min/max summaries use every poin
 in a supported metric file.
 The local CLI remains available for complete files and older runs.
 
+For main and branch UIs sharing this service, see [dashboard deployments](deployment.md).
+
 ## Worker uploads
 
 Create a client configuration on the worker, outside the synced source repo:
@@ -217,6 +219,8 @@ through its test-only WebDriver configuration. The browser also reviews the
 uploaded runs: direct selection/comparison, keyboard tabs, deferred log loading,
 refresh and filters. It checks the desktop layout and a narrow layout at a
 verified 500 CSS pixel viewport, saving screenshots for diagnostics. This Firefox
-check does not cover 320/360 pixel mobile widths.
+check does not cover 320/360 pixel mobile widths. A second HTTPS hostname also
+checks branch assets against the same catalog, cookie replay rejection, and
+independent login/logout sessions.
 Browser request logs contain method, path, origin, status and response policy,
 without credentials or cookies.

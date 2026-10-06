@@ -101,3 +101,7 @@ demand, Refresh preserves the comparison, and filters clear it. The suite checks
 desktop columns and overflow at a verified 500 CSS pixel viewport, saving
 `workspace-desktop.png` and `workspace-narrow.png` with the CI diagnostics.
 The Firefox check covers a narrow layout rather than 320/360 pixel mobile widths.
+
+The service workflow also opens an AB hostname in Firefox. It verifies distinct
+branch asset URLs, the same uploaded runs and comparison values, rejected cookie
+replay between hosts, and logout isolation. `workspace-ab.png` records the preview.

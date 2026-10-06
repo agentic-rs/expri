@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 ORIGIN = 'https://expri.example.net'
 POLICY_OVERRIDE = Path('/tmp/expri-browser-policy')
@@ -67,8 +68,8 @@ class Firefox:
   def call(self, method, path, body=None):
     return self.request(method, '/session/' + self.session + path, body)
 
-  def navigate(self, path):
-    self.call('POST', '/url', {'url': ORIGIN + path})
+  def navigate(self, path, origin=ORIGIN):
+    self.call('POST', '/url', {'url': origin + path})
 
   def element(self, selector):
     return self.call('POST', '/element', {'using': 'css selector', 'value': selector})[ELEMENT]
@@ -93,7 +94,17 @@ class Firefox:
     })
 
   def cookies(self):
-    return [cookie for cookie in self.call('GET', '/cookie') if cookie['name'] == '__Host-expri_session']
+    # Firefox's enumeration can include ancestor-host cookies that its network
+    # stack never sends here. Select the exact host; wire checks prove isolation.
+    hostname = urlsplit(self.call('GET', '/url')).hostname
+    return [cookie for cookie in self.call('GET', '/cookie')
+      if cookie['name'] == '__Host-expri_session' and cookie['domain'] == hostname]
+
+  def restore_cookie(self, cookie):
+    # Omit Domain so replay uses a host-only cookie on the active document,
+    # preserving __Host- semantics instead of creating a domain cookie.
+    host_only = {name: value for name, value in cookie.items() if name != 'domain'}
+    self.call('POST', '/cookie', {'cookie': host_only})
 
   def close(self):
     try:
@@ -117,6 +128,19 @@ def posted_since(start, path, origin, status):
     if record['method'] == 'POST' and record['path'] == path), None), 'browser form POST was not observed')
   assert result['origin'] == origin, f'native {path} Origin was {result["origin"]!r}'
   assert result['status'] == status, f'native {path} returned {result["status"]}, expected {status}'
+  return result
+
+
+def catalog_with_wire_check(browser, status, session_cookie_count):
+  host = urlsplit(browser.call('GET', '/url')).netloc
+  start = len(trace_records())
+  result = browser.catalog()
+  assert result['status'] == status, f'dashboard catalog returned {result["status"]}, expected {status}'
+  request = wait_for(lambda: next((record for record in trace_records()[start:]
+    if record['method'] == 'GET' and record['path'] == '/api/catalog' and record['host'] == host), None),
+    'browser catalog request was not observed')
+  assert request['status'] == status, 'catalog wire response disagrees with Firefox'
+  assert request['session_cookie_count'] == session_cookie_count, 'browser sent an unexpected number of host session cookies'
   return result
 
 
@@ -166,7 +190,7 @@ def forms():
     wait_for(lambda: browser.call('GET', '/url') == ORIGIN + '/login', 'native logout did not reach the login page')
     assert not browser.cookies() and browser.catalog()['status'] == 401, 'native logout left dashboard access active'
     # Replaying the previous cookie also fails, proving server-side revocation.
-    browser.call('POST', '/cookie', {'cookie': cookie})
+    browser.restore_cookie(cookie)
     assert browser.catalog()['status'] == 401, 'native logout did not revoke its session'
     print('Firefox native forms passed: old-policy null Origin rejected; same-origin login/logout succeeded; session revoked.', flush=True)
   finally:
@@ -247,8 +271,78 @@ def workspace(run_id, second_run_id):
     browser.close()
 
 
+def previews(run_id, second_run_id):
+  preview_origin = 'https://ab.expri.example.net'
+  browser = Firefox()
+  def evaluate(script):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': []})
+  def catalog():
+    return browser.call('POST', '/execute/async', {'script': '''const done = arguments[0];
+      fetch('/api/catalog').then(async response => done({status: response.status,
+        catalog: response.ok ? await response.json() : null})).catch(() => done({status: 0}));''', 'args': []})
+  try:
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.navigate('/login')
+    browser.login()
+    wait_for(lambda: browser.catalog()['status'] == 200, 'main login did not complete')
+    catalog_with_wire_check(browser, 200, 1)
+    main_cookie = browser.cookies()[0]
+    main_catalog = catalog()
+    assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/app.js', 'main did not serve its embedded assets'
+
+    start = len(trace_records())
+    browser.navigate('/', preview_origin)
+    assert browser.call('GET', '/url') == preview_origin + '/login', 'main login unexpectedly authorized the preview'
+    catalog_with_wire_check(browser, 401, 0)
+    preview_requests = [record for record in trace_records()[start:]
+      if record['host'] == urlsplit(preview_origin).netloc]
+    assert preview_requests and all(record['session_cookie_count'] == 0 for record in preview_requests), 'main cookie escaped its host on the wire'
+    assert not browser.cookies(), 'preview unexpectedly stored its own session before login'
+    browser.login()
+    wait_for(lambda: browser.catalog()['status'] == 200, 'preview native login did not complete')
+    catalog_with_wire_check(browser, 200, 1)
+    ab_cookie = browser.cookies()[0]
+    assert ab_cookie['value'] != main_cookie['value'], 'preview reused the main session'
+    assert catalog() == main_catalog, 'preview and main do not share one catalog'
+    assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/assets/' + 'a' * 40 + '/app.js', 'preview did not serve pinned branch assets'
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'shared run list is missing in preview')
+    for selected in [run_id, second_run_id]:
+      browser.click(f'input[aria-label="Select {selected} for comparison"]')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'preview comparison did not load shared run data')
+    Path('/tmp/workspace-ab.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+
+    browser.restore_cookie(main_cookie)
+    catalog_with_wire_check(browser, 401, 1)
+    browser.restore_cookie(ab_cookie)
+    catalog_with_wire_check(browser, 200, 1)
+    browser.navigate('/')
+    catalog_with_wire_check(browser, 200, 1)
+    # Replay both directions while both server sessions are still valid.
+    browser.restore_cookie(ab_cookie)
+    catalog_with_wire_check(browser, 401, 1)
+    browser.restore_cookie(main_cookie)
+    catalog_with_wire_check(browser, 200, 1)
+    browser.navigate('/', preview_origin)
+    catalog_with_wire_check(browser, 200, 1)
+    browser.click('#logout-form button[type="submit"]')
+    catalog_with_wire_check(browser, 401, 0)
+    browser.restore_cookie(ab_cookie)
+    catalog_with_wire_check(browser, 401, 1)
+    browser.navigate('/')
+    catalog_with_wire_check(browser, 200, 1)
+    browser.click('#logout-form button[type="submit"]')
+    catalog_with_wire_check(browser, 401, 0)
+    browser.restore_cookie(main_cookie)
+    catalog_with_wire_check(browser, 401, 1)
+    print('Firefox previews passed: separate host sessions, shared catalog/runs, branch assets and comparison, cookie replay denied, independent logout.', flush=True)
+  finally:
+    browser.close()
+
+
 if __name__ == '__main__':
   if len(sys.argv) == 4 and sys.argv[1] == '--workspace':
     workspace(sys.argv[2], sys.argv[3])
+  elif len(sys.argv) == 4 and sys.argv[1] == '--previews':
+    previews(sys.argv[2], sys.argv[3])
   else:
     forms()
