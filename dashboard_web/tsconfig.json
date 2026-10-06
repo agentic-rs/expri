@@ -5,6 +5,7 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": [],
+    "jsx": "react-jsx",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -16,5 +17,5 @@
     "removeComments": true,
     "newLine": "lf"
   },
-  "include": ["app.ts"]
+  "include": ["*.ts", "*.tsx"]
 }

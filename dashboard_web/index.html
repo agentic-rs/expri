@@ -1,110 +1,36 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
     <title>expri · Experiment workspace</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/styles.css" />
     <script type="module" src="/app.js"></script>
   </head>
   <body class="dashboard-page">
     <a class="skip-link" href="#runs-heading">Skip to runs</a>
     <header class="topbar">
       <div class="topbar-inner">
-        <a class="brand" href="/" aria-label="expri dashboard"><span class="brand-mark" aria-hidden="true">e</span>expri</a>
-        <div class="project-context"><span class="eyebrow">Project</span><span class="project-name" id="project-name">Experiment workspace</span></div>
-        <span class="read-only">Read only</span>
-        <div class="source-controls">
-          <label class="field">Source<select id="source-select" aria-label="Run source" disabled><option>Loading sources…</option></select></label>
-          <button id="refresh-button" class="button secondary" type="button" disabled><span aria-hidden="true">↻</span> Refresh</button>
+        <a class="brand" href="/" aria-label="expri dashboard"
+          ><span class="brand-mark" aria-hidden="true">e</span>expri</a
+        >
+        <div class="project-context">
+          <span class="eyebrow">Project</span><span class="project-name" id="project-name"></span>
         </div>
-        <form id="logout-form" class="session-actions" method="post" action="/logout" hidden><button class="text-button" type="submit">Sign out</button></form>
+        <span class="read-only">Read only</span>
+        <div id="source-controls-root" class="source-controls"></div>
+        <form id="logout-form" class="session-actions" method="post" action="/logout" hidden>
+          <button class="text-button" type="submit">Sign out</button>
+        </form>
       </div>
     </header>
     <main class="workspace-main">
-      <div class="workspace-heading"><div><p class="eyebrow">Experiments</p><h1>Workspace</h1></div><div class="refresh-status"><label class="auto-refresh"><input id="auto-refresh-toggle" type="checkbox" checked>Auto refresh</label><span id="updated-at" class="freshness">Loading recorded results…</span></div></div>
-      <div id="source-note" class="source-note" hidden></div>
-      <div id="global-error" class="notice error" role="alert" hidden></div>
-      <div id="catalog-warnings" hidden></div>
-      <div class="workspace-grid">
-        <section class="card runs-card" aria-labelledby="runs-heading">
-          <div class="section-heading"><div><h2 id="runs-heading" tabindex="-1">Runs</h2><p id="run-count" class="muted">Loading run history…</p></div></div>
-          <div class="filters">
-            <label class="field search-field">Search<input id="search-input" type="search" placeholder="Run ID or task" autocomplete="off"></label>
-            <label class="field">Task<input id="task-input" type="search" list="task-options" placeholder="Any task" autocomplete="off"><datalist id="task-options"></datalist></label>
-            <label class="field">Status<select id="status-select"><option value="">Any status</option><option value="preparing">Preparing</option><option value="running">Running</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="cancelled">Cancelled</option><option value="lost">Lost</option><option value="unknown">Unknown</option></select></label>
-            <button id="clear-filters" class="text-button" type="button">Clear filters</button>
-            <p class="filter-hint">Changing filters clears the selection.</p>
-          </div>
-          <div id="list-warnings" hidden></div>
-          <div class="table-scroll runs-scroll" id="runs-region" aria-busy="true">
-            <table class="runs-table"><thead><tr><th class="selection-column"><span class="sr-only">Select for comparison</span></th><th scope="col">Run</th><th scope="col">Status</th></tr></thead><tbody id="run-rows"></tbody></table>
-            <div id="list-empty" class="empty-state"><span class="empty-mark" aria-hidden="true">◌</span><h3>Loading runs</h3><p>Your run history will appear here.</p></div>
-          </div>
-          <div class="pagination"><button id="previous-page" class="text-button" type="button" disabled>← Previous</button><span id="page-label" class="muted">Page 1</span><button id="next-page" class="text-button" type="button" disabled>Next →</button></div>
-          <div class="selection-bar">
-            <div><p id="selection-count" class="selection-count">Select runs to compare</p><div id="selected-runs" class="selected-runs"></div></div>
-            <div class="selection-actions"><button id="clear-selection" class="text-button" type="button" hidden>Clear selection</button><button id="compare-button" class="button primary" type="button" disabled>Compare runs</button></div>
-          </div>
-        </section>
-        <div class="review-workspace">
-          <section id="review-empty" class="review-empty"><p class="eyebrow">Experiment review</p><h2>Select a run</h2><p>Open a run to inspect its curves, parameters, and logs. Select runs to compare their recorded results.</p></section>
-          <section id="review-section" aria-live="polite" hidden>
-            <div class="review-heading"><div><p id="review-eyebrow" class="eyebrow">Run details</p><h2 id="review-title"></h2></div><button id="close-review" class="text-button" type="button">Back to selection</button></div>
-            <div class="review-tabs" role="tablist" aria-label="Run inspection">
-              <button id="review-tab-charts" class="review-tab" role="tab" aria-controls="review-panel-charts" aria-selected="true" type="button">Charts</button>
-              <button id="review-tab-overview" class="review-tab" role="tab" aria-controls="review-panel-overview" aria-selected="false" type="button">Overview</button>
-              <button id="review-tab-logs" class="review-tab" role="tab" aria-controls="review-panel-logs" aria-selected="false" type="button">Logs</button>
-            </div>
-            <div id="review-loading" class="card loading-state" hidden>Loading experiment details…</div>
-            <div id="review-error" class="notice error" role="alert" hidden></div>
-            <div id="review-warnings" hidden></div>
-            <div id="review-panel-charts" role="tabpanel" aria-labelledby="review-tab-charts">
-              <details id="run-metric-controls" class="card metric-settings" hidden><summary>Chart metrics <span class="muted">Choose up to six</span></summary><fieldset class="metric-picker"><legend>Metrics</legend><div id="run-metric-options"></div></fieldset></details>
-              <div id="compare-detail" hidden>
-                <section class="card comparison-controls"><div class="section-heading"><div><h3>Compare selected runs</h3><p class="muted">Recorded scalar values from this source.</p></div><fieldset class="choice-group"><legend>Summary</legend><div class="choice-tags"><label class="choice-tag"><input id="reduction-last" class="sr-only" type="radio" name="reduction" value="last" checked><span>Last</span></label><label class="choice-tag"><input id="reduction-min" class="sr-only" type="radio" name="reduction" value="min"><span>Minimum</span></label><label class="choice-tag"><input id="reduction-max" class="sr-only" type="radio" name="reduction" value="max"><span>Maximum</span></label></div></fieldset></div><details class="metric-settings"><summary>Metrics <span class="muted">Choose up to six</span></summary><fieldset class="metric-picker"><legend>Comparison metrics</legend><div id="compare-metric-options"></div><p id="compare-metric-hint" class="muted"></p></fieldset></details></section>
-                <section class="card comparison-summary"><h3>Metric values</h3><div id="comparison-values" class="table-scroll"></div></section>
-              </div>
-              <section id="chart-card" class="card chart-card" hidden>
-                <div class="section-heading">
-                  <div><h3>Metric curves</h3><p id="chart-note" class="muted">Recorded values by training step.</p></div>
-                  <div class="chart-actions">
-                    <div class="chart-axis-controls">
-                      <fieldset class="choice-group" id="x-axis-options">
-                        <legend>X-axis</legend>
-                        <div class="choice-tags">
-                          <label class="choice-tag"><input id="x-axis-step" class="sr-only" type="radio" name="x_axis" value="step" checked><span>Step</span></label>
-                          <label class="choice-tag"><input id="x-axis-elapsed" class="sr-only" type="radio" name="x_axis" value="elapsed"><span>Elapsed time</span></label>
-                          <label class="choice-tag"><input id="x-axis-wall-clock" class="sr-only" type="radio" name="x_axis" value="wall_clock"><span>Date &amp; time</span></label>
-                        </div>
-                      </fieldset>
-                      <fieldset class="choice-group" id="time-zone-options" aria-describedby="time-zone-label" hidden>
-                        <legend>Timezone</legend>
-                        <div class="time-zone-choices">
-                          <div class="choice-tags">
-                            <label class="choice-tag"><input id="time-zone-local" class="sr-only" type="radio" name="time_zone" value="local" checked><span>Local</span></label>
-                            <label class="choice-tag"><input id="time-zone-utc" class="sr-only" type="radio" name="time_zone" value="utc"><span>UTC</span></label>
-                          </div>
-                          <span id="time-zone-label" class="time-zone-label muted"></span>
-                        </div>
-                      </fieldset>
-                    </div>
-                    <a id="open-chart" class="text-button" target="_blank" rel="noopener noreferrer"><span id="open-chart-label">Open chart</span> <span aria-hidden="true">↗</span></a>
-                  </div>
-                </div>
-                <p id="chart-error" class="notice error" role="alert" hidden></p>
-                <iframe id="chart-frame" title="Interactive experiment metric curves" sandbox="allow-same-origin" loading="lazy"></iframe>
-                <p class="chart-footnote muted">Hover to inspect values, drag across the x-axis to zoom, and use the legend to show or hide runs. Time views omit points without recorded timestamps.</p>
-              </section>
-            </div>
-            <div id="review-panel-overview" role="tabpanel" aria-labelledby="review-tab-overview" hidden><div id="run-detail" hidden></div></div>
-            <div id="review-panel-logs" role="tabpanel" aria-labelledby="review-tab-logs" hidden><div id="run-logs"></div></div>
-          </section>
-        </div>
-      </div>
-      <footer><span id="dashboard-kind">expri · Local experiment review</span><span>Recorded results · Read only</span></footer>
+      <div id="dashboard-root"></div>
+      <noscript
+        ><p class="notice">Enable JavaScript to review recorded experiment results.</p></noscript
+      >
+      <footer><span id="dashboard-kind"></span><span>Recorded results · Read only</span></footer>
     </main>
-    <div id="live-status" class="sr-only" role="status" aria-live="polite"></div>
   </body>
 </html>
