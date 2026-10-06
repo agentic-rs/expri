@@ -288,12 +288,21 @@ def interactive_charts(browser, run_ids, prefix='workspace', check_security=Fals
 
 def select_chart_axis(browser, axis):
   index = {'step': 0, 'elapsed': 1, 'wall_clock': 2}[axis]
-  # Select options live in Firefox's native popup; clicking the hidden option
-  # element bypasses that popup and is intercepted. Use actual keyboard input.
+  # Gecko's element key input focuses a closed select and changes it natively.
+  # Opening its popup first leaves these keys without a committed selection.
   browser.call('POST', '/execute/sync', {'script': '''document.querySelector('#x-axis-select')
     .scrollIntoView({block: 'center', inline: 'nearest'});''', 'args': []})
-  browser.click('#x-axis-select')
   browser.keys('#x-axis-select', '\ue011' + '\ue015' * index + '\ue007')
+  selected = browser.call('POST', '/execute/sync', {'script': "return document.querySelector('#x-axis-select').value;", 'args': []})
+  assert selected == axis, f'native select requested {axis}, actual value {selected}'
+
+
+def chart_axis_diagnostics(browser, requested):
+  return browser.call('POST', '/execute/sync', {'script': '''return {requested: arguments[0],
+    selected: document.querySelector('#x-axis-select').value,
+    rendered: [...(document.querySelector('#chart-frame').contentDocument?.querySelectorAll('svg[data-x-axis]') ?? [])].map(node => node.dataset.xAxis),
+    error: document.querySelector('#chart-error').textContent,
+    error_hidden: document.querySelector('#chart-error').hidden};''', 'args': [requested]})
 
 
 def time_axes(browser, run_ids, prefix='workspace'):
@@ -307,10 +316,35 @@ def time_axes(browser, run_ids, prefix='workspace'):
         domain: [svg.dataset.xMin, svg.dataset.xMax], hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent)} : null;''')
   def choose(axis):
     select_chart_axis(browser, axis)
-    wait_for(lambda: (state() or {}).get('axis') == axis, 'native axis selection did not update the plot')
+    try:
+      wait_for(lambda: (state() or {}).get('axis') == axis, 'native axis selection did not update the plot')
+    except AssertionError as error:
+      raise AssertionError('native axis selection did not update the plot: ' + json.dumps(chart_axis_diagnostics(browser, axis))) from error
     assert 'x_axis=' + axis in evaluate("return document.querySelector('#open-chart').href;"), 'Open chart lost the selected axis'
   def child():
     browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+  def sample():
+    return evaluate('''const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss');
+      const row = card.querySelector('[data-chart-readout-run]'); if (!row) return null;
+      const circle = [...card.querySelectorAll('circle.point')].find(node => node.dataset.chartSeries === row.dataset.chartReadoutRun
+        && node.dataset.xValue === row.dataset.chartX && node.dataset.timestamp === row.dataset.chartTimestamp);
+      return {run_index: row.dataset.chartReadoutRun, run_id: row.querySelector('code').textContent,
+        step: row.dataset.chartStep, value: row.dataset.chartValue, x: row.dataset.chartX, timestamp: row.dataset.chartTimestamp, text: row.textContent,
+        recorded: circle ? {x: circle.dataset.xValue, timestamp: circle.dataset.timestamp, label: circle.getAttribute('aria-label')} : null};''')
+  def assert_recorded_sample(row, axis):
+    assert row['run_index'] == '1' and row['run_id'] == run_ids[0], 'time readout inspected a hidden or unrelated run'
+    assert 0 <= int(row['step']) < 80 and float(row['value']) == 1 / (int(row['step']) + 1), 'time readout changed the original step or metric value'
+    assert row['timestamp'].endswith('Z'), 'time readout omitted the original UTC timestamp'
+    recorded = row['recorded']
+    assert recorded is not None and recorded['x'] == row['x'] and recorded['timestamp'] == row['timestamp'], 'time readout did not match a recorded circle coordinate and timestamp'
+    prefix = f"Run 1 · step {row['step']} · value {row['value']} · timestamp {row['timestamp']}"
+    assert recorded['label'] == prefix or recorded['label'].startswith(prefix + ' · elapsed '), 'time readout changed the exact recorded sample label'
+    assert ('Elapsed' if axis == 'elapsed' else 'UTC') in row['text'], 'time readout omitted the chosen axis value'
+    if axis == 'wall_clock':
+      assert int(row['x']) > 10**18, 'wall-clock readout lost its exact epoch nanosecond coordinate'
+  def first_sample():
+    row = sample()
+    return row if row and row.get('step') == '0' else None
   loss = '//section[@data-interactive-chart][h2="loss"]'
   child()
   try:
@@ -329,15 +363,17 @@ def time_axes(browser, run_ids, prefix='workspace'):
           return {text: card.textContent, circles: card.querySelectorAll('circle.point').length};''')
         assert '1 of 3 samples omitted' in duplicate['text'] and duplicate['circles'] == 4, 'time chart invented a timestamp for a legacy sample'
         browser.pointer(loss + '//*[@data-chart-hit]', .001, using='xpath')
-        row = wait_for(lambda: evaluate('''const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss');
-          const row = card.querySelector('[data-chart-readout-run]'); return row ? {step: row.dataset.chartStep, value: row.dataset.chartValue, x: row.dataset.chartX, timestamp: row.dataset.chartTimestamp, text: row.textContent} : null;'''), 'native time hover did not show an exact sample')
-        assert row['step'] == '0' and float(row['value']) == 1, 'time hover changed the original step or metric value'
-        assert row['timestamp'].endswith('Z'), 'time hover omitted the original UTC timestamp'
-        assert ('Elapsed' if axis == 'elapsed' else 'UTC') in row['text'], 'time hover omitted the chosen axis value'
+        row = wait_for(sample, 'native time hover did not show an exact sample')
+        assert_recorded_sample(row, axis)
+        # Wall-clock runs may start far apart; one physical pointer pixel can
+        # span several samples. Keyboard inspection selects the first sample
+        # independently of transfer delays or the total wall-clock range.
+        browser.keys(loss + '//*[@class="plot-scroll"]', '\ue011\ue014', using='xpath')
+        row = wait_for(first_sample, 'native keyboard did not inspect the first time sample')
+        assert_recorded_sample(row, axis)
+        assert row['step'] == '0' and float(row['value']) == 1, 'keyboard inspection changed the first time sample'
         if axis == 'elapsed':
           assert row['x'] == '0', 'elapsed axis did not anchor the first metric event at zero'
-        else:
-          assert int(row['x']) > 10**18, 'wall-clock axis lost its exact epoch nanosecond coordinate'
         browser.pointer(loss + '//*[@data-chart-hit]', .2, .65, using='xpath')
       finally:
         browser.call('POST', '/frame', {'id': None})
