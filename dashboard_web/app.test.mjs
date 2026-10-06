@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { apiUrl, formatDuration, formatNumber, formatValue, RequestLane, startDashboard } from "./app.js";
+import { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, RequestLane, startDashboard } from "./app.js";
 
 function deferred() {
   let resolve;
@@ -245,6 +245,78 @@ function chartQuery(nodes) {
 function comparisonRows(nodes) {
   return nodes.get("comparison-values").children[0]?.children[1]?.children ?? [];
 }
+
+function chooseAxis(nodes, value) {
+  const input = nodes.get(`x-axis-${value.replace("_", "-")}`); input.checked = true; input.emit("change");
+}
+function selectedAxis(nodes) { return ["step", "elapsed", "wall_clock"].find(value => nodes.get(`x-axis-${value.replace("_", "-")}`).checked); }
+function chooseTimeZone(nodes, value) { const input = nodes.get(`time-zone-${value}`); input.checked = true; input.emit("change"); }
+function chooseReduction(nodes, value) { const input = nodes.get(`reduction-${value}`); input.checked = true; input.emit("change"); }
+
+test("small fixed choices use native radio tags with accessible group labels", () => {
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+  for (const name of ["x_axis", "time_zone", "reduction"]) {
+    const inputs = [...html.matchAll(new RegExp(`<input[^>]+type="radio"[^>]+name="${name}"[^>]*>`, "g"))];
+    assert.equal(inputs.length, name === "time_zone" ? 2 : 3);
+    assert.equal(inputs.filter(([tag]) => /\bchecked\b/.test(tag)).length, 1);
+  }
+  assert.match(html, /<fieldset[^>]+id="x-axis-options"[^>]*>\s*<legend>X-axis<\/legend>/);
+  assert.match(html, /id="time-zone-options"[^>]+aria-describedby="time-zone-label"[^>]+hidden/);
+  assert.match(html, /<span>Date &amp; time<\/span>/);
+  assert.doesNotMatch(html, /id="(?:x-axis|reduction)-select"/);
+});
+
+test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
+  const model = reviewFixture(t), { nodes } = model;
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  selectRow(nodes, 0);
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  assert.equal(chartQuery(nodes).get("x_axis"), "step");
+  chooseAxis(nodes, "elapsed");
+  assert.equal(chartQuery(nodes).get("x_axis"), "elapsed");
+  assert.match(nodes.get("chart-note").textContent, /first timestamped metric event/);
+  selectRow(nodes, 1);
+  await settled(() => chartQuery(nodes).getAll("run_id").length === 2);
+  assert.equal(chartQuery(nodes).get("x_axis"), "elapsed");
+  chooseAxis(nodes, "wall_clock");
+  assert.equal(chartQuery(nodes).get("x_axis"), "wall_clock");
+  assert.match(nodes.get("chart-note").textContent, /your local timezone/);
+  assert.equal(nodes.get("time-zone-options").hidden, false);
+  assert.equal(nodes.get("time-zone-label").textContent, localTimeZoneLabel());
+  assert.equal(nodes.get("open-chart-label").textContent, "Open UTC chart");
+  assert.equal(new URL(nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "wall_clock");
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-1"]);
+  nodes.get("refresh-button").click();
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(selectedAxis(nodes), "wall_clock");
+  assert.equal(chartQuery(nodes).get("x_axis"), "wall_clock");
+  nodes.get("x-axis-elapsed").checked = false; nodes.get("x-axis-elapsed").emit("change");
+  assert.equal(selectedAxis(nodes), "wall_clock", "deselected radio events do not switch axes");
+  chooseAxis(nodes, "step");
+  assert.equal(chartQuery(nodes).get("x_axis"), "step");
+  assert.equal(nodes.get("time-zone-options").hidden, true);
+  assert.equal(nodes.get("open-chart-label").textContent, "Open chart");
+});
+
+test("summary tags select reductions in one action and retain the choice on refresh", async t => {
+  const model = reviewFixture(t), { nodes } = model;
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  selectRow(nodes, 0); selectRow(nodes, 1);
+  await settled(() => model.requests.some(url => url.startsWith("/api/compare")));
+  assert.equal(nodes.get("reduction-last").checked, true);
+  chooseReduction(nodes, "min");
+  await settled(() => new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction") === "min");
+  assert.equal(nodes.get("reduction-min").checked, true);
+  assert.equal(nodes.get("reduction-last").checked, false);
+  chooseReduction(nodes, "max");
+  await settled(() => new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction") === "max");
+  assert.equal(nodes.get("reduction-max").checked, true);
+  assert.equal(nodes.get("reduction-min").checked, false);
+  nodes.get("refresh-button").click();
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction"), "max");
+  assert.equal(nodes.get("reduction-max").checked, true);
+});
 
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = reviewFixture(t);
@@ -524,8 +596,8 @@ class RefreshClock {
   }
 }
 function autoFixture(t, fields = {}) {
-  const clock = new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [] };
-  const controller = { dispose() {}, isInteracting: () => chart.interacting, previewStatus: () => chart.status, replacePreview: html => { if (!chart.ready) return false; chart.previews.push(html); return true; } };
+  const clock = new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [], time_zones: [] };
+  const controller = { dispose() {}, setTimeZone: value => chart.time_zones.push(value), isInteracting: () => chart.interacting, previewStatus: () => chart.status, replacePreview: html => { if (!chart.ready) return false; chart.previews.push(html); return true; } };
   const model = reviewFixture(t, { hosted: true, updates: true, ...fields, refresh_clock: clock, chart_controller: controller });
   return { ...model, model, clock, chart, page_document: globalThis.document };
 }
@@ -572,6 +644,113 @@ test("changed metrics update only the active run and chart while preserving the 
   assert.equal(model.nodes.get("chart-frame").src_writes, writes);
   assert.equal(model.chart.previews.at(-1), "<html>chart-2</html>");
   assert.match(text(model.nodes.get("run-detail")), /0\.125/);
+});
+
+test("time-axis changes replace the preview in place and remain selected for incremental updates", async t => {
+  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const writes = model.nodes.get("chart-frame").src_writes;
+  model.model.chart_html = "<html>elapsed-chart</html>";
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes, "axis switching preserves the iframe and its visibility state");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
+  assert.equal(new URL(model.nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "elapsed");
+  model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>elapsed-chart-updated</html>";
+  await model.clock.advance(5_000);
+  assert.equal(model.chart.previews.at(-1), "<html>elapsed-chart-updated</html>");
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/chart")).at(-1), "http://localhost").searchParams.get("x_axis"), "elapsed");
+  assert.equal(selectedAxis(model.nodes), "elapsed");
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+});
+
+test("timezone tags redraw locally without requests and persist across axes and refresh", async t => {
+  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  assert.deepEqual(model.chart.time_zones, ["local"], "date & time defaults to the viewer’s timezone");
+  chooseAxis(model.nodes, "wall_clock");
+  await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
+  const requests = model.requests.length, writes = model.nodes.get("chart-frame").src_writes, previews = [...model.chart.previews];
+  model.nodes.get("time-zone-utc").focus(); chooseTimeZone(model.nodes, "utc");
+  assert.deepEqual(model.chart.time_zones, ["local", "utc"]);
+  assert.equal(model.nodes.get("time-zone-utc").checked, true);
+  assert.equal(model.nodes.get("time-zone-local").checked, false);
+  assert.equal(model.nodes.get("time-zone-label").textContent, "UTC");
+  assert.match(model.nodes.get("chart-note").textContent, /Recorded date & time in UTC/);
+  assert.equal(model.requests.length, requests, "timezone is a display choice and does not refetch the chart");
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.deepEqual(model.chart.previews, previews);
+  assert.equal(globalThis.document.activeElement, model.nodes.get("time-zone-utc"));
+  chooseTimeZone(model.nodes, "utc");
+  model.nodes.get("time-zone-local").checked = false; model.nodes.get("time-zone-local").emit("change");
+  assert.deepEqual(model.chart.time_zones, ["local", "utc"], "unchanged and deselected radio events do not redraw");
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
+  assert.equal(model.nodes.get("time-zone-options").hidden, true);
+  chooseAxis(model.nodes, "wall_clock");
+  await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
+  assert.equal(model.nodes.get("time-zone-utc").checked, true);
+  model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>utc-updated-chart</html>";
+  await model.clock.advance(5_000);
+  assert.equal(model.chart.previews.at(-1), "<html>utc-updated-chart</html>");
+  assert.equal(model.nodes.get("time-zone-utc").checked, true);
+  assert.equal(selectedAxis(model.nodes), "wall_clock");
+  chooseTimeZone(model.nodes, "local");
+  assert.equal(model.nodes.get("time-zone-label").textContent, localTimeZoneLabel());
+  assert.deepEqual(model.chart.time_zones, ["local", "utc", "local"]);
+});
+
+test("late axis responses cannot replace a newer choice or review", async t => {
+  const model = autoFixture(t); await inspect(model);
+  const pending = deferred(), signals = [];
+  model.model.override = (parsed, options) => {
+    if (parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed") {
+      signals.push(options.signal); return pending.promise;
+    }
+  };
+  chooseAxis(model.nodes, "elapsed");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "true");
+  model.model.chart_html = "<html>wall-clock-chart</html>";
+  chooseAxis(model.nodes, "wall_clock");
+  await settled(() => model.chart.previews.at(-1) === "<html>wall-clock-chart</html>");
+  assert.equal(signals[0].aborted, true);
+  pending.resolve({ ok: true, status: 200, text: async () => "<html>stale-elapsed-chart</html>" });
+  await flush();
+  assert.equal(model.chart.previews.at(-1), "<html>wall-clock-chart</html>");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
+  const next = deferred();
+  model.model.override = parsed => parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed" ? next.promise : null;
+  chooseAxis(model.nodes, "elapsed");
+  model.nodes.get("run-rows").children[1].children[1].children[0].click();
+  await settled(() => chartQuery(model.nodes).get("run_id") === "run-1");
+  next.resolve({ ok: true, status: 200, text: async () => "<html>old-review-chart</html>" });
+  await flush();
+  assert.equal(model.chart.previews.includes("<html>old-review-chart</html>"), false);
+  assert.equal(chartQuery(model.nodes).get("x_axis"), "elapsed");
+});
+
+test("an axis load failure retains the last chart and automatic recovery clears its scoped error", async t => {
+  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const previews = [...model.chart.previews], writes = model.nodes.get("chart-frame").src_writes;
+  model.model.override = parsed => parsed.pathname === "/api/chart" ? response({ error: "Connection temporarily unavailable" }, 503) : null;
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.nodes.get("chart-error").hidden === false);
+  assert.deepEqual(model.chart.previews, previews);
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.match(model.nodes.get("chart-error").textContent, /Showing the last loaded chart/);
+  model.model.override = null; model.model.chart_html = "<html>recovered-elapsed-chart</html>";
+  await model.clock.advance(5_000);
+  assert.equal(model.chart.previews.at(-1), "<html>recovered-elapsed-chart</html>");
+  assert.equal(model.nodes.get("chart-error").hidden, true);
+  assert.equal(selectedAxis(model.nodes), "elapsed");
+});
+
+test("changing only the chart axis does not dismiss an unrelated metadata failure", async t => {
+  const model = autoFixture(t); await inspect(model);
+  const error = model.nodes.get("review-error"); error.hidden = false; error.textContent = "Run metadata temporarily unavailable";
+  model.model.chart_html = "<html>elapsed-chart</html>";
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
+  assert.equal(error.hidden, false);
+  assert.equal(error.textContent, "Run metadata temporarily unavailable");
 });
 
 test("auto and manual refresh preserve pagination and explicit selections outside the page", async t => {
@@ -663,7 +842,7 @@ test("automatic recovery completes an initially failed comparison and reopening 
   assert.equal(model.nodes.get("compare-metric-options").children.length > 0, true);
   assert.equal(model.chart.previews.length, 1);
   const writes = model.nodes.get("chart-frame").src_writes;
-  model.nodes.get("reduction-select").value = "max"; model.nodes.get("reduction-select").emit("change");
+  chooseReduction(model.nodes, "max");
   await settled(() => model.nodes.get("comparison-values").attributes["aria-busy"] === "false");
   assert.equal(model.nodes.get("chart-frame").src_writes, writes, "scalar reduction does not navigate identical chart metrics");
   model.nodes.get("clear-selection").click();

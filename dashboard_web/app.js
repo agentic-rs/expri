@@ -1,5 +1,8 @@
 // interactive_charts.ts
 var MAX_STEP = 18446744073709551615n;
+var MIN_COORDINATE = -(1n << 127n);
+var MAX_COORDINATE = (1n << 127n) - 1n;
+var NANOS_PER_SECOND = 1000000000n;
 var FRACTION_SCALE = 1000000000000n;
 var SVG_NS = "http://www.w3.org/2000/svg";
 var LEFT = 86;
@@ -8,56 +11,133 @@ var TOP = 28;
 var BOTTOM = 274;
 var chart_sequence = 0;
 function parseChartPointLabel(label) {
-  const match = /^Run ([1-8]) · step (\d+) · value (-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$/.exec(label);
+  const match = /^Run ([1-8]) · step (\d+) · value (-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?: · timestamp [^·\r\n]{1,128})?(?: · elapsed [^·\r\n]{1,80})?$/.exec(label);
   if (!match) return null;
   const step = match[2], value_text = match[3];
   if (step === void 0 || value_text === void 0 || step.length > 20 || BigInt(step) > MAX_STEP) return null;
   const value = Number(value_text);
   return Number.isFinite(value) ? { run_index: Number(match[1]), step, value, value_text } : null;
 }
-function steps(range) {
-  if (!/^\d{1,20}$/.test(range.start_step) || !/^\d{1,20}$/.test(range.end_step)) throw new Error("Invalid chart step range");
-  const start = BigInt(range.start_step), end = BigInt(range.end_step);
-  if (start > end || end > MAX_STEP) throw new Error("Invalid chart step range");
+function coordinate(value, x_axis) {
+  if (!/^-?(?:0|[1-9]\d{0,38})$/.test(value) || value === "-0") return null;
+  const parsed = BigInt(value);
+  return x_axis === "step" ? parsed >= 0n && parsed <= MAX_STEP ? parsed : null : parsed >= MIN_COORDINATE && parsed <= MAX_COORDINATE ? parsed : null;
+}
+function parseChartRange(x_axis, start_x, end_x) {
+  if (!["step", "elapsed", "wall_clock"].includes(x_axis ?? "") || start_x === null || end_x === null) return null;
+  const axis = x_axis, start = coordinate(start_x, axis), end = coordinate(end_x, axis);
+  return start !== null && end !== null && start <= end ? { x_axis: axis, start_x, end_x } : null;
+}
+function coordinatesInRange(range) {
+  if (!parseChartRange(range.x_axis, range.start_x, range.end_x)) throw new Error("Invalid chart axis range");
+  const start = BigInt(range.start_x), end = BigInt(range.end_x);
   return [start, end];
 }
 function fractionInteger(fraction) {
   return BigInt(Math.round(Math.min(1, Math.max(0, Number.isFinite(fraction) ? fraction : 0)) * Number(FRACTION_SCALE)));
 }
-function stepAt(range, fraction) {
-  const [start, end] = steps(range);
+function xAt(range, fraction) {
+  const [start, end] = coordinatesInRange(range);
   return start + (end - start) * fractionInteger(fraction) / FRACTION_SCALE;
 }
-function chartStepFraction(step, range) {
-  const [start, end] = steps(range);
+function chartXFraction(x_value, range) {
+  const [start, end] = coordinatesInRange(range), value = coordinate(x_value, range.x_axis);
+  if (value === null) throw new Error("Invalid chart axis coordinate");
   if (start === end) return 0.5;
-  return Number((BigInt(step) - start) * FRACTION_SCALE / (end - start)) / Number(FRACTION_SCALE);
+  return Number((value - start) * FRACTION_SCALE / (end - start)) / Number(FRACTION_SCALE);
 }
 function dragChartRange(range, start_fraction, end_fraction) {
-  const first = stepAt(range, Math.min(start_fraction, end_fraction));
-  const last = stepAt(range, Math.max(start_fraction, end_fraction));
-  return first < last ? { start_step: String(first), end_step: String(last) } : range;
+  const first = xAt(range, Math.min(start_fraction, end_fraction));
+  const last = xAt(range, Math.max(start_fraction, end_fraction));
+  return first < last ? { x_axis: range.x_axis, start_x: String(first), end_x: String(last) } : range;
 }
 function zoomChartRange(range, full_range, factor, center_fraction = 0.5) {
-  const [full_start, full_end] = steps(full_range), [start, end] = steps(range);
+  if (range.x_axis !== full_range.x_axis) throw new Error("Cannot zoom different chart axes");
+  const [full_start, full_end] = coordinatesInRange(full_range), [start, end] = coordinatesInRange(range);
   const full_span = full_end - full_start;
   if (full_span === 0n || !Number.isFinite(factor) || factor <= 0) return range;
   const ratio = BigInt(Math.round(Math.min(1e6, factor) * 1e6));
   let span = (end - start) * ratio / 1000000n;
   if (span < 1n) span = 1n;
   if (span > full_span) span = full_span;
-  const anchor = stepAt(range, center_fraction);
+  const anchor = xAt(range, center_fraction);
   let next_start = anchor - span * fractionInteger(center_fraction) / FRACTION_SCALE;
   if (next_start < full_start) next_start = full_start;
   if (next_start + span > full_end) next_start = full_end - span;
-  return { start_step: String(next_start), end_step: String(next_start + span) };
+  return { x_axis: range.x_axis, start_x: String(next_start), end_x: String(next_start + span) };
 }
 function restoreChartRange(range, full_range) {
-  const [full_start, full_end] = steps(full_range);
-  if (range === null) return full_range;
-  const [start, end] = steps(range);
+  const [full_start, full_end] = coordinatesInRange(full_range);
+  if (range === null || range.x_axis !== full_range.x_axis) return full_range;
+  const [start, end] = coordinatesInRange(range);
   const clamp = (value) => value < full_start ? full_start : value > full_end ? full_end : value;
-  return { start_step: String(clamp(start)), end_step: String(clamp(end)) };
+  return { x_axis: range.x_axis, start_x: String(clamp(start)), end_x: String(clamp(end)) };
+}
+function timeZoneLabel(time_zone) {
+  return time_zone === "utc" ? "UTC" : new Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+function dateParts(value, time_zone) {
+  let seconds = value / NANOS_PER_SECOND, remainder = value % NANOS_PER_SECOND;
+  if (remainder < 0n) {
+    seconds -= 1n;
+    remainder += NANOS_PER_SECOND;
+  }
+  const date = new Date(Number(seconds) * 1e3);
+  if (!Number.isFinite(date.getTime())) return null;
+  const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+  if (time_zone === "utc") {
+    const [date_text, time_text] = date.toISOString().replace(/\.\d{3}Z$/, "").split("T");
+    return { date_text, time_text: `${time_text}${fraction}`, offset_text: "UTC" };
+  }
+  const year = date.getFullYear(), pad = (value2) => String(value2).padStart(2, "0");
+  const year_text = year >= 0 && year <= 9999 ? String(year).padStart(4, "0") : `${year < 0 ? "-" : "+"}${String(Math.abs(year)).padStart(6, "0")}`;
+  const local_as_utc = /* @__PURE__ */ new Date(0);
+  local_as_utc.setUTCFullYear(year, date.getMonth(), date.getDate());
+  local_as_utc.setUTCHours(date.getHours(), date.getMinutes(), date.getSeconds(), 0);
+  const offset = Number.isFinite(local_as_utc.getTime()) ? (local_as_utc.getTime() - date.getTime()) / 1e3 : -date.getTimezoneOffset() * 60;
+  const absolute = Math.abs(offset);
+  const offset_text = offset === 0 ? "UTC" : `UTC${offset < 0 ? "\u2212" : "+"}${pad(Math.floor(absolute / 3600))}:${pad(Math.floor(absolute / 60) % 60)}${absolute % 60 === 0 ? "" : `:${pad(absolute % 60)}`}`;
+  return {
+    date_text: `${year_text}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    time_text: `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${fraction}`,
+    offset_text
+  };
+}
+function formatChartX(x_value, x_axis, time_zone = "utc") {
+  const value = coordinate(x_value, x_axis);
+  if (value === null) throw new Error("Invalid chart axis coordinate");
+  if (x_axis === "step") return x_value;
+  if (x_axis === "elapsed") {
+    const negative = value < 0n, absolute = negative ? -value : value;
+    const sign = negative ? "\u2212" : "";
+    if (absolute !== 0n && absolute < NANOS_PER_SECOND) {
+      const [divisor, digits, unit] = absolute < 1000n ? [1n, 0, "ns"] : absolute < 1000000n ? [1000n, 3, "\xB5s"] : [1000000n, 6, "ms"];
+      const remainder2 = absolute % divisor;
+      const fraction2 = remainder2 === 0n ? "" : `.${String(remainder2).padStart(digits, "0").replace(/0+$/, "")}`;
+      return `${sign}${absolute / divisor}${fraction2} ${unit}`;
+    }
+    const seconds = absolute / NANOS_PER_SECOND, remainder = absolute % NANOS_PER_SECOND;
+    const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+    if (seconds >= 3600n) return `${sign}${seconds / 3600n}:${String(seconds / 60n % 60n).padStart(2, "0")}:${String(seconds % 60n).padStart(2, "0")}${fraction} h`;
+    if (seconds >= 60n) return `${sign}${seconds / 60n}:${String(seconds % 60n).padStart(2, "0")}${fraction} min`;
+    return `${sign}${seconds}${fraction} s`;
+  }
+  const parts = dateParts(value, time_zone);
+  if (!parts) return `${x_value} ns since Unix epoch`;
+  const zone = timeZoneLabel(time_zone);
+  return `${parts.date_text} ${parts.time_text} ${parts.offset_text}${time_zone === "local" && zone !== "UTC" ? ` (${zone})` : ""}`;
+}
+function formatChartTick(x_value, range, time_zone = "utc") {
+  const label = formatChartX(x_value, range.x_axis, time_zone);
+  if (range.x_axis !== "wall_clock") return label;
+  const [start, end] = coordinatesInRange(range);
+  const parts = dateParts(BigInt(x_value), time_zone), first = dateParts(start, time_zone), last = dateParts(end, time_zone);
+  if (!parts || !first || !last) return label;
+  const offset = first.offset_text !== last.offset_text ? ` ${parts.offset_text}` : "";
+  if (first.date_text === last.date_text) return `${parts.time_text}${offset}`;
+  if (end - start >= 365n * 86400n * NANOS_PER_SECOND) return parts.date_text;
+  const time = end - start < 120n * NANOS_PER_SECOND ? parts.time_text : parts.time_text.slice(0, 5);
+  return `${parts.date_text.slice(-5)} ${time}${offset}`;
 }
 function nearestChartPoint(points, x, y, preferred) {
   if (preferred && points.includes(preferred) && preferred.x === x && (y === void 0 || preferred.y === y)) return preferred;
@@ -83,16 +163,30 @@ function svgNode(document2, tag, attrs) {
   return node;
 }
 function plotRange(svg) {
+  if (["data-x-axis", "data-x-min", "data-x-max"].some((name) => svg.hasAttribute(name))) {
+    return parseChartRange(svg.getAttribute("data-x-axis"), svg.getAttribute("data-x-min"), svg.getAttribute("data-x-max"));
+  }
   const tick_steps = [...svg.querySelectorAll("text.tick")].filter((node) => Number(node.getAttribute("y")) >= BOTTOM + 12).map((node) => node.textContent?.trim() ?? "").filter((value) => /^\d{1,20}$/.test(value));
   if (!tick_steps.length) return null;
   const values = tick_steps.map((value) => BigInt(value)).sort((first, second) => first < second ? -1 : first > second ? 1 : 0);
   const start = values[0], end = values[values.length - 1];
   if (start === void 0 || end === void 0 || end > MAX_STEP) return null;
-  return { start_step: String(start), end_step: String(end) };
+  return { x_axis: "step", start_x: String(start), end_x: String(end) };
+}
+function pointCoordinate(circle, parsed, range, explicit) {
+  const value = explicit ? circle.getAttribute("data-x-value") : parsed.step;
+  const x_value = value === null ? null : coordinate(value, range.x_axis);
+  if (x_value === null || x_value < BigInt(range.start_x) || x_value > BigInt(range.end_x)) return null;
+  if (range.x_axis === "step" && x_value !== BigInt(parsed.step)) return null;
+  return String(x_value);
+}
+function pointTimestamp(circle) {
+  const timestamp = circle.getAttribute("data-timestamp");
+  return timestamp !== null && timestamp.length <= 128 && /^[+-]?\d{4,6}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/.test(timestamp) ? timestamp : null;
 }
 var PREVIEW_HTML_TAGS = new Set("html head body meta title style main p section h2 div ul li span code pre details summary table thead tbody tr th td".split(" "));
 var PREVIEW_SVG_TAGS = new Set("svg title desc line text polyline circle".split(" "));
-var PREVIEW_ATTRIBUTES = new Set("lang charset name content class id role aria-label aria-labelledby tabindex viewBox x y x1 x2 y1 y2 cx cy r fill stroke stroke-width stroke-dasharray points text-anchor transform style scope".split(" "));
+var PREVIEW_ATTRIBUTES = new Set("lang charset name content class id role aria-label aria-labelledby tabindex viewBox x y x1 x2 y1 y2 cx cy r fill stroke stroke-width stroke-dasharray points text-anchor transform style scope data-x-axis data-x-min data-x-max data-x-value data-timestamp".split(" "));
 function isDashboardPreview(document2) {
   if (document2.title !== "Run comparison \xB7 expri" || !document2.querySelector("body > main > .chart-summary")) return false;
   if (document2.querySelectorAll("circle.point").length > 4800 || document2.querySelectorAll(".plot-scroll > svg").length > 6) return false;
@@ -100,10 +194,13 @@ function isDashboardPreview(document2) {
     const section = svg.closest("section.card"), metric = section?.querySelector("h2")?.textContent;
     const run_ids = [...section?.querySelectorAll("ul.legend li code") ?? []].map((node) => node.textContent ?? "");
     const circles = svg.querySelectorAll("circle.point");
-    if (!metric || !run_ids.length || run_ids.length > 8 || new Set(run_ids).size !== run_ids.length || run_ids.some((id) => !id) || !plotRange(svg) || !circles.length) return false;
+    const range = plotRange(svg), explicit = svg.hasAttribute("data-x-axis");
+    if (!metric || !run_ids.length || run_ids.length > 8 || new Set(run_ids).size !== run_ids.length || run_ids.some((id) => !id) || !range || !circles.length) return false;
     for (const circle of circles) {
       const point = parseChartPointLabel(circle.getAttribute("aria-label") ?? "");
-      if (!point || point.run_index > run_ids.length) return false;
+      if (!point || point.run_index > run_ids.length || pointCoordinate(circle, point, range, explicit) === null) return false;
+      const timestamp = pointTimestamp(circle);
+      if ((range.x_axis !== "step" || circle.hasAttribute("data-timestamp")) && timestamp === null) return false;
       for (const attribute of ["cx", "cy"]) {
         const value = circle.getAttribute(attribute);
         if (value === null || !Number.isFinite(Number(value))) return false;
@@ -131,11 +228,14 @@ function parseDashboardPreview(markup) {
 }
 function createChartController(frame) {
   let plots = [], current_document = null, disposed = false;
+  let time_zone = "local";
   let completed_source = null;
-  const clear = () => {
+  const hidden_runs = /* @__PURE__ */ new Map();
+  const clear = (forget_visibility = false) => {
     for (const plot of plots) plot.dispose();
     plots = [];
     current_document = null;
+    if (forget_visibility) hidden_runs.clear();
   };
   function currentSource() {
     if (!frame.src || !frame.ownerDocument?.baseURI) return null;
@@ -155,12 +255,12 @@ function createChartController(frame) {
   function enhanceDocument(document2) {
     current_document = document2;
     for (const svg of document2.querySelectorAll(".plot-scroll > svg")) {
-      const plot = enhancePlot(document2, svg);
+      const plot = enhancePlot(document2, svg, time_zone);
       if (plot) plots.push(plot);
     }
   }
   const enhance = (completed = false) => {
-    clear();
+    clear(true);
     if (disposed) return;
     try {
       const source = currentSource(), child = frame.contentDocument;
@@ -174,16 +274,21 @@ function createChartController(frame) {
   frame.addEventListener("load", loaded);
   const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => {
     completed_source = null;
-    clear();
+    clear(true);
   });
   observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
   enhance();
   return {
+    setTimeZone(next) {
+      if (disposed || time_zone === next) return;
+      time_zone = next;
+      for (const plot of plots) plot.setTimeZone(next);
+    },
     dispose() {
       disposed = true;
       frame.removeEventListener("load", loaded);
       observer?.disconnect();
-      clear();
+      clear(true);
     },
     isInteracting() {
       return plots.some((plot) => plot.isInteracting());
@@ -216,6 +321,9 @@ function createChartController(frame) {
         if (!frame_focused) state.focus = null;
         return [state.metric_name, state];
       }));
+      const metric_names = new Set([...next.querySelectorAll("body > main > section.card > h2")].slice(0, 6).map((node) => node.textContent ?? ""));
+      for (const name of hidden_runs.keys()) if (!metric_names.has(name)) hidden_runs.delete(name);
+      for (const [name, state] of states) if (metric_names.has(name)) hidden_runs.set(name, [...state.hidden_run_ids]);
       const window2 = document2.defaultView, parent = frame.ownerDocument.defaultView;
       const scroll = { x: window2?.scrollX ?? 0, y: window2?.scrollY ?? 0, parent_x: parent?.scrollX ?? 0, parent_y: parent?.scrollY ?? 0 };
       const previous_details = document2.querySelector("details.parameter-comparison");
@@ -228,8 +336,12 @@ function createChartController(frame) {
       document2.body.replaceChildren(...body);
       enhanceDocument(document2);
       for (const plot of plots) {
-        const state = states.get(plot.capture().metric_name);
+        const fresh = plot.capture(), state = states.get(fresh.metric_name);
         if (state) plot.restore(state);
+        else {
+          const hidden_run_ids = hidden_runs.get(fresh.metric_name);
+          if (hidden_run_ids) plot.restore({ ...fresh, hidden_run_ids });
+        }
       }
       const details = document2.querySelector("details.parameter-comparison");
       if (details) {
@@ -248,7 +360,7 @@ function attachChartInteractions(frame) {
   const controller = createChartController(frame);
   return () => controller.dispose();
 }
-function enhancePlot(document2, svg) {
+function enhancePlot(document2, svg, time_zone) {
   const section = svg.closest("section.card");
   const region = svg.parentElement;
   const legend = section?.querySelector("ul.legend");
@@ -259,10 +371,15 @@ function enhancePlot(document2, svg) {
   const full_range = parsed_range;
   let range = full_range, follow_full = true, keyboard_index = -1, keyboard_anchor = null;
   let drag_start = null;
+  let inspection = null;
   const listeners = [];
   const original_nodes = [...svg.childNodes];
   const original_attributes = /* @__PURE__ */ new Map();
   const original_description = region.getAttribute("aria-describedby");
+  const axis_label = [...svg.querySelectorAll("text.axis-label")].find((node) => Number(node.getAttribute("y")) === BOTTOM + 52);
+  const original_axis_label = axis_label?.textContent ?? "";
+  const context = full_range.x_axis === "wall_clock" && region.nextElementSibling?.matches("p.muted") ? region.nextElementSibling : null;
+  const original_context = context?.textContent ?? "";
   function remember(node, names) {
     original_attributes.set(node, Object.fromEntries(names.map((name) => [name, node.getAttribute(name)])));
   }
@@ -299,13 +416,15 @@ function enhancePlot(document2, svg) {
     const circle = node;
     const parsed = parseChartPointLabel(circle.getAttribute("aria-label") ?? circle.querySelector("title")?.textContent ?? "");
     const item = parsed && series.get(parsed.run_index);
+    const x_value = parsed && pointCoordinate(circle, parsed, full_range, svg.hasAttribute("data-x-axis"));
+    const timestamp = pointTimestamp(circle);
     const x = Number(circle.getAttribute("cx")), y = Number(circle.getAttribute("cy"));
-    if (!parsed || !item || circle.getAttribute("cx") === null || circle.getAttribute("cy") === null || !Number.isFinite(x) || !Number.isFinite(y)) {
+    if (!parsed || !item || x_value === null || full_range.x_axis !== "step" && timestamp === null || circle.getAttribute("cx") === null || circle.getAttribute("cy") === null || !Number.isFinite(x) || !Number.isFinite(y)) {
       invalid_points = true;
       continue;
     }
     item.polyline = preceding_curve;
-    item.points.push({ ...parsed, x, y, circle });
+    item.points.push({ ...parsed, x_value, timestamp, x, y, circle });
     original_points.set(circle, { cx: circle.getAttribute("cx") ?? "", r: circle.getAttribute("r") ?? "2" });
     remember(circle, ["cx", "r", "clip-path", "display", "data-chart-series"]);
     circle.setAttribute("data-chart-series", String(parsed.run_index));
@@ -374,8 +493,8 @@ function enhancePlot(document2, svg) {
     listeners.push(() => target.removeEventListener(name, callback));
   }
   function inRange(point) {
-    const step = BigInt(point.step);
-    return step >= BigInt(range.start_step) && step <= BigInt(range.end_step);
+    const value = BigInt(point.x_value);
+    return value >= BigInt(range.start_x) && value <= BigInt(range.end_x);
   }
   function available(item) {
     return item.visible ? item.points.filter(inRange) : [];
@@ -385,6 +504,7 @@ function enhancePlot(document2, svg) {
   }
   function showAt(x, y, announce = false, anchor) {
     const position = Math.max(LEFT, Math.min(RIGHT, x));
+    inspection = { x: position, y, anchor };
     crosshair.setAttribute("display", "");
     crosshair.setAttribute("x1", String(position));
     crosshair.setAttribute("x2", String(position));
@@ -405,6 +525,11 @@ function enhancePlot(document2, svg) {
         row.append(html(document2, "span", `step ${point.step}`), html(document2, "code", point.value_text), html(document2, "span", `sample ${item.points.indexOf(point) + 1} of ${item.points.length} displayed`));
         row.setAttribute("data-chart-step", point.step);
         row.setAttribute("data-chart-value", point.value_text);
+        row.setAttribute("data-chart-x", point.x_value);
+        if (range.x_axis === "elapsed") row.append(html(document2, "span", `Elapsed ${formatChartX(point.x_value, "elapsed")}`));
+        if (range.x_axis === "wall_clock") row.append(html(document2, "span", formatChartX(point.x_value, "wall_clock", time_zone)));
+        if (point.timestamp) row.append(html(document2, "span", `timestamp ${point.timestamp}`));
+        if (point.timestamp) row.setAttribute("data-chart-timestamp", point.timestamp);
         if (first) {
           keyboard_index = points.indexOf(point);
           first = false;
@@ -414,48 +539,67 @@ function enhancePlot(document2, svg) {
     }
     if (!readout_values.childNodes.length) readout_values.append(html(document2, "span", "No visible runs. Use the legend to show a run."));
   }
-  function draw() {
+  function drawLabels() {
     axis.replaceChildren();
-    const [start, end] = steps(range), span = end - start;
-    const count = span === 0n ? 1 : Math.max(range.start_step.length, range.end_step.length) > 12 ? 3 : 5;
+    const [start, end] = coordinatesInRange(range), span = end - start;
+    const count = span === 0n ? 1 : range.x_axis !== "step" || Math.max(range.start_x.length, range.end_x.length) > 12 ? 3 : 5;
     const seen = /* @__PURE__ */ new Set();
     for (let index = 0; index < count; index++) {
-      const step = count === 1 ? start : start + span * BigInt(index) / BigInt(count - 1);
-      const label = String(step);
-      if (seen.has(label)) continue;
-      seen.add(label);
-      const x = LEFT + chartStepFraction(label, range) * (RIGHT - LEFT);
+      const value = count === 1 ? start : start + span * BigInt(index) / BigInt(count - 1);
+      const coordinate2 = String(value);
+      if (seen.has(coordinate2)) continue;
+      seen.add(coordinate2);
+      const label2 = formatChartTick(coordinate2, range, time_zone);
+      const x = LEFT + chartXFraction(coordinate2, range) * (RIGHT - LEFT);
       axis.append(svgNode(document2, "line", { class: "grid", x1: String(x), x2: String(x), y1: String(TOP), y2: String(BOTTOM) }));
       const text = svgNode(document2, "text", { class: "tick", x: String(x), y: String(BOTTOM + 23), "text-anchor": count === 1 ? "middle" : index === 0 ? "start" : index === count - 1 ? "end" : "middle" });
-      text.textContent = label;
+      text.textContent = label2;
       axis.append(text);
     }
+    const first_label = formatChartX(range.start_x, range.x_axis, time_zone), last_label = formatChartX(range.end_x, range.x_axis, time_zone);
+    const label = range.x_axis === "step" ? start === end ? "Step" : "Steps" : range.x_axis === "elapsed" ? "Elapsed" : "Date & time";
+    range_label.textContent = start === end ? `${label} ${first_label}` : `${label} ${first_label}\u2013${last_label}`;
+    range_label.setAttribute("data-x-axis", range.x_axis);
+    range_label.setAttribute("data-start-x", range.start_x);
+    range_label.setAttribute("data-end-x", range.end_x);
+    range_label.setAttribute("data-time-zone", time_zone);
+    if (range.x_axis === "step") {
+      range_label.setAttribute("data-start-step", range.start_x);
+      range_label.setAttribute("data-end-step", range.end_x);
+    }
+    if (range.x_axis === "wall_clock") {
+      const zone = timeZoneLabel(time_zone), first = dateParts(start, time_zone), last = dateParts(end, time_zone);
+      if (axis_label) axis_label.textContent = `Date & time (${zone})`;
+      if (context) context.textContent = first && last ? first.date_text === last.date_text ? `${zone} date: ${first.date_text}.` : `${zone} dates: ${first.date_text}\u2013${last.date_text}.` : `Dates and times are shown in ${zone}.`;
+    }
+  }
+  function draw() {
+    drawLabels();
+    const [start, end] = coordinatesInRange(range), span = end - start;
     for (const item of series.values()) {
       item.button.disabled = !item.points.length;
       item.button.setAttribute("aria-pressed", String(item.visible));
       for (const point of item.points) {
-        point.x = LEFT + chartStepFraction(point.step, range) * (RIGHT - LEFT);
+        point.x = LEFT + chartXFraction(point.x_value, range) * (RIGHT - LEFT);
         point.circle.setAttribute("cx", String(point.x));
         point.circle.setAttribute("display", item.visible && inRange(point) ? "" : "none");
       }
       item.polyline?.setAttribute("points", item.points.map((point) => `${point.x},${point.y}`).join(" "));
       item.polyline?.setAttribute("display", item.visible ? "" : "none");
     }
-    range_label.textContent = start === end ? `Step ${range.start_step}` : `Steps ${range.start_step}\u2013${range.end_step}`;
-    range_label.setAttribute("data-start-step", range.start_step);
-    range_label.setAttribute("data-end-step", range.end_step);
     zoom_in.disabled = start === end || span <= 1n;
-    zoom_out.disabled = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
+    zoom_out.disabled = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
     reset.disabled = zoom_out.disabled && follow_full;
     crosshair.setAttribute("display", "none");
     clearHighlights();
     readout_values.replaceChildren(html(document2, "span", "Hover or use arrow keys to inspect displayed samples."));
     keyboard_index = -1;
     keyboard_anchor = null;
+    inspection = null;
   }
   function applyRange(next) {
     range = next;
-    follow_full = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
+    follow_full = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
     selection.setAttribute("display", "none");
     draw();
   }
@@ -540,6 +684,20 @@ function enhancePlot(document2, svg) {
   });
   draw();
   return {
+    setTimeZone(next) {
+      if (time_zone === next) return;
+      time_zone = next;
+      range_label.setAttribute("data-time-zone", time_zone);
+      if (range.x_axis !== "wall_clock") return;
+      drawLabels();
+      if (inspection) {
+        const anchor = keyboard_anchor, index = keyboard_index, crosshair_display = crosshair.getAttribute("display");
+        showAt(inspection.x, inspection.y, false, inspection.anchor);
+        keyboard_anchor = anchor;
+        keyboard_index = index;
+        if (crosshair_display !== null) crosshair.setAttribute("display", crosshair_display);
+      }
+    },
     isInteracting() {
       return drag_start !== null;
     },
@@ -551,11 +709,13 @@ function enhancePlot(document2, svg) {
       const anchor = anchored && item ? {
         run_id: item.run_id,
         step: anchored.step,
+        x_value: anchored.x_value,
         value_text: anchored.value_text,
-        occurrence: item.points.filter((point) => point.step === anchored.step && point.value_text === anchored.value_text).indexOf(anchored)
+        occurrence: item.points.filter((point) => point.step === anchored.step && point.x_value === anchored.x_value && point.value_text === anchored.value_text).indexOf(anchored)
       } : null;
       return {
         metric_name,
+        x_axis: range.x_axis,
         range: follow_full ? null : { ...range },
         hidden_run_ids: [...series.values()].filter((item2) => !item2.visible).map((item2) => item2.run_id),
         keyboard_anchor: anchor,
@@ -566,11 +726,11 @@ function enhancePlot(document2, svg) {
     },
     restore(state) {
       range = restoreChartRange(state.range, full_range);
-      follow_full = state.range === null;
+      follow_full = state.range === null || state.x_axis !== full_range.x_axis;
       for (const item2 of series.values()) item2.visible = !state.hidden_run_ids.includes(item2.run_id);
       draw();
-      const anchor = state.keyboard_anchor, item = anchor && [...series.values()].find((item2) => item2.run_id === anchor.run_id);
-      const point = anchor && item && available(item).filter((point2) => point2.step === anchor.step && point2.value_text === anchor.value_text)[anchor.occurrence];
+      const anchor = state.x_axis === full_range.x_axis ? state.keyboard_anchor : null, item = anchor && [...series.values()].find((item2) => item2.run_id === anchor.run_id);
+      const point = anchor && item && available(item).filter((point2) => point2.step === anchor.step && point2.x_value === anchor.x_value && point2.value_text === anchor.value_text)[anchor.occurrence];
       if (point) {
         showAt(point.x, point.y, false, point);
         keyboard_anchor = point;
@@ -593,6 +753,8 @@ function enhancePlot(document2, svg) {
       controls.remove();
       hint.remove();
       readout.remove();
+      if (axis_label) axis_label.textContent = original_axis_label;
+      if (context) context.textContent = original_context;
       if (original_description === null) region.removeAttribute("aria-describedby");
       else region.setAttribute("aria-describedby", original_description);
       section.removeAttribute("data-interactive-chart");
@@ -847,6 +1009,9 @@ function dateText(value) {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
 }
+function localTimeZoneLabel() {
+  return new Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
 function errorText(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -891,6 +1056,26 @@ function startDashboard(options = {}) {
   const search_input = required("search-input");
   const task_input = required("task-input");
   const status_select = required("status-select");
+  const x_axis_choices = {
+    step: required("x-axis-step"),
+    elapsed: required("x-axis-elapsed"),
+    wall_clock: required("x-axis-wall-clock")
+  };
+  const time_zone_choices = {
+    local: required("time-zone-local"),
+    utc: required("time-zone-utc")
+  };
+  let x_axis = "step";
+  let time_zone = "local";
+  const reduction_choices = {
+    last: required("reduction-last"),
+    min: required("reduction-min"),
+    max: required("reduction-max")
+  };
+  let reduction = "last";
+  for (const [value, input] of Object.entries(reduction_choices)) input.checked = value === reduction;
+  syncChartChoices();
+  chart_controller.setTimeZone(time_zone);
   const previous_page = required("previous-page");
   const next_page = required("next-page");
   const global_error = required("global-error");
@@ -924,6 +1109,7 @@ function startDashboard(options = {}) {
   let last_full_snapshot = -Infinity;
   let last_checked = null;
   let cached_chart = null;
+  let chart_error_context = null;
   let sources = [];
   let source_id = "local";
   let access_mode = "local";
@@ -967,10 +1153,10 @@ function startDashboard(options = {}) {
     return apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset });
   }
   function chartUrl() {
-    return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [] });
+    return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], x_axis });
   }
   function comparisonUrl() {
-    return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction: required("reduction-select").value });
+    return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction });
   }
   function boundedSet(cache, key, value) {
     cache.delete(key);
@@ -1138,9 +1324,11 @@ function startDashboard(options = {}) {
     review_lane.cancel();
     log_lane.cancel();
     compare_lane.cancel();
+    chart_lane.cancel();
     review = null;
     missing_review = null;
     log_view = null;
+    clearChartError();
     required("review-section").hidden = true;
     required("review-empty").hidden = false;
     required("chart-frame").removeAttribute("src");
@@ -1180,11 +1368,13 @@ function startDashboard(options = {}) {
     review_lane.cancel();
     log_lane.cancel();
     compare_lane.cancel();
+    chart_lane.cancel();
     detail_revisions.clear();
     chart_revisions.clear();
     log_revisions.clear();
     comparison_revision = null;
     missing_review = null;
+    clearChartError();
     review = { kind, origin, run_ids: ids, metric_names: [], metric_selection_set: false, tab: "charts", log_stream: "stdout" };
     metric_names = [];
     log_view = null;
@@ -1203,6 +1393,7 @@ function startDashboard(options = {}) {
     required("run-logs").replaceChildren();
     required("chart-card").hidden = true;
     required("chart-frame").removeAttribute("src");
+    required("chart-card").setAttribute("aria-busy", "false");
     const close = required("close-review");
     close.hidden = origin === "selection";
     close.textContent = selected.size ? "Back to selection" : "Close review";
@@ -1235,14 +1426,74 @@ function startDashboard(options = {}) {
     if (!review) return;
     const url = chartUrl();
     const frame = required("chart-frame");
-    if (frame.getAttribute("src") !== url) {
+    if ((cached_chart?.context ?? frame.getAttribute("src")) !== url) {
+      chart_lane.cancel();
       frame.src = url;
       chart_revisions.delete(url);
       cached_chart = null;
+      clearChartError();
+      required("chart-card").setAttribute("aria-busy", "false");
     }
+    chartControls(url);
+  }
+  function chartControls(url) {
+    if (!review) return;
     required("open-chart").href = url;
+    required("open-chart-label").textContent = x_axis === "wall_clock" ? "Open UTC chart" : "Open chart";
     required("chart-card").hidden = false;
-    required("chart-note").textContent = review.metric_names.length ? `${review.metric_names.length} selected metrics \xB7 at most 600 chart points per series` : "First four recorded metrics \xB7 at most 600 chart points per series";
+    const metrics = review.metric_names.length ? `${review.metric_names.length} selected metrics` : "First four recorded metrics";
+    const axis = x_axis === "elapsed" ? "Time since each run\u2019s first timestamped metric event" : x_axis === "wall_clock" ? `Recorded date & time in ${time_zone === "utc" ? "UTC" : "your local timezone"}` : "Global step";
+    required("chart-note").textContent = `${metrics} \xB7 ${axis} \xB7 at most 600 chart points per series`;
+  }
+  function syncChartChoices() {
+    for (const [axis, input] of Object.entries(x_axis_choices)) input.checked = axis === x_axis;
+    for (const [zone, input] of Object.entries(time_zone_choices)) input.checked = zone === time_zone;
+    required("time-zone-options").hidden = x_axis !== "wall_clock";
+    required("time-zone-label").textContent = time_zone === "utc" ? "UTC" : localTimeZoneLabel();
+  }
+  function changeChartTimeZone(value) {
+    if (value === time_zone) return;
+    time_zone = value;
+    syncChartChoices();
+    chart_controller.setTimeZone(value);
+    if (review && !required("chart-card").hidden) chartControls(chartUrl());
+  }
+  function clearChartError(context) {
+    if (context !== void 0 && chart_error_context !== context) return;
+    chart_error_context = null;
+    required("chart-error").hidden = true;
+  }
+  async function changeChartAxis(value) {
+    if (value === x_axis) return;
+    cancelRefresh();
+    chart_lane.cancel();
+    clearChartError();
+    x_axis = value;
+    syncChartChoices();
+    if (!review || required("chart-card").hidden) return;
+    const current_review = review, source = source_id, url = chartUrl();
+    chartControls(url);
+    if (chart_controller.previewStatus() !== "ready" || chart_controller.isInteracting()) {
+      updateChart();
+      return;
+    }
+    required("chart-card").setAttribute("aria-busy", "true");
+    try {
+      const html2 = await chart_lane.runText(url);
+      if (html2 === void 0 || review !== current_review || source_id !== source || chartUrl() !== url) return;
+      if (chart_controller.replacePreview(html2)) {
+        cached_chart = { context: url, html: html2 };
+        chart_revisions.delete(url);
+        clearChartError(url);
+      } else updateChart();
+    } catch (error) {
+      if (review === current_review && source_id === source && chartUrl() === url) {
+        chart_error_context = url;
+        showError(required("chart-error"), new Error(`Could not load the selected axis. Showing the last loaded chart. ${errorText(error)}`));
+      }
+    } finally {
+      if (review === current_review && source_id === source && chartUrl() === url) required("chart-card").setAttribute("aria-busy", "false");
+    }
   }
   function metricPicker(parent, known, on_change) {
     parent.replaceChildren();
@@ -1626,9 +1877,13 @@ function startDashboard(options = {}) {
     }
     const html2 = await lane.runText(url);
     if (html2 === void 0 || review !== current_review || source_id !== source || chartUrl() !== url) return "cancelled";
-    if (cached_chart?.context === url && cached_chart.html === html2) return "applied";
+    if (cached_chart?.context === url && cached_chart.html === html2) {
+      clearChartError(url);
+      return "applied";
+    }
     if (!chart_controller.replacePreview(html2)) return "deferred";
     cached_chart = { context: url, html: html2 };
+    clearChartError(url);
     return "applied";
   }
   function applyLog(view, log) {
@@ -1914,10 +2169,28 @@ function startDashboard(options = {}) {
     openComparison();
   });
   required("close-review").addEventListener("click", closeReview);
-  required("reduction-select").addEventListener("change", () => {
-    cancelRefresh();
-    void loadComparison();
-  });
+  for (const value of Object.keys(reduction_choices)) {
+    const input = reduction_choices[value];
+    input.addEventListener("change", () => {
+      if (!input.checked || reduction === value) return;
+      reduction = value;
+      for (const [choice, item] of Object.entries(reduction_choices)) item.checked = choice === value;
+      cancelRefresh();
+      void loadComparison();
+    });
+  }
+  for (const axis of Object.keys(x_axis_choices)) {
+    const input = x_axis_choices[axis];
+    input.addEventListener("change", () => {
+      if (input.checked) void changeChartAxis(axis);
+    });
+  }
+  for (const zone of Object.keys(time_zone_choices)) {
+    const input = time_zone_choices[zone];
+    input.addEventListener("change", () => {
+      if (input.checked) changeChartTimeZone(zone);
+    });
+  }
   for (const tab of review_tabs) {
     const button = required(`review-tab-${tab}`);
     button.addEventListener("click", () => {
@@ -1965,14 +2238,18 @@ export {
   RequestLane,
   apiUrl,
   attachChartInteractions,
-  chartStepFraction,
+  chartXFraction,
   createChartController,
   dragChartRange,
+  formatChartTick,
+  formatChartX,
   formatDuration,
   formatNumber,
   formatValue,
+  localTimeZoneLabel,
   nearestChartPoint,
   parseChartPointLabel,
+  parseChartRange,
   restoreChartRange,
   startDashboard,
   zoomChartRange

@@ -1,11 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attachChartInteractions, createChartController, parseChartPointLabel, chartStepFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./app.js";
+import { execFileSync } from "node:child_process";
+import { attachChartInteractions, createChartController, parseChartPointLabel, parseChartRange, formatChartX, formatChartTick, chartXFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./app.js";
 
 const MAX_STEP = 18446744073709551615n;
-function range(first, last) { return { start_step: String(first), end_step: String(last) }; }
+function range(first, last, x_axis = "step") { return { x_axis, start_x: String(first), end_x: String(last) }; }
 function point(step, x, y, value_text = "1") {
   return { run_index: 1, step: String(step), value: Number(value_text), value_text, x, y };
+}
+function localLabels(time_zone, values, domain) {
+  const script = `
+    import { formatChartX, formatChartTick } from ${JSON.stringify(new URL("./app.js", import.meta.url).href)};
+    const values = ${JSON.stringify(values)}, domain = ${JSON.stringify(domain)};
+    console.log(JSON.stringify(values.map(value => ({ full: formatChartX(value, "wall_clock", "local"), tick: formatChartTick(value, domain, "local") }))));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, TZ: time_zone }, encoding: "utf8" }));
 }
 
 test("exact labels retain u64 steps and precise finite value strings", () => {
@@ -13,21 +22,103 @@ test("exact labels retain u64 steps and precise finite value strings", () => {
   assert.deepEqual(parsed, { run_index: 8, step: String(MAX_STEP), value: -Number.MAX_VALUE, value_text: "-1.7976931348623157e308" });
   assert.equal(parseChartPointLabel("Run 1 · step 0 · value -0").value_text, "-0");
   assert.equal(Object.is(parseChartPointLabel("Run 1 · step 0 · value -0").value, -0), true);
+  assert.deepEqual(parseChartPointLabel("Run 1 · step 12 · value 0.5 · timestamp 2026-10-06T01:02:03.123456789Z · elapsed 2.5 s"), { run_index: 1, step: "12", value: .5, value_text: "0.5" });
+  assert.deepEqual(parseChartPointLabel("Run 1 · step 12 · value 0.5 · timestamp 2026-10-06T09:02:03+08:00"), { run_index: 1, step: "12", value: .5, value_text: "0.5" });
   for (const label of [
     "Run 9 · step 1 · value 1", "Run 0 · step 1 · value 1", "Run 1 · step -1 · value 1",
     "Run 1 · step 18446744073709551616 · value 1", "Run 1 · step 1 · value Infinity",
     "Run 1 · step 1 · value NaN", "Run 1 · step 1 · value 1e999", "Run 1 · step 1 · value 0x10",
     "run-id · step 1 · value 1", "Run 1 · step 1 · value 1 extra",
+    "Run 1 · step 1 · value 1 · timestamp bad\nlabel", "Run 1 · step 1 · value 1 · axis anything",
   ]) assert.equal(parseChartPointLabel(label), null, label);
+});
+
+test("explicit chart ranges validate exact step and signed nanosecond coordinates", () => {
+  assert.deepEqual(parseChartRange("step", "0", String(MAX_STEP)), range(0n, MAX_STEP));
+  assert.deepEqual(parseChartRange("elapsed", "-2500000000", "0"), range(-2_500_000_000n, 0n, "elapsed"));
+  assert.deepEqual(parseChartRange("wall_clock", "-1", "1780000000000000001"), range(-1n, 1_780_000_000_000_000_001n, "wall_clock"));
+  for (const [axis, first, last] of [
+    ["seconds", "0", "1"], [null, "0", "1"], ["step", null, "1"], ["elapsed", "0", null],
+    ["step", "-1", "1"], ["step", "0", String(MAX_STEP + 1n)], ["wall_clock", "2", "1"],
+    ["elapsed", "0.5", "1"], ["elapsed", "0", "1e9"], ["wall_clock", "-0", "1"],
+    ["elapsed", "01", "2"], ["elapsed", "0", String(1n << 127n)],
+    ["wall_clock", String(-(1n << 127n) - 1n), "0"],
+  ]) assert.equal(parseChartRange(axis, first, last), null, `${axis}: ${first}–${last}`);
+});
+
+test("time zoom keeps adjacent nanoseconds exact and supports pre-epoch and regressing clocks", () => {
+  const epoch = 1_780_000_000_000_000_000n, domain = range(epoch, epoch + 2n, "wall_clock");
+  assert.equal(chartXFraction(String(epoch + 1n), domain), .5);
+  assert.deepEqual(dragChartRange(range(-100n, 100n, "elapsed"), .25, .75), range(-50n, 50n, "elapsed"));
+  assert.deepEqual(zoomChartRange(range(-100n, 100n, "wall_clock"), range(-100n, 100n, "wall_clock"), .5), range(-50n, 50n, "wall_clock"));
+  assert.deepEqual(restoreChartRange(range(epoch, epoch + 1n, "wall_clock"), range(epoch, epoch + 10n, "wall_clock")), range(epoch, epoch + 1n, "wall_clock"));
+  assert.deepEqual(restoreChartRange(range(1n, 2n), range(-20n, 30n, "elapsed")), range(-20n, 30n, "elapsed"), "changing axes resets the inspected domain");
+  assert.throws(() => zoomChartRange(range(1n, 2n), range(1n, 2n, "elapsed"), .5), /different chart axes/);
+  assert.throws(() => chartXFraction("-1", range(0n, 1n)), /Invalid chart axis coordinate/);
+});
+
+test("time labels show readable UTC and elapsed values without losing nanoseconds", () => {
+  assert.equal(formatChartX(String(MAX_STEP), "step"), String(MAX_STEP));
+  assert.equal(formatChartX("0", "elapsed"), "0 s");
+  assert.equal(formatChartX("2500000000", "elapsed"), "2.5 s");
+  assert.equal(formatChartX("-1", "elapsed"), "−1 ns");
+  assert.equal(formatChartX("2500", "elapsed"), "2.5 µs");
+  assert.equal(formatChartX("1234567", "elapsed"), "1.234567 ms");
+  assert.equal(formatChartX("62000000001", "elapsed"), "1:02.000000001 min");
+  assert.equal(formatChartX("3723123456789", "elapsed"), "1:02:03.123456789 h");
+  assert.equal(formatChartX("0", "wall_clock"), "1970-01-01 00:00:00 UTC");
+  assert.equal(formatChartX("1", "wall_clock"), "1970-01-01 00:00:00.000000001 UTC");
+  assert.equal(formatChartX("-1", "wall_clock"), "1969-12-31 23:59:59.999999999 UTC");
+  assert.equal(formatChartX("1700000000123456789", "wall_clock"), "2023-11-14 22:13:20.123456789 UTC");
+  assert.equal(formatChartX("1700000000100000000", "wall_clock"), "2023-11-14 22:13:20.1 UTC");
+});
+
+test("wall-clock ticks stay compact while preserving precision for midnight zoom", () => {
+  const nanos = iso => BigInt(Date.parse(iso)) * 1_000_000n;
+  const morning = nanos("2026-10-06T01:02:03Z"), midnight = nanos("2026-10-07T00:00:00Z");
+  assert.equal(formatChartTick(String(morning + 1n), range(morning, morning + 2n, "wall_clock")), "01:02:03.000000001");
+  assert.equal(formatChartTick(String(midnight - 1n), range(midnight - 1n, midnight, "wall_clock")), "10-06 23:59:59.999999999");
+  assert.equal(formatChartTick(String(midnight), range(midnight - 1n, midnight, "wall_clock")), "10-07 00:00:00");
+  const previous = nanos("2026-12-31T23:00:00Z"), next = nanos("2027-01-01T01:00:00Z");
+  assert.equal(formatChartTick(String(next), range(previous, next, "wall_clock")), "01-01 01:00", "year changes retain useful time within a short range");
+  assert.equal(formatChartTick(String(midnight), range(nanos("2025-10-01T00:00:00Z"), midnight, "wall_clock")), "2026-10-07");
+  assert.equal(formatChartTick("2500000000", range(0n, 3_000_000_000n, "elapsed")), "2.5 s");
+});
+
+test("local date labels keep nanoseconds and the viewer's calendar date across midnight", () => {
+  const midnight = BigInt(Date.parse("2026-10-06T16:00:00Z")) * 1_000_000n;
+  assert.deepEqual(localLabels("Asia/Shanghai", [String(midnight - 1n), String(midnight)], range(midnight - 1n, midnight, "wall_clock")), [
+    { full: "2026-10-06 23:59:59.999999999 UTC+08:00 (Asia/Shanghai)", tick: "10-06 23:59:59.999999999" },
+    { full: "2026-10-07 00:00:00 UTC+08:00 (Asia/Shanghai)", tick: "10-07 00:00:00" },
+  ]);
+  assert.equal(localLabels("Asia/Shanghai", ["-1"], range(-1n, -1n, "wall_clock"))[0].full, "1970-01-01 07:59:59.999999999 UTC+08:00 (Asia/Shanghai)");
+  assert.equal(formatChartX(String(midnight - 1n), "wall_clock", "utc"), "2026-10-06 15:59:59.999999999 UTC", "UTC display leaves exact instants unchanged");
+});
+
+test("local labels support fractional-hour offsets and historical offset seconds", () => {
+  const now = "1700000000123456789";
+  assert.match(localLabels("Asia/Kathmandu", [now], range(now, now, "wall_clock"))[0].full, /^2023-11-15 03:58:20\.123456789 UTC\+05:45 \(Asia\/Kat(?:h)?mandu\)$/, "ICU versions may retain either valid IANA spelling");
+  const old = BigInt(Date.parse("1900-01-01T00:00:00Z")) * 1_000_000n;
+  assert.match(localLabels("Asia/Kathmandu", [String(old)], range(old, old, "wall_clock"))[0].full, /^1900-01-01 05:41:16 UTC\+05:41:16 \(Asia\/Kat(?:h)?mandu\)$/);
+});
+
+test("repeated local hours distinguish the offset at each sample during DST changes", () => {
+  const first = BigInt(Date.parse("2026-11-01T05:30:00Z")) * 1_000_000n;
+  const last = BigInt(Date.parse("2026-11-01T06:30:00Z")) * 1_000_000n;
+  assert.deepEqual(localLabels("America/New_York", [String(first), String(last)], range(first, last, "wall_clock")), [
+    { full: "2026-11-01 01:30:00 UTC−04:00 (America/New_York)", tick: "01:30:00 UTC−04:00" },
+    { full: "2026-11-01 01:30:00 UTC−05:00 (America/New_York)", tick: "01:30:00 UTC−05:00" },
+  ]);
+  assert.equal(localLabels("UTC", ["0"], range(0n, 0n, "wall_clock"))[0].full, "1970-01-01 00:00:00 UTC");
 });
 
 test("adjacent steps above Number precision remain distinct in the plot range", () => {
   const domain = range(MAX_STEP - 2n, MAX_STEP);
-  assert.equal(chartStepFraction(String(MAX_STEP - 2n), domain), 0);
-  assert.equal(chartStepFraction(String(MAX_STEP - 1n), domain), .5);
-  assert.equal(chartStepFraction(String(MAX_STEP), domain), 1);
-  assert.equal(chartStepFraction("100", range(100n, 100n)), .5);
-  assert.throws(() => chartStepFraction("1", range(10n, 1n)), /Invalid chart step range/);
+  assert.equal(chartXFraction(String(MAX_STEP - 2n), domain), 0);
+  assert.equal(chartXFraction(String(MAX_STEP - 1n), domain), .5);
+  assert.equal(chartXFraction(String(MAX_STEP), domain), 1);
+  assert.equal(chartXFraction("100", range(100n, 100n)), .5);
+  assert.throws(() => chartXFraction("1", range(10n, 1n)), /Invalid chart axis range/);
 });
 
 test("drag zoom is direction independent, inclusive, and preserves exact large steps", () => {
@@ -58,7 +149,7 @@ test("refresh follows the full domain and keeps zoom at exact absolute steps", (
   assert.deepEqual(restoreChartRange(range(20n, 80n), range(90n, 100n)), range(90n, 90n));
   assert.deepEqual(restoreChartRange(range(20n, 80n), range(0n, 10n)), range(10n, 10n));
   assert.deepEqual(restoreChartRange(range(MAX_STEP - 2n, MAX_STEP), range(MAX_STEP - 1n, MAX_STEP)), range(MAX_STEP - 1n, MAX_STEP));
-  assert.throws(() => restoreChartRange(range(2n, 1n), range(0n, 3n)), /Invalid chart step range/);
+  assert.throws(() => restoreChartRange(range(2n, 1n), range(0n, 3n)), /Invalid chart axis range/);
 });
 
 test("nearest sample uses displayed points without interpolating or collapsing reset steps", () => {
@@ -90,8 +181,10 @@ test("chart refresh refuses unloaded frames and remains inert after disposal", (
   assert.equal(controller.isInteracting(), false);
   assert.equal(controller.previewStatus(), "loading");
   assert.equal(controller.replacePreview("<html></html>"), false);
+  assert.doesNotThrow(() => controller.setTimeZone("utc"), "display choices can change before the frame loads");
   controller.dispose();
   assert.equal(controller.replacePreview("<html></html>"), false);
+  assert.doesNotThrow(() => controller.setTimeZone("local"), "disposed controllers stay inert");
   assert.equal(handlers.size, 0);
   assert.doesNotThrow(() => controller.dispose());
 });

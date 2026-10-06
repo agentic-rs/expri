@@ -513,6 +513,64 @@ fn cached_initial_source_and_empty_projects_need_no_environment_or_target_creden
 }
 
 #[test]
+fn dashboard_timestamp_axes_work_for_local_and_cached_sources_without_writes() {
+  let fixture = Fixture::new(true);
+  let events = [
+    json!({"step":8,"timestamp":"2026-10-03T01:00:00Z","metrics":{"setup":1}}),
+    json!({"step":2,"timestamp":"2026-10-03T01:00:02.000000001Z","metrics":{"train/loss":0.5}}),
+    json!({"step":0,"metrics":{"train/loss":0.25}}),
+  ]
+  .map(|event| event.to_string())
+  .join("\n")
+    + "\n";
+  for source in ["local", CACHED_SOURCE] {
+    fs::write(
+      fixture
+        .runs_dir(source)
+        .join("run.shared/outputs/metrics.jsonl"),
+      &events,
+    )
+    .unwrap();
+  }
+  let initial = tree(&fixture.repo);
+  let server = Server::start(&fixture, None);
+  for source in ["local", CACHED_QUERY] {
+    for (x_axis, points) in [("step", 2), ("elapsed", 1), ("wall_clock", 1)] {
+      let reply = server.request(
+        "GET",
+        &format!(
+          "/api/chart?source={source}&run_id=run.shared&metric=train%2Floss&x_axis={x_axis}"
+        ),
+      );
+      assert_eq!(reply.status, 200);
+      assert!(reply.headers["content-security-policy"].contains("frame-ancestors 'self'"));
+      let html = std::str::from_utf8(&reply.body).unwrap();
+      assert!(html.contains(&format!("data-x-axis=\"{x_axis}\"")));
+      assert_eq!(html.matches("<circle class=point ").count(), points);
+      if x_axis != "step" {
+        assert!(html.contains("1 of 2 samples omitted"));
+        assert!(html.contains("data-timestamp=\"2026-10-03T01:00:02.000000001Z\""));
+      }
+      if x_axis == "elapsed" {
+        assert!(html.contains("data-x-value=\"2000000001\""));
+      }
+    }
+    for invalid in ["x_axis=", "x_axis=time", "x_axis=step&x_axis=elapsed"] {
+      assert_eq!(
+        server
+          .request(
+            "GET",
+            &format!("/api/chart?source={source}&run_id=run.shared&{invalid}")
+          )
+          .status,
+        400
+      );
+    }
+  }
+  assert_tree_unchanged(&fixture.repo, &initial);
+}
+
+#[test]
 fn dashboard_rejects_unsafe_paths_mutations_and_malformed_requests_and_bounds_logs() {
   let fixture = Fixture::new(true);
   let run = fixture.runs_dir("local").join("run.shared");

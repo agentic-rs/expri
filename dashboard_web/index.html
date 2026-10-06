@@ -63,13 +63,39 @@
             <div id="review-panel-charts" role="tabpanel" aria-labelledby="review-tab-charts">
               <details id="run-metric-controls" class="card metric-settings" hidden><summary>Chart metrics <span class="muted">Choose up to six</span></summary><fieldset class="metric-picker"><legend>Metrics</legend><div id="run-metric-options"></div></fieldset></details>
               <div id="compare-detail" hidden>
-                <section class="card comparison-controls"><div class="section-heading"><div><h3>Compare selected runs</h3><p class="muted">Recorded scalar values from this source.</p></div><label class="field compact">Summary<select id="reduction-select"><option value="last">Last value</option><option value="min">Minimum value</option><option value="max">Maximum value</option></select></label></div><details class="metric-settings"><summary>Metrics <span class="muted">Choose up to six</span></summary><fieldset class="metric-picker"><legend>Comparison metrics</legend><div id="compare-metric-options"></div><p id="compare-metric-hint" class="muted"></p></fieldset></details></section>
+                <section class="card comparison-controls"><div class="section-heading"><div><h3>Compare selected runs</h3><p class="muted">Recorded scalar values from this source.</p></div><fieldset class="choice-group"><legend>Summary</legend><div class="choice-tags"><label class="choice-tag"><input id="reduction-last" class="sr-only" type="radio" name="reduction" value="last" checked><span>Last</span></label><label class="choice-tag"><input id="reduction-min" class="sr-only" type="radio" name="reduction" value="min"><span>Minimum</span></label><label class="choice-tag"><input id="reduction-max" class="sr-only" type="radio" name="reduction" value="max"><span>Maximum</span></label></div></fieldset></div><details class="metric-settings"><summary>Metrics <span class="muted">Choose up to six</span></summary><fieldset class="metric-picker"><legend>Comparison metrics</legend><div id="compare-metric-options"></div><p id="compare-metric-hint" class="muted"></p></fieldset></details></section>
                 <section class="card comparison-summary"><h3>Metric values</h3><div id="comparison-values" class="table-scroll"></div></section>
               </div>
               <section id="chart-card" class="card chart-card" hidden>
-                <div class="section-heading"><div><h3>Metric curves</h3><p id="chart-note" class="muted">Recorded values by training step.</p></div><a id="open-chart" class="text-button" target="_blank" rel="noopener noreferrer">Open chart <span aria-hidden="true">↗</span></a></div>
+                <div class="section-heading">
+                  <div><h3>Metric curves</h3><p id="chart-note" class="muted">Recorded values by training step.</p></div>
+                  <div class="chart-actions">
+                    <div class="chart-axis-controls">
+                      <fieldset class="choice-group" id="x-axis-options">
+                        <legend>X-axis</legend>
+                        <div class="choice-tags">
+                          <label class="choice-tag"><input id="x-axis-step" class="sr-only" type="radio" name="x_axis" value="step" checked><span>Step</span></label>
+                          <label class="choice-tag"><input id="x-axis-elapsed" class="sr-only" type="radio" name="x_axis" value="elapsed"><span>Elapsed time</span></label>
+                          <label class="choice-tag"><input id="x-axis-wall-clock" class="sr-only" type="radio" name="x_axis" value="wall_clock"><span>Date &amp; time</span></label>
+                        </div>
+                      </fieldset>
+                      <fieldset class="choice-group" id="time-zone-options" aria-describedby="time-zone-label" hidden>
+                        <legend>Timezone</legend>
+                        <div class="time-zone-choices">
+                          <div class="choice-tags">
+                            <label class="choice-tag"><input id="time-zone-local" class="sr-only" type="radio" name="time_zone" value="local" checked><span>Local</span></label>
+                            <label class="choice-tag"><input id="time-zone-utc" class="sr-only" type="radio" name="time_zone" value="utc"><span>UTC</span></label>
+                          </div>
+                          <span id="time-zone-label" class="time-zone-label muted"></span>
+                        </div>
+                      </fieldset>
+                    </div>
+                    <a id="open-chart" class="text-button" target="_blank" rel="noopener noreferrer"><span id="open-chart-label">Open chart</span> <span aria-hidden="true">↗</span></a>
+                  </div>
+                </div>
+                <p id="chart-error" class="notice error" role="alert" hidden></p>
                 <iframe id="chart-frame" title="Interactive experiment metric curves" sandbox="allow-same-origin" loading="lazy"></iframe>
-                <p class="chart-footnote muted">Hover to inspect values, drag across steps to zoom, and use the legend to show or hide runs.</p>
+                <p class="chart-footnote muted">Hover to inspect values, drag across the x-axis to zoom, and use the legend to show or hide runs. Time views omit points without recorded timestamps.</p>
               </section>
             </div>
             <div id="review-panel-overview" role="tabpanel" aria-labelledby="review-tab-overview" hidden><div id="run-detail" hidden></div></div>

@@ -515,7 +515,12 @@ fn live_metrics_logs_compare_and_chart_use_bounded_saved_streams() {
   );
   assert!(
     dashboard
-      .chart("hosted:project:worker", &ids, &["loss".into()])
+      .chart(
+        "hosted:project:worker",
+        &ids,
+        &["loss".into()],
+        ChartXAxis::Step
+      )
       .unwrap()
       .contains("loss")
   );
@@ -638,8 +643,97 @@ fn scalar_comparisons_skip_broken_parameters_and_charts_report_them_as_notes() {
       .iter()
       .all(|(key, _)| !parameter_keys.contains(key))
   );
-  let chart = dashboard.chart("hosted:project:worker", &ids, &[]).unwrap();
+  let chart = dashboard
+    .chart("hosted:project:worker", &ids, &[], ChartXAxis::Step)
+    .unwrap();
   assert!(chart.contains("contains invalid JSON"));
+}
+
+#[test]
+fn hosted_time_charts_keep_filtered_origin_and_exact_timestamp_coordinates() {
+  let fixture = Fixture::new();
+  let events = [
+    json!({"step":20,"timestamp":"2026-10-03T01:00:00Z","metrics":{"setup":1}}),
+    json!({"step":2,"timestamp":"2026-10-03T01:00:02.000000001Z","metrics":{"loss":0.5}}),
+    json!({"step":2,"metrics":{"loss":0.25}}),
+    json!({"step":0,"timestamp":"2026-10-03T01:00:05.000000002Z","metrics":{"loss":0.125}}),
+  ]
+  .map(|row| row.to_string())
+  .join("\n")
+    + "\n";
+  for run_id in ["run-object", "run-stream"] {
+    fixture.state(run_id, "completed");
+    if run_id == "run-object" {
+      fixture.run_file(run_id, "outputs/metrics.jsonl", events.as_bytes().to_vec());
+    } else {
+      fixture.append(run_id, "outputs/metrics.jsonl", events.as_bytes());
+    }
+  }
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  for run_id in ["run-object", "run-stream"] {
+    let ids = [run_id.into()];
+    let step = dashboard
+      .chart(
+        "hosted:project:worker",
+        &ids,
+        &["loss".into()],
+        ChartXAxis::Step,
+      )
+      .unwrap();
+    assert_eq!(step.matches("<circle class=point ").count(), 3);
+    let elapsed = dashboard
+      .chart(
+        "hosted:project:worker",
+        &ids,
+        &["loss".into()],
+        ChartXAxis::Elapsed,
+      )
+      .unwrap();
+    assert!(elapsed.contains("data-x-value=\"2000000001\""));
+    assert!(elapsed.contains("data-x-value=\"5000000002\""));
+    assert!(elapsed.contains("1 of 3 samples omitted"));
+    assert_eq!(elapsed.matches("<circle class=point ").count(), 2);
+    let wall_clock = dashboard
+      .chart(
+        "hosted:project:worker",
+        &ids,
+        &["loss".into()],
+        ChartXAxis::WallClock,
+      )
+      .unwrap();
+    assert!(wall_clock.contains("data-x-axis=\"wall_clock\""));
+    assert!(wall_clock.contains("data-timestamp=\"2026-10-03T01:00:02.000000001Z\""));
+  }
+}
+
+#[test]
+fn hosted_time_preview_thins_points_without_losing_timestamp_omission_totals() {
+  let fixture = Fixture::new();
+  fixture.state("run-one", "completed");
+  let mut events =
+    json!({"step":0,"timestamp":"2026-10-03T01:00:00Z","metrics":{"setup":1}}).to_string() + "\n";
+  for index in 0..1300 {
+    let mut row = json!({"step":index,"metrics":{"loss":1.0 / (index + 1) as f64}});
+    if index % 2 == 0 {
+      row["timestamp"] = json!(format!("2026-10-03T01:00:02.{index:09}Z"));
+    }
+    events.push_str(&row.to_string());
+    events.push('\n');
+  }
+  fixture.run_file("run-one", "outputs/metrics.jsonl", events.into_bytes());
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let html = dashboard
+    .chart(
+      "hosted:project:worker",
+      &["run-one".into()],
+      &["loss".into()],
+      ChartXAxis::Elapsed,
+    )
+    .unwrap();
+  assert!(html.contains("650 of 1300 samples omitted"));
+  assert!(html.contains("data-x-min=\"2000000000\""));
+  assert!(html.matches("<circle class=point ").count() <= 600);
+  assert!(html.contains("data-timestamp=\"2026-10-03T01:00:02.000001298Z\""));
 }
 
 #[test]

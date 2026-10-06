@@ -18,6 +18,7 @@ use preview::{bounded_warnings, preview};
 use crate::context::CommandContext;
 use crate::controller::run_pull;
 use crate::error::{ExpriError, Result};
+use crate::metric_charts::ChartXAxis;
 use crate::metrics::{self, MetricSummary, Reduction};
 use crate::protocol::RunQueryRequest;
 use crate::runs;
@@ -81,7 +82,13 @@ pub(crate) trait DashboardView {
     filters: &[String],
     reduction: Reduction,
   ) -> Result<Value>;
-  fn chart(&self, source: &str, run_ids: &[String], filters: &[String]) -> Result<String>;
+  fn chart(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<String>;
 }
 
 impl DashboardView for Dashboard {
@@ -117,8 +124,14 @@ impl DashboardView for Dashboard {
   ) -> Result<Value> {
     Dashboard::compare(self, source, run_ids, filters, reduction)
   }
-  fn chart(&self, source: &str, run_ids: &[String], filters: &[String]) -> Result<String> {
-    Dashboard::chart(self, source, run_ids, filters)
+  fn chart(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<String> {
+    Dashboard::chart(self, source, run_ids, filters, x_axis)
   }
 }
 
@@ -432,7 +445,13 @@ impl Dashboard {
     Ok(json!({"source": source, "comparison": comparison}))
   }
 
-  pub fn chart(&self, source_id: &str, run_ids: &[String], filters: &[String]) -> Result<String> {
+  pub fn chart(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<String> {
     let runs = if filters.is_empty() {
       let summaries = self.read_metrics(source_id, run_ids, &[], 1, false)?;
       let (selected, _) = selected_metrics(&summaries, &[])?;
@@ -453,7 +472,7 @@ impl Dashboard {
     } else {
       self.read_metrics(source_id, run_ids, filters, 1, true)?
     };
-    crate::metric_charts::render_dashboard_chart(&runs, filters)
+    crate::metric_charts::render_dashboard_chart(&runs, filters, x_axis)
   }
 
   fn read_metrics(

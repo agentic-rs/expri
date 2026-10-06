@@ -18,6 +18,11 @@ preview against an older main backend falls back to bounded snapshots every
 five-second change probes on both sites; an AB asset deployment does not upgrade
 the backend.
 
+Time axes require the corresponding Rust chart renderer on the shared backend.
+Deploy the merged main release before publishing branch assets that offer
+elapsed or wall-clock charts; an AB asset deployment alone cannot add an API
+query option or change SVG coordinates.
+
 ## Configure the preview once
 
 Keep the existing `[dashboard]` settings and add a preview to `server.toml`:

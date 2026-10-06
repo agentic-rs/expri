@@ -232,12 +232,13 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
 def publish_refresh_fixture(run_dir, step=None, log=False):
   code = f'''
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 root = Path({run_dir!r})
 step = {step!r}
 if step is not None:
   with (root / 'outputs/metrics.jsonl').open('a') as metrics:
-    metrics.write(json.dumps({{'schema_version': 1, 'step': step, 'metrics': {{'loss': 0.005 if step == 80 else 0.004}}}}) + '\\n')
+    metrics.write(json.dumps({{'schema_version': 1, 'step': step, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z'), 'metrics': {{'loss': 0.005 if step == 80 else 0.004}}}}) + '\\n')
   if step == 81:
     state = json.loads((root / 'run-state.json').read_text())
     state['refresh_probe'] = 'metadata-replacement'
@@ -447,7 +448,12 @@ finally:
     try:
       if container.endswith('-browser'):
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
-        for name in ['workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom', 'workspace-auto-refresh']:
+        for name in [
+          'workspace-desktop', 'workspace-narrow', 'workspace-ab',
+          'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
+          'workspace-elapsed', 'workspace-wall_clock',
+          'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
+        ]:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)

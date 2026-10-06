@@ -414,14 +414,25 @@ minutes to catch changes missed by file metadata.
 
 Charts support point inspection, range zoom, and run visibility controls. Hover
 over a curve to read the nearest displayed samples, or focus the plot and use
-the arrow keys. Drag across training steps to zoom; use the zoom buttons or
+the arrow keys. The **X-axis** tags select **Step** (the default), **Elapsed time**
+since each run's first timestamped metric event, or **Date & time**. Date & time
+defaults to your browser's local timezone, named beside the **Local / UTC** tags.
+Range and sample readouts show the UTC offset at each displayed instant,
+including daylight saving changes. Switching the display timezone preserves
+zoom and hidden runs, changes no recorded timestamps, and makes no API requests.
+The elapsed origin includes all metrics in the run and remains stable when you
+filter metrics or the preview samples points. Time views omit points without
+timestamps and report the omitted count; they do not infer timestamps from steps.
+Drag across the x-axis to zoom; use the zoom buttons or
 **Reset zoom** to change the range. Click a run in the legend to show or hide its
 curve. These interactions use the displayed preview and do not download more
-metric data. Point readouts retain the recorded step and value, including
-repeated steps and step resets. **Open chart** opens the standalone static view.
+metric data. Point readouts retain the recorded step, value, and available timestamp, including
+repeated steps and step resets. **Open chart** opens the standalone static view;
+its Date & time axis uses UTC.
 Changed charts replace their bounded preview because sampling can change older
 displayed points. Updates wait until a drag finishes. A zoomed range stays at
-the same steps; the full range follows newly recorded steps. After an initial
+the same coordinates; the full range follows newly recorded points. Switching
+axes resets zoom while retaining hidden runs. After an initial
 bounded refresh establishes the current view, unchanged probes do not download
 metrics or reload the chart; recovery refreshes still check the full preview.
 

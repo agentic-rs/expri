@@ -5,6 +5,10 @@ use serde_json::json;
 use super::*;
 use crate::metrics::{MetricSeries, MetricSummary};
 
+fn dashboard_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
+  render_dashboard_chart(runs, filters, ChartXAxis::Step)
+}
+
 fn point(step: u64, value: f64) -> MetricPoint {
   MetricPoint {
     step,
@@ -28,6 +32,10 @@ fn series(points: Vec<MetricPoint>) -> MetricSeries {
   MetricSeries {
     summary: MetricSummary {
       count: points.len(),
+      missing_timestamp_count: points
+        .iter()
+        .filter(|point| point.timestamp.is_none())
+        .count(),
       last: points.last().unwrap().clone(),
       min,
       max,
@@ -41,6 +49,7 @@ fn run(id: &str, points: Vec<MetricPoint>) -> RunMetrics {
     run_id: id.to_string(),
     run: json!({"task":"train", "status":"completed", "started_at":"2026-10-03T00:00:00Z", "exit_code":0}),
     params: None,
+    first_metric_timestamp: points.iter().find_map(|point| point.timestamp.clone()),
     metrics: if points.is_empty() {
       BTreeMap::new()
     } else {
@@ -101,9 +110,9 @@ fn empty_and_single_point_series_make_valid_finite_plots() {
   assert!(!single.contains("inf"));
   assert!(single.contains(&u64::MAX.to_string()));
   let points = [point(0, 0.0), point(1, 0.0), point(1, 0.0)];
-  let domain = Domain::new(points.iter()).unwrap();
+  let domain = Domain::new(points.iter().map(|point| (i128::from(point.step), point))).unwrap();
   assert_eq!(domain.y(0.0), 151.0);
-  assert_eq!(domain.step_ticks(), vec![0, 1]);
+  assert_eq!(domain.x_ticks(4), vec![0, 1]);
   assert_eq!(domain.value_ticks(), vec![(0.0, 0.5)]);
 }
 
@@ -117,9 +126,9 @@ fn scales_handle_extreme_tiny_and_adjacent_values_without_overflow() {
     [f64::from_bits(1), f64::from_bits(2)],
   ] {
     let points = vec![point(0, values[0]), point(u64::MAX, values[1])];
-    let domain = Domain::new(points.iter()).unwrap();
+    let domain = Domain::new(points.iter().map(|point| (i128::from(point.step), point))).unwrap();
     for point in &points {
-      assert!(domain.x(point.step).is_finite());
+      assert!(domain.x(i128::from(point.step)).is_finite());
       assert!(domain.y(point.value).is_finite());
       assert!((TOP..=TOP + HEIGHT).contains(&domain.y(point.value)));
     }
@@ -131,9 +140,9 @@ fn scales_handle_extreme_tiny_and_adjacent_values_without_overflow() {
     assert!(!html.contains("inf"));
   }
   let points = [point(u64::MAX - 1, 0.0), point(u64::MAX, 1.0)];
-  let domain = Domain::new(points.iter()).unwrap();
-  assert_eq!(domain.x(u64::MAX - 1), LEFT);
-  assert_eq!(domain.x(u64::MAX), LEFT + WIDTH);
+  let domain = Domain::new(points.iter().map(|point| (i128::from(point.step), point))).unwrap();
+  assert_eq!(domain.x(i128::from(u64::MAX - 1)), LEFT);
+  assert_eq!(domain.x(i128::from(u64::MAX)), LEFT + WIDTH);
 }
 
 #[test]
@@ -203,7 +212,7 @@ fn dashboard_sampling_keeps_extrema_and_complete_sample_counts_with_a_smaller_bu
   assert!(chosen.iter().any(|point| point.step == 5000));
   assert!(chosen.iter().any(|point| point.step == 5001));
   assert!(chosen.windows(2).all(|pair| pair[0].step < pair[1].step));
-  let html = render_dashboard_chart(&[run("run-long", points)], &[]).unwrap();
+  let html = dashboard_chart(&[run("run-long", points)], &[]).unwrap();
   assert!(html.matches("<circle ").count() <= DASHBOARD_POINT_BUDGET);
   assert!(html.contains("at most 600 points per run"));
   assert!(html.contains("10000 samples"));
@@ -221,13 +230,13 @@ fn dashboard_metric_selection_is_bounded_and_cli_export_keeps_every_metric() {
       .metrics
       .insert(name.clone(), series(vec![point(0, 1.0)]));
   }
-  let html = render_dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
+  let html = dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
   assert_eq!(html.matches("<svg ").count(), 4);
   assert!(html.contains("Showing the first 4 of 7 metrics"));
   assert!(!html.contains("metric_04"));
-  let explicit = render_dashboard_chart(std::slice::from_ref(&selected), &names[..6]).unwrap();
+  let explicit = dashboard_chart(std::slice::from_ref(&selected), &names[..6]).unwrap();
   assert_eq!(explicit.matches("<svg ").count(), 6);
-  assert!(render_dashboard_chart(std::slice::from_ref(&selected), &names).is_err());
+  assert!(dashboard_chart(std::slice::from_ref(&selected), &names).is_err());
   let full = render_chart(&[selected], &[]).unwrap();
   assert_eq!(full.matches("<svg ").count(), 7);
   assert!(!full.contains("Showing the first"));
@@ -252,7 +261,7 @@ fn dashboard_aggregate_sampling_keeps_supported_large_comparisons_below_the_html
     runs.push(selected);
   }
   for (filters, plots) in [(&[][..], 4), (names.as_slice(), 6)] {
-    let html = render_dashboard_chart(&runs, filters).unwrap();
+    let html = dashboard_chart(&runs, filters).unwrap();
     assert!(html.len() < 2 * 1024 * 1024);
     assert_eq!(html.matches("<svg ").count(), plots);
     assert!(html.matches("<circle ").count() <= DASHBOARD_TOTAL_POINT_BUDGET);
@@ -277,7 +286,7 @@ fn dashboard_parameter_preview_is_bounded_but_differences_use_complete_values() 
   second.params.as_mut().unwrap()["key-00"] = json!(format!("{}END_B", "λ".repeat(10_000)));
   let runs = [first, second];
   let before = serde_json::to_value(&runs).unwrap();
-  let preview = render_dashboard_chart(&runs, &[]).unwrap();
+  let preview = dashboard_chart(&runs, &[]).unwrap();
   assert!(preview.contains("Dashboard parameter preview"));
   assert!(preview.contains("first 24 keys"));
   assert!(preview.contains("1000 characters"));
@@ -312,7 +321,7 @@ fn dashboard_bounds_metadata_notes_and_repeated_point_labels() {
     name.clone(),
     series((0..10_000).map(|step| point(step, step as f64)).collect()),
   );
-  let preview = render_dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
+  let preview = dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
   assert!(preview.len() < 512 * 1024);
   assert!(!preview.contains("TASK_END") && !preview.contains("WARNING_END"));
   assert!(preview.contains("Long data notes are shortened"));
@@ -340,7 +349,7 @@ fn dashboard_starts_with_curves_and_keeps_multi_run_parameter_differences_collap
   ] {
     assert!(full.contains(retained));
   }
-  let preview = render_dashboard_chart(&runs, &[]).unwrap();
+  let preview = dashboard_chart(&runs, &[]).unwrap();
   assert!(preview.contains("1 metric chart · 2 runs"));
   assert!(!preview.contains("<h1>") && !preview.contains("<footer>"));
   assert!(!preview.contains("<h2>Selected runs</h2>"));
@@ -350,7 +359,7 @@ fn dashboard_starts_with_curves_and_keeps_multi_run_parameter_differences_collap
   assert!(preview.contains("0.01") && preview.contains("0.02"));
   let parameters = "<details class=parameter-comparison><summary>Compare parameters</summary>";
   assert!(preview.find(parameters).unwrap() > preview.rfind("</svg>").unwrap());
-  let single = render_dashboard_chart(&runs[..1], &[]).unwrap();
+  let single = dashboard_chart(&runs[..1], &[]).unwrap();
   assert!(!single.contains(parameters));
   assert!(!single.contains("Effective parameters") && !single.contains("learning_rate"));
 }
@@ -365,7 +374,7 @@ fn dashboard_plot_labels_and_warnings_escape_user_text_and_identify_missing_seri
     .warnings
     .push(json!({"message":"incomplete <final> row & skipped"}));
   let absent = run("run-missing", vec![]);
-  let preview = render_dashboard_chart(&[recorded, absent], &[]).unwrap();
+  let preview = dashboard_chart(&[recorded, absent], &[]).unwrap();
   assert!(!preview.contains("\" onmouseover=\""));
   assert!(
     preview.contains("aria-label=\"Plot of loss&quot; onmouseover=&quot;alert(1)&lt;metric&gt;\"")
@@ -383,7 +392,7 @@ fn dashboard_plot_labels_and_warnings_escape_user_text_and_identify_missing_seri
 fn dashboard_tick_labels_have_left_padding_and_keep_exact_tooltip_values() {
   let exact = 1.844475;
   let selected = run("run-precise", vec![point(0, exact)]);
-  let dashboard = render_dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
+  let dashboard = dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
   assert!(dashboard.contains("viewBox=\"-84 0 1084 340\""));
   assert!(dashboard.contains("text-anchor=end><title>1.844475</title>1.844475</text>"));
   assert!(dashboard.contains("step 0 · value 1.844475"));
@@ -407,7 +416,7 @@ fn dashboard_tick_labels_have_left_padding_and_keep_exact_tooltip_values() {
 #[test]
 fn dashboard_preserves_distinct_ticks_for_narrow_loss_ranges() {
   let selected = run("run-narrow", vec![point(0, 1.8441), point(1, 1.8444)]);
-  let dashboard = render_dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
+  let dashboard = dashboard_chart(std::slice::from_ref(&selected), &[]).unwrap();
   let report = render_chart(&[selected], &[]).unwrap();
   for label in ["1.8441", "1.844175", "1.84425", "1.844325", "1.8444"] {
     assert!(dashboard.contains(&format!("</title>{label}</text>")));
@@ -447,4 +456,302 @@ fn chart_publication_refuses_symlink_and_special_output_without_touching_target(
   assert!(write_chart(&linked, &[], &[]).is_err());
   assert_eq!(fs::read_to_string(&target).unwrap(), "user content");
   assert!(write_chart(directory.path(), &[], &[]).is_err());
+}
+
+fn timed_point(step: u64, value: f64, timestamp: &str) -> MetricPoint {
+  MetricPoint {
+    step,
+    value,
+    timestamp: Some(timestamp.into()),
+  }
+}
+
+#[test]
+fn elapsed_axes_align_runs_and_share_one_origin_across_metrics() {
+  let mut first = run(
+    "first",
+    vec![
+      timed_point(10, 2.0, "2026-10-03T01:00:05Z"),
+      timed_point(20, 1.0, "2026-10-03T01:00:10Z"),
+    ],
+  );
+  first.first_metric_timestamp = Some("2026-10-03T01:00:00Z".into());
+  first.metrics.insert(
+    "warmup".into(),
+    series(vec![timed_point(0, 3.0, "2026-10-03T01:00:00Z")]),
+  );
+  let mut second = run(
+    "second",
+    vec![
+      timed_point(100, 2.0, "2026-10-04T18:00:05Z"),
+      timed_point(200, 1.0, "2026-10-04T18:00:10Z"),
+    ],
+  );
+  second.first_metric_timestamp = Some("2026-10-04T18:00:00Z".into());
+  let html =
+    render_dashboard_chart(&[first, second], &["loss".into()], ChartXAxis::Elapsed).unwrap();
+  assert!(
+    html.contains("data-x-axis=\"elapsed\" data-x-min=\"5000000000\" data-x-max=\"10000000000\"")
+  );
+  assert_eq!(
+    html.matches("points=\"86.00,28.00 950.00,274.00\"").count(),
+    2
+  );
+  assert!(
+    html.contains("Run 1 · step 10 · value 2.0 · timestamp 2026-10-03T01:00:05Z · elapsed 5 s")
+  );
+  assert!(html.contains("Elapsed time from first metric event"));
+  assert!(!html.contains("<h2>warmup</h2>"));
+}
+
+#[test]
+fn wall_clock_axes_preserve_offsets_pre_epoch_dates_and_nanosecond_precision() {
+  let selected = run(
+    "pre-epoch",
+    vec![
+      timed_point(0, 0.0, "1969-12-31T23:59:59.999999999Z"),
+      timed_point(1, 1.0, "1970-01-01T08:00:00+08:00"),
+    ],
+  );
+  let html = render_dashboard_chart(&[selected], &[], ChartXAxis::WallClock).unwrap();
+  assert!(html.contains("data-x-axis=\"wall_clock\" data-x-min=\"-1\" data-x-max=\"0\""));
+  assert!(html.contains("points=\"86.00,274.00 950.00,28.00\""));
+  assert!(html.contains("1969-12-31 23:59:59.999999999 UTC"));
+  assert!(html.contains("1970-01-01 00:00:00 UTC"));
+  assert!(html.contains("data-x-value=\"-1\" data-timestamp=\"1969-12-31T23:59:59.999999999Z\""));
+  assert!(html.contains("Wall-clock time (UTC)"));
+  assert!(!html.contains("NaN"));
+}
+
+#[test]
+fn clock_regressions_remain_visible_in_logging_order_as_negative_elapsed_time() {
+  let selected = run(
+    "clock-reset",
+    vec![
+      timed_point(1, 2.0, "2026-10-03T01:00:05Z"),
+      timed_point(2, 1.0, "2026-10-03T01:00:00Z"),
+    ],
+  );
+  let html = render_dashboard_chart(&[selected], &[], ChartXAxis::Elapsed).unwrap();
+  assert!(html.contains("data-x-min=\"-5000000000\" data-x-max=\"0\""));
+  assert!(html.contains("points=\"950.00,28.00 86.00,274.00\""));
+  assert!(html.contains(" · elapsed −5 s"));
+}
+
+#[test]
+fn time_views_report_complete_missing_counts_and_handle_all_missing_runs() {
+  let mut mixed = run(
+    "mixed",
+    vec![
+      point(0, 5.0),
+      timed_point(1, 2.0, "2026-10-03T01:00:00Z"),
+      point(2, 1.0),
+    ],
+  );
+  mixed.metrics.get_mut("loss").unwrap().summary.count = 100;
+  mixed
+    .metrics
+    .get_mut("loss")
+    .unwrap()
+    .summary
+    .missing_timestamp_count = 99;
+  let absent = run("absent", vec![point(0, 3.0), point(1, 1.0)]);
+  for axis in [ChartXAxis::Elapsed, ChartXAxis::WallClock] {
+    let html = render_dashboard_chart(&[mixed.clone(), absent.clone()], &[], axis).unwrap();
+    assert_eq!(html.matches("<circle ").count(), 1);
+    assert!(html.contains("99 of 100 samples omitted"));
+    assert!(html.contains("2 of 2 samples omitted"));
+    assert!(html.contains("100 samples"));
+    let empty = render_dashboard_chart(std::slice::from_ref(&absent), &[], axis).unwrap();
+    assert!(!empty.contains("<svg"));
+    assert!(empty.contains("No timestamped samples are available to plot."));
+    assert!(empty.contains("2 of 2 samples omitted"));
+  }
+  let step = dashboard_chart(&[mixed, absent], &[]).unwrap();
+  assert_eq!(step.matches("<circle ").count(), 5);
+  assert!(!step.contains("samples omitted"));
+}
+
+#[test]
+fn time_axis_sampling_keeps_the_existing_dashboard_total_point_budget() {
+  let runs = (0..8)
+    .map(|index| {
+      let points = (0..1000)
+        .map(|step| {
+          timed_point(
+            step,
+            step as f64,
+            &format!("2026-10-03T01:00:00.{step:09}Z"),
+          )
+        })
+        .collect();
+      let mut selected = run(&format!("run-{index}"), points);
+      for name in ["accuracy", "precision", "recall", "f1", "lr"] {
+        selected
+          .metrics
+          .insert(name.into(), selected.metrics["loss"].clone());
+      }
+      selected
+    })
+    .collect::<Vec<_>>();
+  for axis in [ChartXAxis::Elapsed, ChartXAxis::WallClock] {
+    let html = render_dashboard_chart(
+      &runs,
+      &[
+        "loss".into(),
+        "accuracy".into(),
+        "precision".into(),
+        "recall".into(),
+        "f1".into(),
+        "lr".into(),
+      ],
+      axis,
+    )
+    .unwrap();
+    assert!(html.matches("<circle ").count() <= DASHBOARD_TOTAL_POINT_BUDGET);
+    assert_eq!(html.matches("data-x-axis=").count(), 6);
+    assert_eq!(
+      html.matches("data-timestamp=").count(),
+      html.matches("<circle ").count()
+    );
+  }
+}
+
+#[test]
+fn axis_tokens_and_duration_labels_are_explicit_and_preserve_small_intervals() {
+  for (token, axis) in [
+    ("step", ChartXAxis::Step),
+    ("elapsed", ChartXAxis::Elapsed),
+    ("wall_clock", ChartXAxis::WallClock),
+  ] {
+    assert_eq!(ChartXAxis::parse(token).unwrap(), axis);
+    assert_eq!(serde_json::to_value(axis).unwrap(), json!(token));
+  }
+  assert!(ChartXAxis::parse("time").is_err());
+  for (value, label) in [
+    (0, "0 s"),
+    (1, "1 ns"),
+    (-1, "−1 ns"),
+    (1500, "1.5 µs"),
+    (1_500_001, "1.500001 ms"),
+    (1_000_000_001, "1.000000001 s"),
+    (62_000_000_000, "1:02 min"),
+    (3_723_000_000_001, "1:02:03.000000001 h"),
+  ] {
+    assert_eq!(duration(value), label);
+  }
+}
+
+#[test]
+fn wall_clock_tick_labels_stay_compact_with_utc_date_context() {
+  for (min, max, first_tick, last_tick, context) in [
+    (
+      "2026-10-03T01:00:00Z",
+      "2026-10-03T01:00:01Z",
+      "01:00:00",
+      "01:00:01",
+      "UTC date: 2026-10-03.",
+    ),
+    (
+      "2026-12-31T23:59:59.999999999Z",
+      "2027-01-01T00:00:00Z",
+      "12-31 23:59:59.999999999",
+      "01-01 00:00:00",
+      "UTC dates: 2026-12-31 – 2027-01-01.",
+    ),
+    (
+      "2026-12-31T23:00:00Z",
+      "2027-01-01T01:00:00Z",
+      "12-31 23:00",
+      "01-01 01:00",
+      "UTC dates: 2026-12-31 – 2027-01-01.",
+    ),
+    (
+      "2026-10-03T01:00:00Z",
+      "2028-10-03T01:00:00Z",
+      "2026-10-03",
+      "2028-10-03",
+      "UTC dates: 2026-10-03 – 2028-10-03.",
+    ),
+  ] {
+    let start = timestamp_nanos(min).unwrap();
+    let end = timestamp_nanos(max).unwrap();
+    assert_eq!(wall_clock_tick(start, start, end), first_tick);
+    assert_eq!(wall_clock_tick(end, start, end), last_tick);
+    assert_eq!(wall_clock_context(start, end), context);
+    let html = render_dashboard_chart(
+      &[run(
+        "time",
+        vec![timed_point(0, 0.0, min), timed_point(1, 1.0, max)],
+      )],
+      &[],
+      ChartXAxis::WallClock,
+    )
+    .unwrap();
+    assert!(html.contains(context));
+    // Time tick titles retain the full UTC instant even when labels are compact.
+    assert!(html.contains(&format!(
+      "<title>{}</title>{first_tick}",
+      utc_timestamp(start)
+    )));
+    assert!(html.matches("y=\"297\"").count() <= 3);
+  }
+}
+
+#[test]
+fn dashboard_html_budget_adapts_to_long_valid_timestamps_and_extreme_values() {
+  let names = (0..6)
+    .map(|index| format!("metric-{index}"))
+    .collect::<Vec<_>>();
+  let timestamp = format!("2026-10-03T01:00:00.{}Z", "1".repeat(107));
+  assert_eq!(timestamp.len(), 128);
+  assert!(DateTime::parse_from_rfc3339(&timestamp).is_ok());
+  let runs = (0..8)
+    .map(|index| {
+      let points = (0..1000)
+        .map(|offset| {
+          timed_point(
+            u64::MAX - offset,
+            if offset % 2 == 0 { f64::MAX } else { -f64::MAX },
+            &timestamp,
+          )
+        })
+        .collect();
+      let mut selected = run(&format!("run-{index}"), points);
+      for name in &names {
+        selected
+          .metrics
+          .insert(name.clone(), selected.metrics["loss"].clone());
+      }
+      selected.metrics.remove("loss");
+      selected
+    })
+    .collect::<Vec<_>>();
+  for axis in [ChartXAxis::Step, ChartXAxis::Elapsed, ChartXAxis::WallClock] {
+    let html = render_dashboard_chart(&runs, &names, axis).unwrap();
+    assert!(
+      html.len() <= DASHBOARD_HTML_LIMIT,
+      "{} bytes for {axis:?}",
+      html.len()
+    );
+    assert!(html.matches("<circle ").count() < DASHBOARD_TOTAL_POINT_BUDGET);
+    assert!(html.matches("<circle ").count() >= 4 * 8 * 6);
+    assert!(html.contains(&format!("data-timestamp=\"{timestamp}\"")));
+    assert!(html.contains(&u64::MAX.to_string()));
+    assert_eq!(html.matches("1000 samples").count(), 8 * 6);
+  }
+}
+
+#[test]
+fn dashboard_html_budget_reports_when_metadata_alone_exceeds_the_limit() {
+  let mut selected = run("notes", vec![point(0, 1.0)]);
+  selected.warnings = (0..1100)
+    .map(|_| json!({"message": "<".repeat(512)}))
+    .collect();
+  assert!(
+    dashboard_chart(&[selected], &[])
+      .unwrap_err()
+      .to_string()
+      .contains("select fewer metrics or runs")
+  );
 }

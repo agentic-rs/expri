@@ -205,7 +205,7 @@ fn selected_metrics_are_passed_to_reader_and_comparison_omits_params() {
   assert!(
     fixture
       .dashboard
-      .chart("local", &ids, &vec!["loss".into(); 7])
+      .chart("local", &ids, &vec!["loss".into(); 7], ChartXAxis::Step)
       .is_err()
   );
 }
