@@ -290,6 +290,8 @@ def select_chart_axis(browser, axis):
   index = {'step': 0, 'elapsed': 1, 'wall_clock': 2}[axis]
   # Select options live in Firefox's native popup; clicking the hidden option
   # element bypasses that popup and is intercepted. Use actual keyboard input.
+  browser.call('POST', '/execute/sync', {'script': '''document.querySelector('#x-axis-select')
+    .scrollIntoView({block: 'center', inline: 'nearest'});''', 'args': []})
   browser.click('#x-axis-select')
   browser.keys('#x-axis-select', '\ue011' + '\ue015' * index + '\ue007')
 
