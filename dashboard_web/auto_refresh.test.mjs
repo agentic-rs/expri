@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AutoRefresh } from "./app.js";
+import { AutoRefresh } from "./.test/app.js";
 
 async function flush() { for (let index = 0; index < 12; index++) await Promise.resolve(); }
 function deferred() { let resolve; const promise = new Promise(accept => { resolve = accept; }); return { promise, resolve }; }

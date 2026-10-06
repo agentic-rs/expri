@@ -650,6 +650,19 @@ def previews(run_id, second_run_id):
     return browser.call('POST', '/execute/async', {'script': '''const done = arguments[0];
       fetch('/api/catalog').then(async response => done({status: response.status,
         catalog: response.ok ? await response.json() : null})).catch(() => done({status: 0}));''', 'args': []})
+  def assert_provenance():
+    for selector in ['header .read-only', 'footer .deployment-revision']:
+      assert browser.call('GET', '/element/' + browser.element(selector) + '/displayed'), 'preview deployment provenance is hidden after mounting'
+    assert evaluate('''const badge = document.querySelector('header .read-only');
+      const revision = document.querySelector('footer .deployment-revision');
+      const branch = revision.querySelector('code');
+      return {badge: badge.textContent, revision: revision.textContent,
+        branch: branch.textContent, branch_title: branch.getAttribute('title')};''') == {
+          'badge': 'Read only · AB · aaaaaaaa',
+          'revision': 'AB · aaaaaaaa · built from fixture/ab',
+          'branch': 'fixture/ab',
+          'branch_title': 'Built from fixture/ab',
+        }, 'preview deployment provenance does not match its pinned release'
   try:
     browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
     browser.navigate('/login')
@@ -677,11 +690,13 @@ def previews(run_id, second_run_id):
     assert catalog() == main_catalog, 'preview and main do not share one catalog'
     assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/assets/' + 'a' * 40 + '/app.js', 'preview did not serve pinned branch assets'
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'shared run list is missing in preview')
+    assert_provenance()
     for selected in [run_id, second_run_id]:
       browser.click(f'input[aria-label="Select {selected} for comparison"]')
     wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'preview comparison did not load shared run data')
     interactive_charts(browser, [run_id, second_run_id], prefix='workspace-ab')
     time_axes(browser, [run_id, second_run_id], prefix='workspace-ab')
+    assert_provenance()
     Path('/tmp/workspace-ab.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
 
     browser.restore_cookie(main_cookie)
@@ -707,7 +722,7 @@ def previews(run_id, second_run_id):
     catalog_with_wire_check(browser, 401, 0)
     browser.restore_cookie(main_cookie)
     catalog_with_wire_check(browser, 401, 1)
-    print('Firefox previews passed: separate host sessions, shared catalog/runs, branch assets and comparison, cookie replay denied, independent logout.', flush=True)
+    print('Firefox previews passed: separate host sessions, shared catalog/runs, branch assets and visible provenance, comparison, cookie replay denied, independent logout.', flush=True)
   finally:
     browser.close()
 

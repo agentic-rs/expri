@@ -134,8 +134,10 @@ python3 scripts/deploy.py --ref main
 Omitting `--ref` selects the current named branch. Feature branches resolve
 locally; `main` always fetches `origin/main` before a real deployment. A main
 dry run reports the cached remote commit and does not fetch. Commit and build
-the TypeScript changes before deploying; the release uses the committed
+the TypeScript and TSX changes before deploying; the release uses the committed
 `dashboard_web/app.js`, which CI checks against its source.
+React is bundled into that asset; neither AB nor the main service needs a
+Node.js runtime or a frontend dependency installation.
 
 The installer verifies the transferred archive, takes a deployment lock, and
 switches the release symlink atomically. Reusing a commit through another branch

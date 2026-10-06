@@ -1,7 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, RequestLane, startDashboard } from "./app.js";
+import { JSDOM } from "jsdom";
+import { act } from "react";
+
+const browser_globals = ["window", "document", "navigator", "HTMLElement", "HTMLInputElement", "HTMLSelectElement", "HTMLIFrameElement", "Node", "Event", "KeyboardEvent", "MutationObserver", "requestAnimationFrame", "cancelAnimationFrame"];
+function installWindow(window) {
+  const previous = new Map(browser_globals.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  for (const name of browser_globals) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: typeof window[name] === "function" && name.endsWith("AnimationFrame") ? window[name].bind(window) : window[name] });
+  return () => {
+    for (const [name, descriptor] of previous) descriptor ? Object.defineProperty(globalThis, name, descriptor) : Reflect.deleteProperty(globalThis, name);
+  };
+}
+// React DOM detects input support during import. Give it a real document without
+// a dashboard root, then mount each test in its own independent browser document.
+const baseline = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/", pretendToBeVisual: true });
+installWindow(baseline.window);
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+const { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, RequestLane, startDashboard } = await import("./.test/app.js");
 
 function deferred() {
   let resolve;
@@ -102,92 +118,65 @@ test("expired sessions navigate to login before parsing the response body", asyn
   assert.deepEqual(redirects, ["/login"], "cancelled work must not navigate a newer view");
 });
 
-class TestElement {
-  constructor(tag) {
-    this.tagName = tag.toUpperCase();
-    this.textContent = "";
-    this.children = [];
-    this.dataset = {};
-    this.attributes = {};
-    this.listeners = {};
-    this.value = "";
-    this.hidden = false;
-    this.disabled = false;
-    this.scrollTop = 0;
-    this.scrollHeight = 100;
-    this.clientHeight = 100;
-    this.src_writes = 0;
-    this.classes = new Set();
-    this.classList = {
-      toggle: (name, enabled) => enabled ? this.classes.add(name) : this.classes.delete(name),
-      add: (...names) => names.forEach(name => this.classes.add(name)),
-    };
-  }
-  set src(value) { this.src_value = value; this.src_writes++; }
-  get src() { return this.src_value ?? ""; }
-  append(...children) { this.children.push(...children); }
-  replaceChildren(...children) { this.children = children; }
-  setAttribute(name, value) { this.attributes[name] = value; }
-  getAttribute(name) { return name === "src" ? this.src || null : this.attributes[name] ?? null; }
-  removeAttribute(name) { delete this.attributes[name]; if (name === "src") this.src = ""; }
-  querySelectorAll(selector) {
-    const tags = selector.split(",").map(tag => tag.trim().toUpperCase());
-    return this.children.flatMap(child => [child, ...child.querySelectorAll(selector)]).filter(child => tags.includes(child.tagName));
-  }
-  addEventListener(name, listener) { (this.listeners[name] ??= []).push(listener); }
-  removeEventListener(name, listener) { this.listeners[name] = (this.listeners[name] ?? []).filter(item => item !== listener); }
-  contains(node) { return node === this || this.children.some(child => child.contains(node)); }
-  emit(name, fields = {}) { for (const listener of this.listeners[name] ?? []) listener({ type: name, preventDefault() {}, ...fields }); }
-  focus() { globalThis.document.activeElement = this; }
-  click() { if (!this.disabled) { this.focus(); this.emit("click"); } }
-}
-
 function dashboard(t) {
-  const original_document = globalThis.document;
   const original_fetch = globalThis.fetch;
-  t.after(() => {
-    globalThis.fetch = original_fetch;
-    if (original_document === undefined) delete globalThis.document;
-    else globalThis.document = original_document;
-  });
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
-  const nodes = new Map([...html.matchAll(/id="([^"]+)"/g)].map(match => [match[1], new TestElement("div")]));
-  globalThis.document = {
-    title: "expri",
-    getElementById: id => nodes.get(id) ?? null,
-    createElement: tag => new TestElement(tag),
-    createTextNode: value => { const node = new TestElement("text"); node.textContent = value; return node; },
-    visibilityState: "visible",
-    listeners: {},
-    addEventListener(name, callback) { (this.listeners[name] ??= []).push(callback); },
-    removeEventListener(name, callback) { this.listeners[name] = (this.listeners[name] ?? []).filter(item => item !== callback); },
-    emit(name) { for (const listener of this.listeners[name] ?? []) listener(); },
+  const dom = new JSDOM(html, { url: "http://localhost/", pretendToBeVisual: true });
+  const restore = installWindow(dom.window);
+  let navigation_count = 0;
+  const record = records => { navigation_count += records.filter(item => item.type === "attributes" && item.target.id === "chart-frame").length; };
+  const observer = new dom.window.MutationObserver(record);
+  observer.observe(dom.window.document.body, { subtree: true, attributes: true, attributeFilter: ["src"] });
+  const nodes = {
+    document: dom.window.document,
+    cleanup: null,
+    get(id) { const node = dom.window.document.getElementById(id); assert.ok(node, `Missing rendered element: ${id}`); return node; },
+    navigationCount() { record(observer.takeRecords()); return navigation_count; },
   };
+  t.after(async () => {
+    if (nodes.cleanup) await act(async () => { nodes.cleanup(); await microtasks(); });
+    observer.disconnect(); dom.window.close(); restore();
+    globalThis.fetch = original_fetch;
+  });
   return nodes;
 }
+
+async function mountDashboard(nodes, options = {}) {
+  await act(async () => { nodes.cleanup = startDashboard(options); await microtasks(); });
+}
+async function microtasks() { for (let index = 0; index < 32; index++) await Promise.resolve(); }
+async function click(node) { await act(async () => { node.focus(); node.click(); await microtasks(); }); }
+async function emit(node, name, fields = {}) {
+  await act(async () => {
+    const window = node.ownerDocument?.defaultView ?? node.defaultView;
+    const EventType = name.startsWith("key") ? window.KeyboardEvent : window.Event;
+    node.dispatchEvent(new EventType(name, { bubbles: true, cancelable: true, ...fields }));
+    await microtasks();
+  });
+}
+function setValue(node, value) {
+  const prototype = node.ownerDocument.defaultView[node.tagName === "SELECT" ? "HTMLSelectElement" : "HTMLInputElement"].prototype;
+  Object.getOwnPropertyDescriptor(prototype, "value").set.call(node, value);
+}
+function frameNavigations(nodes) { return nodes.navigationCount(); }
 
 async function settled(predicate) {
   for (let attempt = 0; attempt < 100; attempt++) {
     if (predicate()) return;
-    await new Promise(resolve => setTimeout(resolve, 10));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
   }
   assert.fail("dashboard did not finish its pending request");
 }
 
-function text(node) {
-  return [node.textContent, ...node.children.map(child => text(child))].join(" ");
-}
-function findElement(node, id) {
-  if (node.id === id) return node;
-  for (const child of node.children) { const found = findElement(child, id); if (found) return found; }
-}
+function text(node) { return node.textContent; }
+function findElement(node, id) { return node.id === id ? node : node.querySelector(`#${id}`); }
 
 function detailRecord(source, run, value = 0.5) {
   const metric = { count: 2, last: { step: 1, value }, min: { step: 1, value }, max: { step: 0, value: 1 } };
   return { source, run, state: { command: "python train.py" }, snapshot: null, environment: null, cache: null, params: { learning_rate: 0.1 }, params_truncated: false, metadata_truncated: false, metrics: { accuracy: metric, loss: metric }, metric_count: 2, metrics_truncated: false, metrics_error: null, warnings: [] };
 }
 
-function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, catalog_failure = false } = {}) {
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, catalog_failure = false } = {}) {
   const nodes = dashboard(t);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
   const runs = Array.from({ length: count }, (_, index) => ({
@@ -230,55 +219,63 @@ function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, u
     }
     assert.fail(`Unexpected dashboard request: ${url}`);
   };
-  t.after(startDashboard({ ...(refresh_clock ? { refresh_clock } : {}), ...(chart_controller ? { chart_controller } : {}) }));
+  await mountDashboard(nodes, { ...(refresh_clock ? { refresh_clock } : {}), ...(chart_controller ? { chart_controller } : {}) });
   return model;
 }
 
-function selectRow(nodes, index, checked = true) {
-  const input = nodes.get("run-rows").children[index].children[0].children[0];
+async function selectRow(nodes, index, checked = true) {
+  const input = runCheckbox(nodes, index);
   assert.equal(input.disabled, false, "the row must be selectable");
-  input.focus(); input.checked = checked; input.emit("change");
+  if (input.checked !== checked) await click(input);
+}
+function runCheckbox(nodes, index) { return nodes.get("run-rows").children[index].querySelector('input[type="checkbox"]'); }
+function runButton(nodes, index) { return nodes.get("run-rows").children[index].querySelector("button"); }
+function metricCheckbox(nodes, name) {
+  const label = [...nodes.get("run-metric-options").querySelectorAll("label.metric-choice")].find(item => item.textContent === name);
+  assert.ok(label, `Missing metric control: ${name}`); return label.querySelector("input");
 }
 function chartQuery(nodes) {
   return new URL(nodes.get("chart-frame").src || "/", "http://localhost").searchParams;
 }
 function comparisonRows(nodes) {
-  return nodes.get("comparison-values").children[0]?.children[1]?.children ?? [];
+  return nodes.get("comparison-values").querySelectorAll("tbody tr");
 }
 
-function chooseAxis(nodes, value) {
-  const input = nodes.get(`x-axis-${value.replace("_", "-")}`); input.checked = true; input.emit("change");
+async function chooseAxis(nodes, value) {
+  await click(nodes.get(`x-axis-${value.replace("_", "-")}`));
 }
 function selectedAxis(nodes) { return ["step", "elapsed", "wall_clock"].find(value => nodes.get(`x-axis-${value.replace("_", "-")}`).checked); }
-function chooseTimeZone(nodes, value) { const input = nodes.get(`time-zone-${value}`); input.checked = true; input.emit("change"); }
-function chooseReduction(nodes, value) { const input = nodes.get(`reduction-${value}`); input.checked = true; input.emit("change"); }
+async function chooseTimeZone(nodes, value) { await click(nodes.get(`time-zone-${value}`)); }
+async function chooseReduction(nodes, value) { await click(nodes.get(`reduction-${value}`)); }
 
-test("small fixed choices use native radio tags with accessible group labels", () => {
-  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+test("React renders small fixed choices as native radio tags with accessible group labels", async t => {
+  const { nodes } = await reviewFixture(t);
+  const document = nodes.document;
   for (const name of ["x_axis", "time_zone", "reduction"]) {
-    const inputs = [...html.matchAll(new RegExp(`<input[^>]+type="radio"[^>]+name="${name}"[^>]*>`, "g"))];
+    const inputs = [...document.querySelectorAll(`input[type="radio"][name="${name}"]`)];
     assert.equal(inputs.length, name === "time_zone" ? 2 : 3);
-    assert.equal(inputs.filter(([tag]) => /\bchecked\b/.test(tag)).length, 1);
+    assert.equal(inputs.filter(input => input.checked).length, 1);
   }
-  assert.match(html, /<fieldset[^>]+id="x-axis-options"[^>]*>\s*<legend>X-axis<\/legend>/);
-  assert.match(html, /id="time-zone-options"[^>]+aria-describedby="time-zone-label"[^>]+hidden/);
-  assert.match(html, /<span>Date &amp; time<\/span>/);
-  assert.doesNotMatch(html, /id="(?:x-axis|reduction)-select"/);
+  assert.equal(nodes.get("x-axis-options").querySelector("legend").textContent, "X-axis");
+  assert.equal(nodes.get("time-zone-options").getAttribute("aria-describedby"), "time-zone-label");
+  assert.equal(nodes.get("time-zone-options").hidden, true);
+  assert.equal(nodes.get("x-axis-wall-clock").closest("label").textContent, "Date & time");
+  assert.equal(document.querySelector("#x-axis-select, #reduction-select"), null);
 });
 
 test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
-  const model = reviewFixture(t), { nodes } = model;
+  const model = await reviewFixture(t), { nodes } = model;
   await settled(() => nodes.get("run-rows").children.length === 3);
-  selectRow(nodes, 0);
+  await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(chartQuery(nodes).get("x_axis"), "step");
-  chooseAxis(nodes, "elapsed");
+  await chooseAxis(nodes, "elapsed");
   assert.equal(chartQuery(nodes).get("x_axis"), "elapsed");
   assert.match(nodes.get("chart-note").textContent, /first timestamped metric event/);
-  selectRow(nodes, 1);
+  await selectRow(nodes, 1);
   await settled(() => chartQuery(nodes).getAll("run_id").length === 2);
   assert.equal(chartQuery(nodes).get("x_axis"), "elapsed");
-  chooseAxis(nodes, "wall_clock");
+  await chooseAxis(nodes, "wall_clock");
   assert.equal(chartQuery(nodes).get("x_axis"), "wall_clock");
   assert.match(nodes.get("chart-note").textContent, /your local timezone/);
   assert.equal(nodes.get("time-zone-options").hidden, false);
@@ -286,96 +283,96 @@ test("axis choice applies to run and comparison charts and survives manual refre
   assert.equal(nodes.get("open-chart-label").textContent, "Open UTC chart");
   assert.equal(new URL(nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "wall_clock");
   assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-1"]);
-  nodes.get("refresh-button").click();
+  await click(nodes.get("refresh-button"));
   await settled(() => nodes.get("refresh-button").disabled === false);
   assert.equal(selectedAxis(nodes), "wall_clock");
   assert.equal(chartQuery(nodes).get("x_axis"), "wall_clock");
-  nodes.get("x-axis-elapsed").checked = false; nodes.get("x-axis-elapsed").emit("change");
+  nodes.get("x-axis-elapsed").checked = false; await emit(nodes.get("x-axis-elapsed"), "change");
   assert.equal(selectedAxis(nodes), "wall_clock", "deselected radio events do not switch axes");
-  chooseAxis(nodes, "step");
+  await chooseAxis(nodes, "step");
   assert.equal(chartQuery(nodes).get("x_axis"), "step");
   assert.equal(nodes.get("time-zone-options").hidden, true);
   assert.equal(nodes.get("open-chart-label").textContent, "Open chart");
 });
 
 test("summary tags select reductions in one action and retain the choice on refresh", async t => {
-  const model = reviewFixture(t), { nodes } = model;
+  const model = await reviewFixture(t), { nodes } = model;
   await settled(() => nodes.get("run-rows").children.length === 3);
-  selectRow(nodes, 0); selectRow(nodes, 1);
+  await selectRow(nodes, 0); await selectRow(nodes, 1);
   await settled(() => model.requests.some(url => url.startsWith("/api/compare")));
   assert.equal(nodes.get("reduction-last").checked, true);
-  chooseReduction(nodes, "min");
+  await chooseReduction(nodes, "min");
   await settled(() => new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction") === "min");
   assert.equal(nodes.get("reduction-min").checked, true);
   assert.equal(nodes.get("reduction-last").checked, false);
-  chooseReduction(nodes, "max");
+  await chooseReduction(nodes, "max");
   await settled(() => new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction") === "max");
   assert.equal(nodes.get("reduction-max").checked, true);
   assert.equal(nodes.get("reduction-min").checked, false);
-  nodes.get("refresh-button").click();
+  await click(nodes.get("refresh-button"));
   await settled(() => nodes.get("refresh-button").disabled === false);
   assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction"), "max");
   assert.equal(nodes.get("reduction-max").checked, true);
 });
 
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
-  const { nodes, requests } = reviewFixture(t);
+  const { nodes, requests } = await reviewFixture(t);
   await settled(() => nodes.get("run-rows").children.length === 3);
   assert.equal(nodes.get("run-rows").children[0].children.length, 3);
   assert.match(text(nodes.get("run-rows").children[0].children[1]), /train.*3s/);
-  nodes.get("run-rows").children[0].children[1].children[0].click();
+  await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
-  assert.equal(nodes.get("review-tab-charts").attributes["aria-selected"], "true");
+  assert.equal(nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
   assert.equal(nodes.get("review-panel-charts").hidden, false);
   assert.equal(nodes.get("review-panel-overview").hidden, true);
   assert.equal(nodes.get("review-panel-logs").hidden, true);
   assert.equal(requests.some(url => url.startsWith("/api/log")), false);
-  nodes.get("review-tab-charts").emit("keydown", { key: "ArrowRight" });
+  await emit(nodes.get("review-tab-charts"), "keydown", { key: "ArrowRight" });
   assert.equal(nodes.get("review-panel-overview").hidden, false);
   assert.equal(globalThis.document.activeElement, nodes.get("review-tab-overview"));
   assert.match(text(nodes.get("run-detail")), /learning_rate.*0\.1/);
   assert.equal(requests.some(url => url.startsWith("/api/log")), false);
-  nodes.get("review-tab-overview").emit("keydown", { key: "End" });
+  await emit(nodes.get("review-tab-overview"), "keydown", { key: "End" });
   await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
   assert.equal(nodes.get("review-panel-logs").hidden, false);
   assert.equal(nodes.get("review-tab-logs").tabIndex, 0);
   assert.equal(nodes.get("review-tab-charts").tabIndex, -1);
-  nodes.get("review-tab-logs").emit("keydown", { key: "Home" });
-  nodes.get("review-tab-charts").emit("keydown", { key: "ArrowLeft" });
+  await emit(nodes.get("review-tab-logs"), "keydown", { key: "Home" });
+  await emit(nodes.get("review-tab-charts"), "keydown", { key: "ArrowLeft" });
   assert.equal(nodes.get("review-panel-logs").hidden, false);
   assert.equal(requests.filter(url => url.startsWith("/api/log")).length, 1, "returning to a loaded log must reuse that bounded tail");
 });
 
 test("selection updates charts, caps eight runs, and inspection returns to the selection", async t => {
-  const { nodes, requests } = reviewFixture(t, { count: 9 });
+  const { nodes, requests } = await reviewFixture(t, { count: 9 });
   await settled(() => nodes.get("run-rows").children.length === 9);
-  selectRow(nodes, 0);
+  await selectRow(nodes, 0);
   assert.equal(nodes.get("review-section").hidden, false);
   await settled(() => chartQuery(nodes).getAll("run_id").length === 1);
-  assert.equal(globalThis.document.activeElement, nodes.get("run-rows").children[0].children[0].children[0], "keyboard checkbox focus must survive the debounced review request");
+  assert.equal(globalThis.document.activeElement, runCheckbox(nodes, 0), "keyboard checkbox focus must survive the debounced review request");
   assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0"]);
   assert.equal(nodes.get("close-review").hidden, true);
-  selectRow(nodes, 1);
+  await selectRow(nodes, 1);
   await settled(() => comparisonRows(nodes).length === 2);
-  assert.equal(globalThis.document.activeElement, nodes.get("run-rows").children[1].children[0].children[0]);
+  assert.equal(globalThis.document.activeElement, runCheckbox(nodes, 1));
   assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-1"]);
   assert.equal(nodes.get("review-tab-overview").disabled, true);
   assert.equal(nodes.get("review-tab-logs").disabled, true);
   const before = requests.filter(url => url.startsWith("/api/compare")).length;
-  for (let index = 2; index < 8; index++) selectRow(nodes, index);
+  for (let index = 2; index < 8; index++) await selectRow(nodes, index);
   await settled(() => comparisonRows(nodes).length === 8);
   assert.equal(requests.filter(url => url.startsWith("/api/compare")).length, before + 1, "rapid selection changes should make one final comparison request");
-  assert.equal(nodes.get("run-rows").children[8].children[0].children[0].disabled, true);
-  nodes.get("selected-runs").children[2].click();
+  assert.equal(runCheckbox(nodes, 8).disabled, true);
+  await click(nodes.get("selected-runs").children[2]);
   await settled(() => comparisonRows(nodes).length === 7);
   assert.equal(chartQuery(nodes).getAll("run_id").includes("run-2"), false);
-  nodes.get("run-rows").children[8].children[1].children[0].click();
+  await click(runButton(nodes, 8));
   await settled(() => chartQuery(nodes).get("run_id") === "run-8");
   assert.equal(nodes.get("selected-runs").children.length, 7);
   assert.equal(nodes.get("close-review").textContent, "Back to selection");
-  nodes.get("close-review").click();
+  await click(nodes.get("close-review"));
   await settled(() => chartQuery(nodes).getAll("run_id").length === 7);
-  nodes.get("clear-selection").click();
+  await click(nodes.get("clear-selection"));
   assert.equal(nodes.get("review-section").hidden, true);
   assert.equal(nodes.get("review-empty").hidden, false);
   assert.equal(nodes.get("selected-runs").children.length, 0);
@@ -383,19 +380,19 @@ test("selection updates charts, caps eight runs, and inspection returns to the s
 });
 
 test("pagination preserves explicit selected IDs while edited filters immediately clear the review", async t => {
-  const { nodes, requests } = reviewFixture(t, { count: 40, hosted: true });
+  const { nodes, requests } = await reviewFixture(t, { count: 40, hosted: true });
   await settled(() => nodes.get("run-rows").children.length === 20);
-  selectRow(nodes, 0);
+  await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
-  nodes.get("next-page").click();
+  await click(nodes.get("next-page"));
   await settled(() => nodes.get("page-label").textContent === "Page 2");
   assert.match(text(nodes.get("selected-runs")), /run-0/);
   assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0"]);
-  selectRow(nodes, 0);
+  await selectRow(nodes, 0);
   await settled(() => comparisonRows(nodes).length === 2);
   assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-20"]);
-  nodes.get("search-input").value = "missing";
-  nodes.get("search-input").emit("input");
+  setValue(nodes.get("search-input"), "missing");
+  await emit(nodes.get("search-input"), "input");
   assert.equal(nodes.get("selected-runs").children.length, 0);
   assert.equal(nodes.get("review-section").hidden, true);
   assert.equal(chartQuery(nodes).getAll("run_id").length, 0);
@@ -410,7 +407,7 @@ test("late comparison and catalog responses cannot restore an old source after a
     { source_id: "worker&A", label: "Worker A", kind: "service", target_name: null },
     { source_id: "worker&B", label: "Worker B", kind: "service", target_name: null },
   ];
-  const model = reviewFixture(t, { sources, hosted: true });
+  const model = await reviewFixture(t, { sources, hosted: true });
   const { nodes } = model;
   await settled(() => nodes.get("run-rows").children.length === 3);
   const old_comparison = deferred();
@@ -418,15 +415,15 @@ test("late comparison and catalog responses cannot restore an old source after a
   model.override = parsed => {
     if (parsed.pathname === "/api/compare") { comparison_started = true; return old_comparison.promise; }
   };
-  selectRow(nodes, 0); selectRow(nodes, 1);
+  await selectRow(nodes, 0); await selectRow(nodes, 1);
   await settled(() => comparison_started);
   const old_catalog = deferred();
   model.override = parsed => parsed.pathname === "/api/catalog" ? old_catalog.promise : undefined;
-  nodes.get("refresh-button").click();
-  nodes.get("source-select").value = sources[1].source_id;
-  nodes.get("source-select").emit("change");
-  await settled(() => nodes.get("runs-region").attributes["aria-busy"] === "false");
-  nodes.get("run-rows").children[0].children[1].children[0].click();
+  await click(nodes.get("refresh-button"));
+  setValue(nodes.get("source-select"), sources[1].source_id);
+  await emit(nodes.get("source-select"), "change");
+  await settled(() => nodes.get("runs-region").getAttribute("aria-busy") === "false");
+  await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("source") === sources[1].source_id);
   old_comparison.resolve(response({ source: sources[0], comparison: { metric_names: [], runs: [], warnings: [] } }));
   old_catalog.resolve(response({ project_name: "Stale source", sources: [sources[0]], initial_source: sources[0].source_id, warnings: [], access_mode: "hosted" }));
@@ -440,41 +437,41 @@ test("late comparison and catalog responses cannot restore an old source after a
 });
 
 test("manual Refresh preserves the review tab and metrics and only updates Last checked after success", async t => {
-  const model = reviewFixture(t);
+  const model = await reviewFixture(t);
   const { nodes, requests } = model;
   await settled(() => nodes.get("run-rows").children.length === 3);
-  nodes.get("run-rows").children[0].children[1].children[0].click();
+  await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
-  const accuracy = nodes.get("run-metric-options").children[0].children[0].children[0];
-  accuracy.checked = false; accuracy.emit("change");
+  const accuracy = metricCheckbox(nodes, "accuracy");
+  await click(accuracy);
   assert.deepEqual(chartQuery(nodes).getAll("metric"), ["loss"]);
-  nodes.get("review-tab-overview").click();
-  nodes.get("refresh-button").click();
+  await click(nodes.get("review-tab-overview"));
+  await click(nodes.get("refresh-button"));
   await settled(() => nodes.get("refresh-button").disabled === false);
   assert.equal(nodes.get("review-panel-overview").hidden, false);
   assert.deepEqual(chartQuery(nodes).getAll("metric"), ["loss"]);
   assert.equal(requests.some(url => url.startsWith("/api/log")), false);
   assert.match(nodes.get("updated-at").textContent, /^Last checked at /);
-  nodes.get("review-tab-logs").click();
+  await click(nodes.get("review-tab-logs"));
   await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
-  findElement(nodes.get("run-logs"), "log-tab-stderr").click();
+  await click(findElement(nodes.get("run-logs"), "log-tab-stderr"));
   await settled(() => text(nodes.get("run-logs")).includes("stderr training complete"));
-  nodes.get("refresh-button").click();
+  await click(nodes.get("refresh-button"));
   await settled(() => nodes.get("refresh-button").disabled === false);
   assert.equal(nodes.get("review-panel-logs").hidden, false);
   assert.equal(requests.filter(url => url.startsWith("/api/log")).length, 3);
   assert.match(text(nodes.get("run-logs")), /stderr training complete/);
-  assert.equal(findElement(nodes.get("run-logs"), "log-tab-stderr").attributes["aria-selected"], "true");
+  assert.equal(findElement(nodes.get("run-logs"), "log-tab-stderr").getAttribute("aria-selected"), "true");
   const previous_check = nodes.get("updated-at").textContent.split(" · ")[0];
   model.failed_list = true;
-  nodes.get("refresh-button").click();
+  await click(nodes.get("refresh-button"));
   await settled(() => nodes.get("refresh-button").disabled === false);
   assert.equal(nodes.get("updated-at").textContent.split(" · ")[0], previous_check);
   assert.match(nodes.get("global-error").textContent, /Results are unavailable/);
 });
 
 test("a tab change during Refresh does not strand an unfinished initial run review", async t => {
-  const model = reviewFixture(t);
+  const model = await reviewFixture(t);
   const { nodes } = model;
   await settled(() => nodes.get("run-rows").children.length === 3);
   const initial_detail = deferred();
@@ -484,10 +481,10 @@ test("a tab change during Refresh does not strand an unfinished initial run revi
     if (parsed.pathname === "/api/run") { detail_started = true; return initial_detail.promise; }
     if (parsed.pathname === "/api/catalog") return refresh_catalog.promise;
   };
-  selectRow(nodes, 0);
+  await selectRow(nodes, 0);
   await settled(() => detail_started);
-  nodes.get("refresh-button").click();
-  nodes.get("review-tab-charts").emit("keydown", { key: "ArrowRight" });
+  await click(nodes.get("refresh-button"));
+  await emit(nodes.get("review-tab-charts"), "keydown", { key: "ArrowRight" });
   assert.equal(nodes.get("review-panel-overview").hidden, false);
   initial_detail.resolve(response(detailRecord(model.sources[0], model.runs[0])));
   refresh_catalog.resolve(response({ project_name: "Late refresh", sources: model.sources, initial_source: "local", warnings: [] }));
@@ -516,17 +513,17 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
     const runs = Array.from({ length: 20 }, (_, index) => ({ run_id: `run-${offset + index}`, task: "train", status: "completed", started_at: null, finished_at: null, exit_code: 0 }));
     return response({ source, runs, warnings: [], total_count: 60, offset, next_offset: offset < 40 ? offset + 20 : null });
   };
-  t.after(startDashboard());
+  await mountDashboard(nodes);
   await settled(() => nodes.get("run-count").textContent === "No synced runs yet");
   assert.deepEqual(requests, ["/api/catalog"], "empty catalog must not request an invalid source");
   assert.equal(nodes.get("logout-form").hidden, false);
   assert.equal(nodes.get("source-select").disabled, true);
   assert.match(text(nodes.get("list-empty")), /No synced runs yet/);
-  const guide = nodes.get("list-empty").children.at(-1).children[0];
+  const guide = Array.from(nodes.get("list-empty").children).at(-1).children[0];
   assert.match(guide.href, /github\.com\/agentic-rs\/expri\/.*self-hosted-service\.md$/);
   await settled(() => nodes.get("refresh-button").disabled === false);
   catalog = { ...catalog, sources: [source], initial_source: source.source_id, warnings: [{ message: "The overview is limited to 500 runs." }] };
-  nodes.get("refresh-button").emit("click");
+  await emit(nodes.get("refresh-button"), "click");
   await settled(() => nodes.get("run-rows").children.length === 20);
   assert.equal(nodes.get("source-select").value, source.source_id);
   assert.equal(nodes.get("source-select").disabled, false);
@@ -534,20 +531,22 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
   assert.equal(nodes.get("source-select").children[0].textContent, "Vision / gpu-1 · Synced");
   assert.match(nodes.get("source-note").textContent, /^Synced results/);
   assert.match(text(nodes.get("catalog-warnings")), /limited to 500 runs/);
-  nodes.get("next-page").emit("click");
+  await emit(nodes.get("next-page"), "click");
   await settled(() => nodes.get("page-label").textContent === "Page 2");
-  nodes.get("previous-page").emit("click");
+  await emit(nodes.get("previous-page"), "click");
   await settled(() => nodes.get("page-label").textContent === "Page 1");
-  nodes.get("search-input").value = "accuracy";
-  nodes.get("task-input").value = "train";
-  nodes.get("status-select").value = "completed";
-  nodes.get("status-select").emit("change");
+  setValue(nodes.get("search-input"), "accuracy");
+  await emit(nodes.get("search-input"), "input");
+  setValue(nodes.get("task-input"), "train");
+  await emit(nodes.get("task-input"), "input");
+  setValue(nodes.get("status-select"), "completed");
+  await emit(nodes.get("status-select"), "change");
   await settled(() => requests.some(url => url.includes("search=accuracy")));
   const query = new URL(requests.at(-1), "http://localhost").searchParams;
   assert.equal(query.get("task"), "train");
   assert.equal(query.get("status"), "completed");
   assert.equal(query.get("offset"), "0");
-  await settled(() => nodes.get("runs-region").attributes["aria-busy"] === "false");
+  await settled(() => nodes.get("runs-region").getAttribute("aria-busy") === "false");
 });
 
 test("local catalogs retain cached labels, 100-row pages, and no logout control", async t => {
@@ -558,7 +557,7 @@ test("local catalogs retain cached labels, 100-row pages, and no logout control"
     assert.equal(new URL(url, "http://localhost").searchParams.get("limit"), "100");
     return response({ source, runs: [], warnings: [], total_count: 0, offset: 0, next_offset: null });
   };
-  t.after(startDashboard());
+  await mountDashboard(nodes);
   await settled(() => nodes.get("run-count").textContent === "No matching runs");
   assert.equal(nodes.get("logout-form").hidden, true);
   assert.equal(nodes.get("source-select").children[0].textContent, source.label);
@@ -567,17 +566,22 @@ test("local catalogs retain cached labels, 100-row pages, and no logout control"
   assert.equal(nodes.get("dashboard-kind").textContent, "expri · Local experiment review");
 });
 
-test("login and logout use browser POST forms without application credentials", () => {
+test("login and logout use browser POST forms without application credentials", async t => {
   const login = readFileSync(new URL("./login.html", import.meta.url), "utf8");
-  const index = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   assert.match(login, /<form[^>]+method="post"[^>]+action="\/login"/);
   assert.match(login, /<input[^>]+name="password"[^>]+type="password"[^>]+autocomplete="current-password"/);
   assert.equal(login.split("<!-- LOGIN_ERROR -->").length, 2);
   assert.doesNotMatch(login, /<script\b|localStorage|Bearer\s|type="hidden"/i);
-  assert.match(index, /<form[^>]+id="logout-form"[^>]+method="post"[^>]+action="\/logout"[^>]+hidden/);
+  const { nodes } = await reviewFixture(t, { hosted: true });
+  const logout = nodes.get("logout-form");
+  assert.equal(logout.method, "post");
+  assert.equal(logout.getAttribute("action"), "/logout");
+  assert.equal(logout.hidden, false);
+  assert.equal(logout.querySelector('button[type="submit"]').textContent, "Sign out");
+  assert.equal(logout.querySelector("input"), null, "logout does not serialize session credentials into the application DOM");
 });
 
-async function flush() { for (let index = 0; index < 64; index++) await Promise.resolve(); }
+async function flush() { await act(async () => { await microtasks(); }); }
 class RefreshClock {
   time = 0;
   sequence = 0;
@@ -590,50 +594,154 @@ class RefreshClock {
     for (;;) {
       const next = [...this.timers].filter(([, timer]) => timer.due <= target).sort((first, second) => first[1].due - second[1].due)[0];
       if (!next) break;
-      this.time = next[1].due; this.timers.delete(next[0]); next[1].callback(); await flush();
+      this.time = next[1].due; this.timers.delete(next[0]);
+      await act(async () => { next[1].callback(); await microtasks(); });
     }
     this.time = target; await flush();
   }
 }
-function autoFixture(t, fields = {}) {
-  const clock = new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [], time_zones: [] };
-  const controller = { dispose() {}, setTimeZone: value => chart.time_zones.push(value), isInteracting: () => chart.interacting, previewStatus: () => chart.status, replacePreview: html => { if (!chart.ready) return false; chart.previews.push(html); return true; } };
-  const model = reviewFixture(t, { hosted: true, updates: true, ...fields, refresh_clock: clock, chart_controller: controller });
+async function autoFixture(t, fields = {}) {
+  const clock = new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [], time_zones: [], disposals: 0 };
+  const controller = { dispose() { chart.disposals++; }, setTimeZone: value => chart.time_zones.push(value), isInteracting: () => chart.interacting, previewStatus: () => chart.status, replacePreview: html => { if (!chart.ready) return false; chart.previews.push(html); return true; } };
+  const model = await reviewFixture(t, { hosted: true, updates: true, ...fields, refresh_clock: clock, chart_controller: controller });
   return { ...model, model, clock, chart, page_document: globalThis.document };
 }
 async function inspect(model, index = 0) {
   await settled(() => model.nodes.get("run-rows").children.length > index);
-  model.nodes.get("run-rows").children[index].children[1].children[0].click();
+  await click(runButton(model.nodes, index));
   await settled(() => chartQuery(model.nodes).get("run_id") === model.runs[index].run_id);
 }
 function requestCounts(requests) {
   return requests.reduce((counts, url) => { const path = new URL(url, "http://localhost").pathname; counts[path] = (counts[path] ?? 0) + 1; return counts; }, {});
 }
 
+test("React retains the actual chart iframe across reviews, tags, tabs and refresh", async t => {
+  const model = await autoFixture(t), { nodes } = model;
+  const frame = nodes.get("chart-frame");
+  const assert_stable = () => {
+    assert.equal(nodes.get("chart-frame"), frame, "state updates must not remount the chart iframe");
+    assert.equal(frame.isConnected, true);
+    assert.equal(frame.getAttribute("sandbox"), "allow-same-origin");
+  };
+  await inspect(model); assert_stable(); await model.clock.advance(5_000);
+  const document = frame.contentDocument, writes = frameNavigations(nodes);
+  await chooseAxis(nodes, "wall_clock"); assert_stable();
+  await chooseTimeZone(nodes, "utc"); assert_stable();
+  assert.equal(frame.contentDocument, document, "axis and timezone controls retain the existing chart security context");
+  assert.equal(frameNavigations(nodes), writes);
+  await click(nodes.get("review-tab-overview")); assert_stable();
+  await click(nodes.get("refresh-button")); assert_stable();
+  await click(nodes.get("review-tab-charts"));
+  await selectRow(nodes, 0); await selectRow(nodes, 1);
+  await settled(() => comparisonRows(nodes).length === 2); assert_stable();
+  await chooseReduction(nodes, "max"); assert_stable();
+  await click(nodes.get("clear-selection")); assert_stable();
+  assert.equal(nodes.get("review-section").hidden, true);
+});
+
+test("unmount aborts foreground requests, removes React content and disposes the chart once", async t => {
+  const model = await autoFixture(t), pending = deferred(); let signal;
+  t.after(() => pending.resolve(response(detailRecord(model.sources[0], model.runs[0]))));
+  model.model.override = (parsed, options) => {
+    if (parsed.pathname === "/api/run") { signal = options.signal; return pending.promise; }
+  };
+  const button = runButton(model.nodes, 0);
+  await click(button);
+  assert.ok(signal && !signal.aborted);
+  const count = model.requests.length, cleanup = model.nodes.cleanup;
+  await act(async () => { cleanup(); cleanup(); await microtasks(); });
+  model.nodes.cleanup = null;
+  assert.equal(signal.aborted, true);
+  assert.equal(model.chart.disposals, 1);
+  assert.equal(model.clock.timers.size, 0);
+  assert.equal(model.nodes.document.getElementById("dashboard-root").childElementCount, 0);
+  pending.resolve(response(detailRecord(model.sources[0], model.runs[0])));
+  await flush(); await model.clock.advance(60_000); await click(button);
+  assert.equal(model.requests.length, count, "late responses and detached controls must not restart work after unmount");
+  assert.equal(model.nodes.document.getElementById("chart-frame"), null);
+});
+
+test("unmount cancels an outstanding automatic probe and every scheduled refresh", async t => {
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const pending = deferred(); let signal;
+  t.after(() => pending.resolve(response({ catalog_revision: "late", source_revision: "late", runs: [] })));
+  model.model.override = (parsed, options) => {
+    if (parsed.pathname === "/api/updates") { signal = options.signal; return pending.promise; }
+  };
+  await model.clock.advance(5_000);
+  assert.ok(signal && !signal.aborted);
+  const count = model.requests.length;
+  await act(async () => { model.nodes.cleanup(); await microtasks(); });
+  model.nodes.cleanup = null;
+  assert.equal(signal.aborted, true);
+  assert.equal(model.chart.disposals, 1);
+  assert.equal(model.clock.timers.size, 0);
+  pending.resolve(response({ catalog_revision: "late", source_revision: "late", runs: [] }));
+  await flush(); await model.clock.advance(90_000);
+  assert.equal(model.requests.length, count);
+});
+
 test("auto checks settle into probe-only traffic without rebuilding controls or navigating the chart", async t => {
-  const model = autoFixture(t); await inspect(model);
+  const model = await autoFixture(t); await inspect(model);
   const { nodes, clock, chart, requests } = model;
   await clock.advance(5_000); // Establish a safe baseline after the initial iframe navigation.
-  const counts = requestCounts(requests), frame_writes = nodes.get("chart-frame").src_writes;
+  const counts = requestCounts(requests), frame_writes = frameNavigations(nodes);
   const choices = nodes.get("run-metric-options").children[0], overview = nodes.get("run-detail").children[0];
   const checkbox = choices.children[0].children[0]; checkbox.focus();
   await clock.advance(15_000);
   assert.equal(requestCounts(requests)["/api/updates"], counts["/api/updates"] + 3);
   for (const path of ["/api/catalog", "/api/runs", "/api/run", "/api/chart"]) assert.equal(requestCounts(requests)[path], counts[path], path);
-  assert.equal(nodes.get("chart-frame").src_writes, frame_writes);
+  assert.equal(frameNavigations(nodes), frame_writes);
   assert.equal(nodes.get("run-metric-options").children[0], choices);
   assert.equal(nodes.get("run-detail").children[0], overview);
   assert.equal(globalThis.document.activeElement, checkbox);
   assert.equal(chart.previews.length, 1);
 });
 
+test("an exact metric draft survives updates within its review and clears for another run or source", async t => {
+  const sources = [
+    { source_id: "hosted:a", label: "A", kind: "service", target_name: null },
+    { source_id: "hosted:b", label: "B", kind: "service", target_name: null },
+  ];
+  const model = await autoFixture(t, { sources }); await inspect(model);
+  const { nodes } = model;
+  const input = () => {
+    const node = nodes.get("run-metric-options").querySelector('.metric-add input[type="text"]');
+    assert.ok(node, "Exact metric name input must be rendered"); return node;
+  };
+  await click(nodes.get("run-metric-controls").querySelector("summary"));
+  const draft = input(); draft.focus(); setValue(draft, "validation/draft");
+  await emit(draft, "input");
+  await model.clock.advance(5_000);
+  model.model.metrics_revision = "metrics-2"; model.model.metric_value = 0.125;
+  await model.clock.advance(5_000);
+  assert.equal(input(), draft, "a quiet update must retain the draft's DOM node");
+  assert.equal(draft.value, "validation/draft");
+  assert.equal(nodes.document.activeElement, draft, "a quiet update must preserve typing focus");
+  await click(nodes.get("refresh-button"));
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(input(), draft); assert.equal(draft.value, "validation/draft");
+  await click(nodes.get("review-tab-overview")); await click(nodes.get("review-tab-charts"));
+  await chooseAxis(nodes, "elapsed");
+  assert.equal(input(), draft); assert.equal(draft.value, "validation/draft");
+  await inspect(model, 1);
+  assert.notEqual(input(), draft, "a new run must receive a fresh metric draft");
+  assert.equal(draft.isConnected, false); assert.equal(input().value, "");
+  setValue(input(), "validation/other-run"); await emit(input(), "input");
+  setValue(nodes.get("source-select"), "hosted:b"); await emit(nodes.get("source-select"), "change");
+  await settled(() => nodes.get("runs-region").getAttribute("aria-busy") === "false");
+  await inspect(model, 1);
+  assert.equal(chartQuery(nodes).get("source"), "hosted:b");
+  assert.equal(input().value, "", "the same run ID on another source must not inherit its draft");
+});
+
 test("changed metrics update only the active run and chart while preserving the metric selection", async t => {
-  const model = autoFixture(t); await inspect(model);
-  const accuracy = model.nodes.get("run-metric-options").children[0].children[0].children[0];
-  accuracy.checked = false; accuracy.emit("change");
+  const model = await autoFixture(t); await inspect(model);
+  const accuracy = metricCheckbox(model.nodes, "accuracy");
+  await click(accuracy);
   await model.clock.advance(5_000);
   const counts = requestCounts(model.requests), choices = model.nodes.get("run-metric-options").children[0];
-  const writes = model.nodes.get("chart-frame").src_writes;
+  const writes = frameNavigations(model.nodes);
   model.model.metrics_revision = "metrics-2"; model.model.metric_value = 0.125; model.model.chart_html = "<html>chart-2</html>";
   await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"] + 1);
@@ -641,18 +749,18 @@ test("changed metrics update only the active run and chart while preserving the 
   for (const path of ["/api/catalog", "/api/runs", "/api/log"]) assert.equal(requestCounts(model.requests)[path], counts[path]);
   assert.equal(model.nodes.get("run-metric-options").children[0], choices);
   assert.deepEqual(chartQuery(model.nodes).getAll("metric"), ["loss"]);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
   assert.equal(model.chart.previews.at(-1), "<html>chart-2</html>");
   assert.match(text(model.nodes.get("run-detail")), /0\.125/);
 });
 
 test("time-axis changes replace the preview in place and remain selected for incremental updates", async t => {
-  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  const writes = model.nodes.get("chart-frame").src_writes;
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const writes = frameNavigations(model.nodes);
   model.model.chart_html = "<html>elapsed-chart</html>";
-  chooseAxis(model.nodes, "elapsed");
+  await chooseAxis(model.nodes, "elapsed");
   await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes, "axis switching preserves the iframe and its visibility state");
+  assert.equal(frameNavigations(model.nodes), writes, "axis switching preserves the iframe and its visibility state");
   assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
   assert.equal(new URL(model.nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "elapsed");
   model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>elapsed-chart-updated</html>";
@@ -660,32 +768,32 @@ test("time-axis changes replace the preview in place and remain selected for inc
   assert.equal(model.chart.previews.at(-1), "<html>elapsed-chart-updated</html>");
   assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/chart")).at(-1), "http://localhost").searchParams.get("x_axis"), "elapsed");
   assert.equal(selectedAxis(model.nodes), "elapsed");
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
 });
 
 test("timezone tags redraw locally without requests and persist across axes and refresh", async t => {
-  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
   assert.deepEqual(model.chart.time_zones, ["local"], "date & time defaults to the viewer’s timezone");
-  chooseAxis(model.nodes, "wall_clock");
+  await chooseAxis(model.nodes, "wall_clock");
   await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
-  const requests = model.requests.length, writes = model.nodes.get("chart-frame").src_writes, previews = [...model.chart.previews];
-  model.nodes.get("time-zone-utc").focus(); chooseTimeZone(model.nodes, "utc");
+  const requests = model.requests.length, writes = frameNavigations(model.nodes), previews = [...model.chart.previews];
+  model.nodes.get("time-zone-utc").focus(); await chooseTimeZone(model.nodes, "utc");
   assert.deepEqual(model.chart.time_zones, ["local", "utc"]);
   assert.equal(model.nodes.get("time-zone-utc").checked, true);
   assert.equal(model.nodes.get("time-zone-local").checked, false);
   assert.equal(model.nodes.get("time-zone-label").textContent, "UTC");
   assert.match(model.nodes.get("chart-note").textContent, /Recorded date & time in UTC/);
   assert.equal(model.requests.length, requests, "timezone is a display choice and does not refetch the chart");
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
   assert.deepEqual(model.chart.previews, previews);
   assert.equal(globalThis.document.activeElement, model.nodes.get("time-zone-utc"));
-  chooseTimeZone(model.nodes, "utc");
-  model.nodes.get("time-zone-local").checked = false; model.nodes.get("time-zone-local").emit("change");
+  await chooseTimeZone(model.nodes, "utc");
+  model.nodes.get("time-zone-local").checked = false; await emit(model.nodes.get("time-zone-local"), "change");
   assert.deepEqual(model.chart.time_zones, ["local", "utc"], "unchanged and deselected radio events do not redraw");
-  chooseAxis(model.nodes, "elapsed");
+  await chooseAxis(model.nodes, "elapsed");
   await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
   assert.equal(model.nodes.get("time-zone-options").hidden, true);
-  chooseAxis(model.nodes, "wall_clock");
+  await chooseAxis(model.nodes, "wall_clock");
   await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
   assert.equal(model.nodes.get("time-zone-utc").checked, true);
   model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>utc-updated-chart</html>";
@@ -693,23 +801,23 @@ test("timezone tags redraw locally without requests and persist across axes and 
   assert.equal(model.chart.previews.at(-1), "<html>utc-updated-chart</html>");
   assert.equal(model.nodes.get("time-zone-utc").checked, true);
   assert.equal(selectedAxis(model.nodes), "wall_clock");
-  chooseTimeZone(model.nodes, "local");
+  await chooseTimeZone(model.nodes, "local");
   assert.equal(model.nodes.get("time-zone-label").textContent, localTimeZoneLabel());
   assert.deepEqual(model.chart.time_zones, ["local", "utc", "local"]);
 });
 
 test("late axis responses cannot replace a newer choice or review", async t => {
-  const model = autoFixture(t); await inspect(model);
+  const model = await autoFixture(t); await inspect(model);
   const pending = deferred(), signals = [];
   model.model.override = (parsed, options) => {
     if (parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed") {
       signals.push(options.signal); return pending.promise;
     }
   };
-  chooseAxis(model.nodes, "elapsed");
+  await chooseAxis(model.nodes, "elapsed");
   assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "true");
   model.model.chart_html = "<html>wall-clock-chart</html>";
-  chooseAxis(model.nodes, "wall_clock");
+  await chooseAxis(model.nodes, "wall_clock");
   await settled(() => model.chart.previews.at(-1) === "<html>wall-clock-chart</html>");
   assert.equal(signals[0].aborted, true);
   pending.resolve({ ok: true, status: 200, text: async () => "<html>stale-elapsed-chart</html>" });
@@ -718,8 +826,8 @@ test("late axis responses cannot replace a newer choice or review", async t => {
   assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
   const next = deferred();
   model.model.override = parsed => parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed" ? next.promise : null;
-  chooseAxis(model.nodes, "elapsed");
-  model.nodes.get("run-rows").children[1].children[1].children[0].click();
+  await chooseAxis(model.nodes, "elapsed");
+  await click(runButton(model.nodes, 1));
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-1");
   next.resolve({ ok: true, status: 200, text: async () => "<html>old-review-chart</html>" });
   await flush();
@@ -728,13 +836,13 @@ test("late axis responses cannot replace a newer choice or review", async t => {
 });
 
 test("an axis load failure retains the last chart and automatic recovery clears its scoped error", async t => {
-  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  const previews = [...model.chart.previews], writes = model.nodes.get("chart-frame").src_writes;
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const previews = [...model.chart.previews], writes = frameNavigations(model.nodes);
   model.model.override = parsed => parsed.pathname === "/api/chart" ? response({ error: "Connection temporarily unavailable" }, 503) : null;
-  chooseAxis(model.nodes, "elapsed");
+  await chooseAxis(model.nodes, "elapsed");
   await settled(() => model.nodes.get("chart-error").hidden === false);
   assert.deepEqual(model.chart.previews, previews);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
   assert.match(model.nodes.get("chart-error").textContent, /Showing the last loaded chart/);
   model.model.override = null; model.model.chart_html = "<html>recovered-elapsed-chart</html>";
   await model.clock.advance(5_000);
@@ -744,46 +852,49 @@ test("an axis load failure retains the last chart and automatic recovery clears 
 });
 
 test("changing only the chart axis does not dismiss an unrelated metadata failure", async t => {
-  const model = autoFixture(t); await inspect(model);
-  const error = model.nodes.get("review-error"); error.hidden = false; error.textContent = "Run metadata temporarily unavailable";
+  const model = await autoFixture(t); await inspect(model);
+  model.model.override = parsed => parsed.pathname === "/api/run" ? response({ error: "Run metadata temporarily unavailable" }, 503) : null;
+  await click(model.nodes.get("refresh-button"));
+  await settled(() => model.nodes.get("review-error").hidden === false);
+  const error = model.nodes.get("review-error");
   model.model.chart_html = "<html>elapsed-chart</html>";
-  chooseAxis(model.nodes, "elapsed");
+  await chooseAxis(model.nodes, "elapsed");
   await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
   assert.equal(error.hidden, false);
   assert.equal(error.textContent, "Run metadata temporarily unavailable");
 });
 
 test("auto and manual refresh preserve pagination and explicit selections outside the page", async t => {
-  const model = autoFixture(t, { count: 45 }); await inspect(model);
-  selectRow(model.nodes, 0);
+  const model = await autoFixture(t, { count: 45 }); await inspect(model);
+  await selectRow(model.nodes, 0);
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-0");
-  model.nodes.get("next-page").click();
+  await click(model.nodes.get("next-page"));
   await settled(() => model.nodes.get("page-label").textContent === "Page 2");
   await model.clock.advance(5_000);
-  const focused = model.nodes.get("run-rows").children[0].children[0].children[0]; focused.focus();
+  const focused = runCheckbox(model.nodes, 0); focused.focus();
   model.model.list_revision = "list-2"; model.runs[20].status = "running";
   await model.clock.advance(5_000);
   assert.equal(model.nodes.get("page-label").textContent, "Page 2");
-  assert.equal(model.nodes.get("run-rows").children[0].children[1].children[0].textContent, "run-20");
+  assert.equal(runButton(model.nodes, 0).textContent, "run-20");
   assert.match(text(model.nodes.get("selected-runs")), /run-0/);
   assert.deepEqual(chartQuery(model.nodes).getAll("run_id"), ["run-0"]);
-  assert.equal(globalThis.document.activeElement, model.nodes.get("run-rows").children[0].children[0].children[0]);
-  const writes = model.nodes.get("chart-frame").src_writes;
-  model.nodes.get("refresh-button").click();
+  assert.equal(globalThis.document.activeElement, runCheckbox(model.nodes, 0));
+  const writes = frameNavigations(model.nodes);
+  await click(model.nodes.get("refresh-button"));
   await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(model.nodes.get("page-label").textContent, "Page 2");
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
 });
 
 test("only the visible log stream refreshes and a reader's scroll position is retained", async t => {
-  const model = autoFixture(t); await inspect(model);
-  model.nodes.get("review-tab-logs").click();
+  const model = await autoFixture(t); await inspect(model);
+  await click(model.nodes.get("review-tab-logs"));
   await settled(() => text(model.nodes.get("run-logs")).includes("stdout training complete"));
-  findElement(model.nodes.get("run-logs"), "log-tab-stderr").click();
+  await click(findElement(model.nodes.get("run-logs"), "log-tab-stderr"));
   await settled(() => text(model.nodes.get("run-logs")).includes("stderr training complete"));
   await model.clock.advance(5_000);
   const output = findElement(model.nodes.get("run-logs"), "log-output"), stderr = findElement(model.nodes.get("run-logs"), "log-tab-stderr");
-  output.scrollHeight = 1_000; output.clientHeight = 100; output.scrollTop = 200;
+  Object.defineProperty(output, "scrollHeight", { configurable: true, value: 1_000 }); Object.defineProperty(output, "clientHeight", { configurable: true, value: 100 }); output.scrollTop = 200;
   const counts = requestCounts(model.requests);
   model.model.stdout_revision = "stdout-2";
   await model.clock.advance(5_000);
@@ -793,13 +904,13 @@ test("only the visible log stream refreshes and a reader's scroll position is re
   assert.equal(output.textContent, "new stderr output");
   assert.equal(output.scrollTop, 200);
   assert.equal(findElement(model.nodes.get("run-logs"), "log-tab-stderr"), stderr);
-  assert.equal(stderr.attributes["aria-selected"], "true");
+  assert.equal(stderr.getAttribute("aria-selected"), "true");
   assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"]);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"]);
 });
 
 test("a failed cycle keeps its successful timestamp and retries unacknowledged revisions", async t => {
-  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
   const checked = model.nodes.get("updated-at").textContent.split(" · ")[0], previews = model.chart.previews.length;
   model.model.metrics_revision = "metrics-2"; model.model.metric_value = 7; model.model.chart_html = "<html>chart-2</html>";
   model.model.override = parsed => parsed.pathname === "/api/run" ? response({ error: "temporarily unavailable" }, 503) : undefined;
@@ -815,7 +926,7 @@ test("a failed cycle keeps its successful timestamp and retries unacknowledged r
 });
 
 test("an active chart drag defers adoption and the next check still applies the new revision", async t => {
-  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
   model.chart.interacting = true; model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>chart-2</html>";
   await model.clock.advance(5_000); assert.equal(model.chart.previews.length, 1);
   const counts = requestCounts(model.requests);
@@ -828,10 +939,10 @@ test("an active chart drag defers adoption and the next check still applies the 
 });
 
 test("automatic recovery completes an initially failed comparison and reopening a review gets a fresh baseline", async t => {
-  const model = autoFixture(t);
+  const model = await autoFixture(t);
   await settled(() => model.nodes.get("run-rows").children.length === 3);
   model.model.override = parsed => parsed.pathname === "/api/compare" ? response({ error: "temporarily unavailable" }, 503) : undefined;
-  selectRow(model.nodes, 0); selectRow(model.nodes, 1);
+  await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
   await settled(() => model.nodes.get("review-error").hidden === false);
   assert.equal(model.nodes.get("chart-frame").src, "");
   model.model.override = null;
@@ -841,40 +952,40 @@ test("automatic recovery completes an initially failed comparison and reopening 
   assert.deepEqual(chartQuery(model.nodes).getAll("run_id"), ["run-0", "run-1"]);
   assert.equal(model.nodes.get("compare-metric-options").children.length > 0, true);
   assert.equal(model.chart.previews.length, 1);
-  const writes = model.nodes.get("chart-frame").src_writes;
-  chooseReduction(model.nodes, "max");
-  await settled(() => model.nodes.get("comparison-values").attributes["aria-busy"] === "false");
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes, "scalar reduction does not navigate identical chart metrics");
-  model.nodes.get("clear-selection").click();
-  selectRow(model.nodes, 0); selectRow(model.nodes, 1);
+  const writes = frameNavigations(model.nodes);
+  await chooseReduction(model.nodes, "max");
+  await settled(() => model.nodes.get("comparison-values").getAttribute("aria-busy") === "false");
+  assert.equal(frameNavigations(model.nodes), writes, "scalar reduction does not navigate identical chart metrics");
+  await click(model.nodes.get("clear-selection"));
+  await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
   await settled(() => chartQuery(model.nodes).getAll("run_id").length === 2);
   await model.clock.advance(5_000);
   assert.equal(model.chart.previews.length, 2, "a new review validates its initial preview again");
 });
 
 test("a completed invalid initial chart retries navigation once and slow pending navigation is left alone", async t => {
-  const model = autoFixture(t); await inspect(model);
+  const model = await autoFixture(t); await inspect(model);
   model.chart.status = "invalid";
-  const writes = model.nodes.get("chart-frame").src_writes, counts = requestCounts(model.requests);
+  const writes = frameNavigations(model.nodes), counts = requestCounts(model.requests);
   await model.clock.advance(5_000);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes + 1);
+  assert.equal(frameNavigations(model.nodes), writes + 1);
   assert.equal(model.chart.previews.length, 0);
   assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"]);
   model.chart.status = "loading";
   await model.clock.advance(15_000);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes + 1, "polls must not restart an outstanding iframe navigation");
+  assert.equal(frameNavigations(model.nodes), writes + 1, "polls must not restart an outstanding iframe navigation");
   assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"]);
   model.chart.status = "ready";
   await model.clock.advance(5_000);
   assert.equal(model.chart.previews.length, 1);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes + 1);
+  assert.equal(frameNavigations(model.nodes), writes + 1);
   await model.clock.advance(5_000);
   assert.equal(model.chart.previews.length, 1, "successful recovery establishes its normal revision baseline");
 });
 
 test("a failed initial hosted catalog recovers through a catalog-only probe", async t => {
   const source = { source_id: "hosted:worker", label: "Worker", kind: "service", target_name: null };
-  const model = autoFixture(t, { sources: [source], catalog_failure: true });
+  const model = await autoFixture(t, { sources: [source], catalog_failure: true });
   await settled(() => model.nodes.get("global-error").hidden === false);
   assert.match(model.nodes.get("global-error").textContent, /Catalog temporarily unavailable/);
   model.model.failed_catalog = false;
@@ -892,12 +1003,12 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
 });
 
 test("an initially failed run can recover directly into Logs without overlapping log requests", async t => {
-  const model = autoFixture(t);
+  const model = await autoFixture(t);
   await settled(() => model.nodes.get("run-rows").children.length === 3);
   model.model.override = parsed => parsed.pathname === "/api/run" ? response({ error: "Run temporarily unavailable" }, 503) : undefined;
-  model.nodes.get("run-rows").children[0].children[1].children[0].click();
+  await click(runButton(model.nodes, 0));
   await settled(() => model.nodes.get("review-error").hidden === false);
-  model.nodes.get("review-tab-logs").click();
+  await click(model.nodes.get("review-tab-logs"));
   assert.equal(requestCounts(model.requests)["/api/log"], undefined);
   model.model.override = null;
   await model.clock.advance(5_000);
@@ -910,18 +1021,18 @@ test("an initially failed run can recover directly into Logs without overlapping
 });
 
 test("failed page loads recover even with unchanged revisions and identical retries restore controls", async t => {
-  const model = autoFixture(t, { count: 45 });
+  const model = await autoFixture(t, { count: 45 });
   await settled(() => model.nodes.get("run-rows").children.length === 20);
   await model.clock.advance(5_000);
   model.model.failed_list = true;
-  model.nodes.get("next-page").click();
+  await click(model.nodes.get("next-page"));
   await settled(() => model.nodes.get("run-count").textContent === "Could not read run history");
   model.model.failed_list = false;
   await model.clock.advance(5_000);
   assert.equal(model.nodes.get("page-label").textContent, "Page 2");
-  assert.equal(model.nodes.get("run-rows").children[0].children[1].children[0].textContent, "run-20");
+  assert.equal(runButton(model.nodes, 0).textContent, "run-20");
   model.model.failed_list = true;
-  model.nodes.get("refresh-button").click();
+  await click(model.nodes.get("refresh-button"));
   await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(model.nodes.get("run-count").textContent, "Could not read run history");
   const row = model.nodes.get("run-rows").children[0];
@@ -935,21 +1046,21 @@ test("failed page loads recover even with unchanged revisions and identical retr
 });
 
 test("missing selected runs retain their preview without artifact retries and reappear with identical revisions", async t => {
-  const model = autoFixture(t, { hosted: false });
+  const model = await autoFixture(t, { hosted: false });
   model.model.catalog_revision = null; model.model.list_revision = null;
   await settled(() => model.nodes.get("run-rows").children.length === 3);
-  selectRow(model.nodes, 0);
+  await selectRow(model.nodes, 0);
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-0");
   await model.clock.advance(5_000);
-  const counts = requestCounts(model.requests), writes = model.nodes.get("chart-frame").src_writes;
+  const counts = requestCounts(model.requests), writes = frameNavigations(model.nodes);
   const removed = model.runs.shift(); model.model.missing_run_ids.add(removed.run_id);
   await model.clock.advance(20_000);
   assert.match(model.nodes.get("review-error").textContent, /selected runs are no longer available.*last successful preview/);
   assert.equal(model.nodes.get("review-error").hidden, false);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
   assert.equal(model.chart.previews.length, 1);
   for (const path of ["/api/run", "/api/chart", "/api/log"]) assert.equal(requestCounts(model.requests)[path], counts[path]);
-  model.nodes.get("review-tab-logs").click(); await flush();
+  await click(model.nodes.get("review-tab-logs")); await flush();
   await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/log"], counts["/api/log"], "known missing logs are not requested when changing tabs");
   assert.match(text(model.nodes.get("selected-runs")), /run-0/);
@@ -957,21 +1068,21 @@ test("missing selected runs retain their preview without artifact retries and re
   await model.clock.advance(5_000);
   assert.equal(model.nodes.get("review-error").hidden, true);
   assert.match(text(model.nodes.get("run-logs")), /stdout training complete/);
-  model.nodes.get("review-tab-charts").click(); await model.clock.advance(5_000);
+  await click(model.nodes.get("review-tab-charts")); await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"] + 1);
   assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"] + 1);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
   assert.equal(model.nodes.get("review-error").hidden, true);
 });
 
 test("completed chart load failures use exponential backoff while a valid recovery restores five-second checks", async t => {
-  const model = autoFixture(t); await inspect(model);
+  const model = await autoFixture(t); await inspect(model);
   model.chart.status = "invalid";
-  const writes = model.nodes.get("chart-frame").src_writes;
+  const writes = frameNavigations(model.nodes);
   let retries = 0;
   for (const [delay, retry] of [[5_000, 10], [10_000, 20], [20_000, 40], [40_000, 60]]) {
     await model.clock.advance(delay); retries++;
-    assert.equal(model.nodes.get("chart-frame").src_writes, writes + retries);
+    assert.equal(frameNavigations(model.nodes), writes + retries);
     assert.match(model.nodes.get("updated-at").textContent, new RegExp(`retrying in ${retry}s`));
   }
   model.chart.status = "ready";
@@ -982,13 +1093,13 @@ test("completed chart load failures use exponential backoff while a valid recove
 
 test("source changes cancel only obsolete background work and late probes cannot restore it", async t => {
   const sources = [{ source_id: "hosted:a", label: "A", kind: "service", target_name: null }, { source_id: "hosted:b", label: "B", kind: "service", target_name: null }];
-  const model = autoFixture(t, { sources }); await inspect(model); await model.clock.advance(5_000);
+  const model = await autoFixture(t, { sources }); await inspect(model); await model.clock.advance(5_000);
   const pending = deferred(); let signal;
   model.model.override = (parsed, options) => {
     if (parsed.pathname === "/api/updates") { signal = options.signal; return pending.promise; }
   };
   await model.clock.advance(5_000);
-  model.nodes.get("source-select").value = "hosted:b"; model.nodes.get("source-select").emit("change");
+  setValue(model.nodes.get("source-select"), "hosted:b"); await emit(model.nodes.get("source-select"), "change");
   await settled(() => model.nodes.get("run-rows").children.length === 3);
   assert.equal(signal.aborted, true);
   model.model.override = null;
@@ -1002,32 +1113,32 @@ test("source changes cancel only obsolete background work and late probes cannot
 });
 
 test("hidden pages stop probes and resume once without disturbing the current review", async t => {
-  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  const probes = requestCounts(model.requests)["/api/updates"], writes = model.nodes.get("chart-frame").src_writes;
-  model.page_document.visibilityState = "hidden"; model.page_document.emit("visibilitychange");
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const probes = requestCounts(model.requests)["/api/updates"], writes = frameNavigations(model.nodes);
+  Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "hidden" }); await emit(model.page_document, "visibilitychange");
   await model.clock.advance(90_000);
   assert.equal(requestCounts(model.requests)["/api/updates"], probes);
-  model.page_document.visibilityState = "visible"; model.page_document.emit("visibilitychange");
+  Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "visible" }); await emit(model.page_document, "visibilitychange");
   await model.clock.advance(0);
   assert.equal(requestCounts(model.requests)["/api/updates"], probes + 1);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
 });
 
 test("older backends fall back once to bounded 30-second snapshots without replacing unchanged charts", async t => {
-  const model = autoFixture(t, { updates: false }); await inspect(model);
+  const model = await autoFixture(t, { updates: false }); await inspect(model);
   await model.clock.advance(5_000);
-  const counts = requestCounts(model.requests), writes = model.nodes.get("chart-frame").src_writes;
+  const counts = requestCounts(model.requests), writes = frameNavigations(model.nodes);
   assert.equal(counts["/api/updates"], 1);
   assert.match(model.nodes.get("updated-at").textContent, /Auto updates every 30s/);
   await model.clock.advance(30_000);
   assert.equal(requestCounts(model.requests)["/api/updates"], 1);
   assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"] + 1);
   assert.equal(model.chart.previews.length, 1);
-  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.equal(frameNavigations(model.nodes), writes);
 });
 
 test("local catalog and list snapshots stay modest while selected update probes remain frequent", async t => {
-  const model = autoFixture(t, { hosted: false }); await inspect(model);
+  const model = await autoFixture(t, { hosted: false }); await inspect(model);
   model.model.catalog_revision = null; model.model.list_revision = null;
   const counts = requestCounts(model.requests);
   await model.clock.advance(25_000);

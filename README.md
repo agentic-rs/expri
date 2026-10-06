@@ -446,8 +446,9 @@ so you can narrow the selection. Original artifacts stay intact. Summary tables
 do not retain point arrays; chart reads retain the existing 128 MiB file and
 1,000,000 selected-point limits.
 
-The Rust binary embeds the dashboard assets, so viewing runs requires no Node.js,
-CDN, or hosted service. For frontend development:
+The dashboard uses React and TypeScript with TSX components. Esbuild bundles the
+UI into one JavaScript asset embedded in the Rust binary, so viewing runs requires
+no Node.js, CDN, or hosted service. For frontend development:
 
 ```sh
 pnpm --dir dashboard_web install --frozen-lockfile
@@ -456,8 +457,11 @@ pnpm --dir dashboard_web test
 pnpm --dir dashboard_web build
 ```
 
-Commit the generated `dashboard_web/app.js` with its TypeScript source. CI checks
-that rebuilding it produces the checked-in asset.
+Commit the generated `dashboard_web/app.js` with its TypeScript and TSX source.
+The controller owns requests and refresh scheduling; React owns the workspace
+UI, while the chart controller keeps its stable iframe and interactive state.
+Frontend tests use jsdom, and container acceptance tests exercise the production
+bundle in Firefox. CI checks that rebuilding produces the checked-in asset.
 
 ## Optional self-hosted storage
 

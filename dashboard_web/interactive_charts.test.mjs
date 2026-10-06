@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { attachChartInteractions, createChartController, parseChartPointLabel, parseChartRange, formatChartX, formatChartTick, chartXFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./app.js";
+import { attachChartInteractions, createChartController, parseChartPointLabel, parseChartRange, formatChartX, formatChartTick, chartXFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./.test/app.js";
 
 const MAX_STEP = 18446744073709551615n;
 function range(first, last, x_axis = "step") { return { x_axis, start_x: String(first), end_x: String(last) }; }
@@ -10,7 +10,7 @@ function point(step, x, y, value_text = "1") {
 }
 function localLabels(time_zone, values, domain) {
   const script = `
-    import { formatChartX, formatChartTick } from ${JSON.stringify(new URL("./app.js", import.meta.url).href)};
+    import { formatChartX, formatChartTick } from ${JSON.stringify(new URL("./.test/app.js", import.meta.url).href)};
     const values = ${JSON.stringify(values)}, domain = ${JSON.stringify(domain)};
     console.log(JSON.stringify(values.map(value => ({ full: formatChartX(value, "wall_clock", "local"), tick: formatChartTick(value, domain, "local") }))));
   `;
