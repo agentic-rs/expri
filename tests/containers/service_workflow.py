@@ -24,6 +24,7 @@ network = f'expri-service-{os.getpid()}'
 containers = []
 created_network = False
 watch = None
+refresh_browser = None
 fixture_env = dict(os.environ)
 fixture_env.update({
   'EXPRI_OWNER_TOKEN': secrets.token_hex(24), 'EXPRI_WORKER_TOKEN': secrets.token_hex(24),
@@ -228,6 +229,64 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert 'Max-Age=0' in logout['headers']['set-cookie'], 'dashboard logout did not clear its cookie'
   assert browser('/api/catalog', cookie=cookie)['status'] == 401, 'dashboard logout did not revoke its session'
 
+def publish_refresh_fixture(run_dir, step=None, log=False):
+  code = f'''
+import json
+from pathlib import Path
+root = Path({run_dir!r})
+step = {step!r}
+if step is not None:
+  with (root / 'outputs/metrics.jsonl').open('a') as metrics:
+    metrics.write(json.dumps({{'schema_version': 1, 'step': step, 'metrics': {{'loss': 0.005 if step == 80 else 0.004}}}}) + '\\n')
+  if step == 81:
+    state = json.loads((root / 'run-state.json').read_text())
+    state['refresh_probe'] = 'metadata-replacement'
+    (root / 'run-state.json').write_text(json.dumps(state))
+if {log!r}:
+  with (root / 'logs/stdout.log').open('a') as output:
+    output.write('automatic refresh log fixture\\n')
+'''
+  python(worker, code)
+  client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', '/home/tester/queue')
+
+def automatic_dashboard_checks(run_id, updated):
+  global refresh_browser
+  coordination = '/tmp/expri-refresh-coordination.json'
+  cookie = dashboard_login()
+  source_id = 'hosted:demo:worker'
+  def phase():
+    if refresh_browser.poll() is not None:
+      raise RuntimeError('Firefox auto-refresh test exited before fixture coordination finished: ' +
+        redact((logs / 'browser-auto-refresh.log').read_text(errors='replace'))[-4096:])
+    return python(firefox, f"import json;from pathlib import Path;p=Path({coordination!r});print(json.loads(p.read_text()).get('phase','') if p.exists() else '')")
+  def set_phase(value):
+    python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase':{value!r}}}))")
+  python(firefox, f"from pathlib import Path;Path({coordination!r}).unlink(missing_ok=True)")
+  with (logs / 'browser-auto-refresh.log').open('wb') as output:
+    refresh_browser = subprocess.Popen(['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--auto-refresh', run_id, updated['run_id']],
+      cwd=ROOT, env=fixture_env, stdout=output, stderr=subprocess.STDOUT)
+    for step in [80, 81]:
+      wait_for(lambda: phase() == f'publish-{step}', f'Firefox did not request sample {step}', timeout=90)
+      before = browser_json('/api/updates?' + urlencode({'source': source_id, 'run_id': updated['run_id']}), cookie)
+      publish_refresh_fixture(updated['run_dir'], step)
+      after = browser_json('/api/updates?' + urlencode({'source': source_id, 'run_id': updated['run_id']}), cookie)
+      assert after['runs'][0]['metrics_revision'] != before['runs'][0]['metrics_revision'], 'worker republication did not change the saved metric revision'
+      assert after['runs'][0]['metrics_revision'].startswith('object:'), 'finalized worker metrics were not republished as an object'
+      if step == 81:
+        assert after['runs'][0]['metadata_revision'] != before['runs'][0]['metadata_revision'], 'worker state replacement did not change its metadata revision'
+      detail = browser_json('/api/run?' + urlencode({'source': source_id, 'run_id': updated['run_id']}), cookie)
+      assert detail['metrics']['loss']['count'] == step + 1 and detail['metrics']['loss']['last']['step'] == step, 'service did not observe the finalized worker publication'
+      set_phase(f'published-{step}')
+    wait_for(lambda: phase() == 'publish-log', 'Firefox did not request a log publication', timeout=90)
+    publish_refresh_fixture(updated['run_dir'], log=True)
+    stdout = browser_json('/api/log?' + urlencode({'source': source_id, 'run_id': updated['run_id'], 'stream': 'stdout'}), cookie)
+    assert 'automatic refresh log fixture' in stdout['content'], 'service did not observe new worker log bytes'
+    set_phase('published-log')
+    assert refresh_browser.wait(timeout=90) == 0, ('Firefox auto-refresh acceptance failed: ' +
+      redact((logs / 'browser-auto-refresh.log').read_text(errors='replace'))[-4096:])
+  assert browser('/logout', method='POST', cookie=cookie)['status'] == 303, 'auto-refresh fixture session did not close'
+
 try:
   if not options.no_build:
     for target in ['worker', 'host', 'service', 'browser']:
@@ -361,6 +420,7 @@ prefix = "acceptance"
     'python3', '/opt/expri-browser/browser_forms.py', '--workspace', run_id, second['run_id']], timeout=180)
   logged('browser-previews.log', ['docker', 'exec', '--user', 'tester', firefox,
     'python3', '/opt/expri-browser/browser_forms.py', '--previews', run_id, second['run_id']], timeout=180)
+  automatic_dashboard_checks(run_id, second)
   docker('stop', '--time', '1', service, s3)
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
@@ -369,6 +429,13 @@ prefix = "acceptance"
   wait_for(review, 'offline dashboard did not recognize service cache')
   print('Service workflow passed: Firefox native forms, inputs, offline metrics, restart, multipart resume, selective pulls, authenticated hosted dashboard, offline review.', flush=True)
 finally:
+  if refresh_browser is not None and refresh_browser.poll() is None:
+    refresh_browser.terminate()
+    try:
+      refresh_browser.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+      refresh_browser.kill()
+      refresh_browser.wait()
   if watch is not None and watch.poll() is None:
     watch.terminate()
     try:
@@ -380,7 +447,7 @@ finally:
     try:
       if container.endswith('-browser'):
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
-        for name in ['workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom']:
+        for name in ['workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom', 'workspace-auto-refresh']:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)

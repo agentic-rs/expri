@@ -12,6 +12,12 @@ service, so an AB asset deployment can preview those controls too. Do not start
 a second service against the same data directory: the service deliberately
 holds an exclusive lease on its store.
 
+Auto refresh uses `/api/updates` when the shared backend supports it. A branch
+preview against an older main backend falls back to bounded snapshots every
+30 seconds and displays that cadence. Merge and deploy main to enable the
+five-second change probes on both sites; an AB asset deployment does not upgrade
+the backend.
+
 ## Configure the preview once
 
 Keep the existing `[dashboard]` settings and add a preview to `server.toml`:

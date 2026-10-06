@@ -387,7 +387,7 @@ Open the printed `http://127.0.0.1:<port>` URL. The dashboard lists local runs
 from `.expri/runs/` and downloaded runs from `results/<target>/runs/` (or your
 configured results directory). Cached sources remain available without target
 credentials. It never contacts a target or changes run files. Use the CLI to
-pull remote metrics and logs, then press **Refresh** in the dashboard:
+pull remote metrics and logs; the dashboard detects updated selected runs:
 
 ```sh
 expri -T runpod runs pull run-abc123 --metrics --logs
@@ -403,6 +403,15 @@ below the curves. Changing search/task/status filters clears the selection;
 paging and Refresh preserve it. Status reflects the saved records;
 `runs status` remains the live check.
 
+**Auto refresh** checks every five seconds while the page is visible. Turn it
+off to pause updates; hidden tabs and offline browsers pause automatically.
+Connection failures keep the current view and slow retries to at most once a
+minute. Updates retain the current page, filters, selected runs, review tab,
+metric choices, zoom, and hidden curves. **Refresh** checks immediately.
+Local source discovery and run lists refresh every 30 seconds; selected-run
+changes are checked every five seconds. A recovery refresh runs every five
+minutes to catch changes missed by file metadata.
+
 Charts support point inspection, range zoom, and run visibility controls. Hover
 over a curve to read the nearest displayed samples, or focus the plot and use
 the arrow keys. Drag across training steps to zoom; use the zoom buttons or
@@ -410,6 +419,11 @@ the arrow keys. Drag across training steps to zoom; use the zoom buttons or
 curve. These interactions use the displayed preview and do not download more
 metric data. Point readouts retain the recorded step and value, including
 repeated steps and step resets. **Open chart** opens the standalone static view.
+Changed charts replace their bounded preview because sampling can change older
+displayed points. Updates wait until a drag finishes. A zoomed range stays at
+the same steps; the full range follows newly recorded steps. After an initial
+bounded refresh establishes the current view, unchanged probes do not download
+metrics or reload the chart; recovery refreshes still check the full preview.
 
 Browser responses stay bounded: details preview large parameters and metadata,
 show up to 50 metric summaries, and omit package/source-file inventories. Log

@@ -102,6 +102,13 @@ desktop columns and overflow at a verified 500 CSS pixel viewport, saving
 `workspace-desktop.png` and `workspace-narrow.png` with the CI diagnostics.
 The Firefox check covers a narrow layout rather than 320/360 pixel mobile widths.
 
+The live-update check republishes new samples, metadata and logs from the
+finalized second worker run while Firefox remains open. It checks five-second
+probes without unchanged metric fetches, defers replacement during a native
+drag, retains zoom/hidden runs/filters/selection, and exercises pause/resume and
+the active Logs tab. `workspace-auto-refresh.png` captures the updated chart;
+`browser-auto-refresh.log` records these assertions.
+
 Native pointer and keyboard input also checks exact hover readouts, drag zoom,
 zoom/reset controls, and per-run legend toggles on both dashboard hosts. Repeated
 samples stay individually reachable, Refresh removes the old chart handlers,

@@ -76,6 +76,14 @@ parameters, metric comparisons, charts, and bounded log tails. Workers must push
 a run before it appears. Private inputs and checkpoint contents are not loaded
 by the dashboard; continue to use the CLI for uploads and selected downloads.
 
+The visible dashboard checks for changes every five seconds, using saved upload
+sequences and stream lengths without reading objects from S3 on unchanged
+checks. Changed views fetch bounded previews and preserve selection, filters,
+the active tab, zoom, and hidden curves. **Auto refresh** pauses updates;
+hidden/offline pages pause automatically, and connection failures retry more
+slowly while keeping the current view. Workers still need `push --watch` for
+live forwarding; dashboard refresh does not initiate an upload.
+
 Browser access is read-only. Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
 Logout revokes the session. Restart the service after changing its password;
@@ -226,5 +234,9 @@ Both hosts also exercise chart hover, drag zoom, legend toggles, and keyboard
 inspection through native browser input. The checks preserve repeated samples,
 verify chart script blocking, and require no additional metric requests during
 interaction. Narrow layouts and chart reloads retain working controls.
+A separate live-update check republishes a finalized worker run through the
+real CLI while Firefox stays open. It verifies five-second probes, unchanged
+snapshots skipped, new samples and summaries, drag deferral, preserved zoom and
+hidden curves, pause/resume, live log tails, and retained script blocking.
 Browser request logs contain method, path, origin, status and response policy,
 without credentials or cookies.
