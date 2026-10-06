@@ -403,6 +403,14 @@ below the curves. Changing search/task/status filters clears the selection;
 paging and Refresh preserve it. Status reflects the saved records;
 `runs status` remains the live check.
 
+Charts support point inspection, range zoom, and run visibility controls. Hover
+over a curve to read the nearest displayed samples, or focus the plot and use
+the arrow keys. Drag across training steps to zoom; use the zoom buttons or
+**Reset zoom** to change the range. Click a run in the legend to show or hide its
+curve. These interactions use the displayed preview and do not download more
+metric data. Point readouts retain the recorded step and value, including
+repeated steps and step resets. **Open chart** opens the standalone static view.
+
 Browser responses stay bounded: details preview large parameters and metadata,
 show up to 50 metric summaries, and omit package/source-file inventories. Log
 tails read at most 64 KiB and 1,000 lines. Charts initially show four metrics;

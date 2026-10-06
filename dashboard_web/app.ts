@@ -1,3 +1,6 @@
+import { attachChartInteractions } from "./interactive_charts";
+export * from "./interactive_charts";
+
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type Warning = { run_id?: string; message: string };
 type Source = { source_id: string; label: string; kind: string; target_name: string | null };
@@ -115,6 +118,7 @@ function jsonObject(value: Json): Record<string, Json> { return value !== null &
 
 export function startDashboard(): void {
   const source_select = required<HTMLSelectElement>("source-select");
+  attachChartInteractions(required<HTMLIFrameElement>("chart-frame"));
   const refresh_button = required<HTMLButtonElement>("refresh-button");
   const search_input = required<HTMLInputElement>("search-input");
   const task_input = required<HTMLInputElement>("task-input");
