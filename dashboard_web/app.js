@@ -203,10 +203,12 @@ function parseDashboardPreview(markup) {
 function createChartController(frame) {
   let plots = [], current_document = null, disposed = false;
   let completed_source = null;
-  const clear = () => {
+  const hidden_runs = /* @__PURE__ */ new Map();
+  const clear = (forget_visibility = false) => {
     for (const plot of plots) plot.dispose();
     plots = [];
     current_document = null;
+    if (forget_visibility) hidden_runs.clear();
   };
   function currentSource() {
     if (!frame.src || !frame.ownerDocument?.baseURI) return null;
@@ -231,7 +233,7 @@ function createChartController(frame) {
     }
   }
   const enhance = (completed = false) => {
-    clear();
+    clear(true);
     if (disposed) return;
     try {
       const source = currentSource(), child = frame.contentDocument;
@@ -245,7 +247,7 @@ function createChartController(frame) {
   frame.addEventListener("load", loaded);
   const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => {
     completed_source = null;
-    clear();
+    clear(true);
   });
   observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
   enhance();
@@ -254,7 +256,7 @@ function createChartController(frame) {
       disposed = true;
       frame.removeEventListener("load", loaded);
       observer?.disconnect();
-      clear();
+      clear(true);
     },
     isInteracting() {
       return plots.some((plot) => plot.isInteracting());
@@ -287,6 +289,9 @@ function createChartController(frame) {
         if (!frame_focused) state.focus = null;
         return [state.metric_name, state];
       }));
+      const metric_names = new Set([...next.querySelectorAll("body > main > section.card > h2")].slice(0, 6).map((node) => node.textContent ?? ""));
+      for (const name of hidden_runs.keys()) if (!metric_names.has(name)) hidden_runs.delete(name);
+      for (const [name, state] of states) if (metric_names.has(name)) hidden_runs.set(name, [...state.hidden_run_ids]);
       const window2 = document2.defaultView, parent = frame.ownerDocument.defaultView;
       const scroll = { x: window2?.scrollX ?? 0, y: window2?.scrollY ?? 0, parent_x: parent?.scrollX ?? 0, parent_y: parent?.scrollY ?? 0 };
       const previous_details = document2.querySelector("details.parameter-comparison");
@@ -299,8 +304,12 @@ function createChartController(frame) {
       document2.body.replaceChildren(...body);
       enhanceDocument(document2);
       for (const plot of plots) {
-        const state = states.get(plot.capture().metric_name);
+        const fresh = plot.capture(), state = states.get(fresh.metric_name);
         if (state) plot.restore(state);
+        else {
+          const hidden_run_ids = hidden_runs.get(fresh.metric_name);
+          if (hidden_run_ids) plot.restore({ ...fresh, hidden_run_ids });
+        }
       }
       const details = document2.querySelector("details.parameter-comparison");
       if (details) {

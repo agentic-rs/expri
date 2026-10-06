@@ -117,9 +117,10 @@ more metric data. Chart scripts remain blocked.
 Hover and zoom screenshots are included in the CI diagnostics.
 
 Time-axis checks on both dashboard hosts cover elapsed and wall-clock hover,
-native drag zoom, axis changes, and hidden-run preservation. A mixed legacy
-series verifies that rows without timestamps stay in Step view and are counted
-as omissions in time views. Live publications preserve exact elapsed and UTC
+native drag zoom, axis changes, and hidden-run preservation. An entirely legacy
+series verifies that rows without timestamps stay in Step view, are counted
+as omissions in time views, and retain legend choices when their empty time
+view returns to Step. Live publications preserve exact elapsed and UTC
 zoom ranges. `workspace-elapsed.png` and `workspace-wall_clock.png` (plus their
 AB counterparts) capture these controls.
 

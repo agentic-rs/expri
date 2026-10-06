@@ -18,12 +18,11 @@ with MetricsLogger() as logger:
   for step in range(80):
     logger.log(step, {'loss': 1.0 / (step + 1)})
     if step == 0:
-      logger.log(0, {'duplicate_probe': 7.0})
-      # A valid legacy row proves time views omit untimestamped samples while
-      # step views and offline synchronization still preserve duplicates.
+      # An entirely legacy series exercises empty time views while Step and
+      # offline synchronization preserve every repeated-coordinate sample.
       with (out / 'metrics.jsonl').open('a') as metrics:
-        metrics.write(json.dumps({'step': 0, 'metrics': {'duplicate_probe': 7.0}}) + '\n')
-      logger.log(1, {'duplicate_probe': 8.0})
+        for duplicate_step, value in [(0, 7.0), (0, 7.0), (1, 8.0)]:
+          metrics.write(json.dumps({'step': duplicate_step, 'metrics': {'duplicate_probe': value}}) + '\n')
     print(f'step={step}', flush=True)
     time.sleep(0.1)
 with (out / 'checkpoint.pt').open('wb') as checkpoint:

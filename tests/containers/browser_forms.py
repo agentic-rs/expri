@@ -80,6 +80,10 @@ class Firefox:
       element = self.element(selector, using)
       return element if self.call('GET', '/element/' + element + '/displayed') else None
     element = wait_for(displayed_element, 'native form button is unavailable')
+    # Gecko can find a visible child element while its iframe is clipped by the
+    # parent viewport. Position both surfaces before dispatching native input.
+    self.call('POST', '/execute/sync', {'script': '''arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});
+      window.frameElement?.scrollIntoView({block: 'center', inline: 'nearest'});''', 'args': [{ELEMENT: element}]})
     self.call('POST', '/element/' + element + '/click', {})
 
   def keys(self, selector, text, using='css selector'):
@@ -249,7 +253,17 @@ def interactive_charts(browser, run_ids, prefix='workspace', check_security=Fals
       assert evaluate("return document.documentElement.getAttribute('data-probe-handler');") is None, 'sandboxed chart executed an inline event handler'
       chart_script('duplicate_probe', "card.querySelector('[data-chart-hit]').removeAttribute('onclick');")
     pointer('loss', .001)
-    wait_for(lambda: sample('loss', 0, 1.0), 'native hover did not show exact recorded first values')
+    try:
+      wait_for(lambda: sample('loss', 0, 1.0), 'native hover did not show exact recorded first values')
+    except AssertionError as error:
+      diagnostics = chart_script('loss', '''const hit = card.querySelector('[data-chart-hit]'); const region = card.querySelector('.plot-scroll');
+        const svg = card.querySelector('svg'); const rect = hit.getBoundingClientRect();
+        return {rows: [...card.querySelectorAll('[data-chart-readout-run]')].map(row => ({run_id: row.querySelector('code').textContent, step: row.dataset.chartStep, value: row.dataset.chartValue, text: row.textContent})),
+          axis: svg.dataset.xAxis, range: [card.querySelector('[data-chart-range]').dataset.startX, card.querySelector('[data-chart-range]').dataset.endX],
+          runs: [...card.querySelectorAll('[data-chart-run]')].map(node => ({run_id: node.querySelector('code').textContent, pressed: node.getAttribute('aria-pressed')})),
+          hit: {x: rect.x, y: rect.y, width: rect.width, height: rect.height}, viewport: {width: innerWidth, height: innerHeight},
+          scroll: {window_x: scrollX, window_y: scrollY, region_x: region.scrollLeft, region_y: region.scrollTop}};''')
+      raise AssertionError('native hover did not show exact recorded first values: ' + json.dumps(diagnostics)) from error
     assert chart_script('loss', "return card.querySelector('[data-chart-crosshair]').getAttribute('display');") != 'none', 'hover did not show its crosshair'
     assert chart_script('loss', "return card.querySelector('[data-chart-readout]').getAttribute('aria-live');") == 'off', 'pointer hover creates live announcement noise'
     capture(prefix + '-hover')
@@ -288,11 +302,11 @@ def interactive_charts(browser, run_ids, prefix='workspace', check_security=Fals
 
 def select_chart_axis(browser, axis):
   index = {'step': 0, 'elapsed': 1, 'wall_clock': 2}[axis]
-  # Gecko's element key input focuses a closed select and changes it natively.
-  # Opening its popup first leaves these keys without a committed selection.
+  # Arrow keys commit changes; Escape closes any remaining native popup so a
+  # later mouse click reaches the page instead of merely dismissing the popup.
   browser.call('POST', '/execute/sync', {'script': '''document.querySelector('#x-axis-select')
     .scrollIntoView({block: 'center', inline: 'nearest'});''', 'args': []})
-  browser.keys('#x-axis-select', '\ue011' + '\ue015' * index + '\ue007')
+  browser.keys('#x-axis-select', '\ue011' + '\ue015' * index + '\ue00c')
   selected = browser.call('POST', '/execute/sync', {'script': "return document.querySelector('#x-axis-select').value;", 'args': []})
   assert selected == axis, f'native select requested {axis}, actual value {selected}'
 
@@ -311,10 +325,13 @@ def time_axes(browser, run_ids, prefix='workspace'):
   def state():
     return evaluate('''const doc = document.querySelector('#chart-frame').contentDocument;
       const card = [...(doc?.querySelectorAll('[data-interactive-chart]') ?? [])].find(node => node.querySelector('h2').textContent === 'loss');
+      const duplicate = [...(doc?.querySelectorAll('[data-interactive-chart]') ?? [])].find(node => node.querySelector('h2').textContent === 'duplicate_probe');
       const range = card?.querySelector('[data-chart-range]'); const svg = card?.querySelector('svg');
       return range && svg ? {axis: svg.dataset.xAxis, range: [range.dataset.startX, range.dataset.endX],
-        domain: [svg.dataset.xMin, svg.dataset.xMax], hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent)} : null;''')
+        domain: [svg.dataset.xMin, svg.dataset.xMax], hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent),
+        duplicate_hidden: duplicate ? [...duplicate.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent) : null} : null;''')
   def choose(axis):
+    previous_plot_count = 2 if state()['axis'] == 'step' else 1
     evaluate('''window.__acceptance_axis_document = document.querySelector('#chart-frame').contentDocument;
       window.__acceptance_axis_plots = [...window.__acceptance_axis_document.querySelectorAll('[data-interactive-chart]')];''')
     select_chart_axis(browser, axis)
@@ -322,10 +339,10 @@ def time_axes(browser, run_ids, prefix='workspace'):
       wait_for(lambda: (state() or {}).get('axis') == axis, 'native axis selection did not update the plot')
     except AssertionError as error:
       raise AssertionError('native axis selection did not update the plot: ' + json.dumps(chart_axis_diagnostics(browser, axis))) from error
-    assert evaluate("return window.__acceptance_axis_plots.length === 2 && window.__acceptance_axis_plots.every(node => !node.isConnected);"), 'changed axis preview did not dispose the previous plot nodes'
+    assert evaluate("return window.__acceptance_axis_plots.length === arguments[0] && window.__acceptance_axis_plots.every(node => !node.isConnected);", previous_plot_count), 'changed axis preview did not dispose the previous plot nodes'
     assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__acceptance_axis_document;"), 'axis switch replaced the chart document and its HTTP security policy'
     assert evaluate('''const plots = [...document.querySelector('#chart-frame').contentDocument.querySelectorAll('[data-interactive-chart]')];
-      return plots.length === 2 && plots.every(node => node.querySelectorAll('[data-chart-hit]').length === 1);'''), 'axis switch lost or duplicated chart interaction layers'
+      return plots.length === arguments[0] && plots.every(node => node.querySelectorAll('[data-chart-hit]').length === 1);''', 2 if axis == 'step' else 1), 'axis switch lost or duplicated chart interaction layers'
     assert 'x_axis=' + axis in evaluate("return document.querySelector('#open-chart').href;"), 'Open chart lost the selected axis'
   def child():
     browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
@@ -354,7 +371,8 @@ def time_axes(browser, run_ids, prefix='workspace'):
   loss = '//section[@data-interactive-chart][h2="loss"]'
   child()
   try:
-    browser.click(loss + '//button[code="' + run_ids[1] + '"]', using='xpath')
+    for metric in ['loss', 'duplicate_probe']:
+      browser.click(f'//section[@data-interactive-chart][h2="{metric}"]//button[code="' + run_ids[1] + '"]', using='xpath')
   finally:
     browser.call('POST', '/frame', {'id': None})
   try:
@@ -365,9 +383,10 @@ def time_axes(browser, run_ids, prefix='workspace'):
       assert full['hidden'] == [run_ids[1]], 'axis switch lost the hidden actual run ID'
       child()
       try:
-        duplicate = evaluate('''const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'duplicate_probe');
-          return {text: card.textContent, circles: card.querySelectorAll('circle.point').length};''')
-        assert '1 of 3 samples omitted' in duplicate['text'] and duplicate['circles'] == 4, 'time chart invented a timestamp for a legacy sample'
+        duplicate = evaluate('''const card = [...document.querySelectorAll('section.card')].find(node => node.querySelector('h2')?.textContent === 'duplicate_probe');
+          return {text: card.textContent, circles: card.querySelectorAll('circle.point').length, svgs: card.querySelectorAll('svg').length};''')
+        assert duplicate['text'].count('3 of 3 samples omitted') == 2 and duplicate['circles'] == 0 and duplicate['svgs'] == 0, 'time chart invented a timestamp or plotted an entirely legacy series'
+        assert 'No timestamped samples are available to plot' in duplicate['text'], 'empty time chart did not explain its missing samples'
         browser.pointer(loss + '//*[@data-chart-hit]', .001, using='xpath')
         row = wait_for(sample, 'native time hover did not show an exact sample')
         assert_recorded_sample(row, axis)
@@ -389,11 +408,14 @@ def time_axes(browser, run_ids, prefix='workspace'):
     choose('step')
     assert state()['range'] == ['0', '79'], 'returning to steps did not reset the time range'
     assert state()['hidden'] == [run_ids[1]], 'returning to steps lost legend visibility'
+    assert state()['duplicate_hidden'] == [run_ids[1]], 'empty time views forgot the legacy metric hidden run'
     child()
     try:
-      browser.click(loss + '//button[code="' + run_ids[1] + '"]', using='xpath')
+      for metric in ['loss', 'duplicate_probe']:
+        browser.click(f'//section[@data-interactive-chart][h2="{metric}"]//button[code="' + run_ids[1] + '"]', using='xpath')
     finally:
       browser.call('POST', '/frame', {'id': None})
+    assert state()['hidden'] == [] and state()['duplicate_hidden'] == [], 'returning to Step did not restore the visible comparison runs'
   finally:
     browser.call('POST', '/frame', {'id': None})
 

@@ -226,7 +226,11 @@ function parseDashboardPreview(markup: string): Document | null {
 export function createChartController(frame: HTMLIFrameElement): ChartController {
   let plots: PlotController[] = [], current_document: Document | null = null, disposed = false;
   let completed_source: string | null = null;
-  const clear = () => { for (const plot of plots) plot.dispose(); plots = []; current_document = null; };
+  const hidden_runs = new Map<string, string[]>();
+  const clear = (forget_visibility = false) => {
+    for (const plot of plots) plot.dispose(); plots = []; current_document = null;
+    if (forget_visibility) hidden_runs.clear();
+  };
   function currentSource(): URL | null {
     if (!frame.src || !frame.ownerDocument?.baseURI) return null;
     const source = new URL(frame.src, frame.ownerDocument.baseURI), owner = new URL(frame.ownerDocument.baseURI);
@@ -248,7 +252,7 @@ export function createChartController(frame: HTMLIFrameElement): ChartController
     }
   }
   const enhance = (completed = false) => {
-    clear();
+    clear(true);
     if (disposed) return;
     try {
       const source = currentSource(), child = frame.contentDocument;
@@ -259,11 +263,11 @@ export function createChartController(frame: HTMLIFrameElement): ChartController
   };
   const loaded = () => enhance(true);
   frame.addEventListener("load", loaded);
-  const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => { completed_source = null; clear(); });
+  const observer = typeof MutationObserver === "undefined" ? null : new MutationObserver(() => { completed_source = null; clear(true); });
   observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
   enhance();
   return {
-    dispose() { disposed = true; frame.removeEventListener("load", loaded); observer?.disconnect(); clear(); },
+    dispose() { disposed = true; frame.removeEventListener("load", loaded); observer?.disconnect(); clear(true); },
     isInteracting() { return plots.some(plot => plot.isInteracting()); },
     previewStatus() {
       if (disposed) return "loading";
@@ -286,6 +290,9 @@ export function createChartController(frame: HTMLIFrameElement): ChartController
         if (!frame_focused) state.focus = null;
         return [state.metric_name, state];
       }));
+      const metric_names = new Set([...next.querySelectorAll("body > main > section.card > h2")].slice(0, 6).map(node => node.textContent ?? ""));
+      for (const name of hidden_runs.keys()) if (!metric_names.has(name)) hidden_runs.delete(name);
+      for (const [name, state] of states) if (metric_names.has(name)) hidden_runs.set(name, [...state.hidden_run_ids]);
       const window = document.defaultView, parent = frame.ownerDocument.defaultView;
       const scroll = { x: window?.scrollX ?? 0, y: window?.scrollY ?? 0, parent_x: parent?.scrollX ?? 0, parent_y: parent?.scrollY ?? 0 };
       const previous_details = document.querySelector<HTMLDetailsElement>("details.parameter-comparison");
@@ -298,7 +305,16 @@ export function createChartController(frame: HTMLIFrameElement): ChartController
       // form one coherent bounded snapshot; sampled points are never appended.
       document.head.replaceChildren(...head); document.body.replaceChildren(...body);
       enhanceDocument(document);
-      for (const plot of plots) { const state = states.get(plot.capture().metric_name); if (state) plot.restore(state); }
+      for (const plot of plots) {
+        const fresh = plot.capture(), state = states.get(fresh.metric_name);
+        if (state) plot.restore(state);
+        else {
+          // A legacy time view can have no plot. Retain its legend choices, but
+          // returning plots start with the current axis's full range and focus.
+          const hidden_run_ids = hidden_runs.get(fresh.metric_name);
+          if (hidden_run_ids) plot.restore({ ...fresh, hidden_run_ids });
+        }
+      }
       const details = document.querySelector<HTMLDetailsElement>("details.parameter-comparison");
       if (details) {
         details.open = details_open;
