@@ -344,3 +344,121 @@ fn a_single_long_log_line_keeps_its_tail_with_or_without_a_final_newline() {
     assert!(log["content"].as_str().unwrap().ends_with(newline));
   }
 }
+
+#[test]
+fn update_probes_use_fixed_stat_hints_without_parsing_or_scanning_outputs() {
+  let fixture = Fixture::new();
+  assert_eq!(
+    fixture.dashboard.updates("", &[]).unwrap(),
+    json!({"catalog_revision":null,"source_revision":null,"runs":[]})
+  );
+  let run = fixture.run("run-a");
+  fs::write(run.join("run-state.json"), "{").unwrap();
+  let metrics = fs::File::create(run.join("outputs/metrics.jsonl")).unwrap();
+  metrics.set_len(metrics::METRICS_FILE_LIMIT + 1).unwrap();
+  fs::create_dir(run.join("outputs/checkpoints")).unwrap();
+  fs::write(run.join("logs/stdout.log"), "before\n").unwrap();
+  let ids = vec!["run-a".into(), "deleted".into()];
+  let first = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_eq!(first["runs"][0]["missing"], false);
+  assert!(first["runs"][0]["metrics_revision"].is_string());
+  assert_eq!(first["runs"][1]["missing"], true);
+  assert_eq!(first, fixture.dashboard.updates("local", &ids).unwrap());
+
+  metrics.set_len(metrics::METRICS_FILE_LIMIT + 2).unwrap();
+  let next = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_ne!(
+    next["runs"][0]["metrics_revision"],
+    first["runs"][0]["metrics_revision"]
+  );
+  assert_eq!(
+    next["runs"][0]["metadata_revision"],
+    first["runs"][0]["metadata_revision"]
+  );
+  assert_eq!(
+    next["runs"][0]["stdout_revision"],
+    first["runs"][0]["stdout_revision"]
+  );
+
+  fs::write(run.join("logs/stdout.log"), "before\nafter\n").unwrap();
+  let logs = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_ne!(
+    logs["runs"][0]["stdout_revision"],
+    next["runs"][0]["stdout_revision"]
+  );
+  assert_eq!(
+    logs["runs"][0]["metrics_revision"],
+    next["runs"][0]["metrics_revision"]
+  );
+  fs::write(run.join("pull-state.json"), "cached provenance").unwrap();
+  let provenance = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_ne!(
+    provenance["runs"][0]["metadata_revision"],
+    logs["runs"][0]["metadata_revision"]
+  );
+
+  fs::remove_dir_all(run).unwrap();
+  let removed = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_eq!(
+    removed["runs"][0],
+    json!({
+      "run_id":"run-a", "metadata_revision":null,"metrics_revision":null,
+      "stdout_revision":null,"stderr_revision":null,"missing":true,
+    })
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn update_probes_detect_same_size_replacement_and_refuse_linked_paths() {
+  use std::os::unix::fs::symlink;
+
+  let fixture = Fixture::new();
+  let run = fixture.run("run-a");
+  let ids = vec!["run-a".into()];
+  fs::write(run.join("run-state.json"), "{").unwrap();
+  let first = fixture.dashboard.updates("local", &ids).unwrap();
+  let modified = fs::metadata(run.join("run-state.json"))
+    .unwrap()
+    .modified()
+    .unwrap();
+  let mut replacement = tempfile::NamedTempFile::new_in(&run).unwrap();
+  std::io::Write::write_all(&mut replacement, b"[").unwrap();
+  replacement
+    .as_file()
+    .set_times(fs::FileTimes::new().set_modified(modified))
+    .unwrap();
+  replacement.persist(run.join("run-state.json")).unwrap();
+  let next = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_ne!(
+    next["runs"][0]["metadata_revision"],
+    first["runs"][0]["metadata_revision"]
+  );
+
+  // Arbitrary checkpoint paths are never probed, even when they are links.
+  symlink(
+    fixture.root.join("expri.toml"),
+    run.join("outputs/model.pt"),
+  )
+  .unwrap();
+  fixture.dashboard.updates("local", &ids).unwrap();
+  fs::remove_file(run.join("outputs/metrics.jsonl")).unwrap();
+  symlink(
+    fixture.root.join("expri.toml"),
+    run.join("outputs/metrics.jsonl"),
+  )
+  .unwrap();
+  assert!(fixture.dashboard.updates("local", &ids).is_err());
+  fs::remove_file(run.join("outputs/metrics.jsonl")).unwrap();
+  fs::remove_file(run.join("outputs/model.pt")).unwrap();
+  fs::remove_dir(run.join("outputs")).unwrap();
+  symlink(&fixture.root, run.join("outputs")).unwrap();
+  assert!(fixture.dashboard.updates("local", &ids).is_err());
+  symlink(&run, fixture.root.join(".expri/runs/linked")).unwrap();
+  assert!(
+    fixture
+      .dashboard
+      .updates("local", &["linked".into()])
+      .is_err()
+  );
+}

@@ -158,7 +158,7 @@ fn validate_request(request: &RunQueryRequest) -> Result<()> {
   Ok(())
 }
 
-fn validate_id(run_id: &str) -> Result<()> {
+pub(crate) fn validate_id(run_id: &str) -> Result<()> {
   let mut bytes = run_id.bytes();
   if !bytes
     .next()

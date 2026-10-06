@@ -1,6 +1,7 @@
 mod artifacts;
 pub(crate) mod preview;
 pub(crate) mod server;
+pub(crate) mod updates;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -61,6 +62,7 @@ pub struct Dashboard {
 /// Shared dashboard views keep local and hosted routes on the same API contract.
 pub(crate) trait DashboardView {
   fn catalog(&self) -> Result<Value>;
+  fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value>;
   fn list(
     &self,
     source: &str,
@@ -85,6 +87,9 @@ pub(crate) trait DashboardView {
 impl DashboardView for Dashboard {
   fn catalog(&self) -> Result<Value> {
     Dashboard::catalog(self)
+  }
+  fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
+    Dashboard::updates(self, source, run_ids)
   }
   fn list(
     &self,
@@ -155,6 +160,23 @@ impl Dashboard {
       json!({"project_name": self.project_name, "initial_source": self.initial_source,
       "sources": sources, "warnings": bounded_warnings(&warnings)}),
     )
+  }
+
+  pub fn updates(&self, source_id: &str, run_ids: &[String]) -> Result<Value> {
+    updates::validate_selection(source_id, run_ids)?;
+    let runs = if source_id.is_empty() {
+      Vec::new()
+    } else {
+      let (_, runs_dir) = self.source(source_id)?;
+      real_prefix(&self.repo_root, &runs_dir)?;
+      run_ids
+        .iter()
+        .map(|run_id| updates::local_run(&runs_dir, run_id))
+        .collect::<Result<Vec<_>>>()?
+    };
+    // Directory mtimes cannot reveal state rewrites below existing run
+    // directories. Local catalog/list refreshes use a periodic recovery read.
+    updates::response(None, None, runs)
   }
 
   fn sources(&self) -> Result<(Vec<Source>, Vec<Value>)> {

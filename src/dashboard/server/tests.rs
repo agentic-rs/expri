@@ -217,6 +217,13 @@ fn rejects_unknown_duplicate_oversized_and_invalid_query_fields() {
     "/api/chart?run_id=run-one&reduction=last",
     "/api/run?run_id=",
     "/api/log",
+    "/api/updates?limit=1",
+    "/api/updates?source=local&source=local",
+    "/api/updates?run_id=run-one",
+    "/api/updates?source=&run_id=run-one",
+    "/api/updates?source=local&run_id=run-one&run_id=run-one",
+    "/api/updates?source=local&run_id=",
+    "/api/updates?source=local&run_id=..%2Foutside",
   ] {
     assert_error(fixture.get(path), 400);
   }
@@ -230,6 +237,55 @@ fn rejects_unknown_duplicate_oversized_and_invalid_query_fields() {
       .join("&")
   );
   assert_error(fixture.get(&too_many), 400);
+  assert_error(
+    fixture.get(&too_many.replace("/api/chart?", "/api/updates?source=local&")),
+    400,
+  );
+  assert_error(
+    fixture.get(&format!(
+      "/api/updates?source=local&run_id={}",
+      "a".repeat(257)
+    )),
+    400,
+  );
+}
+
+#[test]
+fn update_routes_return_bounded_selected_hints_and_preserve_read_boundaries() {
+  let fixture = Fixture::new();
+  for path in [
+    "/api/updates",
+    "/api/updates?source=",
+    "/api/updates?source=local",
+  ] {
+    let reply = fixture.get(path);
+    assert_eq!(reply.status, 200);
+    let value: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(value["runs"], json!([]));
+    assert_eq!(value["source_revision"], Value::Null);
+  }
+  let path = "/api/updates?source=local&run_id=run-one&run_id=removed";
+  let reply = fixture.get(path);
+  assert_eq!(reply.status, 200);
+  assert!(reply.body.len() < 4096);
+  let value: Value = serde_json::from_slice(&reply.body).unwrap();
+  assert_eq!(value["runs"][0]["run_id"], "run-one");
+  assert_eq!(value["runs"][0]["missing"], false);
+  assert_eq!(value["runs"][1]["missing"], true);
+  for (method, headers, expected) in [
+    ("GET", vec![("Host", AUTHORITY), ("Origin", "null")], 403),
+    (
+      "GET",
+      vec![("Host", AUTHORITY), ("Sec-Fetch-Site", "cross-site")],
+      403,
+    ),
+    ("POST", vec![("Host", AUTHORITY)], 405),
+  ] {
+    assert_error(
+      route(&fixture.dashboard, AUTHORITY, method, path, &headers),
+      expected,
+    );
+  }
 }
 
 #[test]

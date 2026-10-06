@@ -332,6 +332,7 @@ mod tests {
     let cookie = issued.split(';').next().unwrap();
     for path in [
       "/api/catalog",
+      "/api/updates?source=hosted:project:worker&run_id=run-1",
       "/api/runs",
       "/api/run?run_id=run-1",
       "/api/log?run_id=run-1",
@@ -364,6 +365,45 @@ mod tests {
       .headers_mut()
       .insert("Sec-Fetch-Site", "same-origin".parse().unwrap());
     assert_eq!(handle(&store, &auth, &private).status(), 200);
+  }
+
+  #[test]
+  fn update_probe_requires_dashboard_session_and_keeps_responses_private() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(temporary.path(), MockStorage::default()).unwrap();
+    let auth = BrowserAuth::new("https://expri.example.com", b"a-dashboard-password").unwrap();
+    assert_eq!(
+      handle(&store, &auth, &request("GET", "/api/updates", b"")).status(),
+      401
+    );
+    let mut login = request("POST", "/login", b"");
+    login
+      .headers_mut()
+      .insert("Origin", "https://expri.example.com".parse().unwrap());
+    let issued = auth.login(&login, b"a-dashboard-password").unwrap();
+    let cookie = issued.split(';').next().unwrap();
+    let mut probe = request(
+      "GET",
+      "/api/updates?source=hosted:project:worker&run_id=missing",
+      b"",
+    );
+    probe
+      .headers_mut()
+      .insert("Cookie", cookie.parse().unwrap());
+    let reply = handle(&store, &auth, &probe);
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.headers()["Cache-Control"], "no-store");
+    let value: serde_json::Value = serde_json::from_slice(reply.body()).unwrap();
+    assert_eq!(value["runs"][0]["missing"], true);
+    let mut invalid = request(
+      "GET",
+      "/api/updates?source=hosted:project:worker&run_id=..%2Foutside",
+      b"",
+    );
+    invalid
+      .headers_mut()
+      .insert("Cookie", cookie.parse().unwrap());
+    assert_eq!(handle(&store, &auth, &invalid).status(), 400);
   }
 
   #[test]
@@ -421,6 +461,7 @@ mod tests {
       for path in [
         "/",
         "/api/catalog",
+        "/api/updates",
         "/api/runs",
         "/api/chart",
         "/unexpected",

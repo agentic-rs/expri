@@ -50,6 +50,9 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
   fn catalog(&self) -> Result<Value> {
     HostedDashboard::catalog(self)
   }
+  fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
+    HostedDashboard::updates(self, source, run_ids)
+  }
   fn list(
     &self,
     source: &str,
@@ -112,6 +115,23 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     Ok(
       json!({"project_name": "Hosted experiments", "access_mode": "hosted", "initial_source": sources.first().map_or("", |source| source.source_id.as_str()), "sources": sources, "warnings": warnings}),
     )
+  }
+
+  pub fn updates(&self, source_id: &str, run_ids: &[String]) -> Result<Value> {
+    crate::dashboard::updates::validate_selection(source_id, run_ids)?;
+    let source = if source_id.is_empty() {
+      None
+    } else {
+      let parsed = parse_source(source_id)?;
+      Some(super::store::DashboardSource {
+        project_id: parsed.project_id,
+        origin: parsed.origin,
+      })
+    };
+    self
+      .store
+      .dashboard_updates(source.as_ref(), run_ids)
+      .map_err(api_error)
   }
 
   pub fn list(

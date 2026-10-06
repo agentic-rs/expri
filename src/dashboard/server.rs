@@ -522,6 +522,15 @@ fn route_content_checked(
       query.allow(&[])?;
       Ok(Reply::json(dashboard.catalog().map_err(service_error)?))
     }
+    "/api/updates" => {
+      query.allow(&["source", "run_id"])?;
+      let ids = query.runs(0)?;
+      Ok(Reply::json(
+        dashboard
+          .updates(query.optional("source").unwrap_or(""), &ids)
+          .map_err(service_error)?,
+      ))
+    }
     "/api/runs" => {
       query.allow(&["source", "search", "task", "status", "limit", "offset"])?;
       let limit = query.number("limit", 100, 1, 1000)?;
