@@ -17,6 +17,10 @@ with MetricsLogger() as logger:
   logger.params({'learning_rate': 0.001, 'input_id': 'dataset-v1'})
   for step in range(80):
     logger.log(step, {'loss': 1.0 / (step + 1)})
+    if step == 0:
+      logger.log(0, {'duplicate_probe': 7.0})
+      logger.log(0, {'duplicate_probe': 7.0})
+      logger.log(1, {'duplicate_probe': 8.0})
     print(f'step={step}', flush=True)
     time.sleep(0.1)
 with (out / 'checkpoint.pt').open('wb') as checkpoint:
