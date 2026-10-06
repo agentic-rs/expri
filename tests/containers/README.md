@@ -116,12 +116,17 @@ handlers; unchanged Refresh retains their controls. Interaction does not fetch
 more metric data. Chart scripts remain blocked.
 Hover and zoom screenshots are included in the CI diagnostics.
 
-Time-axis checks on both dashboard hosts cover elapsed and wall-clock hover,
-native drag zoom, axis changes, and hidden-run preservation. An entirely legacy
+Time-axis checks on both dashboard hosts cover elapsed and date & time hover,
+native drag zoom, single-click axis tags, native radio keyboard navigation, and
+hidden-run preservation. Firefox runs in `Asia/Shanghai` to verify local timezone
+names and exact offsets. Local/UTC tags change the display without refetching
+experiment data, rebuilding plots, changing recorded timestamps, or moving the
+zoom range. Summary tags also select Last, Minimum, and Maximum in one click.
+An entirely legacy
 series verifies that rows without timestamps stay in Step view, are counted
 as omissions in time views, and retain legend choices when their empty time
 view returns to Step. Live publications preserve exact elapsed and UTC
-zoom ranges. `workspace-elapsed.png` and `workspace-wall_clock.png` (plus their
+zoom ranges and the selected timezone. `workspace-elapsed.png` and `workspace-wall_clock.png` (plus their
 AB counterparts) capture these controls.
 
 The service workflow also opens an AB hostname in Firefox. It verifies distinct

@@ -73,7 +73,37 @@ function restoreChartRange(range, full_range) {
   const clamp = (value) => value < full_start ? full_start : value > full_end ? full_end : value;
   return { x_axis: range.x_axis, start_x: String(clamp(start)), end_x: String(clamp(end)) };
 }
-function formatChartX(x_value, x_axis) {
+function timeZoneLabel(time_zone) {
+  return time_zone === "utc" ? "UTC" : new Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+function dateParts(value, time_zone) {
+  let seconds = value / NANOS_PER_SECOND, remainder = value % NANOS_PER_SECOND;
+  if (remainder < 0n) {
+    seconds -= 1n;
+    remainder += NANOS_PER_SECOND;
+  }
+  const date = new Date(Number(seconds) * 1e3);
+  if (!Number.isFinite(date.getTime())) return null;
+  const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+  if (time_zone === "utc") {
+    const [date_text, time_text] = date.toISOString().replace(/\.\d{3}Z$/, "").split("T");
+    return { date_text, time_text: `${time_text}${fraction}`, offset_text: "UTC" };
+  }
+  const year = date.getFullYear(), pad = (value2) => String(value2).padStart(2, "0");
+  const year_text = year >= 0 && year <= 9999 ? String(year).padStart(4, "0") : `${year < 0 ? "-" : "+"}${String(Math.abs(year)).padStart(6, "0")}`;
+  const local_as_utc = /* @__PURE__ */ new Date(0);
+  local_as_utc.setUTCFullYear(year, date.getMonth(), date.getDate());
+  local_as_utc.setUTCHours(date.getHours(), date.getMinutes(), date.getSeconds(), 0);
+  const offset = Number.isFinite(local_as_utc.getTime()) ? (local_as_utc.getTime() - date.getTime()) / 1e3 : -date.getTimezoneOffset() * 60;
+  const absolute = Math.abs(offset);
+  const offset_text = offset === 0 ? "UTC" : `UTC${offset < 0 ? "\u2212" : "+"}${pad(Math.floor(absolute / 3600))}:${pad(Math.floor(absolute / 60) % 60)}${absolute % 60 === 0 ? "" : `:${pad(absolute % 60)}`}`;
+  return {
+    date_text: `${year_text}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    time_text: `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${fraction}`,
+    offset_text
+  };
+}
+function formatChartX(x_value, x_axis, time_zone = "utc") {
   const value = coordinate(x_value, x_axis);
   if (value === null) throw new Error("Invalid chart axis coordinate");
   if (x_axis === "step") return x_value;
@@ -82,36 +112,32 @@ function formatChartX(x_value, x_axis) {
     const sign = negative ? "\u2212" : "";
     if (absolute !== 0n && absolute < NANOS_PER_SECOND) {
       const [divisor, digits, unit] = absolute < 1000n ? [1n, 0, "ns"] : absolute < 1000000n ? [1000n, 3, "\xB5s"] : [1000000n, 6, "ms"];
-      const remainder3 = absolute % divisor;
-      const fraction3 = remainder3 === 0n ? "" : `.${String(remainder3).padStart(digits, "0").replace(/0+$/, "")}`;
-      return `${sign}${absolute / divisor}${fraction3} ${unit}`;
+      const remainder2 = absolute % divisor;
+      const fraction2 = remainder2 === 0n ? "" : `.${String(remainder2).padStart(digits, "0").replace(/0+$/, "")}`;
+      return `${sign}${absolute / divisor}${fraction2} ${unit}`;
     }
-    const seconds2 = absolute / NANOS_PER_SECOND, remainder2 = absolute % NANOS_PER_SECOND;
-    const fraction2 = remainder2 === 0n ? "" : `.${String(remainder2).padStart(9, "0").replace(/0+$/, "")}`;
-    if (seconds2 >= 3600n) return `${sign}${seconds2 / 3600n}:${String(seconds2 / 60n % 60n).padStart(2, "0")}:${String(seconds2 % 60n).padStart(2, "0")}${fraction2} h`;
-    if (seconds2 >= 60n) return `${sign}${seconds2 / 60n}:${String(seconds2 % 60n).padStart(2, "0")}${fraction2} min`;
-    return `${sign}${seconds2}${fraction2} s`;
+    const seconds = absolute / NANOS_PER_SECOND, remainder = absolute % NANOS_PER_SECOND;
+    const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+    if (seconds >= 3600n) return `${sign}${seconds / 3600n}:${String(seconds / 60n % 60n).padStart(2, "0")}:${String(seconds % 60n).padStart(2, "0")}${fraction} h`;
+    if (seconds >= 60n) return `${sign}${seconds / 60n}:${String(seconds % 60n).padStart(2, "0")}${fraction} min`;
+    return `${sign}${seconds}${fraction} s`;
   }
-  let seconds = value / NANOS_PER_SECOND, remainder = value % NANOS_PER_SECOND;
-  if (remainder < 0n) {
-    seconds -= 1n;
-    remainder += NANOS_PER_SECOND;
-  }
-  const date = new Date(Number(seconds) * 1e3);
-  if (!Number.isFinite(date.getTime())) return `${x_value} ns since Unix epoch`;
-  const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
-  return `${date.toISOString().replace(/\.\d{3}Z$/, "").replace("T", " ")}${fraction} UTC`;
+  const parts = dateParts(value, time_zone);
+  if (!parts) return `${x_value} ns since Unix epoch`;
+  const zone = timeZoneLabel(time_zone);
+  return `${parts.date_text} ${parts.time_text} ${parts.offset_text}${time_zone === "local" && zone !== "UTC" ? ` (${zone})` : ""}`;
 }
-function formatChartTick(x_value, range) {
-  const label = formatChartX(x_value, range.x_axis);
+function formatChartTick(x_value, range, time_zone = "utc") {
+  const label = formatChartX(x_value, range.x_axis, time_zone);
   if (range.x_axis !== "wall_clock") return label;
   const [start, end] = coordinatesInRange(range);
-  const parts = /^(\S+) (\S+) UTC$/.exec(label), first = /^(\S+) /.exec(formatChartX(range.start_x, "wall_clock")), last = /^(\S+) /.exec(formatChartX(range.end_x, "wall_clock"));
-  if (!parts?.[1] || !parts[2] || !first?.[1] || !last?.[1]) return label;
-  if (first[1] === last[1]) return parts[2];
-  if (end - start >= 365n * 86400n * NANOS_PER_SECOND) return parts[1];
-  const time = end - start < 120n * NANOS_PER_SECOND ? parts[2] : parts[2].slice(0, 5);
-  return `${parts[1].slice(-5)} ${time}`;
+  const parts = dateParts(BigInt(x_value), time_zone), first = dateParts(start, time_zone), last = dateParts(end, time_zone);
+  if (!parts || !first || !last) return label;
+  const offset = first.offset_text !== last.offset_text ? ` ${parts.offset_text}` : "";
+  if (first.date_text === last.date_text) return `${parts.time_text}${offset}`;
+  if (end - start >= 365n * 86400n * NANOS_PER_SECOND) return parts.date_text;
+  const time = end - start < 120n * NANOS_PER_SECOND ? parts.time_text : parts.time_text.slice(0, 5);
+  return `${parts.date_text.slice(-5)} ${time}${offset}`;
 }
 function nearestChartPoint(points, x, y, preferred) {
   if (preferred && points.includes(preferred) && preferred.x === x && (y === void 0 || preferred.y === y)) return preferred;
@@ -202,6 +228,7 @@ function parseDashboardPreview(markup) {
 }
 function createChartController(frame) {
   let plots = [], current_document = null, disposed = false;
+  let time_zone = "local";
   let completed_source = null;
   const hidden_runs = /* @__PURE__ */ new Map();
   const clear = (forget_visibility = false) => {
@@ -228,7 +255,7 @@ function createChartController(frame) {
   function enhanceDocument(document2) {
     current_document = document2;
     for (const svg of document2.querySelectorAll(".plot-scroll > svg")) {
-      const plot = enhancePlot(document2, svg);
+      const plot = enhancePlot(document2, svg, time_zone);
       if (plot) plots.push(plot);
     }
   }
@@ -252,6 +279,11 @@ function createChartController(frame) {
   observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
   enhance();
   return {
+    setTimeZone(next) {
+      if (disposed || time_zone === next) return;
+      time_zone = next;
+      for (const plot of plots) plot.setTimeZone(next);
+    },
     dispose() {
       disposed = true;
       frame.removeEventListener("load", loaded);
@@ -328,7 +360,7 @@ function attachChartInteractions(frame) {
   const controller = createChartController(frame);
   return () => controller.dispose();
 }
-function enhancePlot(document2, svg) {
+function enhancePlot(document2, svg, time_zone) {
   const section = svg.closest("section.card");
   const region = svg.parentElement;
   const legend = section?.querySelector("ul.legend");
@@ -339,10 +371,15 @@ function enhancePlot(document2, svg) {
   const full_range = parsed_range;
   let range = full_range, follow_full = true, keyboard_index = -1, keyboard_anchor = null;
   let drag_start = null;
+  let inspection = null;
   const listeners = [];
   const original_nodes = [...svg.childNodes];
   const original_attributes = /* @__PURE__ */ new Map();
   const original_description = region.getAttribute("aria-describedby");
+  const axis_label = [...svg.querySelectorAll("text.axis-label")].find((node) => Number(node.getAttribute("y")) === BOTTOM + 52);
+  const original_axis_label = axis_label?.textContent ?? "";
+  const context = full_range.x_axis === "wall_clock" && region.nextElementSibling?.matches("p.muted") ? region.nextElementSibling : null;
+  const original_context = context?.textContent ?? "";
   function remember(node, names) {
     original_attributes.set(node, Object.fromEntries(names.map((name) => [name, node.getAttribute(name)])));
   }
@@ -467,6 +504,7 @@ function enhancePlot(document2, svg) {
   }
   function showAt(x, y, announce = false, anchor) {
     const position = Math.max(LEFT, Math.min(RIGHT, x));
+    inspection = { x: position, y, anchor };
     crosshair.setAttribute("display", "");
     crosshair.setAttribute("x1", String(position));
     crosshair.setAttribute("x2", String(position));
@@ -489,7 +527,7 @@ function enhancePlot(document2, svg) {
         row.setAttribute("data-chart-value", point.value_text);
         row.setAttribute("data-chart-x", point.x_value);
         if (range.x_axis === "elapsed") row.append(html(document2, "span", `Elapsed ${formatChartX(point.x_value, "elapsed")}`));
-        if (range.x_axis === "wall_clock") row.append(html(document2, "span", formatChartX(point.x_value, "wall_clock")));
+        if (range.x_axis === "wall_clock") row.append(html(document2, "span", formatChartX(point.x_value, "wall_clock", time_zone)));
         if (point.timestamp) row.append(html(document2, "span", `timestamp ${point.timestamp}`));
         if (point.timestamp) row.setAttribute("data-chart-timestamp", point.timestamp);
         if (first) {
@@ -501,7 +539,7 @@ function enhancePlot(document2, svg) {
     }
     if (!readout_values.childNodes.length) readout_values.append(html(document2, "span", "No visible runs. Use the legend to show a run."));
   }
-  function draw() {
+  function drawLabels() {
     axis.replaceChildren();
     const [start, end] = coordinatesInRange(range), span = end - start;
     const count = span === 0n ? 1 : range.x_axis !== "step" || Math.max(range.start_x.length, range.end_x.length) > 12 ? 3 : 5;
@@ -511,13 +549,33 @@ function enhancePlot(document2, svg) {
       const coordinate2 = String(value);
       if (seen.has(coordinate2)) continue;
       seen.add(coordinate2);
-      const label2 = formatChartTick(coordinate2, range);
+      const label2 = formatChartTick(coordinate2, range, time_zone);
       const x = LEFT + chartXFraction(coordinate2, range) * (RIGHT - LEFT);
       axis.append(svgNode(document2, "line", { class: "grid", x1: String(x), x2: String(x), y1: String(TOP), y2: String(BOTTOM) }));
       const text = svgNode(document2, "text", { class: "tick", x: String(x), y: String(BOTTOM + 23), "text-anchor": count === 1 ? "middle" : index === 0 ? "start" : index === count - 1 ? "end" : "middle" });
       text.textContent = label2;
       axis.append(text);
     }
+    const first_label = formatChartX(range.start_x, range.x_axis, time_zone), last_label = formatChartX(range.end_x, range.x_axis, time_zone);
+    const label = range.x_axis === "step" ? start === end ? "Step" : "Steps" : range.x_axis === "elapsed" ? "Elapsed" : "Date & time";
+    range_label.textContent = start === end ? `${label} ${first_label}` : `${label} ${first_label}\u2013${last_label}`;
+    range_label.setAttribute("data-x-axis", range.x_axis);
+    range_label.setAttribute("data-start-x", range.start_x);
+    range_label.setAttribute("data-end-x", range.end_x);
+    range_label.setAttribute("data-time-zone", time_zone);
+    if (range.x_axis === "step") {
+      range_label.setAttribute("data-start-step", range.start_x);
+      range_label.setAttribute("data-end-step", range.end_x);
+    }
+    if (range.x_axis === "wall_clock") {
+      const zone = timeZoneLabel(time_zone), first = dateParts(start, time_zone), last = dateParts(end, time_zone);
+      if (axis_label) axis_label.textContent = `Date & time (${zone})`;
+      if (context) context.textContent = first && last ? first.date_text === last.date_text ? `${zone} date: ${first.date_text}.` : `${zone} dates: ${first.date_text}\u2013${last.date_text}.` : `Dates and times are shown in ${zone}.`;
+    }
+  }
+  function draw() {
+    drawLabels();
+    const [start, end] = coordinatesInRange(range), span = end - start;
     for (const item of series.values()) {
       item.button.disabled = !item.points.length;
       item.button.setAttribute("aria-pressed", String(item.visible));
@@ -529,16 +587,6 @@ function enhancePlot(document2, svg) {
       item.polyline?.setAttribute("points", item.points.map((point) => `${point.x},${point.y}`).join(" "));
       item.polyline?.setAttribute("display", item.visible ? "" : "none");
     }
-    const first_label = formatChartX(range.start_x, range.x_axis), last_label = formatChartX(range.end_x, range.x_axis);
-    const label = range.x_axis === "step" ? start === end ? "Step" : "Steps" : range.x_axis === "elapsed" ? "Elapsed" : "UTC time";
-    range_label.textContent = start === end ? `${label} ${first_label}` : `${label} ${first_label}\u2013${last_label}`;
-    range_label.setAttribute("data-x-axis", range.x_axis);
-    range_label.setAttribute("data-start-x", range.start_x);
-    range_label.setAttribute("data-end-x", range.end_x);
-    if (range.x_axis === "step") {
-      range_label.setAttribute("data-start-step", range.start_x);
-      range_label.setAttribute("data-end-step", range.end_x);
-    }
     zoom_in.disabled = start === end || span <= 1n;
     zoom_out.disabled = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
     reset.disabled = zoom_out.disabled && follow_full;
@@ -547,6 +595,7 @@ function enhancePlot(document2, svg) {
     readout_values.replaceChildren(html(document2, "span", "Hover or use arrow keys to inspect displayed samples."));
     keyboard_index = -1;
     keyboard_anchor = null;
+    inspection = null;
   }
   function applyRange(next) {
     range = next;
@@ -635,6 +684,20 @@ function enhancePlot(document2, svg) {
   });
   draw();
   return {
+    setTimeZone(next) {
+      if (time_zone === next) return;
+      time_zone = next;
+      range_label.setAttribute("data-time-zone", time_zone);
+      if (range.x_axis !== "wall_clock") return;
+      drawLabels();
+      if (inspection) {
+        const anchor = keyboard_anchor, index = keyboard_index, crosshair_display = crosshair.getAttribute("display");
+        showAt(inspection.x, inspection.y, false, inspection.anchor);
+        keyboard_anchor = anchor;
+        keyboard_index = index;
+        if (crosshair_display !== null) crosshair.setAttribute("display", crosshair_display);
+      }
+    },
     isInteracting() {
       return drag_start !== null;
     },
@@ -690,6 +753,8 @@ function enhancePlot(document2, svg) {
       controls.remove();
       hint.remove();
       readout.remove();
+      if (axis_label) axis_label.textContent = original_axis_label;
+      if (context) context.textContent = original_context;
       if (original_description === null) region.removeAttribute("aria-describedby");
       else region.setAttribute("aria-describedby", original_description);
       section.removeAttribute("data-interactive-chart");
@@ -944,6 +1009,9 @@ function dateText(value) {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
 }
+function localTimeZoneLabel() {
+  return new Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
 function errorText(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -988,9 +1056,26 @@ function startDashboard(options = {}) {
   const search_input = required("search-input");
   const task_input = required("task-input");
   const status_select = required("status-select");
-  const x_axis_select = required("x-axis-select");
-  x_axis_select.value = "step";
+  const x_axis_choices = {
+    step: required("x-axis-step"),
+    elapsed: required("x-axis-elapsed"),
+    wall_clock: required("x-axis-wall-clock")
+  };
+  const time_zone_choices = {
+    local: required("time-zone-local"),
+    utc: required("time-zone-utc")
+  };
   let x_axis = "step";
+  let time_zone = "local";
+  const reduction_choices = {
+    last: required("reduction-last"),
+    min: required("reduction-min"),
+    max: required("reduction-max")
+  };
+  let reduction = "last";
+  for (const [value, input] of Object.entries(reduction_choices)) input.checked = value === reduction;
+  syncChartChoices();
+  chart_controller.setTimeZone(time_zone);
   const previous_page = required("previous-page");
   const next_page = required("next-page");
   const global_error = required("global-error");
@@ -1071,7 +1156,7 @@ function startDashboard(options = {}) {
     return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], x_axis });
   }
   function comparisonUrl() {
-    return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction: required("reduction-select").value });
+    return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction });
   }
   function boundedSet(cache, key, value) {
     cache.delete(key);
@@ -1354,27 +1439,37 @@ function startDashboard(options = {}) {
   function chartControls(url) {
     if (!review) return;
     required("open-chart").href = url;
+    required("open-chart-label").textContent = x_axis === "wall_clock" ? "Open UTC chart" : "Open chart";
     required("chart-card").hidden = false;
     const metrics = review.metric_names.length ? `${review.metric_names.length} selected metrics` : "First four recorded metrics";
-    const axis = x_axis === "elapsed" ? "Time since each run\u2019s first timestamped metric event" : x_axis === "wall_clock" ? "Recorded time in UTC" : "Global step";
+    const axis = x_axis === "elapsed" ? "Time since each run\u2019s first timestamped metric event" : x_axis === "wall_clock" ? `Recorded date & time in ${time_zone === "utc" ? "UTC" : "your local timezone"}` : "Global step";
     required("chart-note").textContent = `${metrics} \xB7 ${axis} \xB7 at most 600 chart points per series`;
+  }
+  function syncChartChoices() {
+    for (const [axis, input] of Object.entries(x_axis_choices)) input.checked = axis === x_axis;
+    for (const [zone, input] of Object.entries(time_zone_choices)) input.checked = zone === time_zone;
+    required("time-zone-options").hidden = x_axis !== "wall_clock";
+    required("time-zone-label").textContent = time_zone === "utc" ? "UTC" : localTimeZoneLabel();
+  }
+  function changeChartTimeZone(value) {
+    if (value === time_zone) return;
+    time_zone = value;
+    syncChartChoices();
+    chart_controller.setTimeZone(value);
+    if (review && !required("chart-card").hidden) chartControls(chartUrl());
   }
   function clearChartError(context) {
     if (context !== void 0 && chart_error_context !== context) return;
     chart_error_context = null;
     required("chart-error").hidden = true;
   }
-  async function changeChartAxis() {
-    const value = x_axis_select.value;
-    if (value !== "step" && value !== "elapsed" && value !== "wall_clock") {
-      x_axis_select.value = x_axis;
-      return;
-    }
+  async function changeChartAxis(value) {
     if (value === x_axis) return;
     cancelRefresh();
     chart_lane.cancel();
     clearChartError();
     x_axis = value;
+    syncChartChoices();
     if (!review || required("chart-card").hidden) return;
     const current_review = review, source = source_id, url = chartUrl();
     chartControls(url);
@@ -2074,13 +2169,28 @@ function startDashboard(options = {}) {
     openComparison();
   });
   required("close-review").addEventListener("click", closeReview);
-  required("reduction-select").addEventListener("change", () => {
-    cancelRefresh();
-    void loadComparison();
-  });
-  x_axis_select.addEventListener("change", () => {
-    void changeChartAxis();
-  });
+  for (const value of Object.keys(reduction_choices)) {
+    const input = reduction_choices[value];
+    input.addEventListener("change", () => {
+      if (!input.checked || reduction === value) return;
+      reduction = value;
+      for (const [choice, item] of Object.entries(reduction_choices)) item.checked = choice === value;
+      cancelRefresh();
+      void loadComparison();
+    });
+  }
+  for (const axis of Object.keys(x_axis_choices)) {
+    const input = x_axis_choices[axis];
+    input.addEventListener("change", () => {
+      if (input.checked) void changeChartAxis(axis);
+    });
+  }
+  for (const zone of Object.keys(time_zone_choices)) {
+    const input = time_zone_choices[zone];
+    input.addEventListener("change", () => {
+      if (input.checked) changeChartTimeZone(zone);
+    });
+  }
   for (const tab of review_tabs) {
     const button = required(`review-tab-${tab}`);
     button.addEventListener("click", () => {
@@ -2136,6 +2246,7 @@ export {
   formatDuration,
   formatNumber,
   formatValue,
+  localTimeZoneLabel,
   nearestChartPoint,
   parseChartPointLabel,
   parseChartRange,

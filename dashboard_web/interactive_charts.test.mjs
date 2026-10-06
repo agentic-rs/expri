@@ -1,11 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { attachChartInteractions, createChartController, parseChartPointLabel, parseChartRange, formatChartX, formatChartTick, chartXFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./app.js";
 
 const MAX_STEP = 18446744073709551615n;
 function range(first, last, x_axis = "step") { return { x_axis, start_x: String(first), end_x: String(last) }; }
 function point(step, x, y, value_text = "1") {
   return { run_index: 1, step: String(step), value: Number(value_text), value_text, x, y };
+}
+function localLabels(time_zone, values, domain) {
+  const script = `
+    import { formatChartX, formatChartTick } from ${JSON.stringify(new URL("./app.js", import.meta.url).href)};
+    const values = ${JSON.stringify(values)}, domain = ${JSON.stringify(domain)};
+    console.log(JSON.stringify(values.map(value => ({ full: formatChartX(value, "wall_clock", "local"), tick: formatChartTick(value, domain, "local") }))));
+  `;
+  return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, TZ: time_zone }, encoding: "utf8" }));
 }
 
 test("exact labels retain u64 steps and precise finite value strings", () => {
@@ -74,6 +83,33 @@ test("wall-clock ticks stay compact while preserving precision for midnight zoom
   assert.equal(formatChartTick(String(next), range(previous, next, "wall_clock")), "01-01 01:00", "year changes retain useful time within a short range");
   assert.equal(formatChartTick(String(midnight), range(nanos("2025-10-01T00:00:00Z"), midnight, "wall_clock")), "2026-10-07");
   assert.equal(formatChartTick("2500000000", range(0n, 3_000_000_000n, "elapsed")), "2.5 s");
+});
+
+test("local date labels keep nanoseconds and the viewer's calendar date across midnight", () => {
+  const midnight = BigInt(Date.parse("2026-10-06T16:00:00Z")) * 1_000_000n;
+  assert.deepEqual(localLabels("Asia/Shanghai", [String(midnight - 1n), String(midnight)], range(midnight - 1n, midnight, "wall_clock")), [
+    { full: "2026-10-06 23:59:59.999999999 UTC+08:00 (Asia/Shanghai)", tick: "10-06 23:59:59.999999999" },
+    { full: "2026-10-07 00:00:00 UTC+08:00 (Asia/Shanghai)", tick: "10-07 00:00:00" },
+  ]);
+  assert.equal(localLabels("Asia/Shanghai", ["-1"], range(-1n, -1n, "wall_clock"))[0].full, "1970-01-01 07:59:59.999999999 UTC+08:00 (Asia/Shanghai)");
+  assert.equal(formatChartX(String(midnight - 1n), "wall_clock", "utc"), "2026-10-06 15:59:59.999999999 UTC", "UTC display leaves exact instants unchanged");
+});
+
+test("local labels support fractional-hour offsets and historical offset seconds", () => {
+  const now = "1700000000123456789";
+  assert.match(localLabels("Asia/Kathmandu", [now], range(now, now, "wall_clock"))[0].full, /^2023-11-15 03:58:20\.123456789 UTC\+05:45 \(Asia\/Kat(?:h)?mandu\)$/, "ICU versions may retain either valid IANA spelling");
+  const old = BigInt(Date.parse("1900-01-01T00:00:00Z")) * 1_000_000n;
+  assert.match(localLabels("Asia/Kathmandu", [String(old)], range(old, old, "wall_clock"))[0].full, /^1900-01-01 05:41:16 UTC\+05:41:16 \(Asia\/Kat(?:h)?mandu\)$/);
+});
+
+test("repeated local hours distinguish the offset at each sample during DST changes", () => {
+  const first = BigInt(Date.parse("2026-11-01T05:30:00Z")) * 1_000_000n;
+  const last = BigInt(Date.parse("2026-11-01T06:30:00Z")) * 1_000_000n;
+  assert.deepEqual(localLabels("America/New_York", [String(first), String(last)], range(first, last, "wall_clock")), [
+    { full: "2026-11-01 01:30:00 UTC−04:00 (America/New_York)", tick: "01:30:00 UTC−04:00" },
+    { full: "2026-11-01 01:30:00 UTC−05:00 (America/New_York)", tick: "01:30:00 UTC−05:00" },
+  ]);
+  assert.equal(localLabels("UTC", ["0"], range(0n, 0n, "wall_clock"))[0].full, "1970-01-01 00:00:00 UTC");
 });
 
 test("adjacent steps above Number precision remain distinct in the plot range", () => {
@@ -145,8 +181,10 @@ test("chart refresh refuses unloaded frames and remains inert after disposal", (
   assert.equal(controller.isInteracting(), false);
   assert.equal(controller.previewStatus(), "loading");
   assert.equal(controller.replacePreview("<html></html>"), false);
+  assert.doesNotThrow(() => controller.setTimeZone("utc"), "display choices can change before the frame loads");
   controller.dispose();
   assert.equal(controller.replacePreview("<html></html>"), false);
+  assert.doesNotThrow(() => controller.setTimeZone("local"), "disposed controllers stay inert");
   assert.equal(handlers.size, 0);
   assert.doesNotThrow(() => controller.dispose());
 });

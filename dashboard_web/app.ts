@@ -1,4 +1,4 @@
-import { createChartController, type ChartAxis, type ChartController } from "./interactive_charts";
+import { createChartController, type ChartAxis, type ChartController, type ChartTimeZone } from "./interactive_charts";
 import { AutoRefresh, type RefreshAvailability, type RefreshClock, type RefreshOutcome, type RefreshState } from "./auto_refresh";
 export * from "./interactive_charts";
 export * from "./auto_refresh";
@@ -20,6 +20,7 @@ type LogView = { run_id: string; stream: string; output: HTMLElement; note: HTML
 type RunRevision = { run_id: string; metadata_revision: string | null; metrics_revision: string | null; stdout_revision: string | null; stderr_revision: string | null; missing: boolean };
 type Updates = { catalog_revision: string | null; source_revision: string | null; runs: RunRevision[] };
 type ChartRefreshOutcome = "applied" | "deferred" | "cancelled";
+type ComparisonReduction = "last" | "min" | "max";
 export type DashboardOptions = { refresh_clock?: RefreshClock; chart_controller?: ChartController };
 
 export function apiUrl(path: string, fields: Record<string, string | number | string[] | null>): string {
@@ -126,6 +127,7 @@ function dateText(value: string | null): string {
   const date = new Date(value);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
 }
+export function localTimeZoneLabel(): string { return new Intl.DateTimeFormat().resolvedOptions().timeZone; }
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function showError(node: HTMLElement, error: unknown): void { node.textContent = errorText(error); node.hidden = false; }
 function warnings(node: HTMLElement, items: Warning[]): void {
@@ -160,9 +162,26 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const search_input = required<HTMLInputElement>("search-input");
   const task_input = required<HTMLInputElement>("task-input");
   const status_select = required<HTMLSelectElement>("status-select");
-  const x_axis_select = required<HTMLSelectElement>("x-axis-select");
-  x_axis_select.value = "step";
+  const x_axis_choices: Record<ChartAxis, HTMLInputElement> = {
+    step: required<HTMLInputElement>("x-axis-step"),
+    elapsed: required<HTMLInputElement>("x-axis-elapsed"),
+    wall_clock: required<HTMLInputElement>("x-axis-wall-clock"),
+  };
+  const time_zone_choices: Record<ChartTimeZone, HTMLInputElement> = {
+    local: required<HTMLInputElement>("time-zone-local"),
+    utc: required<HTMLInputElement>("time-zone-utc"),
+  };
   let x_axis: ChartAxis = "step";
+  let time_zone: ChartTimeZone = "local";
+  const reduction_choices: Record<ComparisonReduction, HTMLInputElement> = {
+    last: required<HTMLInputElement>("reduction-last"),
+    min: required<HTMLInputElement>("reduction-min"),
+    max: required<HTMLInputElement>("reduction-max"),
+  };
+  let reduction: ComparisonReduction = "last";
+  for (const [value, input] of Object.entries(reduction_choices)) input.checked = value === reduction;
+  syncChartChoices();
+  chart_controller.setTimeZone(time_zone);
   const previous_page = required<HTMLButtonElement>("previous-page");
   const next_page = required<HTMLButtonElement>("next-page");
   const global_error = required("global-error");
@@ -237,7 +256,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   function listUrl(): string { return apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }); }
   function chartUrl(): string { return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], x_axis }); }
-  function comparisonUrl(): string { return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction: required<HTMLSelectElement>("reduction-select").value }); }
+  function comparisonUrl(): string { return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction }); }
   function boundedSet<T>(cache: Map<string, T>, key: string, value: T): void {
     cache.delete(key); cache.set(key, value);
     while (cache.size > 16) { const oldest = cache.keys().next().value; if (oldest === undefined) break; cache.delete(oldest); }
@@ -419,20 +438,31 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function chartControls(url: string): void {
     if (!review) return;
     required<HTMLAnchorElement>("open-chart").href = url;
+    required("open-chart-label").textContent = x_axis === "wall_clock" ? "Open UTC chart" : "Open chart";
     required("chart-card").hidden = false;
     const metrics = review.metric_names.length ? `${review.metric_names.length} selected metrics` : "First four recorded metrics";
-    const axis = x_axis === "elapsed" ? "Time since each run’s first timestamped metric event" : x_axis === "wall_clock" ? "Recorded time in UTC" : "Global step";
+    const axis = x_axis === "elapsed" ? "Time since each run’s first timestamped metric event" : x_axis === "wall_clock" ? `Recorded date & time in ${time_zone === "utc" ? "UTC" : "your local timezone"}` : "Global step";
     required("chart-note").textContent = `${metrics} · ${axis} · at most 600 chart points per series`;
+  }
+  function syncChartChoices(): void {
+    for (const [axis, input] of Object.entries(x_axis_choices)) input.checked = axis === x_axis;
+    for (const [zone, input] of Object.entries(time_zone_choices)) input.checked = zone === time_zone;
+    required("time-zone-options").hidden = x_axis !== "wall_clock";
+    required("time-zone-label").textContent = time_zone === "utc" ? "UTC" : localTimeZoneLabel();
+  }
+  function changeChartTimeZone(value: ChartTimeZone): void {
+    if (value === time_zone) return;
+    time_zone = value; syncChartChoices(); chart_controller.setTimeZone(value);
+    if (review && !required("chart-card").hidden) chartControls(chartUrl());
   }
   function clearChartError(context?: string): void {
     if (context !== undefined && chart_error_context !== context) return;
     chart_error_context = null; required("chart-error").hidden = true;
   }
-  async function changeChartAxis(): Promise<void> {
-    const value = x_axis_select.value;
-    if (value !== "step" && value !== "elapsed" && value !== "wall_clock") { x_axis_select.value = x_axis; return; }
+  async function changeChartAxis(value: ChartAxis): Promise<void> {
     if (value === x_axis) return;
     cancelRefresh(); chart_lane.cancel(); clearChartError(); x_axis = value;
+    syncChartChoices();
     if (!review || required("chart-card").hidden) return;
     const current_review = review, source = source_id, url = chartUrl();
     chartControls(url);
@@ -877,8 +907,23 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   required("clear-selection").addEventListener("click", () => { selected.clear(); selectionChanged(); });
   required("compare-button").addEventListener("click", () => { cancelRefresh(); clearSelectionTimeout(); openComparison(); });
   required("close-review").addEventListener("click", closeReview);
-  required("reduction-select").addEventListener("change", () => { cancelRefresh(); void loadComparison(); });
-  x_axis_select.addEventListener("change", () => { void changeChartAxis(); });
+  for (const value of Object.keys(reduction_choices) as ComparisonReduction[]) {
+    const input = reduction_choices[value];
+    input.addEventListener("change", () => {
+      if (!input.checked || reduction === value) return;
+      reduction = value;
+      for (const [choice, item] of Object.entries(reduction_choices)) item.checked = choice === value;
+      cancelRefresh(); void loadComparison();
+    });
+  }
+  for (const axis of Object.keys(x_axis_choices) as ChartAxis[]) {
+    const input = x_axis_choices[axis];
+    input.addEventListener("change", () => { if (input.checked) void changeChartAxis(axis); });
+  }
+  for (const zone of Object.keys(time_zone_choices) as ChartTimeZone[]) {
+    const input = time_zone_choices[zone];
+    input.addEventListener("change", () => { if (input.checked) changeChartTimeZone(zone); });
+  }
   for (const tab of review_tabs) {
     const button = required<HTMLButtonElement>(`review-tab-${tab}`);
     button.addEventListener("click", () => { selectReviewTab(tab); });

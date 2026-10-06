@@ -34,7 +34,8 @@ class Firefox:
     self.session = None
     self.process = subprocess.Popen([
       'geckodriver', '--host', '127.0.0.1', '--port', '4444', '--log', 'fatal',
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+      env={**os.environ, 'TZ': 'Asia/Shanghai'})
     try:
       wait_for(lambda: self.request('GET', '/status'), 'Firefox driver did not start')
       session = self.request('POST', '/session', {'capabilities': {'alwaysMatch': {
@@ -301,19 +302,16 @@ def interactive_charts(browser, run_ids, prefix='workspace', check_security=Fals
 
 
 def select_chart_axis(browser, axis):
-  index = {'step': 0, 'elapsed': 1, 'wall_clock': 2}[axis]
-  # Arrow keys commit changes; Escape closes any remaining native popup so a
-  # later mouse click reaches the page instead of merely dismissing the popup.
-  browser.call('POST', '/execute/sync', {'script': '''document.querySelector('#x-axis-select')
-    .scrollIntoView({block: 'center', inline: 'nearest'});''', 'args': []})
-  browser.keys('#x-axis-select', '\ue011' + '\ue015' * index + '\ue00c')
-  selected = browser.call('POST', '/execute/sync', {'script': "return document.querySelector('#x-axis-select').value;", 'args': []})
-  assert selected == axis, f'native select requested {axis}, actual value {selected}'
+  # Clicking the visible radio tag selects it in one native action. The input
+  # remains keyboard-accessible while its label carries the visual treatment.
+  browser.click('#x-axis-' + axis.replace('_', '-') + ' + span')
+  selected = browser.call('POST', '/execute/sync', {'script': "return document.querySelector('input[name=\"x_axis\"]:checked').value;", 'args': []})
+  assert selected == axis, f'native axis tag requested {axis}, actual value {selected}'
 
 
 def chart_axis_diagnostics(browser, requested):
   return browser.call('POST', '/execute/sync', {'script': '''return {requested: arguments[0],
-    selected: document.querySelector('#x-axis-select').value,
+    selected: document.querySelector('input[name="x_axis"]:checked').value,
     rendered: [...(document.querySelector('#chart-frame').contentDocument?.querySelectorAll('svg[data-x-axis]') ?? [])].map(node => node.dataset.xAxis),
     error: document.querySelector('#chart-error').textContent,
     error_hidden: document.querySelector('#chart-error').hidden};''', 'args': [requested]})
@@ -328,6 +326,7 @@ def time_axes(browser, run_ids, prefix='workspace'):
       const duplicate = [...(doc?.querySelectorAll('[data-interactive-chart]') ?? [])].find(node => node.querySelector('h2').textContent === 'duplicate_probe');
       const range = card?.querySelector('[data-chart-range]'); const svg = card?.querySelector('svg');
       return range && svg ? {axis: svg.dataset.xAxis, range: [range.dataset.startX, range.dataset.endX],
+        time_zone: range.dataset.timeZone, range_text: range.textContent,
         domain: [svg.dataset.xMin, svg.dataset.xMax], hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent),
         duplicate_hidden: duplicate ? [...duplicate.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent) : null} : null;''')
   def choose(axis):
@@ -368,6 +367,37 @@ def time_axes(browser, run_ids, prefix='workspace'):
   def first_sample():
     row = sample()
     return row if row and row.get('step') == '0' else None
+  def timezone_tags():
+    before = state()
+    start = len(trace_records())
+    href = evaluate("return document.querySelector('#open-chart').href;")
+    evaluate('''window.__acceptance_zone_document = document.querySelector('#chart-frame').contentDocument;
+      window.__acceptance_zone_plots = [...window.__acceptance_zone_document.querySelectorAll('[data-interactive-chart]')];''')
+    for zone in ['utc', 'local']:
+      browser.click('#time-zone-' + zone + ' + span')
+      wait_for(lambda: (state() or {}).get('time_zone') == zone, 'timezone tag did not redraw the chart')
+      after = state()
+      assert after['range'] == before['range'] and after['domain'] == before['domain'], 'timezone change shifted exact zoom coordinates'
+      assert after['hidden'] == before['hidden'], 'timezone change lost hidden run IDs'
+      assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__acceptance_zone_document;"), 'timezone change replaced the chart document'
+      assert evaluate('''const plots = [...document.querySelector('#chart-frame').contentDocument.querySelectorAll('[data-interactive-chart]')];
+        return plots.length === window.__acceptance_zone_plots.length && plots.every((node, index) => node === window.__acceptance_zone_plots[index]);'''), 'timezone change rebuilt the plots'
+      assert evaluate("return document.querySelector('input[name=\"time_zone\"]:checked').value;") == zone, 'timezone tag lost its selected state'
+      assert evaluate("return document.querySelector('#time-zone-label').textContent;") == ('UTC' if zone == 'utc' else 'Asia/Shanghai'), 'timezone tag did not name the displayed timezone'
+      assert evaluate("return document.querySelector('#open-chart').href;") == href, 'timezone display change altered the server chart URL'
+      assert evaluate("return document.querySelector('#open-chart-label').textContent;") == 'Open UTC chart', 'standalone server chart timezone is ambiguous'
+      child()
+      try:
+        browser.pointer(loss + '//*[@data-chart-hit]', .35, using='xpath')
+        row = wait_for(sample, 'timezone hover lost the exact recorded sample')
+        assert_recorded_sample(row, 'wall_clock')
+        if zone == 'local':
+          assert 'UTC+08:00' in row['text'] or 'UTC+8' in row['text'], 'local readout omitted its offset at the recorded instant'
+        else:
+          assert 'UTC+08:00' not in row['text'] and 'UTC+8' not in row['text'], 'UTC tag retained the local display offset'
+      finally:
+        browser.call('POST', '/frame', {'id': None})
+    assert not any(record['path'] in {'/api/chart', '/api/run', '/api/compare'} for record in trace_records()[start:]), 'timezone tags refetched experiment data'
   loss = '//section[@data-interactive-chart][h2="loss"]'
   child()
   try:
@@ -379,6 +409,11 @@ def time_axes(browser, run_ids, prefix='workspace'):
     for axis in ['elapsed', 'wall_clock']:
       choose(axis)
       full = state()
+      assert evaluate("return document.querySelector('#time-zone-options').hidden;") == (axis != 'wall_clock'), 'timezone tags appeared outside the date & time axis'
+      if axis == 'wall_clock':
+        assert evaluate("return document.querySelector('input[name=\"time_zone\"]:checked').value;") == 'local', 'date & time did not default to local'
+        assert evaluate("return Intl.DateTimeFormat().resolvedOptions().timeZone;") == 'Asia/Shanghai', 'native fixture did not establish its non-UTC timezone'
+        assert evaluate("return document.querySelector('#time-zone-label').textContent;") == 'Asia/Shanghai', 'date & time omitted the viewer timezone name'
       assert full['range'] == full['domain'], 'axis switch reused an incompatible zoom range'
       assert full['hidden'] == [run_ids[1]], 'axis switch lost the hidden actual run ID'
       child()
@@ -404,11 +439,20 @@ def time_axes(browser, run_ids, prefix='workspace'):
         browser.call('POST', '/frame', {'id': None})
       zoomed = state()
       assert int(full['domain'][0]) < int(zoomed['range'][0]) < int(zoomed['range'][1]) < int(full['domain'][1]), 'native drag did not narrow the time domain'
+      if axis == 'wall_clock':
+        timezone_tags()
       Path('/tmp/' + prefix + '-' + axis + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
     choose('step')
     assert state()['range'] == ['0', '79'], 'returning to steps did not reset the time range'
     assert state()['hidden'] == [run_ids[1]], 'returning to steps lost legend visibility'
     assert state()['duplicate_hidden'] == [run_ids[1]], 'empty time views forgot the legacy metric hidden run'
+    browser.keys('#x-axis-step', '\ue014')
+    wait_for(lambda: (state() or {}).get('axis') == 'elapsed', 'native radio ArrowRight did not choose elapsed time')
+    assert evaluate("return document.querySelector('#x-axis-elapsed').checked;"), 'keyboard-selected axis tag is not checked'
+    browser.keys('#x-axis-elapsed', '\ue014')
+    wait_for(lambda: (state() or {}).get('axis') == 'wall_clock', 'native radio ArrowRight did not choose date & time')
+    assert state()['time_zone'] == 'local', 'keyboard axis changes forgot the selected timezone'
+    choose('step')
     child()
     try:
       for metric in ['loss', 'duplicate_probe']:
@@ -516,6 +560,11 @@ def workspace(run_id, second_run_id):
     browser.click(f'input[aria-label="Select {second_run_id} for comparison"]')
     wait_for(lambda: check_selection([run_id, second_run_id]), 'selecting a second run did not compare automatically')
     wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'comparison summary lost selected runs')
+    for reduction, expected_step in [('max', 'step 0'), ('min', 'step 79'), ('last', 'step 79')]:
+      browser.click('#reduction-' + reduction + ' + span')
+      wait_for(lambda: evaluate('''const headings = [...document.querySelectorAll('#comparison-values thead th')].map(node => node.textContent);
+        return document.querySelector('#comparison-values').getAttribute('aria-busy') === 'false' && [...document.querySelectorAll('#comparison-values tbody tr')].every(row => row.children[headings.indexOf('loss')]?.querySelector('.cell-step')?.textContent === arguments[0]);''', expected_step), 'native summary tag did not update its reduction')
+      assert evaluate("return document.querySelector('input[name=\"reduction\"]:checked').value;") == reduction, 'summary tag lost its selected state'
     frame = browser.element('#chart-frame')
     browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
     try:
@@ -681,7 +730,7 @@ def automatic_refresh(run_id, updated_run_id):
       if (!card) return null;
       const range = card.querySelector('[data-chart-range]');
       const svg = card.querySelector('svg');
-      return {axis: svg.dataset.xAxis, domain: [svg.dataset.xMin, svg.dataset.xMax], range: [range.dataset.startX, range.dataset.endX],
+      return {axis: svg.dataset.xAxis, time_zone: range.dataset.timeZone, domain: [svg.dataset.xMin, svg.dataset.xMax], range: [range.dataset.startX, range.dataset.endX],
         hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent),
         samples: [...card.querySelectorAll('[data-chart-run]')].map(node => ({run_id: node.querySelector('code').textContent, text: node.textContent})),
         point_labels: [...card.querySelectorAll('circle.point')].map(node => node.getAttribute('aria-label'))};''')
@@ -788,6 +837,8 @@ def automatic_refresh(run_id, updated_run_id):
     # their own locked range and hidden runs across pause/resume.
     select_chart_axis(browser, 'wall_clock')
     wait_for(lambda: (loss_state() or {}).get('axis') == 'wall_clock', 'pause/resume fixture did not select wall-clock time')
+    browser.click('#time-zone-utc + span')
+    wait_for(lambda: (loss_state() or {}).get('time_zone') == 'utc', 'pause/resume fixture did not choose UTC')
     assert loss_state()['hidden'] == [run_id], 'time-axis switch forgot the hidden run'
     browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
     try:
@@ -811,6 +862,7 @@ def automatic_refresh(run_id, updated_run_id):
       'resuming automatic refresh did not catch up with the worker publication', timeout=25)
     assert loss_state()['range'] == before['range'] and loss_state()['hidden'] == [run_id], 'pause/resume lost chart exploration state'
     assert loss_state()['axis'] == 'wall_clock', 'pause/resume changed the selected wall-clock axis'
+    assert loss_state()['time_zone'] == 'utc' and evaluate("return document.querySelector('#time-zone-utc').checked;"), 'pause/resume changed the selected timezone'
 
     # Inspect the updated run's logs; another real publication must update this
     # tab alone and leave its selection and filter intact.

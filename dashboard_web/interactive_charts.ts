@@ -1,5 +1,6 @@
 export type ParsedChartPoint = { run_index: number; step: string; value: number; value_text: string };
 export type ChartAxis = "step" | "elapsed" | "wall_clock";
+export type ChartTimeZone = "local" | "utc";
 export type ChartPoint = ParsedChartPoint & { x: number; y: number };
 export type ChartRange = { x_axis: ChartAxis; start_x: string; end_x: string };
 type PlotPoint = ChartPoint & { x_value: string; timestamp: string | null; circle: SVGCircleElement };
@@ -15,9 +16,9 @@ type PlotState = {
   scroll_left: number;
   scroll_top: number;
 };
-type PlotController = { dispose(): void; isInteracting(): boolean; capture(): PlotState; restore(state: PlotState): void };
+type PlotController = { dispose(): void; isInteracting(): boolean; capture(): PlotState; restore(state: PlotState): void; setTimeZone(time_zone: ChartTimeZone): void };
 export type ChartPreviewStatus = "ready" | "loading" | "invalid";
-export type ChartController = { dispose(): void; isInteracting(): boolean; previewStatus(): ChartPreviewStatus; replacePreview(html: string): boolean };
+export type ChartController = { dispose(): void; isInteracting(): boolean; previewStatus(): ChartPreviewStatus; replacePreview(html: string): boolean; setTimeZone(time_zone: ChartTimeZone): void };
 const MAX_STEP = 18446744073709551615n;
 const MIN_COORDINATE = -(1n << 127n), MAX_COORDINATE = (1n << 127n) - 1n;
 const NANOS_PER_SECOND = 1_000_000_000n;
@@ -90,7 +91,38 @@ export function restoreChartRange(range: ChartRange | null, full_range: ChartRan
   const clamp = (value: bigint) => value < full_start ? full_start : value > full_end ? full_end : value;
   return { x_axis: range.x_axis, start_x: String(clamp(start)), end_x: String(clamp(end)) };
 }
-export function formatChartX(x_value: string, x_axis: ChartAxis): string {
+type DateParts = { date_text: string; time_text: string; offset_text: string };
+function timeZoneLabel(time_zone: ChartTimeZone): string {
+  return time_zone === "utc" ? "UTC" : new Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+function dateParts(value: bigint, time_zone: ChartTimeZone): DateParts | null {
+  // Keep fractions in BigInt: Date only receives whole seconds, including before
+  // the epoch. No nanoseconds pass through Number or millisecond rounding.
+  let seconds = value / NANOS_PER_SECOND, remainder = value % NANOS_PER_SECOND;
+  if (remainder < 0n) { seconds -= 1n; remainder += NANOS_PER_SECOND; }
+  const date = new Date(Number(seconds) * 1000);
+  if (!Number.isFinite(date.getTime())) return null;
+  const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+  if (time_zone === "utc") {
+    const [date_text, time_text] = date.toISOString().replace(/\.\d{3}Z$/, "").split("T");
+    return { date_text: date_text!, time_text: `${time_text}${fraction}`, offset_text: "UTC" };
+  }
+  const year = date.getFullYear(), pad = (value: number) => String(value).padStart(2, "0");
+  const year_text = year >= 0 && year <= 9999 ? String(year).padStart(4, "0") : `${year < 0 ? "-" : "+"}${String(Math.abs(year)).padStart(6, "0")}`;
+  // Derive the offset at this instant, not today's offset. This also keeps
+  // historical offsets with seconds and avoids Date.UTC's special years 0–99.
+  const local_as_utc = new Date(0);
+  local_as_utc.setUTCFullYear(year, date.getMonth(), date.getDate());
+  local_as_utc.setUTCHours(date.getHours(), date.getMinutes(), date.getSeconds(), 0);
+  const offset = Number.isFinite(local_as_utc.getTime()) ? (local_as_utc.getTime() - date.getTime()) / 1000 : -date.getTimezoneOffset() * 60;
+  const absolute = Math.abs(offset);
+  const offset_text = offset === 0 ? "UTC" : `UTC${offset < 0 ? "−" : "+"}${pad(Math.floor(absolute / 3600))}:${pad(Math.floor(absolute / 60) % 60)}${absolute % 60 === 0 ? "" : `:${pad(absolute % 60)}`}`;
+  return {
+    date_text: `${year_text}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+    time_text: `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${fraction}`, offset_text,
+  };
+}
+export function formatChartX(x_value: string, x_axis: ChartAxis, time_zone: ChartTimeZone = "utc"): string {
   const value = coordinate(x_value, x_axis);
   if (value === null) throw new Error("Invalid chart axis coordinate");
   if (x_axis === "step") return x_value;
@@ -109,25 +141,24 @@ export function formatChartX(x_value: string, x_axis: ChartAxis): string {
     if (seconds >= 60n) return `${sign}${seconds / 60n}:${String(seconds % 60n).padStart(2, "0")}${fraction} min`;
     return `${sign}${seconds}${fraction} s`;
   }
-  // BigInt carries the fractional part separately so Date never rounds recorded
-  // nanoseconds or treats a pre-epoch remainder as a positive future offset.
-  let seconds = value / NANOS_PER_SECOND, remainder = value % NANOS_PER_SECOND;
-  if (remainder < 0n) { seconds -= 1n; remainder += NANOS_PER_SECOND; }
-  const date = new Date(Number(seconds) * 1000);
-  if (!Number.isFinite(date.getTime())) return `${x_value} ns since Unix epoch`;
-  const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
-  return `${date.toISOString().replace(/\.\d{3}Z$/, "").replace("T", " ")}${fraction} UTC`;
+  const parts = dateParts(value, time_zone);
+  if (!parts) return `${x_value} ns since Unix epoch`;
+  const zone = timeZoneLabel(time_zone);
+  return `${parts.date_text} ${parts.time_text} ${parts.offset_text}${time_zone === "local" && zone !== "UTC" ? ` (${zone})` : ""}`;
 }
-export function formatChartTick(x_value: string, range: ChartRange): string {
-  const label = formatChartX(x_value, range.x_axis);
+export function formatChartTick(x_value: string, range: ChartRange, time_zone: ChartTimeZone = "utc"): string {
+  const label = formatChartX(x_value, range.x_axis, time_zone);
   if (range.x_axis !== "wall_clock") return label;
   const [start, end] = coordinatesInRange(range);
-  const parts = /^(\S+) (\S+) UTC$/.exec(label), first = /^(\S+) /.exec(formatChartX(range.start_x, "wall_clock")), last = /^(\S+) /.exec(formatChartX(range.end_x, "wall_clock"));
-  if (!parts?.[1] || !parts[2] || !first?.[1] || !last?.[1]) return label;
-  if (first[1] === last[1]) return parts[2];
-  if (end - start >= 365n * 86400n * NANOS_PER_SECOND) return parts[1];
-  const time = end - start < 120n * NANOS_PER_SECOND ? parts[2] : parts[2].slice(0, 5);
-  return `${parts[1].slice(-5)} ${time}`;
+  const parts = dateParts(BigInt(x_value), time_zone), first = dateParts(start, time_zone), last = dateParts(end, time_zone);
+  if (!parts || !first || !last) return label;
+  // Offset changes can repeat a local hour. Distinguish those ticks without
+  // cluttering ordinary ranges that remain in one offset.
+  const offset = first.offset_text !== last.offset_text ? ` ${parts.offset_text}` : "";
+  if (first.date_text === last.date_text) return `${parts.time_text}${offset}`;
+  if (end - start >= 365n * 86400n * NANOS_PER_SECOND) return parts.date_text;
+  const time = end - start < 120n * NANOS_PER_SECOND ? parts.time_text : parts.time_text.slice(0, 5);
+  return `${parts.date_text.slice(-5)} ${time}${offset}`;
 }
 export function nearestChartPoint<T extends ChartPoint>(points: readonly T[], x: number, y?: number, preferred?: T): T | null {
   if (preferred && points.includes(preferred) && preferred.x === x && (y === undefined || preferred.y === y)) return preferred;
@@ -225,6 +256,7 @@ function parseDashboardPreview(markup: string): Document | null {
 
 export function createChartController(frame: HTMLIFrameElement): ChartController {
   let plots: PlotController[] = [], current_document: Document | null = null, disposed = false;
+  let time_zone: ChartTimeZone = "local";
   let completed_source: string | null = null;
   const hidden_runs = new Map<string, string[]>();
   const clear = (forget_visibility = false) => {
@@ -247,7 +279,7 @@ export function createChartController(frame: HTMLIFrameElement): ChartController
   function enhanceDocument(document: Document): void {
     current_document = document;
     for (const svg of document.querySelectorAll<SVGSVGElement>(".plot-scroll > svg")) {
-      const plot = enhancePlot(document, svg);
+      const plot = enhancePlot(document, svg, time_zone);
       if (plot) plots.push(plot);
     }
   }
@@ -267,6 +299,11 @@ export function createChartController(frame: HTMLIFrameElement): ChartController
   observer?.observe(frame, { attributes: true, attributeFilter: ["src"] });
   enhance();
   return {
+    setTimeZone(next) {
+      if (disposed || time_zone === next) return;
+      time_zone = next;
+      for (const plot of plots) plot.setTimeZone(next);
+    },
     dispose() { disposed = true; frame.removeEventListener("load", loaded); observer?.disconnect(); clear(true); },
     isInteracting() { return plots.some(plot => plot.isInteracting()); },
     previewStatus() {
@@ -332,7 +369,7 @@ export function attachChartInteractions(frame: HTMLIFrameElement): () => void {
   return () => controller.dispose();
 }
 
-function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | null {
+function enhancePlot(document: Document, svg: SVGSVGElement, time_zone: ChartTimeZone): PlotController | null {
   const section = svg.closest<HTMLElement>("section.card");
   const region = svg.parentElement;
   const legend = section?.querySelector<HTMLUListElement>("ul.legend");
@@ -343,10 +380,15 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
   const full_range: ChartRange = parsed_range;
   let range = full_range, follow_full = true, keyboard_index = -1, keyboard_anchor: PlotPoint | null = null;
   let drag_start: { x: number; screen_x: number; pointer_id: number } | null = null;
+  let inspection: { x: number; y: number | undefined; anchor: PlotPoint | undefined } | null = null;
   const listeners: (() => void)[] = [];
   const original_nodes = [...svg.childNodes];
   const original_attributes = new Map<Element, Record<string, string | null>>();
   const original_description = region.getAttribute("aria-describedby");
+  const axis_label = [...svg.querySelectorAll<SVGTextElement>("text.axis-label")].find(node => Number(node.getAttribute("y")) === BOTTOM + 52);
+  const original_axis_label = axis_label?.textContent ?? "";
+  const context = full_range.x_axis === "wall_clock" && region.nextElementSibling?.matches("p.muted") ? region.nextElementSibling : null;
+  const original_context = context?.textContent ?? "";
   function remember(node: Element, names: string[]): void {
     original_attributes.set(node, Object.fromEntries(names.map(name => [name, node.getAttribute(name)])));
   }
@@ -431,6 +473,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
   function clearHighlights(): void { for (const [circle, original] of original_points) circle.setAttribute("r", original.r); }
   function showAt(x: number, y?: number, announce = false, anchor?: PlotPoint): void {
     const position = Math.max(LEFT, Math.min(RIGHT, x));
+    inspection = { x: position, y, anchor };
     crosshair.setAttribute("display", ""); crosshair.setAttribute("x1", String(position)); crosshair.setAttribute("x2", String(position));
     readout.setAttribute("aria-live", announce ? "polite" : "off"); readout_values.replaceChildren(); clearHighlights();
     keyboard_anchor = announce && anchor ? anchor : null;
@@ -446,7 +489,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
         row.setAttribute("data-chart-step", point.step); row.setAttribute("data-chart-value", point.value_text);
         row.setAttribute("data-chart-x", point.x_value);
         if (range.x_axis === "elapsed") row.append(html(document, "span", `Elapsed ${formatChartX(point.x_value, "elapsed")}`));
-        if (range.x_axis === "wall_clock") row.append(html(document, "span", formatChartX(point.x_value, "wall_clock")));
+        if (range.x_axis === "wall_clock") row.append(html(document, "span", formatChartX(point.x_value, "wall_clock", time_zone)));
         if (point.timestamp) row.append(html(document, "span", `timestamp ${point.timestamp}`));
         if (point.timestamp) row.setAttribute("data-chart-timestamp", point.timestamp);
         if (first) { keyboard_index = points.indexOf(point); first = false; }
@@ -455,7 +498,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
     }
     if (!readout_values.childNodes.length) readout_values.append(html(document, "span", "No visible runs. Use the legend to show a run."));
   }
-  function draw(): void {
+  function drawLabels(): void {
     axis.replaceChildren();
     const [start, end] = coordinatesInRange(range), span = end - start;
     const count = span === 0n ? 1 : range.x_axis !== "step" || Math.max(range.start_x.length, range.end_x.length) > 12 ? 3 : 5;
@@ -463,11 +506,26 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
     for (let index = 0; index < count; index++) {
       const value = count === 1 ? start : start + span * BigInt(index) / BigInt(count - 1);
       const coordinate = String(value); if (seen.has(coordinate)) continue; seen.add(coordinate);
-      const label = formatChartTick(coordinate, range);
+      const label = formatChartTick(coordinate, range, time_zone);
       const x = LEFT + chartXFraction(coordinate, range) * (RIGHT - LEFT);
       axis.append(svgNode(document, "line", { class: "grid", x1: String(x), x2: String(x), y1: String(TOP), y2: String(BOTTOM) }));
       const text = svgNode(document, "text", { class: "tick", x: String(x), y: String(BOTTOM + 23), "text-anchor": count === 1 ? "middle" : index === 0 ? "start" : index === count - 1 ? "end" : "middle" }); text.textContent = label; axis.append(text);
     }
+    const first_label = formatChartX(range.start_x, range.x_axis, time_zone), last_label = formatChartX(range.end_x, range.x_axis, time_zone);
+    const label = range.x_axis === "step" ? start === end ? "Step" : "Steps" : range.x_axis === "elapsed" ? "Elapsed" : "Date & time";
+    range_label.textContent = start === end ? `${label} ${first_label}` : `${label} ${first_label}–${last_label}`;
+    range_label.setAttribute("data-x-axis", range.x_axis); range_label.setAttribute("data-start-x", range.start_x); range_label.setAttribute("data-end-x", range.end_x);
+    range_label.setAttribute("data-time-zone", time_zone);
+    if (range.x_axis === "step") { range_label.setAttribute("data-start-step", range.start_x); range_label.setAttribute("data-end-step", range.end_x); }
+    if (range.x_axis === "wall_clock") {
+      const zone = timeZoneLabel(time_zone), first = dateParts(start, time_zone), last = dateParts(end, time_zone);
+      if (axis_label) axis_label.textContent = `Date & time (${zone})`;
+      if (context) context.textContent = first && last ? first.date_text === last.date_text ? `${zone} date: ${first.date_text}.` : `${zone} dates: ${first.date_text}–${last.date_text}.` : `Dates and times are shown in ${zone}.`;
+    }
+  }
+  function draw(): void {
+    drawLabels();
+    const [start, end] = coordinatesInRange(range), span = end - start;
     for (const item of series.values()) {
       item.button.disabled = !item.points.length;
       item.button.setAttribute("aria-pressed", String(item.visible));
@@ -479,11 +537,6 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
       item.polyline?.setAttribute("points", item.points.map(point => `${point.x},${point.y}`).join(" "));
       item.polyline?.setAttribute("display", item.visible ? "" : "none");
     }
-    const first_label = formatChartX(range.start_x, range.x_axis), last_label = formatChartX(range.end_x, range.x_axis);
-    const label = range.x_axis === "step" ? start === end ? "Step" : "Steps" : range.x_axis === "elapsed" ? "Elapsed" : "UTC time";
-    range_label.textContent = start === end ? `${label} ${first_label}` : `${label} ${first_label}–${last_label}`;
-    range_label.setAttribute("data-x-axis", range.x_axis); range_label.setAttribute("data-start-x", range.start_x); range_label.setAttribute("data-end-x", range.end_x);
-    if (range.x_axis === "step") { range_label.setAttribute("data-start-step", range.start_x); range_label.setAttribute("data-end-step", range.end_x); }
     zoom_in.disabled = start === end || span <= 1n;
     zoom_out.disabled = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
     reset.disabled = zoom_out.disabled && follow_full;
@@ -491,6 +544,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
     readout_values.replaceChildren(html(document, "span", "Hover or use arrow keys to inspect displayed samples."));
     keyboard_index = -1;
     keyboard_anchor = null;
+    inspection = null;
   }
   function applyRange(next: ChartRange): void {
     range = next; follow_full = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
@@ -546,6 +600,19 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
   });
   draw();
   return {
+    setTimeZone(next) {
+      if (time_zone === next) return;
+      time_zone = next;
+      range_label.setAttribute("data-time-zone", time_zone);
+      if (range.x_axis !== "wall_clock") return;
+      drawLabels();
+      if (inspection) {
+        const anchor = keyboard_anchor, index = keyboard_index, crosshair_display = crosshair.getAttribute("display");
+        showAt(inspection.x, inspection.y, false, inspection.anchor);
+        keyboard_anchor = anchor; keyboard_index = index;
+        if (crosshair_display !== null) crosshair.setAttribute("display", crosshair_display);
+      }
+    },
     isInteracting() { return drag_start !== null; },
     capture() {
       const active = document.activeElement;
@@ -583,6 +650,8 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
         for (const [name, value] of Object.entries(attributes)) value === null ? node.removeAttribute(name) : node.setAttribute(name, value);
       }
       svg.replaceChildren(...original_nodes); styles.remove(); controls.remove(); hint.remove(); readout.remove();
+      if (axis_label) axis_label.textContent = original_axis_label;
+      if (context) context.textContent = original_context;
       if (original_description === null) region.removeAttribute("aria-describedby"); else region.setAttribute("aria-describedby", original_description);
       section.removeAttribute("data-interactive-chart");
     },
