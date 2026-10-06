@@ -315,11 +315,17 @@ def time_axes(browser, run_ids, prefix='workspace'):
       return range && svg ? {axis: svg.dataset.xAxis, range: [range.dataset.startX, range.dataset.endX],
         domain: [svg.dataset.xMin, svg.dataset.xMax], hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent)} : null;''')
   def choose(axis):
+    evaluate('''window.__acceptance_axis_document = document.querySelector('#chart-frame').contentDocument;
+      window.__acceptance_axis_plots = [...window.__acceptance_axis_document.querySelectorAll('[data-interactive-chart]')];''')
     select_chart_axis(browser, axis)
     try:
       wait_for(lambda: (state() or {}).get('axis') == axis, 'native axis selection did not update the plot')
     except AssertionError as error:
       raise AssertionError('native axis selection did not update the plot: ' + json.dumps(chart_axis_diagnostics(browser, axis))) from error
+    assert evaluate("return window.__acceptance_axis_plots.length === 2 && window.__acceptance_axis_plots.every(node => !node.isConnected);"), 'changed axis preview did not dispose the previous plot nodes'
+    assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__acceptance_axis_document;"), 'axis switch replaced the chart document and its HTTP security policy'
+    assert evaluate('''const plots = [...document.querySelector('#chart-frame').contentDocument.querySelectorAll('[data-interactive-chart]')];
+      return plots.length === 2 && plots.every(node => node.querySelectorAll('[data-chart-hit]').length === 1);'''), 'axis switch lost or duplicated chart interaction layers'
     assert 'x_axis=' + axis in evaluate("return document.querySelector('#open-chart').href;"), 'Open chart lost the selected axis'
   def child():
     browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
@@ -507,9 +513,11 @@ def workspace(run_id, second_run_id):
     browser.click('#refresh-button')
     wait_for(lambda: not evaluate("return document.querySelector('#refresh-button').disabled;"), 'Refresh did not finish')
     assert check_selection([run_id, second_run_id]), 'Refresh lost the selected comparison'
-    wait_for(lambda: evaluate("return window.__acceptance_previous_plots.every(node => !node.isConnected);") , 'Refresh did not dispose the previous chart nodes')
+    assert evaluate('''const plots = [...document.querySelector('#chart-frame').contentDocument.querySelectorAll('[data-interactive-chart]')];
+      return plots.length === window.__acceptance_previous_plots.length && plots.every((node, index) => node === window.__acceptance_previous_plots[index] && node.isConnected);'''), 'unchanged warm Refresh replaced the live plot nodes'
     assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__acceptance_chart_document;"), 'Refresh replaced the chart document and its HTTP security policy'
     wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'Refresh lost or duplicated chart interaction layers')
+    interactive_charts(browser, [run_id, second_run_id])
     browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
     assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
     assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow dashboard overflows horizontally'

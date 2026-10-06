@@ -111,8 +111,9 @@ the active Logs tab. `workspace-auto-refresh.png` captures the updated chart;
 
 Native pointer and keyboard input also checks exact hover readouts, drag zoom,
 zoom/reset controls, and per-run legend toggles on both dashboard hosts. Repeated
-samples stay individually reachable, Refresh removes the old chart handlers,
-and interaction does not fetch more metric data. Chart scripts remain blocked.
+samples stay individually reachable. Changed previews remove the old chart
+handlers; unchanged Refresh retains their controls. Interaction does not fetch
+more metric data. Chart scripts remain blocked.
 Hover and zoom screenshots are included in the CI diagnostics.
 
 Time-axis checks on both dashboard hosts cover elapsed and wall-clock hover,
