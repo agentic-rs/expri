@@ -90,19 +90,35 @@ class Firefox:
     geometry = self.call('POST', '/execute/sync', {'script': '''const node = arguments[0];
       node.scrollIntoView({block: 'center', inline: 'nearest'});
       const rect = node.getBoundingClientRect();
-      return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
-        width: rect.width, viewport_width: innerWidth, viewport_height: innerHeight};''', 'args': [{ELEMENT: element}]})
-    left = max(0, geometry['left'])
-    right = min(geometry['viewport_width'], geometry['right'])
-    top = max(0, geometry['top'])
-    bottom = min(geometry['viewport_height'], geometry['bottom'])
+      const visible = {left: Math.max(0, rect.left), right: Math.min(innerWidth, rect.right),
+        top: Math.max(0, rect.top), bottom: Math.min(innerHeight, rect.bottom)};
+      const origin_x = Math.floor((visible.left + visible.right) / 2);
+      const origin_y = Math.floor((visible.top + visible.bottom) / 2);
+      for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor);
+        const box = ancestor.getBoundingClientRect();
+        if (/^(auto|scroll|hidden|clip)$/.test(style.overflowX)) {
+          visible.left = Math.max(visible.left, box.left + ancestor.clientLeft);
+          visible.right = Math.min(visible.right, box.left + ancestor.clientLeft + ancestor.clientWidth);
+        }
+        if (/^(auto|scroll|hidden|clip)$/.test(style.overflowY)) {
+          visible.top = Math.max(visible.top, box.top + ancestor.clientTop);
+          visible.bottom = Math.min(visible.bottom, box.top + ancestor.clientTop + ancestor.clientHeight);
+        }
+      }
+      return {...visible, rect_left: rect.left, width: rect.width, origin_x, origin_y};''', 'args': [{ELEMENT: element}]})
+    left = geometry['left']
+    right = geometry['right']
+    top = geometry['top']
+    bottom = geometry['bottom']
     assert left < right and top < bottom, 'chart pointer target is outside the viewport'
-    center_x = int((left + right) / 2)
-    center_y = int((top + bottom) / 2)
     def move(position, duration):
-      target_x = int(max(left + 1, min(right - 1, geometry['left'] + position * geometry['width'])))
+      target_x = int(max(left + 1, min(right - 1, geometry['rect_left'] + position * geometry['width'])))
+      target_y = int((top + bottom) / 2)
+      assert self.call('POST', '/execute/sync', {'script': 'return document.elementFromPoint(arguments[1], arguments[2]) === arguments[0];',
+        'args': [{ELEMENT: element}, target_x, target_y]}), 'native chart pointer target is clipped or covered'
       return {'type': 'pointerMove', 'duration': duration, 'origin': {ELEMENT: element},
-        'x': target_x - center_x, 'y': int((top + bottom) / 2) - center_y}
+        'x': target_x - geometry['origin_x'], 'y': target_y - geometry['origin_y']}
     actions = [move(fraction, 100)]
     if drag_to is not None:
       actions += [{'type': 'pointerDown', 'button': 0}, move(drag_to, 300), {'type': 'pointerUp', 'button': 0}]
