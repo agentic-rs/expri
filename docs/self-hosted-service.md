@@ -222,5 +222,9 @@ verified 500 CSS pixel viewport, saving screenshots for diagnostics. This Firefo
 check does not cover 320/360 pixel mobile widths. A second HTTPS hostname also
 checks branch assets against the same catalog, cookie replay rejection, and
 independent login/logout sessions.
+Both hosts also exercise chart hover, drag zoom, legend toggles, and keyboard
+inspection through native browser input. The checks preserve repeated samples,
+verify chart script blocking, and require no additional metric requests during
+interaction. Narrow layouts and chart reloads retain working controls.
 Browser request logs contain method, path, origin, status and response policy,
 without credentials or cookies.
