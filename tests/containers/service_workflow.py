@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKER_QUEUE = '/home/tester/experiment/.expri/service-sync'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--no-build', action='store_true')
 options = parser.parse_args()
@@ -247,7 +248,7 @@ if {log!r}:
     output.write('automatic refresh log fixture\\n')
 '''
   python(worker, code)
-  client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', '/home/tester/queue')
+  client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
 
 def automatic_dashboard_checks(run_id, updated):
   global refresh_browser
@@ -377,8 +378,7 @@ prefix = "acceptance"
   receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /home/tester/private.bin').stdout)
   run_id, run_dir = receipt['run_id'], receipt['run_dir']
   assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
-  queue_dir = '/home/tester/experiment/.expri/service-sync'
-  push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', queue_dir]
+  push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
   def publishing(directory):
     return json.loads(python(worker, f"from pathlib import Path;print(Path({directory!r}+'/publishing-state.json').read_text())"))
   wait_for(lambda: api_proxy('/test/state')['lost_stream_ack'], 'live metrics did not arrive or the lost stream acknowledgement was not injected')
