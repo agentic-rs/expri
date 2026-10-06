@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::super::types::{ClientConfig, MAX_REQUEST, Request, Response};
 use super::fs::{self, message};
-use crate::error::Result;
+use crate::error::{ExpriError, Result};
 
 pub(super) struct Api {
   pub(super) endpoint: String,
@@ -17,6 +17,15 @@ pub(super) struct Api {
 }
 
 impl Api {
+  pub(super) fn redact(&self, detail: &str) -> String {
+    detail
+      .replace(&self.token, "[redacted]")
+      .chars()
+      .filter(|character| !character.is_control())
+      .take(512)
+      .collect()
+  }
+
   pub(super) fn new(path: &Path) -> Result<Self> {
     super::super::storage::init_tls();
     let config: ClientConfig = toml::from_str(
@@ -87,12 +96,10 @@ impl Api {
             .map(str::to_string)
         })
         .unwrap_or_else(|| "request rejected".into());
-      let detail: String = detail
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(512)
-        .collect();
-      return Err(message(format!("service returned {status}: {detail}")));
+      return Err(ExpriError::ServiceRejected {
+        status: status.as_u16(),
+        detail: self.redact(&detail),
+      });
     }
     serde_json::from_slice(&bytes).map_err(Into::into)
   }

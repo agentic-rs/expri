@@ -108,6 +108,124 @@ fn root() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
+fn manual_and_automatic_diagnostics_redact_the_in_memory_service_token() {
+  let (_temporary, root) = root();
+  let api = Api::new(&config(&root, "http://example.invalid")).unwrap();
+  let token = std::env::var("PATH").unwrap();
+  assert_eq!(
+    api.redact(&format!("rejected {token}\n retry")),
+    "rejected [redacted] retry"
+  );
+}
+
+#[test]
+fn automatic_status_stays_small_when_manual_queue_has_long_artifact_names() {
+  let (_temporary, root) = root();
+  let run_dir = root.join("run-progress");
+  fs::directories(&run_dir).unwrap();
+  std::fs::write(
+    run_dir.join("run-state.json"),
+    br#"{"run_id":"run-progress","status":"running"}"#,
+  )
+  .unwrap();
+  let options = PushOptions {
+    config: config(&root, "http://example.invalid"),
+    run_dir,
+    project_id: "project".into(),
+    origin: "worker".into(),
+    artifacts: Vec::new(),
+    watch: true,
+    queue_dir: root.join("queue"),
+  };
+  let mut publisher = Publisher::new(&options).unwrap();
+  for index in 0..64 {
+    let path = format!("outputs/{}/{index}.bin", vec!["a".repeat(90); 10].join("/"));
+    validate_run_path(&path).unwrap();
+    publisher.queue.state.files.insert(
+      path.clone(),
+      SavedFile {
+        target: run_target(&publisher.scope, &path),
+        size: 0,
+        sha256: "0".repeat(64),
+        snapshot: None,
+        upload: UploadState {
+          upload_id: format!("finished-{index}"),
+          part_size: 8 * 1024 * 1024,
+          parts: Vec::new(),
+          complete: true,
+        },
+      },
+    );
+  }
+  publisher
+    .queue
+    .state
+    .streams
+    .insert("outputs/metrics.jsonl".into(), 100);
+  let progress = publisher.progress(false);
+  assert_eq!(progress["files_completed"], 64);
+  assert_eq!(progress["stream_offsets"]["outputs/metrics.jsonl"], 100);
+  assert!(serde_json::to_vec_pretty(&progress).unwrap().len() < 1024);
+  assert_eq!(
+    publisher.report(false)["files"].as_array().unwrap().len(),
+    64,
+    "manual report lost its selected file list"
+  );
+}
+
+#[test]
+fn rejected_authentication_keeps_pending_queue_and_redacts_the_response_before_bounding() {
+  let (_temporary, root) = root();
+  let token = std::env::var("PATH").unwrap();
+  let echoed = token.clone();
+  let (url, task) = mock(1, move |request, _| {
+    assert!(matches!(
+      serde_json::from_slice::<Request>(&request.body).unwrap(),
+      Request::BeginUpload { .. }
+    ));
+    (
+      401,
+      Vec::new(),
+      serde_json::to_vec(&json!({"error": format!("{} {echoed}", "x".repeat(480))})).unwrap(),
+    )
+  });
+  let run_dir = root.join("run-auth");
+  fs::directories(&run_dir).unwrap();
+  std::fs::write(run_dir.join("snapshot.json"), br#"{"run_id":"run-auth"}"#).unwrap();
+  std::fs::write(
+    run_dir.join("run-state.json"),
+    br#"{"run_id":"run-auth","status":"running"}"#,
+  )
+  .unwrap();
+  let options = PushOptions {
+    config: config(&root, &url),
+    run_dir,
+    project_id: "project".into(),
+    origin: "worker".into(),
+    artifacts: Vec::new(),
+    watch: true,
+    queue_dir: root.join("queue"),
+  };
+  let mut publisher = Publisher::new(&options).unwrap();
+  let failure = publisher.cycle(&mut |_| Ok(())).unwrap_err();
+  assert!(Publisher::authentication_rejected(&failure));
+  let detail = publisher.error_text(&failure);
+  assert!(!detail.contains(&token));
+  assert!(!detail.contains(token.chars().take(20).collect::<String>().as_str()));
+  let saved = &publisher.queue.state.files["snapshot.json"];
+  assert!(!saved.upload.complete);
+  assert!(
+    publisher
+      .queue
+      .directory
+      .join(saved.snapshot.as_ref().unwrap())
+      .is_file()
+  );
+  assert!(publisher.queue.directory.join("queue.json").is_file());
+  task.join().unwrap();
+}
+
+#[test]
 fn failed_begin_preserves_id_and_immutable_metadata_snapshot_for_retry() {
   let (_temporary, root) = root();
   let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -594,7 +712,18 @@ fn watching_a_future_artifact_still_forwards_live_complete_metric_rows() {
     );
   }
   let selected = BTreeSet::from(["outputs/checkpoint.pt".into()]);
-  assert!(!push_cycle(&api, &mut queue, &scope, &run_dir, &selected, true).unwrap());
+  assert!(
+    !push_cycle(
+      &api,
+      &mut queue,
+      &scope,
+      &run_dir,
+      &selected,
+      true,
+      &mut |_| Ok(())
+    )
+    .unwrap()
+  );
   assert_eq!(
     queue.state.streams["outputs/metrics.jsonl"],
     row.len() as u64
@@ -675,6 +804,157 @@ fn terminal_metric_flush_preserves_the_unterminated_final_row() {
   assert_eq!(
     queue.state.streams["outputs/metrics.jsonl"],
     bytes.len() as u64
+  );
+  task.join().unwrap();
+}
+
+#[test]
+fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progress() {
+  let (_temporary, root) = root();
+  let began = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+  let requests = began.clone();
+  let mut uploads =
+    std::collections::BTreeMap::<String, (FileTarget, u64, String, UploadState)>::new();
+  let mut offline = true;
+  let (url, task) = mock(11, move |request, origin| {
+    if request.path.starts_with("/objects/") {
+      assert!(
+        !request
+          .headers
+          .to_ascii_lowercase()
+          .contains("authorization:")
+      );
+      return (
+        200,
+        vec![("ETag".into(), "\"fixture-etag\"".into())],
+        Vec::new(),
+      );
+    }
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::BeginUpload {
+        upload_id,
+        target,
+        size,
+        sha256,
+      } => {
+        requests.lock().unwrap().push(upload_id.clone());
+        if offline {
+          offline = false;
+          return (
+            503,
+            Vec::new(),
+            br#"{"error":"fixture unavailable"}"#.to_vec(),
+          );
+        }
+        let entry = uploads.entry(upload_id.clone()).or_insert_with(|| {
+          (
+            target,
+            size,
+            sha256,
+            UploadState {
+              upload_id,
+              part_size: 8 * 1024 * 1024,
+              parts: Vec::new(),
+              complete: false,
+            },
+          )
+        });
+        Response::Upload {
+          upload: entry.3.clone(),
+        }
+      }
+      Request::PartUrl {
+        upload_id,
+        part_number,
+      } => {
+        assert_eq!(part_number, 1);
+        Response::Url {
+          url: format!("{origin}/objects/{upload_id}"),
+        }
+      }
+      Request::RecordPart { upload_id, part } => {
+        let upload = &mut uploads.get_mut(&upload_id).unwrap().3;
+        upload.parts.push(part);
+        Response::Upload {
+          upload: upload.clone(),
+        }
+      }
+      Request::CompleteUpload { upload_id } => {
+        let (target, size, sha256, upload) = uploads.get_mut(&upload_id).unwrap();
+        assert_eq!(upload.parts.len(), 1);
+        upload.complete = true;
+        Response::File {
+          file: FileRecord {
+            target: target.clone(),
+            size: *size,
+            sha256: Some(sha256.clone()),
+            storage: FileStorage::Object,
+          },
+        }
+      }
+      _ => panic!("unexpected publishing request"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let run_dir = root.join("run-1");
+  fs::directories(&run_dir).unwrap();
+  std::fs::write(run_dir.join("snapshot.json"), br#"{"run_id":"run-1"}"#).unwrap();
+  std::fs::write(
+    run_dir.join("run-state.json"),
+    br#"{"run_id":"run-1","status":"lost"}"#,
+  )
+  .unwrap();
+  let options = PushOptions {
+    config: config(&root, &url),
+    run_dir,
+    project_id: "project".into(),
+    origin: "worker".into(),
+    artifacts: Vec::new(),
+    watch: true,
+    queue_dir: root.join("queue"),
+  };
+  let mut publisher = Publisher::new(&options).unwrap();
+  let mut progress = Vec::new();
+  assert!(
+    publisher
+      .cycle(&mut |value| {
+        progress.push(value);
+        Ok(())
+      })
+      .is_err()
+  );
+  assert!(
+    progress.is_empty(),
+    "failed work must not be reported as acknowledged"
+  );
+  let queue_path = publisher.queue.directory.clone();
+  assert!(queue_path.join("queue.json").is_file());
+  drop(publisher);
+  let mut publisher = Publisher::new(&options).unwrap();
+  assert!(
+    publisher
+      .cycle(&mut |value| {
+        progress.push(value);
+        Ok(())
+      })
+      .unwrap()
+  );
+  let report = publisher.report(true);
+  assert_eq!(report["terminal"], true);
+  assert_eq!(report["files"], json!(["run-state.json", "snapshot.json"]));
+  assert_eq!(progress.len(), 2);
+  assert!(
+    publisher
+      .queue
+      .state
+      .files
+      .values()
+      .all(|saved| saved.upload.complete && saved.snapshot.is_none())
+  );
+  let seen = began.lock().unwrap();
+  assert_eq!(
+    seen[0], seen[1],
+    "restart changed the durable pending upload identity"
   );
   task.join().unwrap();
 }

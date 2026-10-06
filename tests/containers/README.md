@@ -87,6 +87,12 @@ SHA256-pinned Mozilla geckodriver 0.36.0 release artifacts for amd64 and arm64.
 It checks immutable private inputs, upload recovery, selective downloads and
 offline review without shared project directories or published ports.
 
+Configured runs start their own native publishers in this suite. Training
+finishes through a service outage; killing and resuming the publisher reuses
+its saved intent and acknowledged stream/upload offsets. Failed and cancelled
+runs also reach `synced`, with their original task status preserved in hosted
+review. Checkpoints remain absent until explicitly selected.
+
 The service suite also submits real browser login and logout forms over a
 generated internal HTTPS certificate. It reproduces `Origin: null` failures
 under `no-referrer`, then verifies successful forms under `same-origin`, cookie
@@ -128,6 +134,11 @@ as omissions in time views, and retain legend choices when their empty time
 view returns to Step. Live publications preserve exact elapsed and UTC
 zoom ranges and the selected timezone. `workspace-elapsed.png` and `workspace-wall_clock.png` (plus their
 AB counterparts) capture these controls.
+
+The native run-link check starts logged out, follows a project/origin/run link
+through the password form, and opens the exact run's Charts tab. Selecting a
+different run and refreshing preserves that choice. `browser-deep-link.log`
+records the assertions without credentials or request bodies.
 
 The service workflow also opens an AB hostname in Firefox. It verifies distinct
 branch asset URLs, the same uploaded runs and comparison values, rejected cookie

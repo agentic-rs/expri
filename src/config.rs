@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,8 @@ pub struct Config {
   pub download: Option<DownloadConfig>,
   #[serde(default)]
   pub environment: Option<EnvironmentConfig>,
+  #[serde(default)]
+  pub service: Option<RunServiceConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +48,57 @@ pub struct TargetConfig {
   pub ctl_method: Option<String>,
   #[serde(default)]
   pub environment: Option<EnvironmentConfig>,
+  #[serde(default)]
+  pub service: Option<RunServiceConfig>,
+}
+
+/// Safe publishing intent. Credentials are resolved on the executing worker.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunServiceConfig {
+  pub client_config: PathBuf,
+  pub project_id: String,
+  pub origin: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub dashboard_url: Option<String>,
+}
+
+impl RunServiceConfig {
+  pub fn validate(&self) -> Result<()> {
+    if !self.client_config.is_absolute()
+      || self
+        .client_config
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+      return Err(ExpriError::Message(
+        "service.client_config must be an absolute path on the executing worker without '..'"
+          .into(),
+      ));
+    }
+    for (name, value) in [("project_id", &self.project_id), ("origin", &self.origin)] {
+      crate::service::validate_component(value)
+        .map_err(|_| ExpriError::Message(format!("invalid service.{name}")))?;
+    }
+    if let Some(value) = &self.dashboard_url {
+      let url = reqwest::Url::parse(value)
+        .map_err(|_| ExpriError::Message("invalid service.dashboard_url".into()))?;
+      if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.path() != "/"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+      {
+        return Err(ExpriError::Message(
+          "service.dashboard_url must be an HTTP(S) root URL without credentials, query, or fragment"
+            .into(),
+        ));
+      }
+    }
+    Ok(())
+  }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -210,6 +263,7 @@ impl Config {
       config.target.extend(target_config.target);
     }
     config.local_environment()?;
+    config.local_service()?;
     for name in config.target.keys() {
       config.target(name)?;
     }
@@ -256,8 +310,16 @@ impl Config {
     if target.environment.is_none() {
       target.environment = self.environment.clone();
     }
+    if target.service.is_none() {
+      target.service = self.service.clone();
+    }
     if let Some(environment) = &target.environment {
       environment
+        .validate()
+        .map_err(|error| ExpriError::Message(format!("target {name:?}: {error}")))?;
+    }
+    if let Some(service) = &target.service {
+      service
         .validate()
         .map_err(|error| ExpriError::Message(format!("target {name:?}: {error}")))?;
     }
@@ -269,6 +331,13 @@ impl Config {
       environment.validate()?;
     }
     Ok(self.environment.clone())
+  }
+
+  pub fn local_service(&self) -> Result<Option<RunServiceConfig>> {
+    if let Some(service) = &self.service {
+      service.validate()?;
+    }
+    Ok(self.service.clone())
   }
 
   pub fn task(&self, name: &str) -> Result<TaskConfig> {
@@ -373,6 +442,83 @@ fn target_config_path(path: &Path) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn publishing_config_inherits_or_overrides_whole_worker_scope() {
+    let config: Config = toml::from_str(
+      r#"
+[service]
+client_config = "/etc/expri/local.toml"
+project_id = "vision"
+origin = "local"
+dashboard_url = "https://expri.example.net/"
+[target.inherited]
+host = "gpu.example"
+remote_dir = "/srv/project"
+[target.overridden]
+host = "gpu-2.example"
+remote_dir = "/srv/project"
+[target.overridden.service]
+client_config = "/etc/expri/worker.toml"
+project_id = "vision"
+origin = "gpu-2"
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.local_service().unwrap(), config.service);
+    assert_eq!(config.target("inherited").unwrap().service, config.service);
+    let service = config.target("overridden").unwrap().service.unwrap();
+    assert_eq!(service.origin, "gpu-2");
+    assert_eq!(service.dashboard_url, None);
+  }
+
+  #[test]
+  fn publishing_config_rejects_credentials_and_unsafe_references() {
+    let base = RunServiceConfig {
+      client_config: "/etc/expri/worker.toml".into(),
+      project_id: "vision".into(),
+      origin: "gpu-1".into(),
+      dashboard_url: None,
+    };
+    assert!(base.validate().is_ok());
+    for path in ["worker.toml", "/etc/../worker.toml"] {
+      assert!(
+        RunServiceConfig {
+          client_config: path.into(),
+          ..base.clone()
+        }
+        .validate()
+        .is_err()
+      );
+    }
+    for origin in ["", "..", "worker/1", "x\n"] {
+      assert!(
+        RunServiceConfig {
+          origin: origin.into(),
+          ..base.clone()
+        }
+        .validate()
+        .is_err()
+      );
+    }
+    for url in [
+      "file:///tmp/dashboard",
+      "https://token@example.net",
+      "https://example.net/?token=x",
+      "https://example.net/#x",
+    ] {
+      assert!(
+        RunServiceConfig {
+          dashboard_url: Some(url.into()),
+          ..base.clone()
+        }
+        .validate()
+        .is_err()
+      );
+    }
+    let raw = "client_config='/etc/expri/worker.toml'\nproject_id='vision'\norigin='gpu-1'\ntoken='must-not-be-copied'";
+    assert!(toml::from_str::<RunServiceConfig>(raw).is_err());
+  }
 
   #[test]
   fn target_defaults_to_ssh_transport() {

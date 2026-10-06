@@ -200,6 +200,10 @@ struct RunCommand {
   #[arg(long)]
   no_sync: bool,
 
+  /// Disable automatic publishing for this run.
+  #[arg(long)]
+  no_publish: bool,
+
   /// Start an isolated run in the background and return its run identifier.
   #[arg(long)]
   detach: bool,
@@ -435,11 +439,29 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     .unwrap_or_default();
   let (extras, sync_args) = environment_selection(&context.config);
   if target.is_some() {
-    let context = context.into_target(target, command.control_path)?;
+    let mut context = context.into_target(target, command.control_path)?;
+    if command.no_publish {
+      context.target.service = None;
+    }
+    if context.target.service.is_some() && context.target.environment.is_none() {
+      return Err(ExpriError::Message(
+        "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
+      ));
+    }
     if command.detach && context.target.environment.is_none() {
       return Err(ExpriError::Message(
         "--detach requires a configured target environment".to_string(),
       ));
+    }
+    if context.target.service.is_some() {
+      controller::task::check_run_publishing_target(
+        &context.target,
+        &context.control_path,
+        &command.control_persist,
+        command.dry_run,
+        verbosity,
+        quiet,
+      )?;
     }
     let expected_sync = if !command.no_sync {
       let sync = context.config.sync_rules()?;
@@ -488,6 +510,11 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   }
 
   let environment = context.config.local_environment()?;
+  let service = if command.no_publish {
+    None
+  } else {
+    context.config.local_service()?
+  };
   let mut local_sources = remote_managed;
   if let Some(paths) = context
     .config
@@ -508,6 +535,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     verbosity,
     quiet,
     environment,
+    service,
     remote_managed: local_sources,
     extras,
     sync_args,
@@ -525,6 +553,7 @@ mod tests {
       "run",
       "--dry-run",
       "--no-sync",
+      "--no-publish",
       "--detach",
       "train",
       "--model",
@@ -539,6 +568,7 @@ mod tests {
     assert_eq!(command.task[0], "train");
     assert!(command.dry_run);
     assert!(command.no_sync);
+    assert!(command.no_publish);
     assert!(command.detach);
     assert_eq!(command.task[1..], ["--model", "tiny"]);
   }
@@ -603,6 +633,52 @@ ctl_bin = "/missing-must-not-launch-ctl"
       error.to_string(),
       "--detach requires a configured target environment"
     );
+    assert!(!fixture.path().join(".expri").exists());
+  }
+
+  #[test]
+  fn publishing_legacy_task_requires_recorded_environment_and_can_be_disabled() {
+    let fixture = tempfile::tempdir().unwrap();
+    let config = fixture.path().join("expri.toml");
+    std::fs::write(
+      &config,
+      r#"
+[tasks]
+train = ["python", "train.py"]
+[service]
+client_config = "/etc/expri/worker.toml"
+project_id = "vision"
+origin = "local"
+"#,
+    )
+    .unwrap();
+    for disabled in [false, true] {
+      let mut args = vec![
+        "expri",
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        "--dry-run",
+      ];
+      if disabled {
+        args.push("--no-publish");
+      }
+      args.push("train");
+      let Command::Run(command) = Cli::try_parse_from(args).unwrap().command else {
+        panic!("expected run");
+      };
+      let result = run_task(command, None, 0, true);
+      if disabled {
+        assert!(result.is_ok());
+      } else {
+        assert!(
+          result
+            .unwrap_err()
+            .to_string()
+            .contains("automatic publishing requires")
+        );
+      }
+    }
     assert!(!fixture.path().join(".expri").exists());
   }
 }

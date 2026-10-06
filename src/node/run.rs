@@ -24,6 +24,9 @@ pub fn apply_request(request: &RunRequest) -> Result<()> {
 
 pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
   request.environment.validate()?;
+  if let Some(service) = &request.service {
+    service.validate()?;
+  }
   environment::task_argv(&request.command)?;
   let snapshot = environment::snapshot::create_expected(
     repo_root,
@@ -50,6 +53,16 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
     "run directory: {}",
     snapshot.run_dir.display()
   );
+  if let Some(url) = request
+    .service
+    .as_ref()
+    .and_then(|service| crate::service::publishing::dashboard_url(service, &snapshot.run_id))
+  {
+    let _ = writeln!(
+      std::io::stderr(),
+      "dashboard: {url} (available after service sync)"
+    );
+  }
   if request.detach {
     return start_detached(request, repo_root, &snapshot, &mut state);
   }
@@ -65,6 +78,14 @@ fn execute_snapshot(
   worker: bool,
 ) -> Result<()> {
   let state_path = snapshot.run_dir.join("run-state.json");
+  if let Some(service) = &request.service
+    && crate::service::publishing::start(repo_root, &snapshot.run_dir, service).is_err()
+  {
+    let _ = writeln!(
+      std::io::stderr(),
+      "warning: service publishing could not start; the run will continue. Inspect runs status for sync details."
+    );
+  }
   let mut cancelled = false;
   let mut logs_created = None;
   let mut result = (|| {
@@ -236,10 +257,15 @@ fn start_detached(
         .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
       {
         let current = read_record(&snapshot.run_dir.join("run-state.json"), 256 * 1024)?;
-        println!(
-          "{}",
-          json!({"run_id": snapshot.run_id, "run_dir": snapshot.run_dir, "status": current["status"], "detached": true})
-        );
+        let mut receipt = json!({"run_id": snapshot.run_id, "run_dir": snapshot.run_dir, "status": current["status"], "detached": true});
+        if let Some(url) = request
+          .service
+          .as_ref()
+          .and_then(|service| crate::service::publishing::dashboard_url(service, &snapshot.run_id))
+        {
+          receipt["dashboard_url"] = json!(url);
+        }
+        println!("{receipt}");
         return Ok(());
       }
       if let Some(status) = child.try_wait()? {

@@ -30,7 +30,7 @@ pub(super) fn parents(path: &Path) -> Result<()> {
   Ok(())
 }
 
-pub(super) fn directory(path: &Path) -> Result<()> {
+pub(in crate::service) fn directory(path: &Path) -> Result<()> {
   parents(path)?;
   let metadata = fs::symlink_metadata(path)?;
   if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -62,7 +62,7 @@ pub(super) fn directories(path: &Path) -> Result<()> {
   }
 }
 
-pub(super) fn optional_regular(path: &Path) -> Result<()> {
+pub(in crate::service) fn optional_regular(path: &Path) -> Result<()> {
   parents(path)?;
   if let Some(metadata) = inspect(path)?
     && (!metadata.is_file() || metadata.file_type().is_symlink())
@@ -119,7 +119,7 @@ pub(super) fn unchanged(first: &Metadata, second: &Metadata) -> bool {
     && first.modified().ok() == second.modified().ok()
 }
 
-pub(super) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(in crate::service) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
   let mut bytes = Vec::new();
   open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
   if bytes.len() as u64 > limit {
@@ -128,7 +128,7 @@ pub(super) fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
   Ok(bytes)
 }
 
-pub(super) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(in crate::service) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
   optional_regular(path)?;
   let parent = path
     .parent()

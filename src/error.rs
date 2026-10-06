@@ -35,6 +35,10 @@ pub enum ExpriError {
     program: String,
     code: Option<i32>,
   },
+  ServiceRejected {
+    status: u16,
+    detail: String,
+  },
   Message(String),
 }
 
@@ -68,6 +72,12 @@ impl Display for ExpriError {
         Some(code) => write!(formatter, "{program} exited with status {code}"),
         None => write!(formatter, "{program} terminated by signal"),
       },
+      Self::ServiceRejected { status, detail } => {
+        let status = reqwest::StatusCode::from_u16(*status)
+          .map(|value| value.to_string())
+          .unwrap_or_else(|_| status.to_string());
+        write!(formatter, "service returned {status}: {detail}")
+      }
       Self::Message(message) => write!(formatter, "{message}"),
     }
   }

@@ -52,7 +52,7 @@ fn asset_response(status: u16, asset: Asset) -> HttpResponse<Vec<u8>> {
   reply
 }
 
-fn redirect(location: &'static str, cookie: Option<String>) -> HttpResponse<Vec<u8>> {
+fn redirect(location: &str, cookie: Option<String>) -> HttpResponse<Vec<u8>> {
   let mut reply = response(303, "text/plain; charset=utf-8", Vec::new());
   reply
     .headers_mut()
@@ -66,7 +66,16 @@ fn redirect(location: &'static str, cookie: Option<String>) -> HttpResponse<Vec<
   reply
 }
 
+#[cfg(test)]
 fn login_page(assets: &DashboardAssets, incorrect: bool) -> ApiResult<HttpResponse<Vec<u8>>> {
+  login_page_for_run(assets, incorrect, "")
+}
+
+fn login_page_for_run(
+  assets: &DashboardAssets,
+  incorrect: bool,
+  query: &str,
+) -> ApiResult<HttpResponse<Vec<u8>>> {
   let message = if incorrect {
     "<p class=\"login-error\" role=\"alert\">The dashboard password is incorrect.</p>"
   } else {
@@ -75,9 +84,48 @@ fn login_page(assets: &DashboardAssets, incorrect: bool) -> ApiResult<HttpRespon
   let mut page = assets.page("login.html")?;
   let html = String::from_utf8(page.body)
     .expect("validated UTF-8 login page")
-    .replace("<!-- LOGIN_ERROR -->", message);
+    .replace("<!-- LOGIN_ERROR -->", message)
+    .replace(
+      "action=\"/login\"",
+      &format!("action=\"/login{}\"", query.replace('&', "&amp;")),
+    );
   page.body = html.into_bytes();
   Ok(asset_response(if incorrect { 401 } else { 200 }, page))
+}
+
+/// Preserve only a bounded run identity through sign-in, never a redirect URL.
+fn run_query(request: &HttpRequest<Vec<u8>>) -> ApiResult<String> {
+  let Some(raw) = request.uri().query() else {
+    return Ok(String::new());
+  };
+  if raw.len() > 512 {
+    return Err(ApiError::new(400, "invalid dashboard run link"));
+  }
+  let mut fields = std::collections::BTreeMap::new();
+  for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
+    if !matches!(name.as_ref(), "project_id" | "origin" | "run_id")
+      || super::types::validate_component(&value).is_err()
+      || fields
+        .insert(name.into_owned(), value.into_owned())
+        .is_some()
+    {
+      return Err(ApiError::new(400, "invalid dashboard run link"));
+    }
+  }
+  if fields.len() != 3 {
+    return Err(ApiError::new(
+      400,
+      "dashboard run link requires project_id, origin, and run_id",
+    ));
+  }
+  let query = form_urlencoded::Serializer::new(String::new())
+    .extend_pairs(
+      ["project_id", "origin", "run_id"]
+        .into_iter()
+        .map(|name| (name, fields[name].as_str())),
+    )
+    .finish();
+  Ok(format!("?{query}"))
 }
 
 fn password(request: &HttpRequest<Vec<u8>>) -> ApiResult<Vec<u8>> {
@@ -123,19 +171,14 @@ fn route<S: ObjectStorage>(
   }
   match (method, path) {
     ("GET" | "HEAD", "/login") => {
-      if request.uri().query().is_some() {
-        return Err(ApiError::new(400, "login does not accept query parameters"));
-      }
-      return login_page(assets, false);
+      return login_page_for_run(assets, false, &run_query(request)?);
     }
     ("POST", "/login") => {
-      if request.uri().query().is_some() {
-        return Err(ApiError::new(400, "login does not accept query parameters"));
-      }
+      let query = run_query(request)?;
       auth.check_boundary(request, true)?;
       return match auth.login(request, &password(request)?) {
-        Ok(cookie) => Ok(redirect("/", Some(cookie))),
-        Err(error) if error.status == 401 => login_page(assets, true),
+        Ok(cookie) => Ok(redirect(&format!("/{query}"), Some(cookie))),
+        Err(error) if error.status == 401 => login_page_for_run(assets, true, &query),
         Err(error) => Err(error),
       };
     }
@@ -151,9 +194,10 @@ fn route<S: ObjectStorage>(
     _ => {}
   }
   if matches!(path, "/" | "/index.html") {
+    let query = run_query(request)?;
     match auth.authorized_page(request) {
       Ok(()) => {}
-      Err(error) if error.status == 401 => return Ok(redirect("/login", None)),
+      Err(error) if error.status == 401 => return Ok(redirect(&format!("/login{query}"), None)),
       Err(error) => return Err(error),
     }
   } else if !matches!(path, "/styles.css" | "/app.js")
@@ -163,7 +207,7 @@ fn route<S: ObjectStorage>(
   }
   if matches!(path, "/" | "/index.html" | "/styles.css" | "/app.js") || path.starts_with("/assets/")
   {
-    if request.uri().query().is_some() {
+    if request.uri().query().is_some() && !matches!(path, "/" | "/index.html") {
       return Err(ApiError::new(
         400,
         "dashboard pages and assets do not accept query parameters",
@@ -310,6 +354,84 @@ mod tests {
         .to_str()
         .unwrap()
         .contains("form-action 'self'")
+    );
+  }
+
+  #[test]
+  fn run_links_survive_authentication_without_accepting_redirect_urls() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(temporary.path(), MockStorage::default()).unwrap();
+    let auth = BrowserAuth::new(
+      "https://expri.example.com",
+      b"a-dedicated-dashboard-password",
+    )
+    .unwrap();
+    let query = "?project_id=vision&origin=gpu-1&run_id=run-123";
+    let reply = handle(&store, &auth, &request("GET", &format!("/{query}"), b""));
+    assert_eq!(reply.status(), 303);
+    assert_eq!(reply.headers()["Location"], format!("/login{query}"));
+    let page = handle(
+      &store,
+      &auth,
+      &request("GET", &format!("/login{query}"), b""),
+    );
+    assert_eq!(page.status(), 200);
+    assert!(
+      String::from_utf8_lossy(page.body())
+        .contains("action=\"/login?project_id=vision&amp;origin=gpu-1&amp;run_id=run-123\"")
+    );
+    let mut login = request(
+      "POST",
+      &format!("/login{query}"),
+      b"password=a-dedicated-dashboard-password",
+    );
+    login.headers_mut().insert(
+      "Content-Type",
+      "application/x-www-form-urlencoded".parse().unwrap(),
+    );
+    login
+      .headers_mut()
+      .insert("Origin", "https://expri.example.com".parse().unwrap());
+    let reply = handle(&store, &auth, &login);
+    assert_eq!(reply.status(), 303);
+    assert_eq!(reply.headers()["Location"], format!("/{query}"));
+    let cookie = reply.headers()["Set-Cookie"]
+      .to_str()
+      .unwrap()
+      .split(';')
+      .next()
+      .unwrap();
+    let mut dashboard = request("GET", &format!("/{query}"), b"");
+    dashboard
+      .headers_mut()
+      .insert("Cookie", cookie.parse().unwrap());
+    assert_eq!(handle(&store, &auth, &dashboard).status(), 200);
+    for invalid in [
+      "?return_to=https://evil.example",
+      "?project_id=vision&origin=gpu-1",
+      "?project_id=vision&origin=gpu-1&run_id=run-123&run_id=run-456",
+      "?project_id=vision&origin=gpu-1&run_id=%22%3E%3Cscript%3E",
+    ] {
+      for path in ["/", "/login"] {
+        assert_eq!(
+          handle(
+            &store,
+            &auth,
+            &request("GET", &format!("{path}{invalid}"), b"")
+          )
+          .status(),
+          400
+        );
+      }
+    }
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        &request("GET", &format!("/app.js{query}"), b"")
+      )
+      .status(),
+      400
     );
   }
 

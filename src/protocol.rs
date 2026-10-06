@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::config::EnvironmentConfig;
+use crate::config::{EnvironmentConfig, RunServiceConfig};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -38,6 +38,8 @@ pub struct RunRequest {
   pub name: String,
   pub command: Vec<String>,
   pub environment: EnvironmentConfig,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub service: Option<RunServiceConfig>,
   #[serde(default)]
   pub detach: bool,
   #[serde(default)]

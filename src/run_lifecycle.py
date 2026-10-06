@@ -56,6 +56,8 @@ def _lifecycle_message(message):
 
 def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
   """Snapshot before acknowledgement; return a detached receipt or foreground exit."""
+  if request.get("service") is not None:
+    raise ValueError("automatic publishing requires a native expri worker with run-publishing-v1")
   if not request.get("command"):
     raise ValueError("task command must not be empty")
   detached = request.get("detach", False)

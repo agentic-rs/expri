@@ -10,6 +10,7 @@ import {
 import {
   apiUrl,
   errorText,
+  parseRunDeepLink,
   RequestError,
   RequestLane,
   type Catalog,
@@ -46,20 +47,21 @@ function required<T extends HTMLElement>(id: string): T {
 export function startDashboard(options: DashboardOptions = {}): () => void {
   const page_document = document;
   const page_window = typeof window === "undefined" ? null : window;
-  const catalog_lane = new RequestLane();
-  const list_lane = new RequestLane();
-  const review_lane = new RequestLane();
-  const log_lane = new RequestLane();
-  const compare_lane = new RequestLane();
-  const chart_lane = new RequestLane();
+  const catalog_lane = new RequestLane(() => pending_deep_link);
+  const list_lane = new RequestLane(() => pending_deep_link);
+  const review_lane = new RequestLane(() => pending_deep_link);
+  const log_lane = new RequestLane(() => pending_deep_link);
+  const compare_lane = new RequestLane(() => pending_deep_link);
+  const chart_lane = new RequestLane(() => pending_deep_link);
+  const deep_link_lane = new RequestLane(() => pending_deep_link);
   const quiet_lanes = {
-    updates: new RequestLane(),
-    catalog: new RequestLane(),
-    list: new RequestLane(),
-    detail: new RequestLane(),
-    comparison: new RequestLane(),
-    log: new RequestLane(),
-    chart: new RequestLane(),
+    updates: new RequestLane(() => pending_deep_link),
+    catalog: new RequestLane(() => pending_deep_link),
+    list: new RequestLane(() => pending_deep_link),
+    detail: new RequestLane(() => pending_deep_link),
+    comparison: new RequestLane(() => pending_deep_link),
+    log: new RequestLane(() => pending_deep_link),
+    chart: new RequestLane(() => pending_deep_link),
   };
   const foreground_lanes = [
     catalog_lane,
@@ -68,6 +70,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     log_lane,
     compare_lane,
     chart_lane,
+    deep_link_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
   let auto_refresh: AutoRefresh | null = null;
@@ -91,6 +94,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let chart_error_context: string | null = null;
   let sources: Source[] = [];
   let source_id = "local";
+  let pending_deep_link = parseRunDeepLink(page_window?.location.search ?? "");
+  let deep_link_attempted_source: string | null = null;
   let access_mode: "local" | "hosted" = "local";
   let page_size = 100;
   let runs: Run[] = [];
@@ -195,6 +200,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   const actions: DashboardActions = {
     filter: (field, value) => {
+      discardDeepLink();
       ui[field] = value;
       resetFilters();
       if (field === "status") void loadRuns();
@@ -205,6 +211,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         }, 250);
     },
     clear_filters: () => {
+      discardDeepLink();
       ui.search = "";
       ui.task = "";
       ui.status = "";
@@ -212,6 +219,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       filtersChanged();
     },
     source: (value) => {
+      discardDeepLink();
       cancelRefresh();
       clearSearchTimeout();
       source_id = value;
@@ -234,11 +242,13 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       publish();
     },
     previous: () => {
+      discardDeepLink();
       cancelRefresh();
       offset = Math.max(0, offset - page_size);
       void loadRuns();
     },
     next: () => {
+      discardDeepLink();
       if (next_offset !== null) {
         cancelRefresh();
         offset = next_offset;
@@ -246,20 +256,24 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       }
     },
     select_run: (id, checked) => {
+      discardDeepLink();
       if (checked && selected.size >= 8) return;
       checked ? selected.add(id) : selected.delete(id);
       selectionChanged();
     },
     inspect_run: (id) => {
+      discardDeepLink();
       cancelRefresh();
       clearSelectionTimeout();
       void openRun(id);
     },
     clear_selection: () => {
+      discardDeepLink();
       selected.clear();
       selectionChanged();
     },
     compare: () => {
+      discardDeepLink();
       cancelRefresh();
       clearSelectionTimeout();
       openComparison();
@@ -303,6 +317,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function abortQuietRequests(): void {
     quiet_generation++;
     for (const lane of Object.values(quiet_lanes)) lane.cancel();
+    deep_link_lane.cancel();
   }
   function cancelQuietRefresh(): void {
     if (auto_refresh) auto_refresh.interrupt();
@@ -472,6 +487,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({ review_empty: true, chart_visible: false, log_content: "", log_note: "" });
   }
   function closeReview(): void {
+    discardDeepLink();
     cancelRefresh();
     showSelection(false);
   }
@@ -745,19 +761,61 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     }
     await loadRun(id);
   }
+  function cacheDetail(detail: Detail): void {
+    const id = detail.run.run_id;
+    detail_cache.delete(id);
+    detail_cache.set(id, detail);
+    while (detail_cache.size > 9) {
+      const oldest = detail_cache.keys().next().value;
+      if (oldest === undefined) break;
+      detail_cache.delete(oldest);
+    }
+  }
+  function deepLinkSource(): Source | undefined {
+    const link = pending_deep_link;
+    return link
+      ? sources.find(
+          (source) => source.project_id === link.project_id && source.origin === link.origin,
+        )
+      : undefined;
+  }
+  function discardDeepLink(): void {
+    if (!pending_deep_link) return;
+    pending_deep_link = null;
+    deep_link_lane.cancel();
+    sourceNote();
+  }
+  async function resolveDeepLink(): Promise<boolean> {
+    const link = pending_deep_link,
+      source = deepLinkSource();
+    if (!link || !source || source.source_id !== source_id) return false;
+    deep_link_attempted_source = source.source_id;
+    try {
+      const detail = await deep_link_lane.run<Detail>(
+        apiUrl("/api/run", { source: source.source_id, run_id: link.run_id }),
+      );
+      if (!detail || disposed || pending_deep_link !== link || source_id !== source.source_id)
+        return false;
+      pending_deep_link = null;
+      sourceNote();
+      beginReview("run", [link.run_id]);
+      cacheDetail(detail);
+      updateUi({ review_loading: false, review_warnings: detail.warnings });
+      renderDetail(detail);
+      announce(`Opened ${link.run_id}`);
+      return true;
+    } catch (error) {
+      if (error instanceof RequestError && error.status === 404) return false;
+      throw error;
+    }
+  }
   async function loadRun(id: string, preserve = false): Promise<boolean> {
     try {
       const detail = await review_lane.run<Detail>(
         apiUrl("/api/run", { source: source_id, run_id: id }),
       );
       if (!detail) return false;
-      detail_cache.delete(id);
-      detail_cache.set(id, detail);
-      while (detail_cache.size > 9) {
-        const oldest = detail_cache.keys().next().value;
-        if (oldest === undefined) break;
-        detail_cache.delete(oldest);
-      }
+      cacheDetail(detail);
       updateUi({ review_loading: false });
       updateUi({ review_warnings: detail.warnings });
       if (!renderDetail(detail, preserve)) return false;
@@ -814,13 +872,15 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function sourceNote(): void {
     const source = sources.find((item) => item.source_id === source_id);
     updateUi({
-      source_note: !source
-        ? null
-        : source.kind === "service"
-          ? "Synced results · Updates arrive when workers sync their recorded files."
-          : source.kind === "cached"
-            ? "Cached remote results · Pull updated results with expri runs pull; this dashboard watches the local cache."
-            : "Local results · Status and updates come from recorded run files.",
+      source_note: pending_deep_link
+        ? `Waiting for ${pending_deep_link.run_id} from ${pending_deep_link.project_id} / ${pending_deep_link.origin} to be published. Choose another source or run to stop waiting.`
+        : !source
+          ? null
+          : source.kind === "service"
+            ? "Synced results · Updates arrive when workers sync their recorded files."
+            : source.kind === "cached"
+              ? "Cached remote results · Pull updated results with expri runs pull; this dashboard watches the local cache."
+              : "Local results · Status and updates come from recorded run files.",
     });
   }
   function applyCatalog(catalog: Catalog, quiet = false): void {
@@ -838,6 +898,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         ? catalog.initial_source
         : sources[0]?.source_id ?? "";
     }
+    const linked_source = deepLinkSource();
+    if (linked_source) source_id = linked_source.source_id;
     catalog_initialized = true;
     if (source_id !== previous_source) {
       offset = 0;
@@ -951,6 +1013,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         const current_review = review,
           current_source = source_id;
         if (!(await loadRuns()) || generation !== refresh_generation) return;
+        await resolveDeepLink();
+        if (generation !== refresh_generation) return;
         if (current_review === review && current_source === source_id && current_review) {
           if (current_review.kind === "run") {
             const id = current_review.run_ids[0];
@@ -1007,7 +1071,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           updates = await quiet_lanes.updates.run<Updates>(
             apiUrl("/api/updates", {
               source: last_catalog ? source_id : "",
-              run_id: review?.run_ids ?? [],
+              run_id:
+                review?.run_ids ??
+                (deepLinkSource()?.source_id === source_id && pending_deep_link
+                  ? [pending_deep_link.run_id]
+                  : []),
             }),
           );
         } catch (error) {
@@ -1058,6 +1126,21 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         if (revision !== null && revision !== undefined) {
           const source = source_id;
           acknowledgements.push(() => boundedSet(source_revisions, source, revision));
+        }
+      }
+      const linked_source = deepLinkSource();
+      if (pending_deep_link && linked_source?.source_id === source_id) {
+        const revision = source_changed
+          ? undefined
+          : updates?.runs.find((item) => item.run_id === pending_deep_link?.run_id);
+        if (
+          deep_link_attempted_source !== source_id ||
+          !updates_supported ||
+          full_snapshot ||
+          revision?.missing === false
+        ) {
+          if (await resolveDeepLink()) return complete();
+          if (!current()) return "cancelled";
         }
       }
       const current_review = review;

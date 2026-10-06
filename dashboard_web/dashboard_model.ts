@@ -3,7 +3,32 @@ import type { RefreshClock } from "./auto_refresh";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string };
-export type Source = { source_id: string; label: string; kind: string; target_name: string | null };
+export type Source = {
+  source_id: string;
+  label: string;
+  kind: string;
+  target_name: string | null;
+  project_id?: string;
+  origin?: string;
+};
+export type RunDeepLink = { project_id: string; origin: string; run_id: string };
+
+/** Public service identifiers select existing catalog entries; they are never URLs. */
+export function parseRunDeepLink(search: string): RunDeepLink | null {
+  if (search.length > 512) return null;
+  const query = new URLSearchParams(search);
+  const fields = ["project_id", "origin", "run_id"] as const;
+  const values = fields.map((field) => query.getAll(field));
+  if (values.some((value) => value.length !== 1)) return null;
+  const valid = (value: string | undefined): value is string =>
+    value !== undefined && value !== "." && value !== ".." && /^[A-Za-z0-9._-]{1,96}$/.test(value);
+  const project_id = values[0]?.[0],
+    origin = values[1]?.[0],
+    run_id = values[2]?.[0];
+  return valid(project_id) && valid(origin) && valid(run_id)
+    ? { project_id, origin, run_id }
+    : null;
+}
 export type Run = {
   run_id: string;
   task: string | null;
@@ -159,6 +184,7 @@ async function boundedText(response: Response, maximum_bytes: number): Promise<s
 }
 
 export class RequestLane {
+  constructor(private readonly login_run: () => RunDeepLink | null = () => null) {}
   private controller: AbortController | null = null;
   private generation = 0;
   get pending(): boolean {
@@ -188,7 +214,10 @@ export class RequestLane {
       const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
       if (generation !== this.generation) return undefined;
       if (response.status === 401) {
-        if (typeof location !== "undefined") location.assign("/login");
+        if (typeof location !== "undefined") {
+          const link = this.login_run();
+          location.assign(link ? apiUrl("/login", link) : "/login");
+        }
         return undefined;
       }
       if (!response.ok) {

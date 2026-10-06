@@ -17,7 +17,7 @@ function installWindow(window) {
 const baseline = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/", pretendToBeVisual: true });
 installWindow(baseline.window);
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
-const { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, RequestLane, startDashboard } = await import("./.test/app.js");
+const { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, parseRunDeepLink, RequestLane, startDashboard } = await import("./.test/app.js");
 
 function deferred() {
   let resolve;
@@ -118,10 +118,10 @@ test("expired sessions navigate to login before parsing the response body", asyn
   assert.deepEqual(redirects, ["/login"], "cancelled work must not navigate a newer view");
 });
 
-function dashboard(t) {
+function dashboard(t, url = "http://localhost/") {
   const original_fetch = globalThis.fetch;
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
-  const dom = new JSDOM(html, { url: "http://localhost/", pretendToBeVisual: true });
+  const dom = new JSDOM(html, { url, pretendToBeVisual: true });
   const restore = installWindow(dom.window);
   let navigation_count = 0;
   const record = records => { navigation_count += records.filter(item => item.type === "attributes" && item.target.id === "chart-frame").length; };
@@ -176,14 +176,14 @@ function detailRecord(source, run, value = 0.5) {
   return { source, run, state: { command: "python train.py" }, snapshot: null, environment: null, cache: null, params: { learning_rate: 0.1 }, params_truncated: false, metadata_truncated: false, metrics: { accuracy: metric, loss: metric }, metric_count: 2, metrics_truncated: false, metrics_error: null, warnings: [] };
 }
 
-async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, catalog_failure = false } = {}) {
-  const nodes = dashboard(t);
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, catalog_failure = false, url, override = null } = {}) {
+  const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
   const runs = Array.from({ length: count }, (_, index) => ({
     run_id: `run-${index}`, task: "train", status: "completed",
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
-  const model = { nodes, sources, runs, requests: [], override: null, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {} };
+  const model = { nodes, sources, runs, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {} };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -191,10 +191,10 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     const overridden = model.override?.(parsed, options);
     if (overridden !== undefined && overridden !== null) return overridden;
     if (parsed.pathname === "/api/updates") return updates ? response({ catalog_revision: model.catalog_revision, source_revision: model.list_revision, runs: query.getAll("run_id").map(run_id => {
-      const missing = model.missing_run_ids.has(run_id);
+      const missing = model.missing_run_ids.has(run_id) || !runs.some(run => run.run_id === run_id);
       return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, missing };
     }) }) : response({ error: "Unknown endpoint" }, 404);
-    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0].source_id, warnings: [], access_mode: hosted ? "hosted" : "local" });
+    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local" });
     const source = sources.find(item => item.source_id === query.get("source"));
     assert.ok(source, "all requests must remain in a known source");
     if (parsed.pathname === "/api/runs") {
@@ -208,7 +208,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     if (parsed.pathname === "/api/run") {
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
       const run = runs.find(item => item.run_id === query.get("run_id"));
-      assert.ok(run);
+      if (!run) return response({ error: "Run not found" }, 404);
       return response(detailRecord(source, run, model.metric_value));
     }
     if (parsed.pathname === "/api/log") return response({ content: model.logs[query.get("stream")] ?? `${query.get("stream")} training complete`, stream: query.get("stream"), missing: false, truncated: false });
@@ -426,7 +426,7 @@ test("late comparison and catalog responses cannot restore an old source after a
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("source") === sources[1].source_id);
   old_comparison.resolve(response({ source: sources[0], comparison: { metric_names: [], runs: [], warnings: [] } }));
-  old_catalog.resolve(response({ project_name: "Stale source", sources: [sources[0]], initial_source: sources[0].source_id, warnings: [], access_mode: "hosted" }));
+  old_catalog.resolve(response({ project_name: "Stale source", sources: [sources[0]], initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: "hosted" }));
   await new Promise(resolve => setTimeout(resolve, 20));
   assert.equal(nodes.get("source-select").value, sources[1].source_id);
   assert.equal(chartQuery(nodes).get("source"), sources[1].source_id);
@@ -1162,4 +1162,141 @@ test("chart text requests enforce their byte limit and release pending request s
   await assert.rejects(lane.runText("/api/chart", 5), /preview limit/);
   assert.equal(cancelled, true);
   assert.equal(lane.pending, false);
+});
+
+const linked_source = { source_id: "hosted:vision:gpu-1", label: "Vision / GPU 1", kind: "service", target_name: null, project_id: "vision", origin: "gpu-1" };
+const other_source = { source_id: "hosted:other:cpu", label: "Other / CPU", kind: "service", target_name: null, project_id: "other", origin: "cpu" };
+function runLink(run_id = "run-1") { return `http://localhost/?project_id=vision&origin=gpu-1&run_id=${run_id}`; }
+function publishedRun(run_id) { return { run_id, task: "train", status: "running", started_at: "2026-10-07T01:00:00Z", finished_at: null, exit_code: null }; }
+
+test("run deep links accept only one complete triple of bounded public identifiers", () => {
+  assert.deepEqual(parseRunDeepLink("?project_id=vision&origin=gpu-1&run_id=run_1.2"), { project_id: "vision", origin: "gpu-1", run_id: "run_1.2" });
+  assert.equal(parseRunDeepLink(`?project_id=${"a".repeat(96)}&origin=gpu-1&run_id=run-1`)?.project_id.length, 96);
+  for (const query of [
+    "", "?run_id=run-1", "?project_id=vision&origin=gpu-1&run_id=", "?project_id=vision&origin=gpu-1&run_id=.",
+    "?project_id=vision&origin=..&run_id=run-1", "?project_id=vision&origin=gpu-1&run_id=run-1&run_id=run-2",
+    "?project_id=vision&origin=gpu-1&run_id=..%2Frun-1", "?project_id=vision&origin=gpu-1&run_id=javascript%3Aalert(1)",
+    "?project_id=vision&origin=%CE%BB&run_id=run-1", `?project_id=${"a".repeat(97)}&origin=gpu-1&run_id=run-1`, "?" + "x".repeat(4096),
+  ]) assert.equal(parseRunDeepLink(query), null, query.slice(0, 120));
+});
+
+test("a published run link selects its catalog source and opens a run outside the first page", async t => {
+  const model = await autoFixture(t, { count: 45, sources: [other_source, linked_source], url: runLink("run-44") });
+  await settled(() => chartQuery(model.nodes).get("run_id") === "run-44");
+  assert.equal(model.nodes.get("source-select").value, linked_source.source_id);
+  assert.equal(model.nodes.get("review-title").textContent, "run-44");
+  assert.equal(model.nodes.get("run-rows").children.length, 20);
+  assert.equal(model.nodes.get("source-note").textContent.includes("Waiting for"), false);
+  assert.equal(model.requests.filter(url => url.startsWith("/api/run?")).length, 1, "the linked detail is reused for rendering");
+  assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.get("source") === other_source.source_id), false);
+});
+
+test("a run link survives an empty catalog and opens when its source publishes", async t => {
+  const model = await autoFixture(t, { count: 1, sources: [], url: runLink("run-0") });
+  assert.match(model.nodes.get("source-note").textContent, /Waiting for run-0/);
+  assert.equal(model.nodes.get("review-section").hidden, true);
+  await model.clock.advance(5_000);
+  assert.equal(model.requests.some(url => url.startsWith("/api/run?")), false);
+  model.sources.push(linked_source); model.model.catalog_revision = "catalog-published";
+  await model.clock.advance(5_000);
+  await settled(() => chartQuery(model.nodes).get("run_id") === "run-0");
+  assert.equal(model.nodes.get("source-select").value, linked_source.source_id);
+  assert.equal(model.nodes.get("review-error").hidden, true);
+});
+
+test("a missing linked run waits using lightweight probes and opens after publication", async t => {
+  const model = await autoFixture(t, { count: 0, sources: [linked_source], url: runLink("run-new") });
+  await settled(() => model.nodes.get("refresh-button").disabled === false);
+  assert.match(model.nodes.get("source-note").textContent, /Waiting for run-new/);
+  assert.equal(model.nodes.get("review-section").hidden, true);
+  const count = model.requests.filter(url => url.startsWith("/api/run?")).length;
+  assert.equal(count, 1);
+  await model.clock.advance(20_000);
+  assert.equal(model.requests.filter(url => url.startsWith("/api/run?")).length, count, "missing probes must not download repeated detail responses");
+  const probes = model.requests.filter(url => url.startsWith("/api/updates"));
+  assert.equal(probes.length, 4);
+  assert.ok(probes.every(url => new URL(url, "http://localhost").searchParams.get("run_id") === "run-new"));
+  model.runs.push(publishedRun("run-new")); model.model.list_revision = "published";
+  await model.clock.advance(5_000);
+  await settled(() => chartQuery(model.nodes).get("run_id") === "run-new");
+  assert.equal(model.nodes.get("source-note").textContent.includes("Waiting for"), false);
+});
+
+test("explicit source choice cancels a pending link before its source arrives", async t => {
+  const model = await autoFixture(t, { count: 2, sources: [other_source], url: runLink() });
+  await settled(() => model.nodes.get("run-rows").children.length === 2);
+  setValue(model.nodes.get("source-select"), other_source.source_id); await emit(model.nodes.get("source-select"), "change");
+  await settled(() => model.nodes.get("runs-region").getAttribute("aria-busy") === "false");
+  model.sources.push(linked_source); model.model.catalog_revision = "catalog-published";
+  await model.clock.advance(5_000);
+  assert.equal(model.nodes.get("source-select").value, other_source.source_id);
+  assert.equal(model.nodes.get("review-section").hidden, true);
+  assert.equal(model.requests.some(url => url.startsWith("/api/run?")), false);
+  assert.equal(model.nodes.get("source-note").textContent.includes("Waiting for"), false);
+});
+
+test("explicit run inspection ignores a late linked detail and keeps the user's chart", async t => {
+  const pending = deferred(); let signal;
+  t.after(() => pending.resolve(response(detailRecord(linked_source, publishedRun("run-1")))));
+  const model = await autoFixture(t, { count: 2, sources: [linked_source], url: runLink(), override: (parsed, options) => {
+    if (parsed.pathname === "/api/run" && parsed.searchParams.get("run_id") === "run-1") { signal = options.signal; return pending.promise; }
+    return null;
+  } });
+  await settled(() => signal !== undefined);
+  assert.equal(signal.aborted, false);
+  await inspect(model, 0);
+  assert.equal(signal.aborted, true);
+  const frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  pending.resolve(response(detailRecord(linked_source, model.runs[1]))); await flush();
+  model.model.override = null; await model.clock.advance(5_000);
+  assert.equal(chartQuery(model.nodes).get("run_id"), "run-0");
+  assert.equal(model.nodes.get("chart-frame"), frame);
+  assert.equal(frameNavigations(model.nodes), writes);
+});
+
+test("resolved links preserve the review tab, expanded records, and iframe through refresh", async t => {
+  const model = await autoFixture(t, { sources: [linked_source], url: runLink() });
+  await settled(() => chartQuery(model.nodes).get("run_id") === "run-1");
+  const frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  await click(model.nodes.get("review-tab-overview"));
+  const record = model.nodes.get("run-detail").querySelector("details");
+  await click(record.querySelector("summary")); assert.equal(record.open, true);
+  model.model.metadata_revision = "updated"; model.model.metric_value = 0.125;
+  await model.clock.advance(5_000);
+  await click(model.nodes.get("refresh-button"));
+  await settled(() => model.nodes.get("refresh-button").disabled === false);
+  assert.equal(model.nodes.get("review-tab-overview").getAttribute("aria-selected"), "true");
+  assert.equal(model.nodes.get("run-detail").querySelector("details"), record);
+  assert.equal(record.open, true); assert.equal(model.nodes.get("chart-frame"), frame);
+  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(chartQuery(model.nodes).get("run_id"), "run-1");
+});
+
+function loginRedirects(t) {
+  const previous = globalThis.location;
+  t.after(() => { if (previous === undefined) delete globalThis.location; else globalThis.location = previous; });
+  const redirects = []; globalThis.location = { assign: path => redirects.push(path) };
+  return redirects;
+}
+
+test("API authentication expiry preserves a validated pending run link through login", async t => {
+  const redirects = loginRedirects(t);
+  await autoFixture(t, { sources: [], url: runLink("run-new"), override: parsed => parsed.pathname === "/api/catalog" ? response({ error: "Sign in required" }, 401) : null });
+  assert.deepEqual(redirects, ["/login?project_id=vision&origin=gpu-1&run_id=run-new"]);
+});
+
+test("API authentication expiry ignores malformed URL identities", async t => {
+  const redirects = loginRedirects(t);
+  await autoFixture(t, { sources: [], url: "http://localhost/?project_id=vision&origin=gpu-1&run_id=javascript%3Aoutside", override: parsed => parsed.pathname === "/api/catalog" ? response({ error: "Sign in required" }, 401) : null });
+  assert.deepEqual(redirects, ["/login"]);
+});
+
+test("authentication expiry does not restore a pending link discarded by explicit inspection", async t => {
+  const redirects = loginRedirects(t);
+  const model = await autoFixture(t, { sources: [linked_source], url: runLink("run-new") });
+  await settled(() => model.nodes.get("refresh-button").disabled === false);
+  await inspect(model, 0);
+  model.model.override = parsed => parsed.pathname === "/api/updates" ? response({ error: "Sign in required" }, 401) : null;
+  await model.clock.advance(5_000);
+  assert.deepEqual(redirects, ["/login"]);
 });
