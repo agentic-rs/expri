@@ -594,6 +594,7 @@ def automatic_refresh(run_id, updated_run_id):
     # chart must defer replacement until pointerup, then catch up automatically.
     browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
     try:
+      evaluate("window.__acceptance_pointerup = 0; document.addEventListener('pointerup', () => { window.__acceptance_pointerup++; }, {capture: true});")
       browser.pointer(loss_prefix + '//*[@data-chart-hit]', .5, using='xpath', hold=True)
     finally:
       browser.call('POST', '/frame', {'id': None})
@@ -604,7 +605,16 @@ def automatic_refresh(run_id, updated_run_id):
     time.sleep(.3)
     assert not any(item['run_id'] == updated_run_id and '81 samples' in item['text']
       for item in loss_state()['samples']), 'chart replacement interrupted an active pointer gesture'
-    browser.release_pointer()
+    # WebDriver dispatches native actions in its current browsing context.
+    # Release inside the child where the gesture began; a parent-context
+    # pointerup leaves Gecko's child pointer capture active.
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+    try:
+      browser.release_pointer()
+      wait_for(lambda: evaluate("return window.__acceptance_pointerup;") > 0,
+        'native pointer release did not reach the chart iframe')
+    finally:
+      browser.call('POST', '/frame', {'id': None})
     wait_for(lambda: last_comparison_step() == 'step 80' and any(
       item['run_id'] == updated_run_id and '81 samples' in item['text'] for item in (loss_state() or {}).get('samples', [])),
       'new worker samples did not reach the selected chart and summary automatically', timeout=25)
@@ -660,6 +670,22 @@ def automatic_refresh(run_id, updated_run_id):
     assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'log refresh changed the task filter'
     phase('complete')
     print('Firefox auto refresh passed: real finalized worker publications, five-second probes, unchanged snapshots skipped, active drag deferred, exact samples/summary, absolute zoom and hidden run preserved, pause/resume, live Logs tab, sandbox/CSP retained.', flush=True)
+  except Exception:
+    try:
+      browser.call('POST', '/frame', {'id': None})
+      state = loss_state()
+      if state:
+        state['point_count'] = len(state['point_labels'])
+        state['point_labels'] = state['point_labels'][-4:]
+      print('Firefox auto refresh failure state: ' + json.dumps({
+        'last_comparison_step': last_comparison_step(), 'loss_state': state,
+        'freshness': evaluate("return document.querySelector('#updated-at')?.textContent;"),
+        'request_counts': data_counts(),
+      }), flush=True)
+      Path('/tmp/workspace-auto-refresh.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+    except Exception:
+      print('Firefox auto refresh failure state was unavailable.', flush=True)
+    raise
   finally:
     browser.close()
 
