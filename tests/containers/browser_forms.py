@@ -389,8 +389,16 @@ def workspace(run_id, second_run_id):
       });'''), 'narrow chart controls overflow their iframe'
       loss_region = '//section[@data-interactive-chart][h2="loss"]//*[@class="plot-scroll"]'
       loss_hit = '//section[@data-interactive-chart][h2="loss"]//*[@data-chart-hit]'
-      browser.keys(loss_region, '\ue00c', using='xpath')
       browser.pointer(loss_hit, .001, using='xpath')
+      hover_rows = evaluate("const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss'); return [...card.querySelectorAll('[data-chart-readout-run]')].map(row => ({step: row.getAttribute('data-chart-step'), value: row.getAttribute('data-chart-value')}));")
+      browser.call('POST', '/frame', {'id': None})
+      capture('workspace-narrow')
+      browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+      print('Firefox narrow hover samples: ' + json.dumps(hover_rows), flush=True)
+      assert len(hover_rows) == 2 and all(0 <= int(row['step']) <= 79 and float(row['value']) == 1 / (int(row['step']) + 1) for row in hover_rows), 'narrow hover did not report recorded loss samples'
+      browser.keys(loss_region, '\ue00c', using='xpath')
+      browser.keys(loss_region, '\ue014', using='xpath')
+      assert evaluate("return [...document.querySelectorAll('[data-chart-readout-run]')].filter(row => row.getAttribute('data-chart-step') === '0' && Number(row.getAttribute('data-chart-value')) === 1).length;") == 2, 'refreshed keyboard handlers did not start at the first sample'
       browser.keys(loss_region, '\ue014', using='xpath')
       assert evaluate("return [...document.querySelectorAll('[data-chart-readout-run]')].filter(row => row.getAttribute('data-chart-step') === '1' && row.getAttribute('data-chart-value') === '0.5').length;") == 2, 'refreshed/narrow keyboard handlers skipped or duplicated a sample'
     finally:
