@@ -414,14 +414,20 @@ minutes to catch changes missed by file metadata.
 
 Charts support point inspection, range zoom, and run visibility controls. Hover
 over a curve to read the nearest displayed samples, or focus the plot and use
-the arrow keys. Drag across training steps to zoom; use the zoom buttons or
+the arrow keys. Use **X-axis** to choose **Step** (the default), **Elapsed time**
+since each run's first timestamped metric event, or **Wall-clock time** in UTC.
+The elapsed origin includes all metrics in the run and remains stable when you
+filter metrics or the preview samples points. Time views omit points without
+timestamps and report the omitted count; they do not infer timestamps from steps.
+Drag across the x-axis to zoom; use the zoom buttons or
 **Reset zoom** to change the range. Click a run in the legend to show or hide its
 curve. These interactions use the displayed preview and do not download more
-metric data. Point readouts retain the recorded step and value, including
+metric data. Point readouts retain the recorded step, value, and available timestamp, including
 repeated steps and step resets. **Open chart** opens the standalone static view.
 Changed charts replace their bounded preview because sampling can change older
 displayed points. Updates wait until a drag finishes. A zoomed range stays at
-the same steps; the full range follows newly recorded steps. After an initial
+the same coordinates; the full range follows newly recorded points. Switching
+axes resets zoom while retaining hidden runs. After an initial
 bounded refresh establishes the current view, unchanged probes do not download
 metrics or reload the chart; recovery refreshes still check the full preview.
 

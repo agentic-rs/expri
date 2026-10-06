@@ -367,6 +367,7 @@ fn hosted_reader_bounds_curves_without_changing_complete_reductions() {
     run_id: "preview".into(),
     run: json!({"run_id": "preview"}),
     params: None,
+    first_metric_timestamp: None,
     metrics: BTreeMap::new(),
     warnings: Vec::new(),
   };
@@ -405,6 +406,7 @@ fn hosted_reader_bounds_distinct_series_and_selection_can_read_another_metric() 
     run_id: "preview".into(),
     run: json!({}),
     params: None,
+    first_metric_timestamp: None,
     metrics: BTreeMap::new(),
     warnings: Vec::new(),
   };
@@ -433,4 +435,97 @@ fn hosted_reader_bounds_distinct_series_and_selection_can_read_another_metric() 
   .unwrap();
   assert_eq!(run.metrics.len(), 1);
   assert_eq!(run.metrics["metric-2000"].summary.last.value, 2000.0);
+}
+
+#[test]
+fn metric_time_origin_precedes_filters_and_missing_counts_use_complete_events() {
+  let fixture = Fixture::new();
+  fixture.run(
+    "run-time",
+    br#"{"step":0,"timestamp":"invalid","metrics":{"loss":1}}
+{"step":1,"metrics":{"loss":5}}
+{"step":2,"timestamp":"2026-10-03T01:00:00.000000001Z","metrics":{"warmup":4}}
+{"step":3,"timestamp":"2026-10-03T01:00:05.000000001Z","metrics":{"loss":3}}
+{"step":4,"metrics":{"loss":2}}
+{"step":5,"timestamp":"2026-10-03T00:59:59Z","metrics":{"loss":1}}
+"#,
+  );
+  for record in [
+    read(&fixture.runs, "run-time", &["loss".into()]).unwrap(),
+    read_summaries(&fixture.runs, "run-time", &["loss".into()]).unwrap(),
+  ] {
+    assert_eq!(
+      record.first_metric_timestamp.as_deref(),
+      Some("2026-10-03T01:00:00.000000001Z")
+    );
+    assert!(!record.metrics.contains_key("warmup"));
+    assert_eq!(record.metrics["loss"].summary.count, 4);
+    assert_eq!(record.metrics["loss"].summary.missing_timestamp_count, 2);
+  }
+}
+
+#[test]
+fn hosted_thinning_retains_timestamped_endpoints_and_exact_missing_counts() {
+  let mut bytes = Vec::new();
+  for step in 0..10000 {
+    let mut row = json!({"step": step, "metrics": {"loss": step}});
+    if step == 1 || step == 9998 {
+      row["timestamp"] = json!(format!(
+        "2026-10-03T01:00:{}Z",
+        if step == 1 { "00" } else { "01" }
+      ));
+    }
+    writeln!(&mut bytes, "{row}").unwrap();
+  }
+  for limit in [4, 16] {
+    let mut record = RunMetrics {
+      run_id: "preview".into(),
+      run: json!({}),
+      params: None,
+      first_metric_timestamp: None,
+      metrics: BTreeMap::new(),
+      warnings: Vec::new(),
+    };
+    read_event_data(
+      bytes.as_slice(),
+      bytes.len() as u64,
+      &mut record,
+      &[],
+      true,
+      Some(limit),
+    )
+    .unwrap();
+    let series = &record.metrics["loss"];
+    assert!(series.points.len() <= limit);
+    assert_eq!(series.points.first().unwrap().step, 0);
+    assert_eq!(series.points.last().unwrap().step, 9999);
+    assert!(series.points.iter().any(|point| point.step == 1));
+    assert!(series.points.iter().any(|point| point.step == 9998));
+    assert_eq!(
+      record.first_metric_timestamp.as_deref(),
+      Some("2026-10-03T01:00:00Z")
+    );
+    assert_eq!(series.summary.count, 10000);
+    assert_eq!(series.summary.missing_timestamp_count, 9998);
+    let html = crate::metric_charts::render_dashboard_chart(
+      &[record],
+      &[],
+      crate::metric_charts::ChartXAxis::Elapsed,
+    )
+    .unwrap();
+    assert_eq!(html.matches("<circle ").count(), 2);
+    assert!(html.contains("9998 of 10000 samples omitted"));
+    assert!(html.contains("data-x-max=\"1000000000\""));
+  }
+}
+
+#[test]
+fn older_metric_records_without_time_metadata_remain_deserializable() {
+  let point = json!({"step": 1, "value": 0.5});
+  let record: RunMetrics = serde_json::from_value(json!({
+    "run_id": "legacy", "run": {}, "params": null, "warnings": [],
+    "metrics": {"loss": {"points": [point.clone()], "summary": {"count": 1, "last": point.clone(), "min": point.clone(), "max": point}}}
+  })).unwrap();
+  assert!(record.first_metric_timestamp.is_none());
+  assert_eq!(record.metrics["loss"].summary.missing_timestamp_count, 0);
 }

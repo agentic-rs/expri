@@ -1,12 +1,14 @@
 export type ParsedChartPoint = { run_index: number; step: string; value: number; value_text: string };
+export type ChartAxis = "step" | "elapsed" | "wall_clock";
 export type ChartPoint = ParsedChartPoint & { x: number; y: number };
-export type StepRange = { start_step: string; end_step: string };
-type PlotPoint = ChartPoint & { circle: SVGCircleElement };
+export type ChartRange = { x_axis: ChartAxis; start_x: string; end_x: string };
+type PlotPoint = ChartPoint & { x_value: string; timestamp: string | null; circle: SVGCircleElement };
 type Series = { run_index: number; run_id: string; points: PlotPoint[]; polyline: SVGPolylineElement | null; button: HTMLButtonElement; visible: boolean };
-type KeyboardAnchor = { run_id: string; step: string; value_text: string; occurrence: number };
+type KeyboardAnchor = { run_id: string; step: string; x_value: string; value_text: string; occurrence: number };
 type PlotState = {
   metric_name: string;
-  range: StepRange | null;
+  x_axis: ChartAxis;
+  range: ChartRange | null;
   hidden_run_ids: string[];
   keyboard_anchor: KeyboardAnchor | null;
   focus: string | null;
@@ -17,13 +19,15 @@ type PlotController = { dispose(): void; isInteracting(): boolean; capture(): Pl
 export type ChartPreviewStatus = "ready" | "loading" | "invalid";
 export type ChartController = { dispose(): void; isInteracting(): boolean; previewStatus(): ChartPreviewStatus; replacePreview(html: string): boolean };
 const MAX_STEP = 18446744073709551615n;
+const MIN_COORDINATE = -(1n << 127n), MAX_COORDINATE = (1n << 127n) - 1n;
+const NANOS_PER_SECOND = 1_000_000_000n;
 const FRACTION_SCALE = 1_000_000_000_000n;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const LEFT = 86, RIGHT = 950, TOP = 28, BOTTOM = 274;
 let chart_sequence = 0;
 
 export function parseChartPointLabel(label: string): ParsedChartPoint | null {
-  const match = /^Run ([1-8]) · step (\d+) · value (-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$/.exec(label);
+  const match = /^Run ([1-8]) · step (\d+) · value (-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?: · timestamp [^·\r\n]{1,128})?(?: · elapsed [^·\r\n]{1,80})?$/.exec(label);
   if (!match) return null;
   const step = match[2], value_text = match[3];
   if (step === undefined || value_text === undefined || step.length > 20 || BigInt(step) > MAX_STEP) return null;
@@ -31,49 +35,99 @@ export function parseChartPointLabel(label: string): ParsedChartPoint | null {
   return Number.isFinite(value) ? { run_index: Number(match[1]), step, value, value_text } : null;
 }
 
-function steps(range: StepRange): [bigint, bigint] {
-  if (!/^\d{1,20}$/.test(range.start_step) || !/^\d{1,20}$/.test(range.end_step)) throw new Error("Invalid chart step range");
-  const start = BigInt(range.start_step), end = BigInt(range.end_step);
-  if (start > end || end > MAX_STEP) throw new Error("Invalid chart step range");
+function coordinate(value: string, x_axis: ChartAxis): bigint | null {
+  if (!/^-?(?:0|[1-9]\d{0,38})$/.test(value) || value === "-0") return null;
+  const parsed = BigInt(value);
+  return x_axis === "step" ? parsed >= 0n && parsed <= MAX_STEP ? parsed : null : parsed >= MIN_COORDINATE && parsed <= MAX_COORDINATE ? parsed : null;
+}
+export function parseChartRange(x_axis: string | null, start_x: string | null, end_x: string | null): ChartRange | null {
+  if (!["step", "elapsed", "wall_clock"].includes(x_axis ?? "") || start_x === null || end_x === null) return null;
+  const axis = x_axis as ChartAxis, start = coordinate(start_x, axis), end = coordinate(end_x, axis);
+  return start !== null && end !== null && start <= end ? { x_axis: axis, start_x, end_x } : null;
+}
+function coordinatesInRange(range: ChartRange): [bigint, bigint] {
+  if (!parseChartRange(range.x_axis, range.start_x, range.end_x)) throw new Error("Invalid chart axis range");
+  const start = BigInt(range.start_x), end = BigInt(range.end_x);
   return [start, end];
 }
 function fractionInteger(fraction: number): bigint {
   return BigInt(Math.round(Math.min(1, Math.max(0, Number.isFinite(fraction) ? fraction : 0)) * Number(FRACTION_SCALE)));
 }
-function stepAt(range: StepRange, fraction: number): bigint {
-  const [start, end] = steps(range);
+function xAt(range: ChartRange, fraction: number): bigint {
+  const [start, end] = coordinatesInRange(range);
   return start + (end - start) * fractionInteger(fraction) / FRACTION_SCALE;
 }
-export function chartStepFraction(step: string, range: StepRange): number {
-  const [start, end] = steps(range);
+export function chartXFraction(x_value: string, range: ChartRange): number {
+  const [start, end] = coordinatesInRange(range), value = coordinate(x_value, range.x_axis);
+  if (value === null) throw new Error("Invalid chart axis coordinate");
   if (start === end) return .5;
-  return Number((BigInt(step) - start) * FRACTION_SCALE / (end - start)) / Number(FRACTION_SCALE);
+  return Number((value - start) * FRACTION_SCALE / (end - start)) / Number(FRACTION_SCALE);
 }
-export function dragChartRange(range: StepRange, start_fraction: number, end_fraction: number): StepRange {
-  const first = stepAt(range, Math.min(start_fraction, end_fraction));
-  const last = stepAt(range, Math.max(start_fraction, end_fraction));
-  return first < last ? { start_step: String(first), end_step: String(last) } : range;
+export function dragChartRange(range: ChartRange, start_fraction: number, end_fraction: number): ChartRange {
+  const first = xAt(range, Math.min(start_fraction, end_fraction));
+  const last = xAt(range, Math.max(start_fraction, end_fraction));
+  return first < last ? { x_axis: range.x_axis, start_x: String(first), end_x: String(last) } : range;
 }
-export function zoomChartRange(range: StepRange, full_range: StepRange, factor: number, center_fraction = .5): StepRange {
-  const [full_start, full_end] = steps(full_range), [start, end] = steps(range);
+export function zoomChartRange(range: ChartRange, full_range: ChartRange, factor: number, center_fraction = .5): ChartRange {
+  if (range.x_axis !== full_range.x_axis) throw new Error("Cannot zoom different chart axes");
+  const [full_start, full_end] = coordinatesInRange(full_range), [start, end] = coordinatesInRange(range);
   const full_span = full_end - full_start;
   if (full_span === 0n || !Number.isFinite(factor) || factor <= 0) return range;
   const ratio = BigInt(Math.round(Math.min(1_000_000, factor) * 1_000_000));
   let span = (end - start) * ratio / 1_000_000n;
   if (span < 1n) span = 1n;
   if (span > full_span) span = full_span;
-  const anchor = stepAt(range, center_fraction);
+  const anchor = xAt(range, center_fraction);
   let next_start = anchor - span * fractionInteger(center_fraction) / FRACTION_SCALE;
   if (next_start < full_start) next_start = full_start;
   if (next_start + span > full_end) next_start = full_end - span;
-  return { start_step: String(next_start), end_step: String(next_start + span) };
+  return { x_axis: range.x_axis, start_x: String(next_start), end_x: String(next_start + span) };
 }
-export function restoreChartRange(range: StepRange | null, full_range: StepRange): StepRange {
-  const [full_start, full_end] = steps(full_range);
-  if (range === null) return full_range;
-  const [start, end] = steps(range);
+export function restoreChartRange(range: ChartRange | null, full_range: ChartRange): ChartRange {
+  const [full_start, full_end] = coordinatesInRange(full_range);
+  if (range === null || range.x_axis !== full_range.x_axis) return full_range;
+  const [start, end] = coordinatesInRange(range);
   const clamp = (value: bigint) => value < full_start ? full_start : value > full_end ? full_end : value;
-  return { start_step: String(clamp(start)), end_step: String(clamp(end)) };
+  return { x_axis: range.x_axis, start_x: String(clamp(start)), end_x: String(clamp(end)) };
+}
+export function formatChartX(x_value: string, x_axis: ChartAxis): string {
+  const value = coordinate(x_value, x_axis);
+  if (value === null) throw new Error("Invalid chart axis coordinate");
+  if (x_axis === "step") return x_value;
+  if (x_axis === "elapsed") {
+    const negative = value < 0n, absolute = negative ? -value : value;
+    const sign = negative ? "−" : "";
+    if (absolute !== 0n && absolute < NANOS_PER_SECOND) {
+      const [divisor, digits, unit] = absolute < 1000n ? [1n, 0, "ns"] as const : absolute < 1_000_000n ? [1000n, 3, "µs"] as const : [1_000_000n, 6, "ms"] as const;
+      const remainder = absolute % divisor;
+      const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(digits, "0").replace(/0+$/, "")}`;
+      return `${sign}${absolute / divisor}${fraction} ${unit}`;
+    }
+    const seconds = absolute / NANOS_PER_SECOND, remainder = absolute % NANOS_PER_SECOND;
+    const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+    if (seconds >= 3600n) return `${sign}${seconds / 3600n}:${String(seconds / 60n % 60n).padStart(2, "0")}:${String(seconds % 60n).padStart(2, "0")}${fraction} h`;
+    if (seconds >= 60n) return `${sign}${seconds / 60n}:${String(seconds % 60n).padStart(2, "0")}${fraction} min`;
+    return `${sign}${seconds}${fraction} s`;
+  }
+  // BigInt carries the fractional part separately so Date never rounds recorded
+  // nanoseconds or treats a pre-epoch remainder as a positive future offset.
+  let seconds = value / NANOS_PER_SECOND, remainder = value % NANOS_PER_SECOND;
+  if (remainder < 0n) { seconds -= 1n; remainder += NANOS_PER_SECOND; }
+  const date = new Date(Number(seconds) * 1000);
+  if (!Number.isFinite(date.getTime())) return `${x_value} ns since Unix epoch`;
+  const fraction = remainder === 0n ? "" : `.${String(remainder).padStart(9, "0").replace(/0+$/, "")}`;
+  return `${date.toISOString().replace(/\.\d{3}Z$/, "").replace("T", " ")}${fraction} UTC`;
+}
+export function formatChartTick(x_value: string, range: ChartRange): string {
+  const label = formatChartX(x_value, range.x_axis);
+  if (range.x_axis !== "wall_clock") return label;
+  const [start, end] = coordinatesInRange(range);
+  const parts = /^(\S+) (\S+) UTC$/.exec(label), first = /^(\S+) /.exec(formatChartX(range.start_x, "wall_clock")), last = /^(\S+) /.exec(formatChartX(range.end_x, "wall_clock"));
+  if (!parts?.[1] || !parts[2] || !first?.[1] || !last?.[1]) return label;
+  if (first[1] === last[1]) return parts[2];
+  if (end - start >= 365n * 86400n * NANOS_PER_SECOND) return parts[1];
+  const time = end - start < 120n * NANOS_PER_SECOND ? parts[2] : parts[2].slice(0, 5);
+  return `${parts[1].slice(-5)} ${time}`;
 }
 export function nearestChartPoint<T extends ChartPoint>(points: readonly T[], x: number, y?: number, preferred?: T): T | null {
   if (preferred && points.includes(preferred) && preferred.x === x && (y === undefined || preferred.y === y)) return preferred;
@@ -96,7 +150,10 @@ function svgNode<K extends keyof SVGElementTagNameMap>(document: Document, tag: 
   return node;
 }
 
-function plotRange(svg: SVGSVGElement): StepRange | null {
+function plotRange(svg: SVGSVGElement): ChartRange | null {
+  if (["data-x-axis", "data-x-min", "data-x-max"].some(name => svg.hasAttribute(name))) {
+    return parseChartRange(svg.getAttribute("data-x-axis"), svg.getAttribute("data-x-min"), svg.getAttribute("data-x-max"));
+  }
   const tick_steps = [...svg.querySelectorAll<SVGTextElement>("text.tick")]
     .filter(node => Number(node.getAttribute("y")) >= BOTTOM + 12)
     .map(node => node.textContent?.trim() ?? "").filter(value => /^\d{1,20}$/.test(value));
@@ -104,12 +161,24 @@ function plotRange(svg: SVGSVGElement): StepRange | null {
   const values = tick_steps.map(value => BigInt(value)).sort((first, second) => first < second ? -1 : first > second ? 1 : 0);
   const start = values[0], end = values[values.length - 1];
   if (start === undefined || end === undefined || end > MAX_STEP) return null;
-  return { start_step: String(start), end_step: String(end) };
+  return { x_axis: "step", start_x: String(start), end_x: String(end) };
+}
+
+function pointCoordinate(circle: Element, parsed: ParsedChartPoint, range: ChartRange, explicit: boolean): string | null {
+  const value = explicit ? circle.getAttribute("data-x-value") : parsed.step;
+  const x_value = value === null ? null : coordinate(value, range.x_axis);
+  if (x_value === null || x_value < BigInt(range.start_x) || x_value > BigInt(range.end_x)) return null;
+  if (range.x_axis === "step" && x_value !== BigInt(parsed.step)) return null;
+  return String(x_value);
+}
+function pointTimestamp(circle: Element): string | null {
+  const timestamp = circle.getAttribute("data-timestamp");
+  return timestamp !== null && timestamp.length <= 128 && /^[+-]?\d{4,6}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$/.test(timestamp) ? timestamp : null;
 }
 
 const PREVIEW_HTML_TAGS = new Set("html head body meta title style main p section h2 div ul li span code pre details summary table thead tbody tr th td".split(" "));
 const PREVIEW_SVG_TAGS = new Set("svg title desc line text polyline circle".split(" "));
-const PREVIEW_ATTRIBUTES = new Set("lang charset name content class id role aria-label aria-labelledby tabindex viewBox x y x1 x2 y1 y2 cx cy r fill stroke stroke-width stroke-dasharray points text-anchor transform style scope".split(" "));
+const PREVIEW_ATTRIBUTES = new Set("lang charset name content class id role aria-label aria-labelledby tabindex viewBox x y x1 x2 y1 y2 cx cy r fill stroke stroke-width stroke-dasharray points text-anchor transform style scope data-x-axis data-x-min data-x-max data-x-value data-timestamp".split(" "));
 
 function isDashboardPreview(document: Document): boolean {
   if (document.title !== "Run comparison · expri" || !document.querySelector("body > main > .chart-summary")) return false;
@@ -118,10 +187,13 @@ function isDashboardPreview(document: Document): boolean {
     const section = svg.closest("section.card"), metric = section?.querySelector("h2")?.textContent;
     const run_ids = [...(section?.querySelectorAll("ul.legend li code") ?? [])].map(node => node.textContent ?? "");
     const circles = svg.querySelectorAll("circle.point");
-    if (!metric || !run_ids.length || run_ids.length > 8 || new Set(run_ids).size !== run_ids.length || run_ids.some(id => !id) || !plotRange(svg) || !circles.length) return false;
+    const range = plotRange(svg), explicit = svg.hasAttribute("data-x-axis");
+    if (!metric || !run_ids.length || run_ids.length > 8 || new Set(run_ids).size !== run_ids.length || run_ids.some(id => !id) || !range || !circles.length) return false;
     for (const circle of circles) {
       const point = parseChartPointLabel(circle.getAttribute("aria-label") ?? "");
-      if (!point || point.run_index > run_ids.length) return false;
+      if (!point || point.run_index > run_ids.length || pointCoordinate(circle, point, range, explicit) === null) return false;
+      const timestamp = pointTimestamp(circle);
+      if ((range.x_axis !== "step" || circle.hasAttribute("data-timestamp")) && timestamp === null) return false;
       for (const attribute of ["cx", "cy"]) {
         const value = circle.getAttribute(attribute);
         if (value === null || !Number.isFinite(Number(value))) return false;
@@ -252,7 +324,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
   const x_ticks = [...svg.querySelectorAll<SVGTextElement>("text.tick")].filter(node => Number(node.getAttribute("y")) >= BOTTOM + 12);
   const parsed_range = plotRange(svg);
   if (!parsed_range) return null;
-  const full_range: StepRange = parsed_range;
+  const full_range: ChartRange = parsed_range;
   let range = full_range, follow_full = true, keyboard_index = -1, keyboard_anchor: PlotPoint | null = null;
   let drag_start: { x: number; screen_x: number; pointer_id: number } | null = null;
   const listeners: (() => void)[] = [];
@@ -289,10 +361,12 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
     const circle = node as SVGCircleElement;
     const parsed = parseChartPointLabel(circle.getAttribute("aria-label") ?? circle.querySelector("title")?.textContent ?? "");
     const item = parsed && series.get(parsed.run_index);
+    const x_value = parsed && pointCoordinate(circle, parsed, full_range, svg.hasAttribute("data-x-axis"));
+    const timestamp = pointTimestamp(circle);
     const x = Number(circle.getAttribute("cx")), y = Number(circle.getAttribute("cy"));
-    if (!parsed || !item || circle.getAttribute("cx") === null || circle.getAttribute("cy") === null || !Number.isFinite(x) || !Number.isFinite(y)) { invalid_points = true; continue; }
+    if (!parsed || !item || x_value === null || (full_range.x_axis !== "step" && timestamp === null) || circle.getAttribute("cx") === null || circle.getAttribute("cy") === null || !Number.isFinite(x) || !Number.isFinite(y)) { invalid_points = true; continue; }
     item.polyline = preceding_curve;
-    item.points.push({ ...parsed, x, y, circle });
+    item.points.push({ ...parsed, x_value, timestamp, x, y, circle });
     original_points.set(circle, { cx: circle.getAttribute("cx") ?? "", r: circle.getAttribute("r") ?? "2" });
     remember(circle, ["cx", "r", "clip-path", "display", "data-chart-series"]);
     circle.setAttribute("data-chart-series", String(parsed.run_index));
@@ -336,7 +410,7 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
   function listen(target: EventTarget, name: string, callback: (event: Event) => void): void {
     target.addEventListener(name, callback); listeners.push(() => target.removeEventListener(name, callback));
   }
-  function inRange(point: PlotPoint): boolean { const step = BigInt(point.step); return step >= BigInt(range.start_step) && step <= BigInt(range.end_step); }
+  function inRange(point: PlotPoint): boolean { const value = BigInt(point.x_value); return value >= BigInt(range.start_x) && value <= BigInt(range.end_x); }
   function available(item: Series): PlotPoint[] { return item.visible ? item.points.filter(inRange) : []; }
   function clearHighlights(): void { for (const [circle, original] of original_points) circle.setAttribute("r", original.r); }
   function showAt(x: number, y?: number, announce = false, anchor?: PlotPoint): void {
@@ -354,6 +428,11 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
         point.circle.setAttribute("r", "4.5");
         row.append(html(document, "span", `step ${point.step}`), html(document, "code", point.value_text), html(document, "span", `sample ${item.points.indexOf(point) + 1} of ${item.points.length} displayed`));
         row.setAttribute("data-chart-step", point.step); row.setAttribute("data-chart-value", point.value_text);
+        row.setAttribute("data-chart-x", point.x_value);
+        if (range.x_axis === "elapsed") row.append(html(document, "span", `Elapsed ${formatChartX(point.x_value, "elapsed")}`));
+        if (range.x_axis === "wall_clock") row.append(html(document, "span", formatChartX(point.x_value, "wall_clock")));
+        if (point.timestamp) row.append(html(document, "span", `timestamp ${point.timestamp}`));
+        if (point.timestamp) row.setAttribute("data-chart-timestamp", point.timestamp);
         if (first) { keyboard_index = points.indexOf(point); first = false; }
       } else row.append(html(document, "span", "No displayed samples in this range"));
       readout_values.append(row);
@@ -362,13 +441,14 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
   }
   function draw(): void {
     axis.replaceChildren();
-    const [start, end] = steps(range), span = end - start;
-    const count = span === 0n ? 1 : Math.max(range.start_step.length, range.end_step.length) > 12 ? 3 : 5;
+    const [start, end] = coordinatesInRange(range), span = end - start;
+    const count = span === 0n ? 1 : range.x_axis !== "step" || Math.max(range.start_x.length, range.end_x.length) > 12 ? 3 : 5;
     const seen = new Set<string>();
     for (let index = 0; index < count; index++) {
-      const step = count === 1 ? start : start + span * BigInt(index) / BigInt(count - 1);
-      const label = String(step); if (seen.has(label)) continue; seen.add(label);
-      const x = LEFT + chartStepFraction(label, range) * (RIGHT - LEFT);
+      const value = count === 1 ? start : start + span * BigInt(index) / BigInt(count - 1);
+      const coordinate = String(value); if (seen.has(coordinate)) continue; seen.add(coordinate);
+      const label = formatChartTick(coordinate, range);
+      const x = LEFT + chartXFraction(coordinate, range) * (RIGHT - LEFT);
       axis.append(svgNode(document, "line", { class: "grid", x1: String(x), x2: String(x), y1: String(TOP), y2: String(BOTTOM) }));
       const text = svgNode(document, "text", { class: "tick", x: String(x), y: String(BOTTOM + 23), "text-anchor": count === 1 ? "middle" : index === 0 ? "start" : index === count - 1 ? "end" : "middle" }); text.textContent = label; axis.append(text);
     }
@@ -376,25 +456,28 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
       item.button.disabled = !item.points.length;
       item.button.setAttribute("aria-pressed", String(item.visible));
       for (const point of item.points) {
-        point.x = LEFT + chartStepFraction(point.step, range) * (RIGHT - LEFT);
+        point.x = LEFT + chartXFraction(point.x_value, range) * (RIGHT - LEFT);
         point.circle.setAttribute("cx", String(point.x));
         point.circle.setAttribute("display", item.visible && inRange(point) ? "" : "none");
       }
       item.polyline?.setAttribute("points", item.points.map(point => `${point.x},${point.y}`).join(" "));
       item.polyline?.setAttribute("display", item.visible ? "" : "none");
     }
-    range_label.textContent = start === end ? `Step ${range.start_step}` : `Steps ${range.start_step}–${range.end_step}`;
-    range_label.setAttribute("data-start-step", range.start_step); range_label.setAttribute("data-end-step", range.end_step);
+    const first_label = formatChartX(range.start_x, range.x_axis), last_label = formatChartX(range.end_x, range.x_axis);
+    const label = range.x_axis === "step" ? start === end ? "Step" : "Steps" : range.x_axis === "elapsed" ? "Elapsed" : "UTC time";
+    range_label.textContent = start === end ? `${label} ${first_label}` : `${label} ${first_label}–${last_label}`;
+    range_label.setAttribute("data-x-axis", range.x_axis); range_label.setAttribute("data-start-x", range.start_x); range_label.setAttribute("data-end-x", range.end_x);
+    if (range.x_axis === "step") { range_label.setAttribute("data-start-step", range.start_x); range_label.setAttribute("data-end-step", range.end_x); }
     zoom_in.disabled = start === end || span <= 1n;
-    zoom_out.disabled = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
+    zoom_out.disabled = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
     reset.disabled = zoom_out.disabled && follow_full;
     crosshair.setAttribute("display", "none"); clearHighlights();
     readout_values.replaceChildren(html(document, "span", "Hover or use arrow keys to inspect displayed samples."));
     keyboard_index = -1;
     keyboard_anchor = null;
   }
-  function applyRange(next: StepRange): void {
-    range = next; follow_full = range.start_step === full_range.start_step && range.end_step === full_range.end_step;
+  function applyRange(next: ChartRange): void {
+    range = next; follow_full = range.start_x === full_range.start_x && range.end_x === full_range.end_x;
     selection.setAttribute("display", "none"); draw();
   }
   function coordinates(event: PointerEvent): { x: number; y: number } | null {
@@ -454,22 +537,22 @@ function enhancePlot(document: Document, svg: SVGSVGElement): PlotController | n
       for (const item of series.values()) if (active === item.button) focus = `run:${item.run_id}`;
       const anchored = keyboard_anchor, item = anchored && series.get(anchored.run_index);
       const anchor = anchored && item ? {
-        run_id: item.run_id, step: anchored.step, value_text: anchored.value_text,
-        occurrence: item.points.filter(point => point.step === anchored.step && point.value_text === anchored.value_text).indexOf(anchored),
+        run_id: item.run_id, step: anchored.step, x_value: anchored.x_value, value_text: anchored.value_text,
+        occurrence: item.points.filter(point => point.step === anchored.step && point.x_value === anchored.x_value && point.value_text === anchored.value_text).indexOf(anchored),
       } : null;
       return {
-        metric_name, range: follow_full ? null : { ...range },
+        metric_name, x_axis: range.x_axis, range: follow_full ? null : { ...range },
         hidden_run_ids: [...series.values()].filter(item => !item.visible).map(item => item.run_id), keyboard_anchor: anchor,
         focus, scroll_left: region.scrollLeft, scroll_top: region.scrollTop,
       };
     },
     restore(state) {
       range = restoreChartRange(state.range, full_range);
-      follow_full = state.range === null;
+      follow_full = state.range === null || state.x_axis !== full_range.x_axis;
       for (const item of series.values()) item.visible = !state.hidden_run_ids.includes(item.run_id);
       draw();
-      const anchor = state.keyboard_anchor, item = anchor && [...series.values()].find(item => item.run_id === anchor.run_id);
-      const point = anchor && item && available(item).filter(point => point.step === anchor.step && point.value_text === anchor.value_text)[anchor.occurrence];
+      const anchor = state.x_axis === full_range.x_axis ? state.keyboard_anchor : null, item = anchor && [...series.values()].find(item => item.run_id === anchor.run_id);
+      const point = anchor && item && available(item).filter(point => point.step === anchor.step && point.x_value === anchor.x_value && point.value_text === anchor.value_text)[anchor.occurrence];
       if (point) { showAt(point.x, point.y, false, point); keyboard_anchor = point; }
       const focus = state.focus;
       const focused = focus === "plot" ? region : focus === "zoom-in" ? zoom_in : focus === "zoom-out" ? zoom_out : focus === "reset" ? reset : [...series.values()].find(item => focus === `run:${item.run_id}`)?.button;

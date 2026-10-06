@@ -286,6 +286,74 @@ def interactive_charts(browser, run_ids, prefix='workspace', check_security=Fals
     browser.call('POST', '/frame', {'id': None})
 
 
+def select_chart_axis(browser, axis):
+  index = {'step': 0, 'elapsed': 1, 'wall_clock': 2}[axis]
+  # Select options live in Firefox's native popup; clicking the hidden option
+  # element bypasses that popup and is intercepted. Use actual keyboard input.
+  browser.click('#x-axis-select')
+  browser.keys('#x-axis-select', '\ue011' + '\ue015' * index + '\ue007')
+
+
+def time_axes(browser, run_ids, prefix='workspace'):
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def state():
+    return evaluate('''const doc = document.querySelector('#chart-frame').contentDocument;
+      const card = [...(doc?.querySelectorAll('[data-interactive-chart]') ?? [])].find(node => node.querySelector('h2').textContent === 'loss');
+      const range = card?.querySelector('[data-chart-range]'); const svg = card?.querySelector('svg');
+      return range && svg ? {axis: svg.dataset.xAxis, range: [range.dataset.startX, range.dataset.endX],
+        domain: [svg.dataset.xMin, svg.dataset.xMax], hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent)} : null;''')
+  def choose(axis):
+    select_chart_axis(browser, axis)
+    wait_for(lambda: (state() or {}).get('axis') == axis, 'native axis selection did not update the plot')
+    assert 'x_axis=' + axis in evaluate("return document.querySelector('#open-chart').href;"), 'Open chart lost the selected axis'
+  def child():
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+  loss = '//section[@data-interactive-chart][h2="loss"]'
+  child()
+  try:
+    browser.click(loss + '//button[code="' + run_ids[1] + '"]', using='xpath')
+  finally:
+    browser.call('POST', '/frame', {'id': None})
+  try:
+    for axis in ['elapsed', 'wall_clock']:
+      choose(axis)
+      full = state()
+      assert full['range'] == full['domain'], 'axis switch reused an incompatible zoom range'
+      assert full['hidden'] == [run_ids[1]], 'axis switch lost the hidden actual run ID'
+      child()
+      try:
+        duplicate = evaluate('''const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'duplicate_probe');
+          return {text: card.textContent, circles: card.querySelectorAll('circle.point').length};''')
+        assert '1 of 3 samples omitted' in duplicate['text'] and duplicate['circles'] == 4, 'time chart invented a timestamp for a legacy sample'
+        browser.pointer(loss + '//*[@data-chart-hit]', .001, using='xpath')
+        row = wait_for(lambda: evaluate('''const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss');
+          const row = card.querySelector('[data-chart-readout-run]'); return row ? {step: row.dataset.chartStep, value: row.dataset.chartValue, x: row.dataset.chartX, timestamp: row.dataset.chartTimestamp, text: row.textContent} : null;'''), 'native time hover did not show an exact sample')
+        assert row['step'] == '0' and float(row['value']) == 1, 'time hover changed the original step or metric value'
+        assert row['timestamp'].endswith('Z'), 'time hover omitted the original UTC timestamp'
+        assert ('Elapsed' if axis == 'elapsed' else 'UTC') in row['text'], 'time hover omitted the chosen axis value'
+        if axis == 'elapsed':
+          assert row['x'] == '0', 'elapsed axis did not anchor the first metric event at zero'
+        else:
+          assert int(row['x']) > 10**18, 'wall-clock axis lost its exact epoch nanosecond coordinate'
+        browser.pointer(loss + '//*[@data-chart-hit]', .2, .65, using='xpath')
+      finally:
+        browser.call('POST', '/frame', {'id': None})
+      zoomed = state()
+      assert int(full['domain'][0]) < int(zoomed['range'][0]) < int(zoomed['range'][1]) < int(full['domain'][1]), 'native drag did not narrow the time domain'
+      Path('/tmp/' + prefix + '-' + axis + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+    choose('step')
+    assert state()['range'] == ['0', '79'], 'returning to steps did not reset the time range'
+    assert state()['hidden'] == [run_ids[1]], 'returning to steps lost legend visibility'
+    child()
+    try:
+      browser.click(loss + '//button[code="' + run_ids[1] + '"]', using='xpath')
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+  finally:
+    browser.call('POST', '/frame', {'id': None})
+
+
 def remember_chart_document(browser):
   browser.call('POST', '/execute/sync', {'script': "window.__acceptance_chart_document = document.querySelector('#chart-frame').contentDocument;", 'args': []})
 
@@ -391,6 +459,7 @@ def workspace(run_id, second_run_id):
     finally:
       browser.call('POST', '/frame', {'id': None})
     interactive_charts(browser, [run_id, second_run_id], check_security=True)
+    time_axes(browser, [run_id, second_run_id])
     assert evaluate('''const list = document.querySelector('.runs-card').getBoundingClientRect();
       const review = document.querySelector('#review-section').getBoundingClientRect();
       return list.right <= review.left + 1;'''), 'desktop runs and charts are not side by side'
@@ -495,6 +564,7 @@ def previews(run_id, second_run_id):
       browser.click(f'input[aria-label="Select {selected} for comparison"]')
     wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'preview comparison did not load shared run data')
     interactive_charts(browser, [run_id, second_run_id], prefix='workspace-ab')
+    time_axes(browser, [run_id, second_run_id], prefix='workspace-ab')
     Path('/tmp/workspace-ab.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
 
     browser.restore_cookie(main_cookie)
@@ -542,7 +612,8 @@ def automatic_refresh(run_id, updated_run_id):
       const card = [...(doc?.querySelectorAll('[data-interactive-chart]') ?? [])].find(node => node.querySelector('h2').textContent === 'loss');
       if (!card) return null;
       const range = card.querySelector('[data-chart-range]');
-      return {range: [range.dataset.startStep, range.dataset.endStep],
+      const svg = card.querySelector('svg');
+      return {axis: svg.dataset.xAxis, domain: [svg.dataset.xMin, svg.dataset.xMax], range: [range.dataset.startX, range.dataset.endX],
         hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent),
         samples: [...card.querySelectorAll('[data-chart-run]')].map(node => ({run_id: node.querySelector('code').textContent, text: node.textContent})),
         point_labels: [...card.querySelectorAll('circle.point')].map(node => node.getAttribute('aria-label'))};''')
@@ -567,6 +638,8 @@ def automatic_refresh(run_id, updated_run_id):
     for selected_run in [run_id, updated_run_id]:
       browser.click(f'input[aria-label="Select {selected_run} for comparison"]')
     wait_for(lambda: loss_state() is not None and last_comparison_step() == 'step 79', 'auto-refresh comparison did not load its initial samples')
+    select_chart_axis(browser, 'elapsed')
+    wait_for(lambda: (loss_state() or {}).get('axis') == 'elapsed', 'auto-refresh fixture did not select elapsed time')
     # Let the initial revision baseline settle before proving a later unchanged
     # poll does not fetch chart/summary snapshots again.
     baseline = len(trace_records())
@@ -587,7 +660,7 @@ def automatic_refresh(run_id, updated_run_id):
       browser.call('POST', '/frame', {'id': None})
     before = loss_state()
     assert before['hidden'] == [run_id], 'fixture did not hide the requested actual run'
-    assert 0 < int(before['range'][0]) < int(before['range'][1]) < 79, 'fixture did not establish an absolute zoom'
+    assert 0 < int(before['range'][0]) < int(before['range'][1]) < int(before['domain'][1]), 'fixture did not establish an absolute elapsed-time zoom'
     selected_labels = selection()
     evaluate("window.__refresh_original_document = document.querySelector('#chart-frame').contentDocument;")
     # Keep one native pointer gesture active while the worker publishes. The
@@ -620,6 +693,7 @@ def automatic_refresh(run_id, updated_run_id):
       'new worker samples did not reach the selected chart and summary automatically', timeout=25)
     after = loss_state()
     assert after['range'] == before['range'], 'automatic replacement shifted the absolute zoom range'
+    assert after['axis'] == 'elapsed', 'automatic replacement changed the elapsed-time axis'
     assert after['hidden'] == [run_id], 'automatic replacement forgot the hidden actual run ID'
     assert any('step 80 · value 0.005' in label for label in after['point_labels']), 'replacement omitted the new exact metric sample'
     assert selection() == selected_labels, 'automatic update changed selected runs'
@@ -642,6 +716,19 @@ def automatic_refresh(run_id, updated_run_id):
       browser.call('POST', '/frame', {'id': None})
     Path('/tmp/workspace-auto-refresh.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
 
+    # A second real publication proves large absolute UTC coordinates retain
+    # their own locked range and hidden runs across pause/resume.
+    select_chart_axis(browser, 'wall_clock')
+    wait_for(lambda: (loss_state() or {}).get('axis') == 'wall_clock', 'pause/resume fixture did not select wall-clock time')
+    assert loss_state()['hidden'] == [run_id], 'time-axis switch forgot the hidden run'
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+    try:
+      browser.pointer(loss_prefix + '//*[@data-chart-hit]', .2, .65, using='xpath')
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    before = loss_state()
+    assert int(before['domain'][0]) < int(before['range'][0]) < int(before['range'][1]) < int(before['domain'][1]), 'pause/resume fixture did not lock a wall-clock range'
+
     browser.click('#auto-refresh-toggle')
     wait_for(lambda: 'Auto updates off' in evaluate("return document.querySelector('#updated-at').textContent;"), 'pause control did not report its state')
     paused = len(trace_records())
@@ -655,6 +742,7 @@ def automatic_refresh(run_id, updated_run_id):
       item['run_id'] == updated_run_id and '82 samples' in item['text'] for item in (loss_state() or {}).get('samples', [])),
       'resuming automatic refresh did not catch up with the worker publication', timeout=25)
     assert loss_state()['range'] == before['range'] and loss_state()['hidden'] == [run_id], 'pause/resume lost chart exploration state'
+    assert loss_state()['axis'] == 'wall_clock', 'pause/resume changed the selected wall-clock axis'
 
     # Inspect the updated run's logs; another real publication must update this
     # tab alone and leave its selection and filter intact.
@@ -669,7 +757,7 @@ def automatic_refresh(run_id, updated_run_id):
     assert evaluate("return document.querySelector('#review-tab-logs').getAttribute('aria-selected');") == 'true', 'log refresh changed the active tab'
     assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'log refresh changed the task filter'
     phase('complete')
-    print('Firefox auto refresh passed: real finalized worker publications, five-second probes, unchanged snapshots skipped, active drag deferred, exact samples/summary, absolute zoom and hidden run preserved, pause/resume, live Logs tab, sandbox/CSP retained.', flush=True)
+    print('Firefox auto refresh passed: real finalized worker publications, five-second probes, unchanged snapshots skipped, active drag deferred, exact samples/summary, elapsed and wall-clock zoom and hidden run preserved, pause/resume, live Logs tab, sandbox/CSP retained.', flush=True)
   except Exception:
     try:
       browser.call('POST', '/frame', {'id': None})

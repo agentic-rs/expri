@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::Dashboard;
 use crate::error::{ExpriError, Result};
+use crate::metric_charts::ChartXAxis;
 use crate::metrics::Reduction;
 
 const QUERY_LIMIT: usize = 8 * 1024;
@@ -585,10 +586,12 @@ fn route_content_checked(
       ))
     }
     "/api/chart" => {
-      query.allow(&["source", "run_id", "metric"])?;
+      query.allow(&["source", "run_id", "metric", "x_axis"])?;
       let ids = query.runs(1)?;
+      let x_axis =
+        ChartXAxis::parse(query.optional("x_axis").unwrap_or("step")).map_err(service_error)?;
       let html = dashboard
-        .chart(source, &ids, &query.many("metric"))
+        .chart(source, &ids, &query.many("metric"), x_axis)
         .map_err(service_error)?;
       let mut reply = Reply::bytes("text/html; charset=utf-8", html);
       reply.chart = true;

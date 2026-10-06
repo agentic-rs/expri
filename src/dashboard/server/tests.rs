@@ -215,6 +215,12 @@ fn rejects_unknown_duplicate_oversized_and_invalid_query_fields() {
     "/api/compare?run_id=run-one&run_id=run-two&reduction=mean",
     "/api/chart",
     "/api/chart?run_id=run-one&reduction=last",
+    "/api/chart?run_id=run-one&x_axis=",
+    "/api/chart?run_id=run-one&x_axis=time",
+    "/api/chart?run_id=run-one&x_axis=STEP",
+    "/api/chart?run_id=run-one&x_axis=step&x_axis=elapsed",
+    "/api/chart?run_id=run-one&x_axis=step&%78_axis=step",
+    "/api/compare?run_id=run-one&run_id=run-two&x_axis=elapsed",
     "/api/run?run_id=",
     "/api/log",
     "/api/updates?limit=1",
@@ -248,6 +254,66 @@ fn rejects_unknown_duplicate_oversized_and_invalid_query_fields() {
     )),
     400,
   );
+}
+
+#[test]
+fn charts_select_timestamp_axes_without_changing_filtered_elapsed_origin() {
+  let fixture = Fixture::new();
+  fs::write(
+    fixture
+      .dashboard
+      .repo_root
+      .join(".expri/runs/run-one/outputs/metrics.jsonl"),
+    [
+      json!({"step":5,"timestamp":"2026-10-03T01:00:00Z","metrics":{"setup":1}}),
+      json!({"step":8,"timestamp":"2026-10-03T01:00:02.000000001Z","metrics":{"train/loss":0.5}}),
+      json!({"step":3,"metrics":{"train/loss":0.25}}),
+      json!({"step":0,"timestamp":"2026-10-03T01:00:05.000000002Z","metrics":{"train/loss":0.125}}),
+    ]
+    .map(|row| row.to_string())
+    .join("\n")
+      + "\n",
+  )
+  .unwrap();
+  let base = "/api/chart?run_id=run-one&metric=train%2Floss";
+  let default = fixture.get(base);
+  let explicit = fixture.get(&format!("{base}&x_axis=step"));
+  assert_eq!(default.status, 200);
+  assert_eq!(default.body, explicit.body);
+  let step = String::from_utf8(default.body).unwrap();
+  assert!(step.contains("data-x-axis=\"step\""));
+  assert_eq!(step.matches("<circle class=point ").count(), 3);
+  let elapsed = fixture.get(&format!("{base}&x_axis=elapsed"));
+  assert_eq!(elapsed.status, 200);
+  assert!(elapsed.chart);
+  let html = String::from_utf8(elapsed.body).unwrap();
+  assert!(html.contains("data-x-axis=\"elapsed\""));
+  assert!(html.contains("data-x-value=\"2000000001\""));
+  assert!(html.contains("data-x-value=\"5000000002\""));
+  assert!(html.contains("1 of 3 samples omitted"));
+  assert_eq!(html.matches("<circle class=point ").count(), 2);
+  let wall_clock = fixture.get(&format!("{base}&x_axis=wall_clock"));
+  assert_eq!(wall_clock.status, 200);
+  let html = String::from_utf8(wall_clock.body).unwrap();
+  assert!(html.contains("data-x-axis=\"wall_clock\""));
+  assert!(html.contains("Wall-clock time (UTC)"));
+  assert!(html.contains("data-timestamp=\"2026-10-03T01:00:02.000000001Z\""));
+}
+
+#[test]
+fn time_charts_without_timestamps_report_omissions_and_serve_a_valid_empty_view() {
+  let fixture = Fixture::new();
+  for x_axis in ["elapsed", "wall_clock"] {
+    let reply = fixture.get(&format!(
+      "/api/chart?run_id=run-one&metric=train%2Floss&x_axis={x_axis}"
+    ));
+    assert_eq!(reply.status, 200);
+    assert!(reply.chart);
+    let html = String::from_utf8(reply.body).unwrap();
+    assert!(html.contains("1 of 1 samples omitted"));
+    assert!(html.contains("No timestamped samples are available to plot"));
+    assert!(!html.contains("<circle class=point "));
+  }
 }
 
 #[test]

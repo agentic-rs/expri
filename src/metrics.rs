@@ -30,6 +30,9 @@ pub struct MetricPoint {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MetricSummary {
   pub count: usize,
+  /// Complete count, independent of retained chart samples.
+  #[serde(default)]
+  pub missing_timestamp_count: usize,
   pub last: MetricPoint,
   pub min: MetricPoint,
   pub max: MetricPoint,
@@ -48,6 +51,9 @@ pub struct RunMetrics {
   pub run: Value,
   /// The effective parameter object, without the storage envelope.
   pub params: Option<Value>,
+  /// First timestamped, valid metric event in logging order, before filtering.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub first_metric_timestamp: Option<String>,
   pub metrics: BTreeMap<String, MetricSeries>,
   pub warnings: Vec<Value>,
 }
@@ -129,6 +135,7 @@ fn read_mode(
     run_id: run_id.to_string(),
     run: report["run"].clone(),
     params: None,
+    first_metric_timestamp: None,
     metrics: BTreeMap::new(),
     warnings: report["warnings"].as_array().cloned().unwrap_or_default(),
   };
@@ -400,6 +407,9 @@ pub(crate) fn read_event_data(
     };
     match event(value) {
       Ok((step, timestamp, metrics)) => {
+        if result.first_metric_timestamp.is_none() {
+          result.first_metric_timestamp = timestamp.clone();
+        }
         if previous_step.is_some_and(|previous| step < previous) && !warned_steps {
           warning(
             result,
@@ -442,11 +452,9 @@ pub(crate) fn read_event_data(
             let series = result.metrics.get_mut(&name).expect("metric just inserted");
             if series.points.len() > limit {
               sampled = true;
-              // Repeated thinning keeps the first and most recent point while
-              // bounding memory for long runs. Full reductions remain exact.
-              let last = series.points.pop().unwrap();
-              series.points = series.points.drain(..).step_by(2).collect();
-              series.points.push(last);
+              // Keep timestamped endpoints as well: legacy rows without times
+              // must not erase the only samples usable by a time-axis chart.
+              thin_points(&mut series.points, limit);
             }
           }
         }
@@ -542,6 +550,7 @@ fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint, retain_poin
       entry.insert(MetricSeries {
         summary: MetricSummary {
           count: 1,
+          missing_timestamp_count: usize::from(point.timestamp.is_none()),
           last: point.clone(),
           min: point.clone(),
           max: point.clone(),
@@ -556,6 +565,7 @@ fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint, retain_poin
     std::collections::btree_map::Entry::Occupied(mut entry) => {
       let series = entry.get_mut();
       series.summary.count += 1;
+      series.summary.missing_timestamp_count += usize::from(point.timestamp.is_none());
       series.summary.last = point.clone();
       if point.value < series.summary.min.value {
         series.summary.min = point.clone();
@@ -568,6 +578,30 @@ fn add_point(run: &mut RunMetrics, name: String, point: MetricPoint, retain_poin
       }
     }
   }
+}
+
+fn thin_points(points: &mut Vec<MetricPoint>, limit: usize) {
+  let mut selected = BTreeSet::from([0, points.len() - 1]);
+  if let Some(first) = points.iter().position(|point| point.timestamp.is_some()) {
+    selected.insert(first);
+  }
+  if let Some(last) = points.iter().rposition(|point| point.timestamp.is_some()) {
+    selected.insert(last);
+  }
+  let target = (limit / 2 + 2).min(limit);
+  // Source-order spacing bounds the preview without letting additional endpoint
+  // guarantees exceed its budget. Complete reductions are retained separately.
+  for index in 0..target {
+    if selected.len() >= target {
+      break;
+    }
+    selected.insert(index * (points.len() - 1) / (target - 1));
+  }
+  *points = points
+    .drain(..)
+    .enumerate()
+    .filter_map(|(index, point)| selected.contains(&index).then_some(point))
+    .collect();
 }
 
 fn validate_filters(filters: &[String]) -> Result<()> {

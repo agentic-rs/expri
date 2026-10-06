@@ -13,6 +13,7 @@ use super::store::{ApiError, ApiResult, Store};
 use super::types::{FileRecord, FileTarget, RunScope, STREAM_BATCH, validate_component};
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
 use crate::error::{ExpriError, Result};
+use crate::metric_charts::ChartXAxis;
 use crate::metrics::{self, Reduction, RunMetrics};
 
 const SOURCE_LIMIT: usize = 1000;
@@ -79,8 +80,14 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
   ) -> Result<Value> {
     HostedDashboard::compare(self, source, run_ids, filters, reduction)
   }
-  fn chart(&self, source: &str, run_ids: &[String], filters: &[String]) -> Result<String> {
-    HostedDashboard::chart(self, source, run_ids, filters)
+  fn chart(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<String> {
+    HostedDashboard::chart(self, source, run_ids, filters, x_axis)
   }
 }
 
@@ -378,7 +385,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     Ok(json!({"source": source, "comparison": comparison}))
   }
 
-  pub fn chart(&self, source_id: &str, run_ids: &[String], filters: &[String]) -> Result<String> {
+  pub fn chart(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<String> {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let selected = if filters.is_empty() {
       let summaries = self.read_metrics(
@@ -407,7 +420,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       },
       deadline,
     )?;
-    crate::metric_charts::render_dashboard_chart(&runs, &selected)
+    crate::metric_charts::render_dashboard_chart(&runs, &selected, x_axis)
   }
 
   fn scope(&self, source_id: &str, run_id: &str) -> Result<(Source, RunScope)> {
@@ -609,6 +622,7 @@ fn metric_record(scope: &RunScope, run: Value, params: Option<Value>) -> RunMetr
     run_id: scope.run_id.clone(),
     run,
     params,
+    first_metric_timestamp: None,
     metrics: BTreeMap::new(),
     warnings: Vec::new(),
   }

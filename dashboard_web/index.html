@@ -67,9 +67,10 @@
                 <section class="card comparison-summary"><h3>Metric values</h3><div id="comparison-values" class="table-scroll"></div></section>
               </div>
               <section id="chart-card" class="card chart-card" hidden>
-                <div class="section-heading"><div><h3>Metric curves</h3><p id="chart-note" class="muted">Recorded values by training step.</p></div><a id="open-chart" class="text-button" target="_blank" rel="noopener noreferrer">Open chart <span aria-hidden="true">↗</span></a></div>
+                <div class="section-heading"><div><h3>Metric curves</h3><p id="chart-note" class="muted">Recorded values by training step.</p></div><div class="chart-actions"><label class="field compact">X-axis<select id="x-axis-select"><option value="step">Step</option><option value="elapsed">Elapsed time</option><option value="wall_clock">Wall-clock time</option></select></label><a id="open-chart" class="text-button" target="_blank" rel="noopener noreferrer">Open chart <span aria-hidden="true">↗</span></a></div></div>
+                <p id="chart-error" class="notice error" role="alert" hidden></p>
                 <iframe id="chart-frame" title="Interactive experiment metric curves" sandbox="allow-same-origin" loading="lazy"></iframe>
-                <p class="chart-footnote muted">Hover to inspect values, drag across steps to zoom, and use the legend to show or hide runs.</p>
+                <p class="chart-footnote muted">Hover to inspect values, drag across the x-axis to zoom, and use the legend to show or hide runs. Time views omit points without recorded timestamps.</p>
               </section>
             </div>
             <div id="review-panel-overview" role="tabpanel" aria-labelledby="review-tab-overview" hidden><div id="run-detail" hidden></div></div>

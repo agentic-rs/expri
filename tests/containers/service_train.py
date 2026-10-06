@@ -19,7 +19,10 @@ with MetricsLogger() as logger:
     logger.log(step, {'loss': 1.0 / (step + 1)})
     if step == 0:
       logger.log(0, {'duplicate_probe': 7.0})
-      logger.log(0, {'duplicate_probe': 7.0})
+      # A valid legacy row proves time views omit untimestamped samples while
+      # step views and offline synchronization still preserve duplicates.
+      with (out / 'metrics.jsonl').open('a') as metrics:
+        metrics.write(json.dumps({'step': 0, 'metrics': {'duplicate_probe': 7.0}}) + '\n')
       logger.log(1, {'duplicate_probe': 8.0})
     print(f'step={step}', flush=True)
     time.sleep(0.1)

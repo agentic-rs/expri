@@ -115,6 +115,13 @@ samples stay individually reachable, Refresh removes the old chart handlers,
 and interaction does not fetch more metric data. Chart scripts remain blocked.
 Hover and zoom screenshots are included in the CI diagnostics.
 
+Time-axis checks on both dashboard hosts cover elapsed and wall-clock hover,
+native drag zoom, axis changes, and hidden-run preservation. A mixed legacy
+series verifies that rows without timestamps stay in Step view and are counted
+as omissions in time views. Live publications preserve exact elapsed and UTC
+zoom ranges. `workspace-elapsed.png` and `workspace-wall_clock.png` (plus their
+AB counterparts) capture these controls.
+
 The service workflow also opens an AB hostname in Firefox. It verifies distinct
 branch asset URLs, the same uploaded runs and comparison values, rejected cookie
 replay between hosts, and logout isolation. `workspace-ab.png` records the preview.

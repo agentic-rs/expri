@@ -246,6 +246,37 @@ function comparisonRows(nodes) {
   return nodes.get("comparison-values").children[0]?.children[1]?.children ?? [];
 }
 
+function chooseAxis(nodes, value) {
+  const select = nodes.get("x-axis-select"); select.value = value; select.emit("change");
+}
+
+test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
+  const model = reviewFixture(t), { nodes } = model;
+  await settled(() => nodes.get("run-rows").children.length === 3);
+  selectRow(nodes, 0);
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  assert.equal(chartQuery(nodes).get("x_axis"), "step");
+  chooseAxis(nodes, "elapsed");
+  assert.equal(chartQuery(nodes).get("x_axis"), "elapsed");
+  assert.match(nodes.get("chart-note").textContent, /first timestamped metric event/);
+  selectRow(nodes, 1);
+  await settled(() => chartQuery(nodes).getAll("run_id").length === 2);
+  assert.equal(chartQuery(nodes).get("x_axis"), "elapsed");
+  chooseAxis(nodes, "wall_clock");
+  assert.equal(chartQuery(nodes).get("x_axis"), "wall_clock");
+  assert.match(nodes.get("chart-note").textContent, /UTC/);
+  assert.equal(new URL(nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "wall_clock");
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-1"]);
+  nodes.get("refresh-button").click();
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(nodes.get("x-axis-select").value, "wall_clock");
+  assert.equal(chartQuery(nodes).get("x_axis"), "wall_clock");
+  chooseAxis(nodes, "invalid");
+  assert.equal(nodes.get("x-axis-select").value, "wall_clock");
+  chooseAxis(nodes, "step");
+  assert.equal(chartQuery(nodes).get("x_axis"), "step");
+});
+
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = reviewFixture(t);
   await settled(() => nodes.get("run-rows").children.length === 3);
@@ -572,6 +603,78 @@ test("changed metrics update only the active run and chart while preserving the 
   assert.equal(model.nodes.get("chart-frame").src_writes, writes);
   assert.equal(model.chart.previews.at(-1), "<html>chart-2</html>");
   assert.match(text(model.nodes.get("run-detail")), /0\.125/);
+});
+
+test("time-axis changes replace the preview in place and remain selected for incremental updates", async t => {
+  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const writes = model.nodes.get("chart-frame").src_writes;
+  model.model.chart_html = "<html>elapsed-chart</html>";
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes, "axis switching preserves the iframe and its visibility state");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
+  assert.equal(new URL(model.nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "elapsed");
+  model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>elapsed-chart-updated</html>";
+  await model.clock.advance(5_000);
+  assert.equal(model.chart.previews.at(-1), "<html>elapsed-chart-updated</html>");
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/chart")).at(-1), "http://localhost").searchParams.get("x_axis"), "elapsed");
+  assert.equal(model.nodes.get("x-axis-select").value, "elapsed");
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+});
+
+test("late axis responses cannot replace a newer choice or review", async t => {
+  const model = autoFixture(t); await inspect(model);
+  const pending = deferred(), signals = [];
+  model.model.override = (parsed, options) => {
+    if (parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed") {
+      signals.push(options.signal); return pending.promise;
+    }
+  };
+  chooseAxis(model.nodes, "elapsed");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "true");
+  model.model.chart_html = "<html>wall-clock-chart</html>";
+  chooseAxis(model.nodes, "wall_clock");
+  await settled(() => model.chart.previews.at(-1) === "<html>wall-clock-chart</html>");
+  assert.equal(signals[0].aborted, true);
+  pending.resolve({ ok: true, status: 200, text: async () => "<html>stale-elapsed-chart</html>" });
+  await flush();
+  assert.equal(model.chart.previews.at(-1), "<html>wall-clock-chart</html>");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
+  const next = deferred();
+  model.model.override = parsed => parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed" ? next.promise : null;
+  chooseAxis(model.nodes, "elapsed");
+  model.nodes.get("run-rows").children[1].children[1].children[0].click();
+  await settled(() => chartQuery(model.nodes).get("run_id") === "run-1");
+  next.resolve({ ok: true, status: 200, text: async () => "<html>old-review-chart</html>" });
+  await flush();
+  assert.equal(model.chart.previews.includes("<html>old-review-chart</html>"), false);
+  assert.equal(chartQuery(model.nodes).get("x_axis"), "elapsed");
+});
+
+test("an axis load failure retains the last chart and automatic recovery clears its scoped error", async t => {
+  const model = autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const previews = [...model.chart.previews], writes = model.nodes.get("chart-frame").src_writes;
+  model.model.override = parsed => parsed.pathname === "/api/chart" ? response({ error: "Connection temporarily unavailable" }, 503) : null;
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.nodes.get("chart-error").hidden === false);
+  assert.deepEqual(model.chart.previews, previews);
+  assert.equal(model.nodes.get("chart-frame").src_writes, writes);
+  assert.match(model.nodes.get("chart-error").textContent, /Showing the last loaded chart/);
+  model.model.override = null; model.model.chart_html = "<html>recovered-elapsed-chart</html>";
+  await model.clock.advance(5_000);
+  assert.equal(model.chart.previews.at(-1), "<html>recovered-elapsed-chart</html>");
+  assert.equal(model.nodes.get("chart-error").hidden, true);
+  assert.equal(model.nodes.get("x-axis-select").value, "elapsed");
+});
+
+test("changing only the chart axis does not dismiss an unrelated metadata failure", async t => {
+  const model = autoFixture(t); await inspect(model);
+  const error = model.nodes.get("review-error"); error.hidden = false; error.textContent = "Run metadata temporarily unavailable";
+  model.model.chart_html = "<html>elapsed-chart</html>";
+  chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
+  assert.equal(error.hidden, false);
+  assert.equal(error.textContent, "Run metadata temporarily unavailable");
 });
 
 test("auto and manual refresh preserve pagination and explicit selections outside the page", async t => {

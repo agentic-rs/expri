@@ -3,6 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{ExpriError, Result};
@@ -11,6 +13,7 @@ use crate::metrics::{MetricPoint, RunMetrics};
 const POINT_BUDGET: usize = 2000;
 const DASHBOARD_POINT_BUDGET: usize = 600;
 const DASHBOARD_TOTAL_POINT_BUDGET: usize = 4800;
+const DASHBOARD_HTML_LIMIT: usize = 2 * 1024 * 1024;
 const COLORS: [&str; 10] = [
   "#4056b4", "#087f8c", "#c05a25", "#894caa", "#bd416c", "#577c30", "#9a6717", "#306a94",
   "#78594e", "#59616e",
@@ -19,6 +22,50 @@ const LEFT: f64 = 86.0;
 const TOP: f64 = 28.0;
 const WIDTH: f64 = 864.0;
 const HEIGHT: f64 = 246.0;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChartXAxis {
+  #[default]
+  Step,
+  Elapsed,
+  WallClock,
+}
+
+impl ChartXAxis {
+  pub fn parse(value: &str) -> Result<Self> {
+    match value {
+      "step" => Ok(Self::Step),
+      "elapsed" => Ok(Self::Elapsed),
+      "wall_clock" => Ok(Self::WallClock),
+      _ => Err(message("chart x_axis must be step, elapsed, or wall_clock")),
+    }
+  }
+
+  fn token(self) -> &'static str {
+    match self {
+      Self::Step => "step",
+      Self::Elapsed => "elapsed",
+      Self::WallClock => "wall_clock",
+    }
+  }
+
+  fn label(self) -> &'static str {
+    match self {
+      Self::Step => "Global step",
+      Self::Elapsed => "Elapsed time from first metric event",
+      Self::WallClock => "Wall-clock time (UTC)",
+    }
+  }
+
+  fn format(self, value: i128) -> String {
+    match self {
+      Self::Step => value.to_string(),
+      Self::Elapsed => duration(value),
+      Self::WallClock => utc_timestamp(value),
+    }
+  }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChartPresentation {
@@ -34,6 +81,7 @@ struct ParameterPreview {
 
 #[derive(Clone, Copy)]
 struct ChartOptions {
+  x_axis: ChartXAxis,
   presentation: ChartPresentation,
   point_budget: usize,
   total_point_budget: Option<usize>,
@@ -72,6 +120,7 @@ pub(crate) fn render_chart(runs: &[RunMetrics], filters: &[String]) -> Result<St
     runs,
     filters,
     ChartOptions {
+      x_axis: ChartXAxis::Step,
       presentation: ChartPresentation::Report,
       point_budget: POINT_BUDGET,
       total_point_budget: None,
@@ -84,23 +133,62 @@ pub(crate) fn render_chart(runs: &[RunMetrics], filters: &[String]) -> Result<St
 }
 
 /// Keep browser previews compact while the exported CLI chart retains all data.
-pub(crate) fn render_dashboard_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
-  render_with_options(
-    runs,
-    filters,
-    ChartOptions {
-      presentation: ChartPresentation::Dashboard,
-      point_budget: DASHBOARD_POINT_BUDGET,
-      total_point_budget: Some(DASHBOARD_TOTAL_POINT_BUDGET),
-      default_metric_limit: Some(4),
-      selected_metric_limit: Some(6),
-      parameter_preview: Some(ParameterPreview {
-        keys: 24,
-        characters: 1000,
-      }),
-      text_preview: Some(512),
-    },
-  )
+pub(crate) fn render_dashboard_chart(
+  runs: &[RunMetrics],
+  filters: &[String],
+  x_axis: ChartXAxis,
+) -> Result<String> {
+  let mut options = ChartOptions {
+    x_axis,
+    presentation: ChartPresentation::Dashboard,
+    point_budget: DASHBOARD_POINT_BUDGET,
+    total_point_budget: Some(DASHBOARD_TOTAL_POINT_BUDGET),
+    default_metric_limit: Some(4),
+    selected_metric_limit: Some(6),
+    parameter_preview: Some(ParameterPreview {
+      keys: 24,
+      characters: 1000,
+    }),
+    text_preview: Some(512),
+  };
+  let names: BTreeSet<_> = if filters.is_empty() {
+    runs
+      .iter()
+      .flat_map(|run| run.metrics.keys().map(String::as_str))
+      .collect::<BTreeSet<_>>()
+      .into_iter()
+      .take(options.default_metric_limit.unwrap())
+      .collect()
+  } else {
+    filters.iter().map(String::as_str).collect()
+  };
+  let curves = names
+    .iter()
+    .map(|name| {
+      runs
+        .iter()
+        .filter(|run| run.metrics.contains_key(*name))
+        .count()
+    })
+    .sum::<usize>()
+    .max(1);
+  let minimum_budget = 4 * curves;
+  let mut total_budget = DASHBOARD_TOTAL_POINT_BUDGET.min(DASHBOARD_POINT_BUDGET * curves);
+  loop {
+    options.total_point_budget = Some(total_budget);
+    let html = render_with_options(runs, filters, options)?;
+    if html.len() <= DASHBOARD_HTML_LIMIT {
+      return Ok(html);
+    }
+    if total_budget <= minimum_budget {
+      return Err(message(
+        "dashboard chart exceeds the 2 MiB preview limit; select fewer metrics or runs",
+      ));
+    }
+    // Long timestamp/value labels have variable byte costs. Keep the normal
+    // sample budget when it fits, otherwise reduce using the actual HTML size.
+    total_budget = (total_budget / 2).max(minimum_budget);
+  }
 }
 
 fn render_with_options(
@@ -315,15 +403,42 @@ fn render_metric(
   options: ChartOptions,
 ) {
   html.push_str(&format!("<section class=card><h2>{}</h2>", escape(name)));
-  let all_points = runs
-    .iter()
-    .filter_map(|run| run.metrics.get(name))
-    .flat_map(|series| series.points.iter())
-    .filter(|point| point.value.is_finite());
+  if options.x_axis != ChartXAxis::Step {
+    for (run_index, run) in runs.iter().enumerate() {
+      let Some(series) = run.metrics.get(name) else {
+        continue;
+      };
+      let missing = series.summary.missing_timestamp_count;
+      if missing > 0 {
+        html.push_str(&format!(
+          "<p class=muted>Run {} · <code>{}</code>: {missing} of {} samples omitted from this time view because they have no timestamp.</p>",
+          run_index + 1,
+          escape(&preview_text(&run.run_id, options.text_preview)),
+          series.summary.count
+        ));
+      }
+    }
+  }
+  let all_points = runs.iter().flat_map(|run| {
+    let origin = run
+      .first_metric_timestamp
+      .as_deref()
+      .and_then(timestamp_nanos);
+    run.metrics.get(name).into_iter().flat_map(move |series| {
+      series.points.iter().filter_map(move |point| {
+        point.value.is_finite().then_some(())?;
+        Some((coordinate(point, options.x_axis, origin)?, point))
+      })
+    })
+  });
   if let Some(domain) = Domain::new(all_points) {
     render_plot(html, runs, name, index, &domain, options);
   } else {
-    html.push_str("<p class=muted>No finite samples are available to plot.</p>");
+    html.push_str(if options.x_axis == ChartXAxis::Step {
+      "<p class=muted>No finite samples are available to plot.</p>"
+    } else {
+      "<p class=muted>No timestamped samples are available to plot.</p>"
+    });
   }
   if options.presentation == ChartPresentation::Dashboard {
     html.push_str("</section>");
@@ -375,16 +490,22 @@ fn render_plot(
     ));
   }
   let description = if dashboard {
-    "Metric values by global step. Each color represents one run. Samples remain in logging order; the legend lists complete sample counts. Point tooltips show exact values."
+    format!(
+      "Metric values by {}. Each color represents one run. Samples remain in logging order; the legend lists complete sample counts. Point tooltips show exact values.",
+      options.x_axis.label().to_lowercase()
+    )
   } else {
-    "Metric values by global step. Each color represents one run. Samples remain in logging order; the table below lists statistics from all samples."
+    format!(
+      "Metric values by {}. Each color represents one run. Samples remain in logging order; the table below lists statistics from all samples.",
+      options.x_axis.label().to_lowercase()
+    )
   };
   let view_box = if dashboard {
     "-84 0 1084 340"
   } else {
     "0 0 1000 340"
   };
-  html.push_str(&format!("<svg viewBox=\"{view_box}\" role=img aria-labelledby=\"plot-title-{index} plot-desc-{index}\"><title id=\"plot-title-{index}\">{}</title><desc id=\"plot-desc-{index}\">{description}</desc>", escape(name)));
+  html.push_str(&format!("<svg viewBox=\"{view_box}\" role=img aria-labelledby=\"plot-title-{index} plot-desc-{index}\" data-x-axis=\"{}\" data-x-min=\"{}\" data-x-max=\"{}\"><title id=\"plot-title-{index}\">{}</title><desc id=\"plot-desc-{index}\">{description}</desc>", options.x_axis.token(), domain.x_min, domain.x_max, escape(name)));
   for (value, fraction) in domain.value_ticks() {
     let y = TOP + (1.0 - fraction) * HEIGHT;
     let label = if dashboard {
@@ -394,39 +515,65 @@ fn render_plot(
     };
     html.push_str(&format!("<line class=grid x1=\"{LEFT}\" x2=\"{}\" y1=\"{y:.2}\" y2=\"{y:.2}\"/><text class=tick x=\"{}\" y=\"{:.2}\" text-anchor=end>{label}</text>", LEFT + WIDTH, LEFT - 12.0, y + 4.0));
   }
-  for step in domain.step_ticks() {
-    let x = domain.x(step);
-    let anchor = if domain.step_min == domain.step_max {
+  for value in domain.x_ticks(if options.x_axis == ChartXAxis::Step {
+    4
+  } else {
+    2
+  }) {
+    let x = domain.x(value);
+    let anchor = if domain.x_min == domain.x_max {
       "middle"
-    } else if step == domain.step_min {
+    } else if value == domain.x_min {
       "start"
-    } else if step == domain.step_max {
+    } else if value == domain.x_max {
       "end"
     } else {
       "middle"
     };
-    html.push_str(&format!("<line class=grid x1=\"{x:.2}\" x2=\"{x:.2}\" y1=\"{TOP}\" y2=\"{}\"/><text class=tick x=\"{x:.2}\" y=\"{}\" text-anchor={anchor}>{step}</text>", TOP + HEIGHT, TOP + HEIGHT + 23.0));
+    let label = if options.x_axis == ChartXAxis::WallClock {
+      format!(
+        "<title>{}</title>{}",
+        escape(&options.x_axis.format(value)),
+        escape(&wall_clock_tick(value, domain.x_min, domain.x_max))
+      )
+    } else {
+      escape(&options.x_axis.format(value))
+    };
+    html.push_str(&format!("<line class=grid x1=\"{x:.2}\" x2=\"{x:.2}\" y1=\"{TOP}\" y2=\"{}\"/><text class=tick x=\"{x:.2}\" y=\"{}\" text-anchor={anchor}>{label}</text>", TOP + HEIGHT, TOP + HEIGHT + 23.0));
   }
   html.push_str(&format!(
-    "<text class=axis-label x=\"{}\" y=\"{}\" text-anchor=middle>Global step</text>",
+    "<text class=axis-label x=\"{}\" y=\"{}\" text-anchor=middle>{}</text>",
     LEFT + WIDTH / 2.0,
-    TOP + HEIGHT + 52.0
+    TOP + HEIGHT + 52.0,
+    options.x_axis.label()
   ));
   let mut sampled = false;
   for (run_index, run) in runs.iter().enumerate() {
     let Some(series) = run.metrics.get(name) else {
       continue;
     };
+    let origin = run
+      .first_metric_timestamp
+      .as_deref()
+      .and_then(timestamp_nanos);
     let points: Vec<_> = series
       .points
       .iter()
-      .filter(|point| point.value.is_finite())
+      .filter(|point| {
+        point.value.is_finite() && coordinate(point, options.x_axis, origin).is_some()
+      })
       .collect();
     let chosen = plot_points(&points, point_budget);
     sampled |= chosen.len() < points.len();
     let coordinates = chosen
       .iter()
-      .map(|point| format!("{:.2},{:.2}", domain.x(point.step), domain.y(point.value)))
+      .map(|point| {
+        format!(
+          "{:.2},{:.2}",
+          domain.x(coordinate(point, options.x_axis, origin).unwrap()),
+          domain.y(point.value)
+        )
+      })
       .collect::<Vec<_>>()
       .join(" ");
     let dash = if run_index < COLORS.len() {
@@ -441,7 +588,7 @@ fn render_plot(
       ));
     }
     for point in chosen {
-      let label = if dashboard {
+      let mut label = if dashboard {
         format!(
           "Run {} · step {} · value {}",
           run_index + 1,
@@ -457,12 +604,28 @@ fn render_plot(
           precise_number(point.value)
         )
       };
-      html.push_str(&format!("<circle class=point cx=\"{:.2}\" cy=\"{:.2}\" r=2 fill=\"{}\" aria-label=\"{}\"><title>{}</title></circle>", domain.x(point.step), domain.y(point.value), color(run_index), escape(&label), escape(&label)));
+      let x_value = coordinate(point, options.x_axis, origin).unwrap();
+      let timestamp_attribute = if let Some(timestamp) = &point.timestamp {
+        label.push_str(&format!(" · timestamp {timestamp}"));
+        format!(" data-timestamp=\"{}\"", escape(timestamp))
+      } else {
+        String::new()
+      };
+      if options.x_axis == ChartXAxis::Elapsed {
+        label.push_str(&format!(" · elapsed {}", duration(x_value)));
+      }
+      html.push_str(&format!("<circle class=point cx=\"{:.2}\" cy=\"{:.2}\" r=2 fill=\"{}\" aria-label=\"{}\" data-x-value=\"{x_value}\"{timestamp_attribute}><title>{}</title></circle>", domain.x(x_value), domain.y(point.value), color(run_index), escape(&label), escape(&label)));
     }
   }
   html.push_str("</svg>");
   if dashboard {
     html.push_str("</div>");
+  }
+  if options.x_axis == ChartXAxis::WallClock {
+    html.push_str(&format!(
+      "<p class=muted>{}</p>",
+      escape(&wall_clock_context(domain.x_min, domain.x_max))
+    ));
   }
   html.push_str("<ul class=legend>");
   for (run_index, run) in runs.iter().enumerate() {
@@ -494,26 +657,26 @@ fn render_plot(
 }
 
 struct Domain {
-  step_min: u64,
-  step_max: u64,
+  x_min: i128,
+  x_max: i128,
   value_min: f64,
   value_max: f64,
   scale: f64,
 }
 
 impl Domain {
-  fn new<'a>(mut points: impl Iterator<Item = &'a MetricPoint>) -> Option<Self> {
-    let first = points.next()?;
+  fn new<'a>(mut points: impl Iterator<Item = (i128, &'a MetricPoint)>) -> Option<Self> {
+    let (first_x, first) = points.next()?;
     let mut domain = Self {
-      step_min: first.step,
-      step_max: first.step,
+      x_min: first_x,
+      x_max: first_x,
       value_min: first.value,
       value_max: first.value,
       scale: 1.0,
     };
-    for point in points {
-      domain.step_min = domain.step_min.min(point.step);
-      domain.step_max = domain.step_max.max(point.step);
+    for (x, point) in points {
+      domain.x_min = domain.x_min.min(x);
+      domain.x_max = domain.x_max.max(x);
       domain.value_min = domain.value_min.min(point.value);
       domain.value_max = domain.value_max.max(point.value);
     }
@@ -524,11 +687,11 @@ impl Domain {
     Some(domain)
   }
 
-  fn x(&self, step: u64) -> f64 {
-    let fraction = if self.step_min == self.step_max {
+  fn x(&self, value: i128) -> f64 {
+    let fraction = if self.x_min == self.x_max {
       0.5
     } else {
-      (step - self.step_min) as f64 / (self.step_max - self.step_min) as f64
+      (value - self.x_min) as f64 / (self.x_max - self.x_min) as f64
     };
     LEFT + fraction.clamp(0.0, 1.0) * WIDTH
   }
@@ -543,9 +706,9 @@ impl Domain {
     TOP + (1.0 - fraction.clamp(0.0, 1.0)) * HEIGHT
   }
 
-  fn step_ticks(&self) -> Vec<u64> {
-    let mut ticks: Vec<_> = (0..=4)
-      .map(|index| self.step_min + ((u128::from(self.step_max - self.step_min) * index) / 4) as u64)
+  fn x_ticks(&self, intervals: i128) -> Vec<i128> {
+    let mut ticks: Vec<_> = (0..=intervals)
+      .map(|index| self.x_min + (self.x_max - self.x_min) * index / intervals)
       .collect();
     ticks.dedup();
     ticks
@@ -566,6 +729,105 @@ impl Domain {
         )
       })
       .collect()
+  }
+}
+
+fn timestamp_nanos(value: &str) -> Option<i128> {
+  let timestamp = DateTime::parse_from_rfc3339(value).ok()?;
+  Some(
+    i128::from(timestamp.timestamp()) * 1_000_000_000
+      + i128::from(timestamp.timestamp_subsec_nanos()),
+  )
+}
+
+fn coordinate(point: &MetricPoint, x_axis: ChartXAxis, origin: Option<i128>) -> Option<i128> {
+  match x_axis {
+    ChartXAxis::Step => Some(i128::from(point.step)),
+    ChartXAxis::WallClock => timestamp_nanos(point.timestamp.as_deref()?),
+    ChartXAxis::Elapsed => Some(timestamp_nanos(point.timestamp.as_deref()?)? - origin?),
+  }
+}
+
+fn utc_datetime(value: i128) -> Option<DateTime<Utc>> {
+  let seconds = value.div_euclid(1_000_000_000);
+  let nanos = value.rem_euclid(1_000_000_000) as u32;
+  i64::try_from(seconds)
+    .ok()
+    .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, nanos))
+}
+
+fn utc_timestamp(value: i128) -> String {
+  utc_datetime(value)
+    .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S%.f UTC").to_string())
+    .unwrap_or_else(|| value.to_string())
+}
+
+fn wall_clock_tick(value: i128, min: i128, max: i128) -> String {
+  let Some(timestamp) = utc_datetime(value) else {
+    return value.to_string();
+  };
+  let same_date = utc_datetime(min)
+    .zip(utc_datetime(max))
+    .is_some_and(|(min, max)| min.date_naive() == max.date_naive());
+  let format = if same_date {
+    "%H:%M:%S%.f"
+  } else if max - min < 120_000_000_000 {
+    "%m-%d %H:%M:%S%.f"
+  } else if max - min < 31_536_000_000_000_000 {
+    "%m-%d %H:%M"
+  } else {
+    "%Y-%m-%d"
+  };
+  timestamp.format(format).to_string()
+}
+
+fn wall_clock_context(min: i128, max: i128) -> String {
+  match utc_datetime(min).zip(utc_datetime(max)) {
+    Some((min, max)) if min.date_naive() == max.date_naive() => {
+      format!("UTC date: {}.", min.format("%Y-%m-%d"))
+    }
+    Some((min, max)) => format!(
+      "UTC dates: {} – {}.",
+      min.format("%Y-%m-%d"),
+      max.format("%Y-%m-%d")
+    ),
+    None => "Wall-clock times are shown in UTC.".to_string(),
+  }
+}
+
+fn duration(value: i128) -> String {
+  let negative = if value < 0 { "−" } else { "" };
+  let absolute = value.unsigned_abs();
+  let (scale, unit) = if absolute < 1000 && absolute != 0 {
+    (1_u128, "ns")
+  } else if absolute < 1_000_000 && absolute != 0 {
+    (1000, "µs")
+  } else if absolute < 1_000_000_000 && absolute != 0 {
+    (1_000_000, "ms")
+  } else {
+    (1_000_000_000, "s")
+  };
+  let whole = absolute / scale;
+  let remainder = absolute % scale;
+  let fraction = if remainder == 0 {
+    String::new()
+  } else {
+    let digits = scale.ilog10() as usize;
+    format!(".{remainder:0digits$}")
+      .trim_end_matches('0')
+      .to_string()
+  };
+  if unit == "s" && whole >= 3600 {
+    format!(
+      "{negative}{}:{:02}:{:02}{fraction} h",
+      whole / 3600,
+      whole % 3600 / 60,
+      whole % 60
+    )
+  } else if unit == "s" && whole >= 60 {
+    format!("{negative}{}:{:02}{fraction} min", whole / 60, whole % 60)
+  } else {
+    format!("{negative}{whole}{fraction} {unit}")
   }
 }
 

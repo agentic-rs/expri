@@ -1,4 +1,4 @@
-import { createChartController, type ChartController } from "./interactive_charts";
+import { createChartController, type ChartAxis, type ChartController } from "./interactive_charts";
 import { AutoRefresh, type RefreshAvailability, type RefreshClock, type RefreshOutcome, type RefreshState } from "./auto_refresh";
 export * from "./interactive_charts";
 export * from "./auto_refresh";
@@ -160,6 +160,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const search_input = required<HTMLInputElement>("search-input");
   const task_input = required<HTMLInputElement>("task-input");
   const status_select = required<HTMLSelectElement>("status-select");
+  const x_axis_select = required<HTMLSelectElement>("x-axis-select");
+  x_axis_select.value = "step";
+  let x_axis: ChartAxis = "step";
   const previous_page = required<HTMLButtonElement>("previous-page");
   const next_page = required<HTMLButtonElement>("next-page");
   const global_error = required("global-error");
@@ -193,6 +196,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let last_full_snapshot = -Infinity;
   let last_checked: number | null = null;
   let cached_chart: { context: string; html: string } | null = null;
+  let chart_error_context: string | null = null;
   let sources: Source[] = [];
   let source_id = "local";
   let access_mode: "local" | "hosted" = "local";
@@ -232,7 +236,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     required("updated-at").textContent = `${checked} · ${activity}`;
   }
   function listUrl(): string { return apiUrl("/api/runs", { source: source_id, search: search_input.value.trim(), task: task_input.value.trim(), status: status_select.value, limit: page_size, offset }); }
-  function chartUrl(): string { return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [] }); }
+  function chartUrl(): string { return apiUrl("/api/chart", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], x_axis }); }
   function comparisonUrl(): string { return apiUrl("/api/compare", { source: source_id, run_id: review?.run_ids ?? [], metric: review?.metric_names ?? [], reduction: required<HTMLSelectElement>("reduction-select").value }); }
   function boundedSet<T>(cache: Map<string, T>, key: string, value: T): void {
     cache.delete(key); cache.set(key, value);
@@ -342,8 +346,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function cancelRefresh(): void { cancelQuietRefresh(); refresh_generation++; catalog_lane.cancel(); refresh_button.disabled = false; }
   function hideReview(): void {
     clearSelectionTimeout();
-    review_lane.cancel(); log_lane.cancel(); compare_lane.cancel(); review = null; missing_review = null;
+    review_lane.cancel(); log_lane.cancel(); compare_lane.cancel(); chart_lane.cancel(); review = null; missing_review = null;
     log_view = null;
+    clearChartError();
     required("review-section").hidden = true; required("review-empty").hidden = false;
     required<HTMLIFrameElement>("chart-frame").removeAttribute("src"); renderRows();
   }
@@ -368,9 +373,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   function beginReview(kind: "run" | "compare", ids: string[], origin: Review["origin"] = "inspection"): void {
     clearSelectionTimeout();
-    review_lane.cancel(); log_lane.cancel(); compare_lane.cancel();
+    review_lane.cancel(); log_lane.cancel(); compare_lane.cancel(); chart_lane.cancel();
     detail_revisions.clear(); chart_revisions.clear(); log_revisions.clear(); comparison_revision = null;
     missing_review = null;
+    clearChartError();
     review = { kind, origin, run_ids: ids, metric_names: [], metric_selection_set: false, tab: "charts", log_stream: "stdout" }; metric_names = []; log_view = null; rendered_detail = null; rendered_comparison = null; cached_chart = null;
     required("review-section").hidden = false; required("review-empty").hidden = true;
     required("review-title").textContent = kind === "run" ? ids[0] ?? "Run" : `${ids.length} runs`;
@@ -379,6 +385,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     required("run-detail").hidden = true; required("compare-detail").hidden = true;
     required("run-metric-controls").hidden = true; required("run-logs").replaceChildren();
     required("chart-card").hidden = true; required<HTMLIFrameElement>("chart-frame").removeAttribute("src");
+    required("chart-card").setAttribute("aria-busy", "false");
     const close = required<HTMLButtonElement>("close-review"); close.hidden = origin === "selection";
     close.textContent = selected.size ? "Back to selection" : "Close review";
     warnings(required("review-warnings"), []); syncReviewTabs(); renderRows();
@@ -402,10 +409,48 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (!review) return;
     const url = chartUrl();
     const frame = required<HTMLIFrameElement>("chart-frame");
-    if (frame.getAttribute("src") !== url) { frame.src = url; chart_revisions.delete(url); cached_chart = null; }
+    if ((cached_chart?.context ?? frame.getAttribute("src")) !== url) {
+      chart_lane.cancel(); frame.src = url; chart_revisions.delete(url); cached_chart = null;
+      clearChartError();
+      required("chart-card").setAttribute("aria-busy", "false");
+    }
+    chartControls(url);
+  }
+  function chartControls(url: string): void {
+    if (!review) return;
     required<HTMLAnchorElement>("open-chart").href = url;
     required("chart-card").hidden = false;
-    required("chart-note").textContent = review.metric_names.length ? `${review.metric_names.length} selected metrics · at most 600 chart points per series` : "First four recorded metrics · at most 600 chart points per series";
+    const metrics = review.metric_names.length ? `${review.metric_names.length} selected metrics` : "First four recorded metrics";
+    const axis = x_axis === "elapsed" ? "Time since each run’s first timestamped metric event" : x_axis === "wall_clock" ? "Recorded time in UTC" : "Global step";
+    required("chart-note").textContent = `${metrics} · ${axis} · at most 600 chart points per series`;
+  }
+  function clearChartError(context?: string): void {
+    if (context !== undefined && chart_error_context !== context) return;
+    chart_error_context = null; required("chart-error").hidden = true;
+  }
+  async function changeChartAxis(): Promise<void> {
+    const value = x_axis_select.value;
+    if (value !== "step" && value !== "elapsed" && value !== "wall_clock") { x_axis_select.value = x_axis; return; }
+    if (value === x_axis) return;
+    cancelRefresh(); chart_lane.cancel(); clearChartError(); x_axis = value;
+    if (!review || required("chart-card").hidden) return;
+    const current_review = review, source = source_id, url = chartUrl();
+    chartControls(url);
+    if (chart_controller.previewStatus() !== "ready" || chart_controller.isInteracting()) { updateChart(); return; }
+    required("chart-card").setAttribute("aria-busy", "true");
+    try {
+      const html = await chart_lane.runText(url);
+      if (html === undefined || review !== current_review || source_id !== source || chartUrl() !== url) return;
+      if (chart_controller.replacePreview(html)) { cached_chart = { context: url, html }; chart_revisions.delete(url); clearChartError(url); }
+      else updateChart();
+    } catch (error) {
+      if (review === current_review && source_id === source && chartUrl() === url) {
+        chart_error_context = url;
+        showError(required("chart-error"), new Error(`Could not load the selected axis. Showing the last loaded chart. ${errorText(error)}`));
+      }
+    } finally {
+      if (review === current_review && source_id === source && chartUrl() === url) required("chart-card").setAttribute("aria-busy", "false");
+    }
   }
   function metricPicker(parent: HTMLElement, known: string[], on_change: () => void): void {
     parent.replaceChildren();
@@ -637,9 +682,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     }
     const html = await lane.runText(url);
     if (html === undefined || review !== current_review || source_id !== source || chartUrl() !== url) return "cancelled";
-    if (cached_chart?.context === url && cached_chart.html === html) return "applied";
+    if (cached_chart?.context === url && cached_chart.html === html) { clearChartError(url); return "applied"; }
     if (!chart_controller.replacePreview(html)) return "deferred";
-    cached_chart = { context: url, html }; return "applied";
+    cached_chart = { context: url, html }; clearChartError(url); return "applied";
   }
   function applyLog(view: LogView, log: Log): void {
     const content = log.missing ? "This log has not been recorded or pulled." : log.content || "The log is empty.";
@@ -833,6 +878,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   required("compare-button").addEventListener("click", () => { cancelRefresh(); clearSelectionTimeout(); openComparison(); });
   required("close-review").addEventListener("click", closeReview);
   required("reduction-select").addEventListener("change", () => { cancelRefresh(); void loadComparison(); });
+  x_axis_select.addEventListener("change", () => { void changeChartAxis(); });
   for (const tab of review_tabs) {
     const button = required<HTMLButtonElement>(`review-tab-${tab}`);
     button.addEventListener("click", () => { selectReviewTab(tab); });
