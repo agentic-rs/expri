@@ -6,9 +6,11 @@ sessions. The dashboard password is shared, but signing in or out on one site
 does not sign in or out on the other.
 
 AB previews the selected branch's `dashboard_web` HTML, JavaScript, and CSS.
-The API and Rust chart renderer come from the main service. Do not start a second
-service against the same data directory: the service deliberately holds an
-exclusive lease on its store.
+The API and Rust chart renderer come from the main service. Interactive chart
+controls are bundled into `app.js` and enhance the sampled SVG returned by that
+service, so an AB asset deployment can preview those controls too. Do not start
+a second service against the same data directory: the service deliberately
+holds an exclusive lease on its store.
 
 ## Configure the preview once
 

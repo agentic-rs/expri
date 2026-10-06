@@ -348,8 +348,10 @@ prefix = "acceptance"
   assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False'
   metrics = json.loads(execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json').stdout)
   assert metrics['metrics']['loss']['summary']['last']['step'] == 79
-  steps = json.loads(python(host, f"import json;from pathlib import Path;print(json.dumps([json.loads(line)['step'] for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()]))"))
+  steps = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([row['step'] for row in rows if 'loss' in row['metrics']]))"))
   assert steps == list(range(80)), 'metrics were lost or duplicated during recovery'
+  duplicate_samples = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([[row['step'], row['metrics']['duplicate_probe']] for row in rows if 'duplicate_probe' in row['metrics']]))"))
+  assert duplicate_samples == [[0, 7.0], [0, 7.0], [1, 8.0]], 'recovery lost repeated-coordinate samples'
   assert python(host, f"from pathlib import Path;print(('STDOUT_BURST:'+'x'*(256*1024)+'\\n').encode() in Path({local!r}+'/logs/stdout.log').read_bytes())") == 'True', 'large log stream was truncated'
   client(host, 'pull', *pull_args, '--artifact', 'outputs/checkpoint.pt')
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
@@ -378,7 +380,7 @@ finally:
     try:
       if container.endswith('-browser'):
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
-        for name in ['workspace-desktop', 'workspace-narrow', 'workspace-ab']:
+        for name in ['workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom']:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)

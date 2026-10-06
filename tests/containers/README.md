@@ -102,6 +102,12 @@ desktop columns and overflow at a verified 500 CSS pixel viewport, saving
 `workspace-desktop.png` and `workspace-narrow.png` with the CI diagnostics.
 The Firefox check covers a narrow layout rather than 320/360 pixel mobile widths.
 
+Native pointer and keyboard input also checks exact hover readouts, drag zoom,
+zoom/reset controls, and per-run legend toggles on both dashboard hosts. Repeated
+samples stay individually reachable, Refresh removes the old chart handlers,
+and interaction does not fetch more metric data. Chart scripts remain blocked.
+Hover and zoom screenshots are included in the CI diagnostics.
+
 The service workflow also opens an AB hostname in Firefox. It verifies distinct
 branch asset URLs, the same uploaded runs and comparison values, rejected cookie
 replay between hosts, and logout isolation. `workspace-ab.png` records the preview.

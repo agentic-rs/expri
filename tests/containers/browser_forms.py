@@ -71,15 +71,61 @@ class Firefox:
   def navigate(self, path, origin=ORIGIN):
     self.call('POST', '/url', {'url': origin + path})
 
-  def element(self, selector):
-    return self.call('POST', '/element', {'using': 'css selector', 'value': selector})[ELEMENT]
+  def element(self, selector, using='css selector'):
+    return self.call('POST', '/element', {'using': using, 'value': selector})[ELEMENT]
 
-  def click(self, selector):
+  def click(self, selector, using='css selector'):
     def displayed_element():
-      element = self.element(selector)
+      element = self.element(selector, using)
       return element if self.call('GET', '/element/' + element + '/displayed') else None
     element = wait_for(displayed_element, 'native form button is unavailable')
     self.call('POST', '/element/' + element + '/click', {})
+
+  def keys(self, selector, text, using='css selector'):
+    self.call('POST', '/element/' + self.element(selector, using) + '/value', {'text': text})
+
+  def pointer(self, selector, fraction, drag_to=None, using='css selector'):
+    element = self.element(selector, using)
+    # Position the viewport, then use native input; never synthesize DOM events.
+    geometry = self.call('POST', '/execute/sync', {'script': '''const node = arguments[0];
+      node.scrollIntoView({block: 'center', inline: 'nearest'});
+      const rect = node.getBoundingClientRect();
+      const visible = {left: Math.max(0, rect.left), right: Math.min(innerWidth, rect.right),
+        top: Math.max(0, rect.top), bottom: Math.min(innerHeight, rect.bottom)};
+      const origin_x = Math.floor((visible.left + visible.right) / 2);
+      const origin_y = Math.floor((visible.top + visible.bottom) / 2);
+      for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+        const style = getComputedStyle(ancestor);
+        const box = ancestor.getBoundingClientRect();
+        if (/^(auto|scroll|hidden|clip)$/.test(style.overflowX)) {
+          visible.left = Math.max(visible.left, box.left + ancestor.clientLeft);
+          visible.right = Math.min(visible.right, box.left + ancestor.clientLeft + ancestor.clientWidth);
+        }
+        if (/^(auto|scroll|hidden|clip)$/.test(style.overflowY)) {
+          visible.top = Math.max(visible.top, box.top + ancestor.clientTop);
+          visible.bottom = Math.min(visible.bottom, box.top + ancestor.clientTop + ancestor.clientHeight);
+        }
+      }
+      return {...visible, rect_left: rect.left, width: rect.width, origin_x, origin_y};''', 'args': [{ELEMENT: element}]})
+    left = geometry['left']
+    right = geometry['right']
+    top = geometry['top']
+    bottom = geometry['bottom']
+    assert left < right and top < bottom, 'chart pointer target is outside the viewport'
+    def move(position, duration):
+      target_x = int(max(left + 1, min(right - 1, geometry['rect_left'] + position * geometry['width'])))
+      target_y = int((top + bottom) / 2)
+      assert self.call('POST', '/execute/sync', {'script': 'return document.elementFromPoint(arguments[1], arguments[2]) === arguments[0];',
+        'args': [{ELEMENT: element}, target_x, target_y]}), 'native chart pointer target is clipped or covered'
+      return {'type': 'pointerMove', 'duration': duration, 'origin': {ELEMENT: element},
+        'x': target_x - geometry['origin_x'], 'y': target_y - geometry['origin_y']}
+    actions = [move(fraction, 100)]
+    if drag_to is not None:
+      actions += [{'type': 'pointerDown', 'button': 0}, move(drag_to, 300), {'type': 'pointerUp', 'button': 0}]
+    self.call('POST', '/actions', {'actions': [{
+      'type': 'pointer', 'id': 'chart-pointer', 'parameters': {'pointerType': 'mouse'}, 'actions': actions,
+    }]})
+    self.call('DELETE', '/actions')
 
   def login(self):
     self.call('POST', '/element/' + self.element('#password') + '/value',
@@ -142,6 +188,99 @@ def catalog_with_wire_check(browser, status, session_cookie_count):
   assert request['status'] == status, 'catalog wire response disagrees with Firefox'
   assert request['session_cookie_count'] == session_cookie_count, 'browser sent an unexpected number of host session cookies'
   return result
+
+
+def interactive_charts(browser, run_ids, prefix='workspace', check_security=False):
+  def parent(script):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': []})
+  assert parent("return document.querySelector('#chart-frame').getAttribute('sandbox');").split() == ['allow-same-origin'], 'chart sandbox allows unexpected capabilities'
+  wait_for(lambda: parent("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-interactive-chart]').length;") == 2, 'both metric plots were not enhanced')
+  if check_security:
+    policy = browser.call('POST', '/execute/async', {'script': '''const done = arguments[0];
+      fetch(document.querySelector('#chart-frame').src).then(response => done(response.headers.get('Content-Security-Policy'))).catch(() => done(null));''', 'args': []})
+    assert policy and "default-src 'none'" in policy and 'script-src' not in policy, 'chart response weakened its script-blocking CSP'
+  interaction_start = len(trace_records())
+  frame = browser.element('#chart-frame')
+  browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def chart_script(metric, script):
+    return evaluate("const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === arguments[0]); " + script, metric)
+  def selector(metric, suffix):
+    return f'//section[@data-interactive-chart][h2="{metric}"]{suffix}'
+  def pointer(metric, fraction, drag_to=None):
+    browser.pointer(selector(metric, '//*[@data-chart-hit]'), fraction, drag_to, using='xpath')
+  def keys(metric, text):
+    browser.keys(selector(metric, '//*[@class="plot-scroll"]'), text, using='xpath')
+  def range_of(metric):
+    bounds = chart_script(metric, "const range = card.querySelector('[data-chart-range]'); return [range.getAttribute('data-start-step'), range.getAttribute('data-end-step')];")
+    return tuple(int(value) for value in bounds)
+  def readout(metric):
+    return chart_script(metric, "return [...card.querySelectorAll('[data-chart-readout-run]')].map(row => ({run_id: row.querySelector('code').textContent, step: row.getAttribute('data-chart-step'), value: row.getAttribute('data-chart-value'), text: row.textContent}));")
+  def sample(metric, step, value):
+    rows = readout(metric)
+    return len(rows) == len(run_ids) and {row['run_id'] for row in rows} == set(run_ids) and all(row['step'] == str(step) and float(row['value']) == value for row in rows)
+  def capture(name):
+    browser.call('POST', '/frame', {'id': None})
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+    browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+  try:
+    assert chart_script('loss', "return card.querySelectorAll('[data-chart-hit]').length;") == 1, 'plot has duplicate interaction layers'
+    assert range_of('loss') == (0, 79), 'loss range does not match recorded steps'
+    if check_security:
+      evaluate('''const script = document.createElement('script');
+        script.textContent = "document.documentElement.setAttribute('data-probe-script', 'ran')";
+        document.body.append(script);
+        const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'duplicate_probe');
+        card.querySelector('[data-chart-hit]').setAttribute('onclick', "document.documentElement.setAttribute('data-probe-handler', 'ran')");''')
+      browser.click(selector('duplicate_probe', '//*[@data-chart-hit]'), using='xpath')
+      assert evaluate("return document.documentElement.getAttribute('data-probe-script');") is None, 'sandboxed chart executed an injected script'
+      assert evaluate("return document.documentElement.getAttribute('data-probe-handler');") is None, 'sandboxed chart executed an inline event handler'
+      chart_script('duplicate_probe', "card.querySelector('[data-chart-hit]').removeAttribute('onclick');")
+    pointer('loss', .001)
+    wait_for(lambda: sample('loss', 0, 1.0), 'native hover did not show exact recorded first values')
+    assert chart_script('loss', "return card.querySelector('[data-chart-crosshair]').getAttribute('display');") != 'none', 'hover did not show its crosshair'
+    assert chart_script('loss', "return card.querySelector('[data-chart-readout]').getAttribute('aria-live');") == 'off', 'pointer hover creates live announcement noise'
+    capture(prefix + '-hover')
+    keys('loss', '\ue014')
+    wait_for(lambda: sample('loss', 1, .5), 'keyboard did not advance one displayed sample')
+    assert chart_script('loss', "return card.querySelector('[data-chart-readout]').getAttribute('aria-live');") == 'polite', 'keyboard samples are not announced accessibly'
+    toggle = selector('loss', '//button[@data-chart-run="2"]')
+    browser.keys(toggle, ' ', using='xpath')
+    assert chart_script('loss', "return card.querySelector('[data-chart-run=\"2\"]').getAttribute('aria-pressed');") == 'false', 'native keyboard legend toggle did not hide its run'
+    assert chart_script('loss', "const nodes = [...card.querySelectorAll('[data-chart-series=\"2\"]')]; return nodes.some(node => node.tagName.toLowerCase() === 'polyline') && nodes.some(node => node.tagName.toLowerCase() === 'circle') && nodes.every(node => node.getAttribute('display') === 'none');"), 'legend hid its label but left its curve visible or untagged'
+    assert chart_script('loss', "return [...card.querySelectorAll('[data-chart-series=\"1\"]')].some(node => node.getAttribute('display') !== 'none');"), 'legend toggle hid an unrelated run'
+    browser.click(toggle, using='xpath')
+    assert chart_script('loss', "return card.querySelector('[data-chart-run=\"2\"]').getAttribute('aria-pressed');") == 'true', 'native legend click did not restore its run'
+    assert chart_script('loss', "const nodes = [...card.querySelectorAll('[data-chart-series=\"2\"]')]; return nodes.length > 0 && nodes.every(node => node.getAttribute('display') !== 'none');"), 'legend restored its label but left its curve hidden'
+    pointer('loss', .2, .65)
+    start_step, end_step = range_of('loss')
+    assert 0 < start_step < end_step < 79, 'native drag did not zoom into the recorded range'
+    capture(prefix + '-zoom')
+    browser.click(selector('loss', '//button[@data-chart-zoom="reset"]'), using='xpath')
+    assert range_of('loss') == (0, 79), 'Reset zoom did not restore the full range'
+    keys('loss', '+')
+    assert range_of('loss')[1] - range_of('loss')[0] < 79, 'native keyboard zoom did not narrow the range'
+    keys('loss', '\ue00c')
+    assert range_of('loss') == (0, 79), 'Escape did not reset zoom'
+    keys('duplicate_probe', '\ue00c')
+    for expected_sample, expected_step, expected_value in [(1, 0, 7.0), (2, 0, 7.0), (3, 1, 8.0)]:
+      keys('duplicate_probe', '\ue014')
+      row = readout('duplicate_probe')[0]
+      assert f'sample {expected_sample} of 3 displayed' in row['text'], 'keyboard got trapped at a duplicate coordinate'
+      assert row['step'] == str(expected_step) and float(row['value']) == expected_value, 'keyboard duplicate traversal changed recorded values'
+    assert not any(record['path'] in {'/api/chart', '/api/run', '/api/compare'}
+      for record in trace_records()[interaction_start:]), 'chart interactions fetched experiment data again'
+  finally:
+    browser.call('POST', '/frame', {'id': None})
+
+
+def remember_chart_document(browser):
+  browser.call('POST', '/execute/sync', {'script': "window.__acceptance_chart_document = document.querySelector('#chart-frame').contentDocument;", 'args': []})
+
+
+def assert_chart_document_cleaned(browser):
+  wait_for(lambda: browser.call('POST', '/execute/sync', {'script': "return window.__acceptance_chart_document.querySelectorAll('[data-interactive-chart], [data-chart-hit], [data-chart-run]').length;", 'args': []}) == 0, 'navigation left interactive controls in the previous chart document')
 
 
 def forms():
@@ -239,13 +378,17 @@ def workspace(run_id, second_run_id):
       assert evaluate("return !!document.querySelector('details.parameter-comparison:not([open])');"), 'parameter differences are missing or displace the charts'
     finally:
       browser.call('POST', '/frame', {'id': None})
+    interactive_charts(browser, [run_id, second_run_id], check_security=True)
     assert evaluate('''const list = document.querySelector('.runs-card').getBoundingClientRect();
       const review = document.querySelector('#review-section').getBoundingClientRect();
       return list.right <= review.left + 1;'''), 'desktop runs and charts are not side by side'
     capture('workspace-desktop')
+    remember_chart_document(browser)
     browser.click('#refresh-button')
     wait_for(lambda: not evaluate("return document.querySelector('#refresh-button').disabled;"), 'Refresh did not finish')
     assert check_selection([run_id, second_run_id]), 'Refresh lost the selected comparison'
+    assert_chart_document_cleaned(browser)
+    wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'Refresh lost or duplicated chart interaction layers')
     browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
     assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
     assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow dashboard overflows horizontally'
@@ -254,19 +397,46 @@ def workspace(run_id, second_run_id):
       return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
     });'''), 'narrow controls are clipped'
     evaluate("document.querySelector('#review-section').scrollIntoView();")
+    frame = browser.element('#chart-frame')
+    browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+    try:
+      assert evaluate('''return [...document.querySelectorAll('.chart-explorer-controls button, [data-chart-range], [data-chart-run]')].every(node => {
+        const box = node.getBoundingClientRect(); return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
+      });'''), 'narrow chart controls overflow their iframe'
+      loss_region = '//section[@data-interactive-chart][h2="loss"]//*[@class="plot-scroll"]'
+      loss_hit = '//section[@data-interactive-chart][h2="loss"]//*[@data-chart-hit]'
+      browser.pointer(loss_hit, .001, using='xpath')
+      hover_rows = evaluate("const card = [...document.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss'); return [...card.querySelectorAll('[data-chart-readout-run]')].map(row => ({step: row.getAttribute('data-chart-step'), value: row.getAttribute('data-chart-value')}));")
+      browser.call('POST', '/frame', {'id': None})
+      capture('workspace-narrow')
+      browser.call('POST', '/frame', {'id': {ELEMENT: frame}})
+      print('Firefox narrow hover samples: ' + json.dumps(hover_rows), flush=True)
+      assert len(hover_rows) == 2 and all(0 <= int(row['step']) <= 79 and float(row['value']) == 1 / (int(row['step']) + 1) for row in hover_rows), 'narrow hover did not report recorded loss samples'
+      browser.keys(loss_region, '\ue00c', using='xpath')
+      browser.keys(loss_region, '\ue014', using='xpath')
+      assert evaluate("return [...document.querySelectorAll('[data-chart-readout-run]')].filter(row => row.getAttribute('data-chart-step') === '0' && Number(row.getAttribute('data-chart-value')) === 1).length;") == 2, 'refreshed keyboard handlers did not start at the first sample'
+      browser.keys(loss_region, '\ue014', using='xpath')
+      assert evaluate("return [...document.querySelectorAll('[data-chart-readout-run]')].filter(row => row.getAttribute('data-chart-step') === '1' && row.getAttribute('data-chart-value') === '0.5').length;") == 2, 'refreshed/narrow keyboard handlers skipped or duplicated a sample'
+    finally:
+      browser.call('POST', '/frame', {'id': None})
     capture('workspace-narrow')
+    remember_chart_document(browser)
     search = browser.element('#search-input')
     browser.call('POST', '/element/' + search + '/value', {'text': run_id})
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'run search did not apply')
     assert not visible('#review-section'), 'filtering left an unrelated comparison visible'
     assert evaluate("return document.querySelectorAll('#run-rows input:checked').length;") == 0, 'filtering left an implicit selection'
+    assert_chart_document_cleaned(browser)
     browser.click('#clear-filters')
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'Clear filters did not restore the runs')
     browser.click(f'input[aria-label="Select {run_id} for comparison"]')
     wait_for(lambda: check_selection([run_id]), 'selection did not recover after filtering')
+    wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'single-run selection did not restore chart interactions')
+    remember_chart_document(browser)
     browser.click('#clear-selection')
     assert not visible('#review-section') and visible('#review-empty'), 'Clear selection did not reset the workspace'
-    print('Firefox workspace passed: direct comparison, chart-first tabs, lazy logs, refresh, filters, desktop/narrow layout.', flush=True)
+    assert_chart_document_cleaned(browser)
+    print('Firefox workspace passed: direct comparison, exact hover, native legend/zoom/keyboard, duplicate coordinates, sandbox/CSP, lazy logs, refresh/selection cleanup, desktop/narrow layout.', flush=True)
   finally:
     browser.close()
 
@@ -309,6 +479,7 @@ def previews(run_id, second_run_id):
     for selected in [run_id, second_run_id]:
       browser.click(f'input[aria-label="Select {selected} for comparison"]')
     wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'preview comparison did not load shared run data')
+    interactive_charts(browser, [run_id, second_run_id], prefix='workspace-ab')
     Path('/tmp/workspace-ab.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
 
     browser.restore_cookie(main_cookie)
