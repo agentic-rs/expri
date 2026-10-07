@@ -328,6 +328,32 @@ fn select_capability_protocol(
   }
 }
 
+pub(crate) fn require_run_publishing(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  if preference == ProtocolPreference::Python {
+    return Err(ExpriError::Message(
+      "automatic publishing requires a native expri worker; upgrade the worker and use protocol = \"auto\" or \"expri-node\", or use --no-publish".into(),
+    ));
+  }
+  // A first sync has not created the checkout yet. Installed PATH/absolute
+  // nodes can still be checked, while existing relative nodes resolve there.
+  let directory = remote.quoted_remote_dir();
+  let supported = remote.execute_success(&format!(
+    "if [ -e {directory} ] || [ -L {directory} ]; then cd {directory} || exit 1; fi; {} node capabilities --has {}",
+    shell::quote(node_bin),
+    shell::quote(crate::node::cli::RUN_PUBLISHING_CAPABILITY)
+  ))?;
+  if !remote.dry_run && !supported {
+    return Err(ExpriError::Message(
+      "automatic publishing requires run-publishing-v1; upgrade expri on the target or use --no-publish".into(),
+    ));
+  }
+  Ok(())
+}
+
 fn protocol_with_preference(
   remote: &Remote,
   preference: ProtocolPreference,

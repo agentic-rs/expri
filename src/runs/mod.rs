@@ -242,10 +242,26 @@ fn show(run_dir: &Path) -> Value {
     &mut record.warnings,
     true,
   );
-  json!({
+  let service_sync = match crate::service::publishing::status(run_dir) {
+    Ok(service_sync) => service_sync,
+    Err(_) => {
+      let detail = "Service publishing status could not be read.";
+      warn(
+        &mut record.warnings,
+        &run_dir.file_name().unwrap().to_string_lossy(),
+        detail,
+      );
+      Some(json!({"status": "error", "last_error": detail}))
+    }
+  };
+  let mut report = json!({
     "run": record.summary, "state": record.state, "snapshot": snapshot,
     "environment": environment, "warnings": record.warnings,
-  })
+  });
+  if let Some(service_sync) = service_sync {
+    report["service_sync"] = service_sync;
+  }
+  report
 }
 
 fn record(run_dir: &Path) -> Record {

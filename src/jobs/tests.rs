@@ -87,6 +87,7 @@ fn foreground_legacy_records_can_be_inspected_but_not_cancelled() {
   let status = status_at(&root, "run-test").unwrap();
   assert_eq!(status["status"], "running");
   assert_eq!(status["detached"], false);
+  assert!(status.get("service_sync").is_none());
   assert!(
     query_at(&cancel(), &root)
       .unwrap_err()

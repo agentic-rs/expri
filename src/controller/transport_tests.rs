@@ -11,6 +11,7 @@ fn target(transport: TransportKind) -> TargetConfig {
     ctl_bin: None,
     ctl_method: None,
     environment: None,
+    service: None,
   }
 }
 

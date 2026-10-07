@@ -230,6 +230,7 @@ printf '%s\n' "$PWD" >> {log}
       ctl_bin: Some(ctl.to_string_lossy().into_owned()),
       ctl_method: None,
       environment: None,
+      service: None,
     },
     "/tmp/unused-control".to_string(),
     "10m".to_string(),

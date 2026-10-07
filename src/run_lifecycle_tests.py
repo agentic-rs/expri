@@ -86,6 +86,12 @@ class RunLifecycleTests(unittest.TestCase):
     self.run = Path(receipt["run_dir"])
     return receipt
 
+  def test_publishing_requires_native_worker_before_snapshot(self):
+    self.request["service"] = {"project_id": "vision", "origin": "gpu-1"}
+    with self.assertRaisesRegex(ValueError, "run-publishing-v1"):
+      self.start()
+    self.assertFalse((self.repo / ".expri/runs").exists())
+
   def state(self):
     return json.loads((self.run / "run-state.json").read_text())
 

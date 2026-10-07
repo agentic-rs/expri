@@ -6,9 +6,9 @@ uses SQLite for its catalog and upload receipts, and S3-compatible storage for
 finalized files. Service outages leave training running. Required private inputs
 must already be downloaded before an offline run can start.
 
-This first version provides explicit service commands. It does not schedule runs
-or automatically start an uploader with `expri run`. Launch the uploader beside
-a detached experiment when live forwarding is wanted.
+Runs can start their own uploader when service publishing is configured. Explicit
+service commands remain available for existing runs and selected checkpoints.
+The service does not schedule experiments.
 
 ## Service configuration
 
@@ -81,8 +81,8 @@ sequences and stream lengths without reading objects from S3 on unchanged
 checks. Changed views fetch bounded previews and preserve selection, filters,
 the active tab, zoom, and hidden curves. **Auto refresh** pauses updates;
 hidden/offline pages pause automatically, and connection failures retry more
-slowly while keeping the current view. Workers still need `push --watch` for
-live forwarding; dashboard refresh does not initiate an upload.
+slowly while keeping the current view. Configure automatic publishing or run
+`push --watch` for live forwarding; dashboard refresh does not initiate an upload.
 
 Browser access is read-only. Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
@@ -124,6 +124,61 @@ Create a client configuration on the worker, outside the synced source repo:
 url = "https://expri.example.net"
 token_env = "EXPRI_SERVICE_GPU_1_TOKEN"
 ```
+
+To publish each recorded run automatically, add this to the project's
+`expri.toml` (or `[target.gpu.service]` for a particular worker):
+
+```toml
+[environment]
+
+[service]
+client_config = "/etc/expri/worker.toml"
+project_id = "vision"
+origin = "gpu-1"
+dashboard_url = "https://expri.example.net/"
+```
+
+`client_config` is an absolute path on the machine executing the run. Keep that
+file outside the source checkout and provide its token through the named worker
+environment variable. The run stores the file reference and scope, never the
+token or signed URLs. Targets inherit the complete top-level service configuration
+unless they supply their own service table. Use distinct origins for workers.
+`dashboard_url` is optional and must be a public HTTP(S) root URL without credentials,
+query parameters, or fragments.
+
+`expri run train` and `expri run --detach train` start an independent native
+publisher before environment preparation. It forwards metadata, metrics, and
+logs, including preparation failures and cancellation. The task's exit code is
+independent of publishing: service outages leave queued work retrying after
+training finishes. Checkpoints are still selected explicitly. A lost supervisor
+is recorded as `lost` once its run lease is released; surviving unsupervised
+children are not considered a completed experiment.
+
+Inspect publishing separately from the task result:
+
+```sh
+expri runs status run-abc123
+expri runs show run-abc123
+expri service resume --run-dir .expri/runs/run-abc123
+```
+
+`service resume` runs on the worker and restarts publishing from its saved intent
+and queue after a publisher stops or a configuration/token problem is corrected.
+It does not rerun training. The queue lives at the original checkout's
+`.expri/service-sync`; keep it and the original run files until publication is
+acknowledged. Publishers survive terminal closure and task completion, but must
+be resumed after a worker reboot. `synced` means the terminal upload cycle
+finished; a completed task alone does not imply that its results reached the
+service. The optional dashboard link opens the run after sign-in and waits for
+its first publication.
+
+Automatic publishing requires a configured environment (an empty table selects
+ordinary uv execution), a Unix native expri worker advertising `run-publishing-v1`,
+and no Python fallback. Upgrade older workers or use `expri run --no-publish train`
+for an individual run. Runs without service configuration keep their existing
+execution and fallback behavior.
+
+For existing runs, live publishing can also be started explicitly:
 
 ```sh
 expri service push --config worker.toml \
@@ -217,8 +272,11 @@ The fixture builds pinned official MinIO source; set `EXPRI_TEST_S3_IMAGE` to us
 an existing compatible MinIO image instead. Image builds require network access;
 the acceptance workflow itself uses only the internal network.
 It runs an actual uv experiment with fake installed Torch and a private input,
-interrupts the service during training, loses metric and multipart part acknowledgements,
-restarts the service, resumes the checkpoint, and reviews downloaded data offline.
+starts publishing automatically, interrupts the service during training, and
+loses metric and multipart part acknowledgements. It kills/resumes the publisher
+from its saved queue, restarts the service, resumes the selected checkpoint, and
+reviews downloaded data offline. Failed and cancelled runs also finish publishing
+their original task status and logs without selecting a checkpoint.
 An isolated Firefox image submits the native login and logout forms over an
 internal HTTPS fixture. It reproduces the rejected null origins under
 `no-referrer`, then checks successful forms under `same-origin`, secure cookie
@@ -230,6 +288,8 @@ verified 500 CSS pixel viewport, saving screenshots for diagnostics. This Firefo
 check does not cover 320/360 pixel mobile widths. A second HTTPS hostname also
 checks branch assets against the same catalog, cookie replay rejection, and
 independent login/logout sessions.
+An authenticated run link also survives native password sign-in, opens the exact
+run, and lets the user select another run without later refresh overriding it.
 Both hosts also exercise chart hover, drag zoom, legend toggles, and keyboard
 inspection through native browser input. The checks preserve repeated samples,
 verify chart script blocking, and require no additional metric requests during

@@ -172,6 +172,13 @@ executing the task there. Pass `--no-sync` before the task name to skip that
 sync. Run options must appear before the task name; arguments after the task
 name are passed through to the task.
 
+An optional `[service]` or `[target.<name>.service]` starts a separate publisher
+for each recorded run. It forwards metadata, metrics, and logs through a durable
+queue while training continues independently. `expri runs status <run_id>` shows
+both task and publishing status; `--no-publish` disables it for one run.
+See [automatic publishing and worker credentials](docs/self-hosted-service.md#worker-uploads)
+for configuration, dashboard links, and resuming a stopped publisher.
+
 Each configured-environment run receives these variables:
 
 | Variable | Meaning |

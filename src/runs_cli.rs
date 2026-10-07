@@ -294,6 +294,25 @@ fn print_job_report(report: &serde_json::Value) {
   if report["already_finished"] == true {
     println!("The run already finished; no cancellation was needed.");
   }
+  print_service_sync(report);
+}
+
+fn print_service_sync(report: &serde_json::Value) {
+  let Some(sync) = report.get("service_sync") else {
+    return;
+  };
+  let status = sync["status"].as_str().unwrap_or("unknown");
+  let active = sync["worker_active"].as_bool().unwrap_or(false);
+  println!(
+    "Service sync: {status} (publisher {})",
+    if active { "active" } else { "stopped" }
+  );
+  if let Some(detail) = sync["last_error"].as_str() {
+    println!("Service sync detail: {detail}");
+  }
+  if let Some(url) = sync["dashboard_url"].as_str() {
+    println!("Dashboard: {url}");
+  }
 }
 
 fn print_runs_report(report: &serde_json::Value, request: &protocol::RunQueryRequest) {
@@ -327,6 +346,7 @@ fn print_runs_report(report: &serde_json::Value, request: &protocol::RunQueryReq
       }
     }
     protocol::RunQueryRequest::Show { .. } => {
+      print_service_sync(report);
       let summary = &report["run"];
       for (label, key) in [
         ("Run", "run_id"),

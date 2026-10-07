@@ -3,10 +3,13 @@ mod browser_assets;
 mod browser_auth;
 mod client;
 mod dashboard_data;
+pub(crate) mod publishing;
 mod server;
 mod storage;
 mod store;
 mod types;
+
+pub(crate) use types::validate_component;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -37,6 +40,16 @@ enum ServiceSubcommand {
   },
   /// Upload saved run files; watch forwards live metrics without blocking training.
   Push(PushOptions),
+  /// Resume the saved automatic publisher on this worker.
+  Resume {
+    #[arg(long)]
+    run_dir: PathBuf,
+  },
+  #[command(hide = true)]
+  PublishWorker {
+    #[arg(long)]
+    run_dir: PathBuf,
+  },
   /// Download selected run files into the existing offline review cache.
   Pull(PullOptions),
   /// List runs recorded by the service.
@@ -143,6 +156,8 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       return server::serve(config, listen, data_dir, create_bucket);
     }
     ServiceSubcommand::Push(options) => client::push(options)?,
+    ServiceSubcommand::Resume { run_dir } => publishing::resume(&run_dir)?,
+    ServiceSubcommand::PublishWorker { run_dir } => return publishing::worker(&run_dir),
     ServiceSubcommand::Pull(options) => client::pull(options)?,
     ServiceSubcommand::List {
       config,

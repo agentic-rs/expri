@@ -18,6 +18,8 @@ if args[:2] == ['run', '--isolated']:
   (root / 'helper-started').write_text('ready')
   if os.environ.get('EXPRI_TEST_PREPARE_BLOCK'):
     time.sleep(60)
+  if os.environ.get('EXPRI_TEST_PREPARE_FAIL'):
+    raise SystemExit(43)
   venv = root / 'environment' / '.venv'
   venv.mkdir(parents=True)
   manifest = venv.parent / 'environment-state.json'
@@ -36,6 +38,9 @@ out = pathlib.Path(os.environ['EXPRI_OUTPUT_DIR'])
 os.write(1, b'first\x00\xff\n')
 os.write(2, b'error\x80\n')
 mode = sys.argv[1]
+if mode == 'success':
+  (out / 'model.pt').write_bytes(b'checkpoint')
+  raise SystemExit(0)
 if mode == 'finish':
   time.sleep(1)
   (out / 'model.pt').write_bytes(b'checkpoint')
@@ -107,6 +112,16 @@ impl Fixture {
     command
   }
 
+  fn enable_service_with_missing_client(&self) {
+    let config_path = self.repo.join("expri.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!(
+      "\n[service]\nclient_config = {:?}\nproject_id = 'demo'\norigin = 'worker'\ndashboard_url = 'https://dashboard.example.net'\n",
+      self.repo.parent().unwrap().join("missing-client.toml").to_string_lossy()
+    ));
+    fs::write(config_path, config).unwrap();
+  }
+
   fn run(&self, args: &[&str]) -> Output {
     let output = self.command().args(args).output().unwrap();
     assert!(
@@ -170,6 +185,102 @@ fn terminal(fixture: &Fixture, id: &str) -> Value {
     );
     thread::sleep(Duration::from_millis(50));
   }
+}
+
+fn publishing_error(fixture: &Fixture, id: &str) -> Value {
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    let report: Value =
+      serde_json::from_slice(&fixture.run(&["runs", "status", id, "--json"]).stdout).unwrap();
+    if report["service_sync"]["status"] == "error" {
+      return report;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "publishing error was not reported"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+}
+
+#[test]
+fn publishing_failure_preserves_foreground_success_and_preparation_failure() {
+  for prepare_fails in [false, true] {
+    let fixture = Fixture::new();
+    fixture.enable_service_with_missing_client();
+    let mut command = fixture.command();
+    command.args(["run", "train", "success"]);
+    if prepare_fails {
+      command.env("EXPRI_TEST_PREPARE_FAIL", "1");
+    }
+    let output = command.output().unwrap();
+    assert_eq!(
+      output.status.code(),
+      Some(if prepare_fails { 43 } else { 0 })
+    );
+    let run = fs::read_dir(fixture.repo.join(".expri/runs"))
+      .unwrap()
+      .next()
+      .unwrap()
+      .unwrap()
+      .path();
+    let id = run.file_name().unwrap().to_str().unwrap();
+    let report = publishing_error(&fixture, id);
+    assert_eq!(
+      report["status"],
+      if prepare_fails { "failed" } else { "completed" }
+    );
+    assert_eq!(
+      report["state"]["exit_code"],
+      if prepare_fails { 43 } else { 0 }
+    );
+    assert!(run.join("publishing-request.json").is_file());
+    assert!(run.join("logs/stdout.log").is_file());
+    assert!(run.join("logs/stderr.log").is_file());
+    assert_eq!(run.join("outputs/model.pt").exists(), !prepare_fails);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dashboard: https://dashboard.example.net"));
+    assert!(stderr.contains("available after service sync"));
+    let shown: Value =
+      serde_json::from_slice(&fixture.run(&["runs", "show", id, "--json"]).stdout).unwrap();
+    assert_eq!(shown["service_sync"]["status"], "error");
+    assert_eq!(shown["state"]["exit_code"], report["state"]["exit_code"]);
+  }
+}
+
+#[test]
+fn detached_publishing_error_keeps_receipt_and_training_result_available() {
+  let fixture = Fixture::new();
+  fixture.enable_service_with_missing_client();
+  let receipt = fixture.start("success", false);
+  let id = receipt["run_id"].as_str().unwrap();
+  let url = receipt["dashboard_url"].as_str().unwrap();
+  assert!(url.starts_with("https://dashboard.example.net"));
+  assert!(url.contains(id));
+  let report = terminal(&fixture, id);
+  assert_eq!(report["status"], "completed");
+  assert_eq!(report["state"]["exit_code"], 0);
+  let report = publishing_error(&fixture, id);
+  assert_eq!(report["status"], "completed");
+  let run = Path::new(receipt["run_dir"].as_str().unwrap());
+  assert_eq!(
+    fs::read(run.join("outputs/model.pt")).unwrap(),
+    b"checkpoint"
+  );
+
+  fs::write(run.join("publishing-state.json"), b"invalid JSON").unwrap();
+  let unreadable: Value =
+    serde_json::from_slice(&fixture.run(&["runs", "status", id, "--json"]).stdout).unwrap();
+  assert_eq!(unreadable["status"], "completed");
+  assert_eq!(unreadable["service_sync"]["status"], "error");
+  assert_eq!(
+    unreadable["service_sync"]["last_error"],
+    "Service publishing status could not be read."
+  );
+  let shown: Value =
+    serde_json::from_slice(&fixture.run(&["runs", "show", id, "--json"]).stdout).unwrap();
+  assert_eq!(shown["run"]["status"], "completed");
+  assert_eq!(shown["service_sync"], unreadable["service_sync"]);
 }
 
 #[test]

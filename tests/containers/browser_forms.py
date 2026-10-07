@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 ORIGIN = 'https://expri.example.net'
 POLICY_OVERRIDE = Path('/tmp/expri-browser-policy')
@@ -527,6 +527,55 @@ def forms():
       browser.close()
 
 
+def deep_link(run_id, second_run_id):
+  browser = Firefox()
+  query = urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id})
+  link = '/?' + query
+  source_id = 'hosted:demo:worker'
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def opened(expected):
+    return evaluate('''const frame = document.querySelector('#chart-frame');
+      return document.querySelector('#review-section')?.hidden === false
+        && document.querySelector('#source-select')?.value === arguments[0]
+        && document.querySelector('#review-title')?.textContent === arguments[1]
+        && frame?.getAttribute('src')
+        && JSON.stringify(new URL(frame.src).searchParams.getAll('run_id')) === JSON.stringify([arguments[1]]);''', source_id, expected)
+  try:
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.navigate(link)
+    wait_for(lambda: browser.call('GET', '/url') == ORIGIN + '/login?' + query,
+      'logged-out run link did not retain its identity at login')
+    assert not browser.cookies() and browser.catalog()['status'] == 401, 'run link authorized a logged-out browser'
+    assert evaluate("return document.querySelector('.login-form').getAttribute('action');") == '/login?' + query, 'native login form discarded the linked run'
+    start = len(trace_records())
+    browser.login()
+    posted_since(start, '/login', ORIGIN, 303)
+    wait_for(lambda: browser.call('GET', '/url') == ORIGIN + link,
+      'native login did not return to the original run link')
+    wait_for(lambda: opened(run_id), 'run link did not open the exact hosted source and run')
+    wait_for(lambda: (evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('svg').length;") or 0) > 0,
+      'linked run charts did not load')
+    assert evaluate("return document.querySelector('#review-tab-charts').getAttribute('aria-selected');") == 'true', 'linked run did not open its Charts tab'
+    assert evaluate("return document.querySelectorAll('#run-rows input:checked').length;") == 0, 'run link implicitly selected a comparison'
+    assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'linked chart review eagerly loaded logs'
+    browser.click('#auto-refresh-toggle')
+
+    browser.click('//*[@id="run-rows"]//button[@class="run-link" and text()="' + second_run_id + '"]', using='xpath')
+    wait_for(lambda: opened(second_run_id), 'native run inspection could not leave the linked run')
+    browser.click('#refresh-button')
+    wait_for(lambda: not evaluate("return document.querySelector('#refresh-button').disabled;"), 'linked dashboard Refresh did not finish')
+    assert opened(second_run_id), 'Refresh reopened the original run after native inspection'
+    assert browser.call('GET', '/url') == ORIGIN + link, 'native inspection unexpectedly navigated the public run link'
+    assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'native run inspection eagerly loaded logs'
+    browser.click('#logout-form button[type="submit"]')
+    wait_for(lambda: browser.call('GET', '/url') == ORIGIN + '/login', 'run-link logout did not complete')
+    assert not browser.cookies(), 'run-link logout left its browser session active'
+    print('Firefox run links passed: logged-out identity preserved through native login, exact hosted source/run opened, manual inspection and refresh retained, lazy logs and logout preserved.', flush=True)
+  finally:
+    browser.close()
+
+
 def workspace(run_id, second_run_id):
   browser = Firefox()
   def evaluate(script, *args):
@@ -914,7 +963,9 @@ def automatic_refresh(run_id, updated_run_id):
 
 
 if __name__ == '__main__':
-  if len(sys.argv) == 4 and sys.argv[1] == '--workspace':
+  if len(sys.argv) == 4 and sys.argv[1] == '--deep-link':
+    deep_link(sys.argv[2], sys.argv[3])
+  elif len(sys.argv) == 4 and sys.argv[1] == '--workspace':
     workspace(sys.argv[2], sys.argv[3])
   elif len(sys.argv) == 4 and sys.argv[1] == '--previews':
     previews(sys.argv[2], sys.argv[3])

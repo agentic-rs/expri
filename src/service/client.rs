@@ -1,5 +1,5 @@
 mod download;
-mod fs;
+pub(super) mod fs;
 mod http;
 mod queue;
 #[cfg(test)]
@@ -23,6 +23,10 @@ use upload::{sync_file, sync_stream};
 
 pub use download::{input_get, pull};
 
+pub(super) fn validate_config(path: &Path) -> Result<()> {
+  Api::new(path).map(|_| ())
+}
+
 const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const OBJECT_BATCH: u64 = 8 * 1024 * 1024;
 const METADATA: [&str; 4] = [
@@ -40,53 +44,106 @@ const STREAMS: [&str; 3] = [
 fn terminal(state: &Value) -> bool {
   matches!(
     state.get("status").and_then(Value::as_str),
-    Some("completed" | "failed" | "cancelled")
+    Some("completed" | "failed" | "cancelled" | "lost")
   )
 }
 
+pub(super) struct Publisher {
+  api: Api,
+  run_dir: PathBuf,
+  scope: RunScope,
+  artifacts: BTreeSet<String>,
+  queue: Queue,
+  watch: bool,
+}
+
+impl Publisher {
+  pub(super) fn authentication_rejected(error: &crate::error::ExpriError) -> bool {
+    matches!(
+      error,
+      crate::error::ExpriError::ServiceRejected {
+        status: 401 | 403,
+        ..
+      }
+    )
+  }
+
+  pub(super) fn new(options: &PushOptions) -> Result<Self> {
+    let api = Api::new(&options.config)?;
+    let run_dir = std::path::absolute(&options.run_dir)?;
+    fs::directory(&run_dir)?;
+    let state: Value = serde_json::from_slice(&fs::read_bounded(
+      &run_dir.join("run-state.json"),
+      RECORD_LIMIT,
+    )?)?;
+    let scope = RunScope {
+      project_id: options.project_id.clone(),
+      origin: options.origin.clone(),
+      run_id: state
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| message("run state has no run_id"))?
+        .to_string(),
+    };
+    validate_scope(&scope)?;
+    let artifacts = artifacts(&options.artifacts)?;
+    let queue_dir = std::path::absolute(&options.queue_dir)?
+      .join("runs")
+      .join(&scope.project_id)
+      .join(&scope.origin)
+      .join(&scope.run_id);
+    let owner = json!({"endpoint": api.endpoint, "scope": scope});
+    let queue = Queue::new(queue_dir, owner)?;
+    Ok(Self {
+      api,
+      run_dir,
+      scope,
+      artifacts,
+      queue,
+      watch: options.watch,
+    })
+  }
+
+  pub(super) fn cycle(&mut self, progress: &mut dyn FnMut(Value) -> Result<()>) -> Result<bool> {
+    push_cycle(
+      &self.api,
+      &mut self.queue,
+      &self.scope,
+      &self.run_dir,
+      &self.artifacts,
+      self.watch,
+      progress,
+    )
+  }
+
+  pub(super) fn report(&self, done: bool) -> Value {
+    json!({
+      "scope": self.scope, "terminal": done,
+      "files": self.queue.state.files.keys().collect::<Vec<_>>(),
+      "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
+    })
+  }
+
+  pub(super) fn progress(&self, done: bool) -> Value {
+    let mut progress = queue_progress(&self.queue);
+    progress["terminal"] = json!(done);
+    progress["queue_dir"] = json!(self.queue.directory);
+    progress
+  }
+
+  pub(super) fn error_text(&self, error: &crate::error::ExpriError) -> String {
+    self.api.redact(&error.to_string())
+  }
+}
+
 pub fn push(options: PushOptions) -> Result<Value> {
-  let api = Api::new(&options.config)?;
-  let run_dir = std::path::absolute(&options.run_dir)?;
-  fs::directory(&run_dir)?;
-  let state: Value = serde_json::from_slice(&fs::read_bounded(
-    &run_dir.join("run-state.json"),
-    RECORD_LIMIT,
-  )?)?;
-  let run_id = state
-    .get("run_id")
-    .and_then(Value::as_str)
-    .ok_or_else(|| message("run state has no run_id"))?
-    .to_string();
-  let scope = RunScope {
-    project_id: options.project_id,
-    origin: options.origin,
-    run_id,
-  };
-  validate_scope(&scope)?;
-  let artifacts = artifacts(&options.artifacts)?;
-  let queue_dir = std::path::absolute(options.queue_dir)?
-    .join("runs")
-    .join(&scope.project_id)
-    .join(&scope.origin)
-    .join(&scope.run_id);
-  let owner = json!({"endpoint": api.endpoint, "scope": scope});
-  let mut queue = Queue::new(queue_dir, owner)?;
+  let mut publisher = Publisher::new(&options)?;
   let mut last_error = String::new();
   let mut failures = 0u64;
   loop {
-    match push_cycle(
-      &api,
-      &mut queue,
-      &scope,
-      &run_dir,
-      &artifacts,
-      options.watch,
-    ) {
+    match publisher.cycle(&mut |_| Ok(())) {
       Ok(done) if !options.watch || done => {
-        return Ok(json!({
-          "scope": scope, "terminal": done, "files": queue.state.files.keys().collect::<Vec<_>>(),
-          "stream_offsets": queue.state.streams, "queue_dir": queue.directory,
-        }));
+        return Ok(publisher.report(done));
       }
       Ok(_) => {
         last_error.clear();
@@ -94,12 +151,7 @@ pub fn push(options: PushOptions) -> Result<Value> {
       }
       Err(error) if !options.watch => return Err(error),
       Err(error) => {
-        let detail: String = error
-          .to_string()
-          .chars()
-          .filter(|character| !character.is_control())
-          .take(512)
-          .collect();
+        let detail = publisher.error_text(&error);
         if last_error != detail || failures.is_multiple_of(15) {
           eprintln!("Service sync pending; saved work will retry: {detail}");
           last_error = detail;
@@ -136,6 +188,7 @@ fn push_cycle(
   run_dir: &Path,
   artifacts: &BTreeSet<String>,
   watch: bool,
+  progress: &mut dyn FnMut(Value) -> Result<()>,
 ) -> Result<bool> {
   fs::directory(run_dir)?;
   let state: Value = serde_json::from_slice(&fs::read_bounded(
@@ -148,7 +201,7 @@ fn push_cycle(
   let done = terminal(&state);
   if !done && !artifacts.is_empty() && !watch {
     return Err(message(
-      "explicit output artifacts require a completed, failed or cancelled run",
+      "explicit output artifacts require a completed, failed, cancelled or lost run",
     ));
   }
   if fs::inspect(&run_dir.join("snapshot.json"))?.is_none() {
@@ -158,6 +211,7 @@ fn push_cycle(
     let source = run_dir.join(path);
     if fs::inspect(&source)?.is_some() {
       sync_file(api, queue, path, run_target(scope, path), &source, true)?;
+      progress(queue_progress(queue))?;
     }
   }
   for path in STREAMS {
@@ -174,6 +228,7 @@ fn push_cycle(
       if done {
         sync_file(api, queue, path, run_target(scope, path), &source, false)?;
       }
+      progress(queue_progress(queue))?;
     }
   }
   for path in artifacts.iter().filter(|_| done) {
@@ -194,7 +249,25 @@ fn push_cycle(
     &run_dir.join("run-state.json"),
     true,
   )?;
+  progress(queue_progress(queue))?;
   Ok(done)
+}
+
+fn queue_progress(queue: &Queue) -> Value {
+  let streams: std::collections::BTreeMap<_, _> = STREAMS
+    .iter()
+    .filter_map(|path| {
+      queue
+        .state
+        .streams
+        .get(*path)
+        .map(|offset| (*path, *offset))
+    })
+    .collect();
+  json!({
+    "files_completed": queue.state.files.values().filter(|saved| saved.upload.complete).count(),
+    "stream_offsets": streams,
+  })
 }
 
 pub fn input_put(options: InputPutOptions) -> Result<Value> {

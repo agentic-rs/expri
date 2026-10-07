@@ -22,8 +22,15 @@ name = "Service acceptance"
 base_python = "/usr/local/bin/python3"
 reuse_packages = ["torch"]
 require_cuda = true
+[service]
+client_config = "/tmp/worker.toml"
+project_id = "demo"
+origin = "worker"
+dashboard_url = "https://expri.example.net/"
 [tasks]
 train = ["python", "train.py"]
+fail = ["python", "-c", "raise SystemExit(7)"]
+wait = ["python", "-c", "import time; print('waiting', flush=True); time.sleep(120)"]
 ''')
 for command in [
   ['uv', 'lock', '--python', '/usr/local/bin/python3'],

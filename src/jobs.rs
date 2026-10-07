@@ -59,11 +59,21 @@ pub fn status_at(repo_root: &Path, run_id: &str) -> Result<Value> {
     recorded_status
   };
   let cancel_requested = cancellation_requested(&run_dir)?;
-  Ok(json!({
+  let mut report = json!({
     "run_id": run_id, "status": status, "recorded_status": recorded_status,
     "detached": detached, "alive": busy && active,
     "cancel_requested": cancel_requested, "state": state,
-  }))
+  });
+  match crate::service::publishing::status(&run_dir) {
+    Ok(Some(service_sync)) => report["service_sync"] = service_sync,
+    Ok(None) => {}
+    Err(_) => {
+      report["service_sync"] = json!({
+        "status": "error", "last_error": "Service publishing status could not be read."
+      });
+    }
+  }
+  Ok(report)
 }
 
 fn cancel_at(repo_root: &Path, run_id: &str) -> Result<Value> {

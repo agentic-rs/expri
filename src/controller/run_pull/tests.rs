@@ -87,6 +87,7 @@ impl Fixture {
         ctl_bin: Some(self.ctl.display().to_string()),
         ctl_method: None,
         environment: None,
+        service: None,
       },
       String::new(),
       String::new(),

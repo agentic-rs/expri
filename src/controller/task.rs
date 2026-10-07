@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::config::{EnvironmentConfig, TargetConfig, TaskConfig};
+use crate::config::{EnvironmentConfig, RunServiceConfig, TargetConfig, TaskConfig};
 use crate::controller::protocol::{ProtocolPreference, apply_run_with_preference};
 use crate::controller::transport::Remote;
 use crate::error::{ExpriError, Result, command_exit_code};
@@ -19,6 +19,7 @@ pub struct LocalTaskOptions {
   pub verbosity: u8,
   pub quiet: bool,
   pub environment: Option<EnvironmentConfig>,
+  pub service: Option<RunServiceConfig>,
   pub remote_managed: Vec<String>,
   pub extras: Vec<String>,
   pub sync_args: Vec<String>,
@@ -44,6 +45,29 @@ pub struct RemoteTaskOptions {
   pub expected_sync: Option<SyncIdentity>,
 }
 
+/// Check before syncing so an incompatible worker cannot receive a publishing run.
+pub fn check_run_publishing_target(
+  target: &TargetConfig,
+  control_path: &str,
+  control_persist: &str,
+  dry_run: bool,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
+  let preference = ProtocolPreference::parse(target.protocol.as_deref())?;
+  let node_bin = target.node_bin.as_deref().unwrap_or("expri");
+  let remote = Remote::new(
+    target.clone(),
+    control_path.to_string(),
+    control_persist.to_string(),
+    dry_run,
+    verbosity,
+    quiet,
+  )?;
+  remote.connect()?;
+  super::protocol::require_run_publishing(&remote, preference, node_bin)
+}
+
 pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
   if let Some(environment) = &options.environment {
     let mut command = options.task.command.clone();
@@ -52,6 +76,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       name: options.name.clone(),
       command,
       environment: environment.clone(),
+      service: options.service,
       remote_managed: options.remote_managed,
       extras: options.extras,
       sync_args: options.sync_args,
@@ -65,6 +90,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       return Ok(());
     }
     return crate::node::run::apply_request_at(&request, &options.repo_root);
+  }
+  if options.service.is_some() {
+    return Err(ExpriError::Message(
+      "automatic publishing requires a configured environment; add [environment] or use --no-publish".into(),
+    ));
   }
   if options.detach {
     return Err(ExpriError::Message(
@@ -115,13 +145,14 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       name: options.name.clone(),
       command,
       environment: environment.clone(),
+      service: options.target.service.clone(),
       remote_managed: options.remote_managed,
       extras: options.extras,
       sync_args: options.sync_args,
       expected_sync: options.expected_sync,
       detach: options.detach,
     };
-    let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
+    let mut preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
     let node_bin = options
       .target
       .node_bin
@@ -137,6 +168,11 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     )?
     .with_diagnostic_stdout(options.detach);
     remote.connect()?;
+    if request.service.is_some() {
+      super::protocol::require_run_publishing(&remote, preference, &node_bin)?;
+      // Never fall back to a protocol that silently ignores publishing intent.
+      preference = ProtocolPreference::ExpriNode;
+    }
     let request_dir = tempfile::Builder::new().prefix("expri-run-").tempdir()?;
     let request_path = request_dir.path().join("run-request.json");
     std::fs::write(&request_path, serde_json::to_vec(&request)?)?;
@@ -155,6 +191,11 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       return super::jobs::start_with_preference(&remote, &request_path, preference, &node_bin);
     }
     return apply_run_with_preference(&remote, &request_path, preference, &node_bin);
+  }
+  if options.target.service.is_some() {
+    return Err(ExpriError::Message(
+      "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
+    ));
   }
   if options.detach {
     return Err(ExpriError::Message(
