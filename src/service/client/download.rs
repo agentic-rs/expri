@@ -15,6 +15,30 @@ use super::{Api, METADATA, OBJECT_BATCH, RECORD_LIMIT, STREAMS, artifacts, fs, v
 use crate::error::Result;
 use crate::lock::LockAttempt;
 
+mod initialization;
+mod staging;
+#[cfg(test)]
+mod tests;
+
+fn validate_record(record: &FileRecord) -> Result<()> {
+  validate_target(&record.target)?;
+  match record.storage {
+    FileStorage::Object => validate_digest(
+      record
+        .sha256
+        .as_deref()
+        .ok_or_else(|| message("object record has no SHA256 digest"))?,
+    )?,
+    FileStorage::Stream if record.sha256.is_some() => {
+      return Err(message(
+        "stream record unexpectedly contains a SHA256 digest",
+      ));
+    }
+    FileStorage::Stream => {}
+  }
+  Ok(())
+}
+
 fn read_stream(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
   let FileTarget::Run { scope, path } = &record.target else {
     return Err(message("private inputs cannot use stream storage"));
@@ -106,6 +130,28 @@ fn object_range(
   Ok(())
 }
 
+fn retry_range(
+  api: &Api,
+  record: &FileRecord,
+  offset: u64,
+  length: u64,
+  output: &mut File,
+) -> Result<()> {
+  let mut last_error = None;
+  for attempt in 0..3 {
+    output.set_len(offset)?;
+    output.seek(SeekFrom::Start(offset))?;
+    match object_range(api, record, offset, length, output) {
+      Ok(()) => return Ok(()),
+      Err(error) => last_error = Some(error),
+    }
+    if attempt < 2 {
+      thread::sleep(Duration::from_millis(250 * (attempt + 1)));
+    }
+  }
+  Err(last_error.expect("range attempts return an error"))
+}
+
 fn download(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
   validate_target(&record.target)?;
   match record.storage {
@@ -119,24 +165,7 @@ fn download(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
       let mut offset = 0u64;
       loop {
         let length = (record.size - offset).min(OBJECT_BATCH);
-        let mut error = None;
-        for attempt in 0..3 {
-          output.set_len(offset)?;
-          output.seek(SeekFrom::Start(offset))?;
-          match object_range(api, record, offset, length, output) {
-            Ok(()) => {
-              error = None;
-              break;
-            }
-            Err(value) => error = Some(value),
-          }
-          if attempt < 2 {
-            thread::sleep(Duration::from_millis(250 * (attempt + 1)));
-          }
-        }
-        if let Some(error) = error {
-          return Err(error);
-        }
+        retry_range(api, record, offset, length, output)?;
         offset += length;
         if offset == record.size {
           break;
@@ -154,6 +183,65 @@ fn download(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
   }
   output.sync_all()?;
   Ok(())
+}
+
+fn staged_download(
+  api: &Api,
+  staging: &mut staging::Staging,
+  path: &str,
+  record: &FileRecord,
+) -> Result<(u64, u64)> {
+  validate_record(record)?;
+  let resumable = matches!(record.storage, FileStorage::Object)
+    && !METADATA.contains(&path)
+    && !STREAMS.contains(&path);
+  let (mut output, initial_offset) = staging.prepare(path, record, resumable)?;
+  match record.storage {
+    FileStorage::Stream => read_stream(api, record, &mut output)?,
+    FileStorage::Object => {
+      let mut offset = initial_offset;
+      // Empty objects still need one successful GET before they can be verified.
+      let mut empty_get = record.size == 0 && !staging.verified(path);
+      while offset < record.size || empty_get {
+        let length = (record.size - offset).min(OBJECT_BATCH);
+        retry_range(api, record, offset, length, &mut output)?;
+        offset += length;
+        empty_get = false;
+        staging.acknowledge(path, offset, false, &output)?;
+        if offset == record.size {
+          break;
+        }
+      }
+      if fs::digest(&mut output, record.size)? != record.sha256.as_deref().unwrap() {
+        // A corrupt prefix must not make every subsequent retry fail forever.
+        drop(output);
+        staging.reset(path)?;
+        return Err(message(
+          "download SHA256 does not match its service record; saved progress was reset and previous files were retained",
+        ));
+      }
+    }
+  }
+  if output.metadata()?.len() != record.size {
+    return Err(message("download has an unexpected size"));
+  }
+  staging.acknowledge(path, record.size, true, &output)?;
+  Ok((initial_offset, record.size - initial_offset))
+}
+
+fn publish(staged: &Path, destination: &Path) -> Result<()> {
+  fs::optional_regular(staged)?;
+  fs::optional_regular(destination)?;
+  let parent = destination.parent().unwrap();
+  // Preserve the verified staging inode until the receipt is committed. This
+  // avoids copying large checkpoints and makes interrupted publication retryable.
+  let temporary = tempfile::Builder::new()
+    .prefix(".service-publish-")
+    .tempdir_in(parent)?;
+  let link = temporary.path().join("file");
+  std::fs::hard_link(staged, &link)?;
+  std::fs::rename(link, destination)?;
+  fs::sync_directory(parent)
 }
 
 fn cache_owner(destination: &Path, expected: &Value) -> Result<()> {
@@ -186,9 +274,15 @@ pub fn pull(options: PullOptions) -> Result<Value> {
   else {
     return Err(message("service did not return a file catalog"));
   };
+  if files.len() > 1000 {
+    return Err(message("service file catalog exceeds its size limit"));
+  }
   let mut selected = BTreeMap::new();
+  let mut available_files = Vec::new();
+  let mut available_files_truncated = false;
+  let mut seen = std::collections::BTreeSet::new();
   for file in files {
-    validate_target(&file.target)?;
+    validate_record(&file)?;
     let FileTarget::Run {
       scope: returned,
       path,
@@ -201,12 +295,29 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     if *returned != scope {
       return Err(message("run catalog contains files from another origin"));
     }
-    if (METADATA.contains(&path.as_str())
-      || STREAMS.contains(&path.as_str())
-      || artifacts.contains(path))
-      && selected.insert(path.clone(), file).is_some()
-    {
+    if !seen.insert(path.clone()) {
       return Err(message("service returned duplicate file records"));
+    }
+    if crate::run_artifacts::validate_path(path).is_ok() {
+      if available_files.len() < 200 {
+        let mut available = json!({"path": path, "size": file.size});
+        if let Some(digest) = &file.sha256 {
+          available["sha256"] = json!(digest);
+        }
+        available_files.push(available);
+        if serde_json::to_vec_pretty(&available_files)?.len() + 1 > 64 * 1024 {
+          available_files.pop();
+          available_files_truncated = true;
+        }
+      } else {
+        available_files_truncated = true;
+      }
+    }
+    if METADATA.contains(&path.as_str())
+      || STREAMS.contains(&path.as_str())
+      || artifacts.contains(path)
+    {
+      selected.insert(path.clone(), file);
     }
   }
   if !selected.contains_key("run-state.json") {
@@ -239,45 +350,62 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     fs::optional_regular(&destination.join(path))?;
   }
   fs::directories(&runs_dir)?;
-  let staging = tempfile::Builder::new()
-    .prefix(".service-pull-")
-    .tempdir_in(&runs_dir)?;
+  let mut staging = staging::Staging::open(
+    runs_dir
+      .parent()
+      .unwrap()
+      .join(".service-pull")
+      .join(&scope.run_id),
+    &owner,
+  )?;
+  staging.select(&selected)?;
+  let mut cache_lease = if fs::inspect(&destination)?.is_some() {
+    cache_owner(&destination, &owner)?;
+    let LockAttempt::Acquired(lease) =
+      crate::lock::try_lock_file(&destination.join(".pull.lock"), true)?
+    else {
+      return Err(message(
+        "another pull is using this run cache; retry after it finishes",
+      ));
+    };
+    Some(lease)
+  } else {
+    None
+  };
+  fs::optional_regular(&destination.join("pull-state.json"))?;
+  for path in selected.keys() {
+    let target = destination.join(path);
+    fs::optional_regular(&target)?;
+  }
+  let mut resumed_files = 0usize;
+  let mut resumed_bytes = 0u64;
+  let mut downloaded_bytes = 0u64;
   for (path, record) in &selected {
-    let staged = staging.path().join(path);
-    fs::directories(staged.parent().unwrap())?;
-    let mut file = std::fs::OpenOptions::new()
-      .write(true)
-      .read(true)
-      .create_new(true)
-      .open(staged)?;
-    download(&api, record, &mut file)?;
+    let (resumed, downloaded) = staged_download(&api, &mut staging, path, record)?;
+    resumed_files += usize::from(resumed > 0);
+    resumed_bytes = resumed_bytes.saturating_add(resumed);
+    downloaded_bytes = downloaded_bytes.saturating_add(downloaded);
   }
   let state: Value = serde_json::from_slice(&fs::read_bounded(
-    &staging.path().join("run-state.json"),
+    &staging.path("run-state.json"),
     RECORD_LIMIT,
   )?)?;
   if state.get("run_id").and_then(Value::as_str) != Some(scope.run_id.as_str()) {
     return Err(message("downloaded run state belongs to another run"));
   }
-  match std::fs::create_dir(&destination) {
-    Ok(()) => {
-      fs::atomic_json(&destination.join(".pull-owner.json"), &owner)?;
-      fs::sync_directory(&runs_dir)?;
-    }
-    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-      cache_owner(&destination, &owner)?
-    }
-    Err(error) => return Err(error.into()),
-  }
-  let LockAttempt::Acquired(_lease) =
-    crate::lock::try_lock_file(&destination.join(".pull.lock"), true)?
-  else {
-    return Err(message(
-      "another pull is publishing this run; retry after it finishes",
-    ));
-  };
+  initialization::initialize(&destination, ".pull-owner.json", &owner, None)?;
   cache_owner(&destination, &owner)?;
-  fs::optional_regular(&destination.join("pull-state.json"))?;
+  if cache_lease.is_none() {
+    let LockAttempt::Acquired(lease) =
+      crate::lock::try_lock_file(&destination.join(".pull.lock"), true)?
+    else {
+      return Err(message(
+        "another pull is using this run cache; retry after it finishes",
+      ));
+    };
+    cache_lease = Some(lease);
+  }
+  cache_owner(&destination, &owner)?;
   for path in selected.keys() {
     let target = destination.join(path);
     fs::directories(target.parent().unwrap())?;
@@ -287,11 +415,11 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     .keys()
     .filter(|path| path.as_str() != "run-state.json")
   {
-    std::fs::rename(staging.path().join(path), destination.join(path))?;
+    publish(&staging.path(path), &destination.join(path))?;
   }
-  std::fs::rename(
-    staging.path().join("run-state.json"),
-    destination.join("run-state.json"),
+  publish(
+    &staging.path("run-state.json"),
+    &destination.join("run-state.json"),
   )?;
   let parents = selected
     .keys()
@@ -303,10 +431,15 @@ pub fn pull(options: PullOptions) -> Result<Value> {
   let receipt = json!({
     "schema_version": 1, "target_name": source, "scope": scope, "service_endpoint": api.endpoint,
     "pulled_at": chrono::Utc::now().to_rfc3339(), "selected_files": selected.keys().collect::<Vec<_>>(),
+    "available_files": available_files,
+    "available_files_truncated": available_files_truncated,
   });
   fs::atomic_json(&destination.join("pull-state.json"), &receipt)?;
+  staging.clear()?;
+  drop(cache_lease);
   Ok(
-    json!({"scope": scope, "source": source, "destination": destination, "files": selected.keys().collect::<Vec<_>>()}),
+    json!({"scope": scope, "source": source, "destination": destination, "files": selected.keys().collect::<Vec<_>>(),
+      "resumed_files": resumed_files, "resumed_bytes": resumed_bytes, "downloaded_bytes": downloaded_bytes}),
   )
 }
 

@@ -1,6 +1,7 @@
 mod download;
 pub(super) mod fs;
 mod http;
+mod inventory;
 mod queue;
 #[cfg(test)]
 mod tests;
@@ -29,7 +30,8 @@ pub(super) fn validate_config(path: &Path) -> Result<()> {
 
 const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const OBJECT_BATCH: u64 = 8 * 1024 * 1024;
-const METADATA: [&str; 4] = [
+const METADATA: [&str; 5] = [
+  crate::run_artifacts::INVENTORY_PATH,
   "snapshot.json",
   "environment/environment-state.json",
   "outputs/params.json",
@@ -207,7 +209,10 @@ fn push_cycle(
   if fs::inspect(&run_dir.join("snapshot.json"))?.is_none() {
     return Err(message("run snapshot metadata is missing"));
   }
-  for path in METADATA.iter().filter(|path| **path != "run-state.json") {
+  for path in METADATA
+    .iter()
+    .filter(|path| **path != "run-state.json" && **path != crate::run_artifacts::INVENTORY_PATH)
+  {
     let source = run_dir.join(path);
     if fs::inspect(&source)?.is_some() {
       sync_file(api, queue, path, run_target(scope, path), &source, true)?;
@@ -247,6 +252,21 @@ fn push_cycle(
     "run-state.json",
     run_target(scope, "run-state.json"),
     &run_dir.join("run-state.json"),
+    true,
+  )?;
+  progress(queue_progress(queue))?;
+  // Artifact discovery is optional metadata. Unsafe or unwritable outputs must
+  // not prevent the established run-state and log/metric publication above.
+  if inventory::record(run_dir).is_err() {
+    return Ok(done);
+  }
+  let inventory_path = crate::run_artifacts::INVENTORY_PATH;
+  sync_file(
+    api,
+    queue,
+    inventory_path,
+    run_target(scope, inventory_path),
+    &run_dir.join(inventory_path),
     true,
   )?;
   progress(queue_progress(queue))?;

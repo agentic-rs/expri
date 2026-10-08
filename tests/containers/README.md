@@ -108,6 +108,16 @@ desktop columns and overflow at a verified 500 CSS pixel viewport, saving
 `workspace-desktop.png` and `workspace-narrow.png` with the CI diagnostics.
 The Firefox check covers a narrow layout rather than 320/360 pixel mobile widths.
 
+The Files check opens the fourth tab with native keyboard input, selects an
+uploaded checkpoint, generates a scoped CLI command, and downloads the actual
+17 MiB attachment through Firefox. It verifies its SHA256 and saves
+`workspace-files.png` and `workspace-files-narrow.png`. A test-only HTTPS object
+proxy preserves the signed S3 path/query and streams attachments without forwarding
+dashboard credentials; Firefox's normal insecure-download protection stays enabled.
+The transfer acceptance
+kills a CLI pull after the first durable 8 MiB range, then reruns the same command
+and verifies that the saved prefix is reused while prior cache files stay intact.
+
 The live-update check republishes new samples, metadata and logs from the
 finalized second worker run while Firefox remains open. It checks five-second
 probes without unchanged metric fetches, defers replacement during a native

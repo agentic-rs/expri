@@ -14,6 +14,7 @@ mod metrics;
 mod metrics_cli;
 mod node;
 mod protocol;
+mod run_artifacts;
 mod run_logs;
 mod runs;
 mod runs_cli;

@@ -13,6 +13,7 @@ _CATALOG_DETAIL_LIMIT = 16 * 1024 * 1024
 _CATALOG_EXCLUDED_COMPONENTS = {".venv", ".expri", ".git", ".cache", "cache", "__pycache__"}
 _CATALOG_STATUSES = {"preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"}
 _CATALOG_METADATA_FILES = (
+  "outputs/.expri-artifacts.json",
   "run-state.json", "snapshot.json", "environment/environment-state.json",
 )
 _CATALOG_TIMESTAMP = _catalog_re.compile(

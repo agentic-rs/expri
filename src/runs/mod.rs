@@ -23,7 +23,8 @@ const STATUSES: [&str; 7] = [
   "lost",
   "unknown",
 ];
-const METADATA_FILES: [&str; 3] = [
+const METADATA_FILES: [&str; 4] = [
+  crate::run_artifacts::INVENTORY_PATH,
   "run-state.json",
   "snapshot.json",
   "environment/environment-state.json",

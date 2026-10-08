@@ -247,6 +247,165 @@ impl Fixture {
   }
 }
 
+#[test]
+fn artifact_catalog_unions_worker_inventory_with_completed_cloud_objects_without_checkpoint_reads()
+{
+  let fixture = Fixture::new();
+  let scope = Fixture::scope("artifacts");
+  fixture.publish_size(
+    FileTarget::Run {
+      scope: scope.clone(),
+      path: "outputs/model one.pt".into(),
+    },
+    b"unread-checkpoint".to_vec(),
+    16 * 1024 * 1024 * 1024,
+  );
+  fixture.publish(
+    FileTarget::Run {
+      scope: scope.clone(),
+      path: crate::run_artifacts::INVENTORY_PATH.into(),
+    },
+    serde_json::to_vec(&json!({
+      "schema_version":1,"recorded_at":"2026-10-07T02:03:04Z", "truncated":false,
+      "files":[{"path":"outputs/model one.pt","size":4},{"path":"outputs/worker-only.pt","size":99}]
+    }))
+    .unwrap(),
+  );
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let catalog = dashboard
+    .artifacts("hosted:project:worker", "artifacts")
+    .unwrap();
+  let files = catalog["files"].as_array().unwrap();
+  assert_eq!(files.len(), 2);
+  let model = files
+    .iter()
+    .find(|row| row["path"] == "outputs/model one.pt")
+    .unwrap();
+  assert_eq!(model["size"], 16 * 1024_u64 * 1024 * 1024);
+  assert_eq!(model["cloud"], true);
+  assert_eq!(model["worker"], true);
+  assert!(model["local"].is_null());
+  assert!(
+    model["download_url"]
+      .as_str()
+      .unwrap()
+      .starts_with("/api/artifact?")
+  );
+  let worker = files
+    .iter()
+    .find(|row| row["path"] == "outputs/worker-only.pt")
+    .unwrap();
+  assert_eq!(worker["cloud"], false);
+  assert!(worker["download_url"].is_null());
+  assert_eq!(catalog["pull_scope"]["project_id"], "project");
+  let requests = fixture.backend.objects.lock().unwrap().requests.clone();
+  assert_eq!(
+    requests.len(),
+    1,
+    "only the bounded inventory should be fetched"
+  );
+  let download = dashboard
+    .artifact_download("hosted:project:worker", "artifacts", "outputs/model one.pt")
+    .unwrap();
+  let crate::dashboard::artifacts::Download::Cloud { size, url, .. } = download else {
+    panic!("cloud redirect expected")
+  };
+  assert_eq!(size, 16 * 1024 * 1024 * 1024);
+  assert!(url.contains("signature=private-test-value"));
+  assert_eq!(
+    fixture.backend.objects.lock().unwrap().requests.len(),
+    1,
+    "download resolution never proxies the object"
+  );
+  for path in [
+    crate::run_artifacts::INVENTORY_PATH,
+    "outputs/../inputs/private",
+    "outputs/.env",
+    "inputs/private",
+  ] {
+    assert!(
+      dashboard
+        .artifact_download("hosted:project:worker", "artifacts", path)
+        .is_err()
+    );
+  }
+  assert!(
+    dashboard
+      .artifact_download("hosted:other:worker", "artifacts", "outputs/model one.pt")
+      .is_err()
+  );
+}
+
+#[test]
+fn artifact_catalog_is_bounded_and_bad_inventory_does_not_hide_cloud_objects() {
+  let fixture = Fixture::new();
+  let scope = Fixture::scope("bounded-files");
+  for index in 0..crate::run_artifacts::FILE_LIMIT + 1 {
+    fixture.publish(
+      FileTarget::Run {
+        scope: scope.clone(),
+        path: format!("outputs/model-{index:03}.pt"),
+      },
+      b"checkpoint".to_vec(),
+    );
+  }
+  fixture.publish(
+    FileTarget::Run {
+      scope: scope.clone(),
+      path: crate::run_artifacts::INVENTORY_PATH.into(),
+    },
+    serde_json::to_vec(
+      &json!({"schema_version":1,"files":[{"path":"inputs/private","size":1}],"truncated":false}),
+    )
+    .unwrap(),
+  );
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let catalog = dashboard
+    .artifacts("hosted:project:worker", "bounded-files")
+    .unwrap();
+  assert_eq!(
+    catalog["files"].as_array().unwrap().len(),
+    crate::run_artifacts::FILE_LIMIT
+  );
+  assert_eq!(catalog["truncated"], true);
+  assert!(!catalog["warnings"].as_array().unwrap().is_empty());
+  assert!(
+    serde_json::to_vec(&catalog["files"]).unwrap().len() <= crate::run_artifacts::INVENTORY_LIMIT
+  );
+  assert!(
+    catalog["files"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .all(|row| row["cloud"] == true && row["worker"].is_null())
+  );
+  fixture.publish(
+    FileTarget::Run {
+      scope,
+      path: crate::run_artifacts::INVENTORY_PATH.into(),
+    },
+    serde_json::to_vec(&json!({
+      "schema_version":1,"files":[{"path":"outputs/a-reported.pt","size":99}],"truncated":false
+    }))
+    .unwrap(),
+  );
+  let partial = dashboard
+    .artifacts("hosted:project:worker", "bounded-files")
+    .unwrap();
+  let reported = partial["files"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|row| row["path"] == "outputs/a-reported.pt")
+    .unwrap();
+  assert_eq!(reported["worker"], true);
+  assert!(
+    reported["cloud"].is_null(),
+    "a bounded cloud catalog cannot prove absence"
+  );
+  assert!(reported["download_url"].is_null());
+}
+
 impl Drop for Fixture {
   fn drop(&mut self) {
     self.stop.store(true, Ordering::SeqCst);

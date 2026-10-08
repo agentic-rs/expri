@@ -107,6 +107,270 @@ fn root() -> (tempfile::TempDir, PathBuf) {
   (temporary, path)
 }
 
+fn mark_synced_metadata(queue: &mut Queue, scope: &RunScope, run_dir: &Path, paths: &[&str]) {
+  for (index, path) in paths.iter().enumerate() {
+    let mut file = fs::open(&run_dir.join(path)).unwrap();
+    let size = file.metadata().unwrap().len();
+    queue.state.files.insert(
+      (*path).into(),
+      SavedFile {
+        target: run_target(scope, path),
+        size,
+        sha256: fs::digest(&mut file, size).unwrap(),
+        snapshot: None,
+        upload: UploadState {
+          upload_id: format!("finished-{index}"),
+          part_size: OBJECT_BATCH,
+          parts: Vec::new(),
+          complete: true,
+        },
+      },
+    );
+  }
+}
+
+#[cfg(unix)]
+fn assert_core_sync_without_inventory(linked_outputs: bool) {
+  use std::os::unix::fs::{PermissionsExt, symlink};
+  let (_temporary, root) = root();
+  let run_dir = root.join("core-run");
+  fs::directories(&run_dir.join("logs")).unwrap();
+  std::fs::write(run_dir.join("snapshot.json"), br#"{"run_id":"core-run"}"#).unwrap();
+  let state = br#"{"run_id":"core-run","status":"running"}"#;
+  std::fs::write(run_dir.join("run-state.json"), state).unwrap();
+  let log = b"training is still running\n";
+  std::fs::write(run_dir.join("logs/stdout.log"), log).unwrap();
+  let outputs = run_dir.join("outputs");
+  if linked_outputs {
+    let external = root.join("external-outputs");
+    fs::directories(&external).unwrap();
+    symlink(external, &outputs).unwrap();
+  } else {
+    fs::directories(&outputs).unwrap();
+    std::fs::set_permissions(&outputs, std::fs::Permissions::from_mode(0o555)).unwrap();
+  }
+  assert!(
+    inventory::record(&run_dir).is_err(),
+    "fixture must actually prevent inventory creation"
+  );
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "core-run".into(),
+  };
+  let expected_scope = scope.clone();
+  let mut current_id = String::new();
+  let mut acknowledged = Vec::new();
+  let (url, task) = mock(6, move |request, origin| {
+    if request.path == "/part" {
+      assert_eq!(request.body, state);
+      assert!(
+        !request
+          .headers
+          .to_ascii_lowercase()
+          .contains("authorization:")
+      );
+      return (
+        200,
+        vec![("ETag".into(), "part-receipt".into())],
+        Vec::new(),
+      );
+    }
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::AppendStream {
+        scope,
+        path,
+        offset,
+        data_base64,
+      } => {
+        assert_eq!(scope, expected_scope);
+        assert_eq!(path, "logs/stdout.log");
+        assert_eq!(offset, 0);
+        assert_eq!(
+          base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data_base64).unwrap(),
+          log
+        );
+        Response::Acknowledged {
+          offset: log.len() as u64,
+        }
+      }
+      Request::BeginUpload {
+        upload_id,
+        target,
+        size,
+        sha256,
+      } => {
+        assert_eq!(target, run_target(&expected_scope, "run-state.json"));
+        assert_eq!(size, state.len() as u64);
+        assert_eq!(sha256, fs::hex(&Sha256::digest(state)));
+        current_id = upload_id.clone();
+        Response::Upload {
+          upload: UploadState {
+            upload_id,
+            part_size: OBJECT_BATCH,
+            parts: Vec::new(),
+            complete: false,
+          },
+        }
+      }
+      Request::PartUrl {
+        upload_id,
+        part_number,
+      } => {
+        assert_eq!(upload_id, current_id);
+        assert_eq!(part_number, 1);
+        Response::Url {
+          url: format!("{origin}/part"),
+        }
+      }
+      Request::RecordPart { upload_id, part } => {
+        assert_eq!(upload_id, current_id);
+        acknowledged.push(part);
+        Response::Upload {
+          upload: UploadState {
+            upload_id,
+            part_size: OBJECT_BATCH,
+            parts: acknowledged.clone(),
+            complete: false,
+          },
+        }
+      }
+      Request::CompleteUpload { upload_id } => {
+        assert_eq!(upload_id, current_id);
+        Response::File {
+          file: FileRecord {
+            target: run_target(&expected_scope, "run-state.json"),
+            size: state.len() as u64,
+            sha256: Some(fs::hex(&Sha256::digest(state))),
+            storage: FileStorage::Object,
+          },
+        }
+      }
+      _ => panic!("optional inventory unexpectedly blocked or preceded core publication"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let api = Api::new(&config(&root, &url)).unwrap();
+  let mut queue = Queue::new(
+    root.join("queue"),
+    json!({"endpoint": api.endpoint, "scope": scope}),
+  )
+  .unwrap();
+  mark_synced_metadata(&mut queue, &scope, &run_dir, &["snapshot.json"]);
+  let result = push_cycle(
+    &api,
+    &mut queue,
+    &scope,
+    &run_dir,
+    &BTreeSet::new(),
+    true,
+    &mut |_| Ok(()),
+  );
+  if !linked_outputs {
+    std::fs::set_permissions(&outputs, std::fs::Permissions::from_mode(0o700)).unwrap();
+  }
+  assert!(!result.unwrap());
+  task.join().unwrap();
+  assert_eq!(queue.state.streams["logs/stdout.log"], log.len() as u64);
+  assert!(queue.state.files["run-state.json"].upload.complete);
+  assert!(
+    !queue
+      .state
+      .files
+      .contains_key(crate::run_artifacts::INVENTORY_PATH)
+  );
+  assert!(!run_dir.join(crate::run_artifacts::INVENTORY_PATH).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_empty_outputs_do_not_block_core_log_and_state_publication() {
+  assert_core_sync_without_inventory(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_outputs_do_not_block_core_log_and_state_publication() {
+  // Root can write through ordinary Unix permission bits; the CI runner uses
+  // a regular user, which exercises the actual output-directory failure.
+  if unsafe { libc::geteuid() } != 0 {
+    assert_core_sync_without_inventory(false);
+  }
+}
+
+#[test]
+fn prepared_inventory_transport_failure_remains_retryable_after_core_publication() {
+  let (_temporary, root) = root();
+  let run_dir = root.join("inventory-transport");
+  fs::directories(&run_dir).unwrap();
+  std::fs::write(
+    run_dir.join("snapshot.json"),
+    br#"{"run_id":"inventory-transport"}"#,
+  )
+  .unwrap();
+  std::fs::write(
+    run_dir.join("run-state.json"),
+    br#"{"run_id":"inventory-transport","status":"completed"}"#,
+  )
+  .unwrap();
+  let (url, task) = mock(1, |request, _| {
+    let Request::BeginUpload {
+      target: FileTarget::Run { path, .. },
+      ..
+    } = serde_json::from_slice(&request.body).unwrap()
+    else {
+      panic!("inventory upload expected")
+    };
+    assert_eq!(path, crate::run_artifacts::INVENTORY_PATH);
+    (
+      503,
+      Vec::new(),
+      serde_json::to_vec(&json!({"error":"temporary upload outage"})).unwrap(),
+    )
+  });
+  let api = Api::new(&config(&root, &url)).unwrap();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "inventory-transport".into(),
+  };
+  let mut queue = Queue::new(
+    root.join("queue"),
+    json!({"endpoint":api.endpoint,"scope":scope}),
+  )
+  .unwrap();
+  mark_synced_metadata(
+    &mut queue,
+    &scope,
+    &run_dir,
+    &["snapshot.json", "run-state.json"],
+  );
+  assert!(
+    push_cycle(
+      &api,
+      &mut queue,
+      &scope,
+      &run_dir,
+      &BTreeSet::new(),
+      false,
+      &mut |_| Ok(())
+    )
+    .is_err()
+  );
+  task.join().unwrap();
+  assert!(queue.state.files["run-state.json"].upload.complete);
+  assert!(
+    !queue.state.files[crate::run_artifacts::INVENTORY_PATH]
+      .upload
+      .complete
+  );
+  assert!(
+    queue.state.files[crate::run_artifacts::INVENTORY_PATH]
+      .snapshot
+      .is_some()
+  );
+}
+
 #[test]
 fn manual_and_automatic_diagnostics_redact_the_in_memory_service_token() {
   let (_temporary, root) = root();
@@ -692,7 +956,12 @@ fn watching_a_future_artifact_still_forwards_live_complete_metric_rows() {
   )
   .unwrap();
   // This cycle follows already synchronized metadata; only the live stream needs networking.
-  for path in ["snapshot.json", "run-state.json"] {
+  inventory::record(&run_dir).unwrap();
+  for path in [
+    "snapshot.json",
+    "run-state.json",
+    crate::run_artifacts::INVENTORY_PATH,
+  ] {
     let mut file = fs::open(&run_dir.join(path)).unwrap();
     let size = file.metadata().unwrap().len();
     queue.state.files.insert(
@@ -816,7 +1085,7 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
   let mut uploads =
     std::collections::BTreeMap::<String, (FileTarget, u64, String, UploadState)>::new();
   let mut offline = true;
-  let (url, task) = mock(11, move |request, origin| {
+  let (url, task) = mock(16, move |request, origin| {
     if request.path.starts_with("/objects/") {
       assert!(
         !request
@@ -941,8 +1210,15 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
   );
   let report = publisher.report(true);
   assert_eq!(report["terminal"], true);
-  assert_eq!(report["files"], json!(["run-state.json", "snapshot.json"]));
-  assert_eq!(progress.len(), 2);
+  assert_eq!(
+    report["files"],
+    json!([
+      crate::run_artifacts::INVENTORY_PATH,
+      "run-state.json",
+      "snapshot.json"
+    ])
+  );
+  assert_eq!(progress.len(), 3);
   assert!(
     publisher
       .queue

@@ -346,7 +346,7 @@ fn a_single_long_log_line_keeps_its_tail_with_or_without_a_final_newline() {
 }
 
 #[test]
-fn update_probes_use_fixed_stat_hints_without_parsing_or_scanning_outputs() {
+fn update_probes_read_only_bounded_output_metadata_and_never_parse_contents() {
   let fixture = Fixture::new();
   assert_eq!(
     fixture.dashboard.updates("", &[]).unwrap(),
@@ -371,7 +371,7 @@ fn update_probes_use_fixed_stat_hints_without_parsing_or_scanning_outputs() {
     next["runs"][0]["metrics_revision"],
     first["runs"][0]["metrics_revision"]
   );
-  assert_eq!(
+  assert_ne!(
     next["runs"][0]["metadata_revision"],
     first["runs"][0]["metadata_revision"]
   );
@@ -435,7 +435,7 @@ fn update_probes_detect_same_size_replacement_and_refuse_linked_paths() {
     first["runs"][0]["metadata_revision"]
   );
 
-  // Arbitrary checkpoint paths are never probed, even when they are links.
+  // Checkpoint contents are never read, and linked checkpoints are ignored.
   symlink(
     fixture.root.join("expri.toml"),
     run.join("outputs/model.pt"),
@@ -461,4 +461,187 @@ fn update_probes_detect_same_size_replacement_and_refuse_linked_paths() {
       .updates("local", &["linked".into()])
       .is_err()
   );
+}
+
+#[test]
+fn artifact_catalog_merges_reported_outputs_with_real_local_files() {
+  let fixture = Fixture::new();
+  let run = fixture.run("files");
+  let checkpoint = fs::File::create(run.join("outputs/model one.pt")).unwrap();
+  checkpoint.set_len(16 * 1024 * 1024 * 1024).unwrap();
+  fs::write(run.join("outputs/.env"), "private").unwrap();
+  fs::create_dir_all(run.join("code")).unwrap();
+  fs::write(run.join("code/train.py"), "private code").unwrap();
+  fs::write(run.join(crate::run_artifacts::INVENTORY_PATH), json!({"schema_version":1,"recorded_at":"2026-10-07T01:02:03Z",
+    "files":[{"path":"outputs/model one.pt","size":2},{"path":"outputs/worker-only.pt","size":99}],"truncated":false}).to_string()).unwrap();
+  let catalog = fixture.dashboard.artifacts("local", "files").unwrap();
+  assert_eq!(catalog["files"].as_array().unwrap().len(), 3);
+  let rows = catalog["files"].as_array().unwrap();
+  let model = rows
+    .iter()
+    .find(|row| row["path"] == "outputs/model one.pt")
+    .unwrap();
+  assert_eq!(model["size"], 16 * 1024_u64 * 1024 * 1024);
+  assert_eq!(model["local"], true);
+  assert_eq!(model["worker"], true);
+  assert!(model["cloud"].is_null());
+  assert!(
+    model["download_url"]
+      .as_str()
+      .unwrap()
+      .starts_with("/api/artifact?source=local&run_id=files&path=")
+  );
+  let reported = rows
+    .iter()
+    .find(|row| row["path"] == "outputs/worker-only.pt")
+    .unwrap();
+  assert_eq!(reported["local"], false);
+  assert!(reported["download_url"].is_null());
+  assert_eq!(catalog["inventory_recorded_at"], "2026-10-07T01:02:03Z");
+  assert!(catalog["pull_scope"].is_null());
+  assert!(!catalog["truncated"].as_bool().unwrap());
+}
+
+#[test]
+fn cached_artifact_catalog_reports_last_cloud_catalog_and_pull_scope() {
+  let fixture = Fixture::new();
+  let local = fixture.run("cached-files");
+  let run = fixture
+    .root
+    .join("results/service-worker/runs/cached-files");
+  fs::create_dir_all(run.join("outputs")).unwrap();
+  fs::copy(local.join("run-state.json"), run.join("run-state.json")).unwrap();
+  fs::write(run.join("outputs/local.pt"), b"cache").unwrap();
+  fs::write(
+    run.join("pull-state.json"),
+    json!({"schema_version":1,
+    "scope":{"project_id":"project","origin":"worker","run_id":"cached-files"},
+    "available_files":[{"path":"outputs/local.pt","size":7,"sha256":"a".repeat(64)},
+      {"path":"outputs/cloud-only.pt","size":12,"sha256":"b".repeat(64)},
+      {"path":"outputs/metrics.jsonl","size":3}],"available_files_truncated":false})
+    .to_string(),
+  )
+  .unwrap();
+  let catalog = fixture
+    .dashboard
+    .artifacts("cached:service-worker", "cached-files")
+    .unwrap();
+  assert_eq!(catalog["pull_scope"]["project_id"], "project");
+  let rows = catalog["files"].as_array().unwrap();
+  let local = rows
+    .iter()
+    .find(|row| row["path"] == "outputs/local.pt")
+    .unwrap();
+  assert_eq!(local["size"], 5);
+  assert_eq!(local["local"], true);
+  assert_eq!(local["cloud"], true);
+  let cloud = rows
+    .iter()
+    .find(|row| row["path"] == "outputs/cloud-only.pt")
+    .unwrap();
+  assert_eq!(cloud["local"], false);
+  assert_eq!(cloud["cloud"], true);
+  assert!(cloud["download_url"].is_null());
+  assert_eq!(
+    rows
+      .iter()
+      .find(|row| row["path"] == "outputs/metrics.jsonl")
+      .unwrap()["cloud"],
+    false
+  );
+  assert!(!catalog["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn malformed_worker_inventory_warns_without_hiding_local_files_and_output_changes_refresh() {
+  let fixture = Fixture::new();
+  let run = fixture.run("safe-files");
+  fs::write(
+    run.join(crate::run_artifacts::INVENTORY_PATH),
+    json!({"schema_version":1,"files":[{"path":"inputs/private.pt","size":1}],"truncated":false})
+      .to_string(),
+  )
+  .unwrap();
+  let catalog = fixture.dashboard.artifacts("local", "safe-files").unwrap();
+  assert_eq!(catalog["files"].as_array().unwrap().len(), 1);
+  assert!(!catalog["warnings"].as_array().unwrap().is_empty());
+  let ids = vec!["safe-files".into()];
+  let before = fixture.dashboard.updates("local", &ids).unwrap();
+  fs::create_dir(run.join("outputs/nested")).unwrap();
+  fs::write(run.join("outputs/nested/new.pt"), "output").unwrap();
+  let after = fixture.dashboard.updates("local", &ids).unwrap();
+  assert_ne!(
+    before["runs"][0]["metadata_revision"],
+    after["runs"][0]["metadata_revision"]
+  );
+  assert!(
+    fixture
+      .dashboard
+      .artifacts("local", "../safe-files")
+      .is_err()
+  );
+  for path in [
+    "run-state.json",
+    "outputs/../expri.toml",
+    "inputs/data.pt",
+    "outputs/.env",
+    "outputs/a\\b",
+  ] {
+    assert!(
+      fixture
+        .dashboard
+        .artifact_download("local", "safe-files", path)
+        .is_err(),
+      "{path}"
+    );
+  }
+}
+
+#[cfg(unix)]
+#[test]
+fn artifact_download_rejects_symlink_files_and_parent_directories() {
+  use std::os::unix::fs::symlink;
+  let fixture = Fixture::new();
+  let run = fixture.run("links");
+  let outside = tempfile::tempdir().unwrap();
+  fs::write(outside.path().join("secret.pt"), "private").unwrap();
+  symlink(
+    outside.path().join("secret.pt"),
+    run.join("outputs/link.pt"),
+  )
+  .unwrap();
+  symlink(outside.path(), run.join("outputs/linked")).unwrap();
+  assert!(
+    fixture
+      .dashboard
+      .artifact_download("local", "links", "outputs/link.pt")
+      .is_err()
+  );
+  assert!(
+    fixture
+      .dashboard
+      .artifact_download("local", "links", "outputs/linked/secret.pt")
+      .is_err()
+  );
+  assert_eq!(
+    fixture.dashboard.artifacts("local", "links").unwrap()["files"]
+      .as_array()
+      .unwrap()
+      .len(),
+    1
+  );
+  let file = fs::File::create(run.join("outputs/opened.pt")).unwrap();
+  std::io::Write::write_all(&mut &file, b"safe").unwrap();
+  let download = fixture
+    .dashboard
+    .artifact_download("local", "links", "outputs/opened.pt")
+    .unwrap();
+  fs::rename(run.join("outputs"), run.join("original-outputs")).unwrap();
+  symlink(outside.path(), run.join("outputs")).unwrap();
+  let artifacts::Download::Local { mut file, .. } = download else {
+    panic!("local file expected")
+  };
+  let mut bytes = Vec::new();
+  file.read_to_end(&mut bytes).unwrap();
+  assert_eq!(bytes, b"safe");
 }

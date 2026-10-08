@@ -19,6 +19,7 @@ const HTML_LIMIT: usize = 2 * 1024 * 1024;
 const WORKERS: usize = 4;
 const CONNECTION_QUEUE: usize = 16;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3600);
 const MAIN_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 const CHART_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'";
 
@@ -69,6 +70,7 @@ pub fn serve(dashboard: Dashboard, port: u16) -> Result<()> {
 }
 
 fn respond(dashboard: &Dashboard, authority: &str, mut stream: TcpStream) {
+  let mut download = None;
   let (reply, head) = match read_request(&mut stream) {
     Ok(request) => {
       let head = request.method() == Method::HEAD;
@@ -88,6 +90,15 @@ fn respond(dashboard: &Dashboard, authority: &str, mut stream: TcpStream) {
         .map_or_else(
           |reply| reply,
           |()| {
+            if url.split('?').next() == Some("/api/artifact") {
+              return match artifact_download(dashboard, &url) {
+                Ok(artifact) => {
+                  download = Some(artifact);
+                  Reply::bytes("application/octet-stream", Vec::new())
+                }
+                Err(reply) => reply,
+              };
+            }
             route(
               dashboard,
               authority,
@@ -104,9 +115,18 @@ fn respond(dashboard: &Dashboard, authority: &str, mut stream: TcpStream) {
   // Socket shutdown discards an unread body; it never allocates or drains it.
   let mut writer = DeadlineWriter {
     stream: &mut stream,
-    deadline: Instant::now() + SOCKET_TIMEOUT,
+    deadline: Instant::now()
+      + if download.is_some() && !head {
+        DOWNLOAD_TIMEOUT
+      } else {
+        SOCKET_TIMEOUT
+      },
   };
-  let _ = write_response(&mut writer, reply, head);
+  if let Some(download) = download {
+    let _ = write_download(&mut writer, download, head);
+  } else {
+    let _ = write_response(&mut writer, reply, head);
+  }
   let _ = stream.shutdown(Shutdown::Both);
 }
 
@@ -125,13 +145,47 @@ impl Write for DeadlineWriter<'_> {
         "dashboard response write timed out",
       ));
     }
-    self.stream.set_write_timeout(Some(remaining))?;
+    self
+      .stream
+      .set_write_timeout(Some(remaining.min(SOCKET_TIMEOUT)))?;
     self.stream.write(bytes)
   }
 
   fn flush(&mut self) -> std::io::Result<()> {
     self.stream.flush()
   }
+}
+
+fn write_download(
+  stream: &mut impl Write,
+  download: super::artifacts::Download,
+  head: bool,
+) -> std::io::Result<()> {
+  let super::artifacts::Download::Local {
+    file,
+    size,
+    filename,
+  } = download
+  else {
+    return Err(std::io::Error::other(
+      "local dashboard cannot redirect cloud downloads",
+    ));
+  };
+  write!(
+    stream,
+    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nContent-Disposition: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; sandbox\r\n\r\n",
+    super::artifacts::disposition(&filename)
+  )?;
+  if !head {
+    let copied = std::io::copy(&mut file.take(size), stream)?;
+    if copied != size {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "artifact changed during download",
+      ));
+    }
+  }
+  stream.flush()
 }
 
 fn read_request(stream: &mut TcpStream) -> std::result::Result<Request<()>, Reply> {
@@ -490,6 +544,27 @@ pub(crate) fn route_content(dashboard: &impl super::DashboardView, url: &str) ->
   }
 }
 
+/// The caller must enforce its authentication and HTTP request boundary before
+/// resolving a file or minting a signed object-storage URL.
+pub(crate) fn artifact_download(
+  dashboard: &impl super::DashboardView,
+  url: &str,
+) -> std::result::Result<super::artifacts::Download, Reply> {
+  let (path, raw_query) = url.split_once('?').unwrap_or((url, ""));
+  if path != "/api/artifact" {
+    return Err(Reply::error(404, "dashboard route not found"));
+  }
+  let query = Query::parse(raw_query)?;
+  query.allow(&["source", "run_id", "path"])?;
+  dashboard
+    .artifact_download(
+      query.required("source")?,
+      query.required("run_id")?,
+      query.required("path")?,
+    )
+    .map_err(service_error)
+}
+
 fn route_content_checked(
   dashboard: &impl super::DashboardView,
   url: &str,
@@ -557,6 +632,14 @@ fn route_content_checked(
           .map_err(service_error)?,
       ))
     }
+    "/api/artifacts" => {
+      query.allow(&["source", "run_id"])?;
+      Ok(Reply::json(
+        dashboard
+          .artifacts(source, query.required("run_id")?)
+          .map_err(service_error)?,
+      ))
+    }
     "/api/log" => {
       query.allow(&["source", "run_id", "stream", "tail"])?;
       let stream = query.optional("stream").unwrap_or("stdout");
@@ -603,8 +686,11 @@ fn route_content_checked(
 
 fn service_error(error: ExpriError) -> Reply {
   let status = match &error {
+    ExpriError::Message(message) if message == "object storage unavailable" => 502,
     ExpriError::Message(message)
-      if message.starts_with("run is missing: ") || message.starts_with("unknown source: ") =>
+      if message.starts_with("run is missing: ")
+        || message.starts_with("unknown source: ")
+        || message.starts_with("artifact is missing: ") =>
     {
       404
     }

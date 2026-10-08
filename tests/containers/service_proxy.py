@@ -1,11 +1,15 @@
-"""CI-only proxy losing successful metric and checkpoint-part acknowledgements."""
+"""CI-only proxy injecting acknowledgement loss and interrupted checkpoint reads."""
 import json
+import http.client
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
-state = {'armed': False, 'lost_ack': False, 'lost_stream_ack': False, 'part_urls': {}, 'stream_batches': 0}
+state = {'armed': False, 'lost_ack': False, 'lost_stream_ack': False, 'part_urls': {}, 'stream_batches': 0,
+  'download_armed': False, 'download_blocked': False, 'download_ranges': {}}
 uploads = {}
 lock = threading.Lock()
 
@@ -22,10 +26,50 @@ class Proxy(BaseHTTPRequestHandler):
     self.wfile.write(body)
 
   def do_GET(self):
+    if self.path.startswith('/objects/'):
+      self.object_download()
+      return
     with lock:
       if self.path == '/test/arm':
         state['armed'] = True
+      elif self.path == '/test/arm-download':
+        state['download_armed'] = True
+        state['download_blocked'] = False
+        state['download_ranges'] = {}
+      elif self.path == '/test/release-download':
+        state['download_armed'] = False
       self.reply(200, state)
+
+  def object_download(self):
+    requested = self.headers.get('Range', '')
+    with lock:
+      state['download_ranges'][requested] = state['download_ranges'].get(requested, 0) + 1
+      blocked = state['download_armed'] and requested.startswith('bytes=8388608-')
+      if blocked:
+        state['download_blocked'] = True
+    if blocked:
+      deadline = time.monotonic() + 45
+      while time.monotonic() < deadline:
+        with lock:
+          if not state['download_armed']:
+            break
+        time.sleep(0.1)
+    connection = http.client.HTTPConnection('s3', 9000, timeout=30)
+    try:
+      connection.request('GET', self.path.removeprefix('/objects'), headers={'Range': requested})
+      response = connection.getresponse()
+      self.send_response(response.status)
+      for name in ['Content-Length', 'Content-Range', 'Content-Type']:
+        value = response.getheader(name)
+        if value is not None:
+          self.send_header(name, value)
+      self.end_headers()
+      while chunk := response.read(64 * 1024):
+        self.wfile.write(chunk)
+    except (BrokenPipeError, ConnectionResetError):
+      pass
+    finally:
+      connection.close()
 
   def do_POST(self):
     length = int(self.headers.get('Content-Length', '0'))
@@ -63,6 +107,11 @@ class Proxy(BaseHTTPRequestHandler):
         state['lost_ack'] = True
         self.reply(502, {'error': 'injected lost acknowledgement after durable part commit'})
         return
-    self.reply(status, json.loads(data))
+    result = json.loads(data)
+    if status == 200 and query['action'] == 'download_url' and query['target'].get('path') == 'outputs/checkpoint.pt':
+      # Keep MinIO's signed Host/path/query when forwarding. Never record the URL.
+      parsed = urlsplit(result['url'])
+      result['url'] = 'http://proxy:8001/objects' + parsed.path + '?' + parsed.query
+    self.reply(status, result)
 
 ThreadingHTTPServer(('0.0.0.0', 8001), Proxy).serve_forever()

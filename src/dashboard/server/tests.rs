@@ -91,6 +91,129 @@ fn assert_error(reply: Reply, status: u16) {
 }
 
 #[test]
+fn artifacts_route_is_bounded_and_download_queries_are_strict() {
+  let fixture = Fixture::new();
+  let reply = fixture.get("/api/artifacts?source=local&run_id=run-one");
+  assert_eq!(reply.status, 200);
+  let catalog: Value = serde_json::from_slice(&reply.body).unwrap();
+  assert_eq!(catalog["files"].as_array().unwrap().len(), 2);
+  for url in [
+    "/api/artifact?run_id=run-one&path=outputs/params.json",
+    "/api/artifact?source=local&run_id=run-one&path=outputs/params.json&path=outputs/metrics.jsonl",
+    "/api/artifact?source=local&run_id=run-one&path=outputs/params.json&token=private",
+    "/api/artifact?source=local&run_id=run-one&run_id=run-two&path=outputs/params.json",
+    "/api/artifact?source=local&run_id=run-one&path=outputs%2F..%2Frun-state.json",
+  ] {
+    let Err(reply) = artifact_download(&fixture.dashboard, url) else {
+      panic!("unsafe download query accepted")
+    };
+    assert_error(reply, 400);
+  }
+  let Err(reply) = artifact_download(
+    &fixture.dashboard,
+    "/api/artifact?source=local&run_id=run-one&path=outputs/missing.pt",
+  ) else {
+    panic!("missing file accepted")
+  };
+  assert_error(reply, 404);
+}
+
+#[test]
+fn local_download_streams_large_file_and_head_never_reads_body() {
+  struct Sink {
+    bytes: u64,
+    largest_write: usize,
+    first: Vec<u8>,
+  }
+  impl Write for Sink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+      if self.first.is_empty() {
+        self.first = bytes.to_vec();
+      }
+      self.bytes += bytes.len() as u64;
+      self.largest_write = self.largest_write.max(bytes.len());
+      Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+  let file = tempfile::tempfile().unwrap();
+  let size = 32 * 1024 * 1024;
+  file.set_len(size).unwrap();
+  let mut sink = Sink {
+    bytes: 0,
+    largest_write: 0,
+    first: Vec::new(),
+  };
+  write_download(
+    &mut sink,
+    super::super::artifacts::Download::Local {
+      file,
+      size,
+      filename: "model\"é.pt".into(),
+    },
+    false,
+  )
+  .unwrap();
+  assert!(sink.bytes > size);
+  assert!(
+    sink.largest_write <= 64 * 1024,
+    "checkpoint body must be copied in bounded chunks"
+  );
+  let file = tempfile::tempfile().unwrap();
+  file.set_len(16 * 1024 * 1024 * 1024).unwrap();
+  let mut headers = Vec::new();
+  write_download(
+    &mut headers,
+    super::super::artifacts::Download::Local {
+      file,
+      size: 16 * 1024 * 1024 * 1024,
+      filename: "model.pt".into(),
+    },
+    true,
+  )
+  .unwrap();
+  let headers = String::from_utf8(headers).unwrap();
+  assert!(headers.ends_with("\r\n\r\n"));
+  assert!(headers.contains("Content-Length: 17179869184\r\n"));
+  assert!(headers.contains("Referrer-Policy: no-referrer\r\n"));
+  assert!(headers.contains("Content-Disposition: attachment;"));
+}
+
+#[test]
+fn local_download_socket_keeps_host_and_origin_boundaries() {
+  use std::net::TcpListener;
+  let fixture = Fixture::new();
+  for (host, origin, expected) in [
+    ("attacker.example", None, 403),
+    (AUTHORITY, Some("https://attacker.example"), 403),
+    (AUTHORITY, None, 200),
+  ] {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        let (stream, _) = listener.accept().unwrap();
+        respond(&fixture.dashboard, AUTHORITY, stream);
+      });
+      let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+      client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+      write!(client, "HEAD /api/artifact?source=local&run_id=run-one&path=outputs/params.json HTTP/1.1\r\nHost: {host}\r\n").unwrap();
+      if let Some(origin) = origin {
+        write!(client, "Origin: {origin}\r\n").unwrap();
+      }
+      client.write_all(b"\r\n").unwrap();
+      let mut response = String::new();
+      client.read_to_string(&mut response).unwrap();
+      assert!(response.starts_with(&format!("HTTP/1.1 {expected} ")));
+      assert!(response.ends_with("\r\n\r\n"));
+    });
+  }
+}
+
+#[test]
 fn enforces_exact_single_host_and_same_origin_browser_boundaries() {
   let fixture = Fixture::new();
   for headers in [

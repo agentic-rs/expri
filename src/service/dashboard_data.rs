@@ -68,6 +68,17 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
   fn detail(&self, source: &str, run_id: &str) -> Result<Value> {
     HostedDashboard::detail(self, source, run_id)
   }
+  fn artifacts(&self, source: &str, run_id: &str) -> Result<Value> {
+    HostedDashboard::artifacts(self, source, run_id)
+  }
+  fn artifact_download(
+    &self,
+    source: &str,
+    run_id: &str,
+    path: &str,
+  ) -> Result<crate::dashboard::artifacts::Download> {
+    HostedDashboard::artifact_download(self, source, run_id, path)
+  }
   fn log(&self, source: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value> {
     HostedDashboard::log(self, source, run_id, stream, tail)
   }
@@ -435,6 +446,109 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       return Err(message(format!("run is missing: {run_id}")));
     }
     Ok((source, scope))
+  }
+
+  pub fn artifacts(&self, source_id: &str, run_id: &str) -> Result<Value> {
+    use crate::dashboard::artifacts::{ArtifactRow, bound_rows, download_url, parse_inventory};
+    let (source, scope) = self.scope(source_id, run_id)?;
+    let mut rows = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let mut truncated = false;
+    let mut recorded_at = None;
+    // Only this small published manifest is fetched. Checkpoint objects are
+    // described by SQLite records and never read to construct the catalog.
+    match self.json_artifact(&scope, crate::run_artifacts::INVENTORY_PATH, crate::run_artifacts::INVENTORY_LIMIT as u64, Instant::now() + REQUEST_TIMEOUT)
+      .map_err(api_error).and_then(|value| value.as_ref().map(parse_inventory).transpose()) {
+      Ok(Some(inventory)) => {
+        truncated |= inventory.truncated;
+        recorded_at = inventory.recorded_at;
+        for file in inventory.files {
+          rows.insert(file.path.clone(), ArtifactRow { path: file.path, size: file.size,
+            local: None, cloud: None, worker: Some(true), download_url: None });
+        }
+      }
+      Ok(None) => {}
+      Err(_) => warnings.push(json!({"message": "Worker artifact inventory is unavailable or invalid; reported availability is unknown."})),
+    }
+    let (objects, objects_truncated) = self
+      .store
+      .dashboard_output_objects(&scope)
+      .map_err(api_error)?;
+    truncated |= objects_truncated;
+    for object in objects {
+      let FileTarget::Run { path, .. } = object.target else {
+        unreachable!("validated output target")
+      };
+      let row = rows.entry(path.clone()).or_insert_with(|| ArtifactRow {
+        path: path.clone(),
+        size: object.size,
+        local: None,
+        cloud: None,
+        worker: None,
+        download_url: None,
+      });
+      row.size = object.size;
+      row.cloud = Some(true);
+      row.download_url = Some(download_url(source_id, run_id, &path));
+    }
+    if !objects_truncated {
+      for row in rows.values_mut() {
+        if row.cloud.is_none() {
+          row.cloud = Some(false);
+        }
+      }
+    }
+    let files = bound_rows(rows, &mut truncated)?;
+    if truncated {
+      warnings.push(json!({"message": "Artifact listing is limited to 200 files and bounded metadata; some files are omitted."}));
+    }
+    Ok(
+      json!({"source": source, "run_id": run_id, "files": files, "truncated": truncated,
+      "warnings": bounded_warnings(&warnings), "pull_scope": scope, "inventory_recorded_at": recorded_at}),
+    )
+  }
+
+  fn artifact_download(
+    &self,
+    source_id: &str,
+    run_id: &str,
+    path: &str,
+  ) -> Result<crate::dashboard::artifacts::Download> {
+    use crate::dashboard::artifacts::{Download, disposition, filename, validate_output};
+    validate_output(path)?;
+    let (_, scope) = self.scope(source_id, run_id)?;
+    let filename = filename(path).to_string();
+    let (url, size) = self
+      .store
+      .dashboard_attachment_url(
+        &FileTarget::Run {
+          scope,
+          path: path.into(),
+        },
+        &disposition(&filename),
+      )
+      .map_err(|error| {
+        if error.status == 404 {
+          message(format!("artifact is missing: {path}"))
+        } else {
+          api_error(error)
+        }
+      })?;
+    let parsed =
+      reqwest::Url::parse(&url).map_err(|_| message("invalid object storage download URL"))?;
+    if !matches!(parsed.scheme(), "https" | "http")
+      || parsed.host_str().is_none()
+      || !parsed.username().is_empty()
+      || parsed.password().is_some()
+      || parsed.fragment().is_some()
+    {
+      return Err(message("invalid object storage download URL"));
+    }
+    Ok(Download::Cloud {
+      url,
+      size,
+      filename,
+    })
   }
 
   fn overview(&self, scope: &RunScope, deadline: Instant) -> ApiResult<Value> {

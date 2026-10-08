@@ -1,5 +1,6 @@
 import { Fragment, useSyncExternalStore, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
+import { FilesPanel } from "./dashboard_files";
 import type { ChartAxis, ChartTimeZone } from "./interactive_charts";
 import {
   dateText,
@@ -8,6 +9,7 @@ import {
   formatValue,
   jsonObject,
   localTimeZoneLabel,
+  type ArtifactCatalog,
   type Comparison,
   type ComparisonReduction,
   type Detail,
@@ -51,6 +53,8 @@ export type DashboardUi = {
   comparison_busy: boolean;
   log_content: string;
   log_note: string;
+  artifacts_loading: boolean;
+  artifacts_error: string | null;
   live_status: string;
 };
 export type DashboardSnapshot = DashboardUi & {
@@ -62,6 +66,8 @@ export type DashboardSnapshot = DashboardUi & {
   review: Review | null;
   detail: Detail | null;
   comparison: Comparison | null;
+  artifacts: ArtifactCatalog | null;
+  selected_files: string[];
   metric_names: string[];
   review_version: number;
   x_axis: ChartAxis;
@@ -88,6 +94,9 @@ export type DashboardActions = {
   axis: (value: ChartAxis) => void;
   time_zone: (value: ChartTimeZone) => void;
   log_stream: (value: "stdout" | "stderr") => void;
+  select_file: (path: string, checked: boolean) => void;
+  clear_files: () => void;
+  refresh_files: () => void;
 };
 export type DashboardStore = {
   subscribe: (listener: () => void) => () => void;
@@ -706,7 +715,7 @@ function ReviewWorkspace({
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
 }) {
-  const tabs: ReviewTab[] = ["charts", "overview", "logs"];
+  const tabs: ReviewTab[] = ["charts", "overview", "logs", "files"];
   const available: ReviewTab[] = s.review?.kind === "compare" ? ["charts"] : tabs;
   return (
     <div className="review-workspace">
@@ -912,6 +921,25 @@ function ReviewWorkspace({
           hidden={s.review?.tab !== "logs"}
         >
           <Logs snapshot={s} actions={a} />
+        </div>
+        <div
+          id="review-panel-files"
+          role="tabpanel"
+          aria-labelledby="review-tab-files"
+          hidden={s.review?.tab !== "files"}
+        >
+          <FilesPanel
+            key={`${s.source_id}:${s.review_version}`}
+            catalog={s.artifacts}
+            source_id={s.source_id}
+            run_id={s.review?.run_ids[0] ?? ""}
+            selected={s.selected_files}
+            loading={s.artifacts_loading}
+            error={s.artifacts_error}
+            on_select={a.select_file}
+            on_clear={a.clear_files}
+            on_refresh={a.refresh_files}
+          />
         </div>
       </section>
     </div>

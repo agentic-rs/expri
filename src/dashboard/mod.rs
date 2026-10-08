@@ -1,4 +1,4 @@
-mod artifacts;
+pub(crate) mod artifacts;
 pub(crate) mod preview;
 pub(crate) mod server;
 pub(crate) mod updates;
@@ -74,6 +74,13 @@ pub(crate) trait DashboardView {
     offset: usize,
   ) -> Result<Value>;
   fn detail(&self, source: &str, run_id: &str) -> Result<Value>;
+  fn artifacts(&self, source: &str, run_id: &str) -> Result<Value>;
+  fn artifact_download(
+    &self,
+    source: &str,
+    run_id: &str,
+    path: &str,
+  ) -> Result<artifacts::Download>;
   fn log(&self, source: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value>;
   fn compare(
     &self,
@@ -111,6 +118,17 @@ impl DashboardView for Dashboard {
   }
   fn detail(&self, source: &str, run_id: &str) -> Result<Value> {
     Dashboard::detail(self, source, run_id)
+  }
+  fn artifacts(&self, source: &str, run_id: &str) -> Result<Value> {
+    Dashboard::artifacts(self, source, run_id)
+  }
+  fn artifact_download(
+    &self,
+    source: &str,
+    run_id: &str,
+    path: &str,
+  ) -> Result<artifacts::Download> {
+    Dashboard::artifact_download(self, source, run_id, path)
   }
   fn log(&self, source: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value> {
     Dashboard::log(self, source, run_id, stream, tail)
@@ -254,6 +272,45 @@ impl Dashboard {
       Some(target) => run_pull::cached_runs_dir(&self.repo_root, &self.results_dir, target)?,
     };
     Ok((source, runs_dir))
+  }
+
+  pub fn artifacts(&self, source_id: &str, run_id: &str) -> Result<Value> {
+    let (source, runs_dir) = self.source(source_id)?;
+    runs::query_directory(
+      &runs_dir,
+      &RunQueryRequest::Show {
+        run_id: run_id.into(),
+      },
+    )?;
+    artifacts::local_catalog(&runs_dir.join(run_id), &source, run_id)
+  }
+
+  fn artifact_download(
+    &self,
+    source_id: &str,
+    run_id: &str,
+    path: &str,
+  ) -> Result<artifacts::Download> {
+    artifacts::validate_output(path)?;
+    let (_, runs_dir) = self.source(source_id)?;
+    runs::query_directory(
+      &runs_dir,
+      &RunQueryRequest::Show {
+        run_id: run_id.into(),
+      },
+    )?;
+    let relative = runs_dir.join(run_id).join(path);
+    let relative = relative
+      .strip_prefix(&self.repo_root)
+      .map_err(|_| message("artifact is outside the repository"))?;
+    let file = artifacts::open_beneath(&self.repo_root, relative)?
+      .ok_or_else(|| message(format!("artifact is missing: {path}")))?;
+    let size = file.metadata()?.len();
+    Ok(artifacts::Download::Local {
+      file,
+      size,
+      filename: artifacts::filename(path).into(),
+    })
   }
 
   pub fn list(

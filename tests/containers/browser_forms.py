@@ -1,18 +1,21 @@
 """Drive native hosted forms in isolated Firefox through W3C WebDriver."""
 import http.client
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
+import shlex
 from urllib.parse import urlencode, urlsplit
 
 ORIGIN = 'https://expri.example.net'
 POLICY_OVERRIDE = Path('/tmp/expri-browser-policy')
 TRACE = Path('/tmp/expri-browser-requests.jsonl')
 REFRESH_COORDINATION = Path('/tmp/expri-refresh-coordination.json')
+DOWNLOADS = Path('/tmp/expri-downloads')
 ELEMENT = 'element-6066-11e4-a52e-4f735466cecf'
 
 
@@ -32,6 +35,7 @@ def wait_for(predicate, message, timeout=30):
 class Firefox:
   def __init__(self):
     self.session = None
+    DOWNLOADS.mkdir(mode=0o700, exist_ok=True)
     self.process = subprocess.Popen([
       'geckodriver', '--host', '127.0.0.1', '--port', '4444', '--log', 'fatal',
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -43,6 +47,9 @@ class Firefox:
         'moz:firefoxOptions': {'binary': '/usr/bin/firefox-esr', 'args': ['-headless'], 'prefs': {
           'network.proxy.type': 0, 'datareporting.policy.dataSubmissionEnabled': False,
           'toolkit.telemetry.enabled': False, 'browser.shell.checkDefaultBrowser': False,
+          'browser.download.folderList': 2, 'browser.download.dir': str(DOWNLOADS),
+          'browser.download.useDownloadDir': True, 'browser.download.alwaysOpenPanel': False,
+          'browser.helperApps.neverAsk.saveToDisk': 'application/octet-stream',
         }},
       }}})
       self.session = session['sessionId']
@@ -576,6 +583,84 @@ def deep_link(run_id, second_run_id):
     browser.close()
 
 
+def artifact_files(browser, run_id):
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def checkpoint_row():
+    return evaluate('''const row = [...document.querySelectorAll('#file-rows tr')]
+      .find(node => node.querySelector('th code')?.textContent === 'outputs/checkpoint.pt');
+      if (!row) return null;
+      const link = row.querySelector('a');
+      return {size: row.querySelector('.number').textContent,
+        locations: row.querySelector('.file-locations').textContent,
+        href: link?.getAttribute('href'), filename: link?.getAttribute('download')};''')
+  def capture(name):
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  def show_files():
+    evaluate('''const card = document.querySelector('.files-card');
+      const sticky = document.querySelector('.topbar');
+      const offset = sticky && ['sticky', 'fixed'].includes(getComputedStyle(sticky).position)
+        ? sticky.getBoundingClientRect().height : 0;
+      window.scrollTo(0, Math.max(0, scrollY + card.getBoundingClientRect().top - offset - 12));''')
+  start = len(trace_records())
+  browser.keys('#review-tab-charts', '\ue010')  # End selects the fourth tab.
+  wait_for(lambda: evaluate("return document.querySelector('#review-tab-files').getAttribute('aria-selected') === 'true';"), 'End did not select the fourth Files tab')
+  row = wait_for(checkpoint_row, 'Files did not show the published checkpoint')
+  assert row['size'] == '17 MiB', 'checkpoint size did not use the expected binary unit'
+  assert 'Cloud' in row['locations'] and 'Worker (reported)' in row['locations'] and 'Local' not in row['locations'], 'hosted availability claimed local browser files or omitted reported worker data'
+  assert row['href'].startswith('/api/artifact?') and 'X-Amz-' not in row['href'] and row['filename'] == 'checkpoint.pt', 'checkpoint anchor was not a scoped native attachment link'
+  assert 'cannot see files downloaded to your laptop' in evaluate("return document.querySelector('.file-location-note').textContent;"), 'hosted Files omitted its laptop visibility limit'
+  assert any(record['path'] == '/api/artifacts' for record in trace_records()[start:]), 'Files did not lazily request the inventory'
+  browser.click('input[aria-label="Select outputs/checkpoint.pt for download"]')
+  browser.keys('#artifact-config-path', '/tmp/owner.toml')
+  command = wait_for(lambda: evaluate("return document.querySelector('#artifact-pull-command')?.value;"), 'selected checkpoint did not generate its CLI command')
+  args = shlex.split(command)
+  assert args[:3] == ['expri', 'service', 'pull'] and args[args.index('--config') + 1] == '/tmp/owner.toml', 'CLI command changed the existing client config path'
+  assert args[args.index('--project-id') + 1] == 'demo' and args[args.index('--origin') + 1] == 'worker' and args[args.index('--run-id') + 1] == run_id and args[args.index('--artifact') + 1] == 'outputs/checkpoint.pt', 'CLI command changed the selected run or checkpoint'
+  assert 'included automatically' in evaluate("return document.querySelector('.file-cli').textContent;"), 'CLI instructions omitted automatic run metadata'
+  browser.click('#download-selected-files')
+  assert evaluate("return document.querySelectorAll('#selected-file-downloads a').length;") == 1, 'selected download did not show one explicit native link'
+  show_files()
+  capture('workspace-files')
+  browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+  assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Files view overflows horizontally'
+  assert evaluate('''return ['#refresh-files', '#files-search', '#download-selected-files', '#artifact-config-path', '#artifact-pull-command'].every(selector => {
+    const box = document.querySelector(selector).getBoundingClientRect();
+    return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
+  });'''), 'narrow Files controls are clipped'
+  show_files()
+  capture('workspace-files-narrow')
+  browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+  target = DOWNLOADS / 'checkpoint.pt'
+  target.unlink(missing_ok=True)
+  (DOWNLOADS / 'checkpoint.pt.part').unlink(missing_ok=True)
+  original_window = browser.call('GET', '/window')
+  browser.click('#selected-file-downloads a')
+  wait_for(lambda: target.exists() and target.stat().st_size == 17 * 1024 * 1024
+    and not (DOWNLOADS / 'checkpoint.pt.part').exists(), 'native checkpoint download did not complete', timeout=60)
+  expected = hashlib.sha256()
+  block = bytes(range(256)) * 4096
+  for _ in range(17):
+    expected.update(block)
+  actual = hashlib.sha256()
+  with target.open('rb') as checkpoint:
+    while chunk := checkpoint.read(1024 * 1024):
+      actual.update(chunk)
+  assert actual.digest() == expected.digest(), 'native checkpoint download bytes did not match the published fixture'
+  assert any(record['path'] == '/api/artifact' and record['status'] == 303 for record in trace_records()[start:]), 'native download did not follow the protected attachment redirect'
+  attachments = [record for record in trace_records()[start:] if record['host'] == 's3.expri.example.net']
+  assert attachments and all(record['session_cookie_count'] == 0 and set(record['forwarded_headers']) <= {'Range'} for record in attachments), 'attachment origin received dashboard session or authorization headers'
+  assert 'X-Amz-' not in TRACE.read_text(), 'browser trace exposed a signed attachment query'
+  # A browser may retain a blank attachment tab. Do not inspect or report its URL.
+  for handle in browser.call('GET', '/window/handles'):
+    if handle != original_window:
+      browser.call('POST', '/window', {'handle': handle})
+      browser.call('DELETE', '/window')
+  browser.call('POST', '/window', {'handle': original_window})
+  browser.click('#review-tab-charts')
+  print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI and exact 17 MiB native attachment.', flush=True)
+
+
 def workspace(run_id, second_run_id):
   browser = Firefox()
   def evaluate(script, *args):
@@ -599,6 +684,7 @@ def workspace(run_id, second_run_id):
     wait_for(lambda: check_selection([run_id]), 'selecting one run did not open its charts')
     assert visible('#review-panel-charts') and not visible('#review-panel-overview'), 'inspection did not open Charts first'
     assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'chart review eagerly fetched logs'
+    assert not any(record['path'] == '/api/artifacts' for record in trace_records()[start:]), 'chart review eagerly fetched files'
     browser.call('POST', '/element/' + browser.element('#review-tab-charts') + '/value', {'text': '\ue014'})
     wait_for(lambda: visible('#review-panel-overview'), 'review tabs do not support ArrowRight')
     assert 'learning_rate' in evaluate("return document.querySelector('#run-detail').textContent;"), 'Overview omitted parameters'
@@ -606,6 +692,7 @@ def workspace(run_id, second_run_id):
     browser.click('#review-tab-logs')
     wait_for(lambda: 'training complete' in evaluate("return document.querySelector('#run-logs').textContent;"), 'Logs did not load the uploaded stdout')
     browser.click('#review-tab-charts')
+    artifact_files(browser, run_id)
     browser.click(f'input[aria-label="Select {second_run_id} for comparison"]')
     wait_for(lambda: check_selection([run_id, second_run_id]), 'selecting a second run did not compare automatically')
     wait_for(lambda: evaluate("return document.querySelectorAll('#comparison-values tbody tr').length;") == 2, 'comparison summary lost selected runs')
