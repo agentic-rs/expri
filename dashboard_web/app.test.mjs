@@ -183,7 +183,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     run_id: `run-${index}`, task: "train", status: "completed",
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
-  const model = { nodes, sources, runs, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {} };
+  const model = { nodes, sources, runs, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -211,6 +211,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       if (!run) return response({ error: "Run not found" }, 404);
       return response(detailRecord(source, run, model.metric_value));
     }
+    if (parsed.pathname === "/api/artifacts") return response({ source, run_id: query.get("run_id"), files: model.artifact_files.map(file => ({ ...file, download_url: file.download_url === undefined ? (file.local === true || file.cloud === true ? apiUrl("/api/artifact", { source: source.source_id, run_id: query.get("run_id"), path: file.path }) : null) : file.download_url })), truncated: model.artifact_truncated, warnings: model.artifact_warnings, pull_scope: hosted ? { project_id: source.project_id ?? "test-project", origin: source.origin ?? "test-worker", run_id: query.get("run_id") } : null, inventory_recorded_at: "2026-10-07T01:02:03Z" });
     if (parsed.pathname === "/api/log") return response({ content: model.logs[query.get("stream")] ?? `${query.get("stream")} training complete`, stream: query.get("stream"), missing: false, truncated: false });
     if (parsed.pathname === "/api/chart") return { ok: true, status: 200, text: async () => model.chart_html };
     if (parsed.pathname === "/api/compare") {
@@ -332,13 +333,15 @@ test("run inspection opens Charts and keyboard tabs load logs only on demand", a
   assert.equal(globalThis.document.activeElement, nodes.get("review-tab-overview"));
   assert.match(text(nodes.get("run-detail")), /learning_rate.*0\.1/);
   assert.equal(requests.some(url => url.startsWith("/api/log")), false);
-  await emit(nodes.get("review-tab-overview"), "keydown", { key: "End" });
+  await emit(nodes.get("review-tab-overview"), "keydown", { key: "ArrowRight" });
   await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
   assert.equal(nodes.get("review-panel-logs").hidden, false);
   assert.equal(nodes.get("review-tab-logs").tabIndex, 0);
   assert.equal(nodes.get("review-tab-charts").tabIndex, -1);
   await emit(nodes.get("review-tab-logs"), "keydown", { key: "Home" });
-  await emit(nodes.get("review-tab-charts"), "keydown", { key: "ArrowLeft" });
+  await emit(nodes.get("review-tab-charts"), "keydown", { key: "End" });
+  assert.equal(nodes.get("review-panel-files").hidden, false);
+  await emit(nodes.get("review-tab-files"), "keydown", { key: "ArrowLeft" });
   assert.equal(nodes.get("review-panel-logs").hidden, false);
   assert.equal(requests.filter(url => url.startsWith("/api/log")).length, 1, "returning to a loaded log must reuse that bounded tail");
 });
@@ -358,6 +361,7 @@ test("selection updates charts, caps eight runs, and inspection returns to the s
   assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["run-0", "run-1"]);
   assert.equal(nodes.get("review-tab-overview").disabled, true);
   assert.equal(nodes.get("review-tab-logs").disabled, true);
+  assert.equal(nodes.get("review-tab-files").disabled, true);
   const before = requests.filter(url => url.startsWith("/api/compare")).length;
   for (let index = 2; index < 8; index++) await selectRow(nodes, index);
   await settled(() => comparisonRows(nodes).length === 8);
@@ -1299,4 +1303,142 @@ test("authentication expiry does not restore a pending link discarded by explici
   model.model.override = parsed => parsed.pathname === "/api/updates" ? response({ error: "Sign in required" }, 401) : null;
   await model.clock.advance(5_000);
   assert.deepEqual(redirects, ["/login"]);
+});
+
+function checkpointFile(path, fields = {}) { return { path, size: 2 ** 30, local: null, cloud: true, worker: true, ...fields }; }
+async function filesView(model) {
+  await click(model.nodes.get("review-tab-files"));
+  await settled(() => model.nodes.document.getElementById("file-rows") !== null && model.nodes.get("refresh-files").disabled === false);
+}
+function fileRow(nodes, path) { const row = [...nodes.get("file-rows").children].find(row => row.querySelector("code").textContent === path); assert.ok(row, `Missing file row: ${path}`); return row; }
+function fileCheckbox(nodes, path) { return fileRow(nodes, path).querySelector('input[type="checkbox"]'); }
+
+test("Files loads only on demand and displays reported availability and scoped native downloads", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.artifact_files = [checkpointFile("outputs/model 'two' $HOME.pt"), checkpointFile("outputs/pending.pt", { cloud: false, worker: true }), checkpointFile("outputs/local.pt", { local: true, cloud: false, worker: null })];
+  const frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  assert.equal(requestCounts(model.requests)["/api/artifacts"], undefined);
+  await emit(model.nodes.get("review-tab-logs"), "keydown", { key: "End" });
+  await settled(() => model.nodes.document.getElementById("file-rows") !== null);
+  assert.equal(model.nodes.get("review-panel-files").hidden, false);
+  assert.equal(model.nodes.document.activeElement, model.nodes.get("review-tab-files"));
+  assert.equal(requestCounts(model.requests)["/api/artifacts"], 1);
+  assert.match(fileRow(model.nodes, "outputs/model 'two' $HOME.pt").textContent, /1 GiB.*Cloud.*Worker \(reported\)/);
+  assert.match(model.nodes.get("review-panel-files").textContent, /cannot see files downloaded to your laptop/);
+  const anchor = fileRow(model.nodes, "outputs/model 'two' $HOME.pt").querySelector("a");
+  assert.equal(anchor.getAttribute("download"), "model 'two' $HOME.pt");
+  const query = new URL(anchor.href).searchParams;
+  assert.equal(query.get("path"), "outputs/model 'two' $HOME.pt");
+  assert.equal(query.get("run_id"), "run-0"); assert.equal(query.get("source"), model.sources[0].source_id);
+  assert.equal(fileCheckbox(model.nodes, "outputs/pending.pt").disabled, true);
+  assert.match(fileRow(model.nodes, "outputs/pending.pt").textContent, /Upload to download/);
+  assert.equal(fileCheckbox(model.nodes, "outputs/local.pt").disabled, false);
+  assert.equal(model.nodes.get("chart-frame"), frame); assert.equal(frameNavigations(model.nodes), writes);
+  await click(model.nodes.get("review-tab-charts")); await click(model.nodes.get("review-tab-files"));
+  assert.equal(requestCounts(model.requests)["/api/artifacts"], 1, "returning to Files reuses its current inventory");
+});
+
+test("file selection shows explicit native links and a copyable cloud-only resumable command", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  const path = "outputs/model 'two' $(printf unsafe) $HOME.pt";
+  model.model.artifact_files = [checkpointFile(path), checkpointFile("outputs/local.pt", { local: true, cloud: false })];
+  await filesView(model); await click(fileCheckbox(model.nodes, path)); await click(fileCheckbox(model.nodes, "outputs/local.pt"));
+  assert.equal(model.nodes.get("files-selection-count").textContent, "2 of 64 files selected");
+  const requests = model.requests.length;
+  await click(model.nodes.get("download-selected-files"));
+  assert.equal(model.nodes.get("selected-file-downloads").querySelectorAll("a").length, 2);
+  assert.match(model.nodes.get("selected-file-downloads").textContent, /Browsers may restrict multiple downloads/);
+  assert.equal(model.requests.length, requests, "checkpoint bytes are never fetched into JavaScript");
+  assert.equal(model.nodes.document.getElementById("artifact-pull-command"), null);
+  const input = model.nodes.get("artifact-config-path"); setValue(input, "/private/client's $HOME.toml"); await emit(input, "input");
+  const command = model.nodes.get("artifact-pull-command");
+  assert.match(command.value, /^expri service pull/); assert.equal(command.value.includes("outputs/local.pt"), false);
+  assert.match(model.nodes.get("review-panel-files").textContent, /Metadata, parameters, metrics, and logs are included automatically/);
+  await click(model.nodes.get("copy-artifact-command"));
+  assert.equal(model.nodes.document.activeElement, command, "insecure local browsers fall back to selecting the command");
+  assert.equal(command.selectionStart, 0); assert.equal(command.selectionEnd, command.value.length);
+  assert.equal(model.requests.length, requests, "the client config path stays entirely within the browser");
+});
+
+test("file selections cap at 64 and search retains selected files outside the visible rows", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.artifact_files = Array.from({ length: 65 }, (_, index) => checkpointFile(`outputs/${index}.pt`));
+  await filesView(model);
+  for (let index = 0; index < 64; index++) await click(fileCheckbox(model.nodes, `outputs/${index}.pt`));
+  assert.equal(fileCheckbox(model.nodes, "outputs/64.pt").disabled, true);
+  assert.equal(fileCheckbox(model.nodes, "outputs/0.pt").disabled, false);
+  setValue(model.nodes.get("files-search"), "outputs/64.pt"); await emit(model.nodes.get("files-search"), "input");
+  assert.equal(model.nodes.get("file-rows").children.length, 1);
+  assert.equal(model.nodes.get("files-selection-count").textContent, "64 of 64 files selected");
+  await click(model.nodes.get("download-selected-files"));
+  assert.equal(model.nodes.get("selected-file-downloads").querySelectorAll("a").length, 64);
+});
+
+test("cached cloud-only files remain selectable for the CLI while private inventory paths are hidden", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.artifact_files = [checkpointFile("outputs/remote.pt", { local: false, download_url: null }), checkpointFile("outputs/.expri-artifacts.json")];
+  await filesView(model);
+  assert.equal(model.nodes.get("file-rows").children.length, 1);
+  const row = fileRow(model.nodes, "outputs/remote.pt"), checkbox = fileCheckbox(model.nodes, "outputs/remote.pt");
+  assert.equal(checkbox.disabled, false); assert.equal(row.querySelector("a"), null); assert.match(row.textContent, /Pull with CLI/);
+  await click(checkbox);
+  assert.equal(model.nodes.get("download-selected-files").disabled, true, "a cloud-only cache cannot offer a browser download");
+  const config = model.nodes.get("artifact-config-path"); setValue(config, "/private/owner.toml"); await emit(config, "input");
+  assert.match(model.nodes.get("artifact-pull-command").value, /--artifact 'outputs\/remote.pt'/);
+  await click(model.nodes.get("refresh-files")); await settled(() => model.nodes.get("refresh-files").disabled === false);
+  assert.equal(fileCheckbox(model.nodes, "outputs/remote.pt").checked, true, "refresh keeps valid CLI-only selections");
+  await click([...model.nodes.get("review-panel-files").querySelectorAll("button")].find(node => node.textContent === "Clear file selection"));
+  assert.equal(model.nodes.get("files-selection-count").textContent, "Select files to download");
+});
+
+test("automatic and manual file refresh retain selection, drafts and focus and observe source revisions", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.artifact_files = [checkpointFile("outputs/keep.pt")]; await filesView(model);
+  const checkbox = fileCheckbox(model.nodes, "outputs/keep.pt"); await click(checkbox);
+  const config = model.nodes.get("artifact-config-path"); setValue(config, "/private/owner.toml"); await emit(config, "input");
+  await model.clock.advance(5_000);
+  const counts = requestCounts(model.requests), frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  checkbox.focus(); await model.clock.advance(10_000);
+  assert.equal(requestCounts(model.requests)["/api/artifacts"], counts["/api/artifacts"], "unchanged probes skip inventory downloads");
+  model.model.artifact_files.push(checkpointFile("outputs/new.pt")); model.model.list_revision = "new-output";
+  await model.clock.advance(5_000);
+  assert.equal(model.nodes.get("file-rows").children.length, 2);
+  assert.equal(fileCheckbox(model.nodes, "outputs/keep.pt"), checkbox); assert.equal(checkbox.checked, true);
+  assert.equal(model.nodes.document.activeElement, checkbox); assert.equal(config.value, "/private/owner.toml");
+  await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
+  assert.equal(fileCheckbox(model.nodes, "outputs/keep.pt").checked, true); assert.equal(model.nodes.get("artifact-config-path"), config);
+  assert.equal(model.nodes.get("chart-frame"), frame); assert.equal(frameNavigations(model.nodes), writes);
+  model.model.artifact_files = [checkpointFile("outputs/new.pt")]; model.model.metadata_revision = "removed-output";
+  await model.clock.advance(5_000);
+  assert.equal(model.nodes.get("files-selection-count").textContent, "Select files to download");
+});
+
+test("file requests cancel across tabs and runs and late inventories cannot overwrite a new review", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.artifact_files = [checkpointFile("outputs/initial.pt")]; await filesView(model);
+  await click(fileCheckbox(model.nodes, "outputs/initial.pt"));
+  const pending = deferred(); let signal;
+  t.after(() => pending.resolve(response({ source: model.sources[0], run_id: "run-0", files: [], warnings: [], truncated: false, pull_scope: null })));
+  model.model.override = (parsed, options) => parsed.pathname === "/api/artifacts" && parsed.searchParams.get("run_id") === "run-0" ? (signal = options.signal, pending.promise) : null;
+  await click(model.nodes.get("refresh-files")); assert.equal(signal.aborted, false);
+  await click(model.nodes.get("review-tab-charts")); assert.equal(signal.aborted, true);
+  await inspect(model, 1); model.model.artifact_files = [checkpointFile("outputs/new-run.pt")]; await filesView(model);
+  assert.equal(model.nodes.get("files-selection-count").textContent, "Select files to download");
+  pending.resolve(response({ source: model.sources[0], run_id: "run-0", files: [checkpointFile("outputs/stale.pt")], warnings: [], truncated: false, pull_scope: null })); await flush();
+  assert.equal(model.nodes.get("file-rows").children.length, 1); assert.equal(model.nodes.get("file-rows").textContent.includes("outputs/stale.pt"), false);
+  assert.equal(fileRow(model.nodes, "outputs/new-run.pt").isConnected, true);
+});
+
+test("Files reports empty, truncated and unsupported catalogs and rejects arbitrary download links", async t => {
+  const model = await autoFixture(t); await inspect(model); await filesView(model);
+  assert.match(model.nodes.get("files-empty").textContent, /EXPRI_OUTPUT_DIR/);
+  model.model.artifact_files = [checkpointFile("outputs/unsafe.pt", { download_url: "https://evil.test/file" })]; model.model.artifact_truncated = true; model.model.artifact_warnings = [{ message: "Inventory preview reached its limit." }];
+  await click(model.nodes.get("refresh-files")); await settled(() => model.nodes.get("refresh-files").disabled === false);
+  assert.equal(fileRow(model.nodes, "outputs/unsafe.pt").querySelector("a"), null); assert.equal(fileCheckbox(model.nodes, "outputs/unsafe.pt").disabled, true);
+  assert.match(model.nodes.get("review-panel-files").textContent, /limited file preview/); assert.match(model.nodes.get("files-warnings").textContent, /Inventory preview reached its limit/);
+  await inspect(model, 1);
+  model.model.override = parsed => parsed.pathname === "/api/artifacts" ? response({ error: "Unknown endpoint" }, 404) : null;
+  await click(model.nodes.get("review-tab-files")); await settled(() => model.nodes.get("files-error").hidden === false);
+  assert.match(model.nodes.get("files-error").textContent, /Upgrade expri or use the CLI/);
+  assert.equal(model.nodes.get("review-tab-files").getAttribute("aria-selected"), "true");
 });

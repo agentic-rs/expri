@@ -72,9 +72,22 @@ Provide a strong, separate `EXPRI_DASHBOARD_PASSWORD` containing 16 to 256
 printable ASCII bytes. It must differ from all owner and worker bearer tokens.
 Open the configured HTTPS URL and sign in with this dashboard password.
 The dashboard discovers synced project/worker sources and provides run details,
-parameters, metric comparisons, charts, and bounded log tails. Workers must push
-a run before it appears. Private inputs and checkpoint contents are not loaded
-by the dashboard; continue to use the CLI for uploads and selected downloads.
+parameters, metric comparisons, charts, bounded log tails, and a **Files** tab.
+Workers must push a run before it appears. Files shows output names, sizes, and
+availability without reading checkpoint contents. **Worker (reported)** reflects
+the last published inventory; **Cloud** means a finalized file is downloadable.
+The hosted page cannot inspect your laptop's disk. Local dashboards show files
+actually present in the run or review cache; cached cloud availability is a
+record of the last pull rather than a live storage check.
+
+Select up to 64 files. **Download selected files** provides individual browser
+download links; the browser handles file bytes directly. Cloud downloads require
+your dashboard session and use short-lived attachment links with no referrer.
+Browser restart recovery depends on your browser; use the generated CLI pull
+command for expri's durable resume. Enter the path to an existing service client
+configuration on the computer running that command. No token is copied from the
+browser into the command. Private inputs and checkpoint uploads remain CLI
+operations.
 
 The visible dashboard checks for changes every five seconds, using saved upload
 sequences and stream lengths without reading objects from S3 on unchanged
@@ -238,9 +251,25 @@ should match `[download].results_dir` in the project's `expri.toml`. Downloads
 stage and verify files before publication and retain artifacts selected earlier.
 The existing cached CLI and dashboard read this directory without contacting
 any service or worker.
-Object downloads retry bounded 8 MiB ranges and preserve previous cache files
-on failure. Restarting the pull command currently restarts its staged downloads;
-upload receipts remain durable across command restarts.
+Selected checkpoint downloads retry bounded 8 MiB ranges and save progress under
+`results/<source>/.service-pull/<run_id>/`, outside the visible review cache.
+After an interruption, run the same `service pull` command again. Unchanged
+object records continue from their last durable range; new signed URLs are
+obtained for each request, and the existing full-file SHA256 check must pass
+before publication. Mutable metadata and logs refresh on each invocation.
+Previous cached files remain available during transfer, and checkpoints selected
+earlier stay in the cache. Pull reports include resumed file/byte counts. Keep
+the private staging directory to retain interrupted download progress; no tokens
+or signed URLs are saved there.
+
+The publisher reports regular output file names and sizes in the reserved
+`outputs/.expri-artifacts.json` metadata file. It does not upload those file
+contents unless explicitly selected. Inventory discovery skips hidden files,
+symlinks, and environment/cache internals, and is limited to 200 files, 64 KiB
+of metadata, and a bounded directory scan. The dashboard warns when the list is
+incomplete. Keep the reserved file for expri; it is downloaded as metadata and
+excluded from the user-facing artifact list. If outputs are read-only or linked,
+inventory generation is skipped while metadata and log synchronization continue.
 
 ## Private datasets and files
 

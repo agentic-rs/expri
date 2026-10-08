@@ -13,6 +13,7 @@ import {
   parseRunDeepLink,
   RequestError,
   RequestLane,
+  type ArtifactCatalog,
   type Catalog,
   type ChartRefreshOutcome,
   type Comparison,
@@ -28,6 +29,7 @@ import {
   type Source,
   type Updates,
 } from "./dashboard_model";
+import { artifactCanSelect } from "./dashboard_files";
 import {
   DashboardView,
   type DashboardActions,
@@ -38,6 +40,7 @@ import {
 export * from "./dashboard_model";
 export * from "./interactive_charts";
 export * from "./auto_refresh";
+export * from "./dashboard_files";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -54,6 +57,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const compare_lane = new RequestLane(() => pending_deep_link);
   const chart_lane = new RequestLane(() => pending_deep_link);
   const deep_link_lane = new RequestLane(() => pending_deep_link);
+  const artifact_lane = new RequestLane(() => pending_deep_link);
   const quiet_lanes = {
     updates: new RequestLane(() => pending_deep_link),
     catalog: new RequestLane(() => pending_deep_link),
@@ -62,6 +66,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     comparison: new RequestLane(() => pending_deep_link),
     log: new RequestLane(() => pending_deep_link),
     chart: new RequestLane(() => pending_deep_link),
+    artifacts: new RequestLane(() => pending_deep_link),
   };
   const foreground_lanes = [
     catalog_lane,
@@ -71,6 +76,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     compare_lane,
     chart_lane,
     deep_link_lane,
+    artifact_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
   let auto_refresh: AutoRefresh | null = null;
@@ -81,6 +87,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const detail_revisions = new Map<string, string>();
   const chart_revisions = new Map<string, string>();
   const log_revisions = new Map<string, string | null>();
+  const artifact_revisions = new Map<string, string>();
   let comparison_revision: { context: string; revision: string } | null = null;
   let last_catalog: Catalog | null = null;
   let last_run_list: RunList | null = null;
@@ -111,6 +118,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let log_view: LogView | null = null;
   let rendered_detail: Detail | null = null;
   let rendered_comparison: Comparison | null = null;
+  let artifacts: ArtifactCatalog | null = null;
+  let artifacts_loaded = false;
+  const selected_files = new Set<string>();
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
 
@@ -154,6 +164,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     comparison_busy: false,
     log_content: "",
     log_note: "",
+    artifacts_loading: false,
+    artifacts_error: null,
     live_status: "",
   };
   function snapshot(): DashboardSnapshot {
@@ -170,6 +182,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       review_version,
       detail: rendered_detail,
       comparison: rendered_comparison,
+      artifacts,
+      selected_files: [...selected_files],
       metric_names: [...metric_names],
       x_axis,
       time_zone,
@@ -293,6 +307,27 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       void changeChartAxis(value);
     },
     time_zone: changeChartTimeZone,
+    select_file: (path, checked) => {
+      const file = artifacts?.files.find((file) => file.path === path);
+      const id = review?.run_ids[0];
+      if (
+        !file ||
+        !id ||
+        !artifactCanSelect(file, artifacts?.pull_scope ?? null, source_id, id) ||
+        (checked && selected_files.size >= 64)
+      )
+        return;
+      checked ? selected_files.add(path) : selected_files.delete(path);
+      publish();
+    },
+    clear_files: () => {
+      selected_files.clear();
+      publish();
+    },
+    refresh_files: () => {
+      cancelQuietRefresh();
+      void loadArtifacts();
+    },
     log_stream: (value) => {
       if (!review || review.kind !== "run" || !rendered_detail) return;
       cancelQuietRefresh();
@@ -477,6 +512,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     log_lane.cancel();
     compare_lane.cancel();
     chart_lane.cancel();
+    resetArtifacts();
     review = null;
     missing_review = null;
     log_view = null;
@@ -528,6 +564,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     log_lane.cancel();
     compare_lane.cancel();
     chart_lane.cancel();
+    resetArtifacts();
     detail_revisions.clear();
     chart_revisions.clear();
     log_revisions.clear();
@@ -569,6 +606,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     cancelQuietRefresh();
     review.tab = tab;
     syncReviewTabs();
+    if (tab === "files") ensureArtifacts();
+    else {
+      artifact_lane.cancel();
+      updateUi({ artifacts_loading: false });
+    }
     if (tab === "logs") ensureLog();
     else {
       log_lane.cancel();
@@ -743,6 +785,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       pending: false,
     };
     ensureLog();
+    ensureArtifacts();
     if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
     return true;
   }
@@ -997,6 +1040,84 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     applyLog(view, log);
     return true;
   }
+  function artifactsUrl(): string {
+    return apiUrl("/api/artifacts", { source: source_id, run_id: review?.run_ids[0] ?? "" });
+  }
+  function resetArtifacts(): void {
+    artifact_lane.cancel();
+    artifacts = null;
+    artifacts_loaded = false;
+    selected_files.clear();
+    artifact_revisions.clear();
+    ui.artifacts_loading = false;
+    ui.artifacts_error = null;
+  }
+  function ensureArtifacts(): void {
+    if (
+      review?.kind === "run" &&
+      review !== missing_review &&
+      review.tab === "files" &&
+      !artifacts_loaded &&
+      !artifact_lane.pending
+    )
+      void loadArtifacts();
+  }
+  function applyArtifacts(result: ArtifactCatalog): void {
+    const id = review?.run_ids[0] ?? "";
+    artifacts = result;
+    artifacts_loaded = true;
+    for (const path of selected_files) {
+      const file = result.files.find((file) => file.path === path);
+      if (!file || !artifactCanSelect(file, result.pull_scope, source_id, id))
+        selected_files.delete(path);
+    }
+    updateUi({ artifacts_error: null });
+  }
+  async function loadArtifacts(): Promise<void> {
+    await refreshCurrentArtifacts(artifact_lane, () => true, true);
+  }
+  async function refreshCurrentArtifacts(
+    lane: RequestLane,
+    guard: () => boolean = () => true,
+    foreground = false,
+  ): Promise<boolean> {
+    const current_review = review;
+    if (current_review?.kind !== "run" || current_review.tab !== "files") return true;
+    const source = source_id,
+      url = artifactsUrl();
+    const current = () =>
+      !disposed &&
+      guard() &&
+      review === current_review &&
+      source_id === source &&
+      review?.tab === "files";
+    if (foreground) updateUi({ artifacts_loading: true, artifacts_error: null });
+    try {
+      const result = await lane.run<ArtifactCatalog>(url);
+      if (!result || !current()) return false;
+      if (result.source.source_id !== source || result.run_id !== current_review.run_ids[0])
+        throw new Error("The file inventory does not match the selected run.");
+      applyArtifacts(result);
+      return true;
+    } catch (error) {
+      if (!current()) return false;
+      if (error instanceof RequestError && error.status === 404) {
+        artifacts_loaded = true;
+        updateUi({
+          artifacts_error:
+            "This server does not provide file browsing yet, or the run is no longer available. Upgrade expri or use the CLI to pull selected run files.",
+        });
+        return true;
+      }
+      updateUi({
+        artifacts_error: `Could not read file availability. Showing the last successful inventory, if available. ${errorText(error)}`,
+      });
+      if (!foreground) throw error;
+      return false;
+    } finally {
+      if (current()) updateUi({ artifacts_loading: false });
+    }
+  }
   async function refresh(): Promise<void> {
     cancelQuietRefresh();
     const generation = ++refresh_generation;
@@ -1023,6 +1144,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           if (generation !== refresh_generation || current_review !== review) return;
           if (
             !(await refreshCurrentLog(log_lane)) ||
+            !(await refreshCurrentArtifacts(artifact_lane)) ||
             (await refreshCurrentChart(chart_lane)) !== "applied"
           )
             return;
@@ -1163,6 +1285,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           missing_review = null;
           updateUi({ review_error: null });
           detail_revisions.clear();
+          artifact_revisions.clear();
           chart_revisions.clear();
           log_revisions.clear();
           comparison_revision = null;
@@ -1241,6 +1364,21 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
             if (outcome === "cancelled") return "cancelled";
             if (!current() || review !== current_review) return "cancelled";
             acknowledgements.push(() => boundedSet(chart_revisions, context, view_revision));
+          }
+        } else if (current_review.tab === "files") {
+          const context = artifactsUrl(),
+            artifact_revision = JSON.stringify([
+              revisions[0]?.metadata_revision,
+              updates?.source_revision,
+            ]);
+          if (force || !artifacts_loaded || artifact_revisions.get(context) !== artifact_revision) {
+            if (
+              !(await refreshCurrentArtifacts(quiet_lanes.artifacts, current)) ||
+              !current() ||
+              review !== current_review
+            )
+              return "cancelled";
+            acknowledgements.push(() => boundedSet(artifact_revisions, context, artifact_revision));
           }
         } else if (current_review.tab === "logs" && log_view) {
           const view = log_view,

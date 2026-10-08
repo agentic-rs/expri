@@ -403,7 +403,10 @@ expri -T runpod runs pull run-abc123 --metrics --logs
 The run browser stays beside the review workspace on desktop and stacks above
 it on narrow screens. Opening a run starts with its curves. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads
-stdout/stderr tails when opened. Selecting runs updates the charts directly:
+stdout/stderr tails when opened. **Files** lists regular outputs, sizes, and
+local or reported worker/cloud availability. Select files for individual browser
+downloads, or generate a service pull command for resumable checkpoint downloads.
+Files loads only when opened and keeps selection during refresh. Selecting runs updates the charts directly:
 one run opens its curves, and two to eight runs from one source show a comparison.
 Compare last, minimum or maximum metric values, and expand parameter differences
 below the curves. Changing search/task/status filters clears the selection;

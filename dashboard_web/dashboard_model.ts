@@ -80,7 +80,25 @@ export type Comparison = {
     warnings: Warning[];
   };
 };
-export type ReviewTab = "charts" | "overview" | "logs";
+export type ArtifactScope = { project_id: string; origin: string; run_id: string };
+export type ArtifactFile = {
+  path: string;
+  size: number;
+  local: boolean | null;
+  cloud: boolean | null;
+  worker: boolean | null;
+  download_url: string | null;
+};
+export type ArtifactCatalog = {
+  source: Source;
+  run_id: string;
+  files: ArtifactFile[];
+  truncated: boolean;
+  warnings: Warning[];
+  pull_scope: ArtifactScope | null;
+  inventory_recorded_at?: string | null;
+};
+export type ReviewTab = "charts" | "overview" | "logs" | "files";
 export type Review = {
   kind: "run" | "compare";
   origin: "inspection" | "selection";

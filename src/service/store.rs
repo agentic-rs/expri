@@ -288,6 +288,79 @@ impl<S: ObjectStorage> Store<S> {
     }
   }
 
+  /// Catalog only completed output objects. No checkpoint bytes or object
+  /// storage requests are needed, and pending uploads never claim availability.
+  pub fn dashboard_output_objects(&self, scope: &RunScope) -> ApiResult<(Vec<FileRecord>, bool)> {
+    validate_scope(scope).map_err(bad)?;
+    let db = self.db()?;
+    let mut statement = db.prepare("SELECT record FROM files WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3 AND substr(json_extract(target,'$.path'),1,8)='outputs/' AND json_extract(target,'$.path')<>?4 ORDER BY target LIMIT ?5").map_err(database)?;
+    let records = statement
+      .query_map(
+        params![
+          scope.project_id,
+          scope.origin,
+          scope.run_id,
+          crate::run_artifacts::INVENTORY_PATH,
+          crate::run_artifacts::FILE_LIMIT + 1
+        ],
+        |row| row.get::<_, String>(0),
+      )
+      .map_err(database)?;
+    let mut files = Vec::new();
+    let mut scanned = 0;
+    for record in records {
+      scanned += 1;
+      let file: FileRecord = serde_json::from_str(&record.map_err(database)?)
+        .map_err(|_| ApiError::new(500, "invalid stored artifact"))?;
+      let FileTarget::Run {
+        scope: stored_scope,
+        path,
+      } = &file.target
+      else {
+        return Err(ApiError::new(500, "invalid stored artifact scope"));
+      };
+      if stored_scope != scope || !matches!(file.storage, FileStorage::Object) {
+        return Err(ApiError::new(500, "invalid stored artifact scope"));
+      }
+      if crate::run_artifacts::validate_path(path).is_ok() {
+        files.push(file);
+      }
+    }
+    let truncated = scanned > crate::run_artifacts::FILE_LIMIT;
+    files.truncate(crate::run_artifacts::FILE_LIMIT);
+    Ok((files, truncated))
+  }
+
+  pub fn dashboard_attachment_url(
+    &self,
+    target: &FileTarget,
+    disposition: &str,
+  ) -> ApiResult<(String, u64)> {
+    validate_target(target).map_err(bad)?;
+    let (key, raw) = self
+      .db()?
+      .query_row(
+        "SELECT object_key,record FROM files WHERE target=?1",
+        [target_json(target)?],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+      )
+      .optional()
+      .map_err(database)?
+      .ok_or_else(|| ApiError::new(404, "completed object is missing"))?;
+    let record: FileRecord =
+      serde_json::from_str(&raw).map_err(|_| ApiError::new(500, "invalid stored artifact"))?;
+    if record.target != *target || !matches!(record.storage, FileStorage::Object) {
+      return Err(ApiError::new(500, "invalid stored artifact scope"));
+    }
+    // Capture the object key and its size together before signing. Replacing a
+    // published path cannot mix one version's URL with another's size.
+    let url = self
+      .storage
+      .presign_get_attachment(&key, 900, disposition)
+      .map_err(|_| ApiError::new(502, "object storage unavailable"))?;
+    Ok((url, record.size))
+  }
+
   pub fn dashboard_run_exists(&self, scope: &RunScope) -> ApiResult<bool> {
     validate_scope(scope).map_err(bad)?;
     self.db()?.query_row("SELECT EXISTS(SELECT 1 FROM (SELECT target FROM files UNION ALL SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3)", params![scope.project_id, scope.origin, scope.run_id], |row| row.get(0)).map_err(database)
@@ -1181,7 +1254,7 @@ pub(super) mod tests {
   pub struct MockStorage(Arc<Mutex<Backend>>);
 
   impl MockStorage {
-    fn stage(&self, id: &str, size: u64) {
+    pub(crate) fn stage(&self, id: &str, size: u64) {
       let mut backend = self.0.lock().unwrap();
       let key = backend
         .sessions

@@ -224,6 +224,49 @@ fn route<S: ObjectStorage>(
     .uri()
     .path_and_query()
     .map_or("/", |uri| uri.as_str());
+  if path == "/api/artifact" {
+    return match crate::dashboard::server::artifact_download(dashboard, uri) {
+      Ok(crate::dashboard::artifacts::Download::Cloud {
+        url,
+        size,
+        filename,
+      }) => {
+        let mut reply = response(
+          if method == "HEAD" { 200 } else { 303 },
+          "application/octet-stream",
+          Vec::new(),
+        );
+        reply
+          .headers_mut()
+          .insert("Referrer-Policy", "no-referrer".parse().unwrap());
+        reply.headers_mut().insert(
+          "Content-Security-Policy",
+          "default-src 'none'; sandbox".parse().unwrap(),
+        );
+        if method == "HEAD" {
+          // S3 GET signatures cannot be followed with HEAD. Describe the
+          // download without exposing a method-mismatched signed redirect.
+          reply.headers_mut().insert("Content-Length", size.into());
+          reply.headers_mut().insert(
+            "Content-Disposition",
+            crate::dashboard::artifacts::disposition(&filename)
+              .parse()
+              .expect("safe attachment header"),
+          );
+        } else {
+          reply.headers_mut().insert(
+            "Location",
+            url
+              .parse()
+              .map_err(|_| ApiError::new(502, "invalid object storage download URL"))?,
+          );
+        }
+        Ok(reply)
+      }
+      Ok(_) => Err(ApiError::new(500, "invalid hosted artifact download")),
+      Err(reply) => Ok(response(reply.status, reply.content_type, reply.body)),
+    };
+  }
   let reply = crate::dashboard::server::route_content(dashboard, uri);
   let mut result = response(reply.status, reply.content_type, reply.body);
   if let Some(revision) = assets.current_revision()? {
@@ -266,6 +309,114 @@ mod tests {
       .header("Host", "expri.example.com")
       .body(body.to_vec())
       .unwrap()
+  }
+
+  #[test]
+  fn artifact_download_requires_session_and_scoped_output_before_signed_redirect() {
+    use crate::service::types::{CompletedPart, FileTarget, Request, RunScope};
+    let temporary = tempfile::tempdir().unwrap();
+    let storage = MockStorage::default();
+    let store = Store::open(temporary.path(), storage.clone()).unwrap();
+    let scope = RunScope {
+      project_id: "project".into(),
+      origin: "worker".into(),
+      run_id: "run-1".into(),
+    };
+    store
+      .execute(Request::BeginUpload {
+        upload_id: "download-checkpoint".into(),
+        target: FileTarget::Run {
+          scope,
+          path: "outputs/model.pt".into(),
+        },
+        size: 8,
+        sha256: "a".repeat(64),
+      })
+      .unwrap();
+    storage.stage("download-checkpoint", 8);
+    store
+      .execute(Request::RecordPart {
+        upload_id: "download-checkpoint".into(),
+        part: CompletedPart {
+          part_number: 1,
+          etag: "part".into(),
+        },
+      })
+      .unwrap();
+    store
+      .execute(Request::CompleteUpload {
+        upload_id: "download-checkpoint".into(),
+      })
+      .unwrap();
+    let auth = BrowserAuth::new("https://expri.example.com", b"dashboard-password").unwrap();
+    let path =
+      "/api/artifact?source=hosted%3Aproject%3Aworker&run_id=run-1&path=outputs%2Fmodel.pt";
+    let anonymous = handle(&store, &auth, &request("GET", path, b""));
+    assert_eq!(anonymous.status(), 401);
+    assert!(!anonymous.headers().contains_key("Location"));
+    let anonymous_list = handle(
+      &store,
+      &auth,
+      &request(
+        "GET",
+        "/api/artifacts?source=hosted%3Aproject%3Aworker&run_id=run-1",
+        b"",
+      ),
+    );
+    assert_eq!(anonymous_list.status(), 401);
+    let mut login = request("POST", "/login", b"password=dashboard-password");
+    login
+      .headers_mut()
+      .insert("Origin", "https://expri.example.com".parse().unwrap());
+    login.headers_mut().insert(
+      "Content-Type",
+      "application/x-www-form-urlencoded".parse().unwrap(),
+    );
+    let logged_in = handle(&store, &auth, &login);
+    let cookie = logged_in.headers()["Set-Cookie"]
+      .to_str()
+      .unwrap()
+      .split(';')
+      .next()
+      .unwrap();
+    let mut download = request("GET", path, b"");
+    download
+      .headers_mut()
+      .insert("Cookie", cookie.parse().unwrap());
+    let reply = handle(&store, &auth, &download);
+    assert_eq!(reply.status(), 303);
+    assert_eq!(reply.headers()["Referrer-Policy"], "no-referrer");
+    assert!(
+      reply.headers()["Location"]
+        .to_str()
+        .unwrap()
+        .starts_with("https://storage.invalid/projects/project/runs/worker/run-1/")
+    );
+    assert!(reply.body().is_empty());
+    *download.method_mut() = http::Method::HEAD;
+    let head = handle(&store, &auth, &download);
+    assert_eq!(head.status(), 200);
+    assert_eq!(head.headers()["Content-Length"], "8");
+    assert!(!head.headers().contains_key("Location"));
+    assert!(head.body().is_empty());
+    *download.method_mut() = http::Method::GET;
+    download
+      .headers_mut()
+      .insert("Origin", "https://attacker.invalid".parse().unwrap());
+    let forbidden = handle(&store, &auth, &download);
+    assert_eq!(forbidden.status(), 403);
+    assert!(!forbidden.headers().contains_key("Location"));
+    download.headers_mut().remove("Origin");
+    *download.uri_mut() =
+      "/api/artifact?source=hosted%3Aother%3Aworker&run_id=run-1&path=outputs%2Fmodel.pt"
+        .parse()
+        .unwrap();
+    assert_eq!(handle(&store, &auth, &download).status(), 404);
+    *download.uri_mut() =
+      "/api/artifact?source=hosted%3Aproject%3Aworker&run_id=run-1&path=inputs%2Fprivate"
+        .parse()
+        .unwrap();
+    assert_eq!(handle(&store, &auth, &download).status(), 400);
   }
 
   #[test]

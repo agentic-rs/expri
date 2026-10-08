@@ -44,6 +44,14 @@ pub trait ObjectStorage: Send + Sync {
   ) -> Result<ObjectMetadata>;
   fn head(&self, key: &str) -> Result<Option<ObjectMetadata>>;
   fn presign_get(&self, key: &str, expires_secs: u32) -> Result<String>;
+  fn presign_get_attachment(
+    &self,
+    key: &str,
+    expires_secs: u32,
+    _disposition: &str,
+  ) -> Result<String> {
+    self.presign_get(key, expires_secs)
+  }
 }
 
 pub struct S3Storage {
@@ -237,6 +245,30 @@ impl ObjectStorage for S3Storage {
     self
       .bucket
       .presign_get(key, expires_secs, None)
+      .map_err(|error| backend_error("presign download", error))
+  }
+
+  fn presign_get_attachment(
+    &self,
+    key: &str,
+    expires_secs: u32,
+    disposition: &str,
+  ) -> Result<String> {
+    validate_expiry(expires_secs)?;
+    if disposition.len() > 8192 || disposition.chars().any(char::is_control) {
+      return Err(invalid("invalid attachment disposition"));
+    }
+    let key = self.object_key(key)?;
+    let queries = std::collections::HashMap::from([
+      ("response-content-disposition".into(), disposition.into()),
+      (
+        "response-content-type".into(),
+        "application/octet-stream".into(),
+      ),
+    ]);
+    self
+      .bucket
+      .presign_get(key, expires_secs, Some(queries))
       .map_err(|error| backend_error("presign download", error))
   }
 }
@@ -555,6 +587,29 @@ mod tests {
         .starts_with("test-bucket.s3")
     );
     assert_eq!(uri.path(), "/expri/runs/a/model.pt");
+  }
+
+  #[test]
+  fn attachment_presigns_include_header_overrides_in_the_signature() {
+    let storage = storage(config());
+    let disposition = crate::dashboard::artifacts::disposition("model \"é.pt");
+    let url = storage
+      .presign_get_attachment("runs/a/model.pt", 60, &disposition)
+      .unwrap();
+    let parsed = reqwest::Url::parse(&url).unwrap();
+    let query: BTreeMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(query["response-content-disposition"], disposition);
+    assert_eq!(query["response-content-type"], "application/octet-stream");
+    assert_eq!(query["X-Amz-Expires"], "60");
+    assert_eq!(query["X-Amz-Signature"].len(), 64);
+    assert!(!disposition.contains('é'));
+    assert!(!disposition.contains("filename=\"model \""));
+    assert!(disposition.contains("%22%C3%A9.pt"));
+    assert!(
+      storage
+        .presign_get_attachment("runs/a/model.pt", 60, "attachment\r\nX-Test: unsafe")
+        .is_err()
+    );
   }
 
   #[test]

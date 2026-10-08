@@ -166,6 +166,8 @@ def dashboard_public_checks():
   result = browser('/')
   assert result['status'] == 303 and result['headers'].get('location') == '/login', 'public dashboard root did not redirect to login'
   assert browser('/api/catalog')['status'] == 401, 'unauthenticated dashboard API exposed data'
+  assert browser('/api/artifacts?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated artifact catalog exposed data'
+  assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
   login = browser('/login')
   assert login['status'] == 200 and 'autocomplete="current-password"' in login['body'], 'public login form is unavailable'
   for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD']:
@@ -202,6 +204,19 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert detail['run']['run_id'] == run_id and detail['metrics_error'] is None, 'hosted detail could not review the uploaded run'
   assert detail['params']['learning_rate'] == 0.001 and detail['params']['input_id'] == 'dataset-v1', 'hosted parameters differ from uploaded data'
   assert detail['metrics']['loss']['count'] == 80 and detail['metrics']['loss']['last']['step'] == 79, 'hosted metric summaries differ from uploaded data'
+  artifacts = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': run_id}), cookie)
+  checkpoint = next(file for file in artifacts['files'] if file['path'] == 'outputs/checkpoint.pt')
+  assert checkpoint['size'] == 17 * 1024 * 1024 and checkpoint['cloud'] is True and checkpoint['worker'] is True and checkpoint['local'] is None, 'artifact location or size differs from the published checkpoint'
+  assert checkpoint['download_url'].startswith('/api/artifact?') and 'X-Amz-' not in json.dumps(artifacts), 'artifact catalog exposed a signed URL'
+  assert artifacts['pull_scope'] == {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}, 'artifact pull command changed run scope'
+  other_files = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': second_run_id}), cookie)
+  other_checkpoint = next(file for file in other_files['files'] if file['path'] == 'outputs/checkpoint.pt')
+  assert other_checkpoint['worker'] is True and other_checkpoint['cloud'] is False and other_checkpoint['download_url'] is None, 'worker-only checkpoint was advertised as a cloud download'
+  attachment = browser(checkpoint['download_url'], cookie=cookie)
+  assert attachment['status'] == 303 and attachment['headers']['referrer-policy'] == 'no-referrer', 'artifact download did not use a protected no-referrer redirect'
+  head = browser(checkpoint['download_url'], method='HEAD', cookie=cookie)
+  assert head['status'] == 200 and int(head['headers']['content-length']) == checkpoint['size'] and 'location' not in head['headers'], 'artifact HEAD did not describe its stored size safely'
+  assert browser(checkpoint['download_url'], cookie=cookie, origin='https://outside.invalid')['status'] == 403, 'cross-origin artifact download was accepted'
   stdout = browser_json('/api/log?' + urlencode({'source': source_id, 'run_id': run_id, 'stream': 'stdout', 'tail': 100}), cookie)
   assert stdout['stream'] == 'stdout' and not stdout['missing'], 'hosted stdout log is unavailable'
   assert 'step=79' in stdout['content'] and 'training complete' in stdout['content'], 'hosted stdout does not contain the uploaded task output'
@@ -439,7 +454,30 @@ print(count)''')
   duplicate_samples = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([[row['step'], row['metrics']['duplicate_probe']] for row in rows if 'duplicate_probe' in row['metrics']]))"))
   assert duplicate_samples == [[0, 7.0], [0, 7.0], [1, 8.0]], 'recovery lost repeated-coordinate samples'
   assert python(host, f"from pathlib import Path;print(('STDOUT_BURST:'+'x'*(256*1024)+'\\n').encode() in Path({local!r}+'/logs/stdout.log').read_bytes())") == 'True', 'large log stream was truncated'
-  client(host, 'pull', *pull_args, '--artifact', 'outputs/checkpoint.pt')
+  # Interrupt an actual pull after one durable range, then restart the same CLI.
+  # Previous cached metadata and unselected files must remain intact throughout.
+  previous_state = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())")
+  api_proxy('/test/arm-download')
+  download_command = ['expri', 'service', 'pull', '--config', '/tmp/owner.toml', *pull_args,
+    '--artifact', 'outputs/checkpoint.pt']
+  pull_pid = int(python(host, f'''import subprocess
+from pathlib import Path
+with open('/tmp/checkpoint-pull.stdout', 'wb') as out, open('/tmp/checkpoint-pull.stderr', 'wb') as err:
+  process = subprocess.Popen({download_command!r}, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+print(process.pid)
+'''))
+  progress = f'/home/tester/review/results/service/.service-pull/{run_id}/state.json'
+  wait_for(lambda: api_proxy('/test/state')['download_blocked'], 'checkpoint pull did not reach its second range')
+  assert json.loads(python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())"))['files']['outputs/checkpoint.pt']['offset'] == 8 * 1024 * 1024, 'first range progress was not durable'
+  python(host, f'import os,signal;os.kill({pull_pid},signal.SIGKILL);print("interrupted")')
+  assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False', 'partial checkpoint was published into the review cache'
+  assert python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())") == previous_state, 'interrupted pull changed previous metadata'
+  saved_progress = python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())")
+  assert 'X-Amz-' not in saved_progress and fixture_env['EXPRI_OWNER_TOKEN'] not in saved_progress, 'download progress exposed a credential'
+  api_proxy('/test/release-download')
+  download_report = json.loads(client(host, 'pull', *pull_args, '--artifact', 'outputs/checkpoint.pt').stdout)
+  assert download_report['resumed_bytes'] == 8 * 1024 * 1024 and download_report['resumed_files'] == 1, f'pull did not resume its saved checkpoint range: {download_report}'
+  assert api_proxy('/test/state')['download_ranges'].get('bytes=0-8388607') == 1, 'restart downloaded the acknowledged checkpoint prefix again'
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
   assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
   dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
@@ -475,7 +513,24 @@ print(count)''')
   def review():
     return python(host, "import json;from pathlib import Path;from urllib.request import urlopen;url=Path('/tmp/dashboard.log').read_text().strip().split('Dashboard: ')[1];catalog=json.load(urlopen(url+'/api/catalog',timeout=2));print(catalog['initial_source'])") == 'cached:service'
   wait_for(review, 'offline dashboard did not recognize service cache')
-  print('Service workflow passed: automatic publishing, offline completion, publisher restart, Firefox native forms, inputs, multipart resume, selective pulls, hosted dashboard, offline review.', flush=True)
+  offline_artifact = json.loads(python(host, f'''import hashlib, json
+from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import urlopen
+url = Path('/tmp/dashboard.log').read_text().strip().split('Dashboard: ')[1]
+query = urlencode({{'source': 'cached:service', 'run_id': {run_id!r}}})
+catalog = json.load(urlopen(url + '/api/artifacts?' + query, timeout=2))
+checkpoint = next(file for file in catalog['files'] if file['path'] == 'outputs/checkpoint.pt')
+digest = hashlib.sha256()
+with urlopen(url + checkpoint['download_url'], timeout=5) as response:
+  assert response.headers['Content-Disposition'].startswith('attachment;')
+  for chunk in iter(lambda: response.read(64 * 1024), b''):
+    digest.update(chunk)
+print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
+'''))
+  assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
+  assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
+  print('Service workflow passed: automatic publishing, offline completion, publisher restart, Firefox native forms/downloads, inputs, multipart resume, killed-pull range recovery, artifact availability, hosted dashboard, offline review.', flush=True)
 finally:
   if refresh_browser is not None and refresh_browser.poll() is None:
     refresh_browser.terminate()
@@ -489,7 +544,7 @@ finally:
       if container.endswith('-browser'):
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
         for name in [
-          'workspace-desktop', 'workspace-narrow', 'workspace-ab',
+          'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
           'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
           'workspace-elapsed', 'workspace-wall_clock',
           'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',

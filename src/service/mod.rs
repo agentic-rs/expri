@@ -7,7 +7,7 @@ pub(crate) mod publishing;
 mod server;
 mod storage;
 mod store;
-mod types;
+pub(crate) mod types;
 
 pub(crate) use types::validate_component;
 

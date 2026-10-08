@@ -9,11 +9,12 @@ use super::artifacts::{optional_metadata, real_prefix};
 use super::message;
 use crate::error::Result;
 
-pub(crate) const METADATA_PATHS: [&str; 4] = [
+pub(crate) const METADATA_PATHS: [&str; 5] = [
   "run-state.json",
   "snapshot.json",
   "environment/environment-state.json",
   "outputs/params.json",
+  crate::run_artifacts::INVENTORY_PATH,
 ];
 
 #[derive(Serialize)]
@@ -96,6 +97,17 @@ pub(super) fn local_run(runs_dir: &Path, run_id: &str) -> Result<RunUpdate> {
     .map(|path| fixed_revision(&run_dir, path))
     .collect::<Result<Vec<_>>>()?;
   metadata_revision.push(fixed_revision(&run_dir, "pull-state.json")?);
+  // A bounded output inventory detects checkpoint additions/removals and size
+  // changes without reading their contents. This is only a refresh hint.
+  use std::hash::{Hash, Hasher};
+  let inventory = crate::run_artifacts::scan(&run_dir)?;
+  let mut hint = std::collections::hash_map::DefaultHasher::new();
+  for file in inventory.files {
+    file.path.hash(&mut hint);
+    file.size.hash(&mut hint);
+  }
+  inventory.truncated.hash(&mut hint);
+  metadata_revision.push(Some(format!("outputs:{:016x}", hint.finish())));
   Ok(RunUpdate {
     run_id: run_id.into(),
     metadata_revision: Some(self::metadata_revision(metadata_revision)?),
