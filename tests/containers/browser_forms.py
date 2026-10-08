@@ -596,6 +596,12 @@ def artifact_files(browser, run_id):
         href: link?.getAttribute('href'), filename: link?.getAttribute('download')};''')
   def capture(name):
     Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  def show_files():
+    evaluate('''const card = document.querySelector('.files-card');
+      const sticky = document.querySelector('.topbar');
+      const offset = sticky && ['sticky', 'fixed'].includes(getComputedStyle(sticky).position)
+        ? sticky.getBoundingClientRect().height : 0;
+      window.scrollTo(0, Math.max(0, scrollY + card.getBoundingClientRect().top - offset - 12));''')
   start = len(trace_records())
   browser.keys('#review-tab-charts', '\ue010')  # End selects the fourth tab.
   wait_for(lambda: evaluate("return document.querySelector('#review-tab-files').getAttribute('aria-selected') === 'true';"), 'End did not select the fourth Files tab')
@@ -614,7 +620,7 @@ def artifact_files(browser, run_id):
   assert 'included automatically' in evaluate("return document.querySelector('.file-cli').textContent;"), 'CLI instructions omitted automatic run metadata'
   browser.click('#download-selected-files')
   assert evaluate("return document.querySelectorAll('#selected-file-downloads a').length;") == 1, 'selected download did not show one explicit native link'
-  evaluate("document.querySelector('#review-panel-files').scrollIntoView({block: 'start'});")
+  show_files()
   capture('workspace-files')
   browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
   assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Files view overflows horizontally'
@@ -622,6 +628,7 @@ def artifact_files(browser, run_id):
     const box = document.querySelector(selector).getBoundingClientRect();
     return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
   });'''), 'narrow Files controls are clipped'
+  show_files()
   capture('workspace-files-narrow')
   browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
   target = DOWNLOADS / 'checkpoint.pt'
@@ -641,6 +648,9 @@ def artifact_files(browser, run_id):
       actual.update(chunk)
   assert actual.digest() == expected.digest(), 'native checkpoint download bytes did not match the published fixture'
   assert any(record['path'] == '/api/artifact' and record['status'] == 303 for record in trace_records()[start:]), 'native download did not follow the protected attachment redirect'
+  attachments = [record for record in trace_records()[start:] if record['host'] == 's3.expri.example.net']
+  assert attachments and all(record['session_cookie_count'] == 0 and set(record['forwarded_headers']) <= {'Range'} for record in attachments), 'attachment origin received dashboard session or authorization headers'
+  assert 'X-Amz-' not in TRACE.read_text(), 'browser trace exposed a signed attachment query'
   # A browser may retain a blank attachment tab. Do not inspect or report its URL.
   for handle in browser.call('GET', '/window/handles'):
     if handle != original_window:

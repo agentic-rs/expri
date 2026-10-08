@@ -355,7 +355,7 @@ prefix = "acceptance"
   host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
   worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
   proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
-  firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
+  firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net', 's3.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
   copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
   copy(ROOT / 'tests/containers/service_proxy.py', proxy, '/tmp/proxy.py')
   copy(state / 'owner.toml', host, '/tmp/owner.toml')
