@@ -2,9 +2,12 @@
 
 Expri keeps execution and review local-first. Workers write the existing run
 files, and a separate uploader forwards them to an optional service. The service
-uses SQLite for its catalog and upload receipts, and S3-compatible storage for
-finalized files. Service outages leave training running. Required private inputs
-must already be downloaded before an offline run can start.
+keeps acknowledged JSONL, logs, and versioned metadata on its own disk and
+incrementally indexes metrics in SQLite. After a run finishes, it bundles the
+received tracking files into `result.zip` in S3-compatible storage. Checkpoints
+and private inputs remain separate S3 objects. Service outages leave training
+running. Required private inputs must already be downloaded before an offline
+run can start.
 
 Runs can start their own uploader when service publishing is configured. Explicit
 service commands remain available for existing runs and selected checkpoints.
@@ -50,11 +53,19 @@ proxy when serving other machines. Use `--listen` to select the private bind
 address. `--create-bucket` explicitly provisions a private bucket; it is omitted
 when using an existing bucket.
 
-Persist and back up the entire service data directory. SQLite contains logical
-file mappings, stream data, and multipart receipts; the S3 bucket alone does not
-replace it. Only one service process may use a data directory. Keep the storage
+Persist and back up the entire service data directory. It contains SQLite,
+original tracking files under `tracking/`, staged archives under `archives/`, and
+multipart receipts. The S3 bucket alone does not replace this directory.
+Archiving retains the hot files and SQLite data; expri does not delete them
+automatically. Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
+
+Opening this version upgrades the SQLite schema to version 2. Older binaries
+refuse that directory because they cannot read tracking records. Back up the
+entire service directory before upgrading; restoring that backup is required
+for a backend downgrade. Existing S3 runs remain readable after the upgrade.
+
 The optional object prefix is limited to 512 bytes to leave room for scoped IDs
 within S3's object-key limit.
 
@@ -89,13 +100,17 @@ configuration on the computer running that command. No token is copied from the
 browser into the command. Private inputs and checkpoint uploads remain CLI
 operations.
 
-The visible dashboard checks for changes every five seconds, using saved upload
-sequences and stream lengths without reading objects from S3 on unchanged
-checks. Changed views fetch bounded previews and preserve selection, filters,
+The hosted dashboard listens for small server-sent revision notifications and
+checks for changes every five seconds as recovery. Notifications carry no file
+bytes; changed views fetch their data through the existing incremental requests.
+Saved revisions and stream lengths make unchanged checks independent of S3. Changed views fetch bounded previews and preserve selection, filters,
 the active tab, zoom, and hidden curves. **Auto refresh** pauses updates;
 hidden/offline pages pause automatically, and connection failures retry more
 slowly while keeping the current view. Configure automatic publishing or run
 `push --watch` for live forwarding; dashboard refresh does not initiate an upload.
+The run detail displays archive progress separately from training status, and
+provides an authenticated **Download archive** link after upload succeeds.
+A recovery export is visibly marked as a partial archive.
 
 Browser access is read-only. Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
@@ -114,17 +129,37 @@ for `/login`; a limit of ten requests per minute with a small burst is suitable
 for this single-user setup. Do not cache authenticated responses or log request
 bodies, credentials, or signed S3 URL queries.
 
+Allow long-lived `/api/events` responses: disable proxy buffering and use a read
+timeout above the 15-second heartbeat interval. For nginx, add this location
+alongside your existing proxy configuration, preserving the same auth headers:
+
+```nginx
+location = /api/events {
+  proxy_pass http://127.0.0.1:8787;
+  proxy_set_header Host $host;
+  proxy_buffering off;
+  proxy_read_timeout 60s;
+}
+```
+
+Live connections have a separate pool capped at eight; they do not occupy the
+four ingestion request workers. Hidden/offline pages and paused refresh close
+their connection. Polling continues if notifications are unavailable.
+
 Hosted previews are bounded for small servers: the source catalog shows up to
 1,000 project/worker sources, browsing and filters cover the 500 runs most
 recently updated in the service per source, and cold overview reads have a
 30-second time budget. Within that selection, runs are displayed by their start
 time. Existing catalogs reconstruct update order from upload records and show a
 warning until fresh uploads establish service activity. Overview records are
-cached against the existing run-state file digest. Warnings identify missing
-or incomplete previews; refresh to retry. Hosted metric files are limited to
-16 MiB per run; larger files require local review. Charts retain bounded sampled
-points, and log tails read at most 64 KiB. Last/min/max summaries use every point
-in a supported metric file.
+cached against the run-state file digest or tracking revision. Warnings identify
+missing or incomplete previews; refresh to retry. New tracking runs use the
+incremental SQLite projection, including files larger
+than 16 MiB. Original timestamps and repeated or reset steps are preserved.
+Malformed or oversized metric rows stay in the raw file and produce preview
+warnings. Charts retain bounded sampled points, and log tails read at most
+64 KiB. Last/min/max summaries use every valid point. Legacy S3 metric previews
+retain their 16 MiB limit; pull larger legacy files for local review.
 The local CLI remains available for complete files and older runs.
 
 For main and branch UIs sharing this service, see [dashboard deployments](deployment.md).
@@ -180,9 +215,12 @@ and queue after a publisher stops or a configuration/token problem is corrected.
 It does not rerun training. The queue lives at the original checkout's
 `.expri/service-sync`; keep it and the original run files until publication is
 acknowledged. Publishers survive terminal closure and task completion, but must
-be resumed after a worker reboot. `synced` means the terminal upload cycle
-finished; a completed task alone does not imply that its results reached the
-service. The optional dashboard link opens the run after sign-in and waits for
+be resumed after a worker reboot. For new tracking runs, `synced` means all
+terminal tracking bytes were acknowledged and the archive job was accepted;
+it does not mean the independent S3 archive upload has finished. Archive
+failures retain tracking data and retry without restarting training. For legacy
+queues, `synced` retains its original upload-completion meaning. A completed task
+alone does not imply that its results reached the service. The optional dashboard link opens the run after sign-in and waits for
 its first publication.
 
 Automatic publishing requires a configured environment (an empty table selects
@@ -199,10 +237,44 @@ expri service push --config worker.toml \
   --run-dir .expri/runs/run-abc123 --watch
 ```
 
-The uploader forwards metadata, parameters, complete metric rows, and stdout /
-stderr bytes. Stream batches resume at acknowledged offsets; retries do not add
-duplicate bytes. At terminal run states the completed streams become S3 objects.
+The uploader checks every five seconds and forwards metadata snapshots,
+parameters, complete metric rows, and stdout/stderr bytes. It sends appended
+bytes in batches of at most 64 KiB. The server syncs original bytes to disk and
+commits offsets and metric indexes before acknowledging a batch. Retries compare
+overlapping bytes rather than duplicating them. Terminal publication also sends
+an unfinished final metric line and captures exact file revisions and lengths.
 The training process does not make service requests.
+
+If a training machine disappears, the server can recover its last acknowledged
+prefix. Data still waiting on the worker can be lost. Pull the received files
+normally, or use an owner configuration to create a recovery archive:
+
+```sh
+expri service archive --config owner.toml --project-id vision --origin gpu-1 \
+  --run-id run-abc123 --partial
+```
+
+`--partial` captures received document versions and stream lengths without
+sealing a still-active run or changing its training status. Omit `--partial` to
+archive a terminal run. Normal archives require current revisions and lengths;
+refresh and retry if they changed during the request. Partial exports can use
+captured completed document revisions and stream prefixes while publication
+continues. Network silence does not mark a run as lost or trigger a partial
+archive.
+
+The server builds `result.zip` from its acknowledged files and includes a
+`manifest.json` identifying scope, completeness, paths, revisions, and lengths.
+The ZIP contains run state, snapshot/environment metadata, parameters, artifact
+inventory, metrics JSONL, stdout and stderr as available. It excludes datasets
+and checkpoints. Persistent jobs and multipart receipts resume archive uploads
+after a service restart or storage outage. No tracking file is deleted after
+archiving.
+
+The client negotiates `tracking-v1` and pins that protocol in its durable queue.
+Existing queues that already published files remain on their legacy protocol;
+older completed S3 runs remain readable. An older server's unknown-capability
+response permits legacy publishing, while authentication and connection failures
+leave negotiation pending for retry.
 
 Large result files are selected explicitly after the run is terminal:
 
@@ -226,9 +298,10 @@ ETags remain opaque multipart receipts. Incomplete multipart uploads and old
 object revisions need an operator-selected S3 retention/lifecycle policy.
 The service uses up to 1,000 parts per file, from 8 MiB to 5 GiB per part, and
 accepts files up to 1,000 × 5 GiB. This keeps resumable-upload receipts below the
-1 MiB control-response limit. Live stream batches are limited to 64 KiB;
-completed live stream records are removed after their S3 object is published.
-SQLite reuses their freed pages; this does not immediately shrink the database.
+1 MiB control-response limit. Live stream batches are limited to 64 KiB. New
+tracking runs retain raw files
+and their SQLite projection after archiving. Legacy publishers continue removing
+completed stream records after their individual S3 objects are published.
 
 ## Local download and dashboard
 
@@ -242,6 +315,8 @@ expri service pull --config owner.toml --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo .
 expri service pull --config owner.toml --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo . --artifact outputs/checkpoint.pt
+expri service pull --config owner.toml --project-id vision --origin gpu-1 \
+  --run-id run-abc123 --repo . --artifact result.zip
 expri dashboard
 ```
 
@@ -256,7 +331,10 @@ Selected checkpoint downloads retry bounded 8 MiB ranges and save progress under
 After an interruption, run the same `service pull` command again. Unchanged
 object records continue from their last durable range; new signed URLs are
 obtained for each request, and the existing full-file SHA256 check must pass
-before publication. Mutable metadata and logs refresh on each invocation.
+before publication. Versioned tracking metadata refreshes when its revision
+changes; tracking
+metrics and logs append from their durable saved offsets, including across
+successful pulls. Legacy mutable metadata and logs refresh on each invocation.
 Previous cached files remain available during transfer, and checkpoints selected
 earlier stay in the cache. Pull reports include resumed file/byte counts. Keep
 the private staging directory to retain interrupted download progress; no tokens
@@ -304,7 +382,9 @@ It runs an actual uv experiment with fake installed Torch and a private input,
 starts publishing automatically, interrupts the service during training, and
 loses metric and multipart part acknowledgements. It kills/resumes the publisher
 from its saved queue, restarts the service, resumes the selected checkpoint, and
-reviews downloaded data offline. Failed and cancelled runs also finish publishing
+reviews downloaded data offline. It verifies independent server ZIP completion,
+original tracking bytes without per-file S3 uploads, recovery of an acknowledged
+prefix while the worker is offline, and owner-requested partial archives. Failed and cancelled runs also finish publishing
 their original task status and logs without selecting a checkpoint.
 An isolated Firefox image submits the native login and logout forms over an
 internal HTTPS fixture. It reproduces the rejected null origins under
@@ -323,8 +403,8 @@ Both hosts also exercise chart hover, drag zoom, legend toggles, and keyboard
 inspection through native browser input. The checks preserve repeated samples,
 verify chart script blocking, and require no additional metric requests during
 interaction. Narrow layouts and chart reloads retain working controls.
-A separate live-update check republishes a finalized worker run through the
-real CLI while Firefox stays open. It verifies five-second probes, unchanged
+A separate live-update check publishes appended bytes from an active fixture
+through the real CLI while Firefox stays open. It verifies five-second probes, unchanged
 snapshots skipped, new samples and summaries, drag deferral, preserved zoom and
 hidden curves, pause/resume, live log tails, and retained script blocking.
 Browser request logs contain method, path, origin, status and response policy,

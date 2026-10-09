@@ -471,6 +471,8 @@ fn rejected_authentication_keeps_pending_queue_and_redacts_the_response_before_b
     queue_dir: root.join("queue"),
   };
   let mut publisher = Publisher::new(&options).unwrap();
+  publisher.queue.state.protocol = Some(queue::Protocol::Legacy);
+  publisher.queue.save().unwrap();
   let failure = publisher.cycle(&mut |_| Ok(())).unwrap_err();
   assert!(Publisher::authentication_rejected(&failure));
   let detail = publisher.error_text(&failure);
@@ -1184,6 +1186,8 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
   };
   let mut publisher = Publisher::new(&options).unwrap();
   let mut progress = Vec::new();
+  publisher.queue.state.protocol = Some(queue::Protocol::Legacy);
+  publisher.queue.save().unwrap();
   assert!(
     publisher
       .cycle(&mut |value| {

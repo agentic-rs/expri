@@ -1,5 +1,6 @@
 import type { ChartController } from "./interactive_charts";
 import type { RefreshClock } from "./auto_refresh";
+import type { EventSourceFactory } from "./live_updates";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string };
@@ -69,6 +70,18 @@ export type Detail = {
   metrics_error: string | null;
   warnings: Warning[];
   cache: Json;
+  archive?: ArchiveRecord | null;
+};
+export type ArchiveRecord = {
+  status: "none" | "pending" | "uploading" | "archived" | "failed";
+  incomplete: boolean;
+  file?: {
+    target: { kind: "run"; scope: RunDeepLink; path: string };
+    size: number;
+    sha256: string | null;
+    storage: "object";
+  } | null;
+  last_error?: string | null;
 };
 export type Log = { content: string; stream: string; missing: boolean; truncated: boolean };
 export type Comparison = {
@@ -124,7 +137,11 @@ export type Updates = {
 };
 export type ChartRefreshOutcome = "applied" | "deferred" | "cancelled";
 export type ComparisonReduction = "last" | "min" | "max";
-export type DashboardOptions = { refresh_clock?: RefreshClock; chart_controller?: ChartController };
+export type DashboardOptions = {
+  refresh_clock?: RefreshClock;
+  chart_controller?: ChartController;
+  event_source?: EventSourceFactory;
+};
 
 export function apiUrl(
   path: string,

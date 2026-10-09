@@ -4,10 +4,10 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(super) struct HttpRequest {
-  pub(super) path: String,
-  pub(super) headers: BTreeMap<String, String>,
-  pub(super) body: Vec<u8>,
+pub(in crate::service::client) struct HttpRequest {
+  pub(in crate::service::client) path: String,
+  pub(in crate::service::client) headers: BTreeMap<String, String>,
+  pub(in crate::service::client) body: Vec<u8>,
 }
 
 fn read_request(stream: &mut TcpStream) -> HttpRequest {
@@ -43,7 +43,7 @@ fn read_request(stream: &mut TcpStream) -> HttpRequest {
   }
 }
 
-pub(super) fn mock(
+pub(in crate::service::client) fn mock(
   count: usize,
   mut handler: impl FnMut(HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + 'static,
 ) -> (String, thread::JoinHandle<()>) {

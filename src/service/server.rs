@@ -230,6 +230,27 @@ fn authorize<S: ObjectStorage>(
   worker: Option<&WorkerAuth>,
   request: &Request,
 ) -> ApiResult<()> {
+  let server_archive = match request {
+    Request::BeginUpload {
+      upload_id, target, ..
+    } => {
+      upload_id.starts_with("result-archive-")
+        || matches!(target, FileTarget::Run { path, .. } if path == "result.zip")
+    }
+    Request::PartUrl { upload_id, .. }
+    | Request::RecordPart { upload_id, .. }
+    | Request::CompleteUpload { upload_id } => {
+      upload_id.starts_with("result-archive-")
+        || matches!(store.upload_target(upload_id)?, FileTarget::Run { path, .. } if path == "result.zip")
+    }
+    _ => false,
+  };
+  if server_archive {
+    return Err(ApiError::new(
+      403,
+      "result.zip uploads are managed by the server",
+    ));
+  }
   let Some(worker) = worker else {
     return Ok(());
   };
@@ -242,9 +263,19 @@ fn authorize<S: ObjectStorage>(
     }
     Request::ListFiles { scope }
     | Request::AppendStream { scope, .. }
-    | Request::ReadStream { scope, .. } => {
-      worker.project_id == scope.project_id && worker.origin == scope.origin
-    }
+    | Request::ReadStream { scope, .. }
+    | Request::PutDocument { scope, .. }
+    | Request::AppendTracking { scope, .. }
+    | Request::ArchiveStatus { scope }
+    | Request::SealRun {
+      scope,
+      incomplete: false,
+      ..
+    } => worker.project_id == scope.project_id && worker.origin == scope.origin,
+    Request::Capabilities => true,
+    Request::SealRun {
+      incomplete: true, ..
+    } => false,
     Request::ListRuns { project_id, origin } => {
       worker.project_id == *project_id && worker.origin == *origin
     }
@@ -294,12 +325,53 @@ pub fn serve(
   std::io::stdout().flush()?;
   let (sender, receiver) = mpsc::sync_channel::<TcpStream>(QUEUE);
   let receiver = Mutex::new(receiver);
+  let (notification_sender, notification_receiver) =
+    mpsc::sync_channel::<super::notifications::Connection>(super::notifications::CONNECTION_LIMIT);
+  let notification_receiver = Mutex::new(notification_receiver);
+  let notification_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+  let stop = std::sync::atomic::AtomicBool::new(false);
   std::thread::scope(|scope| {
+    for _ in 0..super::notifications::CONNECTION_LIMIT {
+      let receiver = &notification_receiver;
+      let auth = &auth;
+      let dashboard = dashboard.as_ref();
+      let stop = &stop;
+      scope.spawn(move || {
+        loop {
+          let connection = receiver
+            .lock()
+            .expect("notification connection queue lock")
+            .recv();
+          let Ok(connection) = connection else {
+            break;
+          };
+          if let (Ok(Some(site)), Some(dashboard)) = (auth.site(&connection.request), dashboard) {
+            let _ = super::notifications::serve(connection, &site.auth, dashboard, stop);
+          }
+        }
+      });
+    }
+    let archive_store = &store;
+    let archive_stop = &stop;
+    scope.spawn(move || {
+      while !archive_stop.load(std::sync::atomic::Ordering::Acquire) {
+        // Errors are persisted with a bounded retry delay; they cannot stop ingestion.
+        let _ = archive_store.archive_cycle();
+        for _ in 0..10 {
+          if archive_stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+          }
+          std::thread::sleep(Duration::from_millis(500));
+        }
+      }
+    });
     for _ in 0..WORKERS {
       let receiver = &receiver;
       let auth = &auth;
       let store = &store;
       let dashboard = dashboard.as_ref();
+      let notification_sender = notification_sender.clone();
+      let notification_count = std::sync::Arc::clone(&notification_count);
       scope.spawn(move || {
         loop {
           let stream = receiver
@@ -307,7 +379,13 @@ pub fn serve(
             .expect("service connection queue lock")
             .recv();
           match stream {
-            Ok(stream) => respond(store, auth, dashboard, stream),
+            Ok(stream) => respond_with_notifications(
+              store,
+              auth,
+              dashboard,
+              stream,
+              Some((&notification_sender, &notification_count)),
+            ),
             Err(_) => break,
           }
         }
@@ -328,21 +406,67 @@ pub fn serve(
         Err(error) => break Err(error.into()),
       }
     };
+    stop.store(true, std::sync::atomic::Ordering::Release);
     drop(sender);
+    drop(notification_sender);
     result
   })
 }
 
-fn respond<S: ObjectStorage>(
+type NotificationSender = mpsc::SyncSender<super::notifications::Connection>;
+type NotificationCount = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+fn respond_with_notifications<S: ObjectStorage>(
   store: &Store<S>,
   auth: &Auth,
   dashboard: Option<&HostedDashboard<'_, S>>,
   mut stream: TcpStream,
+  notifications: Option<(&NotificationSender, &NotificationCount)>,
 ) {
   let mut head = false;
   let reply = match read_request(&mut stream) {
     Ok(request) => {
       head = request.method() == "HEAD";
+      if request.uri().path() == "/api/events"
+        && let Some((sender, count)) = notifications
+      {
+        let prepared = (|| {
+          let site = auth
+            .site(&request)?
+            .ok_or_else(|| ApiError::new(404, "hosted live updates are unavailable"))?;
+          let dashboard =
+            dashboard.ok_or_else(|| ApiError::new(404, "hosted live updates are unavailable"))?;
+          let selection = super::notifications::validate(&request, &site.auth, dashboard)?;
+          let permit = super::notifications::acquire(count)?;
+          Ok::<_, ApiError>((selection, permit))
+        })();
+        let error = match prepared {
+          Ok((selection, permit)) => {
+            let connection = super::notifications::Connection {
+              stream,
+              request,
+              selection,
+              _permit: permit,
+            };
+            match sender.try_send(connection) {
+              Ok(()) => return,
+              Err(
+                mpsc::TrySendError::Full(connection) | mpsc::TrySendError::Disconnected(connection),
+              ) => {
+                stream = connection.stream;
+                ApiError::new(
+                  503,
+                  "live updates are unavailable; polling remains available",
+                )
+              }
+            }
+          }
+          Err(error) => error,
+        };
+        let _ = write_response(&mut stream, api_reply(Err(error)), head);
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+      }
       dispatch(store, auth, dashboard, request)
     }
     Err(error) => api_reply(Err(error)),
@@ -1050,6 +1174,72 @@ mod tests {
       HeaderValue::from_static("Bearer owner-token-with-at-least-24-characters"),
     );
     assert_eq!(route(&store, &auth, duplicate).unwrap_err().status, 401);
+  }
+
+  #[test]
+  fn tracking_writes_are_scoped_and_recovery_archives_require_owner_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let worker = Some(&auth.workers[0].1);
+    let put = |scope| Request::PutDocument {
+      scope,
+      path: "run-state.json".into(),
+      revision: 1,
+      offset: 0,
+      total_size: 2,
+      data_base64: "e30=".into(),
+    };
+    assert!(authorize(&store, worker, &put(scope())).is_ok());
+    assert_eq!(
+      authorize(
+        &store,
+        worker,
+        &put(RunScope {
+          origin: "other".into(),
+          ..scope()
+        })
+      )
+      .unwrap_err()
+      .status,
+      403
+    );
+    let seal = |incomplete| Request::SealRun {
+      scope: scope(),
+      documents: Default::default(),
+      streams: Default::default(),
+      incomplete,
+    };
+    assert!(authorize(&store, worker, &seal(false)).is_ok());
+    assert_eq!(
+      authorize(&store, worker, &seal(true)).unwrap_err().status,
+      403
+    );
+    assert!(authorize(&store, None, &seal(true)).is_ok());
+    let archive = Request::BeginUpload {
+      upload_id: "user-owned".into(),
+      target: FileTarget::Run {
+        scope: scope(),
+        path: "result.zip".into(),
+      },
+      size: 1,
+      sha256: "a".repeat(64),
+    };
+    for role in [worker, None] {
+      assert_eq!(authorize(&store, role, &archive).unwrap_err().status, 403);
+      assert_eq!(
+        authorize(
+          &store,
+          role,
+          &Request::CompleteUpload {
+            upload_id: "result-archive-1".into()
+          }
+        )
+        .unwrap_err()
+        .status,
+        403
+      );
+    }
   }
 
   #[test]

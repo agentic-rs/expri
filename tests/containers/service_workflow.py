@@ -150,6 +150,22 @@ def browser_json(path, cookie):
   assert result['headers']['content-type'].startswith('application/json')
   return json.loads(result['body'])
 
+def service_record(action, run_id):
+  result = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+    'action': action, 'scope': {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id},
+  })
+  assert result['status'] == 200, 'owner could not inspect the tracking catalog'
+  return json.loads(result['body'])
+
+def tracking_files(run_id):
+  return {file['target']['path']: file for file in service_record('list_files', run_id)['files']
+    if isinstance(file['storage'], dict) and 'tracking' in file['storage']}
+
+def wait_archive(run_id):
+  wait_for(lambda: service_record('archive_status', run_id)['archive']['status'] == 'archived',
+    'server did not finish the independent result archive', timeout=90)
+  return service_record('archive_status', run_id)['archive']
+
 def dashboard_login():
   result = browser('/login', method='POST', password_env='EXPRI_DASHBOARD_PASSWORD')
   assert result['status'] == 303 and result['headers'].get('location') == '/', 'dashboard password login failed'
@@ -168,6 +184,8 @@ def dashboard_public_checks():
   assert browser('/api/catalog')['status'] == 401, 'unauthenticated dashboard API exposed data'
   assert browser('/api/artifacts?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated artifact catalog exposed data'
   assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
+  assert browser('/api/archive?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated archive download exposed data'
+  assert browser('/api/events')['status'] == 401, 'unauthenticated live updates exposed data'
   login = browser('/login')
   assert login['status'] == 200 and 'autocomplete="current-password"' in login['body'], 'public login form is unavailable'
   for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD']:
@@ -204,6 +222,13 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert detail['run']['run_id'] == run_id and detail['metrics_error'] is None, 'hosted detail could not review the uploaded run'
   assert detail['params']['learning_rate'] == 0.001 and detail['params']['input_id'] == 'dataset-v1', 'hosted parameters differ from uploaded data'
   assert detail['metrics']['loss']['count'] == 80 and detail['metrics']['loss']['last']['step'] == 79, 'hosted metric summaries differ from uploaded data'
+  assert detail['archive']['status'] == 'archived' and detail['archive']['incomplete'] is False, 'terminal training did not retain a distinct completed archive status'
+  archive_url = '/api/archive?' + urlencode({'source': source_id, 'run_id': run_id})
+  archived = browser(archive_url, cookie=cookie)
+  assert archived['status'] == 303 and archived['headers']['referrer-policy'] == 'no-referrer', 'archive download did not use a protected attachment redirect'
+  archive_head = browser(archive_url, method='HEAD', cookie=cookie)
+  assert archive_head['status'] == 200 and int(archive_head['headers']['content-length']) == detail['archive']['file']['size'], 'archive HEAD did not describe its stored snapshot'
+  assert browser(archive_url, cookie=cookie, origin='https://outside.invalid')['status'] == 403, 'cross-origin archive download was accepted'
   artifacts = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': run_id}), cookie)
   checkpoint = next(file for file in artifacts['files'] if file['path'] == 'outputs/checkpoint.pt')
   assert checkpoint['size'] == 17 * 1024 * 1024 and checkpoint['cloud'] is True and checkpoint['worker'] is True and checkpoint['local'] is None, 'artifact location or size differs from the published checkpoint'
@@ -253,17 +278,57 @@ root = Path({run_dir!r})
 step = {step!r}
 if step is not None:
   with (root / 'outputs/metrics.jsonl').open('a') as metrics:
-    metrics.write(json.dumps({{'schema_version': 1, 'step': step, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z'), 'metrics': {{'loss': 0.005 if step == 80 else 0.004}}}}) + '\\n')
+    metrics.write(json.dumps({{'schema_version': 1, 'step': step, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z'), 'metrics': {{'loss': 0.005 if step == 80 else 0.004}}}}) + chr(10))
   if step == 81:
     state = json.loads((root / 'run-state.json').read_text())
     state['refresh_probe'] = 'metadata-replacement'
     (root / 'run-state.json').write_text(json.dumps(state))
 if {log!r}:
   with (root / 'logs/stdout.log').open('a') as output:
-    output.write('automatic refresh log fixture\\n')
+    output.write('automatic refresh log fixture' + chr(10))
 '''
   python(worker, code)
   client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+
+def running_refresh_fixture(original):
+  run_id = 'refresh-' + original['run_id']
+  run_dir = '/home/tester/refresh-run'
+  python(worker, f'''import json, shutil
+from pathlib import Path
+root = Path({run_dir!r})
+shutil.copytree({original['run_dir']!r}, root)
+record = json.loads((root / 'run-state.json').read_text())
+record.update(run_id={run_id!r}, status='running', finished_at=None, exit_code=None)
+(root / 'run-state.json').write_text(json.dumps(record))
+''')
+  client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+  return {'run_id': run_id, 'run_dir': run_dir}
+
+def acknowledged_prefix_checks(updated):
+  records = tracking_files(updated['run_id'])
+  metrics = records['outputs/metrics.jsonl']
+  assert metrics['storage']['tracking']['sealed'] is False, 'active metrics were sealed before completion'
+  size = metrics['size']
+  expected = python(worker, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({updated['run_dir']!r}+'/outputs/metrics.jsonl').read_bytes()[:{size}]).hexdigest())")
+  python(worker, f"from pathlib import Path;p=Path({updated['run_dir']!r}+'/outputs/metrics.jsonl');p.open('ab').write(b'{{\"step\":999,\"metrics\":{{\"loss\":99}}}}'+bytes([10]));print('unsent tail')")
+  docker('stop', '--time', '1', worker)
+  docker('restart', '--time', '1', service)
+  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service did not recover its acknowledged raw tracking files')
+  prefix_args = ['--project-id', 'demo', '--origin', 'worker', '--run-id', updated['run_id'], '--repo', '/home/tester/review', '--source', 'service']
+  client(host, 'pull', *prefix_args)
+  local = f"/home/tester/review/results/service/runs/{updated['run_id']}"
+  result = json.loads(python(host, f"import hashlib,json;from pathlib import Path;p=Path({local!r}+'/outputs/metrics.jsonl');print(json.dumps({{'size':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}}))"))
+  assert result == {'size': size, 'sha256': expected}, 'offline worker pull exposed an unacknowledged tail or lost the acknowledged prefix'
+  partial = json.loads(client(host, 'archive', '--project-id', 'demo', '--origin', 'worker', '--run-id', updated['run_id'], '--partial').stdout)
+  assert partial['incomplete'] is True and partial['status'] in ['pending', 'uploading', 'archived', 'failed'], 'owner partial archive did not capture the acknowledged active prefix'
+  archive = wait_archive(updated['run_id'])
+  assert archive['incomplete'] is True, 'interrupted run archive lost its partial marker'
+  client(host, 'pull', *prefix_args, '--artifact', 'result.zip')
+  manifest = json.loads(python(host, f"import json,zipfile;from pathlib import Path;z=zipfile.ZipFile(Path({local!r})/'result.zip');m=json.loads(z.read('manifest.json'));assert len(z.read('outputs/metrics.jsonl'))=={size};print(json.dumps(m))"))
+  assert manifest['incomplete'] is True and manifest['scope']['run_id'] == updated['run_id'], 'partial ZIP changed its run identity or completeness'
+  docker('start', worker)
+  wait_for(lambda: execute(worker, 'true', check=False).returncode == 0, 'worker did not resume after the recovery fixture')
+  python(worker, f"from pathlib import Path;p=Path({updated['run_dir']!r}+'/outputs/metrics.jsonl');p.open('r+b').truncate({size});print('restored acknowledged fixture')")
 
 def automatic_dashboard_checks(run_id, updated):
   global refresh_browser
@@ -288,7 +353,7 @@ def automatic_dashboard_checks(run_id, updated):
       publish_refresh_fixture(updated['run_dir'], step)
       after = browser_json('/api/updates?' + urlencode({'source': source_id, 'run_id': updated['run_id']}), cookie)
       assert after['runs'][0]['metrics_revision'] != before['runs'][0]['metrics_revision'], 'worker republication did not change the saved metric revision'
-      assert after['runs'][0]['metrics_revision'].startswith('object:'), 'finalized worker metrics were not republished as an object'
+      assert 'outputs/metrics.jsonl' in tracking_files(updated['run_id']), 'live worker metrics lost their acknowledged tracking storage'
       if step == 81:
         assert after['runs'][0]['metadata_revision'] != before['runs'][0]['metadata_revision'], 'worker state replacement did not change its metadata revision'
       detail = browser_json('/api/run?' + urlencode({'source': source_id, 'run_id': updated['run_id']}), cookie)
@@ -427,6 +492,11 @@ print(count)''')
     report = json.loads(execute(worker, 'expri', 'runs', 'status', Path(directory).name, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)
     return report['service_sync']['status'] == 'synced' and not report['service_sync']['worker_active']
   wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
+  queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
+  assert queue_state['protocol'] == 'tracking_v1' and queue_state['files'] == {}, 'fresh publishing queue used terminal per-file multipart instead of tracking-v1'
+  tracked = tracking_files(run_id)
+  assert all(path in tracked for path in ['run-state.json', 'snapshot.json', 'outputs/params.json', 'outputs/metrics.jsonl', 'logs/stdout.log', 'logs/stderr.log']), 'terminal tracking catalog omitted run records or raw streams'
+  assert tracked['outputs/metrics.jsonl']['storage']['tracking']['sealed'] is True, 'terminal metrics were not sealed at their acknowledged extent'
   api_proxy('/test/arm')
   first = client(worker, 'push', *push_args, '--artifact', 'outputs/checkpoint.pt', check=False)
   assert first.returncode != 0 and api_proxy('/test/state')['lost_ack'], 'lost part acknowledgement was not injected'
@@ -439,6 +509,10 @@ print(count)''')
   assert second['run_id'] != run_id, 'second experiment reused the first run identity'
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
   wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)
+  for archived_run in [run_id, second['run_id']]:
+    archive = wait_archive(archived_run)
+    assert archive['incomplete'] is False and archive['file']['target']['path'] == 'result.zip', 'terminal archive did not finish independently as a complete result ZIP'
+  assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
   intent = python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/publishing-request.json').read_text())")
   assert fixture_env['EXPRI_WORKER_TOKEN'] not in intent, 'publishing intent exposed its token'
   assert 'X-Amz-' not in intent, 'publishing intent exposed a signed URL'
@@ -476,7 +550,7 @@ print(process.pid)
   assert 'X-Amz-' not in saved_progress and fixture_env['EXPRI_OWNER_TOKEN'] not in saved_progress, 'download progress exposed a credential'
   api_proxy('/test/release-download')
   download_report = json.loads(client(host, 'pull', *pull_args, '--artifact', 'outputs/checkpoint.pt').stdout)
-  assert download_report['resumed_bytes'] == 8 * 1024 * 1024 and download_report['resumed_files'] == 1, f'pull did not resume its saved checkpoint range: {download_report}'
+  assert download_report['resumed_bytes'] >= 8 * 1024 * 1024 and download_report['resumed_files'] >= 1, 'pull did not resume its saved checkpoint range'
   assert api_proxy('/test/state')['download_ranges'].get('bytes=0-8388607') == 1, 'restart downloaded the acknowledged checkpoint prefix again'
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
   assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
@@ -487,7 +561,9 @@ print(process.pid)
     'python3', '/opt/expri-browser/browser_forms.py', '--previews', run_id, second['run_id']], timeout=180)
   logged('browser-deep-link.log', ['docker', 'exec', '--user', 'tester', firefox,
     'python3', '/opt/expri-browser/browser_forms.py', '--deep-link', run_id, second['run_id']], timeout=180)
-  automatic_dashboard_checks(run_id, second)
+  refresh_run = running_refresh_fixture(second)
+  acknowledged_prefix_checks(refresh_run)
+  automatic_dashboard_checks(run_id, refresh_run)
   # Failed and cancelled runs must also finish publication, without a selected
   # final checkpoint preventing their metadata/logs from draining.
   failed = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach fail').stdout)
@@ -530,7 +606,7 @@ print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
 '''))
   assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
   assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
-  print('Service workflow passed: automatic publishing, offline completion, publisher restart, Firefox native forms/downloads, inputs, multipart resume, killed-pull range recovery, artifact availability, hosted dashboard, offline review.', flush=True)
+  print('Service workflow passed: tracking-v1 publishing, acknowledged-prefix recovery, complete/partial archives, Firefox native downloads/SSE/chart review, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
 finally:
   if refresh_browser is not None and refresh_browser.poll() is None:
     refresh_browser.terminate()

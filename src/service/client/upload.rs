@@ -131,12 +131,23 @@ pub(super) fn sync_stream(
   while offset < size {
     let length = (size - offset).min(buffer.len() as u64) as usize;
     file.read_exact(&mut buffer[..length])?;
-    let response = api.request(&Request::AppendStream {
-      scope: scope.clone(),
-      path: path.to_string(),
-      offset,
-      data_base64: STANDARD.encode(&buffer[..length]),
-    })?;
+    let data_base64 = STANDARD.encode(&buffer[..length]);
+    let request = if queue.state.protocol == Some(super::queue::Protocol::TrackingV1) {
+      Request::AppendTracking {
+        scope: scope.clone(),
+        path: path.into(),
+        offset,
+        data_base64,
+      }
+    } else {
+      Request::AppendStream {
+        scope: scope.clone(),
+        path: path.into(),
+        offset,
+        data_base64,
+      }
+    };
+    let response = api.request(&request)?;
     let Response::Acknowledged {
       offset: acknowledged,
     } = response
@@ -150,6 +161,24 @@ pub(super) fn sync_stream(
     }
     offset = acknowledged;
     queue.state.streams.insert(path.to_string(), offset);
+    queue.save()?;
+  }
+  if queue.state.protocol == Some(super::queue::Protocol::TrackingV1)
+    && !queue.state.streams.contains_key(path)
+  {
+    // Empty streams still have an explicit identity for the final seal.
+    let Response::Acknowledged { offset: 0 } = api.request(&Request::AppendTracking {
+      scope: scope.clone(),
+      path: path.into(),
+      offset: 0,
+      data_base64: String::new(),
+    })?
+    else {
+      return Err(message(
+        "service did not acknowledge its empty tracking stream",
+      ));
+    };
+    queue.state.streams.insert(path.into(), 0);
     queue.save()?;
   }
   Ok(())

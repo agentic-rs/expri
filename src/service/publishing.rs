@@ -387,7 +387,7 @@ pub(super) fn worker(run_dir: &Path) -> Result<()> {
         if done {
           return Ok(());
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(5));
       }
       Err(failure) => {
         if Publisher::authentication_rejected(&failure) {
@@ -399,7 +399,7 @@ pub(super) fn worker(run_dir: &Path) -> Result<()> {
             "Service authentication rejected; repair credentials and resume publishing",
           ));
         }
-        let delay = (2u64 << failures.min(5)).min(60);
+        let delay = (5u64 << failures.min(4)).min(60);
         failures = failures.saturating_add(1);
         state.last_error = Some(safe_error(&error(publisher.error_text(&failure))));
         state.retry_after_seconds = Some(delay);

@@ -7,9 +7,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
-#[path = "mock.rs"]
-mod mock;
-use mock::mock;
+use super::mock::mock;
 
 fn scope() -> RunScope {
   RunScope {
@@ -231,6 +229,256 @@ fn options(root: &Path, config: PathBuf) -> PullOptions {
     source: Some("cached-worker".into()),
     artifacts: vec!["outputs/checkpoint.bin".into()],
   }
+}
+
+fn tracking_record(path: &str, size: u64, revision: u64, sealed: bool) -> FileRecord {
+  FileRecord {
+    target: FileTarget::Run {
+      scope: scope(),
+      path: path.into(),
+    },
+    size,
+    sha256: None,
+    storage: FileStorage::Tracking { revision, sealed },
+  }
+}
+
+#[test]
+fn tracking_pull_reopens_cursors_detaches_cache_and_reads_only_new_log_bytes() {
+  let (_temporary, root) = root();
+  let original = vec![b'a'; STREAM_BATCH + 19];
+  let original_size = original.len();
+  let mut grown = original.clone();
+  grown.extend_from_slice(b"new log");
+  let old_state = br#"{"run_id":"run-test","status":"running"}"#.to_vec();
+  let new_state = br#"{"run_id":"run-test","status":"completed"}"#.to_vec();
+  let cached = root.join("results/cached-worker/runs/run-test");
+  let inspected_cache = cached.clone();
+  let mut cycle = 0;
+  let seen = Arc::new(Mutex::new(Vec::new()));
+  let recorded = seen.clone();
+  let expected = original.clone();
+  let expected_grown = grown.clone();
+  let expected_old_state = old_state.clone();
+  let expected_new_state = new_state.clone();
+  let (url, task) = mock(11, move |request, _| {
+    let state = if cycle < 2 {
+      &expected_old_state
+    } else {
+      &expected_new_state
+    };
+    let log = if cycle < 2 {
+      &expected
+    } else {
+      &expected_grown
+    };
+    let record = |path: &str| {
+      if path == "run-state.json" {
+        tracking_record(path, state.len() as u64, cycle.max(1), cycle >= 2)
+      } else {
+        tracking_record(path, log.len() as u64, 1, cycle >= 2)
+      }
+    };
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::ListFiles { .. } => {
+        cycle += 1;
+        let state = if cycle == 1 {
+          &expected_old_state
+        } else {
+          &expected_new_state
+        };
+        let log = if cycle == 1 {
+          &expected
+        } else {
+          &expected_grown
+        };
+        Response::Files {
+          files: vec![
+            tracking_record("run-state.json", state.len() as u64, cycle, cycle >= 2),
+            tracking_record("logs/stdout.log", log.len() as u64, 1, cycle >= 2),
+          ],
+        }
+      }
+      Request::ReadStream {
+        path,
+        offset,
+        limit,
+        ..
+      } => {
+        recorded.lock().unwrap().push((path.clone(), offset));
+        if cycle == 2 {
+          assert_eq!(
+            std::fs::read(inspected_cache.join("logs/stdout.log")).unwrap(),
+            expected
+          );
+        }
+        let bytes = if path == "run-state.json" { state } else { log };
+        let end = (offset as usize + limit).min(bytes.len());
+        Response::Stream {
+          offset,
+          total_size: bytes.len() as u64,
+          data_base64: STANDARD.encode(&bytes[offset as usize..end]),
+        }
+      }
+      Request::GetFile {
+        target: FileTarget::Run { path, .. },
+      } => Response::File {
+        file: record(&path),
+      },
+      other => panic!("unexpected tracking pull transport: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let config = config(&root, &url);
+  let mut selected = options(&root, config.clone());
+  selected.artifacts.clear();
+  let first = pull(selected).unwrap();
+  assert_eq!(first["resumed_bytes"], 0);
+  assert_eq!(
+    std::fs::read(cached.join("logs/stdout.log")).unwrap(),
+    original
+  );
+  let mut selected = options(&root, config);
+  selected.artifacts.clear();
+  let second = pull(selected).unwrap();
+  assert_eq!(second["resumed_files"], 1);
+  assert_eq!(second["resumed_bytes"], original_size);
+  assert_eq!(second["downloaded_bytes"], 7 + new_state.len());
+  assert_eq!(
+    std::fs::read(cached.join("logs/stdout.log")).unwrap(),
+    grown
+  );
+  assert_eq!(
+    std::fs::read(cached.join("run-state.json")).unwrap(),
+    new_state
+  );
+  assert_eq!(
+    *seen.lock().unwrap(),
+    vec![
+      ("logs/stdout.log".into(), 0),
+      ("logs/stdout.log".into(), STREAM_BATCH as u64),
+      ("run-state.json".into(), 0),
+      ("logs/stdout.log".into(), original_size as u64),
+      ("run-state.json".into(), 0),
+    ]
+  );
+  task.join().unwrap();
+}
+
+#[test]
+fn interrupted_tracking_read_reopens_at_last_durable_chunk() {
+  let (_temporary, root) = root();
+  let bytes = vec![b'm'; STREAM_BATCH + 9];
+  let record = tracking_record("outputs/metrics.jsonl", bytes.len() as u64, 1, false);
+  let expected_record = record.clone();
+  let mut requests = 0;
+  let (url, task) = mock(4, move |request, _| {
+    requests += 1;
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::ReadStream { offset, limit, .. } => {
+        assert_eq!(
+          offset,
+          if requests == 1 {
+            0
+          } else {
+            STREAM_BATCH as u64
+          }
+        );
+        if requests == 2 {
+          return (503, Vec::new(), br#"{"error":"temporary outage"}"#.to_vec());
+        }
+        let end = (offset as usize + limit).min(bytes.len());
+        Response::Stream {
+          offset,
+          total_size: bytes.len() as u64,
+          data_base64: STANDARD.encode(&bytes[offset as usize..end]),
+        }
+      }
+      Request::GetFile { .. } => Response::File {
+        file: expected_record.clone(),
+      },
+      other => panic!("unexpected range request: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let api = Api::new(&config(&root, &url)).unwrap();
+  let directory = root.join("staging");
+  let mut staging = staging::Staging::open(directory.clone(), &owner()).unwrap();
+  assert!(staged_download(&api, &mut staging, "outputs/metrics.jsonl", &record).is_err());
+  drop(staging);
+  let mut staging = staging::Staging::open(directory, &owner()).unwrap();
+  let (resumed, downloaded) =
+    staged_download(&api, &mut staging, "outputs/metrics.jsonl", &record).unwrap();
+  assert_eq!(resumed, STREAM_BATCH as u64);
+  assert_eq!(downloaded, 9);
+  task.join().unwrap();
+}
+
+#[test]
+fn changed_document_during_read_resets_cursor_without_publishing_mixed_bytes() {
+  let (_temporary, root) = root();
+  let initial = tracking_record("outputs/params.json", 5, 1, false);
+  let current = tracking_record("outputs/params.json", 5, 2, false);
+  let expected = current.clone();
+  let (url, task) = mock(4, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::ReadStream { offset, .. } => {
+        assert_eq!(offset, 0);
+        Response::Stream {
+          offset,
+          total_size: 5,
+          data_base64: STANDARD.encode(b"newer"),
+        }
+      }
+      Request::GetFile { .. } => Response::File {
+        file: expected.clone(),
+      },
+      other => panic!("unexpected document request: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let api = Api::new(&config(&root, &url)).unwrap();
+  let mut staging = staging::Staging::open(root.join("staging"), &owner()).unwrap();
+  let cached = root.join("cached-params.json");
+  std::fs::write(&cached, b"older").unwrap();
+  assert!(staged_download(&api, &mut staging, "outputs/params.json", &initial).is_err());
+  assert_eq!(std::fs::read(&cached).unwrap(), b"older");
+  assert!(!staging.path("outputs/params.json").exists());
+  assert_eq!(
+    staged_download(&api, &mut staging, "outputs/params.json", &current).unwrap(),
+    (0, 5)
+  );
+  publish(&staging.path("outputs/params.json"), &cached).unwrap();
+  assert_eq!(std::fs::read(cached).unwrap(), b"newer");
+  task.join().unwrap();
+}
+
+#[test]
+fn edited_tracking_cache_is_refetched_without_truncating_its_shared_inode() {
+  let (_temporary, root) = root();
+  let path = "logs/stdout.log";
+  let record = tracking_record(path, 4, 1, false);
+  let directory = root.join("staging");
+  let mut staging = staging::Staging::open(directory.clone(), &owner()).unwrap();
+  let (mut file, _) = staging.prepare(path, &record, true).unwrap();
+  file.write_all(b"good").unwrap();
+  staging.acknowledge(path, 4, true, &file).unwrap();
+  let cached = root.join("cached.log");
+  publish(&staging.path(path), &cached).unwrap();
+  drop(file);
+  drop(staging);
+  std::fs::write(&cached, b"edit").unwrap();
+  File::open(&cached)
+    .unwrap()
+    .set_times(
+      std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+    )
+    .unwrap();
+  let mut staging = staging::Staging::open(directory, &owner()).unwrap();
+  let (file, offset) = staging.prepare(path, &record, true).unwrap();
+  assert_eq!(offset, 0);
+  assert_eq!(file.metadata().unwrap().len(), 0);
+  assert_eq!(std::fs::read(cached).unwrap(), b"edit");
 }
 
 #[test]

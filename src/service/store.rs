@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -9,6 +9,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::storage::ObjectStorage;
 use super::types::*;
+
+mod archive;
+mod tracking;
 
 const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
@@ -54,6 +57,7 @@ struct Upload {
 }
 
 pub(super) struct Store<S> {
+  directory: PathBuf,
   connection: Mutex<Connection>,
   // Network calls never hold the database lock. This gate prevents simultaneous
   // begin/complete retries from creating conflicting sessions for one upload.
@@ -119,7 +123,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot read service metadata version".into())
       })?;
-    if version > 1 {
+    if version > 2 {
       return Err(crate::error::ExpriError::Message(
         "service metadata schema is newer than this binary".into(),
       ));
@@ -159,12 +163,23 @@ impl<S: ObjectStorage> Store<S> {
         WHERE json_extract(target,'$.kind')='run'
         GROUP BY json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id')
         ORDER BY MAX(sequence),json_extract(target,'$.scope.run_id');
-      PRAGMA user_version=1;",
+      ",
       )
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot initialize service metadata".into())
       })?;
+    tracking::initialize(&connection)?;
+    tracking::recover(&directory, &connection)?;
+    archive::initialize(&connection)
+      .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
+    // Older binaries cannot decode Tracking records; refuse unsafe downgrades.
+    connection
+      .pragma_update(None, "user_version", 2)
+      .map_err(|_| {
+        crate::error::ExpriError::Message("cannot upgrade service metadata version".into())
+      })?;
     Ok(Self {
+      directory,
       connection: Mutex::new(connection),
       upload_gates: Mutex::new(BTreeMap::new()),
       storage,
@@ -293,7 +308,7 @@ impl<S: ObjectStorage> Store<S> {
   pub fn dashboard_output_objects(&self, scope: &RunScope) -> ApiResult<(Vec<FileRecord>, bool)> {
     validate_scope(scope).map_err(bad)?;
     let db = self.db()?;
-    let mut statement = db.prepare("SELECT record FROM files WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3 AND substr(json_extract(target,'$.path'),1,8)='outputs/' AND json_extract(target,'$.path')<>?4 ORDER BY target LIMIT ?5").map_err(database)?;
+    let mut statement = db.prepare("SELECT record FROM files WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3 AND substr(json_extract(target,'$.path'),1,8)='outputs/' AND json_extract(target,'$.path')<>?4 AND json_extract(record,'$.storage')='object' ORDER BY target LIMIT ?5").map_err(database)?;
     let records = statement
       .query_map(
         params![
@@ -319,8 +334,11 @@ impl<S: ObjectStorage> Store<S> {
       else {
         return Err(ApiError::new(500, "invalid stored artifact scope"));
       };
-      if stored_scope != scope || !matches!(file.storage, FileStorage::Object) {
+      if stored_scope != scope {
         return Err(ApiError::new(500, "invalid stored artifact scope"));
+      }
+      if !matches!(file.storage, FileStorage::Object) {
+        continue;
       }
       if crate::run_artifacts::validate_path(path).is_ok() {
         files.push(file);
@@ -357,6 +375,37 @@ impl<S: ObjectStorage> Store<S> {
     let url = self
       .storage
       .presign_get_attachment(&key, 900, disposition)
+      .map_err(|_| ApiError::new(502, "object storage unavailable"))?;
+    Ok((url, record.size))
+  }
+
+  pub fn dashboard_archive_attachment(&self, scope: &RunScope) -> ApiResult<(String, u64)> {
+    validate_scope(scope).map_err(bad)?;
+    let target = FileTarget::Run {
+      scope: scope.clone(),
+      path: "result.zip".into(),
+    };
+    let (status, key, raw): (String, Option<String>, Option<String>) = self.db()?.query_row(
+      "SELECT a.status,f.object_key,f.record FROM result_archives a LEFT JOIN files f ON f.target=?2 WHERE a.scope=?1 ORDER BY a.id DESC LIMIT 1",
+      params![serde_json::to_string(scope).map_err(|_|ApiError::new(500,"cannot encode archive scope"))?, target_json(&target)?],
+      |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(database)?
+      .ok_or_else(||ApiError::new(404,"result archive is not available"))?;
+    if status != "archived" {
+      return Err(ApiError::new(409, "result archive is not ready"));
+    }
+    let raw = raw.ok_or_else(|| ApiError::new(404, "result archive is missing"))?;
+    let record: FileRecord =
+      serde_json::from_str(&raw).map_err(|_| ApiError::new(500, "invalid archive record"))?;
+    if record.target != target || !matches!(record.storage, FileStorage::Object) {
+      return Err(ApiError::new(500, "invalid archive record"));
+    }
+    let url = self
+      .storage
+      .presign_get_attachment(
+        &key.ok_or_else(|| ApiError::new(404, "result archive is missing"))?,
+        900,
+        &crate::dashboard::artifacts::disposition("result.zip"),
+      )
       .map_err(|_| ApiError::new(502, "object storage unavailable"))?;
     Ok((url, record.size))
   }
@@ -424,10 +473,20 @@ impl<S: ObjectStorage> Store<S> {
           runs.push(RunUpdate::missing(run_id));
           continue;
         }
-        let metadata_revision = updates::METADATA_PATHS
+        let mut metadata_revision = updates::METADATA_PATHS
           .iter()
           .map(|path| dashboard_artifact_revision(&db, &scope, path))
           .collect::<ApiResult<Vec<_>>>()?;
+        let archive: Option<(i64, String)> = db
+          .query_row(
+            "SELECT id,status FROM result_archives WHERE scope=?1 ORDER BY id DESC LIMIT 1",
+            [serde_json::to_string(&scope)
+              .map_err(|_| ApiError::new(500, "cannot encode archive scope"))?],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+          )
+          .optional()
+          .map_err(database)?;
+        metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
         runs.push(RunUpdate {
           run_id: run_id.clone(),
           metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
@@ -602,6 +661,34 @@ impl<S: ObjectStorage> Store<S> {
 
   pub fn execute(&self, request: Request) -> ApiResult<Response> {
     match request {
+      Request::Capabilities => Ok(Response::Capabilities {
+        features: vec!["tracking-v1".into()],
+      }),
+      Request::PutDocument {
+        scope,
+        path,
+        revision,
+        offset,
+        total_size,
+        data_base64,
+      } => self.put_document(scope, path, revision, offset, total_size, &data_base64),
+      Request::AppendTracking {
+        scope,
+        path,
+        offset,
+        data_base64,
+      } => self.append_tracking(scope, path, offset, &data_base64),
+      Request::SealRun {
+        scope,
+        documents,
+        streams,
+        incomplete,
+      } => Ok(Response::Archive {
+        archive: self.seal_tracking(scope, documents, streams, incomplete)?,
+      }),
+      Request::ArchiveStatus { scope } => Ok(Response::Archive {
+        archive: self.archive_status(&scope)?,
+      }),
       Request::BeginUpload {
         upload_id,
         target,
@@ -670,6 +757,7 @@ impl<S: ObjectStorage> Store<S> {
   fn begin(&self, id: &str, target: FileTarget, size: u64, sha256: String) -> ApiResult<Response> {
     validate_component(id).map_err(bad)?;
     validate_target(&target).map_err(bad)?;
+    self.reject_managed_tracking(&target)?;
     if sha256.len() != 64
       || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
       || size > MAX_FILE_SIZE
@@ -735,6 +823,7 @@ impl<S: ObjectStorage> Store<S> {
       .lock()
       .map_err(|_| ApiError::new(503, "upload operation unavailable"))?;
     let upload = self.upload(id)?;
+    self.reject_managed_tracking(&upload.target)?;
     check_part(&upload, part.part_number)?;
     if part.etag.is_empty()
       || part.etag.len() > MAX_ETAG_BYTES
@@ -762,6 +851,7 @@ impl<S: ObjectStorage> Store<S> {
       .lock()
       .map_err(|_| ApiError::new(503, "upload operation unavailable"))?;
     let upload = self.upload(id)?;
+    self.reject_managed_tracking(&upload.target)?;
     let state = self.state(id, &upload)?;
     if upload.complete {
       return Ok(Response::File {
@@ -815,6 +905,7 @@ impl<S: ObjectStorage> Store<S> {
     };
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;
+    tracking::reject_managed(&transaction, &upload.target)?;
     if let FileTarget::Input { .. } = upload.target {
       let existing: Option<String> = transaction
         .query_row(
@@ -846,8 +937,14 @@ impl<S: ObjectStorage> Store<S> {
         "stream changed while its object was uploading; retry with current bytes",
       ));
     }
-    let published = transaction.execute("INSERT INTO files(target,record,object_key,sequence) VALUES(?1,?2,?3,?4) ON CONFLICT(target) DO UPDATE SET record=excluded.record,object_key=excluded.object_key,sequence=excluded.sequence WHERE files.sequence < excluded.sequence",
-      params![target, serde_json::to_string(&record).map_err(|_| ApiError::new(500, "cannot encode artifact"))?, upload.key, upload.sequence]).map_err(database)?;
+    let current_archive = archive::can_publish(&transaction, id, &upload.target)?;
+    let published = if current_archive {
+      transaction.execute("INSERT INTO files(target,record,object_key,sequence) VALUES(?1,?2,?3,?4) ON CONFLICT(target) DO UPDATE SET record=excluded.record,object_key=excluded.object_key,sequence=excluded.sequence WHERE files.sequence < excluded.sequence",
+      params![target, serde_json::to_string(&record).map_err(|_| ApiError::new(500, "cannot encode artifact"))?, upload.key, upload.sequence]).map_err(database)?
+    } else {
+      0
+    };
+
     if published != 0 {
       // Publish the immutable object and retire its live copy in one durable transaction.
       transaction
@@ -866,7 +963,11 @@ impl<S: ObjectStorage> Store<S> {
     transaction.commit().map_err(database)?;
     drop(db);
     Ok(Response::File {
-      file: self.file(&upload.target)?,
+      file: if current_archive {
+        self.file(&upload.target)?
+      } else {
+        record
+      },
     })
   }
 
@@ -1080,6 +1181,23 @@ impl<S: ObjectStorage> Store<S> {
     offset: u64,
     limit: usize,
   ) -> ApiResult<Response> {
+    if let Some(file) = self.tracking_file(&FileTarget::Run {
+      scope: scope.clone(),
+      path: path.clone(),
+    })? {
+      if limit > STREAM_BATCH {
+        return Err(ApiError::new(413, "stream reads are limited to 64 KiB"));
+      }
+      if offset > file.size {
+        return Err(ApiError::new(409, "stream offset exceeds available bytes"));
+      }
+      let bytes = self.tracking_range(&file, offset, limit.min((file.size - offset) as usize))?;
+      return Ok(Response::Stream {
+        offset,
+        total_size: file.size,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+      });
+    }
     let target = target_json(&stream_target(scope, path)?)?;
     if limit > STREAM_BATCH {
       return Err(ApiError::new(413, "stream reads are limited to 64 KiB"));

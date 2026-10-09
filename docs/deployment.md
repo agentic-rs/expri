@@ -147,10 +147,36 @@ setting up another server.
 
 A main deployment restarts the service and expires existing browser sessions.
 An AB asset deployment leaves the API, worker uploads, and existing sessions
-running. Keep the previous binary and preview release for rollback. Roll back
-the binary or asset pointer on a failed health check; do not restore an old
-SQLite snapshot during an ordinary code rollback, because that could discard
-uploads received since the snapshot.
+running. Keep the previous binary and preview release for rollback. The installer
+reads `/var/lib/expri/metadata.sqlite3`'s schema version through a read-only SQLite
+connection before and after a main deployment, including committed WAL changes.
+After a failed startup or health check, it stops the new service before checking
+the schema, so a process still starting cannot migrate during rollback. It rolls
+back a failed backend only when that version is unchanged. If the new process
+changed the schema, or the schema cannot be read after startup, it keeps the new
+binary selected with the service stopped and reports that operator recovery is
+required. Failure to stop the service also prevents automatic rollback. This
+avoids starting an older binary against data it cannot read. AB asset failures
+still restore the previous asset pointer without restarting the backend.
+
+Before a schema upgrade, check the actual systemd `--data-dir`, free disk space,
+and the current binary link. Stop the service and back up the entire data
+directory while it is stopped: include SQLite and its WAL/SHM files, tracking
+files, archive staging files, and multipart receipts. Keep the backup outside
+the data directory, restrict it to root, and verify that it can be read before
+continuing. A SQLite-only copy is insufficient. Restart the existing service if
+the release is still being prepared; the installer checks configured previews
+before activation. Record the backup time and old binary revision so a recovery
+has a known boundary.
+
+For the version 2 upgrade, older binaries refuse the upgraded directory. Prefer
+repairing or restarting the new release while retaining received data. A backend
+downgrade requires an explicit operator decision: stop the service, preserve
+the upgraded directory separately, restore the complete pre-upgrade backup with
+its ownership and permissions, select the compatible old binary, and restart.
+This loses uploads received after the backup. The deployment scripts never
+restore or overwrite service data automatically. During an ordinary code
+rollback with an unchanged schema, keep the current data directory.
 
 Both origins must be checked after setup: native login/logout, independent
 sessions, shared catalogs and run values, correct asset revisions, and rejected

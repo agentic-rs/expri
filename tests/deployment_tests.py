@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -118,8 +119,21 @@ class InstallerTests(unittest.TestCase):
     self.config.write_text(self.configuration)
     self.database = self.root / 'var/lib/expri/metadata.sqlite3'
     self.database.parent.mkdir(parents=True)
-    self.database.write_bytes(b'initial data')
+    with sqlite3.connect(self.database) as connection:
+      connection.execute('CREATE TABLE received_data (value TEXT NOT NULL)')
+      connection.execute("INSERT INTO received_data VALUES ('initial data')")
+      connection.execute('PRAGMA user_version=1')
+    self.initial_database = self.database.read_bytes()
     self.commands = []
+
+  def update_database(self, value, *, schema=1):
+    with sqlite3.connect(self.database) as connection:
+      connection.execute('UPDATE received_data SET value=?', (value,))
+      connection.execute(f'PRAGMA user_version={schema}')
+
+  def received_data(self):
+    with sqlite3.connect(self.database) as connection:
+      return connection.execute('SELECT value FROM received_data').fetchone()[0]
 
   def existing(self, kind):
     base = self.root / ('opt/expri/dashboard/ab' if kind == 'ab' else 'opt/expri')
@@ -134,12 +148,12 @@ class InstallerTests(unittest.TestCase):
     link.symlink_to('releases/' + OLD if kind == 'ab' else release / 'expri')
     return link, release
 
-  def install(self, kind='ab', files=None, branch=None, health=lambda *_: None, sha=None):
+  def install(self, kind='ab', files=None, branch=None, health=lambda *_: None, sha=None, execute=None):
     branch = branch or ('main' if kind == 'main' else 'feature/demo')
     files = files or (web_files() if kind == 'ab' else {'expri': b'new binary'})
     upload = archive(self.root / 'upload.tar.gz', files, branch=branch)
     return installer.install(upload, kind, NEW, branch, sha or installer.digest(upload), root=self.root,
-      check_health=health, execute=lambda *args: self.commands.append(args))
+      check_health=health, execute=execute or (lambda *args: self.commands.append(args)))
 
   def test_ab_activation_keeps_backend_data_and_old_assets(self):
     link, old = self.existing('ab')
@@ -150,7 +164,7 @@ class InstallerTests(unittest.TestCase):
     self.assertTrue(old.is_dir())
     self.assertEqual(self.commands, [])
     self.assertEqual(result['built_from_branch'], 'feature/demo')
-    self.assertEqual(self.database.read_bytes(), b'initial data')
+    self.assertEqual(self.database.read_bytes(), self.initial_database)
     self.assertEqual(self.config.read_text(), self.configuration)
 
   def test_failed_ab_health_restores_previous_link_without_restart(self):
@@ -168,15 +182,100 @@ class InstallerTests(unittest.TestCase):
     link, old = self.existing('main')
     def health(kind, release):
       if release.name == NEW:
-        self.database.write_bytes(b'upload accepted during deployment')
+        self.update_database('upload accepted during deployment')
         raise RuntimeError('new process unhealthy')
       self.assertEqual(release, old)
     with self.assertRaisesRegex(RuntimeError, 'new process unhealthy'):
       self.install('main', health=health)
     self.assertEqual(link.resolve(), old / 'expri')
-    self.assertEqual(self.commands[-2:], [('systemctl', 'restart', 'expri'), ('systemctl', 'restart', 'expri')])
-    self.assertEqual(self.database.read_bytes(), b'upload accepted during deployment')
+    self.assertEqual(self.commands[-3:], [('systemctl', 'restart', 'expri'),
+      ('systemctl', 'stop', 'expri'), ('systemctl', 'restart', 'expri')])
+    self.assertEqual(self.received_data(), 'upload accepted during deployment')
+    self.assertEqual(installer.metadata_schema(self.root), 1)
     self.assertEqual(self.config.read_text(), self.configuration)
+
+  def test_migration_health_failure_keeps_new_binary_and_received_data(self):
+    link, old = self.existing('main')
+    def health(kind, release):
+      self.assertEqual(release.name, NEW)
+      self.update_database('upload accepted after migration', schema=2)
+      raise RuntimeError('new process unhealthy')
+    with self.assertRaisesRegex(RuntimeError, 'schema changed from 1 to 2.*Automatic rollback was skipped'):
+      self.install('main', health=health)
+    self.assertEqual(link.resolve().parent.name, NEW)
+    self.assertEqual(self.commands[-1:], [('systemctl', 'stop', 'expri')])
+    self.assertEqual(sum(command == ('systemctl', 'restart', 'expri') for command in self.commands), 1)
+    self.assertEqual(installer.metadata_schema(self.root), 2)
+    self.assertEqual(self.received_data(), 'upload accepted after migration')
+    self.assertEqual(self.config.read_text(), self.configuration)
+    self.assertTrue((old / 'expri').is_file())
+
+  def test_failure_stops_new_process_before_checking_for_late_migration(self):
+    link, _ = self.existing('main')
+    def execute(*args):
+      self.commands.append(args)
+      if args == ('systemctl', 'stop', 'expri'):
+        self.update_database('migration committed before stop finished', schema=2)
+    def health(*_):
+      raise RuntimeError('health check failed before migration completed')
+    with self.assertRaisesRegex(RuntimeError, 'schema changed from 1 to 2.*service stopped'):
+      self.install('main', health=health, execute=execute)
+    self.assertEqual(link.resolve().parent.name, NEW)
+    self.assertEqual(self.commands[-1], ('systemctl', 'stop', 'expri'))
+    self.assertEqual(sum(command == ('systemctl', 'restart', 'expri') for command in self.commands), 1)
+    self.assertEqual(self.received_data(), 'migration committed before stop finished')
+
+  def test_failed_stop_forbids_rollback_even_when_schema_is_unchanged(self):
+    link, _ = self.existing('main')
+    def execute(*args):
+      self.commands.append(args)
+      if args == ('systemctl', 'stop', 'expri'):
+        raise RuntimeError('stop request failed')
+    def health(*_):
+      raise RuntimeError('new process unhealthy')
+    with self.assertRaisesRegex(RuntimeError, 'could not be stopped.*Automatic rollback was skipped'):
+      self.install('main', health=health, execute=execute)
+    self.assertEqual(link.resolve().parent.name, NEW)
+    self.assertEqual(sum(command == ('systemctl', 'restart', 'expri') for command in self.commands), 1)
+    self.assertEqual(installer.metadata_schema(self.root), 1)
+    self.assertEqual(self.received_data(), 'initial data')
+
+  def test_unreadable_post_startup_schema_keeps_new_binary_without_rollback(self):
+    link, _ = self.existing('main')
+    def health(*_):
+      self.database.write_bytes(b'unreadable upgraded database')
+      raise RuntimeError('new process unhealthy')
+    with self.assertRaisesRegex(RuntimeError, 'metadata schema cannot be read.*Operator recovery is required'):
+      self.install('main', health=health)
+    self.assertEqual(link.resolve().parent.name, NEW)
+    self.assertEqual(sum(command == ('systemctl', 'restart', 'expri') for command in self.commands), 1)
+    self.assertEqual(self.database.read_bytes(), b'unreadable upgraded database')
+
+  def test_unreadable_schema_is_rejected_before_activation(self):
+    link, old = self.existing('main')
+    self.database.write_bytes(b'unreadable existing database')
+    with self.assertRaisesRegex(RuntimeError, 'cannot read service metadata schema'):
+      self.install('main', health=lambda *_: self.fail('must not activate an unreadable store'))
+    self.assertEqual(link.resolve(), old / 'expri')
+    self.assertEqual(self.commands, [])
+
+  def test_successful_migration_reports_both_schema_versions(self):
+    link, _ = self.existing('main')
+    result = self.install('main', health=lambda *_: self.update_database('migrated data', schema=2))
+    self.assertEqual(link.resolve().parent.name, NEW)
+    self.assertEqual((result['metadata_schema_before'], result['metadata_schema_after']), (1, 2))
+    self.assertEqual(self.received_data(), 'migrated data')
+
+  def test_schema_inspection_reads_committed_wal_without_modifying_the_database(self):
+    with sqlite3.connect(self.database) as connection:
+      connection.execute('PRAGMA journal_mode=WAL')
+      connection.execute('PRAGMA user_version=2')
+      connection.commit()
+      before = self.database.read_bytes()
+      wal_before = self.database.with_name(self.database.name + '-wal').read_bytes()
+      self.assertEqual(installer.metadata_schema(self.root), 2)
+      self.assertEqual(self.database.read_bytes(), before)
+      self.assertEqual(self.database.with_name(self.database.name + '-wal').read_bytes(), wal_before)
 
   def test_main_initial_rollout_without_previews_does_not_probe_ab(self):
     link, _ = self.existing('main')

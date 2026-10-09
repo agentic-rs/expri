@@ -226,46 +226,16 @@ fn route<S: ObjectStorage>(
     .map_or("/", |uri| uri.as_str());
   if path == "/api/artifact" {
     return match crate::dashboard::server::artifact_download(dashboard, uri) {
-      Ok(crate::dashboard::artifacts::Download::Cloud {
-        url,
-        size,
-        filename,
-      }) => {
-        let mut reply = response(
-          if method == "HEAD" { 200 } else { 303 },
-          "application/octet-stream",
-          Vec::new(),
-        );
-        reply
-          .headers_mut()
-          .insert("Referrer-Policy", "no-referrer".parse().unwrap());
-        reply.headers_mut().insert(
-          "Content-Security-Policy",
-          "default-src 'none'; sandbox".parse().unwrap(),
-        );
-        if method == "HEAD" {
-          // S3 GET signatures cannot be followed with HEAD. Describe the
-          // download without exposing a method-mismatched signed redirect.
-          reply.headers_mut().insert("Content-Length", size.into());
-          reply.headers_mut().insert(
-            "Content-Disposition",
-            crate::dashboard::artifacts::disposition(&filename)
-              .parse()
-              .expect("safe attachment header"),
-          );
-        } else {
-          reply.headers_mut().insert(
-            "Location",
-            url
-              .parse()
-              .map_err(|_| ApiError::new(502, "invalid object storage download URL"))?,
-          );
-        }
-        Ok(reply)
-      }
-      Ok(_) => Err(ApiError::new(500, "invalid hosted artifact download")),
+      Ok(download) => download_response(method, download),
       Err(reply) => Ok(response(reply.status, reply.content_type, reply.body)),
     };
+  }
+  if path == "/api/archive" {
+    let (source, run_id) = archive_selection(request)?;
+    let download = dashboard
+      .archive_download(&source, &run_id)
+      .map_err(|_| ApiError::new(404, "result archive is unavailable"))?;
+    return download_response(method, download);
   }
   let reply = crate::dashboard::server::route_content(dashboard, uri);
   let mut result = response(reply.status, reply.content_type, reply.body);
@@ -281,6 +251,77 @@ fn route<S: ObjectStorage>(
       .insert("Content-Security-Policy", CHART_CSP.parse().unwrap());
   }
   Ok(result)
+}
+
+fn archive_selection(request: &HttpRequest<Vec<u8>>) -> ApiResult<(String, String)> {
+  let query = request.uri().query().unwrap_or_default();
+  if query.len() > 8192 || !request.body().is_empty() {
+    return Err(ApiError::new(400, "invalid archive selection"));
+  }
+  let mut fields = std::collections::BTreeMap::new();
+  for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+    if !matches!(name.as_ref(), "source" | "run_id")
+      || value.is_empty()
+      || fields
+        .insert(name.into_owned(), value.into_owned())
+        .is_some()
+    {
+      return Err(ApiError::new(400, "invalid archive selection"));
+    }
+  }
+  let source = fields
+    .remove("source")
+    .ok_or_else(|| ApiError::new(400, "missing archive source"))?;
+  let run_id = fields
+    .remove("run_id")
+    .ok_or_else(|| ApiError::new(400, "missing archive run"))?;
+  crate::dashboard::updates::validate_selection(&source, std::slice::from_ref(&run_id))
+    .map_err(|_| ApiError::new(400, "invalid archive selection"))?;
+  Ok((source, run_id))
+}
+
+fn download_response(
+  method: &str,
+  download: crate::dashboard::artifacts::Download,
+) -> ApiResult<HttpResponse<Vec<u8>>> {
+  let crate::dashboard::artifacts::Download::Cloud {
+    url,
+    size,
+    filename,
+  } = download
+  else {
+    return Err(ApiError::new(500, "invalid hosted artifact download"));
+  };
+  let mut reply = response(
+    if method == "HEAD" { 200 } else { 303 },
+    "application/octet-stream",
+    Vec::new(),
+  );
+  reply
+    .headers_mut()
+    .insert("Referrer-Policy", "no-referrer".parse().unwrap());
+  reply.headers_mut().insert(
+    "Content-Security-Policy",
+    "default-src 'none'; sandbox".parse().unwrap(),
+  );
+  if method == "HEAD" {
+    // Signed S3 GET links cannot be followed with HEAD; describe the attachment.
+    reply.headers_mut().insert("Content-Length", size.into());
+    reply.headers_mut().insert(
+      "Content-Disposition",
+      crate::dashboard::artifacts::disposition(&filename)
+        .parse()
+        .expect("safe attachment header"),
+    );
+  } else {
+    reply.headers_mut().insert(
+      "Location",
+      url
+        .parse()
+        .map_err(|_| ApiError::new(502, "invalid object storage download URL"))?,
+    );
+  }
+  Ok(reply)
 }
 
 #[cfg(test)]
@@ -417,6 +458,45 @@ mod tests {
         .parse()
         .unwrap();
     assert_eq!(handle(&store, &auth, &download).status(), 400);
+  }
+
+  #[test]
+  fn archive_download_requires_session_and_rejects_invalid_or_unready_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = BrowserAuth::new("https://expri.example.com", b"dashboard-password").unwrap();
+    let mut download = request(
+      "GET",
+      "/api/archive?source=hosted:project:worker&run_id=run-1",
+      b"",
+    );
+    assert_eq!(handle(&store, &auth, &download).status(), 401);
+    let mut login = request("POST", "/login", b"");
+    login
+      .headers_mut()
+      .insert("Origin", "https://expri.example.com".parse().unwrap());
+    let cookie = auth.login(&login, b"dashboard-password").unwrap();
+    download
+      .headers_mut()
+      .insert("Cookie", cookie.split(';').next().unwrap().parse().unwrap());
+    assert_eq!(handle(&store, &auth, &download).status(), 404);
+    for path in [
+      "/api/archive",
+      "/api/archive?source=hosted:project:worker&run_id=run-1&run_id=run-2",
+      "/api/archive?source=hosted:project:worker&run_id=run-1&path=inputs/private",
+    ] {
+      *download.uri_mut() = path.parse().unwrap();
+      let reply = handle(&store, &auth, &download);
+      assert_eq!(reply.status(), 400);
+      assert!(!reply.headers().contains_key("Location"));
+    }
+    *download.uri_mut() = "/api/archive?source=hosted:project:worker&run_id=run-1"
+      .parse()
+      .unwrap();
+    download
+      .headers_mut()
+      .insert("Origin", "https://attacker.invalid".parse().unwrap());
+    assert_eq!(handle(&store, &auth, &download).status(), 403);
   }
 
   #[test]

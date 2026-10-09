@@ -3,6 +3,7 @@ mod browser_assets;
 mod browser_auth;
 mod client;
 mod dashboard_data;
+mod notifications;
 pub(crate) mod publishing;
 mod server;
 mod storage;
@@ -60,6 +61,20 @@ enum ServiceSubcommand {
     project_id: String,
     #[arg(long)]
     origin: String,
+  },
+  /// Ask the server to archive received tracking files without downloading them first.
+  Archive {
+    #[arg(long)]
+    config: PathBuf,
+    #[arg(long)]
+    project_id: String,
+    #[arg(long)]
+    origin: String,
+    #[arg(long)]
+    run_id: String,
+    /// Export an acknowledged prefix of an unfinished run; requires an owner token.
+    #[arg(long)]
+    partial: bool,
   },
   /// Publish or retrieve an immutable private input file.
   Input {
@@ -164,6 +179,21 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       project_id,
       origin,
     } => client::list(config, project_id, origin)?,
+    ServiceSubcommand::Archive {
+      config,
+      project_id,
+      origin,
+      run_id,
+      partial,
+    } => client::archive(
+      &config,
+      &types::RunScope {
+        project_id,
+        origin,
+        run_id,
+      },
+      partial,
+    )?,
     ServiceSubcommand::Input { command } => match command {
       InputCommand::Put(options) => client::input_put(options)?,
       InputCommand::Get(options) => client::input_get(options)?,

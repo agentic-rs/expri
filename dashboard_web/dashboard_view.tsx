@@ -1,8 +1,9 @@
 import { Fragment, useSyncExternalStore, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
-import { FilesPanel } from "./dashboard_files";
+import { FilesPanel, formatFileSize } from "./dashboard_files";
 import type { ChartAxis, ChartTimeZone } from "./interactive_charts";
 import {
+  apiUrl,
   dateText,
   formatDuration,
   formatNumber,
@@ -598,6 +599,41 @@ function Overview({ detail }: { detail: Detail | null }) {
     </div>
   );
 }
+function ArchiveSummary({ detail }: { detail: Detail | null }) {
+  const archive = detail?.archive;
+  if (!detail || !archive) return null;
+  const labels = {
+    none: "No archive",
+    pending: "Archive pending",
+    uploading: "Archiving",
+    archived: "Archived",
+    failed: "Archive failed",
+  };
+  return (
+    <div id="archive-summary" className="notice" role="status">
+      <strong id="archive-status">{labels[archive.status] ?? "Archive status unknown"}</strong>
+      {archive.incomplete && <span> · Partial archive</span>}
+      {archive.status === "archived" && (
+        <>
+          {" · "}
+          <a
+            id="download-archive"
+            href={apiUrl("/api/archive", {
+              source: detail.source.source_id,
+              run_id: detail.run.run_id,
+            })}
+            target="_blank"
+            rel="noopener noreferrer"
+            download
+          >
+            Download archive{archive.file ? ` (${formatFileSize(archive.file.size)})` : ""}
+          </a>
+        </>
+      )}
+      {archive.last_error && <p>Archive issue: {archive.last_error.slice(0, 512)}</p>}
+    </div>
+  );
+}
 function ComparisonValues({ result, busy }: { result: Comparison | null; busy: boolean }) {
   const comparison = result?.comparison;
   return (
@@ -749,6 +785,9 @@ function ReviewWorkspace({
             {s.selected.length ? "Back to selection" : "Close review"}
           </button>
         </div>
+        {s.access_mode === "hosted" && s.review?.kind === "run" && (
+          <ArchiveSummary detail={s.detail} />
+        )}
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {tabs.map((tab) => (
             <button
