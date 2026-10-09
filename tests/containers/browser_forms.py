@@ -88,10 +88,30 @@ class Firefox:
     # window constraint, leaving the tested page and its security policy intact.
     self.call('POST', '/moz/context', {'context': 'chrome'})
     try:
-      self.call('POST', '/execute/sync', {'script':
-        'document.documentElement.style.setProperty("min-width", "0px", "important");', 'args': []})
+      self.call('POST', '/execute/sync', {'script': '''const root = document.documentElement;
+        root.style.setProperty('min-width', '0px', 'important');
+        root.getBoundingClientRect();''', 'args': []})
     finally:
       self.call('POST', '/moz/context', {'context': 'content'})
+
+  def set_viewport(self, width, height):
+    # Gecko can acknowledge Set Window Rect before the page's layout viewport
+    # reaches that width, especially after switching away from a download tab.
+    # Measure the actual CSS viewport and retry the native resize if necessary.
+    observed = None
+    for _ in range(3):
+      if width < 500:
+        self.allow_narrow_viewports()
+      self.call('POST', '/window/rect', {'width': width, 'height': height})
+      deadline = time.monotonic() + 3
+      matches = 0
+      while time.monotonic() < deadline:
+        observed = self.call('POST', '/execute/sync', {'script': 'return innerWidth;', 'args': []})
+        matches = matches + 1 if observed == width else 0
+        if matches == 2:
+          return
+        time.sleep(0.1)
+    raise AssertionError(f'Firefox layout viewport stayed {observed} CSS pixels wide after requesting {width}')
 
   def element(self, selector, using='css selector'):
     return self.call('POST', '/element', {'using': using, 'value': selector})[ELEMENT]
@@ -562,7 +582,7 @@ def deep_link(run_id, second_run_id):
         && frame?.getAttribute('src')
         && JSON.stringify(new URL(frame.src).searchParams.getAll('run_id')) === JSON.stringify([arguments[1]]);''', source_id, expected)
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate(link)
     wait_for(lambda: browser.call('GET', '/url') == ORIGIN + '/login?' + query,
       'logged-out run link did not retain its identity at login')
@@ -635,7 +655,7 @@ def artifact_files(browser, run_id):
   assert evaluate("return document.querySelectorAll('#selected-file-downloads a').length;") == 1, 'selected download did not show one explicit native link'
   show_files()
   capture('workspace-files')
-  browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+  browser.set_viewport(500, 800)
   assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Files view overflows horizontally'
   assert evaluate('''return ['#refresh-files', '#files-search', '#download-selected-files', '#artifact-config-path', '#artifact-pull-command'].every(selector => {
     const box = document.querySelector(selector).getBoundingClientRect();
@@ -643,7 +663,7 @@ def artifact_files(browser, run_id):
   });'''), 'narrow Files controls are clipped'
   show_files()
   capture('workspace-files-narrow')
-  browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+  browser.set_viewport(1440, 1000)
   target = DOWNLOADS / 'checkpoint.pt'
   target.unlink(missing_ok=True)
   (DOWNLOADS / 'checkpoint.pt.part').unlink(missing_ok=True)
@@ -699,7 +719,7 @@ def project_storage(run_id=None):
   def capture(name):
     Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelector('#workspace-view-storage') !== null;"), 'hosted project did not offer its Storage page')
@@ -753,7 +773,7 @@ def project_storage(run_id=None):
       browser.keys('#storage-search', 'checkpoint.pt')
       wait_for(lambda: evaluate("return document.querySelectorAll('#storage-rows tr').length === 1 && document.querySelector('#storage-rows').textContent.includes('outputs/checkpoint.pt');"), 'Storage search did not narrow uploaded outputs')
       capture('workspace-storage')
-      browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+      browser.set_viewport(500, 800)
       assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Storage page overflows horizontally'
       assert evaluate('''return ['#workspace-view-options', '#storage-kind-options', '#storage-search', '#refresh-storage', '#storage-page-label'].every(selector => {
         const box = document.querySelector(selector).getBoundingClientRect();
@@ -872,20 +892,19 @@ def run_table_columns(browser, run_ids):
   wait_for(lambda: settled() and 'loss · ascending' in evaluate("return document.querySelector('#run-sort-description').textContent;"), 'native keyboard header sorting did not select the metric')
   preserved()
   for width in [1440, 1024]:
-    browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+    browser.set_viewport(width, 1000)
     table_scroll_contained(browser, width)
     preserved()
     capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
   for width in [860, 859]:
-    browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+    browser.set_viewport(width, 1000)
     if width == 860:
       table_scroll_contained(browser, width)
     else:
       workspace_layout(browser, width)
     preserved()
-  browser.allow_narrow_viewports()
   for width in [320, 360]:
-    browser.call('POST', '/window/rect', {'width': width, 'height': 800})
+    browser.set_viewport(width, 800)
     table_scroll_contained(browser, width)
     assert evaluate('''const table = document.querySelector('#runs-region');
       return table.scrollWidth > table.clientWidth && ['#run-columns', '#run-column-search', '#run-reduction-options', '#search-input', '#task-input', '#status-options'].every(selector => {
@@ -893,7 +912,7 @@ def run_table_columns(browser, run_ids):
       });'''), f'{width}px custom table does not scroll or its controls are clipped'
     capture(f'workspace-columns-{width}')
     preserved()
-  browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+  browser.set_viewport(1440, 1000)
   for name in ['Parameter learning_rate', 'Metric loss']:
     browser.click(f'input[aria-label="{name}"] + span')
     wait_for(settled, 'removing a table column did not finish')
@@ -925,7 +944,7 @@ def workspace(run_id, second_run_id):
   def capture(name):
     Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
@@ -975,7 +994,7 @@ def workspace(run_id, second_run_id):
     wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'Refresh lost or duplicated chart interaction layers')
     interactive_charts(browser, [run_id, second_run_id])
     run_table_columns(browser, [run_id, second_run_id])
-    browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+    browser.set_viewport(500, 800)
     assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
     assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow dashboard overflows horizontally'
     assert evaluate('''return ['#source-select', '#refresh-button', '#search-input'].every(selector => {
@@ -1067,7 +1086,7 @@ def previews(run_id, second_run_id):
           'branch_title': 'Built from fixture/ab',
         }, 'preview deployment provenance does not match its pinned release'
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: browser.catalog()['status'] == 200, 'main login did not complete')
@@ -1160,7 +1179,7 @@ def project_workspace(run_id):
       const range=card.querySelector('[data-chart-range]'); return {range:[range.dataset.startX,range.dataset.endX],
         hidden:[...card.querySelectorAll('[data-chart-run]')].filter(node=>node.getAttribute('aria-pressed')==='false').map(node=>node.querySelector('code').textContent)};''')
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: settled() and project_selected(), 'hosted dashboard did not default to its project')
@@ -1199,10 +1218,10 @@ def project_workspace(run_id):
     evaluate("window.__project_chart_document=document.querySelector('#chart-frame').contentDocument;")
     project_layouts = {}
     for width in [1440, 1024]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      browser.set_viewport(width, 1000)
       project_layouts[width] = workspace_layout(browser, width, wide=True)
       capture('workspace-project-default-desktop' if width == 1440 else 'workspace-project-default-1024')
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     choose_run_table_columns(browser)
     browser.click('button[aria-label="Sort by Machine ascending"]')
     wait_for(settled, 'native Machine header did not finish sorting')
@@ -1217,16 +1236,15 @@ def project_workspace(run_id):
       assert geometry['page_width'] == reference['page_width'], f'{width}px choosing project columns widened the page'
       assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in reference['review']), f'{width}px choosing project columns moved or resized Review'
     for width in [1440, 1024]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      browser.set_viewport(width, 1000)
       stable_project_layout(width, scroll=True)
       capture('workspace-project-desktop' if width == 1440 else 'workspace-project-1024')
-    browser.allow_narrow_viewports()
     for width in [320, 360]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 800})
+      browser.set_viewport(width, 800)
       table_scroll_contained(browser, width)
       evaluate("document.querySelector('#runs-region').scrollIntoView({block:'start'});")
       capture(f'workspace-project-{width}')
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.click('#run-columns summary')
     for name in ['Parameter learning_rate', 'Metric loss']:
       browser.click(f'input[aria-label="{name}"] + span')
@@ -1234,9 +1252,9 @@ def project_workspace(run_id):
     assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '0', 'removing project columns did not restore its built-in table'
     browser.click('#run-columns summary')
     for width in [1440, 1024]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      browser.set_viewport(width, 1000)
       stable_project_layout(width)
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     choose_run_table_columns(browser)
     browser.click('#run-columns summary')
     stable_project_layout(1440, scroll=True)
@@ -1317,7 +1335,7 @@ def automatic_refresh(run_id, updated_run_id):
       'worker publication did not finish: ' + name, timeout=90)
   try:
     REFRESH_COORDINATION.unlink(missing_ok=True)
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh fixture runs did not load')
