@@ -118,7 +118,7 @@ pub(super) fn local_run(runs_dir: &Path, run_id: &str) -> Result<RunUpdate> {
   })
 }
 
-fn fixed_revision(run_dir: &Path, relative: &str) -> Result<Option<String>> {
+pub(super) fn fixed_revision(run_dir: &Path, relative: &str) -> Result<Option<String>> {
   let path = run_dir.join(relative);
   real_prefix(run_dir, path.parent().unwrap())?;
   let Some(metadata) = optional_metadata(&path)? else {

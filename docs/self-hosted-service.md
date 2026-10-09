@@ -84,6 +84,13 @@ printable ASCII bytes. It must differ from all owner and worker bearer tokens.
 Open the configured HTTPS URL and sign in with this dashboard password.
 The dashboard discovers synced project/worker sources and provides run details,
 parameters, metric comparisons, charts, bounded log tails, and a **Files** tab.
+Choose up to eight parameter or metric columns using the **Columns** checkbox
+tags. Click table headers to sort before paging, and use the table's
+**Last / Min / Max** tags to choose its metric values. Missing values
+stay at the end in either sort direction. Adding columns places the run table
+above the review workspace, with horizontal scrolling contained in the table
+on narrow screens. Sorting and column changes preserve the current review;
+these choices last for the current page.
 Workers must push a run before it appears. Files shows output names, sizes, and
 availability without reading checkpoint contents. **Worker (reported)** reflects
 the last published inventory; **Cloud** means a finalized file is downloadable.
@@ -149,8 +156,10 @@ their connection. Polling continues if notifications are unavailable.
 Hosted previews are bounded for small servers: the source catalog shows up to
 1,000 project/worker sources, browsing and filters cover the 500 runs most
 recently updated in the service per source, and cold overview reads have a
-30-second time budget. Within that selection, runs are displayed by their start
-time. Existing catalogs reconstruct update order from upload records and show a
+30-second time budget. Column discovery and sorting cover that same selection;
+sorting does not expand it to older runs. Runs start ordered by their start
+time, with parameter, metric, run ID, and status sorting available through table
+headers. Existing catalogs reconstruct update order from upload records and show a
 warning until fresh uploads establish service activity. Overview records are
 cached against the run-state file digest or tracking revision. Warnings identify
 missing or incomplete previews; refresh to retry. New tracking runs use the
@@ -392,9 +401,10 @@ internal HTTPS fixture. It reproduces the rejected null origins under
 flags and session revocation. The test browser accepts the generated certificate
 through its test-only WebDriver configuration. The browser also reviews the
 uploaded runs: direct selection/comparison, keyboard tabs, deferred log loading,
-refresh and filters. It checks the desktop layout and a narrow layout at a
-verified 500 CSS pixel viewport, saving screenshots for diagnostics. This Firefox
-check does not cover 320/360 pixel mobile widths. A second HTTPS hostname also
+refresh and filters. It checks parameter and metric checkbox columns, table
+summary tags, native sortable headers, and retained review state. It verifies
+desktop and 320/360/500 CSS pixel layouts, including table scrolling without
+page overflow, saving screenshots for diagnostics. A second HTTPS hostname also
 checks branch assets against the same catalog, cookie replay rejection, and
 independent login/logout sessions.
 An authenticated run link also survives native password sign-in, opens the exact

@@ -1,4 +1,5 @@
 mod reader;
+mod table_data;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use super::store::{ApiError, ApiResult, Store};
 use super::types::{FileRecord, FileTarget, RunScope, STREAM_BATCH, validate_component};
 use crate::dashboard::artifacts::Download;
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
+use crate::dashboard::table::{self, ListQuery};
 use crate::error::{ExpriError, Result};
 use crate::metric_charts::ChartXAxis;
 use crate::metrics::{self, Reduction, RunMetrics};
@@ -55,16 +57,11 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
     HostedDashboard::updates(self, source, run_ids)
   }
-  fn list(
-    &self,
-    source: &str,
-    search: Option<&str>,
-    task: Option<&str>,
-    status: Option<&str>,
-    limit: usize,
-    offset: usize,
-  ) -> Result<Value> {
-    HostedDashboard::list(self, source, search, task, status, limit, offset)
+  fn list_table(&self, source: &str, query: &ListQuery<'_>) -> Result<Value> {
+    HostedDashboard::list_table(self, source, query)
+  }
+  fn columns(&self, source: &str) -> Result<Value> {
+    HostedDashboard::columns(self, source)
   }
   fn detail(&self, source: &str, run_id: &str) -> Result<Value> {
     HostedDashboard::detail(self, source, run_id)
@@ -153,6 +150,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       .map_err(api_error)
   }
 
+  #[cfg(test)]
   pub fn list(
     &self,
     source_id: &str,
@@ -162,6 +160,28 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     limit: usize,
     offset: usize,
   ) -> Result<Value> {
+    self.list_table(
+      source_id,
+      &ListQuery {
+        search,
+        task,
+        status,
+        limit,
+        offset,
+        table: None,
+      },
+    )
+  }
+
+  pub(super) fn list_table(&self, source_id: &str, query: &ListQuery<'_>) -> Result<Value> {
+    let ListQuery {
+      search,
+      task,
+      status,
+      limit,
+      offset,
+      table,
+    } = *query;
     if !(1..=100).contains(&limit) || offset > OVERVIEW_LIMIT {
       return Err(message(
         "hosted list pages support 1 to 100 rows and offsets up to 500",
@@ -249,11 +269,55 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       }
       rows.push(run.clone());
     }
-    rows.sort_by(|left, right| {
-      started_at(right)
-        .cmp(&started_at(left))
-        .then_with(|| right["run_id"].as_str().cmp(&left["run_id"].as_str()))
-    });
+    if let Some(options) = table {
+      let mut table_rows = Vec::with_capacity(rows.len());
+      for group in rows.chunks(4) {
+        let next = std::thread::scope(|threads| {
+          let handles: Vec<_> = group
+            .iter()
+            .map(|run| {
+              let scope = RunScope {
+                project_id: source.project_id.clone(),
+                origin: source.origin.clone(),
+                run_id: run["run_id"].as_str().unwrap().into(),
+              };
+              threads.spawn(move || {
+                let (data, warnings) = self.table_data(
+                  &scope,
+                  options.needs_params(),
+                  options.needs_metrics(),
+                  deadline,
+                );
+                (table::TableRow::new(run.clone(), data), warnings)
+              })
+            })
+            .collect();
+          handles
+            .into_iter()
+            .zip(group)
+            .map(|(handle,run)| handle.join().unwrap_or_else(|_| (
+              table::TableRow::new(run.clone(),table::ScalarData::default()),
+              vec![json!({"run_id":run["run_id"],"message":"Table columns are unavailable; refresh to retry."})],
+            )))
+            .collect::<Vec<_>>()
+        });
+        for (row, next_warnings) in next {
+          table_rows.push(row);
+          warnings.extend(next_warnings);
+        }
+      }
+      options.sort_rows(&mut table_rows);
+      rows = table_rows
+        .into_iter()
+        .map(|row| options.project(row))
+        .collect();
+    } else {
+      rows.sort_by(|left, right| {
+        started_at(right)
+          .cmp(&started_at(left))
+          .then_with(|| right["run_id"].as_str().cmp(&left["run_id"].as_str()))
+      });
+    }
     let total_count = rows.len();
     let mut metadata_truncated = overview_truncated;
     let rows: Vec<_> = rows
@@ -265,6 +329,52 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let next_offset = offset.saturating_add(rows.len());
     Ok(
       json!({"source": source, "runs": rows, "warnings": bounded_warnings(&warnings), "total_count": total_count, "catalog_total_count": page.total_count, "limit": limit, "offset": offset, "next_offset": (next_offset < total_count).then_some(next_offset), "metadata_truncated": metadata_truncated}),
+    )
+  }
+
+  pub(super) fn columns(&self, source_id: &str) -> Result<Value> {
+    let source = parse_source(source_id)?;
+    let page = self
+      .store
+      .dashboard_runs(&source.project_id, &source.origin, OVERVIEW_LIMIT, 0)
+      .map_err(api_error)?;
+    if page.total_count == 0 {
+      return Err(message(format!("unknown source: {source_id}")));
+    }
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let mut columns = table::Columns::default();
+    let mut warnings = Vec::new();
+    for group in page.items.chunks(4) {
+      let results = std::thread::scope(|threads| {
+        let handles: Vec<_> = group
+          .iter()
+          .map(|scope| threads.spawn(move || self.table_data(scope, true, true, deadline)))
+          .collect();
+        handles
+          .into_iter()
+          .zip(group)
+          .map(|(handle,scope)| handle.join().unwrap_or_else(|_| (
+            table::ScalarData::default(),
+            vec![json!({"run_id":scope.run_id,"message":"Table columns are unavailable; refresh to retry."})],
+          )))
+          .collect::<Vec<_>>()
+      });
+      for (data, next_warnings) in results {
+        columns.add(&data);
+        columns.truncated |= next_warnings.iter().any(|warning| {
+          warning["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("columns are unavailable"))
+        });
+        warnings.extend(next_warnings);
+      }
+    }
+    columns.truncated |= page.total_count > OVERVIEW_LIMIT;
+    if columns.truncated {
+      warnings.push(json!({"message":"Column discovery covers the 500 most recently updated hosted runs and up to 100 parameter and metric keys; some columns are omitted."}));
+    }
+    Ok(
+      json!({"source":source,"available_columns":columns.response(),"warnings":bounded_warnings(&warnings)}),
     )
   }
 

@@ -39,6 +39,7 @@ class Firefox:
     DOWNLOADS.mkdir(mode=0o700, exist_ok=True)
     self.process = subprocess.Popen([
       'geckodriver', '--host', '127.0.0.1', '--port', '4444', '--log', 'fatal',
+      '--allow-system-access',
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
       env={**os.environ, 'TZ': 'Asia/Shanghai'})
     try:
@@ -80,6 +81,16 @@ class Firefox:
 
   def navigate(self, path, origin=ORIGIN):
     self.call('POST', '/url', {'url': origin + path})
+
+  def allow_narrow_viewports(self):
+    # Firefox's desktop window has a 500px minimum. Remove only that browser
+    # window constraint, leaving the tested page and its security policy intact.
+    self.call('POST', '/moz/context', {'context': 'chrome'})
+    try:
+      self.call('POST', '/execute/sync', {'script':
+        'document.documentElement.style.setProperty("min-width", "0px", "important");', 'args': []})
+    finally:
+      self.call('POST', '/moz/context', {'context': 'content'})
 
   def element(self, selector, using='css selector'):
     return self.call('POST', '/element', {'using': using, 'value': selector})[ELEMENT]
@@ -680,6 +691,100 @@ def artifact_files(browser, run_id):
   print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
 
 
+def choose_run_table_columns(browser):
+  def evaluate(script):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': []})
+  browser.click('#run-columns summary')
+  wait_for(lambda: evaluate("return !!document.querySelector('input[aria-label=\"Parameter learning_rate\"]:not(:disabled)');"), 'parameter column discovery did not finish')
+  for name in ['Parameter learning_rate', 'Metric loss']:
+    browser.click(f'input[aria-label="{name}"] + span')
+    wait_for(lambda: evaluate("return document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'choosing a run table column did not finish')
+  wait_for(lambda: evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '2', 'native checkbox tags did not select both columns')
+
+
+def run_table_columns(browser, run_ids):
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def capture(name):
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  def settled():
+    return evaluate("return document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';")
+  def selection():
+    return evaluate("return [...document.querySelectorAll('#run-rows input:checked')].map(node => node.getAttribute('aria-label')).sort();")
+  def loss_state():
+    return evaluate('''const doc = document.querySelector('#chart-frame').contentDocument;
+      const card = [...doc.querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss');
+      return {range: [card.querySelector('[data-chart-range]').dataset.startX, card.querySelector('[data-chart-range]').dataset.endX],
+        hidden: [...card.querySelectorAll('[data-chart-run]')].filter(node => node.getAttribute('aria-pressed') === 'false').map(node => node.querySelector('code').textContent)};''')
+  def preserved():
+    assert selection() == selected, 'table column or sort change lost selected runs'
+    assert evaluate("return document.querySelector('#review-tab-charts').getAttribute('aria-selected');") == 'true', 'table column or sort change lost the active review tab'
+    assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__table_chart_document;"), 'table column or sort change replaced the chart document'
+    assert loss_state() == explored, 'table column or sort change lost zoom or hidden curves'
+  browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+  try:
+    loss_prefix = '//section[@data-interactive-chart][h2="loss"]'
+    browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
+    browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '+', using='xpath')
+  finally:
+    browser.call('POST', '/frame', {'id': None})
+  selected = selection()
+  explored = loss_state()
+  assert explored['hidden'] == [run_ids[0]], 'table fixture did not establish a hidden curve'
+  evaluate("window.__table_chart_document = document.querySelector('#chart-frame').contentDocument;")
+  choose_run_table_columns(browser)
+  preserved()
+  assert evaluate('''return [...document.querySelectorAll('#run-rows td[data-column-kind="param"][data-column-key="/learning_rate"]')].every(node => Number(node.title) === 0.001)
+    && document.querySelectorAll('#run-rows td[data-column-kind="param"]').length === 2;'''), 'parameter table values differ from uploaded parameters'
+  for reduction, expected in [('max', 1.0), ('min', 1 / 80), ('last', 1 / 80)]:
+    browser.click('#run-reduction-' + reduction + ' + span')
+    wait_for(lambda: settled() and evaluate('''const values = [...document.querySelectorAll('#run-rows td[data-column-kind="metric"][data-column-key="loss"]')];
+      return values.length === 2 && values.every(node => Number(node.title) === arguments[0]);''', expected), 'table summary tag did not show exact uploaded values')
+    assert evaluate("return document.querySelector('input[name=\"run_reduction\"]:checked').value;") == reduction, 'table summary lost its native radio selection'
+    assert evaluate("return document.querySelector('input[name=\"reduction\"]:checked').value;") == 'last', 'table summary changed the independent comparison summary'
+    preserved()
+  for direction, expected in [('ascending', sorted(run_ids)), ('descending', sorted(run_ids, reverse=True))]:
+    browser.click(f'button[aria-label="Sort by Run {direction}"]')
+    wait_for(lambda: settled() and evaluate("return [...document.querySelectorAll('#run-rows .run-link')].map(node => node.textContent);") == expected, 'native run header did not sort the full listing')
+    assert evaluate("return document.querySelector('.run-column').getAttribute('aria-sort');") == direction, 'run header did not announce its sort direction'
+    preserved()
+  browser.keys('button[aria-label="Sort by loss ascending"]', ' ')
+  wait_for(lambda: settled() and 'loss · ascending' in evaluate("return document.querySelector('#run-sort-description').textContent;"), 'native keyboard header sorting did not select the metric')
+  preserved()
+  assert evaluate('''const table = document.querySelector('.runs-card').getBoundingClientRect();
+    const review = document.querySelector('#review-section').getBoundingClientRect();
+    return table.bottom <= review.top + 1;'''), 'custom run columns did not move the table above the review'
+  capture('workspace-columns-desktop')
+  browser.allow_narrow_viewports()
+  for width in [320, 360]:
+    browser.call('POST', '/window/rect', {'width': width, 'height': 800})
+    assert evaluate('return innerWidth;') == width, f'mobile viewport is not {width} CSS pixels wide'
+    assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), f'{width}px dashboard overflows horizontally'
+    assert evaluate('''const table = document.querySelector('#runs-region');
+      return table.scrollWidth > table.clientWidth && ['#run-columns', '#run-column-search', '#run-reduction-options', '#search-input', '#task-input', '#status-options'].every(selector => {
+        const rect = document.querySelector(selector).getBoundingClientRect(); return rect.left >= 0 && rect.right <= document.documentElement.clientWidth + 1;
+      });'''), f'{width}px custom table does not scroll or its controls are clipped'
+    capture(f'workspace-columns-{width}')
+    preserved()
+  browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+  for name in ['Parameter learning_rate', 'Metric loss']:
+    browser.click(f'input[aria-label="{name}"] + span')
+    wait_for(settled, 'removing a table column did not finish')
+  assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '0', 'removing all columns did not restore the compact table'
+  preserved()
+  if evaluate("return !document.querySelector('#reset-run-sort').disabled;"):
+    browser.click('#reset-run-sort')
+    wait_for(settled, 'resetting the table sort did not finish')
+  browser.click('#run-columns summary')
+  browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+  try:
+    browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
+    browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '\ue00c', using='xpath')
+  finally:
+    browser.call('POST', '/frame', {'id': None})
+  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, review/selection/zoom/visibility preserved, desktop and 320/360px table scroll without page overflow.', flush=True)
+
+
 def workspace(run_id, second_run_id):
   browser = Firefox()
   def evaluate(script, *args):
@@ -744,6 +849,7 @@ def workspace(run_id, second_run_id):
     assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__acceptance_chart_document;"), 'Refresh replaced the chart document and its HTTP security policy'
     wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'Refresh lost or duplicated chart interaction layers')
     interactive_charts(browser, [run_id, second_run_id])
+    run_table_columns(browser, [run_id, second_run_id])
     browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
     assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
     assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow dashboard overflows horizontally'
@@ -791,6 +897,15 @@ def workspace(run_id, second_run_id):
     browser.click('#clear-selection')
     assert not visible('#review-section') and visible('#review-empty'), 'Clear selection did not reset the workspace'
     assert_chart_document_cleaned(browser)
+    assert evaluate("return document.querySelectorAll('#status-options input[type=\"radio\"]').length;") == 8, 'fixed status choices are not native single-click radio tags'
+    browser.click('#status-completed + span')
+    wait_for(lambda: evaluate("return document.querySelector('#status-completed').checked && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'native Completed status tag did not finish filtering')
+    browser.keys('#status-completed', '\ue014')
+    wait_for(lambda: evaluate("return document.querySelector('#status-failed').checked && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'native status ArrowRight did not select Failed')
+    assert evaluate("return getComputedStyle(document.querySelector('#status-failed + span')).outlineStyle;") == 'solid', 'keyboard status tag has no visible focus'
+    assert evaluate("return document.querySelectorAll('#run-rows tr').length;") == 0, 'Failed status filter retained completed runs'
+    browser.click('#clear-filters')
+    wait_for(lambda: evaluate("return document.querySelector('#status-any').checked && document.querySelectorAll('#run-rows tr').length === 2;"), 'Clear filters did not restore the Any status tag')
     print('Firefox workspace passed: direct comparison, exact hover, native legend/zoom/keyboard, duplicate coordinates, sandbox/CSP, lazy logs, refresh/selection cleanup, desktop/narrow layout.', flush=True)
   finally:
     browser.close()
@@ -927,6 +1042,10 @@ def automatic_refresh(run_id, updated_run_id):
     for selected_run in [run_id, updated_run_id]:
       browser.click(f'input[aria-label="Select {selected_run} for comparison"]')
     wait_for(lambda: loss_state() is not None and last_comparison_step() == 'step 79', 'auto-refresh comparison did not load its initial samples')
+    choose_run_table_columns(browser)
+    browser.click('button[aria-label="Sort by Run ascending"]')
+    wait_for(lambda: evaluate("return document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'automatic update fixture did not finish run sorting')
+    browser.click('#run-columns summary')
     select_chart_axis(browser, 'elapsed')
     wait_for(lambda: (loss_state() or {}).get('axis') == 'elapsed', 'auto-refresh fixture did not select elapsed time')
     # Let the initial revision baseline settle before proving a later unchanged
@@ -987,6 +1106,10 @@ def automatic_refresh(run_id, updated_run_id):
     assert any('step 80 · value 0.005' in label for label in after['point_labels']), 'replacement omitted the new exact metric sample'
     assert selection() == selected_labels, 'automatic update changed selected runs'
     assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'automatic update changed the task filter'
+    assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '2', 'automatic update changed selected run table columns'
+    assert evaluate("return document.querySelector('.run-column').getAttribute('aria-sort');") == 'ascending', 'automatic update changed run table sorting'
+    wait_for(lambda: evaluate('''const row = [...document.querySelectorAll('#run-rows tr')].find(node => node.querySelector('.run-link').textContent === arguments[0]);
+      return Number(row?.querySelector('td[data-column-kind="metric"][data-column-key="loss"]')?.title) === 0.005;''', updated_run_id), 'new metric sample did not update its selected run table column', timeout=15)
     assert evaluate("return document.querySelector('#review-tab-charts').getAttribute('aria-selected');") == 'true', 'automatic update changed the active tab'
     assert evaluate("return document.querySelector('#chart-frame').contentDocument === window.__refresh_original_document;"), 'automatic replacement changed the HTTP chart document'
     assert evaluate("return document.querySelector('#chart-frame').getAttribute('sandbox');").split() == ['allow-same-origin'], 'automatic replacement weakened the iframe sandbox'
@@ -1035,6 +1158,7 @@ def automatic_refresh(run_id, updated_run_id):
     assert loss_state()['range'] == before['range'] and loss_state()['hidden'] == [run_id], 'pause/resume lost chart exploration state'
     assert loss_state()['axis'] == 'wall_clock', 'pause/resume changed the selected wall-clock axis'
     assert loss_state()['time_zone'] == 'utc' and evaluate("return document.querySelector('#time-zone-utc').checked;"), 'pause/resume changed the selected timezone'
+    assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '2' and evaluate("return document.querySelector('.run-column').getAttribute('aria-sort');") == 'ascending', 'pause/resume lost run table columns or sorting'
 
     # Inspect the updated run's logs; another real publication must update this
     # tab alone and leave its selection and filter intact.

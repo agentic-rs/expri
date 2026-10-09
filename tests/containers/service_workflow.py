@@ -182,6 +182,7 @@ def dashboard_public_checks():
   result = browser('/')
   assert result['status'] == 303 and result['headers'].get('location') == '/login', 'public dashboard root did not redirect to login'
   assert browser('/api/catalog')['status'] == 401, 'unauthenticated dashboard API exposed data'
+  assert browser('/api/run-columns?source=service:demo:worker')['status'] == 401, 'unauthenticated run columns exposed data'
   assert browser('/api/artifacts?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated artifact catalog exposed data'
   assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
   assert browser('/api/archive?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated archive download exposed data'
@@ -213,6 +214,16 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert len(matching) == 1, 'uploaded worker source is missing from the hosted catalog'
   assert matching[0]['kind'] == 'service', 'hosted source kind must match the service frontend contract'
   source_id = matching[0]['source_id']
+  columns = browser_json('/api/run-columns?' + urlencode({'source': source_id}), cookie)
+  assert any(column['key'] == '/learning_rate' for column in columns['available_columns']['params']), 'hosted run column discovery omitted the uploaded parameter'
+  assert any(column['key'] == 'loss' for column in columns['available_columns']['metrics']), 'hosted run column discovery omitted the uploaded metric'
+  for reduction, expected in [('max', 1.0), ('min', 1 / 80), ('last', 1 / 80)]:
+    values = browser_json('/api/runs?' + urlencode([
+      ('source', source_id), ('param', '/learning_rate'), ('metric', 'loss'),
+      ('reduction', reduction), ('sort', 'run_id'), ('direction', 'asc'),
+    ]), cookie)['runs']
+    assert [run['run_id'] for run in values] == sorted([run_id, second_run_id]), 'hosted table sorting changed the full uploaded run listing'
+    assert all(run['table_values']['params']['/learning_rate'] == 0.001 and run['table_values']['metrics']['loss'] == expected for run in values), 'hosted table column values differ from the uploaded parameters or metric reduction'
   listing = browser_json('/api/runs?' + urlencode({
     'source': source_id, 'status': 'completed', 'task': 'train', 'search': run_id, 'limit': 20, 'offset': 0,
   }), cookie)
@@ -621,6 +632,7 @@ finally:
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
         for name in [
           'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
+          'workspace-columns-desktop', 'workspace-columns-320', 'workspace-columns-360',
           'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
           'workspace-elapsed', 'workspace-wall_clock',
           'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',

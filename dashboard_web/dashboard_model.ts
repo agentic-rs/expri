@@ -37,6 +37,24 @@ export type Run = {
   started_at: string | null;
   finished_at: string | null;
   exit_code: number | null;
+  table_values?: {
+    params: Record<string, RunTableValue>;
+    metrics: Record<string, number | null>;
+  };
+  table_values_truncated?: boolean;
+};
+export type RunTableValue = null | boolean | number | string;
+export type RunColumnChoice = { key: string; label: string };
+export type RunColumn = RunColumnChoice & { kind: "param" | "metric" };
+export type RunSort = { key: string; direction: "asc" | "desc" };
+export type AvailableRunColumns = {
+  params: RunColumnChoice[];
+  metrics: RunColumnChoice[];
+  truncated: boolean;
+};
+export type RunColumns = {
+  available_columns: AvailableRunColumns;
+  warnings: Warning[];
 };
 export type Point = { step: number; value: number; timestamp?: string };
 export type Metric = { count: number; last: Point; min: Point; max: Point };

@@ -401,7 +401,7 @@ impl Query {
       values.push(value.into_owned());
     }
     for (name, values) in &fields {
-      if values.len() > 1 && !matches!(name.as_str(), "run_id" | "metric") {
+      if values.len() > 1 && !matches!(name.as_str(), "run_id" | "metric" | "param") {
         return Err(Reply::error(400, format!("duplicate query field: {name}")));
       }
     }
@@ -608,20 +608,55 @@ fn route_content_checked(
       ))
     }
     "/api/runs" => {
-      query.allow(&["source", "search", "task", "status", "limit", "offset"])?;
+      query.allow(&[
+        "source",
+        "search",
+        "task",
+        "status",
+        "limit",
+        "offset",
+        "param",
+        "metric",
+        "reduction",
+        "sort",
+        "direction",
+      ])?;
       let limit = query.number("limit", 100, 1, 1000)?;
       let offset = query.number("offset", 0, 0, usize::MAX)?;
+      let table = ["param", "metric", "reduction", "sort", "direction"]
+        .iter()
+        .any(|field| query.optional(field).is_some())
+        .then(|| {
+          super::table::TableOptions::parse(
+            query.many("param"),
+            query.many("metric"),
+            query.optional("reduction").unwrap_or("last"),
+            query.optional("sort"),
+            query.optional("direction"),
+          )
+        })
+        .transpose()
+        .map_err(service_error)?;
       Ok(Reply::json(
         dashboard
-          .list(
+          .list_table(
             source,
-            query.optional("search"),
-            query.optional("task"),
-            query.optional("status"),
-            limit,
-            offset,
+            &super::table::ListQuery {
+              search: query.optional("search"),
+              task: query.optional("task"),
+              status: query.optional("status"),
+              limit,
+              offset,
+              table: table.as_ref(),
+            },
           )
           .map_err(service_error)?,
+      ))
+    }
+    "/api/run-columns" => {
+      query.allow(&["source"])?;
+      Ok(Reply::json(
+        dashboard.columns(source).map_err(service_error)?,
       ))
     }
     "/api/run" => {

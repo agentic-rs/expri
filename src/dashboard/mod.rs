@@ -1,6 +1,8 @@
 pub(crate) mod artifacts;
 pub(crate) mod preview;
 pub(crate) mod server;
+pub(crate) mod table;
+mod table_cache;
 pub(crate) mod updates;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,21 +60,15 @@ pub struct Dashboard {
   results_dir: String,
   targets: BTreeSet<String>,
   initial_source: String,
+  table_cache: table_cache::Cache,
 }
 
 /// Shared dashboard views keep local and hosted routes on the same API contract.
 pub(crate) trait DashboardView {
   fn catalog(&self) -> Result<Value>;
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value>;
-  fn list(
-    &self,
-    source: &str,
-    search: Option<&str>,
-    task: Option<&str>,
-    status: Option<&str>,
-    limit: usize,
-    offset: usize,
-  ) -> Result<Value>;
+  fn list_table(&self, source: &str, query: &table::ListQuery<'_>) -> Result<Value>;
+  fn columns(&self, source: &str) -> Result<Value>;
   fn detail(&self, source: &str, run_id: &str) -> Result<Value>;
   fn artifacts(&self, source: &str, run_id: &str) -> Result<Value>;
   fn artifact_download(
@@ -105,16 +101,11 @@ impl DashboardView for Dashboard {
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
     Dashboard::updates(self, source, run_ids)
   }
-  fn list(
-    &self,
-    source: &str,
-    search: Option<&str>,
-    task: Option<&str>,
-    status: Option<&str>,
-    limit: usize,
-    offset: usize,
-  ) -> Result<Value> {
-    Dashboard::list(self, source, search, task, status, limit, offset)
+  fn list_table(&self, source: &str, query: &table::ListQuery<'_>) -> Result<Value> {
+    Dashboard::list_table(self, source, query)
+  }
+  fn columns(&self, source: &str) -> Result<Value> {
+    Dashboard::columns(self, source)
   }
   fn detail(&self, source: &str, run_id: &str) -> Result<Value> {
     Dashboard::detail(self, source, run_id)
@@ -179,6 +170,7 @@ impl Dashboard {
       results_dir,
       targets,
       initial_source,
+      table_cache: table_cache::Cache::default(),
     };
     dashboard.local_runs_dir()?;
     dashboard.sources()?;
@@ -313,6 +305,7 @@ impl Dashboard {
     })
   }
 
+  #[cfg(test)]
   pub fn list(
     &self,
     source_id: &str,
@@ -322,8 +315,33 @@ impl Dashboard {
     limit: usize,
     offset: usize,
   ) -> Result<Value> {
+    self.list_table(
+      source_id,
+      &table::ListQuery {
+        search,
+        task,
+        status,
+        limit,
+        offset,
+        table: None,
+      },
+    )
+  }
+
+  pub(crate) fn list_table(&self, source_id: &str, query: &table::ListQuery<'_>) -> Result<Value> {
+    let table::ListQuery {
+      search,
+      task,
+      status,
+      limit,
+      offset,
+      table,
+    } = *query;
     if !(1..=1000).contains(&limit) {
       return Err(message("limit must be between 1 and 1000"));
+    }
+    if table.is_some_and(|table| table.needs_params() || table.needs_metrics()) && limit > 100 {
+      return Err(message("table column pages support at most 100 rows"));
     }
     let (source, runs_dir) = self.source(source_id)?;
     let report = runs::query_directory(
@@ -351,6 +369,26 @@ impl Dashboard {
       })
       .cloned()
       .collect();
+    let mut warnings = report["warnings"].as_array().cloned().unwrap_or_default();
+    let records = if let Some(options) = table {
+      let mut rows = records
+        .into_iter()
+        .map(|run| {
+          let data = self.table_data(
+            &runs_dir,
+            run["run_id"].as_str().unwrap(),
+            options.needs_params(),
+            options.needs_metrics(),
+            &mut warnings,
+          );
+          table::TableRow::new(run, data)
+        })
+        .collect::<Vec<_>>();
+      options.sort_rows(&mut rows);
+      rows.into_iter().map(|row| options.project(row)).collect()
+    } else {
+      records
+    };
     let total_count = records.len();
     let mut metadata_truncated = false;
     let records: Vec<_> = records
@@ -362,8 +400,129 @@ impl Dashboard {
     let next_offset = offset.saturating_add(records.len());
     let next_offset = (next_offset < total_count).then_some(next_offset);
     Ok(
-      json!({"source": source, "runs": records, "warnings": bounded_warnings(report["warnings"].as_array().unwrap()), "total_count": total_count, "limit": limit, "offset": offset, "next_offset": next_offset, "metadata_truncated": metadata_truncated}),
+      json!({"source": source, "runs": records, "warnings": bounded_warnings(&warnings), "total_count": total_count, "limit": limit, "offset": offset, "next_offset": next_offset, "metadata_truncated": metadata_truncated}),
     )
+  }
+
+  pub(crate) fn columns(&self, source_id: &str) -> Result<Value> {
+    let (source, runs_dir) = self.source(source_id)?;
+    let report = runs::query_directory(
+      &runs_dir,
+      &RunQueryRequest::List {
+        task: None,
+        status: None,
+        limit: None,
+      },
+    )?;
+    let runs = report["runs"].as_array().unwrap();
+    let mut columns = table::Columns::default();
+    let mut warnings = report["warnings"].as_array().cloned().unwrap_or_default();
+    // Discovery is an explicit picker read, bounded independently of run sorting.
+    for run in runs.iter().take(500) {
+      columns.add(&self.table_data(
+        &runs_dir,
+        run["run_id"].as_str().unwrap(),
+        true,
+        true,
+        &mut warnings,
+      ));
+    }
+    columns.truncated |= runs.len() > 500;
+    if columns.truncated {
+      warnings.push(json!({"message":"Column discovery covers up to 500 recent runs and 100 parameter and metric keys; some columns are omitted."}));
+    }
+    Ok(
+      json!({"source":source,"available_columns":columns.response(),"warnings":bounded_warnings(&warnings)}),
+    )
+  }
+
+  fn table_data(
+    &self,
+    runs_dir: &std::path::Path,
+    run_id: &str,
+    params: bool,
+    metric_values: bool,
+    warnings: &mut Vec<Value>,
+  ) -> table::ScalarData {
+    if !params && !metric_values {
+      return table::ScalarData::default();
+    }
+    let run = runs_dir.join(run_id);
+    let revision = match table_cache::Cache::revision(&run, params, metric_values) {
+      Ok(revision) => revision,
+      Err(error) => {
+        warnings.push(
+          json!({"run_id":run_id,"message":format!("Table columns are unavailable: {error}")}),
+        );
+        return table::ScalarData::default();
+      }
+    };
+    if let Some((data, next_warnings)) =
+      self.table_cache.get(&run, params, metric_values, &revision)
+    {
+      warnings.extend(next_warnings);
+      return data;
+    }
+    let mut next_warnings = Vec::new();
+    let data =
+      self.table_data_uncached(runs_dir, run_id, params, metric_values, &mut next_warnings);
+    if table_cache::Cache::revision(&run, params, metric_values)
+      .is_ok_and(|after| after == revision)
+    {
+      self.table_cache.insert(
+        (run, params, metric_values),
+        revision,
+        data.clone(),
+        bounded_warnings(&next_warnings),
+      );
+    }
+    warnings.extend(next_warnings);
+    data
+  }
+
+  fn table_data_uncached(
+    &self,
+    runs_dir: &std::path::Path,
+    run_id: &str,
+    params: bool,
+    metric_values: bool,
+    warnings: &mut Vec<Value>,
+  ) -> table::ScalarData {
+    let mut data = table::ScalarData::default();
+    if metric_values {
+      match metrics::read_summary_files(
+        runs_dir,
+        run_id,
+        &[],
+        metrics::MetricFiles {
+          metrics: true,
+          params,
+        },
+      ) {
+        Ok(result) => {
+          if params {
+            data.params = result.params;
+          }
+          warnings.extend(result.warnings);
+          for (name, series) in result.metrics {
+            data.add_metric(name, series.summary);
+          }
+          return data;
+        }
+        Err(error) => warnings.push(
+          json!({"run_id":run_id,"message":format!("Metric columns are unavailable: {error}")}),
+        ),
+      }
+    }
+    if params {
+      match metrics::read_parameters(runs_dir, run_id) {
+        Ok(value) => data.params = value,
+        Err(error) => warnings.push(
+          json!({"run_id":run_id,"message":format!("Parameter columns are unavailable: {error}")}),
+        ),
+      }
+    }
+    data
   }
 
   pub fn detail(&self, source_id: &str, run_id: &str) -> Result<Value> {

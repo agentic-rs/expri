@@ -108,7 +108,7 @@ pub fn read_with_files(
 /// Read complete scalar summaries without retaining metric point arrays.
 /// Dashboard tables do not need curves; the file/row limits still bound reads.
 pub fn read_summaries(runs_dir: &Path, run_id: &str, filters: &[String]) -> Result<RunMetrics> {
-  read_mode(
+  read_summary_files(
     runs_dir,
     run_id,
     filters,
@@ -116,8 +116,16 @@ pub fn read_summaries(runs_dir: &Path, run_id: &str, filters: &[String]) -> Resu
       metrics: true,
       params: true,
     },
-    false,
   )
+}
+
+pub(crate) fn read_summary_files(
+  runs_dir: &Path,
+  run_id: &str,
+  filters: &[String],
+  files: MetricFiles,
+) -> Result<RunMetrics> {
+  read_mode(runs_dir, run_id, filters, files, false)
 }
 
 fn read_mode(
