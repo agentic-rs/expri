@@ -230,6 +230,10 @@ fn route<S: ObjectStorage>(
       Err(reply) => Ok(response(reply.status, reply.content_type, reply.body)),
     };
   }
+  if path == "/api/input" {
+    let (project_id, input_id) = input_selection(request)?;
+    return download_response(method, dashboard.input_download(&project_id, &input_id)?);
+  }
   if path == "/api/archive" {
     let (source, run_id) = archive_selection(request)?;
     let download = dashboard
@@ -278,6 +282,34 @@ fn archive_selection(request: &HttpRequest<Vec<u8>>) -> ApiResult<(String, Strin
   crate::dashboard::updates::validate_selection(&source, std::slice::from_ref(&run_id))
     .map_err(|_| ApiError::new(400, "invalid archive selection"))?;
   Ok((source, run_id))
+}
+
+fn input_selection(request: &HttpRequest<Vec<u8>>) -> ApiResult<(String, String)> {
+  let query = request.uri().query().unwrap_or_default();
+  if query.len() > 512 || !request.body().is_empty() {
+    return Err(ApiError::new(400, "invalid input selection"));
+  }
+  let mut fields = std::collections::BTreeMap::new();
+  for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+    if !matches!(name.as_ref(), "project_id" | "input_id")
+      || super::types::validate_component(&value).is_err()
+      || fields
+        .insert(name.into_owned(), value.into_owned())
+        .is_some()
+    {
+      return Err(ApiError::new(400, "invalid input selection"));
+    }
+  }
+  if fields.len() != 2 {
+    return Err(ApiError::new(
+      400,
+      "input selection requires project_id and input_id",
+    ));
+  }
+  Ok((
+    fields.remove("project_id").unwrap(),
+    fields.remove("input_id").unwrap(),
+  ))
 }
 
 fn download_response(
@@ -458,6 +490,124 @@ mod tests {
         .parse()
         .unwrap();
     assert_eq!(handle(&store, &auth, &download).status(), 400);
+  }
+
+  #[test]
+  fn private_input_listing_and_download_require_a_session_and_exact_project_scope() {
+    use crate::service::types::{CompletedPart, FileTarget, Request};
+    let temporary = tempfile::tempdir().unwrap();
+    let storage = MockStorage::default();
+    let store = Store::open(temporary.path(), storage.clone()).unwrap();
+    store
+      .execute(Request::BeginUpload {
+        upload_id: "private-input-upload".into(),
+        target: FileTarget::Input {
+          project_id: "project".into(),
+          input_id: "dataset-v1".into(),
+        },
+        size: 8,
+        sha256: "a".repeat(64),
+      })
+      .unwrap();
+    storage.stage("private-input-upload", 8);
+    store
+      .execute(Request::RecordPart {
+        upload_id: "private-input-upload".into(),
+        part: CompletedPart {
+          part_number: 1,
+          etag: "part".into(),
+        },
+      })
+      .unwrap();
+    store
+      .execute(Request::CompleteUpload {
+        upload_id: "private-input-upload".into(),
+      })
+      .unwrap();
+    let auth = BrowserAuth::new("https://expri.example.com", b"dashboard-password").unwrap();
+    let path = "/api/input?project_id=project&input_id=dataset-v1";
+    assert_eq!(
+      handle(&store, &auth, &request("GET", path, b"")).status(),
+      401
+    );
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        &request("GET", "/api/storage?project_id=project&kind=input", b"")
+      )
+      .status(),
+      401
+    );
+    let mut login = request("POST", "/login", b"");
+    login
+      .headers_mut()
+      .insert("Origin", "https://expri.example.com".parse().unwrap());
+    let cookie = auth.login(&login, b"dashboard-password").unwrap();
+    let mut input = request("GET", path, b"");
+    input
+      .headers_mut()
+      .insert("Cookie", cookie.split(';').next().unwrap().parse().unwrap());
+    let listing = handle(
+      &store,
+      &auth,
+      &request_with_cookie("/api/storage?project_id=project&kind=input", &cookie),
+    );
+    assert_eq!(listing.status(), 200);
+    let body = std::str::from_utf8(listing.body()).unwrap();
+    assert!(body.contains(path));
+    assert!(!body.contains("storage.invalid") && !body.contains("projects/project/inputs/"));
+    let reply = handle(&store, &auth, &input);
+    assert_eq!(reply.status(), 303);
+    assert_eq!(reply.headers()["Referrer-Policy"], "no-referrer");
+    assert!(
+      reply.headers()["Location"]
+        .to_str()
+        .unwrap()
+        .contains("projects/project/inputs/dataset-v1/")
+    );
+    assert!(reply.body().is_empty());
+    *input.method_mut() = http::Method::HEAD;
+    let head = handle(&store, &auth, &input);
+    assert_eq!(head.status(), 200);
+    assert_eq!(head.headers()["Content-Length"], "8");
+    assert!(
+      head.headers()["Content-Disposition"]
+        .to_str()
+        .unwrap()
+        .contains("dataset-v1")
+    );
+    assert!(!head.headers().contains_key("Location"));
+    *input.method_mut() = http::Method::GET;
+    for invalid in [
+      "/api/input?project_id=other&input_id=dataset-v1",
+      "/api/input?project_id=project&input_id=missing",
+    ] {
+      *input.uri_mut() = invalid.parse().unwrap();
+      assert_eq!(handle(&store, &auth, &input).status(), 404);
+    }
+    for invalid in [
+      "/api/input?project_id=project&input_id=dataset-v1&input_id=dataset-v1",
+      "/api/input?project_id=project&input_id=dataset-v1&token=secret",
+      "/api/input?project_id=project&input_id=..",
+      "/api/artifact?source=hosted-project%3Aproject&run_id=worker%3Arun&path=inputs%2Fdataset-v1",
+    ] {
+      *input.uri_mut() = invalid.parse().unwrap();
+      assert_eq!(handle(&store, &auth, &input).status(), 400);
+    }
+    *input.uri_mut() = path.parse().unwrap();
+    input
+      .headers_mut()
+      .insert("Origin", "https://outside.invalid".parse().unwrap());
+    assert_eq!(handle(&store, &auth, &input).status(), 403);
+  }
+
+  fn request_with_cookie(path: &str, cookie: &str) -> HttpRequest<Vec<u8>> {
+    let mut request = request("GET", path, b"");
+    request
+      .headers_mut()
+      .insert("Cookie", cookie.split(';').next().unwrap().parse().unwrap());
+    request
   }
 
   #[test]

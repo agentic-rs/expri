@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER_QUEUE = '/home/tester/experiment/.expri/service-sync'
@@ -187,6 +187,8 @@ def dashboard_public_checks():
   assert browser('/api/run-columns?source=service:demo:worker')['status'] == 401, 'unauthenticated run columns exposed data'
   assert browser('/api/artifacts?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated artifact catalog exposed data'
   assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
+  assert browser('/api/storage?project_id=demo&kind=input')['status'] == 401, 'unauthenticated project storage catalog exposed data'
+  assert browser('/api/input?project_id=demo&input_id=dataset-v1')['status'] == 401, 'unauthenticated private input download exposed data'
   assert browser('/api/archive?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated archive download exposed data'
   assert browser('/api/events')['status'] == 401, 'unauthenticated live updates exposed data'
   login = browser('/login')
@@ -204,9 +206,52 @@ def dashboard_public_checks():
   })['status'] == 401, 'browser session authorized the writable CLI API'
   return cookie
 
+def project_storage_checks(cookie, run_id=None, second_run_id=None):
+  def catalog(kind, **query):
+    return browser_json('/api/storage?' + urlencode({'project_id': 'demo', 'kind': kind, **query}), cookie)
+
+  inputs = catalog('input', limit=1)
+  assert inputs['project_id'] == 'demo' and inputs['kind'] == 'input' and inputs['total_count'] == 2, 'project storage did not count both completed private inputs'
+  assert len(inputs['items']) == 1 and inputs['next_offset'] == 1, 'project input catalog did not bound its first page'
+  next_page = catalog('input', limit=1, offset=inputs['next_offset'])
+  assert len(next_page['items']) == 1 and next_page['next_offset'] is None, 'project input catalog did not finish its second page'
+  input_rows = {item['input_id']: item for item in inputs['items'] + next_page['items']}
+  assert set(input_rows) == {'dataset-v1', 'empty-file'}, 'project input catalog changed immutable input IDs'
+  assert input_rows['dataset-v1']['size'] == len(b'private-input-fixture') * 1024 and input_rows['empty-file']['size'] == 0, 'project input catalog reported wrong sizes'
+  assert [item['input_id'] for item in catalog('input', search='dataset-v1')['items']] == ['dataset-v1'], 'project input search did not filter by input ID'
+  assert not catalog('input', search='private.bin')['items'], 'project input search exposed the original local filename'
+  serialized = json.dumps(input_rows)
+  assert '/home/tester/private.bin' not in serialized and 'X-Amz-' not in serialized, 'project input catalog exposed a local filename or signed URL'
+  input_url = input_rows['dataset-v1']['download_url']
+  input_link = urlsplit(input_url)
+  assert input_link.path == '/api/input' and not input_link.scheme and not input_link.netloc and parse_qs(input_link.query) == {'project_id': ['demo'], 'input_id': ['dataset-v1']}, 'project input download link changed its project or ID'
+  attachment = browser(input_url, cookie=cookie)
+  assert attachment['status'] == 303 and attachment['headers']['referrer-policy'] == 'no-referrer', 'input download did not use a protected no-referrer redirect'
+  head = browser(input_url, method='HEAD', cookie=cookie)
+  assert head['status'] == 200 and int(head['headers']['content-length']) == input_rows['dataset-v1']['size'] and 'location' not in head['headers'], 'input HEAD did not describe its finalized object safely'
+  assert browser(input_url, cookie=cookie, origin='https://outside.invalid')['status'] == 403, 'cross-origin input download was accepted'
+  assert browser('/api/input?project_id=other&input_id=dataset-v1', cookie=cookie)['status'] == 404, 'private input download crossed project scope'
+  assert browser('/api/input?project_id=demo&input_id=unknown', cookie=cookie)['status'] == 404, 'unknown private input acquired a download URL'
+  foreign = browser('/api/storage?project_id=other&kind=input', cookie=cookie)
+  assert foreign['status'] in {200, 404} and (foreign['status'] == 404 or json.loads(foreign['body'])['items'] == []), 'project storage exposed another project\'s inputs'
+  assert browser('/api/storage?project_id=demo&kind=unknown', cookie=cookie)['status'] == 400, 'unknown storage kind was accepted'
+
+  if run_id is not None:
+    outputs = catalog('output', search='checkpoint.pt')
+    assert outputs['project_id'] == 'demo' and outputs['kind'] == 'output', 'project output catalog changed its scope'
+    checkpoint = next((item for item in outputs['items'] if item['origin'] == 'worker' and item['run_id'] == run_id and item['path'] == 'outputs/checkpoint.pt'), None)
+    assert checkpoint is not None and checkpoint['size'] == 17 * 1024 * 1024, 'project Storage omitted the uploaded checkpoint'
+    assert not any(item['run_id'] == second_run_id and item['path'] == 'outputs/checkpoint.pt' for item in outputs['items']), 'worker-only checkpoint appeared as a completed cloud object'
+    assert checkpoint['download_url'].startswith('/api/artifact?') and 'X-Amz-' not in json.dumps(outputs), 'project output catalog exposed a signed URL or changed the artifact route'
+    output_link = urlsplit(checkpoint['download_url'])
+    assert not output_link.scheme and not output_link.netloc and parse_qs(output_link.query) == {'source': ['hosted-project:demo'], 'run_id': [f'worker:{run_id}'], 'path': ['outputs/checkpoint.pt']}, 'project output download link changed its machine or run'
+    assert browser(checkpoint['download_url'], method='HEAD', cookie=cookie)['status'] == 200, 'project output link did not resolve the completed checkpoint'
+    assert not catalog('output', search='dataset-v1')['items'], 'private inputs leaked into project output results'
+
 def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert browser('/api/catalog', cookie=previous_cookie)['status'] == 401, 'service restart preserved an old browser session'
   cookie = dashboard_login()
+  project_storage_checks(cookie, run_id, second_run_id)
   page = browser('/', cookie=cookie)
   assert page['status'] == 200 and 'id="logout-form"' in page['body'], 'authenticated dashboard HTML is unavailable'
   assert "frame-ancestors 'none'" in page['headers']['content-security-policy'], 'private dashboard can be framed'
@@ -599,6 +644,14 @@ prefix = "acceptance"
   client(host, 'input put', '--project-id', 'demo', '--input-id', 'empty-file', '--file', '/home/tester/empty.bin', '--queue-dir', '/home/tester/queue')
   client(worker, 'input get', '--project-id', 'demo', '--input-id', 'empty-file', '--destination', '/home/tester/empty.bin')
   assert python(worker, "from pathlib import Path;print(Path('/home/tester/empty.bin').stat().st_size)") == '0', 'empty input did not round-trip'
+  assert python(worker, "from pathlib import Path;print(Path('/home/tester/private.bin').read_bytes() == b'private-input-fixture'*1024)") == 'True', 'private input bytes changed during worker download'
+  input_only = browser_json('/api/projects', initial_session)
+  project = next((source for source in input_only['sources'] if source['source_id'] == 'hosted-project:demo'), None)
+  assert project is not None and project['machines'] == [], 'input-only project is absent from hosted project discovery'
+  assert browser_json('/api/catalog', initial_session)['sources'] == [], 'private inputs unexpectedly became run sources'
+  project_storage_checks(initial_session)
+  logged('browser-storage-input-only.log', ['docker', 'exec', '--user', 'tester', firefox,
+    'python3', '/opt/expri-browser/browser_forms.py', '--storage-input-only'], timeout=90)
   forbidden = client(worker, 'input put', '--project-id', 'demo', '--input-id', 'forbidden', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/input-queue', check=False)
   assert forbidden.returncode != 0, 'worker unexpectedly uploaded a private input'
   python(host, "from pathlib import Path;Path('/home/tester/different.bin').write_bytes(b'different dataset')")
@@ -709,6 +762,8 @@ print(process.pid)
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
   assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
   dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
+  logged('browser-storage.log', ['docker', 'exec', '--user', 'tester', firefox,
+    'python3', '/opt/expri-browser/browser_forms.py', '--storage', run_id], timeout=90)
   python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').touch()")
   logged('browser-workspace.log', ['docker', 'exec', '--user', 'tester', firefox,
     'python3', '/opt/expri-browser/browser_forms.py', '--workspace', run_id, second['run_id']], timeout=180)
@@ -780,6 +835,7 @@ finally:
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
         for name in [
           'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
+          'workspace-storage-input-only', 'workspace-storage-inputs', 'workspace-storage', 'workspace-storage-narrow',
           'workspace-columns-desktop', 'workspace-columns-1024', 'workspace-columns-320', 'workspace-columns-360',
           'workspace-project-default-desktop', 'workspace-project-default-1024',
           'workspace-project-desktop', 'workspace-project-1024',

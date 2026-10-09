@@ -1,6 +1,7 @@
 import { Fragment, useSyncExternalStore, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
+import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
 import {
   MAX_RUN_COLUMNS,
   formatRunTableValue,
@@ -78,6 +79,9 @@ export type DashboardUi = {
   log_note: string;
   artifacts_loading: boolean;
   artifacts_error: string | null;
+  storage_search: string;
+  storage_loading: boolean;
+  storage_error: string | null;
   live_status: string;
 };
 export type DashboardSnapshot = DashboardUi & {
@@ -96,6 +100,10 @@ export type DashboardSnapshot = DashboardUi & {
   comparison: Comparison | null;
   artifacts: ArtifactCatalog | null;
   selected_files: string[];
+  workspace_view: "workspace" | "storage";
+  storage_kind: StorageKind;
+  storage_offset: number;
+  storage_catalog: StorageCatalog | null;
   metric_names: string[];
   review_version: number;
   x_axis: ChartAxis;
@@ -130,6 +138,12 @@ export type DashboardActions = {
   select_file: (path: string, checked: boolean) => void;
   clear_files: () => void;
   refresh_files: () => void;
+  workspace_view: (view: "workspace" | "storage") => void;
+  storage_kind: (kind: StorageKind) => void;
+  storage_search: (search: string) => void;
+  storage_previous: () => void;
+  storage_next: () => void;
+  storage_refresh: () => void;
 };
 export type DashboardStore = {
   subscribe: (listener: () => void) => () => void;
@@ -1307,6 +1321,8 @@ export function DashboardView({
   const source_controls = document.getElementById("source-controls-root");
   const project = document.getElementById("project-name");
   const kind = document.getElementById("dashboard-kind");
+  const active_source = s.sources.find((source) => source.source_id === s.source_id);
+  const project_id = active_source?.kind === "hosted_project" ? active_source.project_id : null;
   return (
     <>
       {project && createPortal(s.project_name, project)}
@@ -1373,8 +1389,10 @@ export function DashboardView({
         )}
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">Experiments</p>
-          <h1>Workspace</h1>
+          <p className="eyebrow">{s.workspace_view === "storage" ? "Project storage" : "Experiments"}</p>
+          <h1 id={s.workspace_view === "storage" ? "storage-heading" : undefined}>
+            {s.workspace_view === "storage" ? "Storage" : "Workspace"}
+          </h1>
         </div>
         <div className="refresh-status">
           <label className="auto-refresh">
@@ -1391,18 +1409,51 @@ export function DashboardView({
           </span>
         </div>
       </div>
-      <div id="source-note" className="source-note" hidden={s.source_note === null}>
-        {s.source_note}
-      </div>
       <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>
         {s.project_catalog_note}
       </div>
       <ErrorNotice id="global-error" message={s.global_error} />
       <Warnings id="catalog-warnings" items={s.catalog_warnings} />
-      <div className={`workspace-grid${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-wide-table" : ""}`}>
-        <RunBrowser snapshot={s} actions={actions} />
-        <ReviewWorkspace snapshot={s} actions={actions} />
+      {project_id && (
+        <RadioTags
+          id="workspace-view-options"
+          name="workspace_view"
+          legend="Project page"
+          value={s.workspace_view}
+          options={[
+            { id: "workspace-view-workspace", value: "workspace", label: "Workspace" },
+            { id: "workspace-view-storage", value: "storage", label: "Storage" },
+          ]}
+          on_change={actions.workspace_view}
+        />
+      )}
+      <div id="workspace-page" hidden={s.workspace_view !== "workspace"}>
+        <div id="source-note" className="source-note" hidden={s.source_note === null}>
+          {s.source_note}
+        </div>
+        <div className={`workspace-grid${(s.run_columns.length || project_id) ? " has-wide-table" : ""}`}>
+          <RunBrowser snapshot={s} actions={actions} />
+          <ReviewWorkspace snapshot={s} actions={actions} />
+        </div>
       </div>
+      {project_id && (
+        <div hidden={s.workspace_view !== "storage"}>
+          <StoragePanel
+            project_id={project_id}
+            kind={s.storage_kind}
+            search={s.storage_search}
+            offset={s.storage_offset}
+            catalog={s.storage_catalog}
+            loading={s.storage_loading}
+            error={s.storage_error}
+            on_kind={actions.storage_kind}
+            on_search={actions.storage_search}
+            on_previous={actions.storage_previous}
+            on_next={actions.storage_next}
+            on_refresh={actions.storage_refresh}
+          />
+        </div>
+      )}
       <div id="live-status" className="sr-only" role="status" aria-live="polite">
         {s.live_status}
       </div>

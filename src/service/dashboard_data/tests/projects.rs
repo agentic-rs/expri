@@ -112,6 +112,7 @@ fn projects_aggregate_published_machines_and_keep_the_legacy_catalog_unchanged()
     projects["sources"],
     json!([
       {"source_id":"hosted-project:other","label":"other","kind":"hosted_project","target_name":null,"project_id":"other","origin":null,"machines":["worker-a"]},
+      {"source_id":"hosted-project:private-only","label":"private-only","kind":"hosted_project","target_name":null,"project_id":"private-only","origin":null,"machines":[]},
       {"source_id":"hosted-project:project","label":"project","kind":"hosted_project","target_name":null,"project_id":"project","origin":null,"machines":["worker-a","worker-b"]}
     ])
   );
@@ -128,6 +129,213 @@ fn projects_aggregate_published_machines_and_keep_the_legacy_catalog_unchanged()
         && source["origin"].is_string())
   );
   assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+}
+
+#[test]
+fn storage_lists_completed_project_inputs_and_outputs_without_reading_object_bytes() {
+  let fixture = Fixture::new();
+  fixture.publish(
+    FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset-v1".into(),
+    },
+    b"private input".to_vec(),
+  );
+  fixture.publish(
+    FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "weights-v1".into(),
+    },
+    b"weights".to_vec(),
+  );
+  fixture.publish(
+    FileTarget::Input {
+      project_id: "other".into(),
+      input_id: "hidden".into(),
+    },
+    b"another project".to_vec(),
+  );
+  let pending = FileTarget::Input {
+    project_id: "project".into(),
+    input_id: "pending".into(),
+  };
+  fixture
+    .store
+    .execute(Request::BeginUpload {
+      upload_id: "pending-storage-input".into(),
+      target: pending,
+      size: 10,
+      sha256: "a".repeat(64),
+    })
+    .unwrap();
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let input_page = dashboard.storage("project", "input", "", 1, 0).unwrap();
+  assert_eq!(input_page["total_count"], 2);
+  assert_eq!(input_page["next_offset"], 1);
+  assert_eq!(
+    input_page["items"][0],
+    json!({
+      "input_id": "weights-v1",
+      "size": 7,
+      "download_url": "/api/input?project_id=project&input_id=weights-v1",
+    })
+  );
+  let next = dashboard.storage("project", "input", "", 1, 1).unwrap();
+  assert_eq!(next["items"][0]["input_id"], "dataset-v1");
+  assert!(next["next_offset"].is_null());
+  let searched = dashboard
+    .storage("project", "input", "DATASET", 100, 0)
+    .unwrap();
+  assert_eq!(searched["total_count"], 1);
+  assert_eq!(searched["items"][0]["input_id"], "dataset-v1");
+
+  for (origin, run_id, path) in [
+    ("worker-a", "shared", "outputs/checkpoint.pt"),
+    ("worker-b", "shared", "outputs/model.pt"),
+  ] {
+    fixture.publish(
+      FileTarget::Run {
+        scope: RunScope {
+          project_id: "project".into(),
+          origin: origin.into(),
+          run_id: run_id.into(),
+        },
+        path: path.into(),
+      },
+      b"checkpoint".to_vec(),
+    );
+  }
+  fixture.publish(
+    FileTarget::Run {
+      scope: RunScope {
+        project_id: "other".into(),
+        origin: "worker-a".into(),
+        run_id: "shared".into(),
+      },
+      path: "outputs/foreign.pt".into(),
+    },
+    b"foreign".to_vec(),
+  );
+  fixture.publish(
+    FileTarget::Run {
+      scope: RunScope {
+        project_id: "project".into(),
+        origin: "worker-a".into(),
+        run_id: "shared".into(),
+      },
+      path: crate::run_artifacts::INVENTORY_PATH.into(),
+    },
+    b"{}".to_vec(),
+  );
+  fixture.publish(
+    FileTarget::Run {
+      scope: RunScope {
+        project_id: "project".into(),
+        origin: "worker-a".into(),
+        run_id: "shared".into(),
+      },
+      path: "outputs/.hidden".into(),
+    },
+    b"excluded".to_vec(),
+  );
+  for path in ["outputs/control\n.pt", "outputs/control\u{0085}.pt"] {
+    fixture.publish(
+      FileTarget::Run {
+        scope: RunScope {
+          project_id: "project".into(),
+          origin: "worker-a".into(),
+          run_id: "shared".into(),
+        },
+        path: path.into(),
+      },
+      b"excluded".to_vec(),
+    );
+  }
+  let output_page = dashboard.storage("project", "output", "", 100, 0).unwrap();
+  assert_eq!(output_page["total_count"], 2);
+  assert_eq!(
+    output_page["items"][0],
+    json!({
+      "origin": "worker-b",
+      "run_id": "shared",
+      "path": "outputs/model.pt",
+      "size": 10,
+      "download_url": "/api/artifact?source=hosted-project%3Aproject&run_id=worker-b%3Ashared&path=outputs%2Fmodel.pt",
+    })
+  );
+  let searched = dashboard
+    .storage("project", "output", "WORKER-A", 100, 0)
+    .unwrap();
+  assert_eq!(searched["total_count"], 1);
+  assert_eq!(searched["items"][0]["path"], "outputs/checkpoint.pt");
+  let serialized = output_page.to_string() + &input_page.to_string();
+  assert!(!serialized.contains("projects/") && !serialized.contains("X-Amz-"));
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  assert!(dashboard.storage("project", "input", "", 101, 0).is_err());
+  assert!(
+    dashboard
+      .storage("project", "input", "", 1, usize::MAX)
+      .is_err()
+  );
+  assert!(
+    dashboard
+      .storage("project", "input", &"x".repeat(257), 1, 0)
+      .is_err()
+  );
+  assert!(dashboard.storage("project", "unknown", "", 1, 0).is_err());
+}
+
+#[test]
+fn input_uploads_change_project_storage_revision_without_changing_run_revisions() {
+  let fixture = Fixture::new();
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let before = dashboard.updates("hosted-project:input-only", &[]).unwrap();
+  assert_eq!(before["storage_revision"], "0");
+  fixture.publish(
+    FileTarget::Input {
+      project_id: "input-only".into(),
+      input_id: "dataset".into(),
+    },
+    b"data".to_vec(),
+  );
+  let after = dashboard.updates("hosted-project:input-only", &[]).unwrap();
+  assert_ne!(after["storage_revision"], before["storage_revision"]);
+  assert_eq!(after["source_revision"], before["source_revision"]);
+  assert_eq!(after["catalog_revision"], before["catalog_revision"]);
+  assert_eq!(
+    dashboard.projects().unwrap()["sources"][0]["source_id"],
+    "hosted-project:input-only"
+  );
+  let empty_runs = dashboard
+    .list_table("hosted-project:input-only", &list(None, None, 100, 0))
+    .unwrap();
+  assert_eq!(empty_runs["total_count"], 0);
+  assert!(empty_runs["runs"].as_array().unwrap().is_empty());
+  assert!(
+    dashboard.columns("hosted-project:input-only").unwrap()["available_columns"]["metrics"]
+      .as_array()
+      .unwrap()
+      .is_empty()
+  );
+  assert!(
+    dashboard.catalog().unwrap()["sources"]
+      .as_array()
+      .unwrap()
+      .is_empty()
+  );
+  let input = dashboard.input_download("input-only", "dataset").unwrap();
+  let Download::Cloud {
+    url,
+    size,
+    filename,
+  } = input
+  else {
+    panic!("cloud expected")
+  };
+  assert_eq!(size, 4);
+  assert_eq!(filename, "dataset");
+  assert!(url.contains("projects/input-only/inputs/dataset/"));
+  assert!(dashboard.input_download("other", "dataset").is_err());
 }
 
 #[test]

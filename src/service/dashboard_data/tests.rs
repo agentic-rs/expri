@@ -662,7 +662,7 @@ fn hosted_update_probes_skip_storage_reads_and_separate_changed_resources() {
   let empty = dashboard.updates("", &[]).unwrap();
   assert_eq!(
     empty,
-    json!({"catalog_revision":"0","source_revision":null,"runs":[]})
+    json!({"catalog_revision":"0","source_revision":null,"storage_revision":null,"runs":[]})
   );
   fixture.publish(
     FileTarget::Input {

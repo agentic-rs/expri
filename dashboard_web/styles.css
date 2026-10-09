@@ -321,3 +321,20 @@ footer { color: #8690a2; font-size: 10px; display: flex; justify-content: space-
 .selected-file-downloads li + li { margin-top: 7px; }
 .file-cli .field { max-width: 480px; }
 .file-command { display: block; width: 100%; max-height: 240px; resize: vertical; box-sizing: border-box; padding: 11px; font: 11px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; border: 1px solid var(--line); border-radius: 6px; background: #f7f8fb; color: #39445b; }
+#workspace-view-options { margin: 14px 0 18px; }
+.storage-page { min-width: 0; }
+.storage-intro { font-size: 12px; margin-bottom: 18px; }
+.storage-kinds { margin-bottom: 16px; }
+.storage-card { min-width: 0; }
+.storage-card .section-heading { align-items: start; flex-wrap: wrap; }
+.storage-card .section-heading p { margin-top: 4px; }
+.storage-search { max-width: 420px; margin: 16px 0; }
+.storage-scroll { max-height: 630px; border: 1px solid var(--line); border-radius: 6px; }
+.storage-table-input { min-width: 410px; }
+.storage-table-output { min-width: 720px; }
+.storage-table th[scope="row"] { max-width: 500px; font-weight: 400; overflow-wrap: anywhere; }
+.storage-table td.number { white-space: nowrap; }
+.storage-table .text-button { white-space: nowrap; }
+#storage-empty { font-size: 12px; padding: 14px 0; }
+.storage-pagination { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; font-size: 11px; }
+.storage-pagination > div { display: flex; gap: 14px; }

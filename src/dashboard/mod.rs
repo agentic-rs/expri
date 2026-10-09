@@ -69,6 +69,16 @@ pub(crate) trait DashboardView {
   fn projects(&self) -> Result<Option<Value>> {
     Ok(None)
   }
+  fn storage(
+    &self,
+    _project_id: &str,
+    _kind: &str,
+    _search: &str,
+    _limit: usize,
+    _offset: usize,
+  ) -> Result<Option<Value>> {
+    Ok(None)
+  }
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value>;
   fn list_table(&self, source: &str, query: &table::ListQuery<'_>) -> Result<Value>;
   fn columns(&self, source: &str) -> Result<Value>;

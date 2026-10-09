@@ -88,10 +88,30 @@ class Firefox:
     # window constraint, leaving the tested page and its security policy intact.
     self.call('POST', '/moz/context', {'context': 'chrome'})
     try:
-      self.call('POST', '/execute/sync', {'script':
-        'document.documentElement.style.setProperty("min-width", "0px", "important");', 'args': []})
+      self.call('POST', '/execute/sync', {'script': '''const root = document.documentElement;
+        root.style.setProperty('min-width', '0px', 'important');
+        root.getBoundingClientRect();''', 'args': []})
     finally:
       self.call('POST', '/moz/context', {'context': 'content'})
+
+  def set_viewport(self, width, height):
+    # Gecko can acknowledge Set Window Rect before the page's layout viewport
+    # reaches that width, especially after switching away from a download tab.
+    # Measure the actual CSS viewport and retry the native resize if necessary.
+    observed = None
+    for _ in range(3):
+      if width < 500:
+        self.allow_narrow_viewports()
+      self.call('POST', '/window/rect', {'width': width, 'height': height})
+      deadline = time.monotonic() + 3
+      matches = 0
+      while time.monotonic() < deadline:
+        observed = self.call('POST', '/execute/sync', {'script': 'return innerWidth;', 'args': []})
+        matches = matches + 1 if observed == width else 0
+        if matches == 2:
+          return
+        time.sleep(0.1)
+    raise AssertionError(f'Firefox layout viewport stayed {observed} CSS pixels wide after requesting {width}')
 
   def element(self, selector, using='css selector'):
     return self.call('POST', '/element', {'using': using, 'value': selector})[ELEMENT]
@@ -562,7 +582,7 @@ def deep_link(run_id, second_run_id):
         && frame?.getAttribute('src')
         && JSON.stringify(new URL(frame.src).searchParams.getAll('run_id')) === JSON.stringify([arguments[1]]);''', source_id, expected)
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate(link)
     wait_for(lambda: browser.call('GET', '/url') == ORIGIN + '/login?' + query,
       'logged-out run link did not retain its identity at login')
@@ -635,7 +655,7 @@ def artifact_files(browser, run_id):
   assert evaluate("return document.querySelectorAll('#selected-file-downloads a').length;") == 1, 'selected download did not show one explicit native link'
   show_files()
   capture('workspace-files')
-  browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+  browser.set_viewport(500, 800)
   assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Files view overflows horizontally'
   assert evaluate('''return ['#refresh-files', '#files-search', '#download-selected-files', '#artifact-config-path', '#artifact-pull-command'].every(selector => {
     const box = document.querySelector(selector).getBoundingClientRect();
@@ -643,7 +663,7 @@ def artifact_files(browser, run_id):
   });'''), 'narrow Files controls are clipped'
   show_files()
   capture('workspace-files-narrow')
-  browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+  browser.set_viewport(1440, 1000)
   target = DOWNLOADS / 'checkpoint.pt'
   target.unlink(missing_ok=True)
   (DOWNLOADS / 'checkpoint.pt.part').unlink(missing_ok=True)
@@ -690,6 +710,81 @@ def artifact_files(browser, run_id):
       browser.call('DELETE', '/window')
   browser.call('POST', '/window', {'handle': original_window})
   print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
+
+
+def project_storage(run_id=None):
+  browser = Firefox()
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def capture(name):
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  try:
+    browser.set_viewport(1440, 1000)
+    browser.navigate('/login')
+    browser.login()
+    wait_for(lambda: evaluate("return document.querySelector('#workspace-view-storage') !== null;"), 'hosted project did not offer its Storage page')
+    start = len(trace_records())
+    browser.click('#workspace-view-storage + span')
+    wait_for(lambda: evaluate("return document.querySelector('#storage-kind-input')?.checked && document.querySelectorAll('#storage-rows tr').length === 2;"), 'project Storage did not show both completed private inputs')
+    assert evaluate("return document.querySelector('#workspace-view-storage').checked;"), 'Storage tag did not select the project page in one click'
+    inputs = evaluate('''return [...document.querySelectorAll('#storage-rows tr')].map(row => ({
+      id: row.querySelector('th code')?.textContent,
+      size: row.querySelector('.number')?.textContent,
+      href: row.querySelector('a')?.getAttribute('href'),
+      filename: row.querySelector('a')?.getAttribute('download')
+    }));''')
+    by_id = {item['id']: item for item in inputs}
+    assert set(by_id) == {'dataset-v1', 'empty-file'}, 'Storage input rows changed the published input IDs'
+    assert by_id['dataset-v1']['size'] == '21 KiB' and by_id['empty-file']['size'] == '0 B', 'Storage input sizes differ from the published files'
+    assert by_id['dataset-v1']['href'].startswith('/api/input?') and by_id['dataset-v1']['filename'] == 'dataset-v1', 'Storage input download lost its scoped native attachment'
+    assert 'private.bin' not in evaluate("return document.querySelector('#project-storage').textContent;"), 'Storage exposed the original private input filename'
+    assert any(record['path'] == '/api/storage' for record in trace_records()[start:]), 'Storage did not lazily request its input catalog'
+    capture('workspace-storage-input-only' if run_id is None else 'workspace-storage-inputs')
+
+    target = DOWNLOADS / 'dataset-v1'
+    target.unlink(missing_ok=True)
+    (DOWNLOADS / 'dataset-v1.part').unlink(missing_ok=True)
+    original_window = browser.call('GET', '/window')
+    browser.click('//tbody[@id="storage-rows"]/tr[th/code="dataset-v1"]//a', using='xpath')
+    wait_for(lambda: target.exists() and target.stat().st_size == len(b'private-input-fixture') * 1024
+      and not (DOWNLOADS / 'dataset-v1.part').exists(), 'native private input download did not complete', timeout=60)
+    assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(b'private-input-fixture' * 1024).digest(), 'native private input download changed its bytes'
+    assert any(record['path'] == '/api/input' and record['status'] == 303 for record in trace_records()[start:]), 'native private input download bypassed the protected attachment route'
+    attachments = [record for record in trace_records()[start:] if record['host'] == 's3.expri.example.net']
+    assert attachments and all(record['session_cookie_count'] == 0 and set(record['forwarded_headers']) <= {'Range'} for record in attachments), 'private input attachment sent dashboard credentials to S3'
+    for handle in browser.call('GET', '/window/handles'):
+      if handle != original_window:
+        browser.call('POST', '/window', {'handle': handle})
+        browser.call('DELETE', '/window')
+    browser.call('POST', '/window', {'handle': original_window})
+
+    browser.click('#storage-kind-output + span')
+    assert evaluate("return document.querySelector('#storage-kind-output').checked;"), 'Run outputs tag did not select in one click'
+    if run_id is None:
+      wait_for(lambda: evaluate("return document.querySelector('#storage-empty')?.textContent.includes('No run outputs') && document.querySelectorAll('#storage-rows tr').length === 0;"), 'input-only project claimed uploaded run outputs')
+    else:
+      def checkpoint_row():
+        return evaluate('''const row = [...document.querySelectorAll('#storage-rows tr')]
+          .find(node => node.querySelector('th code')?.textContent === 'outputs/checkpoint.pt' && node.textContent.includes(arguments[0]));
+          if (!row) return null;
+          return {text: row.textContent, href: row.querySelector('a')?.getAttribute('href')};''', run_id)
+      row = wait_for(checkpoint_row, 'project Storage did not show the uploaded checkpoint')
+      assert 'worker' in row['text'] and '17 MiB' in row['text'] and row['href'].startswith('/api/artifact?'), 'Storage checkpoint row lost machine, size, or scoped download'
+      browser.keys('#storage-search', 'checkpoint.pt')
+      wait_for(lambda: evaluate("return document.querySelectorAll('#storage-rows tr').length === 1 && document.querySelector('#storage-rows').textContent.includes('outputs/checkpoint.pt');"), 'Storage search did not narrow uploaded outputs')
+      capture('workspace-storage')
+      browser.set_viewport(500, 800)
+      assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Storage page overflows horizontally'
+      assert evaluate('''return ['#workspace-view-options', '#storage-kind-options', '#storage-search', '#refresh-storage', '#storage-page-label'].every(selector => {
+        const box = document.querySelector(selector).getBoundingClientRect();
+        return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
+      });'''), 'narrow Storage controls are clipped'
+      capture('workspace-storage-narrow')
+    browser.click('#workspace-view-workspace + span')
+    assert evaluate("return document.querySelector('#workspace-view-workspace').checked;"), 'Storage could not return to the project workspace'
+    print('Firefox Storage passed: project inputs before runs, authenticated input bytes, completed output inventory, native tags, search, and narrow layout.' if run_id else 'Firefox input-only Storage passed: project discovery before runs, private input bytes, and empty run outputs.', flush=True)
+  finally:
+    browser.close()
 
 
 def workspace_layout(browser, width, wide=False):
@@ -797,20 +892,19 @@ def run_table_columns(browser, run_ids):
   wait_for(lambda: settled() and 'loss · ascending' in evaluate("return document.querySelector('#run-sort-description').textContent;"), 'native keyboard header sorting did not select the metric')
   preserved()
   for width in [1440, 1024]:
-    browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+    browser.set_viewport(width, 1000)
     table_scroll_contained(browser, width)
     preserved()
     capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
   for width in [860, 859]:
-    browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+    browser.set_viewport(width, 1000)
     if width == 860:
       table_scroll_contained(browser, width)
     else:
       workspace_layout(browser, width)
     preserved()
-  browser.allow_narrow_viewports()
   for width in [320, 360]:
-    browser.call('POST', '/window/rect', {'width': width, 'height': 800})
+    browser.set_viewport(width, 800)
     table_scroll_contained(browser, width)
     assert evaluate('''const table = document.querySelector('#runs-region');
       return table.scrollWidth > table.clientWidth && ['#run-columns', '#run-column-search', '#run-reduction-options', '#search-input', '#task-input', '#status-options'].every(selector => {
@@ -818,7 +912,7 @@ def run_table_columns(browser, run_ids):
       });'''), f'{width}px custom table does not scroll or its controls are clipped'
     capture(f'workspace-columns-{width}')
     preserved()
-  browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+  browser.set_viewport(1440, 1000)
   for name in ['Parameter learning_rate', 'Metric loss']:
     browser.click(f'input[aria-label="{name}"] + span')
     wait_for(settled, 'removing a table column did not finish')
@@ -850,7 +944,7 @@ def workspace(run_id, second_run_id):
   def capture(name):
     Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
@@ -900,7 +994,7 @@ def workspace(run_id, second_run_id):
     wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") == 2, 'Refresh lost or duplicated chart interaction layers')
     interactive_charts(browser, [run_id, second_run_id])
     run_table_columns(browser, [run_id, second_run_id])
-    browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+    browser.set_viewport(500, 800)
     assert evaluate('return innerWidth;') == 500, 'narrow viewport is not 500 CSS pixels wide'
     assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow dashboard overflows horizontally'
     assert evaluate('''return ['#source-select', '#refresh-button', '#search-input'].every(selector => {
@@ -992,7 +1086,7 @@ def previews(run_id, second_run_id):
           'branch_title': 'Built from fixture/ab',
         }, 'preview deployment provenance does not match its pinned release'
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: browser.catalog()['status'] == 200, 'main login did not complete')
@@ -1085,7 +1179,7 @@ def project_workspace(run_id):
       const range=card.querySelector('[data-chart-range]'); return {range:[range.dataset.startX,range.dataset.endX],
         hidden:[...card.querySelectorAll('[data-chart-run]')].filter(node=>node.getAttribute('aria-pressed')==='false').map(node=>node.querySelector('code').textContent)};''')
   try:
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: settled() and project_selected(), 'hosted dashboard did not default to its project')
@@ -1124,10 +1218,10 @@ def project_workspace(run_id):
     evaluate("window.__project_chart_document=document.querySelector('#chart-frame').contentDocument;")
     project_layouts = {}
     for width in [1440, 1024]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      browser.set_viewport(width, 1000)
       project_layouts[width] = workspace_layout(browser, width, wide=True)
       capture('workspace-project-default-desktop' if width == 1440 else 'workspace-project-default-1024')
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     choose_run_table_columns(browser)
     browser.click('button[aria-label="Sort by Machine ascending"]')
     wait_for(settled, 'native Machine header did not finish sorting')
@@ -1142,16 +1236,15 @@ def project_workspace(run_id):
       assert geometry['page_width'] == reference['page_width'], f'{width}px choosing project columns widened the page'
       assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in reference['review']), f'{width}px choosing project columns moved or resized Review'
     for width in [1440, 1024]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      browser.set_viewport(width, 1000)
       stable_project_layout(width, scroll=True)
       capture('workspace-project-desktop' if width == 1440 else 'workspace-project-1024')
-    browser.allow_narrow_viewports()
     for width in [320, 360]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 800})
+      browser.set_viewport(width, 800)
       table_scroll_contained(browser, width)
       evaluate("document.querySelector('#runs-region').scrollIntoView({block:'start'});")
       capture(f'workspace-project-{width}')
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.click('#run-columns summary')
     for name in ['Parameter learning_rate', 'Metric loss']:
       browser.click(f'input[aria-label="{name}"] + span')
@@ -1159,9 +1252,9 @@ def project_workspace(run_id):
     assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '0', 'removing project columns did not restore its built-in table'
     browser.click('#run-columns summary')
     for width in [1440, 1024]:
-      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      browser.set_viewport(width, 1000)
       stable_project_layout(width)
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     choose_run_table_columns(browser)
     browser.click('#run-columns summary')
     stable_project_layout(1440, scroll=True)
@@ -1242,7 +1335,7 @@ def automatic_refresh(run_id, updated_run_id):
       'worker publication did not finish: ' + name, timeout=90)
   try:
     REFRESH_COORDINATION.unlink(missing_ok=True)
-    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh fixture runs did not load')
@@ -1417,5 +1510,9 @@ if __name__ == '__main__':
     automatic_refresh(sys.argv[2], sys.argv[3])
   elif len(sys.argv) == 3 and sys.argv[1] == '--project':
     project_workspace(sys.argv[2])
+  elif len(sys.argv) == 2 and sys.argv[1] == '--storage-input-only':
+    project_storage()
+  elif len(sys.argv) == 3 and sys.argv[1] == '--storage':
+    project_storage(sys.argv[2])
   else:
     forms()

@@ -11,6 +11,7 @@ use super::storage::ObjectStorage;
 use super::types::*;
 
 mod archive;
+mod dashboard_storage;
 mod tracking;
 
 const MAX_PARTS: u64 = 1000;
@@ -70,6 +71,12 @@ pub(super) struct Store<S> {
 pub(super) struct DashboardSource {
   pub project_id: String,
   pub origin: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DashboardProjectSource {
+  pub project_id: String,
+  pub origin: Option<String>,
 }
 
 pub(super) struct DashboardPage<T> {
@@ -154,8 +161,12 @@ impl<S: ObjectStorage> Store<S> {
         project_id TEXT NOT NULL, origin TEXT NOT NULL, run_id TEXT NOT NULL,
         legacy_order INTEGER NOT NULL DEFAULT 0,
         UNIQUE(project_id,origin,run_id));
+      CREATE TABLE IF NOT EXISTS project_storage_revisions (
+        project_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS dashboard_activity_source ON dashboard_run_activity(project_id,origin,sequence);
       CREATE INDEX IF NOT EXISTS dashboard_files_scope ON files(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'));
+      CREATE INDEX IF NOT EXISTS dashboard_storage_inputs ON files(json_extract(target,'$.kind'),json_extract(target,'$.project_id'),sequence DESC);
+      CREATE INDEX IF NOT EXISTS dashboard_storage_outputs ON files(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),sequence DESC);
       CREATE INDEX IF NOT EXISTS dashboard_streams_scope ON streams(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'));
       INSERT OR IGNORE INTO dashboard_run_activity(project_id,origin,run_id,legacy_order)
         SELECT json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'),1
@@ -528,6 +539,18 @@ impl<S: ObjectStorage> Store<S> {
         .map_err(database)
       })
       .transpose()?;
+    let storage_revision = project_id
+      .map(|project_id| {
+        db.query_row(
+          "SELECT revision FROM project_storage_revisions WHERE project_id=?1",
+          [project_id],
+          |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|revision| revision.unwrap_or(0).to_string())
+        .map_err(database)
+      })
+      .transpose()?;
     let mut runs = Vec::with_capacity(selections.len());
     for (run_id, scope) in selections {
       let exists: bool = db
@@ -564,7 +587,11 @@ impl<S: ObjectStorage> Store<S> {
         missing: false,
       });
     }
-    updates::response(Some(catalog_revision), source_revision, runs).map_err(bad)
+    let mut reply =
+      updates::response(Some(catalog_revision), source_revision, runs).map_err(bad)?;
+    reply["storage_revision"] = serde_json::to_value(storage_revision)
+      .map_err(|_| ApiError::new(500, "cannot encode storage revision"))?;
+    Ok(reply)
   }
 
   pub fn dashboard_stream_range(
@@ -1078,6 +1105,7 @@ impl<S: ObjectStorage> Store<S> {
       if let FileTarget::Run { scope, .. } = &upload.target {
         record_run_activity(&transaction, scope)?;
       }
+      record_storage_publication(&transaction, &upload.target)?;
     }
     transaction
       .execute("UPDATE uploads SET complete=1 WHERE upload_id=?1", [id])
@@ -1419,6 +1447,28 @@ fn dashboard_artifact_revision(
 
 fn record_run_activity(db: &Connection, scope: &RunScope) -> ApiResult<()> {
   db.execute("INSERT OR REPLACE INTO dashboard_run_activity(project_id,origin,run_id,legacy_order) VALUES(?1,?2,?3,0)", params![scope.project_id,scope.origin,scope.run_id]).map_err(database)?;
+  Ok(())
+}
+
+/// Upload IDs are allocated at begin, so their sequence cannot represent the
+/// order in which files become visible. Advance this counter at publication.
+fn record_storage_publication(db: &Connection, target: &FileTarget) -> ApiResult<()> {
+  let project_id = match target {
+    FileTarget::Input { project_id, .. } => Some(project_id.as_str()),
+    FileTarget::Run { scope, path }
+      if path != crate::run_artifacts::INVENTORY_PATH
+        && crate::run_artifacts::validate_path(path).is_ok() =>
+    {
+      Some(scope.project_id.as_str())
+    }
+    _ => None,
+  };
+  if let Some(project_id) = project_id {
+    db.execute(
+      "INSERT INTO project_storage_revisions(project_id,revision) VALUES(?1,1) ON CONFLICT(project_id) DO UPDATE SET revision=project_storage_revisions.revision+1",
+      [project_id],
+    ).map_err(database)?;
+  }
   Ok(())
 }
 
@@ -2218,6 +2268,106 @@ pub(super) mod tests {
       store
         .dashboard_updates(Some(&source), &["..".into()])
         .is_err()
+    );
+  }
+
+  #[test]
+  fn storage_revision_tracks_publication_order_overwrites_and_ignores_suppressed_uploads() {
+    let directory = tempfile::tempdir().unwrap();
+    let backend = MockStorage::default();
+    let store = Store::open(directory.path(), backend.clone()).unwrap();
+    let source = DashboardSource {
+      project_id: "project".into(),
+      origin: "worker".into(),
+    };
+    {
+      let revision = || {
+        store.dashboard_updates(Some(&source), &[]).unwrap()["storage_revision"]
+          .as_str()
+          .unwrap()
+          .parse::<u64>()
+          .unwrap()
+      };
+      let begin = |id: &str, path: &str| {
+        store
+          .execute(Request::BeginUpload {
+            upload_id: id.into(),
+            target: FileTarget::Run {
+              scope: scope(),
+              path: path.into(),
+            },
+            size: 1,
+            sha256: "a".repeat(64),
+          })
+          .unwrap();
+        store
+          .execute(Request::RecordPart {
+            upload_id: id.into(),
+            part: CompletedPart {
+              part_number: 1,
+              etag: "part".into(),
+            },
+          })
+          .unwrap();
+        backend.stage(id, 1);
+      };
+      let complete = |id: &str| {
+        store
+          .execute(Request::CompleteUpload {
+            upload_id: id.into(),
+          })
+          .unwrap();
+      };
+      assert_eq!(revision(), 0);
+      begin("older-start", "outputs/early.pt");
+      begin("newer-start", "outputs/later.pt");
+      complete("newer-start");
+      assert_eq!(revision(), 1);
+      complete("older-start");
+      assert_eq!(
+        revision(),
+        2,
+        "late completion must advance the project revision"
+      );
+      begin("replace-existing", "outputs/early.pt");
+      begin("new-high-sequence", "outputs/new.pt");
+      complete("new-high-sequence");
+      assert_eq!(revision(), 3);
+      complete("replace-existing");
+      assert_eq!(
+        revision(),
+        4,
+        "an overwrite older than another upload must refresh Storage"
+      );
+      complete("replace-existing");
+      assert_eq!(
+        revision(),
+        4,
+        "idempotent completion must not advance revision"
+      );
+      begin("suppressed-old", "outputs/late.pt");
+      begin("winning-new", "outputs/late.pt");
+      complete("winning-new");
+      assert_eq!(revision(), 5);
+      complete("suppressed-old");
+      assert_eq!(
+        revision(),
+        5,
+        "an upload that did not publish must not advance revision"
+      );
+      begin("inventory", crate::run_artifacts::INVENTORY_PATH);
+      complete("inventory");
+      assert_eq!(
+        revision(),
+        5,
+        "the internal artifact manifest is not a Storage row"
+      );
+    }
+    drop(store);
+    let reopened = Store::open(directory.path(), backend).unwrap();
+    assert_eq!(
+      reopened.dashboard_updates(Some(&source), &[]).unwrap()["storage_revision"],
+      "5"
     );
   }
 
