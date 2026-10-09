@@ -76,6 +76,10 @@ enum ServiceSubcommand {
     #[arg(long)]
     partial: bool,
   },
+  /// Reference a completed object as an output or reusable input without copying bytes.
+  Reference(ReferenceOptions),
+  /// Upload one explicit run output or metadata file without creating a run archive.
+  FilePut(FilePutOptions),
   /// Publish or retrieve an immutable private input file.
   Input {
     #[command(subcommand)]
@@ -126,6 +130,35 @@ pub struct PullOptions {
   pub source: Option<String>,
   #[arg(long = "artifact")]
   pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct FilePutOptions {
+  #[arg(long)]
+  pub config: PathBuf,
+  /// Destination FileTarget as JSON.
+  #[arg(long)]
+  pub target: String,
+  #[arg(long)]
+  pub file: PathBuf,
+  #[arg(long, default_value = ".expri/service-sync")]
+  pub queue_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ReferenceOptions {
+  #[arg(long)]
+  pub config: PathBuf,
+  /// Source FileTarget as JSON (run output or project input).
+  #[arg(long)]
+  pub source: String,
+  /// Destination FileTarget as JSON. Requires an owner token.
+  #[arg(long)]
+  pub target: String,
+  #[arg(long)]
+  pub size: u64,
+  #[arg(long)]
+  pub sha256: String,
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +227,8 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       },
       partial,
     )?,
+    ServiceSubcommand::FilePut(options) => client::file_put(options)?,
+    ServiceSubcommand::Reference(options) => client::reference(options)?,
     ServiceSubcommand::Input { command } => match command {
       InputCommand::Put(options) => client::input_put(options)?,
       InputCommand::Get(options) => client::input_get(options)?,
