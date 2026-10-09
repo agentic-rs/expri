@@ -17,7 +17,7 @@ function installWindow(window) {
 const baseline = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost/", pretendToBeVisual: true });
 installWindow(baseline.window);
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
-const { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, parseRunDeepLink, RequestLane, startDashboard } = await import("./.test/app.js");
+const { apiUrl, formatDuration, formatNumber, formatValue, localTimeZoneLabel, parseRunDeepLink, RequestLane, runIdentity, startDashboard } = await import("./.test/app.js");
 
 function deferred() {
   let resolve;
@@ -176,14 +176,15 @@ function detailRecord(source, run, value = 0.5) {
   return { source, run, state: { command: "python train.py" }, snapshot: null, environment: null, cache: null, params: { learning_rate: 0.1 }, params_truncated: false, metadata_truncated: false, metrics: { accuracy: metric, loss: metric }, metric_count: 2, metrics_truncated: false, metrics_error: null, warnings: [] };
 }
 
-async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null } = {}) {
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null } = {}) {
   const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
-  const runs = Array.from({ length: count }, (_, index) => ({
+  const runs = project_runs ?? Array.from({ length: count }, (_, index) => ({
     run_id: `run-${index}`, task: "train", status: "completed",
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
-  const model = { nodes, sources, runs, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
+  const project_sources = [{ source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] }];
+  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -191,11 +192,12 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     const overridden = model.override?.(parsed, options);
     if (overridden !== undefined && overridden !== null) return overridden;
     if (parsed.pathname === "/api/updates") return updates ? response({ catalog_revision: model.catalog_revision, source_revision: model.list_revision, runs: query.getAll("run_id").map(run_id => {
-      const missing = model.missing_run_ids.has(run_id) || !runs.some(run => run.run_id === run_id);
+      const missing = model.missing_run_ids.has(run_id) || !runs.some(run => runIdentity(run) === run_id);
       return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, missing };
     }) }) : response({ error: "Unknown endpoint" }, 404);
     if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local" });
-    const source = sources.find(item => item.source_id === query.get("source"));
+    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [] }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    const source = [...sources, ...project_sources].find(item => item.source_id === query.get("source"));
     assert.ok(source, "all requests must remain in a known source");
     if (parsed.pathname === "/api/run-columns") return response({
       available_columns: {
@@ -206,7 +208,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     });
     if (parsed.pathname === "/api/runs") {
       if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
-      const visible = runs.filter(run => !query.get("search") || run.run_id.includes(query.get("search")));
+      const visible = runs.filter(run => (!query.get("search") || run.run_id.includes(query.get("search"))) && (!query.get("origin") || run.origin === query.get("origin")));
       const offset = Number(query.get("offset"));
       const limit = Number(query.get("limit"));
       const rows = visible.slice(offset, offset + limit).map(run => ({ ...run,
@@ -220,16 +222,19 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     const metric = { count: 2, last: { step: 1, value: model.metric_value }, min: { step: 1, value: model.metric_value }, max: { step: 0, value: 1 } };
     if (parsed.pathname === "/api/run") {
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
-      const run = runs.find(item => item.run_id === query.get("run_id"));
+      const run = runs.find(item => runIdentity(item) === query.get("run_id"));
       if (!run) return response({ error: "Run not found" }, 404);
       return response({ ...detailRecord(source, run, model.metric_value), archive: model.archive });
     }
-    if (parsed.pathname === "/api/artifacts") return response({ source, run_id: query.get("run_id"), files: model.artifact_files.map(file => ({ ...file, download_url: file.download_url === undefined ? (file.local === true || file.cloud === true ? apiUrl("/api/artifact", { source: source.source_id, run_id: query.get("run_id"), path: file.path }) : null) : file.download_url })), truncated: model.artifact_truncated, warnings: model.artifact_warnings, pull_scope: hosted ? { project_id: source.project_id ?? "test-project", origin: source.origin ?? "test-worker", run_id: query.get("run_id") } : null, inventory_recorded_at: "2026-10-07T01:02:03Z" });
-    if (parsed.pathname === "/api/log") return response({ content: model.logs[query.get("stream")] ?? `${query.get("stream")} training complete`, stream: query.get("stream"), missing: false, truncated: false });
+    if (parsed.pathname === "/api/artifacts") {
+      const selected_run = runs.find(run => runIdentity(run) === query.get("run_id"));
+      return response({ source, run_id: selected_run?.run_id ?? query.get("run_id"), ...(selected_run?.run_key ? {run_key: selected_run.run_key} : {}), files: model.artifact_files.map(file => ({ ...file, download_url: file.download_url === undefined ? (file.local === true || file.cloud === true ? apiUrl("/api/artifact", { source: source.source_id, run_id: query.get("run_id"), path: file.path }) : null) : file.download_url })), truncated: model.artifact_truncated, warnings: model.artifact_warnings, pull_scope: hosted ? { project_id: source.project_id ?? "test-project", origin: selected_run?.origin ?? source.origin ?? "test-worker", run_id: selected_run?.run_id ?? query.get("run_id") } : null, inventory_recorded_at: "2026-10-07T01:02:03Z" });
+    }
+    if (parsed.pathname === "/api/log") return response({ content: model.logs[query.get("stream")] ?? `${query.get("stream")} training complete${source.kind === "hosted_project" ? ` ${query.get("run_id")}` : ""}`, stream: query.get("stream"), missing: false, truncated: false });
     if (parsed.pathname === "/api/chart") return { ok: true, status: 200, text: async () => model.chart_html };
     if (parsed.pathname === "/api/compare") {
       const metric_names = query.getAll("metric").length ? query.getAll("metric") : ["accuracy", "loss"];
-      return response({ source, comparison: { reduction: query.get("reduction"), metric_names, runs: query.getAll("run_id").map(run_id => ({ run_id, run: runs.find(item => item.run_id === run_id), values: Object.fromEntries(metric_names.map(name => [name, metric.last])) })), warnings: [] } });
+      return response({ source, comparison: { reduction: query.get("reduction"), metric_names, runs: query.getAll("run_id").map(run_id => ({ run_id, run: runs.find(item => runIdentity(item) === run_id), values: Object.fromEntries(metric_names.map(name => [name, metric.last])) })), warnings: [] } });
     }
     assert.fail(`Unexpected dashboard request: ${url}`);
   };
@@ -626,6 +631,7 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
   globalThis.fetch = async url => {
     requests.push(url);
     if (url === "/api/catalog") return response(catalog);
+    if (url === "/api/projects") return response({ error: "Unknown endpoint" }, 404);
     const query = new URL(url, "http://localhost").searchParams;
     assert.equal(query.get("source"), source.source_id);
     assert.equal(query.get("limit"), "20");
@@ -635,7 +641,7 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
   };
   await mountDashboard(nodes);
   await settled(() => nodes.get("run-count").textContent === "No synced runs yet");
-  assert.deepEqual(requests, ["/api/catalog"], "empty catalog must not request an invalid source");
+  assert.deepEqual(requests, ["/api/catalog", "/api/projects"], "empty catalog must not request an invalid source");
   assert.equal(nodes.get("logout-form").hidden, false);
   assert.equal(nodes.get("source-select").disabled, true);
   assert.match(text(nodes.get("list-empty")), /No synced runs yet/);
@@ -728,7 +734,7 @@ async function autoFixture(t, fields = {}) {
 async function inspect(model, index = 0) {
   await settled(() => model.nodes.get("run-rows").children.length > index);
   await click(runButton(model.nodes, index));
-  await settled(() => chartQuery(model.nodes).get("run_id") === model.runs[index].run_id);
+  await settled(() => chartQuery(model.nodes).get("run_id") === runIdentity(model.runs[index]));
 }
 function requestCounts(requests) {
   return requests.reduce((counts, url) => { const path = new URL(url, "http://localhost").pathname; counts[path] = (counts[path] ?? 0) + 1; return counts; }, {});
@@ -1662,4 +1668,139 @@ test("archive metadata hints update the badge during Logs without fetching metri
   assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"]); assert.equal(next["/api/log"], counts["/api/log"]);
   assert.match(model.nodes.get("archive-summary").textContent, /Archived.*Partial archive.*Download archive/);
   assert.equal(model.nodes.get("review-tab-logs").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("log-output"), log); assert.equal(log.scrollTop, 24);
+});
+
+
+const project_source = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] };
+function projectRuns() {
+  return ["gpu-a", "gpu-b"].map(origin => ({ ...publishedRun("same-run"), origin, run_key: `${origin}:same-run` }));
+}
+
+test("project browsing selects projects and preserves duplicate run IDs across recorded machines", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  await settledTable(nodes);
+  assert.equal(nodes.get("project-name").textContent, "vision");
+  assert.equal(nodes.document.title, "expri · vision");
+  assert.equal(nodes.get("project-vision").checked, true);
+  assert.equal(nodes.get("machine-all").checked, true);
+  assert.equal(nodes.get("run-rows").children.length, 2);
+  assert.deepEqual([...nodes.get("run-rows").children].map(row => row.dataset.runKey), ["gpu-a:same-run", "gpu-b:same-run"]);
+  assert.deepEqual([...nodes.get("run-rows").querySelectorAll("button.run-link")].map(button => button.textContent), ["same-run", "same-run"]);
+  assert.deepEqual(model.requests.filter(url => url.startsWith("/api/runs")).map(url => new URL(url, "http://localhost").searchParams.get("source")), [project_source.source_id], "no transient worker list is fetched");
+  await selectRow(nodes, 0); await selectRow(nodes, 1); await click(nodes.get("compare-button"));
+  await settled(() => nodes.get("comparison-values").querySelectorAll("tbody tr").length === 2);
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["gpu-a:same-run", "gpu-b:same-run"]);
+  assert.match(nodes.get("comparison-values").textContent, /same-run · gpu-a/);
+  assert.match(nodes.get("comparison-values").textContent, /same-run · gpu-b/);
+  const catalog_count = requestCounts(model.requests)["/api/catalog"];
+  model.model.catalog_revision = "projects-2";
+  await model.clock.advance(5_000);
+  assert.equal(requestCounts(model.requests)["/api/catalog"], catalog_count);
+  assert.ok(requestCounts(model.requests)["/api/projects"] >= 2);
+});
+
+test("project inspection, logs, archives and CLI files bind machine identity while retaining actual run IDs", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  model.model.archive = { status: "archived", incomplete: false };
+  await inspect(model, 1);
+  assert.equal(nodes.get("review-title").textContent, "same-run · gpu-b");
+  await click(nodes.get("review-tab-logs"));
+  await settled(() => nodes.get("log-output").textContent.includes("gpu-b:same-run"));
+  await click(nodes.get("log-tab-stderr"));
+  await settled(() => nodes.get("log-output").textContent.includes("stderr training complete gpu-b:same-run"));
+  await click(nodes.get("review-tab-overview"));
+  const archive = new URL(nodes.get("download-archive").href);
+  assert.equal(archive.searchParams.get("source"), project_source.source_id);
+  assert.equal(archive.searchParams.get("run_id"), "gpu-b:same-run");
+  model.model.artifact_files = [checkpointFile("outputs/model.pt")];
+  await filesView(model); await click(fileCheckbox(nodes, "outputs/model.pt"));
+  const download = new URL(fileRow(nodes, "outputs/model.pt").querySelector("a").href);
+  assert.equal(download.searchParams.get("run_id"), "gpu-b:same-run");
+  setValue(nodes.get("artifact-config-path"), "/private/owner.toml"); await emit(nodes.get("artifact-config-path"), "input");
+  assert.match(nodes.get("artifact-pull-command").value, /--origin 'gpu-b' --run-id 'same-run'/);
+  assert.equal(nodes.get("artifact-pull-command").value.includes("gpu-b:same-run"), false);
+  await inspect(model, 0); await click(nodes.get("review-tab-logs"));
+  await settled(() => nodes.get("log-output").textContent.includes("gpu-a:same-run"));
+  assert.equal(nodes.get("review-title").textContent, "same-run · gpu-a");
+});
+
+test("machine filters operate within projects, clear run selection and use one-click sortable machine headers", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  await settledTable(nodes); await selectRow(nodes, 0);
+  await click(nodes.get("machine-gpu-b")); await settledTable(nodes);
+  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-b:same-run");
+  assert.equal(latestRunQuery(model).get("origin"), "gpu-b");
+  assert.equal(nodes.get("review-section").hidden, true);
+  assert.equal(runCheckbox(nodes, 0).checked, false);
+  await click(nodes.get("machine-all")); await settledTable(nodes);
+  assert.equal(nodes.get("run-rows").children.length, 2);
+  assert.equal(latestRunQuery(model).has("origin"), false);
+  await click(nodes.document.querySelector('button[aria-label="Sort by Machine ascending"]')); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("sort"), "origin");
+  assert.equal(latestRunQuery(model).get("direction"), "asc");
+  const frame = nodes.get("chart-frame");
+  model.model.project_sources.push({ ...project_source, project_id: "other", source_id: "hosted-project:other", label: "other" });
+  model.model.catalog_revision = "another-project"; await model.clock.advance(5_000);
+  await click(nodes.get("project-other")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("source"), "hosted-project:other");
+  assert.equal(nodes.get("project-name").textContent, "other");
+  assert.equal(nodes.document.title, "expri · other");
+  assert.equal(nodes.get("chart-frame"), frame);
+});
+
+test("legacy deep links open the exact project run and live probes retain its machine key", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns(), url: "http://localhost/?project_id=vision&origin=gpu-b&run_id=same-run" }), { nodes } = model;
+  await settled(() => chartQuery(nodes).get("run_id") === "gpu-b:same-run");
+  assert.equal(nodes.get("review-title").textContent, "same-run · gpu-b");
+  const frame = nodes.get("chart-frame");
+  await click(nodes.get("review-tab-logs"));
+  model.model.metrics_revision = "metric-2"; model.model.metadata_revision = "metadata-2"; model.model.stdout_revision = "log-2";
+  await model.clock.advance(5_000);
+  const probe = new URL(model.requests.filter(url => url.startsWith("/api/updates")).at(-1), "http://localhost");
+  assert.deepEqual(probe.searchParams.getAll("run_id"), ["gpu-b:same-run"]);
+  assert.equal(nodes.get("review-tab-logs").getAttribute("aria-selected"), "true");
+  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(nodes.get("review-error").hidden, true);
+});
+
+test("project capability fallback retries manually and transient project failures retain the successful view", async t => {
+  const model = await autoFixture(t, { projects: false }), { nodes } = model;
+  await settledTable(nodes);
+  assert.match(nodes.get("project-catalog-note").textContent, /Upgrade the expri server/);
+  const attempts = requestCounts(model.requests)["/api/projects"];
+  model.model.catalog_revision = "legacy-2"; await model.clock.advance(5_000);
+  assert.equal(requestCounts(model.requests)["/api/projects"], attempts, "404 is cached during automatic refresh");
+  model.model.projects_status = 200;
+  await click(nodes.get("refresh-button")); await settled(() => nodes.document.getElementById("project-vision")?.checked);
+  assert.equal(nodes.get("project-catalog-note").hidden, true);
+  const frame = nodes.get("chart-frame");
+  model.model.projects_status = 503;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.match(nodes.get("global-error").textContent, /Project browsing unavailable/);
+  assert.equal(nodes.get("project-vision").checked, true);
+  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(nodes.get("chart-frame"), frame);
+  model.model.projects_status = 200;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.equal(nodes.get("global-error").hidden, true);
+});
+
+
+test("a late project catalog cannot replace an explicit project choice", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  await settledTable(nodes);
+  model.model.project_sources.push({ ...project_source, project_id: "other", source_id: "hosted-project:other", label: "other" });
+  await click(nodes.get("refresh-button")); await settled(() => nodes.document.getElementById("project-other") !== null);
+  const pending = deferred(); let signal;
+  t.after(() => pending.resolve(response({ project_name: "Old projects", sources: [project_source], initial_source: project_source.source_id, access_mode: "hosted", warnings: [] })));
+  model.model.override = (parsed, options) => parsed.pathname === "/api/projects" ? (signal = options.signal, pending.promise) : null;
+  await click(nodes.get("refresh-button")); await settled(() => signal !== undefined);
+  await click(nodes.get("project-other")); await settledTable(nodes);
+  assert.equal(signal.aborted, true);
+  pending.resolve(response({ project_name: "Old projects", sources: [project_source], initial_source: project_source.source_id, access_mode: "hosted", warnings: [] }));
+  await flush();
+  assert.equal(nodes.get("project-other").checked, true);
+  assert.equal(nodes.get("project-name").textContent, "other");
+  assert.equal(latestRunQuery(model).get("source"), "hosted-project:other");
 });

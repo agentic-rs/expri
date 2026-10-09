@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   apiUrl,
+  artifactScopeMatchesRun,
   dateText,
   parseRunDeepLink,
   type ArtifactCatalog,
@@ -32,12 +33,13 @@ export function artifactCanSelect(
   run_id: string,
 ): boolean {
   if (!safeArtifactPath(file.path)) return false;
-  if (artifactDownloadUrl(file, source_id, run_id)) return true;
+  if (source_id.startsWith("hosted-project:") && !artifactScopeMatchesRun(scope, source_id, run_id))
+    return false;
+  if (artifactDownloadUrl(file, source_id, run_id, scope)) return true;
   return (
     file.download_url === null &&
     file.cloud === true &&
-    scope?.run_id === run_id &&
-    parseRunDeepLink(apiUrl("", scope)) !== null
+    artifactScopeMatchesRun(scope, source_id, run_id)
   );
 }
 /** Accept only the catalog's scoped, same-origin artifact endpoint. */
@@ -45,7 +47,10 @@ export function artifactDownloadUrl(
   file: ArtifactFile,
   source_id: string,
   run_id: string,
+  scope: ArtifactScope | null = null,
 ): string | null {
+  if (source_id.startsWith("hosted-project:") && !artifactScopeMatchesRun(scope, source_id, run_id))
+    return null;
   const value = file.download_url;
   if (typeof value !== "string" || !value.startsWith("/api/artifact?")) return null;
   if (!safeArtifactPath(file.path)) return null;
@@ -177,9 +182,10 @@ export function FilesPanel({
     file.path.toLocaleLowerCase().includes(search.toLocaleLowerCase()),
   );
   const chosen = files.filter((file) => selected.includes(file.path));
-  const downloadable = chosen.filter((file) => artifactDownloadUrl(file, source_id, run_id));
+  const scope = catalog?.pull_scope ?? null;
+  const pull_scope = artifactScopeMatchesRun(scope, source_id, run_id) ? scope : null;
+  const downloadable = chosen.filter((file) => artifactDownloadUrl(file, source_id, run_id, pull_scope));
   const cloud = chosen.filter((file) => file.cloud === true);
-  const pull_scope = catalog?.pull_scope?.run_id === run_id ? catalog.pull_scope : null;
   const command = artifactPullCommand(pull_scope, files, selected, config_path);
   useEffect(() => {
     setCopyStatus("");
@@ -263,7 +269,7 @@ export function FilesPanel({
               </thead>
               <tbody id="file-rows">
                 {visible.map((file) => {
-                  const url = artifactDownloadUrl(file, source_id, run_id),
+                  const url = artifactDownloadUrl(file, source_id, run_id, pull_scope),
                     selectable = artifactCanSelect(file, pull_scope, source_id, run_id),
                     checked = selected.includes(file.path);
                   return (
@@ -382,7 +388,7 @@ export function FilesPanel({
               </p>
               <ul>
                 {downloadable.map((file) => {
-                  const url = artifactDownloadUrl(file, source_id, run_id);
+                  const url = artifactDownloadUrl(file, source_id, run_id, pull_scope);
                   return (
                     url && (
                       <li key={file.path}>

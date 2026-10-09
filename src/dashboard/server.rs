@@ -598,6 +598,14 @@ fn route_content_checked(
       query.allow(&[])?;
       Ok(Reply::json(dashboard.catalog().map_err(service_error)?))
     }
+    "/api/projects" => {
+      query.allow(&[])?;
+      let projects = dashboard
+        .projects()
+        .map_err(service_error)?
+        .ok_or_else(|| Reply::error(404, "project browsing is unavailable"))?;
+      Ok(Reply::json(projects))
+    }
     "/api/updates" => {
       query.allow(&["source", "run_id"])?;
       let ids = query.runs(0)?;
@@ -620,6 +628,7 @@ fn route_content_checked(
         "reduction",
         "sort",
         "direction",
+        "origin",
       ])?;
       let limit = query.number("limit", 100, 1, 1000)?;
       let offset = query.number("offset", 0, 0, usize::MAX)?;
@@ -642,6 +651,7 @@ fn route_content_checked(
           .list_table(
             source,
             &super::table::ListQuery {
+              origin: query.optional("origin"),
               search: query.optional("search"),
               task: query.optional("task"),
               status: query.optional("status"),

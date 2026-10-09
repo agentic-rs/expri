@@ -497,7 +497,14 @@ acknowledged tracking files into `result.zip` in S3; checkpoints and inputs
 remain separate objects.
 
 An optional hosted dashboard reviews synced runs through HTTPS with a separate
-dashboard password and read-only browser sessions. The local dashboard remains
+dashboard password and read-only browser sessions. Choose a project to review
+its runs across recorded machines; **All machines** is the default. Machine
+tags filter by the publishing origin, and the sortable **Machine** column keeps
+that provenance visible. Runs from different machines can be compared even
+when their recorded run IDs match. Their logs, files, browser downloads, and
+generated CLI commands keep each run's original project and machine scope.
+Existing worker run links continue to open the exact recorded run.
+The local dashboard remains
 available for offline review after downloading results.
 
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and

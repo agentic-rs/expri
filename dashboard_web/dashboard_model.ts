@@ -10,7 +10,8 @@ export type Source = {
   kind: string;
   target_name: string | null;
   project_id?: string;
-  origin?: string;
+  origin?: string | null;
+  machines?: string[];
 };
 export type RunDeepLink = { project_id: string; origin: string; run_id: string };
 
@@ -32,6 +33,8 @@ export function parseRunDeepLink(search: string): RunDeepLink | null {
 }
 export type Run = {
   run_id: string;
+  run_key?: string;
+  origin?: string;
   task: string | null;
   status: string;
   started_at: string | null;
@@ -123,12 +126,52 @@ export type ArtifactFile = {
 export type ArtifactCatalog = {
   source: Source;
   run_id: string;
+  run_key?: string;
   files: ArtifactFile[];
   truncated: boolean;
   warnings: Warning[];
   pull_scope: ArtifactScope | null;
   inventory_recorded_at?: string | null;
 };
+
+export function runIdentity(run: Pick<Run, "run_id" | "run_key">): string {
+  return run.run_key ?? run.run_id;
+}
+export function runLabel(run: Pick<Run, "run_id" | "origin">): string {
+  return run.origin ? `${run.run_id} · ${run.origin}` : run.run_id;
+}
+export function runKeyLabel(run_key: string): string {
+  const run = parseProjectRunKey(run_key);
+  return run ? runLabel(run) : run_key;
+}
+export function projectRunKey(origin: string, run_id: string): string {
+  return `${origin}:${run_id}`;
+}
+export function parseProjectRunKey(value: string): { origin: string; run_id: string } | null {
+  const parts = value.split(":");
+  if (parts.length !== 2) return null;
+  const [origin, run_id] = parts;
+  const scope = parseRunDeepLink(apiUrl("", {
+    project_id: "project",
+    origin: origin ?? "",
+    run_id: run_id ?? "",
+  }));
+  return scope ? { origin: scope.origin, run_id: scope.run_id } : null;
+}
+export function artifactScopeMatchesRun(
+  scope: ArtifactScope | null,
+  source_id: string,
+  run_key: string,
+): scope is ArtifactScope {
+  if (!scope || !parseRunDeepLink(apiUrl("", scope))) return false;
+  if (!source_id.startsWith("hosted-project:")) return scope.run_id === run_key;
+  const identity = parseProjectRunKey(run_key);
+  return (
+    source_id.slice("hosted-project:".length) === scope.project_id &&
+    identity?.origin === scope.origin &&
+    identity.run_id === scope.run_id
+  );
+}
 export type ReviewTab = "charts" | "overview" | "logs" | "files";
 export type Review = {
   kind: "run" | "compare";

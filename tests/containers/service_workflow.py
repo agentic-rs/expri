@@ -28,6 +28,7 @@ refresh_browser = None
 fixture_env = dict(os.environ)
 fixture_env.update({
   'EXPRI_OWNER_TOKEN': secrets.token_hex(24), 'EXPRI_WORKER_TOKEN': secrets.token_hex(24),
+  'EXPRI_MACHINE_TOKEN': secrets.token_hex(24),
   'EXPRI_DASHBOARD_PASSWORD': secrets.token_hex(24),
   'AWS_ACCESS_KEY_ID': 'expri-ci', 'AWS_SECRET_ACCESS_KEY': secrets.token_hex(24),
 })
@@ -36,7 +37,7 @@ fixture_env['MINIO_ROOT_PASSWORD'] = fixture_env['AWS_SECRET_ACCESS_KEY']
 browser_secrets = []
 
 def redact(text):
-  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD', 'AWS_SECRET_ACCESS_KEY']:
+  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD', 'AWS_SECRET_ACCESS_KEY']:
     text = text.replace(fixture_env[key], '[redacted]')
   for cookie in browser_secrets:
     text = text.replace(cookie, '[redacted]')
@@ -100,8 +101,8 @@ def wait_for(predicate, message, timeout=60):
     time.sleep(0.2)
   raise AssertionError(message)
 
-def client(container, action, *args, check=True):
-  config = '/tmp/worker.toml' if container == worker else '/tmp/owner.toml'
+def client(container, action, *args, check=True, config=None):
+  config = config or ('/tmp/worker.toml' if container == worker else '/tmp/owner.toml')
   return execute(container, 'expri', 'service', *action.split(), '--config', config, *args, check=check)
 
 def browser(path, *, method='GET', cookie=None, bearer_env=None, password_env=None,
@@ -150,9 +151,9 @@ def browser_json(path, cookie):
   assert result['headers']['content-type'].startswith('application/json')
   return json.loads(result['body'])
 
-def service_record(action, run_id):
+def service_record(action, run_id, origin='worker'):
   result = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
-    'action': action, 'scope': {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id},
+    'action': action, 'scope': {'project_id': 'demo', 'origin': origin, 'run_id': run_id},
   })
   assert result['status'] == 200, 'owner could not inspect the tracking catalog'
   return json.loads(result['body'])
@@ -182,6 +183,7 @@ def dashboard_public_checks():
   result = browser('/')
   assert result['status'] == 303 and result['headers'].get('location') == '/login', 'public dashboard root did not redirect to login'
   assert browser('/api/catalog')['status'] == 401, 'unauthenticated dashboard API exposed data'
+  assert browser('/api/projects')['status'] == 401, 'unauthenticated project dashboard exposed data'
   assert browser('/api/run-columns?source=service:demo:worker')['status'] == 401, 'unauthenticated run columns exposed data'
   assert browser('/api/artifacts?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated artifact catalog exposed data'
   assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
@@ -189,10 +191,10 @@ def dashboard_public_checks():
   assert browser('/api/events')['status'] == 401, 'unauthenticated live updates exposed data'
   login = browser('/login')
   assert login['status'] == 200 and 'autocomplete="current-password"' in login['body'], 'public login form is unavailable'
-  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD']:
+  for key in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD']:
     assert fixture_env[key] not in login['body'], 'public login page exposed a fixture credential'
   assert browser('/login', method='POST', password_env='EXPRI_OWNER_TOKEN')['status'] == 401, 'owner API token replaced the dedicated dashboard password'
-  for token in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN']:
+  for token in ['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN']:
     assert browser('/api/catalog', bearer_env=token)['status'] == 401, 'service bearer token authorized the browser dashboard'
   cookie = dashboard_login()
   catalog = browser_json('/api/catalog', cookie)
@@ -379,6 +381,141 @@ def automatic_dashboard_checks(run_id, updated):
       redact((logs / 'browser-auto-refresh.log').read_text(errors='replace'))[-4096:])
   assert browser('/logout', method='POST', cookie=cookie)['status'] == 303, 'auto-refresh fixture session did not close'
 
+def project_machine_fixture(original):
+  run_dir = '/home/tester/project-worker-b'
+  staging = state / 'project-machine-run'
+  docker('cp', f"{worker}:{original['run_dir']}", str(staging))
+  copy(staging, host, run_dir)
+  docker('exec', '--user', '0', host, 'chown', '-R', 'tester:tester', run_dir)
+  python(host, f'''import json
+from pathlib import Path
+root = Path({run_dir!r})
+rows = [json.loads(line) for line in (root / 'outputs/metrics.jsonl').read_text().splitlines()]
+timed = [row for row in rows if 'timestamp' in row]
+for row, value in [(timed[0], 0.7), (timed[-1], 0.07)]:
+  row['metrics'] = {{'loss': value}}
+(root / 'outputs/metrics.jsonl').write_text(''.join(json.dumps(row) + chr(10) for row in [timed[0], timed[-1]]))
+(root / 'outputs/params.json').write_text(json.dumps({{'learning_rate': 0.002, 'machine_probe': 'worker-b'}}))
+(root / 'logs/stdout.log').write_text('project machine worker-b log' + chr(10))
+(root / 'outputs/project-scope.txt').write_text('worker-b scope fixture' + chr(10))
+''')
+  client(host, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker-b',
+    '--queue-dir', '/home/tester/project-machine-queue', config='/tmp/machine-worker.toml')
+  python(worker, f"from pathlib import Path;Path({original['run_dir']!r}+'/outputs/project-scope.txt').write_text('worker scope fixture'+chr(10))")
+  client(worker, 'push', '--run-dir', original['run_dir'], '--project-id', 'demo', '--origin', 'worker',
+    '--queue-dir', WORKER_QUEUE)
+  assert json.loads(python(host, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['run_id'] == original['run_id'], 'second recorded machine did not preserve the colliding run ID'
+  return {'run_id': original['run_id'], 'run_dir': run_dir}
+
+def project_api_checks(first, second):
+  cookie = dashboard_login()
+  source = 'hosted-project:demo'
+  projects = browser_json('/api/projects', cookie)
+  matching = [project for project in projects['sources'] if project['source_id'] == source]
+  assert len(matching) == 1 and matching[0]['kind'] == 'hosted_project', 'project catalog did not aggregate the recorded machines'
+  keys = ['worker:' + first['run_id'], 'worker-b:' + second['run_id']]
+  listing = browser_json('/api/runs?' + urlencode({'source': source}), cookie)['runs']
+  collisions = [run for run in listing if run['run_id'] == first['run_id']]
+  assert {run['run_key'] for run in collisions} == set(keys), 'project listing collapsed equal run IDs from different machines'
+  assert {run['origin'] for run in collisions} == {'worker', 'worker-b'}, 'project listing omitted machine provenance'
+  filtered = browser_json('/api/runs?' + urlencode({'source': source, 'origin': 'worker-b', 'sort': 'origin', 'direction': 'asc'}), cookie)['runs']
+  assert len(filtered) == 1 and filtered[0]['run_key'] == keys[1], 'machine filter selected the wrong colliding run'
+  comparison = browser_json('/api/compare?' + urlencode([('source', source), *[('run_id', key) for key in keys], ('metric', 'loss')]), cookie)['comparison']
+  assert {run['run_id'] for run in comparison['runs']} == set(keys), 'cross-machine comparison collapsed transport identities'
+  for origin, key, value in [('worker', keys[0], 0.004), ('worker-b', keys[1], 0.07)]:
+    row = next(run for run in comparison['runs'] if run['run_id'] == key)
+    assert row['run']['run_id'] == first['run_id'] and row['run']['origin'] == origin, 'comparison replaced the recorded run ID or machine'
+    assert row['values']['loss']['value'] == value, 'cross-machine comparison read a different machine metric stream'
+    detail = browser_json('/api/run?' + urlencode({'source': source, 'run_id': key}), cookie)
+    assert detail['run']['run_id'] == first['run_id'] and detail['run']['origin'] == origin, 'project detail resolved the wrong machine'
+    files = browser_json('/api/artifacts?' + urlencode({'source': source, 'run_id': key}), cookie)
+    assert files['pull_scope'] == {'project_id': 'demo', 'origin': origin, 'run_id': first['run_id']}, 'project artifact pull command changed the actual scope'
+    artifact = next(file for file in files['files'] if file['path'] == 'outputs/project-scope.txt')
+    assert artifact['worker'] is True and artifact['cloud'] is False and artifact['download_url'] is None, 'active project artifact inventory did not preserve its reported machine location'
+  rejected = browser('/v1/request', method='POST', bearer_env='EXPRI_MACHINE_TOKEN', payload={
+    'action': 'list_runs', 'project_id': 'demo', 'origin': 'worker',
+  })
+  assert rejected['status'] == 403, 'second machine token authorized the first recorded origin'
+  browser('/logout', method='POST', cookie=cookie)
+
+def project_dashboard_checks(first, second):
+  global refresh_browser
+  coordination = '/tmp/expri-project-coordination.json'
+  python(firefox, f"from pathlib import Path;Path({coordination!r}).unlink(missing_ok=True)")
+  def phase():
+    if refresh_browser.poll() is not None:
+      raise RuntimeError('Firefox project test exited before publication: ' + redact((logs / 'browser-project.log').read_text(errors='replace'))[-4096:])
+    return python(firefox, f"import json;from pathlib import Path;p=Path({coordination!r});print(json.loads(p.read_text()).get('phase','') if p.exists() else '')")
+  with (logs / 'browser-project.log').open('wb') as output:
+    refresh_browser = subprocess.Popen(['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--project', first['run_id']],
+      cwd=ROOT, env=fixture_env, stdout=output, stderr=subprocess.STDOUT)
+    for origin, container, fixture, step, value, config, queue in [
+      ('worker', worker, first, 82, 0.003, '/tmp/worker.toml', WORKER_QUEUE),
+      ('worker-b', host, second, 83, 0.006, '/tmp/machine-worker.toml', '/home/tester/project-machine-queue'),
+    ]:
+      wait_for(lambda: phase() == 'publish-' + origin, 'Firefox did not request project publication from ' + origin, timeout=90)
+      python(container, f'''import json
+from datetime import datetime, timezone
+from pathlib import Path
+root = Path({fixture['run_dir']!r})
+with (root / 'outputs/metrics.jsonl').open('a') as metrics:
+  metrics.write(json.dumps({{'schema_version': 1, 'step': {step}, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z'), 'metrics': {{'loss': {value}}}}}) + chr(10))
+with (root / 'logs/stdout.log').open('a') as output:
+  output.write('project live update from {origin}' + chr(10))
+''')
+      client(container, 'push', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
+        '--queue-dir', queue, config=config)
+      python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'published-{origin}'}}))")
+    wait_for(lambda: phase() == 'finish-runs', 'Firefox did not request terminal project artifacts', timeout=90)
+    for origin, container, fixture, config, queue in [
+      ('worker', worker, first, '/tmp/worker.toml', WORKER_QUEUE),
+      ('worker-b', host, second, '/tmp/machine-worker.toml', '/home/tester/project-machine-queue'),
+    ]:
+      python(container, f'''import json
+from datetime import datetime, timezone
+from pathlib import Path
+path=Path({fixture['run_dir']!r})/'run-state.json'
+record=json.loads(path.read_text())
+record.update(status='completed', exit_code=0, finished_at=datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
+path.write_text(json.dumps(record))
+''')
+      client(container, 'push', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
+        '--queue-dir', queue, '--artifact', 'outputs/project-scope.txt', config=config)
+      python(container, f'''import json
+from pathlib import Path
+saved=json.loads((Path({queue!r})/'runs/demo'/{origin!r}/{fixture['run_id']!r}/'queue.json').read_text())
+assert saved['protocol']=='tracking_v1' and saved['archive']['incomplete'] is False
+assert all(document['complete'] for document in saved['documents'].values())
+assert saved['files']['outputs/project-scope.txt']['upload']['complete'] is True
+record=json.loads((Path({fixture['run_dir']!r})/'run-state.json').read_text())
+assert record['status']=='completed' and record['exit_code']==0 and record['finished_at']
+print('project terminal tracking queue verified')
+''')
+    project_artifact_checks(first, second)
+    python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'finished-runs'}}))")
+    wait_for(lambda: refresh_browser.poll() is not None, 'Firefox project workflow did not finish', timeout=90)
+    if refresh_browser.returncode:
+      raise RuntimeError('Firefox project workflow failed: ' + redact((logs / 'browser-project.log').read_text(errors='replace'))[-4096:])
+    refresh_browser = None
+
+def project_artifact_checks(first, second):
+  cookie=dashboard_login()
+  for origin, fixture in [('worker', first), ('worker-b', second)]:
+    key=origin+':'+fixture['run_id']
+    query={'source':'hosted-project:demo','run_id':key}
+    detail=browser_json('/api/run?'+urlencode(query),cookie)
+    assert detail['run']['status']=='completed' and detail['run']['exit_code']==0 and detail['run']['finished_at'], 'project terminal fields did not reach their machine scope'
+    files=browser_json('/api/artifacts?'+urlencode(query),cookie)
+    assert files['pull_scope']=={'project_id':'demo','origin':origin,'run_id':fixture['run_id']}, 'terminal project artifact command changed its recorded scope'
+    artifact=next(file for file in files['files'] if file['path']=='outputs/project-scope.txt')
+    expected_size=len((origin+' scope fixture\n').encode())
+    assert artifact['worker'] is True and artifact['cloud'] is True and artifact['size']==expected_size, 'terminal project artifact inventory did not report the finalized machine file'
+    head=browser(artifact['download_url'],method='HEAD',cookie=cookie)
+    assert head['status']==200 and int(head['headers']['content-length'])==expected_size, 'project artifact HEAD resolved a different machine file'
+    assert browser(artifact['download_url'],cookie=cookie,origin='https://outside.invalid')['status']==403, 'cross-origin project artifact request was accepted'
+  browser('/logout',method='POST',cookie=cookie)
+
 try:
   if not options.no_build:
     for target in ['worker', 'host', 'service', 'browser']:
@@ -401,6 +538,10 @@ try:
 project_id = "demo"
 origin = "worker"
 token_env = "EXPRI_WORKER_TOKEN"
+[[workers]]
+project_id = "demo"
+origin = "worker-b"
+token_env = "EXPRI_MACHINE_TOKEN"
 [dashboard]
 public_url = "https://expri.example.net"
 password_env = "EXPRI_DASHBOARD_PASSWORD"
@@ -416,8 +557,9 @@ prefix = "acceptance"
 ''')
   (state / 'owner.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_OWNER_TOKEN"\n')
   (state / 'worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_WORKER_TOKEN"\n')
+  (state / 'machine-worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_MACHINE_TOKEN"\n')
   service = create('service', 'expri-ci-service', ['--config', '/tmp/server.toml', '--listen', '0.0.0.0:8787',
-    '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
+    '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
   copy(server_config, service, '/tmp/server.toml')
   preview = state / 'preview'
   revision = 'a' * 40
@@ -428,13 +570,14 @@ prefix = "acceptance"
   (release / 'deployment.json').write_text(json.dumps({'commit': revision, 'branch': 'fixture/ab'}))
   (preview / 'current').symlink_to('releases/' + revision)
   copy(preview, service, '/home/tester/preview')
-  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
+  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
   worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
   proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
   firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net', 's3.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
   copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
   copy(ROOT / 'tests/containers/service_proxy.py', proxy, '/tmp/proxy.py')
   copy(state / 'owner.toml', host, '/tmp/owner.toml')
+  copy(state / 'machine-worker.toml', host, '/tmp/machine-worker.toml')
   copy(state / 'worker.toml', worker, '/tmp/worker.toml')
   docker('start', host)
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://s3:9000/minio/health/ready',timeout=1).status)") == '200', 'S3 fixture not ready')
@@ -566,6 +709,7 @@ print(process.pid)
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
   assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
   dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
+  python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').touch()")
   logged('browser-workspace.log', ['docker', 'exec', '--user', 'tester', firefox,
     'python3', '/opt/expri-browser/browser_forms.py', '--workspace', run_id, second['run_id']], timeout=180)
   logged('browser-previews.log', ['docker', 'exec', '--user', 'tester', firefox,
@@ -575,6 +719,10 @@ print(process.pid)
   refresh_run = running_refresh_fixture(second)
   acknowledged_prefix_checks(refresh_run)
   automatic_dashboard_checks(run_id, refresh_run)
+  python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').unlink()")
+  machine_run = project_machine_fixture(refresh_run)
+  project_api_checks(refresh_run, machine_run)
+  project_dashboard_checks(refresh_run, machine_run)
   # Failed and cancelled runs must also finish publication, without a selected
   # final checkpoint preventing their metadata/logs from draining.
   failed = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach fail').stdout)
@@ -633,6 +781,7 @@ finally:
         for name in [
           'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
           'workspace-columns-desktop', 'workspace-columns-320', 'workspace-columns-360',
+          'workspace-project-desktop', 'workspace-project-320', 'workspace-project-360', 'workspace-project-failure',
           'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
           'workspace-elapsed', 'workspace-wall_clock',
           'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',

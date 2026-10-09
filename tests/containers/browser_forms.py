@@ -16,6 +16,7 @@ ORIGIN = 'https://expri.example.net'
 POLICY_OVERRIDE = Path('/tmp/expri-browser-policy')
 TRACE = Path('/tmp/expri-browser-requests.jsonl')
 REFRESH_COORDINATION = Path('/tmp/expri-refresh-coordination.json')
+PROJECT_COORDINATION = Path('/tmp/expri-project-coordination.json')
 DOWNLOADS = Path('/tmp/expri-downloads')
 ELEMENT = 'element-6066-11e4-a52e-4f735466cecf'
 
@@ -920,6 +921,14 @@ def previews(run_id, second_run_id):
     return browser.call('POST', '/execute/async', {'script': '''const done = arguments[0];
       fetch('/api/catalog').then(async response => done({status: response.status,
         catalog: response.ok ? await response.json() : null})).catch(() => done({status: 0}));''', 'args': []})
+  def pause_dashboard():
+    # Cookie replay intentionally presents a revoked/other-host session. Finish
+    # initial page requests and pause automatic checks so those checks do not
+    # navigate away while WebDriver observes the explicit catalog response.
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length === 2 && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'preview authentication page did not finish its initial run request')
+    if evaluate("return document.querySelector('#auto-refresh-toggle').checked;"):
+      browser.click('#auto-refresh-toggle')
+    wait_for(lambda: 'Auto updates off' in evaluate("return document.querySelector('#updated-at').textContent;"), 'preview authentication fixture did not pause automatic checks')
   def assert_provenance():
     for selector in ['header .read-only', 'footer .deployment-revision']:
       assert browser.call('GET', '/element/' + browser.element(selector) + '/displayed'), 'preview deployment provenance is hidden after mounting'
@@ -975,6 +984,7 @@ def previews(run_id, second_run_id):
     catalog_with_wire_check(browser, 200, 1)
     browser.navigate('/')
     catalog_with_wire_check(browser, 200, 1)
+    pause_dashboard()
     # Replay both directions while both server sessions are still valid.
     browser.restore_cookie(ab_cookie)
     catalog_with_wire_check(browser, 401, 1)
@@ -982,17 +992,140 @@ def previews(run_id, second_run_id):
     catalog_with_wire_check(browser, 200, 1)
     browser.navigate('/', preview_origin)
     catalog_with_wire_check(browser, 200, 1)
+    pause_dashboard()
     browser.click('#logout-form button[type="submit"]')
     catalog_with_wire_check(browser, 401, 0)
     browser.restore_cookie(ab_cookie)
     catalog_with_wire_check(browser, 401, 1)
     browser.navigate('/')
     catalog_with_wire_check(browser, 200, 1)
+    pause_dashboard()
     browser.click('#logout-form button[type="submit"]')
     catalog_with_wire_check(browser, 401, 0)
     browser.restore_cookie(main_cookie)
     catalog_with_wire_check(browser, 401, 1)
     print('Firefox previews passed: separate host sessions, shared catalog/runs, branch assets and visible provenance, comparison, cookie replay denied, independent logout.', flush=True)
+  finally:
+    browser.close()
+
+
+def project_workspace(run_id):
+  browser = Firefox()
+  source = 'hosted-project:demo'
+  keys = ['worker:' + run_id, 'worker-b:' + run_id]
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def settled():
+    return evaluate("return document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';")
+  def select(key):
+    browser.click(f'#run-rows tr[data-run-key="{key}"] input[type="checkbox"]')
+  def table_value(key):
+    return evaluate('''const row = [...document.querySelectorAll('#run-rows tr')].find(node => node.dataset.runKey === arguments[0]);
+      return row?.querySelector('td[data-column-kind="metric"][data-column-key="loss"]')?.title ?? null;''', key)
+  def project_selected():
+    return evaluate("return document.querySelector('#project-demo')?.checked === true && document.querySelector('#project-name').textContent === 'demo';")
+  def capture(name):
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  def chart_keys():
+    return evaluate("const frame=document.querySelector('#chart-frame'); return frame?.getAttribute('src') ? new URL(frame.src).searchParams.getAll('run_id').sort() : [];")
+  def selected_keys():
+    return evaluate("return [...document.querySelectorAll('#run-rows tr')].filter(row=>row.querySelector('input[type=\"checkbox\"]').checked).map(row=>row.dataset.runKey).sort();")
+  def chart_state():
+    return evaluate('''const doc=document.querySelector('#chart-frame').contentDocument;
+      const card=[...doc.querySelectorAll('[data-interactive-chart]')].find(node=>node.querySelector('h2').textContent==='loss');
+      const range=card.querySelector('[data-chart-range]'); return {range:[range.dataset.startX,range.dataset.endX],
+        hidden:[...card.querySelectorAll('[data-chart-run]')].filter(node=>node.getAttribute('aria-pressed')==='false').map(node=>node.querySelector('code').textContent)};''')
+  try:
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.navigate('/login')
+    browser.login()
+    wait_for(lambda: settled() and project_selected(), 'hosted dashboard did not default to its project')
+    assert evaluate("return document.querySelector('#project-options legend').textContent;") == 'Project', 'hosted aggregate selector is not labeled Project'
+    assert evaluate("return document.querySelector('#machine-all').checked;"), 'project did not begin with All machines'
+    assert evaluate("return document.querySelectorAll('#machine-options input[type=\"radio\"]').length;") == 3, 'project machine tags do not match its two recorded origins'
+    assert evaluate('''return [...document.querySelectorAll('#run-rows .run-link')].filter(node=>node.textContent===arguments[0]).length;''', run_id) == 2, 'project default collapsed duplicate actual run IDs'
+    browser.click('#machine-worker-b + span')
+    wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'native machine filter did not isolate worker-b')
+    assert evaluate("return document.querySelector('#run-rows tr').dataset.runKey;") == keys[1], 'machine filter resolved the colliding ID to worker'
+    browser.click('#machine-all + span')
+    wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 4, 'All machines did not restore project history')
+    for key in keys:
+      select(key)
+    wait_for(lambda: chart_keys() == sorted(keys), 'cross-machine selection did not retain both qualified run identities')
+    assert evaluate("return new URL(document.querySelector('#chart-frame').src).searchParams.get('source');") == source, 'cross-machine comparison used a legacy machine source'
+    wait_for(lambda: evaluate("return document.querySelector('#chart-frame').contentDocument?.querySelectorAll('[data-chart-hit]').length;") >= 1, 'project comparison chart did not load')
+    assert selected_keys() == sorted(keys), 'equal actual run IDs share a selection state'
+    assert evaluate('''const doc=document.querySelector('#chart-frame').contentDocument;
+      const card=[...doc.querySelectorAll('[data-interactive-chart]')].find(node=>node.querySelector('h2').textContent==='loss');
+      const labels=[...card.querySelectorAll('[data-chart-run]')].map(node=>node.textContent);
+      return labels.length===2 && labels.some(label=>label.includes('worker-b') && label.includes(arguments[0])) && labels.some(label=>label.includes('worker:') && label.includes(arguments[0]));''', run_id), 'chart legend does not distinguish machines with equal run IDs'
+    browser.call('POST', '/frame', {'id': {ELEMENT: browser.element('#chart-frame')}})
+    try:
+      loss = '//section[@data-interactive-chart][h2="loss"]'
+      browser.keys(loss + '//*[@class="plot-scroll"]', '\ue011\ue014', using='xpath')
+      values = evaluate("const card=[...document.querySelectorAll('[data-interactive-chart]')].find(node=>node.querySelector('h2').textContent==='loss'); return [...card.querySelectorAll('[data-chart-readout-run]')].map(node=>Number(node.dataset.chartValue)).sort((a,b)=>a-b);")
+      assert values == [0.7, 1.0], 'exact comparison samples came from the same machine stream'
+      browser.click(loss + '//button[code="' + keys[1] + '"]', using='xpath')
+      browser.keys(loss + '//*[@class="plot-scroll"]', '+', using='xpath')
+    finally:
+      browser.call('POST', '/frame', {'id': None})
+    exploration = chart_state()
+    assert exploration['hidden'] == [keys[1]], 'project chart visibility toggle did not target the qualified run identity'
+    evaluate("window.__project_chart_document=document.querySelector('#chart-frame').contentDocument;")
+    choose_run_table_columns(browser)
+    browser.click('button[aria-label="Sort by Machine ascending"]')
+    wait_for(settled, 'native Machine header did not finish sorting')
+    browser.click('#run-columns summary')
+    assert sorted([float(table_value(key)) for key in keys]) == [0.004, 0.07], 'project table columns mixed the two machine metric streams'
+    assert selected_keys() == sorted(keys) and chart_keys() == sorted(keys), 'Machine sorting or columns lost the cross-machine comparison'
+    assert evaluate("return document.querySelector('#chart-frame').contentDocument===window.__project_chart_document;"), 'Machine sorting or columns replaced chart exploration'
+    assert chart_state() == exploration, 'Machine sorting or columns changed project zoom or hidden curves'
+    capture('workspace-project-desktop')
+    browser.allow_narrow_viewports()
+    for width in [320, 360]:
+      browser.call('POST', '/window/rect', {'width': width, 'height': 800})
+      assert evaluate('return innerWidth;') == width, 'project mobile viewport did not resize to its exact CSS width'
+      assert evaluate('return document.documentElement.scrollWidth<=document.documentElement.clientWidth+1;'), f'project dashboard overflows at {width}px'
+      evaluate("document.querySelector('#runs-region').scrollIntoView({block:'start'});")
+      capture(f'workspace-project-{width}')
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    for origin, key, value in [('worker', keys[0], 0.003), ('worker-b', keys[1], 0.006)]:
+      PROJECT_COORDINATION.write_text(json.dumps({'phase': 'publish-' + origin}))
+      wait_for(lambda: json.loads(PROJECT_COORDINATION.read_text()).get('phase') == 'published-' + origin, 'project publication did not finish for ' + origin, timeout=90)
+      wait_for(lambda: table_value(key) is not None and float(table_value(key)) == value, 'project live update did not refresh the correct machine metric cell', timeout=25)
+      assert project_selected() and evaluate("return document.querySelector('#machine-all').checked;"), 'live update changed project or machine scope'
+      assert selected_keys() == sorted(keys) and chart_keys() == sorted(keys), 'live update collapsed equal-ID selected runs'
+      assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '2', 'project live update changed table columns'
+      assert 'Machine · ascending' in evaluate("return document.querySelector('#run-sort-description').textContent;"), 'project live update changed table sorting'
+      assert evaluate("return document.querySelector('#review-tab-charts').getAttribute('aria-selected');") == 'true', 'project live update changed the review tab'
+      assert evaluate("return document.querySelector('#chart-frame').contentDocument===window.__project_chart_document;"), 'project live update replaced the chart document'
+      assert chart_state() == exploration, 'project live update changed zoom or hidden machine curves'
+    PROJECT_COORDINATION.write_text(json.dumps({'phase': 'finish-runs'}))
+    wait_for(lambda: json.loads(PROJECT_COORDINATION.read_text()).get('phase') == 'finished-runs', 'project runs did not finalize their scoped artifacts', timeout=90)
+    for origin, key, log in [('worker', keys[0], 'automatic refresh log fixture'), ('worker-b', keys[1], 'project machine worker-b log')]:
+      browser.click('#clear-selection')
+      select(key)
+      wait_for(lambda: chart_keys() == [key], 'single project run did not retain its machine identity')
+      browser.click('#review-tab-logs')
+      wait_for(lambda: log in evaluate("return document.querySelector('#run-logs').textContent;"), 'project Logs opened the other machine with the same run ID')
+      browser.click('#review-tab-files')
+      wait_for(lambda: evaluate("return !!document.querySelector('input[aria-label=\"Select outputs/project-scope.txt for download\"]');"), 'project Files omitted its uploaded machine artifact')
+      browser.click('input[aria-label="Select outputs/project-scope.txt for download"]')
+      if not evaluate("return document.querySelector('#artifact-config-path').value;"):
+        browser.keys('#artifact-config-path', '/tmp/client.toml')
+      command = wait_for(lambda: evaluate("return document.querySelector('#artifact-pull-command')?.value;"), 'project artifact did not generate its actual-scope CLI command')
+      args = shlex.split(command)
+      assert args[args.index('--origin') + 1] == origin and args[args.index('--run-id') + 1] == run_id, 'project artifact CLI command contains the transport key or wrong origin'
+      browser.click('#download-selected-files')
+      wait_for(lambda: evaluate("return document.querySelectorAll('#selected-file-downloads a').length;") == 1, 'project selected artifact did not provide one attachment link')
+      browser.click('#selected-file-downloads a')
+      expected = (origin + ' scope fixture\n').encode()
+      wait_for(lambda: any(path.is_file() and path.stat().st_size == len(expected) and path.read_bytes() == expected for path in DOWNLOADS.iterdir()), 'project browser download resolved the artifact from the other machine', timeout=30)
+    PROJECT_COORDINATION.write_text(json.dumps({'phase': 'complete'}))
+    print('Firefox project workspace passed: default All machines, native machine filter, colliding recorded IDs remain distinct in selection/chart/readout, Machine sorting/columns preserved, live samples from both origins, correctly scoped Logs/Files/CLI/native downloads, actual320/360px overflow checks.', flush=True)
+  except Exception:
+    capture('workspace-project-failure')
+    raise
   finally:
     browser.close()
 
@@ -1203,5 +1336,7 @@ if __name__ == '__main__':
     previews(sys.argv[2], sys.argv[3])
   elif len(sys.argv) == 4 and sys.argv[1] == '--auto-refresh':
     automatic_refresh(sys.argv[2], sys.argv[3])
+  elif len(sys.argv) == 3 and sys.argv[1] == '--project':
+    project_workspace(sys.argv[2])
   else:
     forms()

@@ -82,8 +82,17 @@ password_env = "EXPRI_DASHBOARD_PASSWORD"
 Provide a strong, separate `EXPRI_DASHBOARD_PASSWORD` containing 16 to 256
 printable ASCII bytes. It must differ from all owner and worker bearer tokens.
 Open the configured HTTPS URL and sign in with this dashboard password.
-The dashboard discovers synced project/worker sources and provides run details,
+The dashboard discovers synced projects and provides run details,
 parameters, metric comparisons, charts, bounded log tails, and a **Files** tab.
+Choose a project at the top of the page. **All machines** initially shows its
+runs across recorded publishing origins. The **Machine** tags filter that
+history, and the built-in **Machine** column sorts by origin. A machine label
+comes from the origin saved with a run; no additional registration is needed
+for existing history to appear. Select runs across machines to compare them.
+Equal run IDs from different origins remain distinct, with machine provenance
+shown in the comparison. Logs, files, browser downloads, and generated pull
+commands retain each run's actual project, origin, and run ID. Existing worker
+run links open the same exact run within the project view.
 Choose up to eight parameter or metric columns using the **Columns** checkbox
 tags. Click table headers to sort before paging, and use the table's
 **Last / Min / Max** tags to choose its metric values. Missing values
@@ -154,10 +163,12 @@ four ingestion request workers. Hidden/offline pages and paused refresh close
 their connection. Polling continues if notifications are unavailable.
 
 Hosted previews are bounded for small servers: the source catalog shows up to
-1,000 project/worker sources, browsing and filters cover the 500 runs most
-recently updated in the service per source, and cold overview reads have a
-30-second time budget. Column discovery and sorting cover that same selection;
-sorting does not expand it to older runs. Runs start ordered by their start
+1,000 recorded project/worker sources. **All machines** covers up to 500 runs most
+recently updated in that project across machines. Selecting a machine chooses
+its own 500 most recently updated runs before applying search, task, status, or
+sort choices. Cold overview reads have a 30-second time budget. Sorting happens
+within the chosen history window before paging; it does not expand that window
+to older runs. Column discovery uses the unfiltered project window. Runs start ordered by their start
 time, with parameter, metric, run ID, and status sorting available through table
 headers. Existing catalogs reconstruct update order from upload records and show a
 warning until fresh uploads establish service activity. Overview records are
@@ -402,7 +413,13 @@ flags and session revocation. The test browser accepts the generated certificate
 through its test-only WebDriver configuration. The browser also reviews the
 uploaded runs: direct selection/comparison, keyboard tabs, deferred log loading,
 refresh and filters. It checks parameter and metric checkbox columns, table
-summary tags, native sortable headers, and retained review state. It verifies
+summary tags, native sortable headers, and retained review state. A second
+publishing origin uses its own scoped token and the same recorded run ID as an
+active first-origin fixture. The project check exercises default All machines,
+filtering, comparison, distinct metric streams, machine sorting, scoped
+logs/files/downloads, and live updates from both origins without changing chart
+exploration or table choices. The original native checks also exercise an older
+backend's missing project catalog through a fixture-controlled fallback. It verifies
 desktop and 320/360/500 CSS pixel layouts, including table scrolling without
 page overflow, saving screenshots for diagnostics. A second HTTPS hostname also
 checks branch assets against the same catalog, cookie replay rejection, and

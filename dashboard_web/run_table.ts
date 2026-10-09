@@ -68,6 +68,7 @@ export function runSortLabel(sort: RunSort, columns: RunColumn[]): string {
     started_at: "Start time",
     run_id: "Run",
     status: "Status",
+    origin: "Machine",
   };
   const column = columns.find((item) => runColumnSortKey(item) === sort.key);
   const name = builtins[sort.key] ?? column?.label ?? "Column";
