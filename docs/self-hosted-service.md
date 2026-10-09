@@ -84,6 +84,11 @@ printable ASCII bytes. It must differ from all owner and worker bearer tokens.
 Open the configured HTTPS URL and sign in with this dashboard password.
 The dashboard discovers synced projects and provides run details,
 parameters, metric comparisons, charts, bounded log tails, and a **Files** tab.
+Select **Storage** in a project to browse completed cloud objects. Its
+**Private inputs** list shows input IDs and sizes, while **Run outputs** shows
+uploaded files, including checkpoints, with their machine and run. Search and
+page within either list. Both lists come from finalized service records; the
+browser does not list the bucket or read file contents to build them.
 Choose a project at the top of the page. **All machines** initially shows its
 runs across recorded publishing origins. The **Machine** tags filter that
 history, and the built-in **Machine** column sorts by origin. A machine label
@@ -105,6 +110,9 @@ review; these choices last for the current page.
 Workers must push a run before it appears. Files shows output names, sizes, and
 availability without reading checkpoint contents. **Worker (reported)** reflects
 the last published inventory; **Cloud** means a finalized file is downloadable.
+The per-run **Files** tab can therefore show a checkpoint reported on its
+worker before it appears in project **Storage**. Storage shows only completed
+cloud objects for the selected project, across all its machines and runs.
 The hosted page cannot inspect your laptop's disk. Local dashboards show files
 actually present in the run or review cache; cached cloud availability is a
 record of the last pull rather than a live storage check.
@@ -115,14 +123,18 @@ your dashboard session and use short-lived attachment links with no referrer.
 Browser restart recovery depends on your browser; use the generated CLI pull
 command for expri's durable resume. Enter the path to an existing service client
 configuration on the computer running that command. No token is copied from the
-browser into the command. Private inputs and checkpoint uploads remain CLI
-operations.
+browser into the command. Browser downloads in Storage use the same authenticated
+attachment flow. For large checkpoints, use the generated CLI pull command for
+durable resume. Private input and checkpoint uploads remain CLI operations.
 
 The hosted dashboard listens for small server-sent revision notifications and
 checks for changes every five seconds as recovery. Notifications carry no file
 bytes; changed views fetch their data through the existing incremental requests.
-Saved revisions and stream lengths make unchanged checks independent of S3. Changed views fetch bounded previews and preserve selection, filters,
-the active tab, zoom, and hidden curves. **Auto refresh** pauses updates;
+Saved revisions and stream lengths make unchanged checks independent of S3.
+Storage refreshes the current search and page when an input or output is
+published; unchanged checks skip fetching the file list. Changed views fetch
+bounded previews and preserve selection, filters, the active tab, zoom, and
+hidden curves. **Auto refresh** pauses updates;
 hidden/offline pages pause automatically, and connection failures retry more
 slowly while keeping the current view. Configure automatic publishing or run
 `push --watch` for live forwarding; dashboard refresh does not initiate an upload.
@@ -382,6 +394,12 @@ expri service input put --config owner.toml --project-id vision \
 expri service input get --config worker.toml --project-id vision \
   --input-id dataset-v1 --destination .expri/inputs/dataset-v1.bin
 ```
+
+The hosted project's **Storage → Private inputs** view lists completed input IDs and
+sizes and provides individual browser downloads. Expri stores the input ID,
+size, and digest, not the original filename passed to `--file`; choose a
+download destination when using the CLI. A worker may retrieve inputs in its
+project, while publishing a new input requires the owner client.
 
 Pass the downloaded path to the experiment as needed. Keep input files outside
 Git and code snapshots. This version handles datasets/files; credentials and

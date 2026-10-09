@@ -194,6 +194,7 @@ export type RunRevision = {
 export type Updates = {
   catalog_revision: string | null;
   source_revision: string | null;
+  storage_revision?: string | null;
   runs: RunRevision[];
 };
 export type ChartRefreshOutcome = "applied" | "deferred" | "cancelled";

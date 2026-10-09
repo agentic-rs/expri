@@ -37,6 +37,13 @@ import {
   type Updates,
 } from "./dashboard_model";
 import { artifactCanSelect } from "./dashboard_files";
+import {
+  boundedStorageSearch,
+  storageCatalogValid,
+  storageUrl,
+  type StorageCatalog,
+  type StorageKind,
+} from "./dashboard_storage";
 import { LiveUpdates, type LiveUpdatesState } from "./live_updates";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import {
@@ -50,6 +57,7 @@ export * from "./dashboard_model";
 export * from "./interactive_charts";
 export * from "./auto_refresh";
 export * from "./dashboard_files";
+export * from "./dashboard_storage";
 export * from "./live_updates";
 
 function required<T extends HTMLElement>(id: string): T {
@@ -69,6 +77,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const chart_lane = new RequestLane(() => pending_deep_link);
   const deep_link_lane = new RequestLane(() => pending_deep_link);
   const artifact_lane = new RequestLane(() => pending_deep_link);
+  const storage_lane = new RequestLane(() => pending_deep_link);
   const quiet_lanes = {
     updates: new RequestLane(() => pending_deep_link),
     catalog: new RequestLane(() => pending_deep_link),
@@ -78,6 +87,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     log: new RequestLane(() => pending_deep_link),
     chart: new RequestLane(() => pending_deep_link),
     artifacts: new RequestLane(() => pending_deep_link),
+    storage: new RequestLane(() => pending_deep_link),
   };
   const foreground_lanes = [
     catalog_lane,
@@ -89,6 +99,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     chart_lane,
     deep_link_lane,
     artifact_lane,
+    storage_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
   let auto_refresh: AutoRefresh | null = null;
@@ -146,6 +157,13 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let rendered_comparison: Comparison | null = null;
   let artifacts: ArtifactCatalog | null = null;
   let artifacts_loaded = false;
+  let workspace_view: "workspace" | "storage" = "workspace";
+  let storage_kind: StorageKind = "input";
+  let storage_offset = 0;
+  let storage_catalog: StorageCatalog | null = null;
+  let storage_revision: string | null | undefined;
+  let storage_retry_at = 0;
+  let storage_search_timeout: ReturnType<typeof setTimeout> | undefined;
   const selected_files = new Set<string>();
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
@@ -194,6 +212,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     log_note: "",
     artifacts_loading: false,
     artifacts_error: null,
+    storage_search: "",
+    storage_loading: false,
+    storage_error: null,
     live_status: "",
     run_columns_loading: false,
     run_columns_error: null,
@@ -220,6 +241,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       comparison: rendered_comparison,
       artifacts,
       selected_files: [...selected_files],
+      workspace_view,
+      storage_kind,
+      storage_offset,
+      storage_catalog,
       metric_names: [...metric_names],
       x_axis,
       time_zone,
@@ -280,6 +305,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       cancelRefresh();
       clearSearchTimeout();
       source_id = value;
+      resetStorage();
       ui.origin = "";
       if (run_sort.key === "origin" && currentSource()?.kind !== "hosted_project")
         run_sort = { key: "started_at", direction: "desc" };
@@ -292,10 +318,13 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       syncSelection();
       sourceNote();
       void loadRuns();
+      if (workspace_view === "storage") void loadStorage();
     },
     refresh: () => {
       clearSearchTimeout();
-      void refresh();
+      void refresh().then(() => {
+        if (workspace_view === "storage") return loadStorage();
+      });
     },
     auto_refresh: (enabled) => {
       ui.auto_enabled = enabled;
@@ -404,6 +433,61 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       cancelQuietRefresh();
       void loadArtifacts();
     },
+    workspace_view: (value) => {
+      if (value === workspace_view ||
+        (value === "storage" && currentSource()?.kind !== "hosted_project")) return;
+      workspace_view = value;
+      if (value === "workspace") {
+        storage_lane.cancel();
+        clearStorageSearchTimeout();
+        ui.storage_loading = false;
+      }
+      publish();
+      if (value === "storage") void loadStorage();
+    },
+    storage_kind: (value) => {
+      if (storage_kind === value) return;
+      storage_lane.cancel();
+      clearStorageSearchTimeout();
+      storage_kind = value;
+      storage_offset = 0;
+      storage_catalog = null;
+      ui.storage_search = "";
+      ui.storage_error = null;
+      publish();
+      void loadStorage();
+    },
+    storage_search: (value) => {
+      storage_lane.cancel();
+      clearStorageSearchTimeout();
+      ui.storage_search = boundedStorageSearch(value);
+      storage_offset = 0;
+      storage_catalog = null;
+      ui.storage_error = null;
+      ui.storage_loading = true;
+      publish();
+      storage_search_timeout = setTimeout(() => {
+        storage_search_timeout = undefined;
+        void loadStorage();
+      }, 250);
+    },
+    storage_previous: () => {
+      if (ui.storage_loading || storage_offset === 0) return;
+      storage_offset = Math.max(0, storage_offset - 100);
+      storage_catalog = null;
+      void loadStorage();
+    },
+    storage_next: () => {
+      if (ui.storage_loading || storage_catalog?.next_offset === null ||
+        storage_catalog?.next_offset === undefined) return;
+      storage_offset = storage_catalog.next_offset;
+      storage_catalog = null;
+      void loadStorage();
+    },
+    storage_refresh: () => {
+      clearStorageSearchTimeout();
+      void loadStorage();
+    },
     log_stream: (value) => {
       if (!review || review.kind !== "run" || !rendered_detail) return;
       cancelQuietRefresh();
@@ -439,6 +523,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (typeof navigator !== "undefined" && navigator.onLine === false) return "offline";
     return foreground_lanes.some((lane) => lane.pending) ||
       search_timeout !== undefined ||
+      storage_search_timeout !== undefined ||
       selection_timeout !== undefined
       ? "busy"
       : "ready";
@@ -473,13 +558,64 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       active
         ? apiUrl("/api/events", {
             source: source_id,
-            run_id: review?.run_ids ?? [],
+            run_id: workspace_view === "storage" ? [] : review?.run_ids ?? [],
           })
         : null,
     );
   }
   function currentSource(): Source | undefined {
     return sources.find((source) => source.source_id === source_id);
+  }
+  function clearStorageSearchTimeout(): void {
+    if (storage_search_timeout !== undefined) clearTimeout(storage_search_timeout);
+    storage_search_timeout = undefined;
+  }
+  function resetStorage(): void {
+    storage_lane.cancel();
+    clearStorageSearchTimeout();
+    storage_offset = 0;
+    storage_catalog = null;
+    storage_revision = undefined;
+    storage_retry_at = 0;
+    ui.storage_search = "";
+    ui.storage_loading = false;
+    ui.storage_error = null;
+    if (currentSource()?.kind !== "hosted_project") workspace_view = "workspace";
+  }
+  async function loadStorage(): Promise<void> {
+    const source = currentSource();
+    if (workspace_view !== "storage" || source?.kind !== "hosted_project" || !source.project_id)
+      return;
+    const project_id = source.project_id,
+      kind = storage_kind,
+      offset = storage_offset,
+      search = ui.storage_search,
+      url = storageUrl(project_id, kind, offset, search);
+    cancelQuietRefresh();
+    const current = () => !disposed && workspace_view === "storage" &&
+      currentSource()?.project_id === project_id && storage_kind === kind &&
+      storage_offset === offset && ui.storage_search === search;
+    updateUi({ storage_loading: true, storage_error: null });
+    try {
+      const result = await storage_lane.run<StorageCatalog>(url);
+      if (!result || !current()) return;
+      if (!storageCatalogValid(result, project_id, kind, offset, 100))
+        throw new Error("The storage listing does not match this project or page.");
+      storage_retry_at = 0;
+      storage_catalog = result;
+      updateUi({ storage_error: null });
+    } catch (error) {
+      if (!current()) return;
+      if (error instanceof RequestError && error.status === 404) {
+        storage_retry_at = now() + 5 * 60_000;
+        storage_catalog = null;
+        updateUi({ storage_error: "Project storage browsing is unavailable on this server. Upgrade expri, then Refresh storage; the service CLI remains available." });
+      } else {
+        updateUi({ storage_error: `Could not load project storage. ${errorText(error)}` });
+      }
+    } finally {
+      if (current()) updateUi({ storage_loading: false });
+    }
   }
   function listUrl(): string {
     return apiUrl("/api/runs", {
@@ -1172,6 +1308,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (linked_source) source_id = linked_source.source_id;
     catalog_initialized = true;
     if (source_id !== previous_source) {
+      resetStorage();
       resetRunColumns();
       offset = 0;
       ui.origin = "";
@@ -1368,7 +1505,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         if (!(await loadRuns()) || generation !== refresh_generation) return;
         await resolveDeepLink();
         if (generation !== refresh_generation) return;
-        if (current_review === review && current_source === source_id && current_review) {
+        if (workspace_view === "workspace" && current_review === review &&
+          current_source === source_id && current_review) {
           if (current_review.kind === "run") {
             const id = current_review.run_ids[0];
             if (id && !(await loadRun(id, true))) return;
@@ -1401,6 +1539,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   async function quietRefresh(): Promise<RefreshOutcome> {
     if (availability() !== "ready") return "cancelled";
+    if (workspace_view === "storage") return quietStorageRefresh();
     const generation = quiet_generation;
     const current = () => generation === quiet_generation && availability() === "ready";
     const acknowledgements: (() => void)[] = [];
@@ -1651,6 +1790,60 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       return "failure";
     }
   }
+  async function quietStorageRefresh(): Promise<RefreshOutcome> {
+    const source = currentSource();
+    if (source?.kind !== "hosted_project" || !source.project_id) return "cancelled";
+    const generation = quiet_generation,
+      project_id = source.project_id,
+      kind = storage_kind,
+      offset = storage_offset,
+      search = ui.storage_search,
+      url = storageUrl(project_id, kind, offset, search);
+    const current = () => !disposed && generation === quiet_generation &&
+      workspace_view === "storage" && source_id === source.source_id &&
+      storage_kind === kind && storage_offset === offset && ui.storage_search === search;
+    try {
+      if (!updates_supported) return "success";
+      let updates: Updates | undefined;
+      try {
+        updates = await quiet_lanes.updates.run<Updates>(
+          apiUrl("/api/updates", { source: source_id, run_id: [] }),
+        );
+      } catch (error) {
+        if (!(error instanceof RequestError) || error.status !== 404) throw error;
+        updates_supported = false;
+        auto_refresh?.setInterval(30_000);
+        return "success";
+      }
+      if (!updates || !current()) return "cancelled";
+      const revision = updates.storage_revision;
+      if (revision === undefined || (storage_revision === revision && storage_catalog) ||
+        now() < storage_retry_at) {
+        last_checked = now();
+        return "success";
+      }
+      const result = await quiet_lanes.storage.run<StorageCatalog>(url);
+      if (!result || !current()) return "cancelled";
+      if (!storageCatalogValid(result, project_id, kind, offset, 100)) return "failure";
+      storage_revision = revision;
+      if (JSON.stringify(storage_catalog) !== JSON.stringify(result)) {
+        storage_catalog = result;
+        publish();
+      }
+      if (ui.storage_error) updateUi({ storage_error: null });
+      last_checked = now();
+      return "success";
+    } catch (error) {
+      if (!current()) return "cancelled";
+      if (error instanceof RequestError && error.status === 404) {
+        storage_retry_at = now() + 5 * 60_000;
+        storage_catalog = null;
+        updateUi({ storage_error: "Project storage browsing is unavailable on this server. Upgrade expri, then Refresh storage; the service CLI remains available." });
+        return "success";
+      }
+      return "failure";
+    }
+  }
   function resetFilters(): void {
     cancelRefresh();
     list_lane.cancel();
@@ -1704,6 +1897,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     chart_controller.dispose();
     for (const lane of foreground_lanes) lane.cancel();
     clearSearchTimeout();
+    clearStorageSearchTimeout();
     clearSelectionTimeout();
     page_document.removeEventListener?.("visibilitychange", resume);
     if (page_window) {

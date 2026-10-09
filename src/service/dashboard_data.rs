@@ -49,6 +49,16 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
   fn projects(&self) -> Result<Option<Value>> {
     HostedDashboard::projects(self).map(Some)
   }
+  fn storage(
+    &self,
+    project_id: &str,
+    kind: &str,
+    search: &str,
+    limit: usize,
+    offset: usize,
+  ) -> Result<Option<Value>> {
+    HostedDashboard::storage(self, project_id, kind, search, limit, offset).map(Some)
+  }
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
     HostedDashboard::updates(self, source, run_ids)
   }
@@ -126,6 +136,89 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     Ok(
       json!({"project_name": "Hosted experiments", "access_mode": "hosted", "initial_source": sources.first().map_or("", |source| source.source_id.as_str()), "sources": sources, "warnings": warnings}),
     )
+  }
+
+  pub fn storage(
+    &self,
+    project_id: &str,
+    kind: &str,
+    search: &str,
+    limit: usize,
+    offset: usize,
+  ) -> Result<Value> {
+    let page = self
+      .store
+      .dashboard_storage_objects(project_id, kind, search, limit, offset)
+      .map_err(api_error)?;
+    let mut items = Vec::with_capacity(page.items.len());
+    for record in page.items {
+      match record.target {
+        FileTarget::Input { input_id, .. } => {
+          let query = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([("project_id", project_id), ("input_id", input_id.as_str())])
+            .finish();
+          items.push(json!({
+            "input_id": input_id,
+            "size": record.size,
+            "download_url": format!("/api/input?{query}"),
+          }));
+        }
+        FileTarget::Run { scope, path } => {
+          let source = format!("hosted-project:{project_id}");
+          let run_key = format!("{}:{}", scope.origin, scope.run_id);
+          let download_url = crate::dashboard::artifacts::download_url(&source, &run_key, &path);
+          items.push(json!({
+            "origin": scope.origin,
+            "run_id": scope.run_id,
+            "path": path,
+            "size": record.size,
+            "download_url": download_url,
+          }));
+        }
+      }
+    }
+    let next_offset = (offset + items.len() < page.total_count).then_some(offset + items.len());
+    Ok(json!({
+      "project_id": project_id,
+      "kind": kind,
+      "items": items,
+      "total_count": page.total_count,
+      "next_offset": next_offset,
+    }))
+  }
+
+  pub fn input_download(
+    &self,
+    project_id: &str,
+    input_id: &str,
+  ) -> ApiResult<crate::dashboard::artifacts::Download> {
+    use crate::dashboard::artifacts::{Download, disposition};
+    validate_component(project_id).map_err(|_| ApiError::new(400, "invalid input project"))?;
+    validate_component(input_id).map_err(|_| ApiError::new(400, "invalid input ID"))?;
+    let (url, size) = self
+      .store
+      .dashboard_attachment_url(
+        &FileTarget::Input {
+          project_id: project_id.into(),
+          input_id: input_id.into(),
+        },
+        &disposition(input_id),
+      )
+      .map_err(|error| {
+        if error.status == 404 {
+          ApiError::new(404, "input is missing")
+        } else {
+          error
+        }
+      })?;
+    if !valid_storage_download_url(&url) {
+      return Err(ApiError::new(502, "invalid object storage download URL"));
+    }
+    Ok(Download::Cloud {
+      url,
+      size,
+      filename: input_id.into(),
+    })
   }
 
   pub fn updates(&self, source_id: &str, run_ids: &[String]) -> Result<Value> {
@@ -233,7 +326,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         0,
       )
       .map_err(api_error)?;
-    if page.total_count == 0 {
+    if page.total_count == 0
+      && (source.origin.is_some()
+        || !self
+          .store
+          .dashboard_input_project_exists(&source.project_id)
+          .map_err(api_error)?)
+    {
       return Err(message(format!("unknown source: {source_id}")));
     }
     let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -372,7 +471,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         0,
       )
       .map_err(api_error)?;
-    if page.total_count == 0 {
+    if page.total_count == 0
+      && (source.origin.is_some()
+        || !self
+          .store
+          .dashboard_input_project_exists(&source.project_id)
+          .map_err(api_error)?)
+    {
       return Err(message(format!("unknown source: {source_id}")));
     }
     let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -723,14 +828,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           api_error(error)
         }
       })?;
-    let parsed =
-      reqwest::Url::parse(&url).map_err(|_| message("invalid object storage download URL"))?;
-    if !matches!(parsed.scheme(), "https" | "http")
-      || parsed.host_str().is_none()
-      || !parsed.username().is_empty()
-      || parsed.password().is_some()
-      || parsed.fragment().is_some()
-    {
+    if !valid_storage_download_url(&url) {
       return Err(message("invalid object storage download URL"));
     }
     Ok(Download::Cloud {
@@ -972,6 +1070,17 @@ fn verify_bytes(record: &FileRecord, bytes: &[u8]) -> ApiResult<()> {
 
 fn hex_digest(bytes: &[u8]) -> String {
   bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn valid_storage_download_url(url: &str) -> bool {
+  let Ok(parsed) = reqwest::Url::parse(url) else {
+    return false;
+  };
+  matches!(parsed.scheme(), "https" | "http")
+    && parsed.host_str().is_some()
+    && parsed.username().is_empty()
+    && parsed.password().is_none()
+    && parsed.fragment().is_none()
 }
 
 fn api_error(error: ApiError) -> ExpriError {

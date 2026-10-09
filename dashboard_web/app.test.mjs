@@ -184,19 +184,35 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
   const project_sources = [{ source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] }];
-  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
+  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
     const query = parsed.searchParams;
     const overridden = model.override?.(parsed, options);
     if (overridden !== undefined && overridden !== null) return overridden;
-    if (parsed.pathname === "/api/updates") return updates ? response({ catalog_revision: model.catalog_revision, source_revision: model.list_revision, runs: query.getAll("run_id").map(run_id => {
+    if (parsed.pathname === "/api/updates") return updates ? response({ catalog_revision: model.catalog_revision, source_revision: model.list_revision, ...(model.projects_status === 200 ? { storage_revision: model.storage_revision } : {}), runs: query.getAll("run_id").map(run_id => {
       const missing = model.missing_run_ids.has(run_id) || !runs.some(run => runIdentity(run) === run_id);
       return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, missing };
     }) }) : response({ error: "Unknown endpoint" }, 404);
     if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local" });
     if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [] }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    if (parsed.pathname === "/api/storage") {
+      const project_id = query.get("project_id"), kind = query.get("kind"),
+        offset = Number(query.get("offset")), limit = Number(query.get("limit")),
+        search = (query.get("search") ?? "").toLocaleLowerCase();
+      const records = (kind === "input" ? model.storage_inputs : model.storage_outputs)
+        .filter(item => (kind === "input" ? item.input_id : `${item.origin} ${item.run_id} ${item.path}`).toLocaleLowerCase().includes(search));
+      const items = records.slice(offset, offset + limit).map(item => ({ ...item,
+        download_url: item.download_url === undefined
+          ? kind === "input"
+            ? apiUrl("/api/input", { project_id, input_id: item.input_id })
+            : apiUrl("/api/artifact", { source: `hosted-project:${project_id}`, run_id: `${item.origin}:${item.run_id}`, path: item.path })
+          : item.download_url,
+      }));
+      return response({ project_id, kind, items, total_count: records.length,
+        next_offset: offset + limit < records.length ? offset + limit : null });
+    }
     const source = [...sources, ...project_sources].find(item => item.source_id === query.get("source"));
     assert.ok(source, "all requests must remain in a known source");
     if (parsed.pathname === "/api/run-columns") return response({
@@ -1717,6 +1733,144 @@ test("project tables retain separate run and review panes before and after optio
   assert.deepEqual(workspacePanes(nodes), panes);
   assert.equal(nodes.get("chart-frame"), frame);
   assert.equal(frame.src, chart_url);
+});
+
+test("project Storage loads lazily, shows inputs and uploaded outputs, and preserves the chart iframe", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  model.model.storage_inputs = [{ input_id: "dataset-v1", size: 1024 }];
+  model.model.storage_outputs = [{ origin: "gpu-a", run_id: "same-run", path: "outputs/checkpoint.pt", size: 2048 }];
+  await inspect(model);
+  const frame = nodes.get("chart-frame"), chart_url = frame.src, writes = frameNavigations(nodes);
+  assert.equal(model.requests.some(url => url.startsWith("/api/storage")), false, "Storage is lazy");
+  assert.equal(nodes.get("workspace-view-workspace").checked, true);
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("storage-rows")?.children.length === 1);
+  assert.equal(nodes.get("workspace-page").hidden, true);
+  assert.equal(nodes.get("project-storage").querySelector(".storage-card").getAttribute("aria-busy"), "false");
+  assert.equal(nodes.get("storage-kind-input").checked, true);
+  assert.match(nodes.get("storage-rows").textContent, /dataset-v1.*1 KiB/);
+  assert.equal(new URL(nodes.get("storage-rows").querySelector("a").href).searchParams.get("input_id"), "dataset-v1");
+  const first_query = new URL(model.requests.find(url => url.startsWith("/api/storage")), "http://localhost").searchParams;
+  assert.deepEqual(Object.fromEntries(first_query), { project_id: "vision", kind: "input", limit: "100", offset: "0" });
+  await click(nodes.get("storage-kind-output"));
+  await settled(() => nodes.get("storage-rows").textContent.includes("outputs/checkpoint.pt"));
+  const row = nodes.get("storage-rows").children[0];
+  assert.match(row.textContent, /gpu-a.*same-run.*outputs\/checkpoint.pt.*2 KiB/);
+  const link = new URL(row.querySelector("a").href);
+  assert.equal(link.searchParams.get("source"), "hosted-project:vision");
+  assert.equal(link.searchParams.get("run_id"), "gpu-a:same-run");
+  await click(nodes.get("workspace-view-workspace"));
+  assert.equal(nodes.get("workspace-page").hidden, false);
+  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(frame.src, chart_url);
+  assert.equal(frameNavigations(nodes), writes, "page switching must not reload chart contents");
+  await click(nodes.get("workspace-view-storage"));
+  assert.equal(nodes.get("chart-frame"), frame);
+  const count = requestCounts(model.requests)["/api/storage"], projects = requestCounts(model.requests)["/api/projects"];
+  await click(nodes.get("refresh-button"));
+  await settled(() => requestCounts(model.requests)["/api/storage"] === count + 1);
+  assert.equal(requestCounts(model.requests)["/api/projects"], projects + 1, "global Refresh also discovers projects");
+});
+
+test("Storage searches and pages on the server, including a project with no runs", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
+  model.model.storage_inputs = Array.from({ length: 105 }, (_, index) => ({ input_id: `dataset-${String(index).padStart(3, "0")}`, size: index }));
+  await settled(() => nodes.get("refresh-button").disabled === false);
+  assert.equal(nodes.get("run-rows").children.length, 0);
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-rows").children.length === 100);
+  assert.equal(nodes.get("storage-page-label").textContent, "1–100 of 105");
+  assert.equal(nodes.get("storage-previous-page").disabled, true);
+  await click(nodes.get("storage-next-page"));
+  await settled(() => nodes.get("storage-rows").children.length === 5);
+  assert.equal(nodes.get("storage-page-label").textContent, "101–105 of 105");
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/storage")).at(-1), "http://localhost").searchParams.get("offset"), "100");
+  await click(nodes.get("storage-previous-page"));
+  await settled(() => nodes.get("storage-rows").children.length === 100);
+  const search = nodes.get("storage-search");
+  setValue(search, "dataset-104"); await emit(search, "input");
+  await settled(() => nodes.document.getElementById("storage-rows")?.children.length === 1);
+  assert.equal(nodes.get("storage-rows").textContent.includes("dataset-104"), true);
+  const query = new URL(model.requests.filter(url => url.startsWith("/api/storage")).at(-1), "http://localhost").searchParams;
+  assert.equal(query.get("search"), "dataset-104");
+  assert.equal(query.get("offset"), "0");
+  setValue(search, "not-published"); await emit(search, "input");
+  await settled(() => nodes.document.getElementById("storage-empty")?.textContent.includes("No files match") && !nodes.get("storage-empty").hidden);
+});
+
+test("Storage revision checks reload a changed visible page but skip unchanged pages", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
+  model.model.storage_inputs = [{ input_id: "dataset-v1", size: 8 }];
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-rows").children.length === 1);
+  await model.clock.advance(5_000);
+  const initial = requestCounts(model.requests)["/api/storage"];
+  const probes = requestCounts(model.requests)["/api/updates"];
+  await model.clock.advance(5_000);
+  assert.equal(requestCounts(model.requests)["/api/updates"], probes + 1, "visible Storage checks the small project revision");
+  assert.equal(requestCounts(model.requests)["/api/storage"], initial, "unchanged revision must not relist storage");
+  model.model.storage_inputs.push({ input_id: "dataset-v2", size: 16 });
+  model.model.storage_revision = "storage-2";
+  await model.clock.advance(5_000);
+  await settled(() => nodes.get("storage-rows").children.length === 2);
+  assert.equal(requestCounts(model.requests)["/api/storage"], initial + 1);
+  await model.clock.advance(5_000);
+  assert.equal(requestCounts(model.requests)["/api/storage"], initial + 1);
+});
+
+test("Storage ignores late searches and explains older backends without losing the selected page", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
+  model.model.storage_outputs = [{ origin: "gpu-a", run_id: "run-1", path: "outputs/checkpoint.pt", size: 128 }];
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-page-label").textContent === "0 files");
+  const pending = deferred(); let signal;
+  t.after(() => pending.resolve(response({ project_id: "vision", kind: "input", items: [], total_count: 0, next_offset: null })));
+  model.model.override = (parsed, options) => parsed.pathname === "/api/storage" && parsed.searchParams.get("kind") === "input" && parsed.searchParams.get("search") === "late"
+    ? (signal = options.signal, pending.promise) : null;
+  setValue(nodes.get("storage-search"), "late"); await emit(nodes.get("storage-search"), "input");
+  await settled(() => signal !== undefined);
+  await click(nodes.get("storage-kind-output"));
+  await settled(() => nodes.get("storage-rows").textContent.includes("outputs/checkpoint.pt"));
+  assert.equal(signal.aborted, true);
+  pending.resolve(response({ project_id: "vision", kind: "input", items: [{ input_id: "stale", size: 1, download_url: null }], total_count: 1, next_offset: null }));
+  await flush();
+  assert.equal(nodes.get("storage-rows").textContent.includes("stale"), false);
+  model.model.override = parsed => parsed.pathname === "/api/storage" ? response({ error: "Unknown endpoint" }, 404) : null;
+  await click(nodes.get("refresh-storage"));
+  await settled(() => !nodes.get("storage-error").hidden);
+  assert.match(nodes.get("storage-error").textContent, /Upgrade expri/);
+  assert.equal(nodes.get("workspace-view-storage").checked, true);
+});
+
+test("Storage follows a project switch and discards the previous project query", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
+  model.model.storage_inputs = [{ input_id: "vision-data", size: 4 }];
+  let fail_projects = false;
+  model.model.override = parsed => {
+    if (fail_projects && parsed.pathname === "/api/projects") return response({ error: "Project catalog is unavailable" }, 503);
+    if (parsed.pathname === "/api/storage" && parsed.searchParams.get("project_id") === "other")
+      return response({ project_id: "other", kind: parsed.searchParams.get("kind"), items: [{ input_id: "other-data", size: 8, download_url: apiUrl("/api/input", { project_id: "other", input_id: "other-data" }) }], total_count: 1, next_offset: null });
+    return null;
+  };
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-rows").textContent.includes("vision-data"));
+  fail_projects = true;
+  await click(nodes.get("refresh-button"));
+  await settled(() => !nodes.get("global-error").hidden);
+  assert.match(nodes.get("global-error").textContent, /Project catalog is unavailable/);
+  assert.match(nodes.get("storage-rows").textContent, /vision-data/, "catalog failure retains Storage data");
+  fail_projects = false;
+  model.project_sources.push({ source_id: "hosted-project:other", project_id: "other", label: "other", kind: "hosted_project", origin: null, target_name: null, machines: [] });
+  await click(nodes.get("refresh-button"));
+  await settled(() => nodes.document.getElementById("project-other") !== null);
+  assert.equal(nodes.get("workspace-view-storage").checked, true, "global Refresh keeps Storage visible");
+  setValue(nodes.get("storage-search"), "vision"); await emit(nodes.get("storage-search"), "input");
+  await click(nodes.get("project-other"));
+  await settled(() => nodes.get("storage-rows").textContent.includes("other-data"));
+  assert.equal(nodes.get("storage-search").value, "", "project switch clears the old search");
+  assert.equal(nodes.get("project-name").textContent, "other");
+  assert.equal(nodes.get("workspace-view-storage").checked, true);
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/storage")).at(-1), "http://localhost").searchParams.get("project_id"), "other");
 });
 
 test("project browsing selects projects and preserves duplicate run IDs across recorded machines", async t => {

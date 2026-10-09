@@ -12,6 +12,20 @@ const AUTHORITY: &str = "127.0.0.1:8765";
 fn local_project_probe_returns_capability_fallback_and_rejects_machine_filters() {
   let fixture = Fixture::new();
   assert_error(fixture.get("/api/projects"), 404);
+  assert_error(fixture.get("/api/storage?project_id=demo&kind=input"), 404);
+  assert_error(fixture.get("/api/storage?project_id=demo&kind=output"), 404);
+  assert_error(
+    fixture.get("/api/storage?project_id=demo&kind=unknown"),
+    400,
+  );
+  assert_error(
+    fixture.get("/api/storage?project_id=demo&kind=input&limit=101"),
+    400,
+  );
+  assert_error(
+    fixture.get("/api/storage?project_id=demo&kind=input&offset=0&offset=1"),
+    400,
+  );
   assert_error(fixture.get("/api/projects?source=local"), 400);
   assert_error(fixture.get("/api/runs?source=local&origin=worker"), 400);
   assert_error(fixture.get("/api/runs?source=local&origin=a&origin=b"), 400);

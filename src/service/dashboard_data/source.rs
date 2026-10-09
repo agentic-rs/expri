@@ -66,14 +66,14 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
   pub(super) fn projects(&self) -> Result<Value> {
     let page = self
       .store
-      .dashboard_sources(SOURCE_LIMIT, 0)
+      .dashboard_project_sources(SOURCE_LIMIT, 0)
       .map_err(api_error)?;
     let mut projects = BTreeMap::<String, BTreeSet<String>>::new();
     for source in page.items {
-      projects
-        .entry(source.project_id)
-        .or_default()
-        .insert(source.origin);
+      let machines = projects.entry(source.project_id).or_default();
+      if let Some(origin) = source.origin {
+        machines.insert(origin);
+      }
     }
     let mut sources = Vec::new();
     let mut budget = 480 * 1024;

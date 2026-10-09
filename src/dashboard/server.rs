@@ -606,6 +606,32 @@ fn route_content_checked(
         .ok_or_else(|| Reply::error(404, "project browsing is unavailable"))?;
       Ok(Reply::json(projects))
     }
+    "/api/storage" => {
+      query.allow(&["project_id", "kind", "limit", "offset", "search"])?;
+      let project_id = query.required("project_id")?;
+      let kind = query.required("kind")?;
+      if !matches!(kind, "input" | "output") {
+        return Err(Reply::error(400, "storage kind must be input or output"));
+      }
+      let limit = query.number("limit", 100, 1, 100)?;
+      let offset = query.number(
+        "offset",
+        0,
+        0,
+        usize::try_from(i64::MAX).unwrap_or(usize::MAX),
+      )?;
+      let items = dashboard
+        .storage(
+          project_id,
+          kind,
+          query.optional("search").unwrap_or(""),
+          limit,
+          offset,
+        )
+        .map_err(service_error)?
+        .ok_or_else(|| Reply::error(404, "project storage browsing is unavailable"))?;
+      Ok(Reply::json(items))
+    }
     "/api/updates" => {
       query.allow(&["source", "run_id"])?;
       let ids = query.runs(0)?;

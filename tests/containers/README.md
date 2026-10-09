@@ -137,6 +137,10 @@ uploaded checkpoint, generates a scoped CLI command, and downloads the actual
 `workspace-files.png` and `workspace-files-narrow.png`. A test-only HTTPS object
 proxy preserves the signed S3 path/query and streams attachments without forwarding
 dashboard credentials; Firefox's normal insecure-download protection stays enabled.
+The project Storage check lists completed private inputs and output objects,
+verifies project-scoped search and browser attachment links, and confirms that
+worker-only checkpoints do not appear as completed cloud objects. It reuses the
+published input and checkpoint fixtures and captures `workspace-storage.png`.
 The transfer acceptance
 kills a CLI pull after the first durable 8 MiB range, then reruns the same command
 and verifies that the saved prefix is reused while prior cache files stay intact.

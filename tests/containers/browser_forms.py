@@ -692,6 +692,81 @@ def artifact_files(browser, run_id):
   print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
 
 
+def project_storage(run_id=None):
+  browser = Firefox()
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def capture(name):
+    Path('/tmp/' + name + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+  try:
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.navigate('/login')
+    browser.login()
+    wait_for(lambda: evaluate("return document.querySelector('#workspace-view-storage') !== null;"), 'hosted project did not offer its Storage page')
+    start = len(trace_records())
+    browser.click('#workspace-view-storage + span')
+    wait_for(lambda: evaluate("return document.querySelector('#storage-kind-input')?.checked && document.querySelectorAll('#storage-rows tr').length === 2;"), 'project Storage did not show both completed private inputs')
+    assert evaluate("return document.querySelector('#workspace-view-storage').checked;"), 'Storage tag did not select the project page in one click'
+    inputs = evaluate('''return [...document.querySelectorAll('#storage-rows tr')].map(row => ({
+      id: row.querySelector('th code')?.textContent,
+      size: row.querySelector('.number')?.textContent,
+      href: row.querySelector('a')?.getAttribute('href'),
+      filename: row.querySelector('a')?.getAttribute('download')
+    }));''')
+    by_id = {item['id']: item for item in inputs}
+    assert set(by_id) == {'dataset-v1', 'empty-file'}, 'Storage input rows changed the published input IDs'
+    assert by_id['dataset-v1']['size'] == '21 KiB' and by_id['empty-file']['size'] == '0 B', 'Storage input sizes differ from the published files'
+    assert by_id['dataset-v1']['href'].startswith('/api/input?') and by_id['dataset-v1']['filename'] == 'dataset-v1', 'Storage input download lost its scoped native attachment'
+    assert 'private.bin' not in evaluate("return document.querySelector('#project-storage').textContent;"), 'Storage exposed the original private input filename'
+    assert any(record['path'] == '/api/storage' for record in trace_records()[start:]), 'Storage did not lazily request its input catalog'
+    capture('workspace-storage-input-only' if run_id is None else 'workspace-storage-inputs')
+
+    target = DOWNLOADS / 'dataset-v1'
+    target.unlink(missing_ok=True)
+    (DOWNLOADS / 'dataset-v1.part').unlink(missing_ok=True)
+    original_window = browser.call('GET', '/window')
+    browser.click('//tbody[@id="storage-rows"]/tr[th/code="dataset-v1"]//a', using='xpath')
+    wait_for(lambda: target.exists() and target.stat().st_size == len(b'private-input-fixture') * 1024
+      and not (DOWNLOADS / 'dataset-v1.part').exists(), 'native private input download did not complete', timeout=60)
+    assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(b'private-input-fixture' * 1024).digest(), 'native private input download changed its bytes'
+    assert any(record['path'] == '/api/input' and record['status'] == 303 for record in trace_records()[start:]), 'native private input download bypassed the protected attachment route'
+    attachments = [record for record in trace_records()[start:] if record['host'] == 's3.expri.example.net']
+    assert attachments and all(record['session_cookie_count'] == 0 and set(record['forwarded_headers']) <= {'Range'} for record in attachments), 'private input attachment sent dashboard credentials to S3'
+    for handle in browser.call('GET', '/window/handles'):
+      if handle != original_window:
+        browser.call('POST', '/window', {'handle': handle})
+        browser.call('DELETE', '/window')
+    browser.call('POST', '/window', {'handle': original_window})
+
+    browser.click('#storage-kind-output + span')
+    assert evaluate("return document.querySelector('#storage-kind-output').checked;"), 'Run outputs tag did not select in one click'
+    if run_id is None:
+      wait_for(lambda: evaluate("return document.querySelector('#storage-empty')?.textContent.includes('No run outputs') && document.querySelectorAll('#storage-rows tr').length === 0;"), 'input-only project claimed uploaded run outputs')
+    else:
+      def checkpoint_row():
+        return evaluate('''const row = [...document.querySelectorAll('#storage-rows tr')]
+          .find(node => node.querySelector('th code')?.textContent === 'outputs/checkpoint.pt' && node.textContent.includes(arguments[0]));
+          if (!row) return null;
+          return {text: row.textContent, href: row.querySelector('a')?.getAttribute('href')};''', run_id)
+      row = wait_for(checkpoint_row, 'project Storage did not show the uploaded checkpoint')
+      assert 'worker' in row['text'] and '17 MiB' in row['text'] and row['href'].startswith('/api/artifact?'), 'Storage checkpoint row lost machine, size, or scoped download'
+      browser.keys('#storage-search', 'checkpoint.pt')
+      wait_for(lambda: evaluate("return document.querySelectorAll('#storage-rows tr').length === 1 && document.querySelector('#storage-rows').textContent.includes('outputs/checkpoint.pt');"), 'Storage search did not narrow uploaded outputs')
+      capture('workspace-storage')
+      browser.call('POST', '/window/rect', {'width': 500, 'height': 800})
+      assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Storage page overflows horizontally'
+      assert evaluate('''return ['#workspace-view-options', '#storage-kind-options', '#storage-search', '#refresh-storage', '#storage-page-label'].every(selector => {
+        const box = document.querySelector(selector).getBoundingClientRect();
+        return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
+      });'''), 'narrow Storage controls are clipped'
+      capture('workspace-storage-narrow')
+    browser.click('#workspace-view-workspace + span')
+    assert evaluate("return document.querySelector('#workspace-view-workspace').checked;"), 'Storage could not return to the project workspace'
+    print('Firefox Storage passed: project inputs before runs, authenticated input bytes, completed output inventory, native tags, search, and narrow layout.' if run_id else 'Firefox input-only Storage passed: project discovery before runs, private input bytes, and empty run outputs.', flush=True)
+  finally:
+    browser.close()
+
+
 def workspace_layout(browser, width, wide=False):
   geometry = browser.call('POST', '/execute/sync', {'script': '''window.scrollTo(0, 0);
     const bounds = selector => {
@@ -1417,5 +1492,9 @@ if __name__ == '__main__':
     automatic_refresh(sys.argv[2], sys.argv[3])
   elif len(sys.argv) == 3 and sys.argv[1] == '--project':
     project_workspace(sys.argv[2])
+  elif len(sys.argv) == 2 and sys.argv[1] == '--storage-input-only':
+    project_storage()
+  elif len(sys.argv) == 3 and sys.argv[1] == '--storage':
+    project_storage(sys.argv[2])
   else:
     forms()

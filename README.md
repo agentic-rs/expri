@@ -427,11 +427,21 @@ paging, table sorting, column changes, and Refresh preserve it. Status reflects
 the saved records;
 `runs status` remains the live check.
 
+On the hosted dashboard, switch to **Storage** to browse finalized S3 objects
+for the selected project. **Private inputs** shows immutable input IDs and
+sizes; **Run outputs** shows uploaded files, including checkpoints, with their
+machine and run. Search and page through either list, then download a file
+through the authenticated dashboard. Storage records input IDs rather than
+original local filenames. Input and checkpoint uploads remain CLI operations;
+use `expri service pull` for resumable downloads of large checkpoints.
+
 **Auto refresh** checks every five seconds while the page is visible. Turn it
 off to pause updates; hidden tabs and offline browsers pause automatically.
 Connection failures keep the current view and slow retries to at most once a
 minute. Updates retain the current page, filters, selected runs, review tab,
 metric choices, zoom, and hidden curves. **Refresh** checks immediately.
+While Storage is open, unchanged checks skip fetching the file list; new
+uploads refresh the current search and page.
 Local source discovery and run lists refresh every 30 seconds; selected-run
 changes are checked every five seconds. A recovery refresh runs every five
 minutes to catch changes missed by file metadata.
@@ -505,8 +515,11 @@ that provenance visible. Runs from different machines can be compared even
 when their recorded run IDs match. Their logs, files, browser downloads, and
 generated CLI commands keep each run's original project and machine scope.
 Existing worker run links continue to open the exact recorded run.
-The local dashboard remains
-available for offline review after downloading results.
+The project's **Storage** view lists completed private inputs and uploaded
+outputs across its machines and runs; the per-run **Files** tab also shows
+worker-reported outputs that have not yet been uploaded.
+The local dashboard remains available for offline review after downloading
+results.
 
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and
 worker configuration, browser sign-in, input files, selective downloads, and offline dashboard
