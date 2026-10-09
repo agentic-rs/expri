@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use super::storage::ObjectStorage;
 use super::store::{ApiError, ApiResult, Store};
 use super::types::{FileRecord, FileTarget, RunScope, STREAM_BATCH, validate_component};
+use crate::dashboard::artifacts::Download;
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
 use crate::error::{ExpriError, Result};
 use crate::metric_charts::ChartXAxis;
@@ -318,9 +319,52 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if metadata_truncated || params_truncated {
       warnings.push(json!({"message": "Hosted previews are limited; download the original run records for complete metadata and parameters."}));
     }
+    let archive = match self
+      .store
+      .execute(super::types::Request::ArchiveStatus {
+        scope: scope.clone(),
+      })
+      .map_err(api_error)?
+    {
+      super::types::Response::Archive { archive } => {
+        let mut value = serde_json::to_value(&archive)?;
+        value["download_url"] = if archive.status == "archived" && archive.file.is_some() {
+          let query = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([("source", source_id), ("run_id", run_id)])
+            .finish();
+          json!(format!("/api/archive?{query}"))
+        } else {
+          Value::Null
+        };
+        value
+      }
+      _ => return Err(message("invalid result archive response")),
+    };
     Ok(
-      json!({"source": source, "run": run, "state": metadata["state"], "snapshot": metadata["snapshot"], "environment": metadata["environment"], "metadata_truncated": metadata_truncated, "params": params, "params_truncated": params_truncated, "metrics": summaries, "metric_count": metric_count, "metrics_truncated": metric_count > 50, "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": null}),
+      json!({"source": source, "archive": archive, "run": run, "state": metadata["state"], "snapshot": metadata["snapshot"], "environment": metadata["environment"], "metadata_truncated": metadata_truncated, "params": params, "params_truncated": params_truncated, "metrics": summaries, "metric_count": metric_count, "metrics_truncated": metric_count > 50, "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": null}),
     )
+  }
+
+  pub(super) fn archive_download(&self, source_id: &str, run_id: &str) -> Result<Download> {
+    let (_, scope) = self.scope(source_id, run_id)?;
+    let (url, size) = self
+      .store
+      .dashboard_archive_attachment(&scope)
+      .map_err(api_error)?;
+    let parsed = reqwest::Url::parse(&url).map_err(|_| message("invalid archive download URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+      || parsed.host_str().is_none()
+      || !parsed.username().is_empty()
+      || parsed.password().is_some()
+      || parsed.fragment().is_some()
+    {
+      return Err(message("invalid archive download URL"));
+    }
+    Ok(Download::Cloud {
+      url,
+      size,
+      filename: "result.zip".into(),
+    })
   }
 
   pub fn log(&self, source_id: &str, run_id: &str, stream: &str, tail: usize) -> Result<Value> {
@@ -553,11 +597,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
 
   fn overview(&self, scope: &RunScope, deadline: Instant) -> ApiResult<Value> {
     let record = self.store.dashboard_artifact(scope, "run-state.json")?;
-    let version = record
-      .as_ref()
-      .and_then(|record| record.sha256.as_deref())
-      .unwrap_or("missing");
-    if let Some(value) = self.store.dashboard_cached_overview(scope, version)?
+    let version = record.as_ref().map_or_else(
+      || "missing".to_string(),
+      |record| match record.storage {
+        super::types::FileStorage::Tracking { revision, .. } => format!("tracking:{revision}"),
+        _ => record.sha256.clone().unwrap_or_else(|| "missing".into()),
+      },
+    );
+    if let Some(value) = self.store.dashboard_cached_overview(scope, &version)?
       && value["overview_schema"] == 1
     {
       return Ok(value);
@@ -597,7 +644,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if record.is_none() || normalized["state"].is_object() {
       self
         .store
-        .dashboard_cache_overview(scope, version, &result)?;
+        .dashboard_cache_overview(scope, &version, &result)?;
     }
     Ok(result)
   }

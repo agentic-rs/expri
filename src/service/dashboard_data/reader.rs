@@ -22,6 +22,12 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
       result.warnings.push(json!({"run_id": scope.run_id, "message": "outputs/metrics.jsonl is missing; no metrics have been recorded"}));
       return Ok(());
     };
+    if matches!(record.storage, FileStorage::Tracking { .. }) {
+      return self
+        .store
+        .tracking_metrics(scope, result, filters, retain_points)
+        .map_err(api_error);
+    }
     if record.size > METRICS_LIMIT {
       return Err(message(
         "outputs/metrics.jsonl exceeds the 16 MiB hosted read limit; download the run for complete local review",
@@ -44,6 +50,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
           expected_digest: record.sha256.clone(),
         })
       }
+      FileStorage::Tracking { .. } => unreachable!("tracking metrics use their projection"),
       FileStorage::Stream => MetricReader::Stream(StreamReader {
         dashboard: self,
         record: record.clone(),
@@ -87,6 +94,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
       return Ok(Vec::new());
     }
     match record.storage {
+      FileStorage::Tracking { .. } => self.store.tracking_range(record, offset, length),
       FileStorage::Stream => {
         let FileTarget::Run { scope, path } = &record.target else {
           return Err(ApiError::new(500, "invalid stored stream"));

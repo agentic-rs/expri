@@ -30,6 +30,7 @@ import {
   type Updates,
 } from "./dashboard_model";
 import { artifactCanSelect } from "./dashboard_files";
+import { LiveUpdates, type LiveUpdatesState } from "./live_updates";
 import {
   DashboardView,
   type DashboardActions,
@@ -41,6 +42,7 @@ export * from "./dashboard_model";
 export * from "./interactive_charts";
 export * from "./auto_refresh";
 export * from "./dashboard_files";
+export * from "./live_updates";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -80,11 +82,17 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
   let auto_refresh: AutoRefresh | null = null;
+  let live_updates: LiveUpdates | null = null;
+  let live_updates_state: LiveUpdatesState = "unavailable";
+  let refresh_state: RefreshState | null = null;
   let quiet_generation = 0;
   let updates_supported = true;
   let catalog_revision: string | undefined;
   const source_revisions = new Map<string, string>();
-  const detail_revisions = new Map<string, string>();
+  const detail_revisions = new Map<
+    string,
+    { view_revision: string; metadata_revision: string | null | undefined }
+  >();
   const chart_revisions = new Map<string, string>();
   const log_revisions = new Map<string, string | null>();
   const artifact_revisions = new Map<string, string>();
@@ -203,6 +211,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   };
   function publish(): void {
     if (disposed) return;
+    syncLiveUpdates();
+    auto_refresh?.resumeHint();
     view = snapshot();
     flushSync(() => {
       for (const listener of listeners) listener();
@@ -368,6 +378,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       : "ready";
   }
   function showFreshness(state: RefreshState): void {
+    refresh_state = state;
     const checked =
       last_checked === null
         ? "Waiting for updates"
@@ -380,8 +391,26 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           ? "Offline · updates resume when connected"
           : state.failed
             ? `Updates unavailable · retrying in ${state.retry_ms / 1_000}s`
-            : `Auto updates every ${state.interval_ms / 1_000}s`;
+            : live_updates_state === "connected"
+              ? `Live updates · recovery check every ${state.interval_ms / 1_000}s`
+              : `Auto updates every ${state.interval_ms / 1_000}s`;
     updateUi({ freshness: `${checked} · ${activity}`, auto_enabled: state.enabled });
+  }
+  function syncLiveUpdates(): void {
+    const active =
+      catalog_initialized &&
+      access_mode === "hosted" &&
+      ui.auto_enabled &&
+      availability() !== "hidden" &&
+      availability() !== "offline";
+    live_updates?.setUrl(
+      active
+        ? apiUrl("/api/events", {
+            source: source_id,
+            run_id: review?.run_ids ?? [],
+          })
+        : null,
+    );
   }
   function listUrl(): string {
     return apiUrl("/api/runs", {
@@ -1308,11 +1337,18 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         );
         const force =
           !updates_supported || full_snapshot || revisions.some((item) => item === undefined);
-        if (current_review.kind === "run" && (current_review.tab !== "logs" || !log_view)) {
+        if (current_review.kind === "run") {
           const id = current_review.run_ids[0];
           if (id) {
             const context = apiUrl("/api/run", { source: source_id, run_id: id });
-            if (force || detail_revisions.get(context) !== view_revision) {
+            const previous = detail_revisions.get(context),
+              metadata_revision = revisions[0]?.metadata_revision;
+            const needs_metadata =
+              access_mode === "hosted" && previous?.metadata_revision !== metadata_revision;
+            if (
+              (current_review.tab !== "logs" || !log_view || needs_metadata) &&
+              (force || previous?.view_revision !== view_revision)
+            ) {
               const detail = await quiet_lanes.detail.run<Detail>(context);
               if (!detail || !current() || review !== current_review) return "cancelled";
               const warnings_changed =
@@ -1323,7 +1359,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
               updateUi({ review_loading: false });
               updateUi({ review_error: null });
               if (!current()) return "cancelled";
-              acknowledgements.push(() => boundedSet(detail_revisions, context, view_revision));
+              acknowledgements.push(() =>
+                boundedSet(detail_revisions, context, { view_revision, metadata_revision }),
+              );
             }
           }
         } else if (current_review.kind === "compare") {
@@ -1437,6 +1475,16 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     on_state: showFreshness,
     ...(options.refresh_clock ? { clock: options.refresh_clock } : {}),
   });
+  live_updates = new LiveUpdates({
+    create:
+      options.event_source ??
+      ((url) => (page_window?.EventSource ? new page_window.EventSource(url) : null)),
+    on_hint: () => auto_refresh?.requestRefresh(),
+    on_state: (state) => {
+      live_updates_state = state;
+      if (refresh_state) showFreshness(refresh_state);
+    },
+  });
   const resume = () => auto_refresh?.availabilityChanged();
   document.addEventListener?.("visibilitychange", resume);
   if (typeof window !== "undefined") {
@@ -1448,6 +1496,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   return () => {
     if (disposed) return;
     disposed = true;
+    live_updates.dispose();
     auto_refresh?.dispose();
     chart_controller.dispose();
     for (const lane of foreground_lanes) lane.cancel();

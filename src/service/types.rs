@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const STREAM_BATCH: usize = 64 * 1024;
@@ -80,6 +81,7 @@ pub struct UploadState {
 pub enum FileStorage {
   Object,
   Stream,
+  Tracking { revision: u64, sealed: bool },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +95,30 @@ pub struct FileRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  Capabilities,
+  PutDocument {
+    scope: RunScope,
+    path: String,
+    revision: u64,
+    offset: u64,
+    total_size: u64,
+    data_base64: String,
+  },
+  AppendTracking {
+    scope: RunScope,
+    path: String,
+    offset: u64,
+    data_base64: String,
+  },
+  SealRun {
+    scope: RunScope,
+    documents: BTreeMap<String, u64>,
+    streams: BTreeMap<String, u64>,
+    incomplete: bool,
+  },
+  ArchiveStatus {
+    scope: RunScope,
+  },
   BeginUpload {
     upload_id: String,
     target: FileTarget,
@@ -140,6 +166,17 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  Capabilities {
+    features: Vec<String>,
+  },
+  DocumentAcknowledged {
+    offset: u64,
+    revision: u64,
+    complete: bool,
+  },
+  Archive {
+    archive: ArchiveRecord,
+  },
   Upload {
     upload: UploadState,
   },
@@ -163,6 +200,32 @@ pub enum Response {
     total_size: u64,
     data_base64: String,
   },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchiveRecord {
+  pub status: String,
+  pub incomplete: bool,
+  pub file: Option<FileRecord>,
+  pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct ArchiveSnapshot {
+  pub scope: RunScope,
+  pub files: Vec<FileRecord>,
+  pub incomplete: bool,
+}
+
+pub fn document_path(path: &str) -> bool {
+  matches!(
+    path,
+    "run-state.json"
+      | "snapshot.json"
+      | "environment/environment-state.json"
+      | "outputs/params.json"
+      | "outputs/.expri-artifacts.json"
+  )
 }
 
 pub fn validate_component(value: &str) -> crate::error::Result<()> {
@@ -190,6 +253,7 @@ pub fn validate_scope(scope: &RunScope) -> crate::error::Result<()> {
 
 pub fn validate_run_path(path: &str) -> crate::error::Result<()> {
   let fixed = [
+    "result.zip",
     "run-state.json",
     "snapshot.json",
     "environment/environment-state.json",

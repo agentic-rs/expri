@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,17 @@ struct SavedFile {
   record: FileRecord,
   offset: u64,
   verified: bool,
+  #[serde(default)]
+  modified: Option<(u64, u32)>,
+}
+
+fn modified(metadata: &std::fs::Metadata) -> Option<(u64, u32)> {
+  metadata
+    .modified()
+    .ok()?
+    .duration_since(std::time::UNIX_EPOCH)
+    .ok()
+    .map(|time| (time.as_secs(), time.subsec_nanos()))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -58,12 +69,30 @@ fn private(path: &Path, directory: bool) -> Result<()> {
 
 fn record_matches(first: &FileRecord, second: &FileRecord) -> bool {
   first.target == second.target
-    && first.size == second.size
     && first.sha256 == second.sha256
-    && matches!(
-      (&first.storage, &second.storage),
-      (FileStorage::Object, FileStorage::Object) | (FileStorage::Stream, FileStorage::Stream)
-    )
+    && match (&first.storage, &second.storage) {
+      (FileStorage::Object, FileStorage::Object) | (FileStorage::Stream, FileStorage::Stream) => {
+        first.size == second.size
+      }
+      (
+        FileStorage::Tracking {
+          revision: old,
+          sealed,
+        },
+        FileStorage::Tracking { revision: new, .. },
+      ) => {
+        let FileTarget::Run { path, .. } = &first.target else {
+          return false;
+        };
+        old == new
+          && if super::stream_path(path) {
+            first.size <= second.size && (!sealed || first.size == second.size)
+          } else {
+            first.size == second.size
+          }
+      }
+      _ => false,
+    }
 }
 
 impl Staging {
@@ -215,11 +244,17 @@ impl Staging {
           record: record.clone(),
           offset: 0,
           verified: false,
+          modified: None,
         },
       );
       self.save()?;
       super::initialization::checkpoint(&self.directory, "record_reset");
       self.remove_data(path)?;
+    } else {
+      let saved = self.state.files.get_mut(path).unwrap();
+      saved.record = record.clone();
+      saved.verified &= saved.offset == record.size;
+      self.save()?;
     }
     let offset = self.state.files[path].offset;
     let data_path = self.path(path);
@@ -261,12 +296,40 @@ impl Staging {
     if metadata.len() < offset {
       return Err(message("acknowledged download data is truncated"));
     }
+    if matches!(record.storage, FileStorage::Tracking { .. })
+      && metadata.len() == offset
+      && self.state.files[path].modified.is_some()
+      && self.state.files[path].modified != modified(&metadata)
+    {
+      // Tracking records need no remote hash, but an edited cached hardlink must
+      // not be mistaken for the acknowledged server prefix.
+      drop(file);
+      self.reset(path)?;
+      return self.prepare(path, record, resumable);
+    }
     #[cfg(unix)]
     {
       use std::os::unix::fs::MetadataExt;
       if metadata.nlink() > 1
         && (!self.state.files[path].verified || offset < record.size || metadata.len() != offset)
       {
+        if matches!(record.storage, FileStorage::Tracking { .. }) {
+          // The previous cache remains visible while its acknowledged prefix is
+          // copied to a private inode. Only the new inode receives appended bytes.
+          let mut source = file;
+          let mut temporary = tempfile::NamedTempFile::new_in(data_path.parent().unwrap())?;
+          source.seek(SeekFrom::Start(0))?;
+          let copied = std::io::copy(&mut source.by_ref().take(offset), &mut temporary)?;
+          if copied != offset || !fs::unchanged(&metadata, &source.metadata()?) {
+            return Err(message("cached tracking prefix changed while detaching"));
+          }
+          temporary.as_file().sync_all()?;
+          private(&data_path, false)?;
+          let detached = temporary.persist(&data_path).map_err(|error| error.error)?;
+          fs::sync_directory(data_path.parent().unwrap())?;
+          self.acknowledge(path, offset, false, &detached)?;
+          return self.prepare(path, record, resumable);
+        }
         // A cache publication shares only complete verified data. Never trim or
         // extend a shared inode if an interrupted reset left partial progress.
         drop(file);
@@ -297,6 +360,7 @@ impl Staging {
       .expect("prepared file has a record");
     saved.offset = offset;
     saved.verified = verified;
+    saved.modified = modified(&file.metadata()?);
     self.save()
   }
 
@@ -308,6 +372,7 @@ impl Staging {
       .expect("prepared file has a record");
     saved.offset = 0;
     saved.verified = false;
+    saved.modified = None;
     self.save()?;
     self.remove_data(path)
   }
@@ -317,6 +382,32 @@ impl Staging {
     self.state.files.clear();
     self.save()?;
     for path in paths {
+      self.remove_data(&path)?;
+    }
+    Ok(())
+  }
+
+  pub(super) fn retain_tracking(&mut self) -> Result<()> {
+    if !self
+      .state
+      .files
+      .values()
+      .any(|saved| matches!(saved.record.storage, FileStorage::Tracking { .. }))
+    {
+      return self.clear();
+    }
+    let removed = self
+      .state
+      .files
+      .iter()
+      .filter(|(_, saved)| !matches!(saved.record.storage, FileStorage::Tracking { .. }))
+      .map(|(path, _)| path.clone())
+      .collect::<Vec<_>>();
+    for path in &removed {
+      self.state.files.remove(path);
+    }
+    self.save()?;
+    for path in removed {
       self.remove_data(&path)?;
     }
     Ok(())

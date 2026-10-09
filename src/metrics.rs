@@ -504,9 +504,9 @@ fn read_line(
   }
 }
 
-type ParsedEvent = (u64, Option<String>, BTreeMap<String, f64>);
+pub(crate) type ParsedEvent = (u64, Option<String>, BTreeMap<String, f64>);
 
-fn event(value: Value) -> std::result::Result<ParsedEvent, String> {
+pub(crate) fn event(value: Value) -> std::result::Result<ParsedEvent, String> {
   let object = value.as_object().ok_or("event must be an object")?;
   if object
     .get("schema_version")
@@ -604,7 +604,7 @@ fn thin_points(points: &mut Vec<MetricPoint>, limit: usize) {
     .collect();
 }
 
-fn validate_filters(filters: &[String]) -> Result<()> {
+pub(crate) fn validate_filters(filters: &[String]) -> Result<()> {
   for name in filters {
     validate_name(name)?;
   }

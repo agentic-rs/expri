@@ -5,6 +5,7 @@ mod inventory;
 mod queue;
 #[cfg(test)]
 mod tests;
+mod tracking;
 mod upload;
 
 use std::collections::BTreeSet;
@@ -89,6 +90,11 @@ impl Publisher {
     };
     validate_scope(&scope)?;
     let artifacts = artifacts(&options.artifacts)?;
+    if artifacts.contains("result.zip") {
+      return Err(message(
+        "result.zip is created by the service; select it with service pull",
+      ));
+    }
     let queue_dir = std::path::absolute(&options.queue_dir)?
       .join("runs")
       .join(&scope.project_id)
@@ -119,10 +125,18 @@ impl Publisher {
   }
 
   pub(super) fn report(&self, done: bool) -> Value {
+    let files = self
+      .queue
+      .state
+      .files
+      .keys()
+      .chain(self.queue.state.documents.keys())
+      .collect::<BTreeSet<_>>();
     json!({
       "scope": self.scope, "terminal": done,
-      "files": self.queue.state.files.keys().collect::<Vec<_>>(),
+      "files": files,
       "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
+      "protocol": self.queue.state.protocol, "archive": self.queue.state.archive,
     })
   }
 
@@ -161,8 +175,69 @@ pub fn push(options: PushOptions) -> Result<Value> {
         failures += 1;
       }
     }
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(5));
   }
+}
+
+pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
+  validate_scope(scope)?;
+  let api = Api::new(config)?;
+  let Response::Capabilities { features } = api.request(&Request::Capabilities)? else {
+    return Err(message("service did not return protocol capabilities"));
+  };
+  if !features.iter().any(|feature| feature == "tracking-v1") {
+    return Err(message("service does not support tracking archives"));
+  }
+  let Response::Files { files } = api.request(&Request::ListFiles {
+    scope: scope.clone(),
+  })?
+  else {
+    return Err(message("service did not return its tracking catalog"));
+  };
+  if files.len() > 1000 {
+    return Err(message("service file catalog exceeds its size limit"));
+  }
+  let mut documents = std::collections::BTreeMap::new();
+  let mut streams = std::collections::BTreeMap::new();
+  let mut seen = BTreeSet::new();
+  for file in files {
+    download::validate_record(&file)?;
+    let FileTarget::Run {
+      scope: returned,
+      path,
+    } = file.target
+    else {
+      return Err(message(
+        "tracking catalog unexpectedly contains private inputs",
+      ));
+    };
+    if returned != *scope || !seen.insert(path.clone()) {
+      return Err(message(
+        "tracking catalog contains another run or duplicate file records",
+      ));
+    }
+    if let FileStorage::Tracking { revision, .. } = file.storage {
+      if document_path(&path) {
+        documents.insert(path, revision);
+      } else if stream_path(&path) {
+        streams.insert(path, file.size);
+      }
+    }
+  }
+  if documents.is_empty() && streams.is_empty() {
+    return Err(message("run has no synchronized tracking data to archive"));
+  }
+  let Response::Archive { archive } = api.request(&Request::SealRun {
+    scope: scope.clone(),
+    documents,
+    streams,
+    incomplete: partial,
+  })?
+  else {
+    return Err(message("service did not acknowledge its tracking archive"));
+  };
+  serde_json::to_value(tracking::archive_receipt(&api, scope, archive, partial)?)
+    .map_err(Into::into)
 }
 
 fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
@@ -173,9 +248,9 @@ fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
     .iter()
     .map(|path| {
       validate_run_path(path)?;
-      if !path.starts_with("outputs/") {
+      if !path.starts_with("outputs/") && path != "result.zip" {
         return Err(message(
-          "explicit service artifacts must be files under outputs/",
+          "explicit service artifacts must be files under outputs/ or result.zip",
         ));
       }
       Ok(path.clone())
@@ -209,13 +284,14 @@ fn push_cycle(
   if fs::inspect(&run_dir.join("snapshot.json"))?.is_none() {
     return Err(message("run snapshot metadata is missing"));
   }
+  let protocol = tracking::negotiate(api, queue)?;
   for path in METADATA
     .iter()
     .filter(|path| **path != "run-state.json" && **path != crate::run_artifacts::INVENTORY_PATH)
   {
     let source = run_dir.join(path);
     if fs::inspect(&source)?.is_some() {
-      sync_file(api, queue, path, run_target(scope, path), &source, true)?;
+      sync_metadata(api, queue, scope, path, &source, protocol)?;
       progress(queue_progress(queue))?;
     }
   }
@@ -230,7 +306,7 @@ fn push_cycle(
       {
         sync_stream(api, queue, scope, path, &source, done)?;
       }
-      if done {
+      if done && protocol == queue::Protocol::Legacy {
         sync_file(api, queue, path, run_target(scope, path), &source, false)?;
       }
       progress(queue_progress(queue))?;
@@ -246,31 +322,41 @@ fn push_cycle(
       false,
     )?;
   }
-  sync_file(
+  sync_metadata(
     api,
     queue,
+    scope,
     "run-state.json",
-    run_target(scope, "run-state.json"),
     &run_dir.join("run-state.json"),
-    true,
+    protocol,
   )?;
   progress(queue_progress(queue))?;
   // Artifact discovery is optional metadata. Unsafe or unwritable outputs must
   // not prevent the established run-state and log/metric publication above.
-  if inventory::record(run_dir).is_err() {
-    return Ok(done);
+  if inventory::record(run_dir).is_ok() {
+    let path = crate::run_artifacts::INVENTORY_PATH;
+    sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
+    progress(queue_progress(queue))?;
   }
-  let inventory_path = crate::run_artifacts::INVENTORY_PATH;
-  sync_file(
-    api,
-    queue,
-    inventory_path,
-    run_target(scope, inventory_path),
-    &run_dir.join(inventory_path),
-    true,
-  )?;
-  progress(queue_progress(queue))?;
+  if done && protocol == queue::Protocol::TrackingV1 {
+    tracking::seal(api, queue, scope)?;
+    progress(queue_progress(queue))?;
+  }
   Ok(done)
+}
+
+fn sync_metadata(
+  api: &Api,
+  queue: &mut Queue,
+  scope: &RunScope,
+  path: &str,
+  source: &Path,
+  protocol: queue::Protocol,
+) -> Result<()> {
+  match protocol {
+    queue::Protocol::TrackingV1 => tracking::sync_document(api, queue, scope, path, source),
+    queue::Protocol::Legacy => sync_file(api, queue, path, run_target(scope, path), source, true),
+  }
 }
 
 fn queue_progress(queue: &Queue) -> Value {
@@ -285,8 +371,10 @@ fn queue_progress(queue: &Queue) -> Value {
     })
     .collect();
   json!({
-    "files_completed": queue.state.files.values().filter(|saved| saved.upload.complete).count(),
+    "files_completed": queue.state.files.values().filter(|saved| saved.upload.complete).count()
+      + queue.state.documents.values().filter(|saved| saved.complete).count(),
     "stream_offsets": streams,
+    "archive": queue.state.archive,
   })
 }
 

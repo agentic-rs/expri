@@ -476,10 +476,12 @@ bundle in Firefox. CI checks that rebuilding produces the checked-in asset.
 ## Optional self-hosted storage
 
 Use `expri service` to forward run metadata, metrics and logs to a service backed
-by S3-compatible storage, publish private input files, and download selected
+by durable tracking files and SQLite, publish private input files, and download selected
 checkpoints into the local review cache. A separate `push --watch` process retries
 outages while training continues. Uploads keep durable multipart receipts; pulls
-verify file SHA256 digests before publishing downloaded files.
+verify file SHA256 digests before publishing downloaded files. The server archives
+acknowledged tracking files into `result.zip` in S3; checkpoints and inputs
+remain separate objects.
 
 An optional hosted dashboard reviews synced runs through HTTPS with a separate
 dashboard password and read-only browser sessions. The local dashboard remains
@@ -487,7 +489,8 @@ available for offline review after downloading results.
 
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and
 worker configuration, browser sign-in, input files, selective downloads, and offline dashboard
-review. This initial version uses explicit CLI commands alongside `expri run`.
+review. Configure `[service]` for automatic publication with `expri run`, or use
+explicit service commands for existing runs.
 
 ## Python environment
 

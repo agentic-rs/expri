@@ -9,7 +9,7 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
 state = {'armed': False, 'lost_ack': False, 'lost_stream_ack': False, 'part_urls': {}, 'stream_batches': 0,
-  'download_armed': False, 'download_blocked': False, 'download_ranges': {}}
+  'download_armed': False, 'download_blocked': False, 'download_ranges': {}, 'multipart_paths': []}
 uploads = {}
 lock = threading.Lock()
 
@@ -92,7 +92,10 @@ class Proxy(BaseHTTPRequestHandler):
       action = query['action']
       if action == 'begin_upload':
         uploads[query['upload_id']] = query['target'].get('path')
-      if action == 'append_stream' and status == 200:
+        path = query['target'].get('path')
+        if query['target'].get('kind') == 'run' and path not in state['multipart_paths']:
+          state['multipart_paths'].append(path)
+      if action in {'append_stream', 'append_tracking'} and status == 200:
         state['stream_batches'] += 1
         if query['path'] == 'outputs/metrics.jsonl' and not state['lost_stream_ack']:
           state['lost_stream_ack'] = True

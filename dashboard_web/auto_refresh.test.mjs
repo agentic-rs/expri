@@ -115,3 +115,28 @@ test("changing to the bounded fallback cadence is retained after successful chec
   await model.clock.advance(29_999); assert.equal(model.calls, 1);
   await model.clock.advance(1); assert.equal(model.calls, 2);
 });
+
+test("notification hints coalesce into an immediate probe and one follow-up after running work", async t => {
+  const pending = deferred(); let first = true;
+  const model = fixture(t, () => first ? (first = false, pending.promise) : Promise.resolve("success"));
+  model.scheduler.requestRefresh(); model.scheduler.requestRefresh();
+  await model.clock.advance(0); assert.equal(model.calls, 1);
+  model.scheduler.requestRefresh(); model.scheduler.requestRefresh();
+  await model.clock.advance(20_000); assert.equal(model.calls, 1);
+  pending.resolve("success"); await flush(); await model.clock.advance(0);
+  assert.equal(model.calls, 2); await model.clock.advance(4_999); assert.equal(model.calls, 2);
+  await model.clock.advance(1); assert.equal(model.calls, 3, "five-second recovery polls continue");
+});
+
+test("hints wait for foreground work and cannot run while disabled or paused", async t => {
+  const model = fixture(t); model.availability = "busy";
+  model.scheduler.requestRefresh(); await model.clock.advance(10_000); assert.equal(model.calls, 0);
+  model.availability = "ready"; model.scheduler.resumeHint(); await model.clock.advance(0); assert.equal(model.calls, 1);
+  model.scheduler.setEnabled(false); model.scheduler.requestRefresh(); await model.clock.advance(90_000); assert.equal(model.calls, 1);
+  model.scheduler.setEnabled(true); await model.clock.advance(0);
+  for (const availability of ["hidden", "offline"]) {
+    const calls = model.calls; model.availability = availability; model.scheduler.availabilityChanged();
+    model.scheduler.requestRefresh(); model.scheduler.resumeHint(); await model.clock.advance(90_000); assert.equal(model.calls, calls);
+    model.availability = "ready"; model.scheduler.availabilityChanged(); await model.clock.advance(0);
+  }
+});

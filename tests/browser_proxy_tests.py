@@ -11,6 +11,35 @@ spec.loader.exec_module(proxy)
 
 
 class BrowserProxyTests(unittest.TestCase):
+  def test_event_stream_forwards_available_hints_without_buffering_until_disconnect(self):
+    handler = object.__new__(proxy.Proxy)
+    handler.command = 'GET'
+    handler.path = '/api/events?source=hosted%3Ademo%3Aworker'
+    handler.headers = Message()
+    handler.headers['Host'] = 'expri.example.net'
+    handler.headers['Cookie'] = '__Host-expri_session=private'
+    handler.connection = Mock()
+    handler.rfile = Mock()
+    handler.wfile = Mock()
+    handler.send_response = Mock()
+    handler.send_header = Mock()
+    handler.end_headers = Mock()
+    handler.send_error = Mock()
+    response = Mock(status=200)
+    response.getheader.side_effect = lambda name, default=None: {'Content-Type': 'text/event-stream', 'Referrer-Policy': 'no-referrer'}.get(name, default)
+    response.getheaders.return_value = [('Content-Type', 'text/event-stream')]
+    response.read1.side_effect = [b'event: updates\ndata: {"catalog_revision":"7"}\n\n', b': heartbeat\n\n', b'']
+    upstream = Mock()
+    upstream.getresponse.return_value = response
+    with patch.object(proxy.http.client, 'HTTPConnection', return_value=upstream), patch.object(proxy, 'record_trace'), patch.object(proxy, 'POLICY_OVERRIDE', Mock(exists=lambda: False)):
+      handler.forward()
+    response.read.assert_not_called()
+    self.assertEqual(response.read1.call_count, 3)
+    self.assertTrue(all(call.args == (64 * 1024,) for call in response.read1.call_args_list))
+    self.assertEqual(handler.wfile.flush.call_count, 2)
+    self.assertFalse(any(call.args[0] == 'Content-Length' for call in handler.send_header.call_args_list))
+    handler.send_error.assert_not_called()
+
   def test_attachment_redirect_rewrites_only_the_exact_fixture_origin(self):
     path = '/bucket/model.pt?X-Amz-Signature=fixture%2B%2F&response-content-disposition=attachment'
     self.assertEqual(proxy.attachment_location('http://s3:9000' + path), 'https://s3.expri.example.net' + path)

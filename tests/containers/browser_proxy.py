@@ -55,10 +55,12 @@ class Proxy(BaseHTTPRequestHandler):
     # Host, Origin, Sec-Fetch-Site and Cookie come directly from Firefox.
     headers = {name: value for name, value in self.headers.items() if name.lower() not in HOP_HEADERS}
     upstream = http.client.HTTPConnection('service', 8787, timeout=20)
+    started = False
     try:
       upstream.request(self.command, self.path, body=body, headers=headers)
       response = upstream.getresponse()
-      data = response.read(2 * 1024 * 1024 + 1)
+      events = response.getheader('Content-Type', '').startswith('text/event-stream')
+      data = b'' if events else response.read(2 * 1024 * 1024 + 1)
       if len(data) > 2 * 1024 * 1024:
         raise ValueError('bounded proxy response exceeded')
       policy = response.getheader('Referrer-Policy')
@@ -83,11 +85,23 @@ class Proxy(BaseHTTPRequestHandler):
           self.send_header(name, value)
       if policy is not None:
         self.send_header('Referrer-Policy', policy)
-      self.send_header('Content-Length', response.getheader('Content-Length', '0') if self.command == 'HEAD' else str(len(data)))
+      if not events:
+        self.send_header('Content-Length', response.getheader('Content-Length', '0') if self.command == 'HEAD' else str(len(data)))
       self.end_headers()
-      self.wfile.write(data)
+      started = True
+      if events:
+        # read1 forwards each available event/heartbeat without waiting for a
+        # full chunk or buffering the lifetime of a browser connection.
+        while chunk := response.read1(64 * 1024):
+          self.wfile.write(chunk)
+          self.wfile.flush()
+      else:
+        self.wfile.write(data)
     except (OSError, ValueError, http.client.HTTPException):
-      self.send_error(502, 'fixture upstream unavailable')
+      if not started:
+        self.send_error(502, 'fixture upstream unavailable')
+      else:
+        self.close_connection = True
     finally:
       upstream.close()
 

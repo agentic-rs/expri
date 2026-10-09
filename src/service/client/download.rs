@@ -16,11 +16,13 @@ use crate::error::Result;
 use crate::lock::LockAttempt;
 
 mod initialization;
+#[cfg(test)]
+pub(in crate::service::client) mod mock;
 mod staging;
 #[cfg(test)]
 mod tests;
 
-fn validate_record(record: &FileRecord) -> Result<()> {
+pub(super) fn validate_record(record: &FileRecord) -> Result<()> {
   validate_target(&record.target)?;
   match record.storage {
     FileStorage::Object => validate_digest(
@@ -35,41 +37,63 @@ fn validate_record(record: &FileRecord) -> Result<()> {
       ));
     }
     FileStorage::Stream => {}
+    FileStorage::Tracking { revision, .. } => {
+      let FileTarget::Run { path, .. } = &record.target else {
+        return Err(message("private inputs cannot use tracking storage"));
+      };
+      if revision == 0
+        || revision > i64::MAX as u64
+        || (!stream_path(path) && !document_path(path))
+        || (document_path(path) && record.size > RECORD_LIMIT)
+      {
+        return Err(message("invalid tracking file record"));
+      }
+      if let Some(digest) = &record.sha256 {
+        validate_digest(digest)?;
+      }
+    }
   }
   Ok(())
 }
 
-fn read_stream(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
+fn stream_batch(api: &Api, record: &FileRecord, offset: u64) -> Result<Vec<u8>> {
   let FileTarget::Run { scope, path } = &record.target else {
     return Err(message("private inputs cannot use stream storage"));
   };
-  if !stream_path(path) {
+  if !stream_path(path)
+    && !(matches!(record.storage, FileStorage::Tracking { .. }) && document_path(path))
+  {
     return Err(message("service returned an invalid stream path"));
   }
+  let limit = (record.size - offset).min(STREAM_BATCH as u64) as usize;
+  let Response::Stream {
+    offset: returned,
+    total_size,
+    data_base64,
+  } = api.request(&Request::ReadStream {
+    scope: scope.clone(),
+    path: path.clone(),
+    offset,
+    limit,
+  })?
+  else {
+    return Err(message("service did not return its stream batch"));
+  };
+  let bytes = STANDARD
+    .decode(data_base64)
+    .map_err(|_| message("invalid service stream encoding"))?;
+  if returned != offset || total_size < record.size || bytes.is_empty() || bytes.len() > limit {
+    return Err(message(
+      "service stream changed or returned an invalid byte range",
+    ));
+  }
+  Ok(bytes)
+}
+
+fn read_stream(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
   let mut offset = 0u64;
   while offset < record.size {
-    let limit = (record.size - offset).min(STREAM_BATCH as u64) as usize;
-    let Response::Stream {
-      offset: returned,
-      total_size,
-      data_base64,
-    } = api.request(&Request::ReadStream {
-      scope: scope.clone(),
-      path: path.clone(),
-      offset,
-      limit,
-    })?
-    else {
-      return Err(message("service did not return its stream batch"));
-    };
-    let bytes = STANDARD
-      .decode(data_base64)
-      .map_err(|_| message("invalid service stream encoding"))?;
-    if returned != offset || total_size < record.size || bytes.is_empty() || bytes.len() > limit {
-      return Err(message(
-        "service stream changed or returned an invalid byte range",
-      ));
-    }
+    let bytes = stream_batch(api, record, offset)?;
     output.write_all(&bytes)?;
     offset += bytes.len() as u64;
   }
@@ -155,7 +179,7 @@ fn retry_range(
 fn download(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
   validate_target(&record.target)?;
   match record.storage {
-    FileStorage::Stream => read_stream(api, record, output)?,
+    FileStorage::Stream | FileStorage::Tracking { .. } => read_stream(api, record, output)?,
     FileStorage::Object => {
       let digest = record
         .sha256
@@ -192,12 +216,52 @@ fn staged_download(
   record: &FileRecord,
 ) -> Result<(u64, u64)> {
   validate_record(record)?;
-  let resumable = matches!(record.storage, FileStorage::Object)
-    && !METADATA.contains(&path)
-    && !STREAMS.contains(&path);
+  let resumable = matches!(record.storage, FileStorage::Tracking { .. })
+    || (matches!(record.storage, FileStorage::Object)
+      && !METADATA.contains(&path)
+      && !STREAMS.contains(&path));
   let (mut output, initial_offset) = staging.prepare(path, record, resumable)?;
   match record.storage {
     FileStorage::Stream => read_stream(api, record, &mut output)?,
+    FileStorage::Tracking { revision, .. } => {
+      let mut offset = initial_offset;
+      while offset < record.size {
+        let bytes = stream_batch(api, record, offset)?;
+        output.write_all(&bytes)?;
+        offset += bytes.len() as u64;
+        staging.acknowledge(path, offset, false, &output)?;
+      }
+      let Response::File { file: current } = api.request(&Request::GetFile {
+        target: record.target.clone(),
+      })?
+      else {
+        return Err(message("service did not confirm its tracking revision"));
+      };
+      validate_record(&current)?;
+      let unchanged = current.target == record.target
+        && matches!(current.storage, FileStorage::Tracking { revision: current_revision, .. } if current_revision == revision)
+        && if stream_path(path) {
+          current.size >= record.size
+        } else {
+          current.size == record.size
+        };
+      if !unchanged {
+        drop(output);
+        staging.reset(path)?;
+        return Err(message(
+          "tracking revision changed during download; retry with its current catalog",
+        ));
+      }
+      if let Some(digest) = &record.sha256
+        && fs::digest(&mut output, record.size)? != *digest
+      {
+        drop(output);
+        staging.reset(path)?;
+        return Err(message(
+          "tracking download SHA256 does not match its service record",
+        ));
+      }
+    }
     FileStorage::Object => {
       let mut offset = initial_offset;
       // Empty objects still need one successful GET before they can be verified.
@@ -435,7 +499,7 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     "available_files_truncated": available_files_truncated,
   });
   fs::atomic_json(&destination.join("pull-state.json"), &receipt)?;
-  staging.clear()?;
+  staging.retain_tracking()?;
   drop(cache_lease);
   Ok(
     json!({"scope": scope, "source": source, "destination": destination, "files": selected.keys().collect::<Vec<_>>(),

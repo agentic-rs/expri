@@ -148,7 +148,7 @@ async function microtasks() { for (let index = 0; index < 32; index++) await Pro
 async function click(node) { await act(async () => { node.focus(); node.click(); await microtasks(); }); }
 async function emit(node, name, fields = {}) {
   await act(async () => {
-    const window = node.ownerDocument?.defaultView ?? node.defaultView;
+    const window = node.ownerDocument?.defaultView ?? node.defaultView ?? node.window;
     const EventType = name.startsWith("key") ? window.KeyboardEvent : window.Event;
     node.dispatchEvent(new EventType(name, { bubbles: true, cancelable: true, ...fields }));
     await microtasks();
@@ -176,7 +176,7 @@ function detailRecord(source, run, value = 0.5) {
   return { source, run, state: { command: "python train.py" }, snapshot: null, environment: null, cache: null, params: { learning_rate: 0.1 }, params_truncated: false, metadata_truncated: false, metrics: { accuracy: metric, loss: metric }, metric_count: 2, metrics_truncated: false, metrics_error: null, warnings: [] };
 }
 
-async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, catalog_failure = false, url, override = null } = {}) {
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null } = {}) {
   const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
   const runs = Array.from({ length: count }, (_, index) => ({
@@ -209,7 +209,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
       const run = runs.find(item => item.run_id === query.get("run_id"));
       if (!run) return response({ error: "Run not found" }, 404);
-      return response(detailRecord(source, run, model.metric_value));
+      return response({ ...detailRecord(source, run, model.metric_value), archive: model.archive });
     }
     if (parsed.pathname === "/api/artifacts") return response({ source, run_id: query.get("run_id"), files: model.artifact_files.map(file => ({ ...file, download_url: file.download_url === undefined ? (file.local === true || file.cloud === true ? apiUrl("/api/artifact", { source: source.source_id, run_id: query.get("run_id"), path: file.path }) : null) : file.download_url })), truncated: model.artifact_truncated, warnings: model.artifact_warnings, pull_scope: hosted ? { project_id: source.project_id ?? "test-project", origin: source.origin ?? "test-worker", run_id: query.get("run_id") } : null, inventory_recorded_at: "2026-10-07T01:02:03Z" });
     if (parsed.pathname === "/api/log") return response({ content: model.logs[query.get("stream")] ?? `${query.get("stream")} training complete`, stream: query.get("stream"), missing: false, truncated: false });
@@ -220,7 +220,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     }
     assert.fail(`Unexpected dashboard request: ${url}`);
   };
-  await mountDashboard(nodes, { ...(refresh_clock ? { refresh_clock } : {}), ...(chart_controller ? { chart_controller } : {}) });
+  await mountDashboard(nodes, { ...(refresh_clock ? { refresh_clock } : {}), ...(chart_controller ? { chart_controller } : {}), ...(event_source ? { event_source } : {}) });
   return model;
 }
 
@@ -1441,4 +1441,110 @@ test("Files reports empty, truncated and unsupported catalogs and rejects arbitr
   await click(model.nodes.get("review-tab-files")); await settled(() => model.nodes.get("files-error").hidden === false);
   assert.match(model.nodes.get("files-error").textContent, /Upgrade expri or use the CLI/);
   assert.equal(model.nodes.get("review-tab-files").getAttribute("aria-selected"), "true");
+});
+
+class DashboardEventSource {
+  readyState = 0;
+  listeners = new Map();
+  closed = 0;
+  constructor(url) { this.url = url; }
+  addEventListener(type, listener) { const listeners = this.listeners.get(type) ?? new Set(); listeners.add(listener); this.listeners.set(type, listeners); }
+  removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+  close() { this.closed++; this.readyState = 2; }
+  async emit(type, data) { await act(async () => { for (const listener of [...this.listeners.get(type) ?? []]) listener({ type, data }); await microtasks(); }); }
+}
+function dashboardStreams() {
+  const streams = [];
+  return { streams, create: url => { const stream = new DashboardEventSource(url); streams.push(stream); return stream; }, latest: () => streams.at(-1) };
+}
+
+test("hosted live hints coalesce into incremental probes and preserve the current chart", async t => {
+  const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create }); await inspect(model);
+  const stream = live.latest(), query = new URL(stream.url, "http://localhost").searchParams;
+  assert.equal(query.get("source"), model.sources[0].source_id); assert.deepEqual(query.getAll("run_id"), ["run-0"]);
+  assert.equal(live.streams[0].closed, 1, "inspection closes the unscoped previous stream");
+  stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
+  assert.match(model.nodes.get("updated-at").textContent, /Live updates.*recovery check every 5s/);
+  const counts = requestCounts(model.requests), frame = model.nodes.get("chart-frame"), previews = model.chart.previews.length;
+  model.model.metrics_revision = "metrics-push"; model.model.metric_value = 0.25; model.model.chart_html = "<html>chart-push</html>";
+  await stream.emit("updates", '{"catalog_revision":"11"}'); await stream.emit("updates", '{"catalog_revision":"12"}');
+  await model.clock.advance(0);
+  const next = requestCounts(model.requests);
+  assert.equal(next["/api/updates"], counts["/api/updates"] + 1);
+  assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"] + 1);
+  for (const path of ["/api/catalog", "/api/runs", "/api/log"]) assert.equal(next[path], counts[path], path);
+  assert.equal(model.nodes.get("chart-frame"), frame); assert.equal(model.chart.previews.length, previews + 1);
+  assert.equal(model.nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
+  await stream.emit("updates", '{"catalog_revision":"12"}'); await stream.emit("updates", '{"catalog_revision":12}'); await model.clock.advance(0);
+  assert.equal(requestCounts(model.requests)["/api/updates"], next["/api/updates"]);
+  await model.clock.advance(5_000);
+  assert.equal(requestCounts(model.requests)["/api/updates"], next["/api/updates"] + 1, "recovery polling stays active");
+});
+
+test("local dashboards avoid streams and unsupported hosted streams retain recovery polling", async t => {
+  const local = dashboardStreams(), local_model = await autoFixture(t, { hosted: false, event_source: local.create });
+  await local_model.clock.advance(5_000); assert.equal(local.streams.length, 0); assert.equal(requestCounts(local_model.requests)["/api/updates"], 1);
+  await act(async () => { local_model.nodes.cleanup(); await microtasks(); });
+  const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create });
+  const stream = live.latest(); stream.readyState = 2; await stream.emit("error");
+  assert.equal(stream.closed, 1); assert.doesNotMatch(model.nodes.get("updated-at").textContent, /Live updates/);
+  await model.clock.advance(10_000); assert.equal(requestCounts(model.requests)["/api/updates"], 2);
+  assert.equal(live.streams.length, 1, "closed 404-like streams do not retry on every React publication");
+});
+
+test("live connections close while hidden offline disabled and disposed and reopen on resume", async t => {
+  const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create }); await inspect(model);
+  let stream = live.latest(); stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
+  const frame = model.nodes.get("chart-frame"); await click(model.nodes.get("review-tab-overview"));
+  Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "hidden" }); await emit(model.page_document, "visibilitychange");
+  assert.equal(stream.closed, 1); const requests = model.requests.length; await stream.emit("updates", '{"catalog_revision":"77"}'); await model.clock.advance(30_000); assert.equal(model.requests.length, requests);
+  Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "visible" }); await emit(model.page_document, "visibilitychange");
+  assert.notEqual(live.latest(), stream); stream = live.latest(); await model.clock.advance(0);
+  Object.defineProperty(globalThis.navigator, "onLine", { configurable: true, value: false }); await emit(globalThis.window, "offline"); assert.equal(stream.closed, 1);
+  Object.defineProperty(globalThis.navigator, "onLine", { configurable: true, value: true }); await emit(globalThis.window, "online"); assert.notEqual(live.latest(), stream); stream = live.latest();
+  await click(model.nodes.get("auto-refresh-toggle")); assert.equal(stream.closed, 1);
+  const closed_count = live.streams.length; await model.clock.advance(30_000); assert.equal(live.streams.length, closed_count);
+  await click(model.nodes.get("auto-refresh-toggle")); assert.equal(live.streams.length, closed_count + 1); stream = live.latest();
+  stream.readyState = 0; await stream.emit("error"); assert.equal(stream.closed, 0, "transient loss leaves native reconnection intact");
+  stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
+  assert.equal(model.nodes.get("review-tab-overview").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("chart-frame"), frame);
+  await act(async () => { model.nodes.cleanup(); model.nodes.cleanup(); await microtasks(); }); assert.equal(stream.closed, 1);
+});
+
+test("archive state is separate from training and downloads only archived scoped snapshots", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  assert.equal(model.nodes.document.getElementById("archive-summary"), null, "legacy records may omit archives");
+  for (const status of ["none", "pending", "uploading", "failed"]) {
+    model.model.archive = { status, incomplete: status === "failed", last_error: status === "failed" ? "Some output files were unavailable <script>" : null };
+    await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
+    assert.equal(model.nodes.document.getElementById("download-archive"), null);
+    assert.equal(model.nodes.get("archive-summary").classList.contains("error"), false);
+    assert.equal(model.nodes.get("run-detail").textContent.includes("completed"), true, "archive progress does not change training status");
+  }
+  assert.match(model.nodes.get("archive-summary").textContent, /Partial archive.*Archive issue: Some output files were unavailable <script>/);
+  assert.equal(model.nodes.get("archive-summary").querySelector("script"), null);
+  model.model.archive = { status: "archived", incomplete: true, file: { target: { kind: "run", scope: { project_id: "project", origin: "worker", run_id: "run-0" }, path: "result.zip" }, size: 1024, sha256: null, storage: "object" } };
+  await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
+  const anchor = model.nodes.get("download-archive"), query = new URL(anchor.href).searchParams;
+  assert.match(anchor.textContent, /Download archive \(1 KiB\)/); assert.equal(query.get("source"), model.sources[0].source_id); assert.equal(query.get("run_id"), "run-0"); assert.equal(anchor.getAttribute("download"), "");
+  const requests = model.requests.length; await click(model.nodes.get("review-tab-logs")); await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
+  assert.equal(model.nodes.get("download-archive"), anchor); assert.equal(model.requests.slice(requests).some(url => url.startsWith("/api/archive")), false, "archive bytes stay out of JavaScript");
+  await selectRow(model.nodes, 0); await selectRow(model.nodes, 1); await settled(() => model.nodes.get("review-title").textContent.includes("runs"));
+  assert.equal(model.nodes.document.getElementById("archive-summary"), null, "comparisons do not expose one run's archive");
+});
+
+test("archive metadata hints update the badge during Logs without fetching metric-only detail", async t => {
+  const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create });
+  model.model.archive = { status: "pending", incomplete: false }; await inspect(model); await click(model.nodes.get("review-tab-logs"));
+  await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
+  const stream = live.latest(); stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
+  const log = model.nodes.get("log-output"), counts = requestCounts(model.requests); log.scrollTop = 24;
+  model.model.metrics_revision = "metric-only"; await stream.emit("updates", '{"catalog_revision":"20"}'); await model.clock.advance(0);
+  assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"], "active Logs skips metric-only details");
+  model.model.archive = { status: "archived", incomplete: true }; model.model.metadata_revision = "archive-finished";
+  await stream.emit("updates", '{"catalog_revision":"21"}'); await model.clock.advance(0);
+  const next = requestCounts(model.requests);
+  assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"]); assert.equal(next["/api/log"], counts["/api/log"]);
+  assert.match(model.nodes.get("archive-summary").textContent, /Archived.*Partial archive.*Download archive/);
+  assert.equal(model.nodes.get("review-tab-logs").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("log-output"), log); assert.equal(log.scrollTop, 24);
 });

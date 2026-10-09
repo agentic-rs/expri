@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import shlex
+import zipfile
 from urllib.parse import urlencode, urlsplit
 
 ORIGIN = 'https://expri.example.net'
@@ -49,7 +50,7 @@ class Firefox:
           'toolkit.telemetry.enabled': False, 'browser.shell.checkDefaultBrowser': False,
           'browser.download.folderList': 2, 'browser.download.dir': str(DOWNLOADS),
           'browser.download.useDownloadDir': True, 'browser.download.alwaysOpenPanel': False,
-          'browser.helperApps.neverAsk.saveToDisk': 'application/octet-stream',
+          'browser.helperApps.neverAsk.saveToDisk': 'application/octet-stream,application/zip',
         }},
       }}})
       self.session = session['sessionId']
@@ -658,7 +659,25 @@ def artifact_files(browser, run_id):
       browser.call('DELETE', '/window')
   browser.call('POST', '/window', {'handle': original_window})
   browser.click('#review-tab-charts')
-  print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI and exact 17 MiB native attachment.', flush=True)
+  wait_for(lambda: evaluate("return document.querySelector('#archive-status')?.textContent;") == 'Archived', 'completed run did not show its independent archive badge')
+  archive_path = DOWNLOADS / 'result.zip'
+  archive_path.unlink(missing_ok=True)
+  (DOWNLOADS / 'result.zip.part').unlink(missing_ok=True)
+  browser.click('#download-archive')
+  wait_for(lambda: archive_path.exists() and archive_path.stat().st_size > 0 and not (DOWNLOADS / 'result.zip.part').exists(), 'native result archive download did not complete', timeout=60)
+  with zipfile.ZipFile(archive_path) as archive:
+    assert archive.testzip() is None, 'result archive contains corrupt entries'
+    manifest = json.loads(archive.read('manifest.json'))
+    assert manifest['scope'] == {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id} and manifest['incomplete'] is False, 'native archive changed its scope or completeness'
+    metrics = [json.loads(line) for line in archive.read('outputs/metrics.jsonl').splitlines()]
+    assert [row['step'] for row in metrics if 'loss' in row['metrics']] == list(range(80)), 'native ZIP lost or duplicated acknowledged metrics'
+    assert 'outputs/checkpoint.pt' not in archive.namelist(), 'tracking archive unexpectedly bundled the separately selected heavy checkpoint'
+  for handle in browser.call('GET', '/window/handles'):
+    if handle != original_window:
+      browser.call('POST', '/window', {'handle': handle})
+      browser.call('DELETE', '/window')
+  browser.call('POST', '/window', {'handle': original_window})
+  print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
 
 
 def workspace(run_id, second_run_id):
@@ -899,10 +918,12 @@ def automatic_refresh(run_id, updated_run_id):
     browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
     browser.navigate('/login')
     browser.login()
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'auto-refresh fixture runs did not load')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh fixture runs did not load')
     browser.keys('#task-input', 'train')
     wait_for(lambda: evaluate("return document.querySelector('#task-input').value;") == 'train' and
-      evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'auto-refresh task filter did not apply')
+      evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh task filter did not apply')
+    wait_for(lambda: 'Live updates' in evaluate("return document.querySelector('#updated-at').textContent;"), 'native hosted EventSource did not connect', timeout=20)
+    assert any(record['path'] == '/api/events' and record['status'] == 200 for record in trace_records()), 'native EventSource did not open its authenticated endpoint'
     for selected_run in [run_id, updated_run_id]:
       browser.click(f'input[aria-label="Select {selected_run} for comparison"]')
     wait_for(lambda: loss_state() is not None and last_comparison_step() == 'step 79', 'auto-refresh comparison did not load its initial samples')
@@ -1028,7 +1049,7 @@ def automatic_refresh(run_id, updated_run_id):
     assert evaluate("return document.querySelector('#review-tab-logs').getAttribute('aria-selected');") == 'true', 'log refresh changed the active tab'
     assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'log refresh changed the task filter'
     phase('complete')
-    print('Firefox auto refresh passed: real finalized worker publications, five-second probes, unchanged snapshots skipped, active drag deferred, exact samples/summary, elapsed and wall-clock zoom and hidden run preserved, pause/resume, live Logs tab, sandbox/CSP retained.', flush=True)
+    print('Firefox auto refresh passed: acknowledged tracking publications, live notifications and recovery probes, unchanged snapshots skipped, active drag deferred, exact samples/summary, elapsed and wall-clock zoom and hidden run preserved, pause/resume, live Logs tab, sandbox/CSP retained.', flush=True)
   except Exception:
     try:
       browser.call('POST', '/frame', {'id': None})
