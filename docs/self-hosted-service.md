@@ -405,6 +405,39 @@ Pass the downloaded path to the experiment as needed. Keep input files outside
 Git and code snapshots. This version handles datasets/files; credentials and
 secret injection are outside its scope.
 
+### Reuse an uploaded file
+
+The owner can reference a completed input or run output as another input or
+output in the same project. The service reuses the existing S3 object without
+transferring its bytes. Pin the source's recorded size and SHA256 digest; an
+existing destination must already reference that same object.
+
+For example, expose an uploaded checkpoint as a private input for later runs:
+
+```sh
+expri service reference --config owner.toml \
+  --source '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-1"},"path":"outputs/best.pt"}' \
+  --target '{"kind":"input","project_id":"vision","input_id":"checkpoint-v1"}' \
+  --size "$CHECKPOINT_SIZE" --sha256 "$CHECKPOINT_SHA256"
+```
+
+Set `CHECKPOINT_SIZE` and `CHECKPOINT_SHA256` to the source's saved values. References appear in
+the project's Storage view and use the usual input and artifact downloads.
+Workers may retrieve referenced inputs, but only the owner may create references.
+
+To publish one file independently of run completion, use `expri service file-put`:
+
+```sh
+expri service file-put --config owner.toml \
+  --target '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-1"},"path":"outputs/best.pt"}' \
+  --file /private/checkpoints/best.pt
+```
+
+This command does not seal the run or create `result.zip`. If the destination
+already stores an object with matching size and digest, it returns `reused: true`
+without uploading or creating a local queue. Otherwise it uses a resumable upload
+queue under `.expri/service-sync/files/`, configurable with `--queue-dir`.
+
 ## Acceptance tests
 
 ```sh

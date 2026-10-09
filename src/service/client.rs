@@ -479,8 +479,12 @@ pub fn file_put(options: super::FilePutOptions) -> Result<Value> {
   let api = Api::new(&options.config)?;
   let path = std::path::absolute(&options.file)?;
   let mut source = fs::open(&path)?;
-  let size = source.metadata()?.len();
+  let initial = source.metadata()?;
+  let size = initial.len();
   let digest = fs::digest(&mut source, size)?;
+  if !fs::unchanged(&initial, &source.metadata()?) {
+    return Err(message("finalized artifact changed while reading"));
+  }
   // An existing output may be a reference adopted from an older input upload.
   // Keep that object key instead of uploading identical bytes under a new key.
   match api.request(&Request::GetFile {
@@ -491,6 +495,9 @@ pub fn file_put(options: super::FilePutOptions) -> Result<Value> {
         && file.size == size
         && file.sha256.as_deref() == Some(&digest)
       {
+        if !fs::unchanged(&initial, &fs::open(&path)?.metadata()?) {
+          return Err(message("finalized artifact changed while reading"));
+        }
         return Ok(json!({"target":target,"size":size,"sha256":digest,"reused":true}));
       }
     }
