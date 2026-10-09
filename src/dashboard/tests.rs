@@ -1,6 +1,202 @@
 use super::*;
 use crate::config::Config;
 
+#[test]
+fn local_scalar_cache_refreshes_appended_metrics_and_replaced_parameter_files() {
+  use std::io::Write;
+  let fixture = Fixture::new();
+  let run = fixture.run("run-a");
+  let params = run.join("outputs/params.json");
+  fs::write(&params, json!({"rate":1}).to_string()).unwrap();
+  let options = table::TableOptions::parse(
+    vec!["/rate".into()],
+    vec!["loss".into()],
+    "last",
+    Some("metric:loss"),
+    Some("asc"),
+  )
+  .unwrap();
+  let query = table::ListQuery {
+    search: None,
+    task: None,
+    status: None,
+    limit: 100,
+    offset: 0,
+    table: Some(&options),
+  };
+  let first = fixture.dashboard.list_table("local", &query).unwrap();
+  assert_eq!(first["runs"][0]["table_values"]["metrics"]["loss"], 1.0);
+  let revision = table_cache::Cache::revision(&run, true, true).unwrap();
+  assert!(
+    fixture
+      .dashboard
+      .table_cache
+      .get(&run, true, true, &revision)
+      .is_some()
+  );
+  assert_eq!(
+    fixture.dashboard.list_table("local", &query).unwrap(),
+    first
+  );
+  fs::OpenOptions::new()
+    .append(true)
+    .open(run.join("outputs/metrics.jsonl"))
+    .unwrap()
+    .write_all(b"{\"step\":2,\"metrics\":{\"loss\":0.25}}\n")
+    .unwrap();
+  let next = fixture.dashboard.list_table("local", &query).unwrap();
+  assert_eq!(next["runs"][0]["table_values"]["metrics"]["loss"], 0.25);
+  let replacement = run.join("outputs/new-params.json");
+  fs::write(&replacement, json!({"rate":2}).to_string()).unwrap();
+  fs::rename(&replacement, &params).unwrap();
+  let next = fixture.dashboard.list_table("local", &query).unwrap();
+  assert_eq!(next["runs"][0]["table_values"]["params"]["/rate"], 2);
+}
+
+#[test]
+fn configurable_columns_sort_the_filtered_history_before_pagination() {
+  let fixture = Fixture::new();
+  for (id, rate, loss) in [
+    ("run-a", Some(10), Some(4)),
+    ("run-b", Some(2), Some(9)),
+    ("run-c", None, None),
+  ] {
+    let run = fixture.run(id);
+    fs::write(
+      run.join("outputs/params.json"),
+      json!({"optimizer":{"rate":rate},"literal/key":true}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+      run.join("outputs/metrics.jsonl"),
+      format!("{}\n", json!({"step":0,"metrics":{"loss":loss}})),
+    )
+    .unwrap();
+  }
+  let options = table::TableOptions::parse(
+    vec!["/optimizer/rate".into(), "/literal~1key".into()],
+    vec!["loss".into()],
+    "last",
+    Some("param:/optimizer/rate"),
+    Some("asc"),
+  )
+  .unwrap();
+  let query = table::ListQuery {
+    search: Some("TRAIN"),
+    task: Some("train"),
+    status: Some("completed"),
+    limit: 1,
+    offset: 1,
+    table: Some(&options),
+  };
+  let page = fixture.dashboard.list_table("local", &query).unwrap();
+  assert_eq!(page["total_count"], 3);
+  assert_eq!(page["runs"][0]["run_id"], "run-a");
+  assert_eq!(
+    page["runs"][0]["table_values"]["params"]["/optimizer/rate"],
+    10
+  );
+  assert_eq!(
+    page["runs"][0]["table_values"]["params"]["/literal~1key"],
+    true
+  );
+  assert_eq!(page["runs"][0]["table_values"]["metrics"]["loss"], 4.0);
+  assert_eq!(page["next_offset"], 2);
+  let columns = fixture.dashboard.columns("local").unwrap();
+  assert!(
+    columns["available_columns"]["params"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|column| column["key"] == "/optimizer/rate")
+  );
+  let options = table::TableOptions::parse(
+    vec![],
+    vec!["loss".into()],
+    "max",
+    Some("metric:loss"),
+    Some("desc"),
+  )
+  .unwrap();
+  let query = table::ListQuery {
+    search: None,
+    task: None,
+    status: None,
+    limit: 3,
+    offset: 0,
+    table: Some(&options),
+  };
+  let page = fixture.dashboard.list_table("local", &query).unwrap();
+  assert_eq!(
+    page["runs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .map(|row| row["run_id"].as_str().unwrap())
+      .collect::<Vec<_>>(),
+    ["run-b", "run-a", "run-c"]
+  );
+}
+
+#[test]
+fn parameter_only_tables_do_not_open_metrics_and_long_values_have_explicit_previews() {
+  let fixture = Fixture::new();
+  let run = fixture.run("run-a");
+  fs::write(
+    run.join("outputs/params.json"),
+    json!({"name":"雪".repeat(100_000)}).to_string(),
+  )
+  .unwrap();
+  fs::remove_file(run.join("outputs/metrics.jsonl")).unwrap();
+  fs::create_dir(run.join("outputs/metrics.jsonl")).unwrap();
+  let options = table::TableOptions::parse(
+    vec!["/name".into()],
+    vec![],
+    "last",
+    Some("param:/name"),
+    Some("asc"),
+  )
+  .unwrap();
+  let page = fixture
+    .dashboard
+    .list_table(
+      "local",
+      &table::ListQuery {
+        search: None,
+        task: None,
+        status: None,
+        limit: 100,
+        offset: 0,
+        table: Some(&options),
+      },
+    )
+    .unwrap();
+  assert!(page["warnings"].as_array().unwrap().is_empty());
+  assert_eq!(page["runs"][0]["table_values_truncated"], true);
+  assert!(serde_json::to_vec(&page).unwrap().len() < 2048);
+  assert!(
+    fixture
+      .dashboard
+      .list_table(
+        "local",
+        &table::ListQuery {
+          search: None,
+          task: None,
+          status: None,
+          limit: 101,
+          offset: 0,
+          table: Some(&options)
+        }
+      )
+      .is_err()
+  );
+  let legacy = fixture
+    .dashboard
+    .list("local", None, None, None, 1000, 0)
+    .unwrap();
+  assert!(legacy["runs"][0].get("table_values").is_none());
+}
+
 struct Fixture {
   _directory: tempfile::TempDir,
   root: PathBuf,

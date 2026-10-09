@@ -544,10 +544,32 @@ impl<S: ObjectStorage> Store<S> {
     scope: &RunScope,
     version: &str,
   ) -> ApiResult<Option<serde_json::Value>> {
+    self.dashboard_cached_record(scope, "run-state.json", version, 16 * 1024)
+  }
+
+  pub(in crate::service) fn dashboard_cached_scalars(
+    &self,
+    scope: &RunScope,
+    path: &str,
+    version: &str,
+  ) -> ApiResult<Option<serde_json::Value>> {
+    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl") {
+      return Err(ApiError::new(400, "invalid scalar cache artifact"));
+    }
+    self.dashboard_cached_record(scope, path, version, 64 * 1024)
+  }
+
+  fn dashboard_cached_record(
+    &self,
+    scope: &RunScope,
+    path: &str,
+    version: &str,
+    limit: usize,
+  ) -> ApiResult<Option<serde_json::Value>> {
     validate_scope(scope).map_err(bad)?;
     let key = target_json(&FileTarget::Run {
       scope: scope.clone(),
-      path: "run-state.json".into(),
+      path: path.into(),
     })?;
     let raw: Option<String> = self
       .db()?
@@ -560,7 +582,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(database)?;
     Ok(
       raw
-        .filter(|raw| raw.len() <= 16 * 1024)
+        .filter(|raw| raw.len() <= limit)
         .and_then(|raw| serde_json::from_str(&raw).ok()),
     )
   }
@@ -571,18 +593,51 @@ impl<S: ObjectStorage> Store<S> {
     version: &str,
     record: &serde_json::Value,
   ) -> ApiResult<()> {
+    self.dashboard_cache_record(scope, "run-state.json", version, record, 16 * 1024)
+  }
+
+  /// Reuse the disposable overview cache for compact table data. Large
+  /// projections remain readable but are not retained in this cache.
+  pub(in crate::service) fn dashboard_cache_scalars(
+    &self,
+    scope: &RunScope,
+    path: &str,
+    version: &str,
+    record: &serde_json::Value,
+  ) -> ApiResult<()> {
+    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl") {
+      return Err(ApiError::new(400, "invalid scalar cache artifact"));
+    }
+    if serde_json::to_vec(record)
+      .map_err(|_| ApiError::new(500, "cannot encode scalar columns"))?
+      .len()
+      > 64 * 1024
+    {
+      return Ok(());
+    }
+    self.dashboard_cache_record(scope, path, version, record, 64 * 1024)
+  }
+
+  fn dashboard_cache_record(
+    &self,
+    scope: &RunScope,
+    path: &str,
+    version: &str,
+    record: &serde_json::Value,
+    limit: usize,
+  ) -> ApiResult<()> {
     validate_scope(scope).map_err(bad)?;
     if version.len() > 96 {
       return Err(ApiError::new(400, "invalid overview version"));
     }
     let raw = serde_json::to_string(record)
       .map_err(|_| ApiError::new(500, "cannot encode run overview"))?;
-    if raw.len() > 16 * 1024 {
+    if raw.len() > limit {
       return Err(ApiError::new(413, "run overview exceeds its cache limit"));
     }
     let key = target_json(&FileTarget::Run {
       scope: scope.clone(),
-      path: "run-state.json".into(),
+      path: path.into(),
     })?;
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;

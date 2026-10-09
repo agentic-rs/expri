@@ -104,9 +104,16 @@ without passwords, cookies or request bodies.
 After the worker uploads two runs, Firefox checks the workspace against those
 results: selecting runs updates charts, tabs support the keyboard, logs load on
 demand, Refresh preserves the comparison, and filters clear it. The suite checks
-desktop columns and overflow at a verified 500 CSS pixel viewport, saving
-`workspace-desktop.png` and `workspace-narrow.png` with the CI diagnostics.
-The Firefox check covers a narrow layout rather than 320/360 pixel mobile widths.
+desktop columns and overflow at verified 320, 360, and 500 CSS pixel viewports,
+saving `workspace-desktop.png`, `workspace-narrow.png`, and
+`workspace-columns-<width>.png` with the CI diagnostics. Native checkbox tags
+choose parameter and metric columns, summary tags switch Last/Min/Max,
+and header clicks sort while retaining selection, the active tab, and chart
+zoom. Adding columns moves the table above the review; narrow layouts scroll
+the table without extending the page.
+The isolated Firefox driver removes its desktop window's 500px minimum before
+the mobile checks and asserts the resulting page viewport. It changes no page
+markup, authentication rules, iframe sandbox, or content security policy.
 
 The Files check opens the fourth tab with native keyboard input, selects an
 uploaded checkpoint, generates a scoped CLI command, and downloads the actual
@@ -121,8 +128,8 @@ and verifies that the saved prefix is reused while prior cache files stay intact
 The live-update check republishes new samples, metadata and logs from the
 finalized second worker run while Firefox remains open. It checks five-second
 probes without unchanged metric fetches, defers replacement during a native
-drag, retains zoom/hidden runs/filters/selection, and exercises pause/resume and
-the active Logs tab. `workspace-auto-refresh.png` captures the updated chart;
+drag, retains zoom/hidden runs/filters/selection/table columns and sorting, and
+exercises pause/resume and the active Logs tab. `workspace-auto-refresh.png` captures the updated chart;
 `browser-auto-refresh.log` records these assertions.
 
 Native pointer and keyboard input also checks exact hover readouts, drag zoom,

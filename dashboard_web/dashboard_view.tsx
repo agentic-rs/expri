@@ -1,6 +1,16 @@
 import { Fragment, useSyncExternalStore, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
+import {
+  MAX_RUN_COLUMNS,
+  formatRunTableValue,
+  runColumnChoices,
+  runColumnIdentity,
+  runColumnSortKey,
+  runColumnValue,
+  runSortIsDefault,
+  runSortLabel,
+} from "./run_table";
 import type { ChartAxis, ChartTimeZone } from "./interactive_charts";
 import {
   apiUrl,
@@ -18,6 +28,8 @@ import {
   type Review,
   type ReviewTab,
   type Run,
+  type RunColumn,
+  type RunSort,
   type Source,
   type Warning,
 } from "./dashboard_model";
@@ -39,6 +51,11 @@ export type DashboardUi = {
   run_count: string;
   page_label: string;
   list_busy: boolean;
+  run_columns_loading: boolean;
+  run_columns_error: string | null;
+  run_columns_warnings: Warning[];
+  run_columns_truncated: boolean;
+  run_columns_supported: boolean;
   previous_disabled: boolean;
   next_disabled: boolean;
   list_empty: EmptyRuns | null;
@@ -63,6 +80,10 @@ export type DashboardSnapshot = DashboardUi & {
   source_id: string;
   access_mode: "local" | "hosted";
   runs: Run[];
+  run_columns: RunColumn[];
+  available_run_columns: RunColumn[];
+  run_sort: RunSort;
+  run_reduction: ComparisonReduction;
   selected: string[];
   review: Review | null;
   detail: Detail | null;
@@ -78,6 +99,11 @@ export type DashboardSnapshot = DashboardUi & {
 export type DashboardActions = {
   filter: (field: "search" | "task" | "status", value: string) => void;
   clear_filters: () => void;
+  run_column: (column: RunColumn, checked: boolean) => void;
+  run_sort: (key: string) => void;
+  reset_run_sort: () => void;
+  run_reduction: (value: ComparisonReduction) => void;
+  refresh_run_columns: () => void;
   source: (value: string) => void;
   refresh: () => void;
   auto_refresh: (enabled: boolean) => void;
@@ -114,6 +140,7 @@ function RadioTags<T extends string>({
   on_change,
   hidden = false,
   description,
+  disabled = false,
 }: {
   id?: string;
   name: string;
@@ -123,9 +150,16 @@ function RadioTags<T extends string>({
   on_change: (value: T) => void;
   hidden?: boolean;
   description?: string;
+  disabled?: boolean;
 }) {
   return (
-    <fieldset id={id} className="choice-group" hidden={hidden} aria-describedby={description}>
+    <fieldset
+      id={id}
+      className="choice-group"
+      hidden={hidden}
+      disabled={disabled}
+      aria-describedby={description}
+    >
       <legend>{legend}</legend>
       <div className={name === "time_zone" ? "time-zone-choices" : undefined}>
         <div className="choice-tags">
@@ -237,6 +271,142 @@ function MetricPicker({
     </div>
   );
 }
+function RunColumnPicker({
+  snapshot: s,
+  actions: a,
+}: {
+  snapshot: DashboardSnapshot;
+  actions: DashboardActions;
+}) {
+  const [search, setSearch] = useState("");
+  const choices = runColumnChoices(s.available_run_columns, s.run_columns);
+  const chosen = new Set(s.run_columns.map(runColumnIdentity));
+  const query = search.trim().toLocaleLowerCase();
+  const visible = choices.filter(
+    (column) =>
+      !query ||
+      column.label.toLocaleLowerCase().includes(query) ||
+      column.key.toLocaleLowerCase().includes(query),
+  );
+  const disabled =
+    s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported;
+  return (
+    <details
+      id="run-columns"
+      className="run-columns-panel"
+      onToggle={(event) => {
+        if (event.currentTarget.open) a.refresh_run_columns();
+      }}
+    >
+      <summary>
+        Columns <span className="muted">{s.run_columns.length} / {MAX_RUN_COLUMNS}</span>
+      </summary>
+      <p id="run-columns-hint" className="muted">
+        Run and Status stay visible. Choose up to eight parameter or metric columns.
+      </p>
+      {s.run_columns_loading && <p role="status">Finding recorded columns…</p>}
+      <Warnings id="run-columns-warnings" items={s.run_columns_warnings} />
+      {choices.length > 0 && (
+        <label className="field">
+          Find a column
+          <input
+            id="run-column-search"
+            type="search"
+            maxLength={200}
+            value={search}
+            onChange={(event) => setSearch(event.currentTarget.value)}
+            placeholder="Parameter or metric name"
+          />
+        </label>
+      )}
+      {(["param", "metric"] as const).map((kind) => {
+        const columns = visible.filter((column) => column.kind === kind);
+        if (columns.length === 0) return null;
+        return (
+          <fieldset key={kind} className="run-column-group" aria-describedby="run-columns-hint">
+            <legend>{kind === "param" ? "Parameters" : "Metrics"}</legend>
+            <div className="run-column-options">
+              {columns.map((column) => {
+                const identity = runColumnIdentity(column);
+                const selected = chosen.has(identity);
+                return (
+                  <label className="run-column-choice choice-tag" key={identity}>
+                    <input
+                      type="checkbox"
+                      className="sr-only"
+                      checked={selected}
+                      disabled={disabled || (chosen.size >= MAX_RUN_COLUMNS && !selected)}
+                      aria-label={`${kind === "param" ? "Parameter" : "Metric"} ${column.label}`}
+                      onChange={(event) => a.run_column(column, event.currentTarget.checked)}
+                    />
+                    <span title={column.key}>{column.label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
+        );
+      })}
+      {s.run_columns_supported &&
+        !s.run_columns_loading &&
+        !s.run_columns_error &&
+        choices.length === 0 && (
+          <p className="muted" role="status">
+            No parameters or metrics are recorded in this source yet.
+          </p>
+        )}
+      {query && visible.length === 0 && choices.length > 0 && (
+        <p className="muted" role="status">No columns match this name.</p>
+      )}
+      {s.run_columns_truncated && (
+        <p className="muted">
+          Column discovery is limited. Selected columns remain available.
+        </p>
+      )}
+      {chosen.size >= MAX_RUN_COLUMNS && <p className="muted">Remove a column to choose another.</p>}
+    </details>
+  );
+}
+function RunSortHeader({
+  label,
+  sort_key,
+  snapshot: s,
+  actions: a,
+  class_name,
+  description,
+}: {
+  label: string;
+  sort_key: string;
+  snapshot: DashboardSnapshot;
+  actions: DashboardActions;
+  class_name: string;
+  description?: string;
+}) {
+  const active = s.run_sort.key === sort_key;
+  const direction = active && s.run_sort.direction === "asc" ? "descending" : "ascending";
+  return (
+    <th
+      scope="col"
+      className={class_name}
+      aria-sort={active ? (s.run_sort.direction === "asc" ? "ascending" : "descending") : "none"}
+    >
+      <button
+        type="button"
+        className="run-sort-button"
+        disabled={
+          s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported
+        }
+        aria-label={`Sort by ${label} ${direction}`}
+        title={label}
+        onClick={() => a.run_sort(sort_key)}
+      >
+        <span>{label}</span>
+        <span aria-hidden="true">{active ? (s.run_sort.direction === "asc" ? "↑" : "↓") : "↕"}</span>
+      </button>
+      {description && <span className="run-column-kind">{description}</span>}
+    </th>
+  );
+}
 function RunBrowser({
   snapshot: s,
   actions: a,
@@ -290,25 +460,24 @@ function RunBrowser({
             ))}
           </datalist>
         </label>
-        <label className="field">
-          Status
-          <select
-            id="status-select"
-            disabled={s.controls_disabled}
-            value={s.status}
-            onChange={(event) => a.filter("status", event.currentTarget.value)}
-          >
-            <option value="">Any status</option>
-            {["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].map(
-              (status) => (
-                <option key={status} value={status}>
-                  {status[0]?.toUpperCase()}
-                  {status.slice(1)}
-                </option>
-              ),
-            )}
-          </select>
-        </label>
+        <RadioTags
+          id="status-options"
+          name="status"
+          legend="Status"
+          value={s.status}
+          disabled={s.controls_disabled}
+          options={[
+            { id: "status-any", value: "", label: "Any" },
+            ...["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].map(
+              (status) => ({
+                id: `status-${status}`,
+                value: status,
+                label: `${status[0]?.toUpperCase()}${status.slice(1)}`,
+              }),
+            ),
+          ]}
+          on_change={(value) => a.filter("status", value)}
+        />
         <button
           id="clear-filters"
           className="text-button"
@@ -320,16 +489,91 @@ function RunBrowser({
         </button>
         <p className="filter-hint">Changing filters clears the selection.</p>
       </div>
+      <div className="run-table-toolbar">
+        <RunColumnPicker key={s.source_id} snapshot={s} actions={a} />
+        <RadioTags
+          id="run-reduction-options"
+          name="run_reduction"
+          legend="Metric summary"
+          value={s.run_reduction}
+          hidden={!s.run_columns.some((column) => column.kind === "metric")}
+          disabled={
+            s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported
+          }
+          options={[
+            { id: "run-reduction-last", value: "last", label: "Last" },
+            { id: "run-reduction-min", value: "min", label: "Min" },
+            { id: "run-reduction-max", value: "max", label: "Max" },
+          ]}
+          on_change={a.run_reduction}
+        />
+        <button
+          id="reset-run-sort"
+          className="text-button"
+          type="button"
+          aria-pressed={runSortIsDefault(s.run_sort)}
+          disabled={s.controls_disabled || s.list_busy || runSortIsDefault(s.run_sort)}
+          onClick={a.reset_run_sort}
+        >
+          Newest first
+        </button>
+        <p id="run-sort-description" className="muted">
+          {runSortLabel(s.run_sort, s.run_columns)} · Missing values last
+        </p>
+      </div>
+      {(!s.run_columns_supported || s.run_columns_error) && (
+        <div
+          id="run-columns-feedback"
+          className={`notice run-columns-feedback${s.run_columns_supported ? " error" : ""}`}
+          role={s.run_columns_supported ? "alert" : "status"}
+        >
+          <p>{s.run_columns_error ?? "Table columns require an updated expri backend."}</p>
+          <button
+            type="button"
+            className="text-button"
+            disabled={s.run_columns_loading || s.controls_disabled}
+            onClick={a.refresh_run_columns}
+          >
+            Retry column discovery
+          </button>
+        </div>
+      )}
       <Warnings id="list-warnings" items={s.list_warnings} />
       <div className="table-scroll runs-scroll" id="runs-region" aria-busy={s.list_busy}>
-        <table className="runs-table">
+        <table
+          className={`runs-table${s.run_columns.length ? " has-custom-columns" : ""}`}
+          data-column-count={s.run_columns.length}
+        >
           <thead>
             <tr>
               <th className="selection-column">
                 <span className="sr-only">Select for comparison</span>
               </th>
-              <th scope="col">Run</th>
-              <th scope="col">Status</th>
+              <RunSortHeader
+                label="Run"
+                sort_key="run_id"
+                class_name="run-column"
+                snapshot={s}
+                actions={a}
+              />
+              <RunSortHeader
+                label="Status"
+                sort_key="status"
+                class_name="status-column"
+                snapshot={s}
+                actions={a}
+              />
+              {s.run_columns.map((column) => (
+                <RunSortHeader
+                  key={runColumnIdentity(column)}
+                  label={column.label}
+                  sort_key={runColumnSortKey(column)}
+                  class_name="run-custom-column"
+                  snapshot={s}
+                  actions={a}
+                  description={column.kind === "param" ? "Parameter" : `Metric · ${s.run_reduction}`}
+                />
+              ))}
             </tr>
           </thead>
           <tbody id="run-rows">
@@ -370,14 +614,36 @@ function RunBrowser({
                     </button>
                     <div className="run-task">{run.task ?? "No task recorded"}</div>
                     <div className="run-meta">{metadata.join(" · ")}</div>
+                    {run.table_values_truncated && (
+                      <div
+                        className="run-value-warning"
+                        title="Some selected values exceed the table preview limit."
+                      >
+                        Limited values
+                      </div>
+                    )}
                   </td>
-                  <td>
+                  <td className="status-column">
                     <span
                       className={`status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(run.status) ? run.status : ""}`}
                     >
                       {run.status}
                     </span>
                   </td>
+                  {s.run_columns.map((column) => {
+                    const value = formatRunTableValue(runColumnValue(run, column));
+                    return (
+                      <td
+                        key={runColumnIdentity(column)}
+                        className={`run-column-value${value.numeric ? " number" : ""}`}
+                        data-column-kind={column.kind}
+                        data-column-key={column.key}
+                        title={value.title}
+                      >
+                        {value.text}
+                      </td>
+                    );
+                  })}
                 </tr>
               );
             })}
@@ -1067,7 +1333,7 @@ export function DashboardView({
       </div>
       <ErrorNotice id="global-error" message={s.global_error} />
       <Warnings id="catalog-warnings" items={s.catalog_warnings} />
-      <div className="workspace-grid">
+      <div className={`workspace-grid${s.run_columns.length ? " has-custom-columns" : ""}`}>
         <RunBrowser snapshot={s} actions={actions} />
         <ReviewWorkspace snapshot={s} actions={actions} />
       </div>

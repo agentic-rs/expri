@@ -8,6 +8,40 @@ use crate::context::CommandContext;
 
 const AUTHORITY: &str = "127.0.0.1:8765";
 
+#[test]
+fn run_table_routes_discover_keys_validate_selection_and_sort_before_paging() {
+  let fixture = Fixture::new();
+  let columns = fixture.get("/api/run-columns?source=local");
+  assert_eq!(columns.status, 200);
+  let columns: Value = serde_json::from_slice(&columns.body).unwrap();
+  assert_eq!(
+    columns["available_columns"]["params"],
+    json!([{"key":"/learning_rate","label":"learning_rate"}])
+  );
+  let page = fixture.get("/api/runs?source=local&param=%2Flearning_rate&metric=train%2Floss&reduction=last&sort=metric%3Atrain%2Floss&direction=asc&limit=1&offset=1");
+  assert_eq!(page.status, 200);
+  let page: Value = serde_json::from_slice(&page.body).unwrap();
+  assert_eq!(page["runs"][0]["run_id"], "run-one");
+  assert_eq!(
+    page["runs"][0]["table_values"]["metrics"]["train/loss"],
+    0.5
+  );
+  for query in [
+    "param=/x&param=/x",
+    "param=/bad~2pointer",
+    "sort=metric:unselected",
+    "sort=duration",
+    "direction=up",
+    "reduction=mean",
+    "metric=loss&metric=loss",
+    "param=/x&limit=101",
+    "direction=asc&direction=desc",
+  ] {
+    assert_error(fixture.get(&format!("/api/runs?{query}")), 400);
+  }
+  assert_error(fixture.get("/api/run-columns?source=local&param=/x"), 400);
+}
+
 struct Fixture {
   _directory: TempDir,
   dashboard: Dashboard,

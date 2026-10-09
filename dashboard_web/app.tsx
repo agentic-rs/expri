@@ -25,12 +25,16 @@ import {
   type Review,
   type ReviewTab,
   type Run,
+  type RunColumn,
+  type RunColumns,
   type RunList,
+  type RunSort,
   type Source,
   type Updates,
 } from "./dashboard_model";
 import { artifactCanSelect } from "./dashboard_files";
 import { LiveUpdates, type LiveUpdatesState } from "./live_updates";
+import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import {
   DashboardView,
   type DashboardActions,
@@ -54,6 +58,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const page_window = typeof window === "undefined" ? null : window;
   const catalog_lane = new RequestLane(() => pending_deep_link);
   const list_lane = new RequestLane(() => pending_deep_link);
+  const run_columns_lane = new RequestLane(() => pending_deep_link);
   const review_lane = new RequestLane(() => pending_deep_link);
   const log_lane = new RequestLane(() => pending_deep_link);
   const compare_lane = new RequestLane(() => pending_deep_link);
@@ -73,6 +78,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const foreground_lanes = [
     catalog_lane,
     list_lane,
+    run_columns_lane,
     review_lane,
     log_lane,
     compare_lane,
@@ -114,6 +120,12 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let access_mode: "local" | "hosted" = "local";
   let page_size = 100;
   let runs: Run[] = [];
+  let run_columns: RunColumn[] = [];
+  let available_run_columns: RunColumn[] = [];
+  let run_sort: RunSort = { key: "started_at", direction: "desc" };
+  let run_reduction: ComparisonReduction = "last";
+  let run_columns_source: string | null = null;
+  let run_columns_version = 0;
   let offset = 0;
   let next_offset: number | null = null;
   let review: Review | null = null;
@@ -175,6 +187,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     artifacts_loading: false,
     artifacts_error: null,
     live_status: "",
+    run_columns_loading: false,
+    run_columns_error: null,
+    run_columns_truncated: false,
+    run_columns_supported: true,
+    run_columns_warnings: [],
   };
   function snapshot(): DashboardSnapshot {
     return {
@@ -196,6 +213,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       x_axis,
       time_zone,
       reduction,
+      run_columns: [...run_columns],
+      available_run_columns: [...available_run_columns],
+      run_sort: { ...run_sort },
+      run_reduction,
     };
   }
   let view = snapshot();
@@ -247,6 +268,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       cancelRefresh();
       clearSearchTimeout();
       source_id = value;
+      resetRunColumns();
       runs = [];
       offset = 0;
       selected.clear();
@@ -295,6 +317,35 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       discardDeepLink();
       selected.clear();
       selectionChanged();
+    },
+    run_column: (column, checked) => {
+      if (!ui.run_columns_supported) return;
+      const identity = runColumnIdentity(column);
+      const existing = run_columns.some((item) => runColumnIdentity(item) === identity);
+      if (existing === checked || (checked && run_columns.length >= MAX_RUN_COLUMNS)) return;
+      run_columns = checked
+        ? [...run_columns, column]
+        : run_columns.filter((item) => runColumnIdentity(item) !== identity);
+      if (!checked && run_sort.key === runColumnSortKey(column))
+        run_sort = { key: "started_at", direction: "desc" };
+      reloadRunTable();
+    },
+    run_sort: (key) => {
+      void sortRuns(key);
+    },
+    reset_run_sort: () => {
+      if (runSortIsDefault(run_sort)) return;
+      run_sort = { key: "started_at", direction: "desc" };
+      reloadRunTable();
+    },
+    run_reduction: (value) => {
+      if (run_reduction === value) return;
+      run_reduction = value;
+      if (run_columns.some((column) => column.kind === "metric")) reloadRunTable();
+      else publish();
+    },
+    refresh_run_columns: () => {
+      void loadRunColumns(true);
     },
     compare: () => {
       discardDeepLink();
@@ -420,7 +471,89 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       status: ui.status,
       limit: page_size,
       offset,
+      param: ui.run_columns_supported
+        ? run_columns.filter((column) => column.kind === "param").map((column) => column.key)
+        : [],
+      metric: ui.run_columns_supported
+        ? run_columns.filter((column) => column.kind === "metric").map((column) => column.key)
+        : [],
+      reduction:
+        ui.run_columns_supported && run_columns.some((column) => column.kind === "metric")
+          ? run_reduction
+          : null,
+      sort: ui.run_columns_supported && !runSortIsDefault(run_sort) ? run_sort.key : null,
+      direction: ui.run_columns_supported && !runSortIsDefault(run_sort) ? run_sort.direction : null,
     });
+  }
+  function resetRunColumns(): void {
+    run_columns_version++;
+    run_columns_lane.cancel();
+    run_columns_source = null;
+    available_run_columns = [];
+    ui.run_columns_loading = false;
+    ui.run_columns_error = null;
+    ui.run_columns_truncated = false;
+    ui.run_columns_supported = true;
+    ui.run_columns_warnings = [];
+  }
+  async function loadRunColumns(force = false): Promise<boolean> {
+    const source = source_id;
+    if (!source) return false;
+    if (!force && run_columns_source === source) return ui.run_columns_supported;
+    const version = ++run_columns_version;
+    const current = () => source_id === source && version === run_columns_version;
+    updateUi({ run_columns_loading: true, run_columns_error: null });
+    try {
+      const result = await run_columns_lane.run<RunColumns>(
+        apiUrl("/api/run-columns", { source }),
+      );
+      if (!result || !current()) return false;
+      const columns = result.available_columns;
+      if (!columns || !Array.isArray(columns.params) || !Array.isArray(columns.metrics))
+        throw new Error("The column choices could not be read. Try again.");
+      available_run_columns = [
+        ...columns.params.map((column): RunColumn => ({ ...column, kind: "param" })),
+        ...columns.metrics.map((column): RunColumn => ({ ...column, kind: "metric" })),
+      ];
+      run_columns_source = source;
+      updateUi({
+        run_columns_supported: true,
+        run_columns_truncated: columns.truncated,
+        run_columns_error: null,
+        run_columns_warnings: result.warnings,
+      });
+      return true;
+    } catch (error) {
+      if (!current()) return false;
+      if (error instanceof RequestError && error.status === 404) {
+        run_columns_source = source;
+        updateUi({
+          run_columns_supported: false,
+          run_columns_error: "Upgrade the expri server to use configurable columns and sorting.",
+        });
+      } else updateUi({ run_columns_error: errorText(error) });
+      return false;
+    } finally {
+      if (current()) updateUi({ run_columns_loading: false });
+    }
+  }
+  function reloadRunTable(): void {
+    cancelRefresh();
+    list_lane.cancel();
+    clearSearchTimeout();
+    offset = 0;
+    publish();
+    void loadRuns();
+  }
+  async function sortRuns(key: string): Promise<void> {
+    if (!["run_id", "status", ...run_columns.map(runColumnSortKey)].includes(key)) return;
+    const source = source_id;
+    if (!(await loadRunColumns()) || source_id !== source) return;
+    run_sort = {
+      key,
+      direction: run_sort.key === key && run_sort.direction === "asc" ? "desc" : "asc",
+    };
+    reloadRunTable();
   }
   function chartUrl(): string {
     return apiUrl("/api/chart", {
@@ -974,6 +1107,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (linked_source) source_id = linked_source.source_id;
     catalog_initialized = true;
     if (source_id !== previous_source) {
+      resetRunColumns();
       offset = 0;
       runs = [];
       selected.clear();
@@ -991,6 +1125,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   function emptyCatalog(): void {
     list_lane.cancel();
+    resetRunColumns();
     runs = [];
     next_offset = null;
     updateUi({

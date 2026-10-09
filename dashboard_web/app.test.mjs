@@ -197,12 +197,25 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local" });
     const source = sources.find(item => item.source_id === query.get("source"));
     assert.ok(source, "all requests must remain in a known source");
+    if (parsed.pathname === "/api/run-columns") return response({
+      available_columns: {
+        params: [{ key: "/learning_rate", label: "learning_rate" }, { key: "/batch_size", label: "batch_size" }],
+        metrics: [{ key: "accuracy", label: "accuracy" }, { key: "loss", label: "loss" }],
+        truncated: false,
+      }, warnings: [],
+    });
     if (parsed.pathname === "/api/runs") {
       if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
       const visible = runs.filter(run => !query.get("search") || run.run_id.includes(query.get("search")));
       const offset = Number(query.get("offset"));
       const limit = Number(query.get("limit"));
-      return response({ source, runs: visible.slice(offset, offset + limit), warnings: [], total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
+      const rows = visible.slice(offset, offset + limit).map(run => ({ ...run,
+        ...(query.has("param") || query.has("metric") ? { table_values: {
+          params: Object.fromEntries(query.getAll("param").map(key => [key, key === "/learning_rate" ? 0.01 : 32])),
+          metrics: Object.fromEntries(query.getAll("metric").map(key => [key, model.metric_value])),
+        } } : {}),
+      }));
+      return response({ source, runs: rows, warnings: [], total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
     }
     const metric = { count: 2, last: { step: 1, value: model.metric_value }, min: { step: 1, value: model.metric_value }, max: { step: 0, value: 1 } };
     if (parsed.pathname === "/api/run") {
@@ -231,6 +244,23 @@ async function selectRow(nodes, index, checked = true) {
 }
 function runCheckbox(nodes, index) { return nodes.get("run-rows").children[index].querySelector('input[type="checkbox"]'); }
 function runButton(nodes, index) { return nodes.get("run-rows").children[index].querySelector("button"); }
+function columnCheckbox(nodes, name) {
+  const input = [...nodes.get("run-columns").querySelectorAll('input[type="checkbox"]')]
+    .find(node => node.getAttribute("aria-label") === name);
+  assert.ok(input, `Missing column choice: ${name}`);
+  return input;
+}
+async function openColumns(nodes) {
+  nodes.get("run-columns").open = true;
+  await emit(nodes.get("run-columns"), "toggle");
+  await settled(() => [...nodes.get("run-columns").querySelectorAll('input[type="checkbox"]')].some(node => !node.disabled));
+}
+async function settledTable(nodes) {
+  await settled(() => nodes.get("runs-region").getAttribute("aria-busy") === "false");
+}
+function latestRunQuery(model) {
+  return new URL(model.requests.filter(url => url.startsWith("/api/runs?")).at(-1), "http://localhost").searchParams;
+}
 function metricCheckbox(nodes, name) {
   const label = [...nodes.get("run-metric-options").querySelectorAll("label.metric-choice")].find(item => item.textContent === name);
   assert.ok(label, `Missing metric control: ${name}`); return label.querySelector("input");
@@ -314,6 +344,92 @@ test("summary tags select reductions in one action and retain the choice on refr
   await settled(() => nodes.get("refresh-button").disabled === false);
   assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/compare")).at(-1), "http://localhost").searchParams.get("reduction"), "max");
   assert.equal(nodes.get("reduction-max").checked, true);
+});
+
+test("columns and server sorting preserve the selected run, chart settings and inspection tab", async t => {
+  const model = await reviewFixture(t, { count: 25, hosted: true }), { nodes } = model;
+  await settledTable(nodes);
+  assert.equal(model.requests.some(url => url.startsWith("/api/run-columns")), false, "discovery stays lazy");
+  await selectRow(nodes, 0);
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  await chooseAxis(nodes, "elapsed");
+  await click(nodes.get("review-tab-logs"));
+  await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
+  const chart_url = nodes.get("chart-frame").src;
+  const chart_count = requestCounts(model.requests)["/api/chart"];
+  await openColumns(nodes);
+  await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
+  await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
+  assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
+  assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
+  assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.equal(nodes.get("page-label").textContent, "Page 2");
+  const loss_header = () => [...nodes.document.querySelectorAll("th")].find(node => node.querySelector("button")?.getAttribute("aria-label")?.startsWith("Sort by loss "));
+  await click(loss_header().querySelector("button")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("sort"), "metric:loss");
+  assert.equal(latestRunQuery(model).get("direction"), "asc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(loss_header().getAttribute("aria-sort"), "ascending");
+  await click(loss_header().querySelector("button")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("direction"), "desc");
+  await click(nodes.get("run-reduction-min")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("reduction"), "min");
+  assert.equal(runCheckbox(nodes, 0).checked, true);
+  assert.equal(nodes.get("review-tab-logs").getAttribute("aria-selected"), "true");
+  assert.equal(nodes.get("chart-frame").src, chart_url);
+  assert.equal(requestCounts(model.requests)["/api/chart"], chart_count, "table changes do not refetch the chart");
+  await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).has("sort"), false, "removing the active column restores newest first");
+  assert.equal(latestRunQuery(model).has("metric"), false);
+  assert.match(nodes.get("run-sort-description").textContent, /Newest first/);
+});
+
+test("column discovery failure leaves the dashboard usable and retries after an in-place backend upgrade", async t => {
+  let upgraded = false;
+  const model = await reviewFixture(t, { override: parsed =>
+    parsed.pathname === "/api/run-columns" && !upgraded ? response({ error: "Unknown endpoint" }, 404) : null,
+  }), { nodes } = model;
+  await settledTable(nodes);
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run ascending"]'));
+  await settled(() => nodes.document.getElementById("run-columns-feedback")?.textContent.includes("Upgrade the expri server"));
+  const feedback = nodes.document.getElementById("run-columns-feedback");
+  assert.equal(nodes.get("run-columns").open, false);
+  assert.equal(feedback.closest("details"), null, "a header-sort failure stays visible when Columns is closed");
+  assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.has("sort")), false);
+  assert.equal(nodes.get("run-rows").children.length, 3);
+  await click(runButton(nodes, 0));
+  await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  upgraded = true;
+  const retry = feedback.querySelector("button");
+  assert.equal(retry.disabled, false);
+  await click(retry);
+  await settled(() => [...nodes.get("run-columns").querySelectorAll('input[type="checkbox"]')].some(node => !node.disabled));
+  assert.equal(nodes.document.getElementById("run-columns-feedback"), null);
+  await openColumns(nodes);
+  await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
+  assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
+});
+
+test("automatic list updates keep table choices and sorting while refreshing only compact scalar values", async t => {
+  const fixture = await autoFixture(t), { nodes } = fixture;
+  await settledTable(nodes);
+  await openColumns(nodes);
+  await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
+  await click(nodes.document.querySelector('button[aria-label="Sort by loss ascending"]')); await settledTable(nodes);
+  const discovery_count = requestCounts(fixture.requests)["/api/run-columns"];
+  const details = requestCounts(fixture.requests)["/api/run"] ?? 0;
+  fixture.model.metric_value = 0.125;
+  fixture.model.list_revision = "table-2";
+  await fixture.clock.advance(5_000);
+  const cell = nodes.get("run-rows").children[0].querySelector('[data-column-kind="metric"]');
+  assert.equal(cell.textContent, "0.125");
+  assert.equal(columnCheckbox(nodes, "Metric loss").checked, true);
+  assert.equal(latestRunQuery(fixture).get("sort"), "metric:loss");
+  assert.equal(latestRunQuery(fixture).get("direction"), "asc");
+  assert.equal(requestCounts(fixture.requests)["/api/run-columns"], discovery_count);
+  assert.equal(requestCounts(fixture.requests)["/api/run"] ?? 0, details, "no per-row detail requests");
 });
 
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
@@ -543,8 +659,7 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
   await emit(nodes.get("search-input"), "input");
   setValue(nodes.get("task-input"), "train");
   await emit(nodes.get("task-input"), "input");
-  setValue(nodes.get("status-select"), "completed");
-  await emit(nodes.get("status-select"), "change");
+  await click(nodes.get("status-completed"));
   await settled(() => requests.some(url => url.includes("search=accuracy")));
   const query = new URL(requests.at(-1), "http://localhost").searchParams;
   assert.equal(query.get("task"), "train");

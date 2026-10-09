@@ -401,7 +401,19 @@ expri -T runpod runs pull run-abc123 --metrics --logs
 ```
 
 The run browser stays beside the review workspace on desktop and stacks above
-it on narrow screens. Opening a run starts with its curves. **Overview** holds
+it on narrow screens. Choose up to eight parameter or metric columns with the
+**Columns** checkbox tags; adding columns moves the table above the review
+workspace and keeps horizontal scrolling within the table. Nested parameters
+remain distinct, including keys containing dots or slashes. Missing values show
+an em dash. The table's **Last / Min / Max** tags choose the metric
+summary, independently of the chart comparison summary. Click a column header
+to sort; clicking again reverses its direction. Sorting applies before paging,
+and missing values stay at the end in either direction. Column and sort changes
+preserve selected runs, the active review tab, and chart exploration. Status
+filters use single-click tags. These choices last for the current page;
+saved workspace views are a separate roadmap step.
+
+Opening a run starts with its curves. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads
 stdout/stderr tails when opened. **Files** lists regular outputs, sizes, and
 local or reported worker/cloud availability. Select files for individual browser
@@ -410,7 +422,8 @@ Files loads only when opened and keeps selection during refresh. Selecting runs 
 one run opens its curves, and two to eight runs from one source show a comparison.
 Compare last, minimum or maximum metric values, and expand parameter differences
 below the curves. Changing search/task/status filters clears the selection;
-paging and Refresh preserve it. Status reflects the saved records;
+paging, table sorting, column changes, and Refresh preserve it. Status reflects
+the saved records;
 `runs status` remains the live check.
 
 **Auto refresh** checks every five seconds while the page is visible. Turn it

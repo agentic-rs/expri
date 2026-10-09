@@ -9,6 +9,240 @@ use super::*;
 use crate::service::storage::{CompletedPart, ObjectMetadata};
 use crate::service::types::{Request, Response as ApiResponse};
 
+#[test]
+fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache() {
+  let fixture = Fixture::new();
+  for (id, rate, loss) in [("run-a", 10, 4), ("run-b", 2, 9)] {
+    fixture.state(id, "completed");
+    fixture.run_file(
+      id,
+      "outputs/params.json",
+      json!({"optimizer":{"rate":rate}}).to_string().into_bytes(),
+    );
+    fixture.run_file(
+      id,
+      "outputs/metrics.jsonl",
+      format!("{}\n", json!({"step":0,"metrics":{"loss":loss}})).into_bytes(),
+    );
+  }
+  fixture.state("run-missing", "completed");
+  fixture.publish_size(
+    FileTarget::Run {
+      scope: Fixture::scope("run-a"),
+      path: "outputs/model.pt".into(),
+    },
+    vec![],
+    64 * 1024 * 1024 * 1024,
+  );
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let columns = dashboard.columns("hosted:project:worker").unwrap();
+  assert_eq!(
+    columns["available_columns"]["params"],
+    json!([{"key":"/optimizer/rate","label":"optimizer / rate"}])
+  );
+  assert_eq!(fixture.backend.objects.lock().unwrap().requests.len(), 4);
+  fixture.backend.objects.lock().unwrap().requests.clear();
+  let options = table::TableOptions::parse(
+    vec!["/optimizer/rate".into()],
+    vec!["loss".into()],
+    "last",
+    Some("param:/optimizer/rate"),
+    Some("asc"),
+  )
+  .unwrap();
+  let page = dashboard
+    .list_table(
+      "hosted:project:worker",
+      &ListQuery {
+        search: None,
+        task: Some("train"),
+        status: Some("completed"),
+        limit: 1,
+        offset: 1,
+        table: Some(&options),
+      },
+    )
+    .unwrap();
+  assert_eq!(page["runs"][0]["run_id"], "run-a");
+  assert_eq!(page["total_count"], 3);
+  assert_eq!(page["runs"][0]["table_values"]["metrics"]["loss"], 4.0);
+  assert_eq!(
+    fixture.backend.objects.lock().unwrap().requests.len(),
+    3,
+    "only uncached run states should be read"
+  );
+  fixture.backend.objects.lock().unwrap().requests.clear();
+  dashboard
+    .list_table(
+      "hosted:project:worker",
+      &ListQuery {
+        search: None,
+        task: None,
+        status: None,
+        limit: 3,
+        offset: 0,
+        table: Some(&options),
+      },
+    )
+    .unwrap();
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  fixture.run_file(
+    "run-a",
+    "outputs/metrics.jsonl",
+    format!(
+      "{}\n",
+      json!({"step":1,"metrics":{"loss":12,"new_metric":0.5}})
+    )
+    .into_bytes(),
+  );
+  let options = table::TableOptions::parse(
+    vec![],
+    vec!["loss".into()],
+    "last",
+    Some("metric:loss"),
+    Some("desc"),
+  )
+  .unwrap();
+  let page = dashboard
+    .list_table(
+      "hosted:project:worker",
+      &ListQuery {
+        search: None,
+        task: None,
+        status: None,
+        limit: 3,
+        offset: 0,
+        table: Some(&options),
+      },
+    )
+    .unwrap();
+  assert_eq!(
+    page["runs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .map(|run| run["run_id"].as_str().unwrap())
+      .collect::<Vec<_>>(),
+    ["run-a", "run-b", "run-missing"]
+  );
+  assert_eq!(page["runs"][0]["table_values"]["metrics"]["loss"], 12.0);
+  assert_eq!(
+    fixture.backend.objects.lock().unwrap().requests.len(),
+    1,
+    "replacing one metric artifact invalidates only its scalar cache"
+  );
+  let columns = dashboard.columns("hosted:project:worker").unwrap();
+  assert!(
+    columns["available_columns"]["metrics"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|column| column["key"] == "new_metric")
+  );
+  assert_eq!(fixture.backend.objects.lock().unwrap().requests.len(), 1);
+}
+
+#[test]
+fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_storage_reads() {
+  let fixture = Fixture::new();
+  for (id, rate, loss) in [("run-a", 10, 4), ("run-b", 2, 9)] {
+    for (path, value) in [
+      (
+        "run-state.json",
+        json!({"schema_version":1,"run_id":id,"task":"train","status":"running","started_at":"2026-10-09T00:00:00Z"}),
+      ),
+      ("outputs/params.json", json!({"rate":rate})),
+    ] {
+      let bytes = value.to_string().into_bytes();
+      fixture
+        .store
+        .execute(Request::PutDocument {
+          scope: Fixture::scope(id),
+          path: path.into(),
+          revision: 1,
+          offset: 0,
+          total_size: bytes.len() as u64,
+          data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+        .unwrap();
+    }
+    let bytes = format!("{}\n", json!({"step":0,"metrics":{"loss":loss}})).into_bytes();
+    fixture
+      .store
+      .execute(Request::AppendTracking {
+        scope: Fixture::scope(id),
+        path: "outputs/metrics.jsonl".into(),
+        offset: 0,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+      })
+      .unwrap();
+  }
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  dashboard.columns("hosted:project:worker").unwrap();
+  let options = table::TableOptions::parse(
+    vec!["/rate".into()],
+    vec!["loss".into()],
+    "min",
+    Some("metric:loss"),
+    Some("asc"),
+  )
+  .unwrap();
+  let query = ListQuery {
+    search: None,
+    task: None,
+    status: None,
+    limit: 1,
+    offset: 0,
+    table: Some(&options),
+  };
+  assert_eq!(
+    dashboard
+      .list_table("hosted:project:worker", &query)
+      .unwrap()["runs"][0]["run_id"],
+    "run-a"
+  );
+  let FileRecord { size, .. } = fixture
+    .store
+    .dashboard_artifact(&Fixture::scope("run-b"), "outputs/metrics.jsonl")
+    .unwrap()
+    .unwrap();
+  let bytes = format!(
+    "{}\n",
+    json!({"step":1,"metrics":{"loss":1,"new_metric":0.2}})
+  )
+  .into_bytes();
+  fixture
+    .store
+    .execute(Request::AppendTracking {
+      scope: Fixture::scope("run-b"),
+      path: "outputs/metrics.jsonl".into(),
+      offset: size,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+    .unwrap();
+  let page = dashboard
+    .list_table("hosted:project:worker", &query)
+    .unwrap();
+  assert_eq!(page["runs"][0]["run_id"], "run-b");
+  assert_eq!(page["runs"][0]["table_values"]["metrics"]["loss"], 1.0);
+  let columns = dashboard.columns("hosted:project:worker").unwrap();
+  assert!(
+    columns["available_columns"]["metrics"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|column| column["key"] == "new_metric")
+  );
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  assert_eq!(
+    rusqlite::Connection::open(fixture._directory.path().join("metadata.sqlite3"))
+      .unwrap()
+      .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+      .unwrap(),
+    2
+  );
+}
+
 #[derive(Clone)]
 struct Object {
   bytes: Arc<Vec<u8>>,
