@@ -9,6 +9,15 @@ use crate::context::CommandContext;
 const AUTHORITY: &str = "127.0.0.1:8765";
 
 #[test]
+fn local_project_probe_returns_capability_fallback_and_rejects_machine_filters() {
+  let fixture = Fixture::new();
+  assert_error(fixture.get("/api/projects"), 404);
+  assert_error(fixture.get("/api/projects?source=local"), 400);
+  assert_error(fixture.get("/api/runs?source=local&origin=worker"), 400);
+  assert_error(fixture.get("/api/runs?source=local&origin=a&origin=b"), 400);
+}
+
+#[test]
 fn run_table_routes_discover_keys_validate_selection_and_sort_before_paging() {
   let fixture = Fixture::new();
   let columns = fixture.get("/api/run-columns?source=local");

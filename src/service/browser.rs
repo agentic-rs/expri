@@ -685,6 +685,7 @@ mod tests {
     let cookie = issued.split(';').next().unwrap();
     for path in [
       "/api/catalog",
+      "/api/projects",
       "/api/updates?source=hosted:project:worker&run_id=run-1",
       "/api/runs",
       "/api/run?run_id=run-1",

@@ -9,6 +9,10 @@ import {
 } from "./auto_refresh";
 import {
   apiUrl,
+  artifactScopeMatchesRun,
+  projectRunKey,
+  runIdentity,
+  runKeyLabel,
   errorText,
   parseRunDeepLink,
   RequestError,
@@ -104,6 +108,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const artifact_revisions = new Map<string, string>();
   let comparison_revision: { context: string; revision: string } | null = null;
   let last_catalog: Catalog | null = null;
+  let legacy_catalog: Catalog | null = null;
+  let project_catalog_status: "unknown" | "supported" | "unsupported" = "unknown";
   let last_run_list: RunList | null = null;
   let last_run_list_context = "";
   let list_ready = false;
@@ -154,6 +160,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     search: "",
     task: "",
     status: "",
+    origin: "",
+    project_catalog_note: null,
     refreshing: true,
     controls_disabled: true,
     auto_enabled: true,
@@ -194,11 +202,14 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     run_columns_warnings: [],
   };
   function snapshot(): DashboardSnapshot {
+    const source = currentSource();
     return {
       ...ui,
+      project_name: source?.kind === "hosted_project" ? source.project_id ?? ui.project_name : ui.project_name,
       sources,
       source_id,
       access_mode,
+      project_catalog_enabled: project_catalog_status === "supported",
       runs,
       selected: [...selected],
       review: review
@@ -248,7 +259,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       discardDeepLink();
       ui[field] = value;
       resetFilters();
-      if (field === "status") void loadRuns();
+      if (field === "status" || field === "origin") void loadRuns();
       else
         search_timeout = setTimeout(() => {
           search_timeout = undefined;
@@ -260,6 +271,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       ui.search = "";
       ui.task = "";
       ui.status = "";
+      ui.origin = "";
       clearSearchTimeout();
       filtersChanged();
     },
@@ -268,6 +280,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       cancelRefresh();
       clearSearchTimeout();
       source_id = value;
+      ui.origin = "";
+      if (run_sort.key === "origin" && currentSource()?.kind !== "hosted_project")
+        run_sort = { key: "started_at", direction: "desc" };
       resetRunColumns();
       runs = [];
       offset = 0;
@@ -395,7 +410,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       log_lane.cancel();
       review.log_stream = value;
       log_view = {
-        run_id: rendered_detail.run.run_id,
+        run_id: runIdentity(rendered_detail.run),
         stream: value,
         loaded: false,
         pending: false,
@@ -463,12 +478,16 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         : null,
     );
   }
+  function currentSource(): Source | undefined {
+    return sources.find((source) => source.source_id === source_id);
+  }
   function listUrl(): string {
     return apiUrl("/api/runs", {
       source: source_id,
       search: ui.search.trim(),
       task: ui.task.trim(),
       status: ui.status,
+      origin: currentSource()?.kind === "hosted_project" ? ui.origin : null,
       limit: page_size,
       offset,
       param: ui.run_columns_supported
@@ -546,7 +565,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     void loadRuns();
   }
   async function sortRuns(key: string): Promise<void> {
-    if (!["run_id", "status", ...run_columns.map(runColumnSortKey)].includes(key)) return;
+    const builtins = currentSource()?.kind === "hosted_project"
+      ? ["run_id", "status", "origin"]
+      : ["run_id", "status"];
+    if (![...builtins, ...run_columns.map(runColumnSortKey)].includes(key)) return;
     const source = source_id;
     if (!(await loadRunColumns()) || source_id !== source) return;
     run_sort = {
@@ -634,7 +656,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       list_empty: null,
       list_busy: false,
     });
-    if (!runs.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status), result.source);
+    if (!runs.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status || ui.origin), result.source);
     announce(`${result.total_count} matching runs`);
   }
   async function loadRuns(): Promise<boolean> {
@@ -939,9 +961,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       review.metric_selection_set = true;
     }
     publish();
-    if (preserve && log_view?.run_id === detail.run.run_id) return true;
+    if (preserve && log_view?.run_id === runIdentity(detail.run)) return true;
     log_view = {
-      run_id: detail.run.run_id,
+      run_id: runIdentity(detail.run),
       stream: review?.log_stream ?? "stdout",
       loaded: false,
       pending: false,
@@ -967,7 +989,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     await loadRun(id);
   }
   function cacheDetail(detail: Detail): void {
-    const id = detail.run.run_id;
+    const id = runIdentity(detail.run);
     detail_cache.delete(id);
     detail_cache.set(id, detail);
     while (detail_cache.size > 9) {
@@ -978,11 +1000,14 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   function deepLinkSource(): Source | undefined {
     const link = pending_deep_link;
-    return link
-      ? sources.find(
-          (source) => source.project_id === link.project_id && source.origin === link.origin,
-        )
-      : undefined;
+    if (!link) return undefined;
+    return sources.find((source) => source.kind === "hosted_project" && source.project_id === link.project_id) ??
+      sources.find((source) => source.project_id === link.project_id && source.origin === link.origin);
+  }
+  function deepLinkIdentity(): string | null {
+    const link = pending_deep_link;
+    if (!link) return null;
+    return deepLinkSource()?.kind === "hosted_project" ? projectRunKey(link.origin, link.run_id) : link.run_id;
   }
   function discardDeepLink(): void {
     if (!pending_deep_link) return;
@@ -995,19 +1020,22 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       source = deepLinkSource();
     if (!link || !source || source.source_id !== source_id) return false;
     deep_link_attempted_source = source.source_id;
+    const identity = source.kind === "hosted_project" ? projectRunKey(link.origin, link.run_id) : link.run_id;
     try {
       const detail = await deep_link_lane.run<Detail>(
-        apiUrl("/api/run", { source: source.source_id, run_id: link.run_id }),
+        apiUrl("/api/run", { source: source.source_id, run_id: identity }),
       );
       if (!detail || disposed || pending_deep_link !== link || source_id !== source.source_id)
         return false;
+      if (runIdentity(detail.run) !== identity || detail.source.source_id !== source.source_id)
+        throw new Error("The run details do not match the selected run.");
       pending_deep_link = null;
       sourceNote();
-      beginReview("run", [link.run_id]);
+      beginReview("run", [identity]);
       cacheDetail(detail);
       updateUi({ review_loading: false, review_warnings: detail.warnings });
       renderDetail(detail);
-      announce(`Opened ${link.run_id}`);
+      announce(`Opened ${runKeyLabel(identity)}`);
       return true;
     } catch (error) {
       if (error instanceof RequestError && error.status === 404) return false;
@@ -1020,11 +1048,13 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         apiUrl("/api/run", { source: source_id, run_id: id }),
       );
       if (!detail) return false;
+      if (runIdentity(detail.run) !== id || detail.source.source_id !== source_id)
+        throw new Error("The run details do not match the selected run.");
       cacheDetail(detail);
       updateUi({ review_loading: false });
       updateUi({ review_warnings: detail.warnings });
       if (!renderDetail(detail, preserve)) return false;
-      if (!preserve) announce(`Opened ${id}`);
+      if (!preserve) announce(`Opened ${runKeyLabel(id)}`);
       return true;
     } catch (error) {
       updateUi({ review_loading: false });
@@ -1075,7 +1105,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     void loadComparison();
   }
   function sourceNote(): void {
-    const source = sources.find((item) => item.source_id === source_id);
+    const source = currentSource();
+    document.title = `expri · ${source?.kind === "hosted_project" ? source.project_id ?? ui.project_name : ui.project_name}`;
     updateUi({
       source_note: pending_deep_link
         ? `Waiting for ${pending_deep_link.run_id} from ${pending_deep_link.project_id} / ${pending_deep_link.origin} to be published. Choose another source or run to stop waiting.`
@@ -1083,10 +1114,44 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           ? null
           : source.kind === "service"
             ? "Synced results · Updates arrive when workers sync their recorded files."
-            : source.kind === "cached"
-              ? "Cached remote results · Pull updated results with expri runs pull; this dashboard watches the local cache."
-              : "Local results · Status and updates come from recorded run files.",
+            : source.kind === "hosted_project"
+              ? "Project results across recorded machines · Updates arrive when workers sync their recorded files."
+              : source.kind === "cached"
+                ? "Cached remote results · Pull updated results with expri runs pull; this dashboard watches the local cache."
+                : "Local results · Status and updates come from recorded run files.",
     });
+  }
+  async function projectCatalog(lane: RequestLane): Promise<Catalog | null | undefined> {
+    try {
+      const projects = await lane.run<Catalog>("/api/projects");
+      if (!projects) return undefined;
+      project_catalog_status = "supported";
+      updateUi({ project_catalog_note: null });
+      return projects;
+    } catch (error) {
+      if (!(error instanceof RequestError) || error.status !== 404) throw error;
+      project_catalog_status = "unsupported";
+      updateUi({
+        project_catalog_note:
+          "Upgrade the expri server to browse projects across machines. Refresh retries after an upgrade.",
+      });
+      return null;
+    }
+  }
+  async function loadCatalog(lane: RequestLane, retry_projects = false): Promise<Catalog | undefined> {
+    if (
+      project_catalog_status === "supported" ||
+      (retry_projects && legacy_catalog?.access_mode === "hosted")
+    ) {
+      const projects = await projectCatalog(lane);
+      if (projects !== null) return projects;
+    }
+    const catalog = await lane.run<Catalog>("/api/catalog");
+    if (!catalog) return undefined;
+    legacy_catalog = catalog;
+    if (catalog.access_mode !== "hosted" || project_catalog_status === "unsupported") return catalog;
+    const projects = await projectCatalog(lane);
+    return projects === null ? catalog : projects;
   }
   function applyCatalog(catalog: Catalog, quiet = false): void {
     last_catalog_snapshot = now();
@@ -1109,13 +1174,15 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (source_id !== previous_source) {
       resetRunColumns();
       offset = 0;
+      ui.origin = "";
+      if (run_sort.key === "origin" && currentSource()?.kind !== "hosted_project")
+        run_sort = { key: "started_at", direction: "desc" };
       runs = [];
       selected.clear();
       detail_cache.clear();
       hideReview();
       syncSelection();
     }
-    document.title = `expri · ${catalog.project_name}`;
     updateUi({
       controls_disabled: !sources.length,
       project_name: catalog.project_name,
@@ -1259,7 +1326,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     try {
       const result = await lane.run<ArtifactCatalog>(url);
       if (!result || !current()) return false;
-      if (result.source.source_id !== source || result.run_id !== current_review.run_ids[0])
+      if (result.source.source_id !== source || runIdentity(result) !== current_review.run_ids[0] ||
+        (source.startsWith("hosted-project:") && !artifactScopeMatchesRun(result.pull_scope, source, current_review.run_ids[0] ?? "")))
         throw new Error("The file inventory does not match the selected run.");
       applyArtifacts(result);
       return true;
@@ -1288,7 +1356,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({ refreshing: true, global_error: null });
     let successful = false;
     try {
-      const catalog = await catalog_lane.run<Catalog>("/api/catalog");
+      const catalog = await loadCatalog(catalog_lane, true);
       if (!catalog || generation !== refresh_generation) return;
       applyCatalog(catalog);
       if (!source_id) {
@@ -1360,7 +1428,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
               run_id:
                 review?.run_ids ??
                 (deepLinkSource()?.source_id === source_id && pending_deep_link
-                  ? [pending_deep_link.run_id]
+                  ? [deepLinkIdentity()!]
                   : []),
             }),
           );
@@ -1381,7 +1449,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         catalog_changed ||
         (updates?.catalog_revision === null && now() - last_catalog_snapshot >= 30_000)
       ) {
-        const catalog = await quiet_lanes.catalog.run<Catalog>("/api/catalog");
+        const catalog = await loadCatalog(quiet_lanes.catalog);
         if (!catalog || !current()) return "cancelled";
         applyCatalog(catalog, true);
         if (updates?.catalog_revision !== null && updates?.catalog_revision !== undefined) {
@@ -1418,7 +1486,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (pending_deep_link && linked_source?.source_id === source_id) {
         const revision = source_changed
           ? undefined
-          : updates?.runs.find((item) => item.run_id === pending_deep_link?.run_id);
+          : updates?.runs.find((item) => item.run_id === deepLinkIdentity());
         if (
           deep_link_attempted_source !== source_id ||
           !updates_supported ||

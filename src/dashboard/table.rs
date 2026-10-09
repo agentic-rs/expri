@@ -14,6 +14,7 @@ const DISCOVERY_LIMIT: usize = 100;
 const STRING_LIMIT: usize = 256;
 
 pub(crate) struct ListQuery<'a> {
+  pub origin: Option<&'a str>,
   pub search: Option<&'a str>,
   pub task: Option<&'a str>,
   pub status: Option<&'a str>,
@@ -61,7 +62,7 @@ impl TableOptions {
       _ => return Err(message("reduction must be last, min, or max")),
     };
     let sort = sort.unwrap_or("started_at");
-    if !matches!(sort, "started_at" | "run_id" | "status")
+    if !matches!(sort, "started_at" | "run_id" | "status" | "origin")
       && !sort
         .strip_prefix("param:")
         .is_some_and(|key| params.iter().any(|selected| selected == key))
@@ -70,7 +71,7 @@ impl TableOptions {
         .is_some_and(|key| metrics.iter().any(|selected| selected == key))
     {
       return Err(message(
-        "sort must be started_at, run_id, status, or a selected table column",
+        "sort must be started_at, run_id, status, origin, or a selected table column",
       ));
     }
     let descending = match direction.unwrap_or("desc") {
@@ -125,11 +126,17 @@ impl TableOptions {
           |left, right| compare_scalar(left, right),
         )
       };
-      order.then_with(|| {
-        left.run["run_id"]
-          .as_str()
-          .cmp(&right.run["run_id"].as_str())
-      })
+      order
+        .then_with(|| {
+          left.run["run_id"]
+            .as_str()
+            .cmp(&right.run["run_id"].as_str())
+        })
+        .then_with(|| {
+          left.run["origin"]
+            .as_str()
+            .cmp(&right.run["origin"].as_str())
+        })
     });
   }
 

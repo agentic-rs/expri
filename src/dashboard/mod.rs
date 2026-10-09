@@ -66,6 +66,9 @@ pub struct Dashboard {
 /// Shared dashboard views keep local and hosted routes on the same API contract.
 pub(crate) trait DashboardView {
   fn catalog(&self) -> Result<Value>;
+  fn projects(&self) -> Result<Option<Value>> {
+    Ok(None)
+  }
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value>;
   fn list_table(&self, source: &str, query: &table::ListQuery<'_>) -> Result<Value>;
   fn columns(&self, source: &str) -> Result<Value>;
@@ -318,6 +321,7 @@ impl Dashboard {
     self.list_table(
       source_id,
       &table::ListQuery {
+        origin: None,
         search,
         task,
         status,
@@ -330,6 +334,7 @@ impl Dashboard {
 
   pub(crate) fn list_table(&self, source_id: &str, query: &table::ListQuery<'_>) -> Result<Value> {
     let table::ListQuery {
+      origin,
       search,
       task,
       status,
@@ -337,6 +342,9 @@ impl Dashboard {
       offset,
       table,
     } = *query;
+    if origin.is_some() {
+      return Err(message("machine filters are available for hosted projects"));
+    }
     if !(1..=1000).contains(&limit) {
       return Err(message("limit must be between 1 and 1000"));
     }

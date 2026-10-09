@@ -240,6 +240,7 @@ impl<S: ObjectStorage> Store<S> {
 
   /// A source may exceed the sync CLI's original 500-run convenience listing.
   /// Dashboard readers select a bounded, deterministic page directly in SQLite.
+  #[cfg(test)]
   pub fn dashboard_runs(
     &self,
     project_id: &str,
@@ -247,11 +248,25 @@ impl<S: ObjectStorage> Store<S> {
     limit: usize,
     offset: usize,
   ) -> ApiResult<DashboardPage<RunScope>> {
+    self.dashboard_project_runs(project_id, Some(origin), limit, offset)
+  }
+
+  /// Select one project window across all published origins, without per-machine
+  /// fanout. An explicit machine selects its own window before other filters.
+  pub(in crate::service) fn dashboard_project_runs(
+    &self,
+    project_id: &str,
+    origin: Option<&str>,
+    limit: usize,
+    offset: usize,
+  ) -> ApiResult<DashboardPage<RunScope>> {
     validate_component(project_id).map_err(bad)?;
-    validate_component(origin).map_err(bad)?;
+    if let Some(origin) = origin {
+      validate_component(origin).map_err(bad)?;
+    }
     dashboard_page_bounds(limit, offset)?;
     let db = self.db()?;
-    let selection = "SELECT DISTINCT json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2";
+    let selection = "SELECT DISTINCT json_extract(target,'$.scope.origin') AS origin,json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND (?2 IS NULL OR json_extract(target,'$.scope.origin')=?2)";
     let total_count = db
       .query_row(
         &format!("SELECT COUNT(*) FROM ({selection})"),
@@ -261,7 +276,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(database)?;
     let mut statement = db
       .prepare(&format!(
-        "SELECT discovered.run_id, COALESCE(activity.legacy_order,1) FROM ({selection}) AS discovered LEFT JOIN dashboard_run_activity AS activity ON activity.project_id=?1 AND activity.origin=?2 AND activity.run_id=discovered.run_id ORDER BY COALESCE(activity.sequence,0) DESC,discovered.run_id DESC LIMIT ?3 OFFSET ?4"
+        "SELECT discovered.origin,discovered.run_id, COALESCE(activity.legacy_order,1) FROM ({selection}) AS discovered LEFT JOIN dashboard_run_activity AS activity ON activity.project_id=?1 AND activity.origin=discovered.origin AND activity.run_id=discovered.run_id ORDER BY COALESCE(activity.sequence,0) DESC,discovered.run_id DESC,discovered.origin ASC LIMIT ?3 OFFSET ?4"
       ))
       .map_err(database)?;
     let rows = statement
@@ -269,10 +284,10 @@ impl<S: ObjectStorage> Store<S> {
         Ok((
           RunScope {
             project_id: project_id.into(),
-            origin: origin.into(),
-            run_id: row.get(0)?,
+            origin: row.get(0)?,
+            run_id: row.get(1)?,
           },
-          row.get::<_, bool>(1)?,
+          row.get::<_, bool>(2)?,
         ))
       })
       .map_err(database)?;
@@ -423,7 +438,7 @@ impl<S: ObjectStorage> Store<S> {
     source: Option<&DashboardSource>,
     run_ids: &[String],
   ) -> ApiResult<serde_json::Value> {
-    use crate::dashboard::updates::{self, RunUpdate};
+    use crate::dashboard::updates;
 
     updates::validate_selection(if source.is_some() { "selected" } else { "" }, run_ids)
       .map_err(bad)?;
@@ -434,6 +449,65 @@ impl<S: ObjectStorage> Store<S> {
     for run_id in run_ids {
       validate_component(run_id).map_err(bad)?;
     }
+    let runs: Vec<_> = source
+      .map(|source| {
+        run_ids
+          .iter()
+          .map(|run_id| {
+            (
+              run_id.clone(),
+              RunScope {
+                project_id: source.project_id.clone(),
+                origin: source.origin.clone(),
+                run_id: run_id.clone(),
+              },
+            )
+          })
+          .collect()
+      })
+      .unwrap_or_default();
+    self.dashboard_revision_updates(
+      source.map(|source| source.project_id.as_str()),
+      source.map(|source| source.origin.as_str()),
+      &runs,
+    )
+  }
+
+  pub(in crate::service) fn dashboard_project_updates(
+    &self,
+    project_id: &str,
+    runs: &[(String, RunScope)],
+  ) -> ApiResult<serde_json::Value> {
+    self.dashboard_revision_updates(Some(project_id), None, runs)
+  }
+
+  fn dashboard_revision_updates(
+    &self,
+    project_id: Option<&str>,
+    origin: Option<&str>,
+    selections: &[(String, RunScope)],
+  ) -> ApiResult<serde_json::Value> {
+    use crate::dashboard::updates::{self, RunUpdate};
+    let keys: Vec<_> = selections.iter().map(|(key, _)| key.clone()).collect();
+    updates::validate_selection(if project_id.is_some() { "selected" } else { "" }, &keys)
+      .map_err(bad)?;
+    if let Some(project_id) = project_id {
+      validate_component(project_id).map_err(bad)?;
+    }
+    if let Some(origin) = origin {
+      validate_component(origin).map_err(bad)?;
+    }
+    for (_, scope) in selections {
+      validate_scope(scope).map_err(bad)?;
+      if Some(scope.project_id.as_str()) != project_id
+        || origin.is_some_and(|origin| scope.origin != origin)
+      {
+        return Err(ApiError::new(
+          400,
+          "run selection is outside the dashboard source",
+        ));
+      }
+    }
     let db = self.db()?;
     let catalog_revision = db
       .query_row(
@@ -443,59 +517,52 @@ impl<S: ObjectStorage> Store<S> {
       )
       .map_err(database)?
       .to_string();
-    let source_revision = source
-      .map(|source| {
+    let source_revision = project_id
+      .map(|project_id| {
         db.query_row(
-          "SELECT COALESCE(MAX(sequence),0) FROM dashboard_run_activity WHERE project_id=?1 AND origin=?2",
-          params![source.project_id, source.origin],
+          "SELECT COALESCE(MAX(sequence),0) FROM dashboard_run_activity WHERE project_id=?1 AND (?2 IS NULL OR origin=?2)",
+          params![project_id, origin],
           |row| row.get::<_, i64>(0),
         )
         .map(|sequence| sequence.to_string())
         .map_err(database)
       })
       .transpose()?;
-    let mut runs = Vec::with_capacity(run_ids.len());
-    if let Some(source) = source {
-      for run_id in run_ids {
-        let scope = RunScope {
-          project_id: source.project_id.clone(),
-          origin: source.origin.clone(),
-          run_id: run_id.clone(),
-        };
-        let exists: bool = db
+    let mut runs = Vec::with_capacity(selections.len());
+    for (run_id, scope) in selections {
+      let exists: bool = db
           .query_row(
             "SELECT EXISTS(SELECT 1 FROM files WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3 UNION ALL SELECT 1 FROM streams WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3)",
             params![scope.project_id, scope.origin, scope.run_id],
             |row| row.get(0),
           )
           .map_err(database)?;
-        if !exists {
-          runs.push(RunUpdate::missing(run_id));
-          continue;
-        }
-        let mut metadata_revision = updates::METADATA_PATHS
-          .iter()
-          .map(|path| dashboard_artifact_revision(&db, &scope, path))
-          .collect::<ApiResult<Vec<_>>>()?;
-        let archive: Option<(i64, String)> = db
-          .query_row(
-            "SELECT id,status FROM result_archives WHERE scope=?1 ORDER BY id DESC LIMIT 1",
-            [serde_json::to_string(&scope)
-              .map_err(|_| ApiError::new(500, "cannot encode archive scope"))?],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-          )
-          .optional()
-          .map_err(database)?;
-        metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
-        runs.push(RunUpdate {
-          run_id: run_id.clone(),
-          metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
-          metrics_revision: dashboard_artifact_revision(&db, &scope, "outputs/metrics.jsonl")?,
-          stdout_revision: dashboard_artifact_revision(&db, &scope, "logs/stdout.log")?,
-          stderr_revision: dashboard_artifact_revision(&db, &scope, "logs/stderr.log")?,
-          missing: false,
-        });
+      if !exists {
+        runs.push(RunUpdate::missing(run_id));
+        continue;
       }
+      let mut metadata_revision = updates::METADATA_PATHS
+        .iter()
+        .map(|path| dashboard_artifact_revision(&db, scope, path))
+        .collect::<ApiResult<Vec<_>>>()?;
+      let archive: Option<(i64, String)> = db
+        .query_row(
+          "SELECT id,status FROM result_archives WHERE scope=?1 ORDER BY id DESC LIMIT 1",
+          [serde_json::to_string(&scope)
+            .map_err(|_| ApiError::new(500, "cannot encode archive scope"))?],
+          |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(database)?;
+      metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
+      runs.push(RunUpdate {
+        run_id: run_id.clone(),
+        metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
+        metrics_revision: dashboard_artifact_revision(&db, scope, "outputs/metrics.jsonl")?,
+        stdout_revision: dashboard_artifact_revision(&db, scope, "logs/stdout.log")?,
+        stderr_revision: dashboard_artifact_revision(&db, scope, "logs/stderr.log")?,
+        missing: false,
+      });
     }
     updates::response(Some(catalog_revision), source_revision, runs).map_err(bad)
   }
@@ -1890,6 +1957,88 @@ pub(super) mod tests {
         .unwrap(),
       Response::File { file } if file.size == 4 && matches!(file.storage, FileStorage::Object)
     ));
+  }
+
+  #[test]
+  fn dashboard_project_windows_aggregate_before_paging_and_machine_filters_choose_their_own_window()
+  {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let mut db = store.db().unwrap();
+    let tx = db.transaction().unwrap();
+    for index in 0..650 {
+      let scope = RunScope {
+        project_id: "project".into(),
+        origin: if index % 2 == 0 {
+          "worker-a"
+        } else {
+          "worker-b"
+        }
+        .into(),
+        run_id: format!("run-{:04}", index / 2),
+      };
+      let target = FileTarget::Run {
+        scope: scope.clone(),
+        path: "logs/stdout.log".into(),
+      };
+      tx.execute(
+        "INSERT INTO streams(target,size) VALUES(?1,0)",
+        [target_json(&target).unwrap()],
+      )
+      .unwrap();
+      tx.execute("INSERT INTO dashboard_run_activity(project_id,origin,run_id,legacy_order) VALUES(?1,?2,?3,0)",params![scope.project_id,scope.origin,scope.run_id]).unwrap();
+    }
+    let outside = FileTarget::Run {
+      scope: RunScope {
+        project_id: "other".into(),
+        origin: "worker-a".into(),
+        run_id: "run-0324".into(),
+      },
+      path: "logs/stdout.log".into(),
+    };
+    tx.execute(
+      "INSERT INTO streams(target,size) VALUES(?1,0)",
+      [target_json(&outside).unwrap()],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(db);
+    let project = store
+      .dashboard_project_runs("project", None, 500, 0)
+      .unwrap();
+    assert_eq!(project.total_count, 650);
+    assert_eq!(project.items.len(), 500);
+    assert_eq!(project.items[0].origin, "worker-b");
+    assert_eq!(project.items[0].run_id, "run-0324");
+    assert_eq!(project.items.last().unwrap().run_id, "run-0075");
+    assert!(!project.legacy_order);
+    let machine = store
+      .dashboard_project_runs("project", Some("worker-a"), 500, 0)
+      .unwrap();
+    assert_eq!(machine.total_count, 325);
+    assert_eq!(machine.items.last().unwrap().run_id, "run-0000");
+    assert!(
+      machine
+        .items
+        .iter()
+        .all(|scope| scope.origin == "worker-a" && scope.project_id == "project")
+    );
+    let older = store
+      .dashboard_project_runs("project", None, 500, 500)
+      .unwrap();
+    assert_eq!(older.items.len(), 150);
+    let outside = RunScope {
+      project_id: "other".into(),
+      origin: "worker-a".into(),
+      run_id: "run-0324".into(),
+    };
+    assert_eq!(
+      store
+        .dashboard_project_updates("project", &[("worker-a:run-0324".into(), outside)])
+        .unwrap_err()
+        .status,
+      400
+    );
   }
 
   #[test]

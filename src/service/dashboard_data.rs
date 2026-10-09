@@ -1,13 +1,15 @@
 mod reader;
+mod source;
 mod table_data;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
-use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use source::{Source, parse_source, source_record};
 
 use super::storage::ObjectStorage;
 use super::store::{ApiError, ApiResult, Store};
@@ -27,16 +29,6 @@ const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Serialize)]
-struct Source {
-  source_id: String,
-  label: String,
-  kind: &'static str,
-  target_name: Option<String>,
-  project_id: String,
-  origin: String,
-}
-
 struct MetricReadMode {
   minimum: usize,
   retain_points: bool,
@@ -53,6 +45,9 @@ pub(super) struct HostedDashboard<'a, S> {
 impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S> {
   fn catalog(&self) -> Result<Value> {
     HostedDashboard::catalog(self)
+  }
+  fn projects(&self) -> Result<Option<Value>> {
+    HostedDashboard::projects(self).map(Some)
   }
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
     HostedDashboard::updates(self, source, run_ids)
@@ -139,9 +134,19 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       None
     } else {
       let parsed = parse_source(source_id)?;
+      if parsed.origin.is_none() {
+        let selections = run_ids
+          .iter()
+          .map(|key| parsed.resolve(key).map(|scope| (key.clone(), scope)))
+          .collect::<Result<Vec<_>>>()?;
+        return self
+          .store
+          .dashboard_project_updates(&parsed.project_id, &selections)
+          .map_err(api_error);
+      }
       Some(super::store::DashboardSource {
         project_id: parsed.project_id,
-        origin: parsed.origin,
+        origin: parsed.origin.unwrap(),
       })
     };
     self
@@ -163,6 +168,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     self.list_table(
       source_id,
       &ListQuery {
+        origin: None,
         search,
         task,
         status,
@@ -175,6 +181,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
 
   pub(super) fn list_table(&self, source_id: &str, query: &ListQuery<'_>) -> Result<Value> {
     let ListQuery {
+      origin,
       search,
       task,
       status,
@@ -207,9 +214,24 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       return Err(message("invalid run status"));
     }
     let source = parse_source(source_id)?;
+    if let Some(origin) = origin {
+      validate_component(origin)?;
+      if source
+        .origin
+        .as_deref()
+        .is_some_and(|selected| selected != origin)
+      {
+        return Err(message("machine filter is outside the dashboard source"));
+      }
+    }
     let page = self
       .store
-      .dashboard_runs(&source.project_id, &source.origin, OVERVIEW_LIMIT, 0)
+      .dashboard_project_runs(
+        &source.project_id,
+        origin.or(source.origin.as_deref()),
+        OVERVIEW_LIMIT,
+        0,
+      )
       .map_err(api_error)?;
     if page.total_count == 0 {
       return Err(message(format!("unknown source: {source_id}")));
@@ -236,7 +258,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           }
         }).collect::<Vec<_>>()
       });
-      reports.extend(next);
+      for (mut report, scope) in next.into_iter().zip(group) {
+        source.decorate_run(&mut report["run"], scope);
+        if let Some(warnings) = report["warnings"].as_array_mut() {
+          source.decorate_warnings(warnings, scope);
+        }
+        reports.push(report);
+      }
     }
     let search = search.unwrap_or_default().to_lowercase();
     let overview_truncated = reports
@@ -252,7 +280,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         continue;
       }
       if !search.is_empty()
-        && !["run_id", "status"].iter().any(|field| {
+        && !["run_id", "status", "origin"].iter().any(|field| {
           run[field]
             .as_str()
             .unwrap_or_default()
@@ -276,11 +304,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           let handles: Vec<_> = group
             .iter()
             .map(|run| {
-              let scope = RunScope {
-                project_id: source.project_id.clone(),
-                origin: source.origin.clone(),
-                run_id: run["run_id"].as_str().unwrap().into(),
-              };
+              let scope = source
+                .resolve(&source.reference(run))
+                .expect("validated run scope");
               threads.spawn(move || {
                 let (data, warnings) = self.table_data(
                   &scope,
@@ -301,7 +327,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
             )))
             .collect::<Vec<_>>()
         });
-        for (row, next_warnings) in next {
+        for (row, mut next_warnings) in next {
+          let scope = source.resolve(&source.reference(&row.run))?;
+          source.decorate_warnings(&mut next_warnings, &scope);
           table_rows.push(row);
           warnings.extend(next_warnings);
         }
@@ -316,6 +344,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         started_at(right)
           .cmp(&started_at(left))
           .then_with(|| right["run_id"].as_str().cmp(&left["run_id"].as_str()))
+          .then_with(|| left["origin"].as_str().cmp(&right["origin"].as_str()))
       });
     }
     let total_count = rows.len();
@@ -336,7 +365,12 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let source = parse_source(source_id)?;
     let page = self
       .store
-      .dashboard_runs(&source.project_id, &source.origin, OVERVIEW_LIMIT, 0)
+      .dashboard_project_runs(
+        &source.project_id,
+        source.origin.as_deref(),
+        OVERVIEW_LIMIT,
+        0,
+      )
       .map_err(api_error)?;
     if page.total_count == 0 {
       return Err(message(format!("unknown source: {source_id}")));
@@ -359,7 +393,8 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           )))
           .collect::<Vec<_>>()
       });
-      for (data, next_warnings) in results {
+      for ((data, mut next_warnings), scope) in results.into_iter().zip(group) {
+        source.decorate_warnings(&mut next_warnings, scope);
         columns.add(&data);
         columns.truncated |= next_warnings.iter().any(|warning| {
           warning["message"]
@@ -384,7 +419,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let state = self.json_artifact(&scope, "run-state.json", STATE_LIMIT, deadline);
     let mut warnings = Vec::new();
     let state = optional_record(state, &scope, "run-state.json", &mut warnings);
-    let mut record = crate::runs::summary_from_state(run_id, state);
+    let mut record = crate::runs::summary_from_state(&scope.run_id, state);
     warnings.extend(record["warnings"].as_array().cloned().unwrap_or_default());
     for (field, path) in [
       ("snapshot", "snapshot.json"),
@@ -425,7 +460,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut metadata_truncated = false;
     let metadata = run_metadata(&record, &mut metadata_truncated);
-    let run = preview(&record["run"], &mut metadata_truncated);
+    let mut run = preview(&record["run"], &mut metadata_truncated);
+    source.decorate_run(&mut run, &scope);
+    source.decorate_warnings(&mut warnings, &scope);
     if metadata_truncated || params_truncated {
       warnings.push(json!({"message": "Hosted previews are limited; download the original run records for complete metadata and parameters."}));
     }
@@ -590,12 +627,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
 
   fn scope(&self, source_id: &str, run_id: &str) -> Result<(Source, RunScope)> {
     let source = parse_source(source_id)?;
-    validate_component(run_id)?;
-    let scope = RunScope {
-      project_id: source.project_id.clone(),
-      origin: source.origin.clone(),
-      run_id: run_id.into(),
-    };
+    let scope = source.resolve(run_id)?;
     if !self.store.dashboard_run_exists(&scope).map_err(api_error)? {
       return Err(message(format!("run is missing: {run_id}")));
     }
@@ -656,10 +688,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if truncated {
       warnings.push(json!({"message": "Artifact listing is limited to 200 files and bounded metadata; some files are omitted."}));
     }
-    Ok(
-      json!({"source": source, "run_id": run_id, "files": files, "truncated": truncated,
-      "warnings": bounded_warnings(&warnings), "pull_scope": scope, "inventory_recorded_at": recorded_at}),
-    )
+    source.decorate_warnings(&mut warnings, &scope);
+    let mut result = json!({"source": source, "run_id": scope.run_id, "files": files, "truncated": truncated,
+      "warnings": bounded_warnings(&warnings), "pull_scope": scope, "inventory_recorded_at": recorded_at});
+    if source.origin.is_none() {
+      result["run_key"] = json!(run_id);
+    }
+    Ok(result)
   }
 
   fn artifact_download(
@@ -836,7 +871,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     run_ids
       .iter()
       .map(|run_id| {
-        let (_, scope) = self.scope(source_id, run_id)?;
+        let (source, scope) = self.scope(source_id, run_id)?;
         let overview = self.overview(&scope, deadline).map_err(api_error)?;
         let mut result = metric_record(&scope, overview["run"].clone(), None);
         result.warnings = overview["warnings"].as_array().cloned().unwrap_or_default();
@@ -849,20 +884,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           }
         }
         self.metric_data(&scope, &mut result, filters, mode.retain_points, deadline)?;
+        if source.origin.is_none() {
+          result.run_id = run_id.clone();
+          source.decorate_run(&mut result.run, &scope);
+          source.decorate_warnings(&mut result.warnings, &scope);
+        }
         Ok(result)
       })
       .collect()
-  }
-}
-
-fn source_record(project_id: &str, origin: &str) -> Source {
-  Source {
-    source_id: format!("hosted:{project_id}:{origin}"),
-    label: format!("{project_id} / {origin}"),
-    kind: "service",
-    target_name: None,
-    project_id: project_id.into(),
-    origin: origin.into(),
   }
 }
 
@@ -870,22 +899,6 @@ fn started_at(run: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
   run["started_at"]
     .as_str()
     .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-}
-
-fn parse_source(source_id: &str) -> Result<Source> {
-  let mut parts = source_id.split(':');
-  if parts.next() != Some("hosted") {
-    return Err(message(format!("unknown source: {source_id}")));
-  }
-  let project_id = parts.next().unwrap_or_default();
-  let origin = parts.next().unwrap_or_default();
-  if parts.next().is_some()
-    || validate_component(project_id).is_err()
-    || validate_component(origin).is_err()
-  {
-    return Err(message(format!("unknown source: {source_id}")));
-  }
-  Ok(source_record(project_id, origin))
 }
 
 fn metric_record(scope: &RunScope, run: Value, params: Option<Value>) -> RunMetrics {

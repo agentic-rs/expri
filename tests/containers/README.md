@@ -115,6 +115,19 @@ The isolated Firefox driver removes its desktop window's 500px minimum before
 the mobile checks and asserts the resulting page viewport. It changes no page
 markup, authentication rules, iframe sandbox, or content security policy.
 
+The project workflow publishes an active run from a second recorded origin using
+a distinct worker token, preserving the first origin's actual run ID. It checks
+default All machines, native filtering, distinct selection and chart samples,
+Machine sorting, retained columns and chart exploration, live metric/log updates
+from both origins, and correctly scoped browser downloads and CLI commands.
+The additional publisher uses the existing host image and small attachments;
+it does not repeat the experiment or large checkpoint fault scenarios.
+`workspace-project-desktop.png` and `workspace-project-320.png` /
+`workspace-project-360.png` capture the project table. The original browser suite
+also verifies fallback to worker sources when an authenticated project-catalog
+request returns 404. Only a fixture-controlled file enables that proxy behavior;
+authentication failures and other endpoints retain their upstream responses.
+
 The Files check opens the fourth tab with native keyboard input, selects an
 uploaded checkpoint, generates a scoped CLI command, and downloads the actual
 17 MiB attachment through Firefox. It verifies its SHA256 and saves

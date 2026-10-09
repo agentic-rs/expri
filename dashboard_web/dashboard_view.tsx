@@ -19,6 +19,9 @@ import {
   formatNumber,
   formatValue,
   jsonObject,
+  runIdentity,
+  runKeyLabel,
+  runLabel,
   localTimeZoneLabel,
   type ArtifactCatalog,
   type Comparison,
@@ -40,6 +43,8 @@ export type DashboardUi = {
   search: string;
   task: string;
   status: string;
+  origin: string;
+  project_catalog_note: string | null;
   refreshing: boolean;
   controls_disabled: boolean;
   auto_enabled: boolean;
@@ -79,6 +84,7 @@ export type DashboardSnapshot = DashboardUi & {
   sources: Source[];
   source_id: string;
   access_mode: "local" | "hosted";
+  project_catalog_enabled: boolean;
   runs: Run[];
   run_columns: RunColumn[];
   available_run_columns: RunColumn[];
@@ -97,7 +103,7 @@ export type DashboardSnapshot = DashboardUi & {
   reduction: ComparisonReduction;
 };
 export type DashboardActions = {
-  filter: (field: "search" | "task" | "status", value: string) => void;
+  filter: (field: "search" | "task" | "status" | "origin", value: string) => void;
   clear_filters: () => void;
   run_column: (column: RunColumn, checked: boolean) => void;
   run_sort: (key: string) => void;
@@ -407,6 +413,40 @@ function RunSortHeader({
     </th>
   );
 }
+function MachineFilter({ source, snapshot: s, actions: a }: {
+  source: Source;
+  snapshot: DashboardSnapshot;
+  actions: DashboardActions;
+}) {
+  const [search, setSearch] = useState("");
+  const machines = [...new Set(source.machines ?? [])].sort();
+  const visible = machines.filter((machine) =>
+    machine === s.origin || machine.toLocaleLowerCase().includes(search.toLocaleLowerCase()),
+  );
+  return (
+    <div className="machine-filter">
+      {machines.length > 12 && (
+        <label className="field">
+          Find a machine
+          <input type="search" id="machine-search" maxLength={96} value={search}
+            onChange={(event) => setSearch(event.currentTarget.value)} />
+        </label>
+      )}
+      <RadioTags
+        id="machine-options"
+        name="machine"
+        legend="Machine"
+        value={s.origin}
+        disabled={s.controls_disabled}
+        options={[
+          { id: "machine-all", value: "", label: "All machines" },
+          ...visible.map((machine) => ({ id: `machine-${machine}`, value: machine, label: machine })),
+        ]}
+        on_change={(value) => a.filter("origin", value)}
+      />
+    </div>
+  );
+}
 function RunBrowser({
   snapshot: s,
   actions: a,
@@ -414,6 +454,7 @@ function RunBrowser({
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
 }) {
+  const project = s.sources.find((source) => source.source_id === s.source_id && source.kind === "hosted_project");
   const tasks = [
     ...new Set(s.runs.map((run) => run.task).filter((task): task is string => task !== null)),
   ].sort();
@@ -430,6 +471,7 @@ function RunBrowser({
         </div>
       </div>
       <div className="filters">
+        {project && <MachineFilter key={project.source_id} source={project} snapshot={s} actions={a} />}
         <label className="field search-field">
           Search
           <input
@@ -541,7 +583,7 @@ function RunBrowser({
       <Warnings id="list-warnings" items={s.list_warnings} />
       <div className="table-scroll runs-scroll" id="runs-region" aria-busy={s.list_busy}>
         <table
-          className={`runs-table${s.run_columns.length ? " has-custom-columns" : ""}`}
+          className={`runs-table${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-custom-columns" : ""}`}
           data-column-count={s.run_columns.length}
         >
           <thead>
@@ -556,6 +598,7 @@ function RunBrowser({
                 snapshot={s}
                 actions={a}
               />
+              {project && <RunSortHeader label="Machine" sort_key="origin" class_name="machine-column" snapshot={s} actions={a} />}
               <RunSortHeader
                 label="Status"
                 sort_key="status"
@@ -583,13 +626,15 @@ function RunBrowser({
               );
               if (run.exit_code !== null && run.exit_code !== 0)
                 metadata.push(`exit ${run.exit_code}`);
-              const selected = s.selected.includes(run.run_id);
+              const identity = runIdentity(run);
+              const selected = s.selected.includes(identity);
               return (
                 <tr
-                  key={run.run_id}
+                  key={identity}
+                  data-run-key={identity}
                   className={[
                     selected && "selected",
-                    s.review?.kind === "run" && s.review.run_ids[0] === run.run_id && "active",
+                    s.review?.kind === "run" && s.review.run_ids[0] === identity && "active",
                   ]
                     .filter(Boolean)
                     .join(" ")}
@@ -599,8 +644,8 @@ function RunBrowser({
                       type="checkbox"
                       checked={selected}
                       disabled={s.list_busy || (s.selected.length >= 8 && !selected)}
-                      aria-label={`Select ${run.run_id} for comparison`}
-                      onChange={(event) => a.select_run(run.run_id, event.currentTarget.checked)}
+                      aria-label={`Select ${runLabel(run)} for comparison`}
+                      onChange={(event) => a.select_run(identity, event.currentTarget.checked)}
                     />
                   </td>
                   <td className="run-cell">
@@ -608,7 +653,7 @@ function RunBrowser({
                       type="button"
                       className="run-link"
                       disabled={s.list_busy}
-                      onClick={() => a.inspect_run(run.run_id)}
+                      onClick={() => a.inspect_run(identity)}
                     >
                       {run.run_id}
                     </button>
@@ -623,6 +668,7 @@ function RunBrowser({
                       </div>
                     )}
                   </td>
+                  {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
                   <td className="status-column">
                     <span
                       className={`status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(run.status) ? run.status : ""}`}
@@ -704,10 +750,10 @@ function RunBrowser({
                 type="button"
                 className="selection-chip"
                 key={id}
-                aria-label={`Remove ${id} from comparison`}
+                aria-label={`Remove ${runKeyLabel(id)} from comparison`}
                 onClick={() => a.select_run(id, false)}
               >
-                {id} ×
+                {runKeyLabel(id)} ×
               </button>
             ))}
           </div>
@@ -886,7 +932,7 @@ function ArchiveSummary({ detail }: { detail: Detail | null }) {
             id="download-archive"
             href={apiUrl("/api/archive", {
               source: detail.source.source_id,
-              run_id: detail.run.run_id,
+              run_id: runIdentity(detail.run),
             })}
             target="_blank"
             rel="noopener noreferrer"
@@ -918,7 +964,7 @@ function ComparisonValues({ result, busy }: { result: Comparison | null; busy: b
             <tbody>
               {comparison.runs.map((run) => (
                 <tr key={run.run_id}>
-                  <th scope="row">{run.run_id}</th>
+                  <th scope="row">{runLabel(run.run)}</th>
                   {comparison.metric_names.map((name) => {
                     const point = run.values[name];
                     return (
@@ -1038,7 +1084,7 @@ function ReviewWorkspace({
             <h2 id="review-title">
               {s.review?.kind === "compare"
                 ? `${s.review.run_ids.length} runs`
-                : s.review?.run_ids[0] ?? ""}
+                : runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
           </div>
           <button
@@ -1274,28 +1320,45 @@ export function DashboardView({
       {source_controls &&
         createPortal(
           <>
-            <label className="field">
-              Source
-              <select
-                id="source-select"
-                aria-label="Run source"
-                disabled={!s.sources.length}
+            {s.project_catalog_enabled && s.sources.length > 0 && s.sources.length <= 6 ? (
+              <RadioTags
+                id="project-options"
+                name="project"
+                legend="Project"
                 value={s.source_id}
-                onChange={(event) => actions.source(event.currentTarget.value)}
-              >
-                {s.sources.length ? (
-                  s.sources.map((source) => (
-                    <option key={source.source_id} value={source.source_id}>
-                      {source.kind === "service" ? `${source.label} · Synced` : source.label}
+                options={s.sources.map((source) => ({
+                  id: `project-${source.project_id}`,
+                  value: source.source_id,
+                  label: source.label,
+                }))}
+                on_change={actions.source}
+              />
+            ) : (
+              <label className="field">
+                {s.project_catalog_enabled ? "Project" : "Source"}
+                <select
+                  id="source-select"
+                  aria-label={s.project_catalog_enabled ? "Project" : "Run source"}
+                  disabled={!s.sources.length}
+                  value={s.source_id}
+                  onChange={(event) => actions.source(event.currentTarget.value)}
+                >
+                  {s.sources.length ? (
+                    s.sources.map((source) => (
+                      <option key={source.source_id} value={source.source_id}>
+                        {source.kind === "service" ? `${source.label} · Synced` : source.label}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">
+                      {s.refreshing
+                      ? s.project_catalog_enabled ? "Loading projects…" : "Loading sources…"
+                      : s.project_catalog_enabled ? "No synced projects" : "No synced sources"}
                     </option>
-                  ))
-                ) : (
-                  <option value="">
-                    {s.refreshing ? "Loading sources…" : "No synced sources"}
-                  </option>
-                )}
-              </select>
-            </label>
+                  )}
+                </select>
+              </label>
+            )}
             <button
               id="refresh-button"
               className="button secondary"
@@ -1331,9 +1394,12 @@ export function DashboardView({
       <div id="source-note" className="source-note" hidden={s.source_note === null}>
         {s.source_note}
       </div>
+      <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>
+        {s.project_catalog_note}
+      </div>
       <ErrorNotice id="global-error" message={s.global_error} />
       <Warnings id="catalog-warnings" items={s.catalog_warnings} />
-      <div className={`workspace-grid${s.run_columns.length ? " has-custom-columns" : ""}`}>
+      <div className={`workspace-grid${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-custom-columns" : ""}`}>
         <RunBrowser snapshot={s} actions={actions} />
         <ReviewWorkspace snapshot={s} actions={actions} />
       </div>

@@ -52,6 +52,12 @@ p { margin: 0; }
 .source-controls { display: flex; align-items: flex-end; gap: 9px; flex-shrink: 0; }
 .source-controls select { width: 100%; min-width: 180px; max-width: 280px; }
 .source-controls .field { font-size: 10px; gap: 3px; }
+.source-controls .choice-group legend { font-size: 10px; }
+.machine-filter { grid-column: 1 / -1; }
+.machine-filter > .field { max-width: 380px; margin-bottom: 9px; }
+.machine-filter .choice-tags { max-height: 160px; overflow: auto; padding: 3px; }
+.machine-column { width: 160px; }
+.machine-name { font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .field { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; font-weight: 600; min-width: 0; }
 .field input, .field select { height: 35px; border: 1px solid #d9dfe9; border-radius: 6px; background: var(--paper); color: var(--ink); padding: 6px 9px; font-size: 12px; font-weight: 400; min-width: 0; }
 .field select { padding-right: 24px; }

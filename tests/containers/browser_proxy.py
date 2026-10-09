@@ -10,6 +10,7 @@ import threading
 from urllib.parse import urlsplit, urlunsplit
 
 POLICY_OVERRIDE = Path('/tmp/expri-browser-policy')
+LEGACY_CATALOG = Path('/tmp/expri-browser-legacy-catalog')
 TRACE = Path('/tmp/expri-browser-requests.jsonl')
 TRACE_LOCK = threading.Lock()
 HOP_HEADERS = {'connection', 'transfer-encoding', 'keep-alive', 'proxy-connection'}
@@ -63,13 +64,19 @@ class Proxy(BaseHTTPRequestHandler):
       data = b'' if events else response.read(2 * 1024 * 1024 + 1)
       if len(data) > 2 * 1024 * 1024:
         raise ValueError('bounded proxy response exceeded')
+      status = response.status
+      # Fixture-controlled capability fallback: preserve upstream authentication
+      # and policies, then emulate an older backend missing only this endpoint.
+      if status == 200 and urlsplit(self.path).path == '/api/projects' and LEGACY_CATALOG.exists():
+        status = 404
+        data = b'{"error":"unknown dashboard route"}'
       policy = response.getheader('Referrer-Policy')
       if POLICY_OVERRIDE.exists():
         policy = POLICY_OVERRIDE.read_text().strip()
       record = {
         'method': self.command, 'path': urlsplit(self.path).path,
         'host': self.headers.get('Host'),
-        'origin': self.headers.get('Origin'), 'status': response.status,
+        'origin': self.headers.get('Origin'), 'status': status,
         'referrer_policy': policy,
         'session_cookie_count': sum(
           pair.strip().split('=', 1)[0] == '__Host-expri_session'
@@ -77,7 +84,7 @@ class Proxy(BaseHTTPRequestHandler):
         ),
       }
       record_trace(record)
-      self.send_response(response.status)
+      self.send_response(status)
       for name, value in response.getheaders():
         if name.lower() not in HOP_HEADERS | {'content-length', 'referrer-policy'}:
           if name.lower() == 'location':

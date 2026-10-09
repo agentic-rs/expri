@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { artifactCanSelect, artifactDownloadUrl, artifactPullCommand, apiUrl, formatFileSize, safeArtifactPath } from "./.test/app.js";
+import { artifactCanSelect, artifactDownloadUrl, artifactPullCommand, artifactScopeMatchesRun, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
 
 const scope = { project_id: "vision", origin: "gpu-1", run_id: "run-123" };
 const source_id = "hosted:vision:gpu-1";
@@ -61,4 +61,24 @@ test("file sizes distinguish unknown values and binary units", () => {
   assert.equal(formatFileSize(2 ** 30), "1 GiB");
   assert.equal(formatFileSize(-1), "Unknown");
   assert.equal(formatFileSize(Infinity), "Unknown");
+});
+
+test("project artifacts bind the recorded machine and actual run ID before browser or CLI selection", () => {
+  const source = "hosted-project:vision", key = "gpu-1:run-123";
+  const item = file("outputs/model.pt", { download_url: apiUrl("/api/artifact", { source, run_id: key, path: "outputs/model.pt" }) });
+  assert.equal(runIdentity({ run_id: "run-123", run_key: key }), key);
+  assert.deepEqual(parseProjectRunKey(key), { origin: "gpu-1", run_id: "run-123" });
+  assert.equal(artifactScopeMatchesRun(scope, source, key), true);
+  assert.equal(artifactDownloadUrl(item, source, key, scope), item.download_url);
+  assert.equal(artifactCanSelect(item, scope, source, key), true);
+  for (const invalid of [null, { ...scope, origin: "gpu-2" }, { ...scope, project_id: "other" }, { ...scope, run_id: key }]) {
+    assert.equal(artifactScopeMatchesRun(invalid, source, key), false);
+    assert.equal(artifactDownloadUrl(item, source, key, invalid), null);
+    assert.equal(artifactCanSelect(item, invalid, source, key), false);
+  }
+  for (const invalid of ["run-123", "gpu-1:run-123:extra", "../gpu:run-123", "gpu-1:", "gpu-1:.."]) {
+    assert.equal(parseProjectRunKey(invalid), null);
+    assert.equal(artifactScopeMatchesRun(scope, source, invalid), false);
+  }
+  assert.equal(artifactDownloadUrl(item, source, key), null, "project downloads require their actual stored scope");
 });
