@@ -96,10 +96,12 @@ run links open the same exact run within the project view.
 Choose up to eight parameter or metric columns using the **Columns** checkbox
 tags. Click table headers to sort before paging, and use the table's
 **Last / Min / Max** tags to choose its metric values. Missing values
-stay at the end in either sort direction. Adding columns places the run table
-above the review workspace, with horizontal scrolling contained in the table
-on narrow screens. Sorting and column changes preserve the current review;
-these choices last for the current page.
+stay at the end in either sort direction. At widths of at least 860 CSS pixels,
+the project run browser and review remain side by side, including when columns
+are added. The run browser widens and contains the table's horizontal scrolling.
+Below 860 CSS pixels, the run browser stacks above the review with scrolling
+still contained in **Runs**. Sorting and column changes preserve the current
+review; these choices last for the current page.
 Workers must push a run before it appears. Files shows output names, sizes, and
 availability without reading checkpoint contents. **Worker (reported)** reflects
 the last published inventory; **Cloud** means a finalized file is downloadable.
@@ -420,10 +422,12 @@ filtering, comparison, distinct metric streams, machine sorting, scoped
 logs/files/downloads, and live updates from both origins without changing chart
 exploration or table choices. The original native checks also exercise an older
 backend's missing project catalog through a fixture-controlled fallback. It verifies
-desktop and 320/360/500 CSS pixel layouts, including table scrolling without
-page overflow, saving screenshots for diagnostics. A second HTTPS hostname also
-checks branch assets against the same catalog, cookie replay rejection, and
-independent login/logout sessions.
+1440/1024/860 CSS pixel desktop layouts with Runs beside Review, including project
+and added-column tables, plus a stacked layout at 859 CSS pixels and narrow
+320/360/500 CSS pixel layouts with table scrolling without page overflow,
+saving screenshots for diagnostics.
+A second HTTPS hostname also checks branch assets against the same catalog,
+cookie replay rejection, and independent login/logout sessions.
 An authenticated run link also survives native password sign-in, opens the exact
 run, and lets the user select another run without later refresh overriding it.
 Both hosts also exercise chart hover, drag zoom, legend toggles, and keyboard

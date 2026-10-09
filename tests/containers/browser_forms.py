@@ -692,6 +692,50 @@ def artifact_files(browser, run_id):
   print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
 
 
+def workspace_layout(browser, width, wide=False):
+  geometry = browser.call('POST', '/execute/sync', {'script': '''window.scrollTo(0, 0);
+    const bounds = selector => {
+      const rect = document.querySelector(selector).getBoundingClientRect();
+      return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
+        width: rect.width, height: rect.height};
+    };
+    const table = document.querySelector('#runs-region');
+    return {viewport_width: innerWidth, page_width: document.documentElement.scrollWidth,
+      client_width: document.documentElement.clientWidth, grid: bounds('.workspace-grid'),
+      runs: bounds('.runs-card'), review: bounds('.review-workspace'),
+      table: {client_width: table.clientWidth, scroll_width: table.scrollWidth, scroll_left: table.scrollLeft}};''', 'args': []})
+  assert geometry['viewport_width'] == width, f'layout viewport is not {width} CSS pixels wide'
+  assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px workspace overflows horizontally'
+  runs, review = geometry['runs'], geometry['review']
+  if width >= 860:
+    assert runs['right'] <= review['left'] + 1, f'{width}px Runs and Review are not side by side'
+    assert abs(runs['top'] - review['top']) <= 1, f'{width}px Review is displaced below Runs'
+    if wide:
+      expected = min(geometry['grid']['width'] * 0.44, 520)
+      assert abs(runs['width'] - expected) <= 1, f'{width}px expanded Runs sidebar has unexpected width'
+      minimum_review_width = 500 if width >= 1024 else 400
+      assert review['width'] >= minimum_review_width, f'{width}px expanded Runs sidebar leaves Review too narrow'
+  else:
+    assert runs['bottom'] <= review['top'] + 1, f'{width}px Runs and Review are not stacked'
+  assert geometry['table']['client_width'] <= runs['width'] + 1, f'{width}px table escapes its Runs panel'
+  return geometry
+
+
+def table_scroll_contained(browser, width):
+  before = workspace_layout(browser, width, wide=width >= 860)
+  assert before['table']['scroll_width'] > before['table']['client_width'], f'{width}px selected columns do not scroll within Runs'
+  browser.call('POST', '/execute/sync', {'script': '''const table = document.querySelector('#runs-region');
+    table.scrollLeft = table.scrollWidth;''', 'args': []})
+  try:
+    after = workspace_layout(browser, width, wide=width >= 860)
+    assert after['table']['scroll_left'] > 0, f'{width}px table could not scroll to its later columns'
+    assert after['page_width'] == before['page_width'], f'{width}px table scrolling widened the page'
+    assert all(abs(after['review'][key] - before['review'][key]) <= 1 for key in before['review']), f'{width}px table scrolling moved or resized Review'
+  finally:
+    browser.call('POST', '/execute/sync', {'script': "document.querySelector('#runs-region').scrollLeft = 0;", 'args': []})
+  return before
+
+
 def choose_run_table_columns(browser):
   def evaluate(script):
     return browser.call('POST', '/execute/sync', {'script': script, 'args': []})
@@ -752,15 +796,22 @@ def run_table_columns(browser, run_ids):
   browser.keys('button[aria-label="Sort by loss ascending"]', ' ')
   wait_for(lambda: settled() and 'loss · ascending' in evaluate("return document.querySelector('#run-sort-description').textContent;"), 'native keyboard header sorting did not select the metric')
   preserved()
-  assert evaluate('''const table = document.querySelector('.runs-card').getBoundingClientRect();
-    const review = document.querySelector('#review-section').getBoundingClientRect();
-    return table.bottom <= review.top + 1;'''), 'custom run columns did not move the table above the review'
-  capture('workspace-columns-desktop')
+  for width in [1440, 1024]:
+    browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+    table_scroll_contained(browser, width)
+    preserved()
+    capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
+  for width in [860, 859]:
+    browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+    if width == 860:
+      table_scroll_contained(browser, width)
+    else:
+      workspace_layout(browser, width)
+    preserved()
   browser.allow_narrow_viewports()
   for width in [320, 360]:
     browser.call('POST', '/window/rect', {'width': width, 'height': 800})
-    assert evaluate('return innerWidth;') == width, f'mobile viewport is not {width} CSS pixels wide'
-    assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), f'{width}px dashboard overflows horizontally'
+    table_scroll_contained(browser, width)
     assert evaluate('''const table = document.querySelector('#runs-region');
       return table.scrollWidth > table.clientWidth && ['#run-columns', '#run-column-search', '#run-reduction-options', '#search-input', '#task-input', '#status-options'].every(selector => {
         const rect = document.querySelector(selector).getBoundingClientRect(); return rect.left >= 0 && rect.right <= document.documentElement.clientWidth + 1;
@@ -783,7 +834,7 @@ def run_table_columns(browser, run_ids):
     browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '\ue00c', using='xpath')
   finally:
     browser.call('POST', '/frame', {'id': None})
-  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, review/selection/zoom/visibility preserved, desktop and 320/360px table scroll without page overflow.', flush=True)
+  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, review/selection/zoom/visibility preserved, 1440/1024/860px split panels, an 859px stacked boundary, and 320/360px stacked panels with contained table scroll.', flush=True)
 
 
 def workspace(run_id, second_run_id):
@@ -836,9 +887,7 @@ def workspace(run_id, second_run_id):
       browser.call('POST', '/frame', {'id': None})
     interactive_charts(browser, [run_id, second_run_id], check_security=True)
     time_axes(browser, [run_id, second_run_id])
-    assert evaluate('''const list = document.querySelector('.runs-card').getBoundingClientRect();
-      const review = document.querySelector('#review-section').getBoundingClientRect();
-      return list.right <= review.left + 1;'''), 'desktop runs and charts are not side by side'
+    workspace_layout(browser, 1440)
     capture('workspace-desktop')
     remember_chart_document(browser)
     evaluate("window.__acceptance_previous_plots = [...document.querySelector('#chart-frame').contentDocument.querySelectorAll('[data-interactive-chart]')];")
@@ -1044,6 +1093,7 @@ def project_workspace(run_id):
     assert evaluate("return document.querySelector('#machine-all').checked;"), 'project did not begin with All machines'
     assert evaluate("return document.querySelectorAll('#machine-options input[type=\"radio\"]').length;") == 3, 'project machine tags do not match its two recorded origins'
     assert evaluate('''return [...document.querySelectorAll('#run-rows .run-link')].filter(node=>node.textContent===arguments[0]).length;''', run_id) == 2, 'project default collapsed duplicate actual run IDs'
+    workspace_layout(browser, 1440, wide=True)
     browser.click('#machine-worker-b + span')
     wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'native machine filter did not isolate worker-b')
     assert evaluate("return document.querySelector('#run-rows tr').dataset.runKey;") == keys[1], 'machine filter resolved the colliding ID to worker'
@@ -1072,6 +1122,12 @@ def project_workspace(run_id):
     exploration = chart_state()
     assert exploration['hidden'] == [keys[1]], 'project chart visibility toggle did not target the qualified run identity'
     evaluate("window.__project_chart_document=document.querySelector('#chart-frame').contentDocument;")
+    project_layouts = {}
+    for width in [1440, 1024]:
+      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      project_layouts[width] = workspace_layout(browser, width, wide=True)
+      capture('workspace-project-default-desktop' if width == 1440 else 'workspace-project-default-1024')
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
     choose_run_table_columns(browser)
     browser.click('button[aria-label="Sort by Machine ascending"]')
     wait_for(settled, 'native Machine header did not finish sorting')
@@ -1080,15 +1136,38 @@ def project_workspace(run_id):
     assert selected_keys() == sorted(keys) and chart_keys() == sorted(keys), 'Machine sorting or columns lost the cross-machine comparison'
     assert evaluate("return document.querySelector('#chart-frame').contentDocument===window.__project_chart_document;"), 'Machine sorting or columns replaced chart exploration'
     assert chart_state() == exploration, 'Machine sorting or columns changed project zoom or hidden curves'
-    capture('workspace-project-desktop')
+    def stable_project_layout(width, scroll=False):
+      geometry = table_scroll_contained(browser, width) if scroll else workspace_layout(browser, width, wide=True)
+      reference = project_layouts[width]
+      assert geometry['page_width'] == reference['page_width'], f'{width}px choosing project columns widened the page'
+      assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in reference['review']), f'{width}px choosing project columns moved or resized Review'
+    for width in [1440, 1024]:
+      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      stable_project_layout(width, scroll=True)
+      capture('workspace-project-desktop' if width == 1440 else 'workspace-project-1024')
     browser.allow_narrow_viewports()
     for width in [320, 360]:
       browser.call('POST', '/window/rect', {'width': width, 'height': 800})
-      assert evaluate('return innerWidth;') == width, 'project mobile viewport did not resize to its exact CSS width'
-      assert evaluate('return document.documentElement.scrollWidth<=document.documentElement.clientWidth+1;'), f'project dashboard overflows at {width}px'
+      table_scroll_contained(browser, width)
       evaluate("document.querySelector('#runs-region').scrollIntoView({block:'start'});")
       capture(f'workspace-project-{width}')
     browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    browser.click('#run-columns summary')
+    for name in ['Parameter learning_rate', 'Metric loss']:
+      browser.click(f'input[aria-label="{name}"] + span')
+      wait_for(settled, 'removing a project table column did not finish')
+    assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '0', 'removing project columns did not restore its built-in table'
+    browser.click('#run-columns summary')
+    for width in [1440, 1024]:
+      browser.call('POST', '/window/rect', {'width': width, 'height': 1000})
+      stable_project_layout(width)
+    browser.call('POST', '/window/rect', {'width': 1440, 'height': 1000})
+    choose_run_table_columns(browser)
+    browser.click('#run-columns summary')
+    stable_project_layout(1440, scroll=True)
+    assert selected_keys() == sorted(keys) and chart_keys() == sorted(keys), 'layout changes lost the cross-machine comparison'
+    assert evaluate("return document.querySelector('#chart-frame').contentDocument===window.__project_chart_document;"), 'layout changes replaced chart exploration'
+    assert chart_state() == exploration, 'layout changes lost project zoom or hidden curves'
     for origin, key, value in [('worker', keys[0], 0.003), ('worker-b', keys[1], 0.006)]:
       PROJECT_COORDINATION.write_text(json.dumps({'phase': 'publish-' + origin}))
       wait_for(lambda: json.loads(PROJECT_COORDINATION.read_text()).get('phase') == 'published-' + origin, 'project publication did not finish for ' + origin, timeout=90)
@@ -1122,7 +1201,7 @@ def project_workspace(run_id):
       expected = (origin + ' scope fixture\n').encode()
       wait_for(lambda: any(path.is_file() and path.stat().st_size == len(expected) and path.read_bytes() == expected for path in DOWNLOADS.iterdir()), 'project browser download resolved the artifact from the other machine', timeout=30)
     PROJECT_COORDINATION.write_text(json.dumps({'phase': 'complete'}))
-    print('Firefox project workspace passed: default All machines, native machine filter, colliding recorded IDs remain distinct in selection/chart/readout, Machine sorting/columns preserved, live samples from both origins, correctly scoped Logs/Files/CLI/native downloads, actual320/360px overflow checks.', flush=True)
+    print('Firefox project workspace passed: default All machines, native machine filter, colliding recorded IDs remain distinct in selection/chart/readout, Machine sorting/columns preserved, live samples from both origins, correctly scoped Logs/Files/CLI/native downloads, stable 1440/1024px split layout through column changes and stacked 320/360px layout with contained table scroll.', flush=True)
   except Exception:
     capture('workspace-project-failure')
     raise

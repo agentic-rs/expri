@@ -1399,7 +1399,7 @@ export function DashboardView({
       </div>
       <ErrorNotice id="global-error" message={s.global_error} />
       <Warnings id="catalog-warnings" items={s.catalog_warnings} />
-      <div className={`workspace-grid${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-custom-columns" : ""}`}>
+      <div className={`workspace-grid${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-wide-table" : ""}`}>
         <RunBrowser snapshot={s} actions={actions} />
         <ReviewWorkspace snapshot={s} actions={actions} />
       </div>

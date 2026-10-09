@@ -780,8 +780,10 @@ finally:
         docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
         for name in [
           'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
-          'workspace-columns-desktop', 'workspace-columns-320', 'workspace-columns-360',
-          'workspace-project-desktop', 'workspace-project-320', 'workspace-project-360', 'workspace-project-failure',
+          'workspace-columns-desktop', 'workspace-columns-1024', 'workspace-columns-320', 'workspace-columns-360',
+          'workspace-project-default-desktop', 'workspace-project-default-1024',
+          'workspace-project-desktop', 'workspace-project-1024',
+          'workspace-project-320', 'workspace-project-360', 'workspace-project-failure',
           'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
           'workspace-elapsed', 'workspace-wall_clock',
           'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
