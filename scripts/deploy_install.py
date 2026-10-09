@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import tarfile
@@ -130,6 +131,21 @@ def preview_revisions(root):
   return revisions
 
 
+def metadata_schema(root):
+  """Read the configured Vultr store, including committed WAL changes."""
+  database = root / 'var/lib/expri/metadata.sqlite3'
+  try:
+    if not stat.S_ISREG(database.lstat().st_mode):
+      raise ValueError('service metadata is not a regular file')
+    connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=5)
+    try:
+      return connection.execute('PRAGMA user_version').fetchone()[0]
+    finally:
+      connection.close()
+  except (OSError, ValueError, sqlite3.Error) as error:
+    raise RuntimeError('cannot read service metadata schema') from error
+
+
 def install(upload, kind, commit, branch, expected_digest, *, root=Path('/'), check_health=healthy, execute=run):
   if kind not in HOSTS or not re.fullmatch('[0-9a-f]{40}', commit) or not re.fullmatch('[0-9a-f]{64}', expected_digest):
     raise ValueError('invalid deployment identity')
@@ -165,19 +181,42 @@ def install(upload, kind, commit, branch, expected_digest, *, root=Path('/'), ch
         stage.chmod(0o755)
         os.rename(stage, release)
     target = 'releases/' + commit if kind == 'ab' else str(release / 'expri')
+    schema_before = metadata_schema(root) if kind == 'main' else None
+    schema_after = None
     if kind == 'main':
       execute(str(release / 'expri'), '--version')
     previews = preview_revisions(root) if kind == 'main' else {}
+    startup_attempted = False
     try:
       switch(link, target)
       if kind == 'main':
+        startup_attempted = True
         execute('systemctl', 'restart', 'expri')
       check_health(kind, release)
       if kind == 'main' and preview_revisions(root) != previews:
         raise RuntimeError('primary deployment changed a configured preview revision')
       if protected != {path: digest(root / path) for path in protected}:
         raise RuntimeError('service configuration changed during deployment')
-    except Exception:
+      if kind == 'main':
+        schema_after = metadata_schema(root)
+    except Exception as failure:
+      if startup_attempted:
+        try:
+          execute('systemctl', 'stop', 'expri')
+        except Exception:
+          raise RuntimeError('Deployment failed and the new service could not be stopped for schema verification. '
+            'Automatic rollback was skipped; the new binary and service data are retained. '
+            'Operator recovery is required.') from failure
+        try:
+          schema_after = metadata_schema(root)
+        except RuntimeError:
+          raise RuntimeError('Deployment failed after service startup and the metadata schema cannot be read. '
+            'Automatic rollback was skipped; the new binary and service data are retained with the service stopped. '
+            'Operator recovery is required.') from failure
+        if schema_after != schema_before:
+          raise RuntimeError(f'Deployment failed after the metadata schema changed from {schema_before} to {schema_after}. '
+            'Automatic rollback was skipped; the new binary and service data are retained with the service stopped. '
+            'Operator recovery is required.') from failure
       if previous is None:
         link.unlink(missing_ok=True)
       else:
@@ -188,8 +227,11 @@ def install(upload, kind, commit, branch, expected_digest, *, root=Path('/'), ch
         if kind == 'main' and preview_revisions(root) != previews:
           raise RuntimeError('rollback did not restore configured preview access')
       raise
-    return {'status': 'deployed', 'target': kind, 'commit': commit, 'requested_branch': branch,
+    result = {'status': 'deployed', 'target': kind, 'commit': commit, 'requested_branch': branch,
       'built_from_branch': provenance['branch'], 'reused_release': reused, 'previous': previous}
+    if kind == 'main':
+      result.update(metadata_schema_before=schema_before, metadata_schema_after=schema_after)
+    return result
 
 
 if __name__ == '__main__':
