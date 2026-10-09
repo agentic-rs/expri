@@ -400,11 +400,12 @@ pull remote metrics and logs; the dashboard detects updated selected runs:
 expri -T runpod runs pull run-abc123 --metrics --logs
 ```
 
-The run browser stays beside the review workspace on desktop and stacks above
-it on narrow screens. Choose up to eight parameter or metric columns with the
-**Columns** checkbox tags; adding columns moves the table above the review
-workspace and keeps horizontal scrolling within the table. Nested parameters
-remain distinct, including keys containing dots or slashes. Missing values show
+The run browser stays beside the review workspace at widths of at least 860 CSS
+pixels and stacks above it on narrower screens. Choose up to eight parameter or
+metric columns with the **Columns** checkbox tags. On desktop, the project view
+and added columns widen the run browser while keeping the review beside it.
+Wider tables scroll horizontally inside **Runs**. Nested parameters remain
+distinct, including keys containing dots or slashes. Missing values show
 an em dash. The table's **Last / Min / Max** tags choose the metric
 summary, independently of the chart comparison summary. Click a column header
 to sort; clicking again reverses its direction. Sorting applies before paging,

@@ -266,6 +266,15 @@ async function settledTable(nodes) {
 function latestRunQuery(model) {
   return new URL(model.requests.filter(url => url.startsWith("/api/runs?")).at(-1), "http://localhost").searchParams;
 }
+function workspacePanes(nodes) {
+  const grid = nodes.document.querySelector(".workspace-grid");
+  const browser = grid.querySelector(":scope > .runs-card");
+  const review = grid.querySelector(":scope > .review-workspace");
+  assert.deepEqual([...grid.children], [browser, review], "run browsing and review stay in sibling panes");
+  assert.equal(nodes.get("runs-region").closest(".runs-card"), browser, "wide tables keep their own scrolling region");
+  assert.equal(grid.classList.contains("has-custom-columns"), false, "table sizing does not select the workspace layout");
+  return { grid, browser, review };
+}
 function metricCheckbox(nodes, name) {
   const label = [...nodes.get("run-metric-options").querySelectorAll("label.metric-choice")].find(item => item.textContent === name);
   assert.ok(label, `Missing metric control: ${name}`); return label.querySelector("input");
@@ -354,6 +363,8 @@ test("summary tags select reductions in one action and retain the choice on refr
 test("columns and server sorting preserve the selected run, chart settings and inspection tab", async t => {
   const model = await reviewFixture(t, { count: 25, hosted: true }), { nodes } = model;
   await settledTable(nodes);
+  const panes = workspacePanes(nodes);
+  assert.equal(panes.grid.classList.contains("has-wide-table"), false);
   assert.equal(model.requests.some(url => url.startsWith("/api/run-columns")), false, "discovery stays lazy");
   await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
@@ -365,6 +376,9 @@ test("columns and server sorting preserve the selected run, chart settings and i
   await openColumns(nodes);
   await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
   await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
+  assert.deepEqual(workspacePanes(nodes), panes, "adding optional columns preserves both workspace panes");
+  assert.equal(panes.grid.classList.contains("has-wide-table"), true);
+  assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
   assert.equal(nodes.get("run-rows").children[0].children.length, 5);
@@ -1675,6 +1689,35 @@ const project_source = { source_id: "hosted-project:vision", project_id: "vision
 function projectRuns() {
   return ["gpu-a", "gpu-b"].map(origin => ({ ...publishedRun("same-run"), origin, run_key: `${origin}:same-run` }));
 }
+
+test("project tables retain separate run and review panes before and after optional columns", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  await settledTable(nodes);
+  const panes = workspacePanes(nodes), frame = nodes.get("chart-frame");
+  const table = nodes.document.querySelector(".runs-table");
+  assert.equal(panes.grid.classList.contains("has-wide-table"), true, "the built-in Machine column widens the browser pane");
+  assert.equal(table.classList.contains("has-custom-columns"), true, "project columns scroll within the table container");
+  assert.equal(table.dataset.columnCount, "0");
+  await inspect(model, 0);
+  const chart_url = frame.src;
+  await openColumns(nodes);
+  for (const name of ["Parameter learning_rate", "Metric loss"]) {
+    await click(columnCheckbox(nodes, name)); await settledTable(nodes);
+  }
+  assert.equal(table.dataset.columnCount, "2");
+  assert.deepEqual(workspacePanes(nodes), panes);
+  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(frame.src, chart_url);
+  assert.equal(nodes.get("review-title").textContent, "same-run · gpu-a");
+  for (const name of ["Parameter learning_rate", "Metric loss"]) {
+    await click(columnCheckbox(nodes, name)); await settledTable(nodes);
+  }
+  assert.equal(table.dataset.columnCount, "0");
+  assert.equal(panes.grid.classList.contains("has-wide-table"), true, "removing optional columns retains the Machine column's width");
+  assert.deepEqual(workspacePanes(nodes), panes);
+  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(frame.src, chart_url);
+});
 
 test("project browsing selects projects and preserves duplicate run IDs across recorded machines", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
