@@ -272,6 +272,7 @@ fn authorize<S: ObjectStorage>(
       incomplete: false,
       ..
     } => worker.project_id == scope.project_id && worker.origin == scope.origin,
+    Request::ReferenceFile { .. } => false,
     Request::Capabilities => true,
     Request::SealRun {
       incomplete: true, ..
@@ -1081,6 +1082,32 @@ mod tests {
         403
       );
     }
+  }
+
+  #[test]
+  fn only_owner_can_create_object_references() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let operation = Request::ReferenceFile {
+      source: FileTarget::Run {
+        scope: scope(),
+        path: "outputs/data.tar.gz".into(),
+      },
+      target: FileTarget::Input {
+        project_id: "project".into(),
+        input_id: "asset".into(),
+      },
+      size: 7,
+      sha256: "a".repeat(64),
+    };
+    assert!(authorize(&store, None, &operation).is_ok());
+    assert_eq!(
+      authorize(&store, Some(&auth.workers[0].1), &operation)
+        .unwrap_err()
+        .status,
+      403
+    );
   }
 
   #[test]

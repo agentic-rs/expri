@@ -1,3 +1,4 @@
+use crate::service::types::Response;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1181,4 +1182,61 @@ fn exact_task_filters_use_full_bounded_names_and_explicitly_report_longer_names(
       .to_string()
       .contains("task filters and searches omit it")
   );
+}
+
+#[test]
+fn referenced_dataset_outputs_are_visible_and_download_the_existing_object() {
+  let fixture = Fixture::new();
+  let source = FileTarget::Input {
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+  };
+  fixture.publish(source.clone(), b"dataset bytes".to_vec());
+  let Response::File { file } = fixture
+    .store
+    .execute(Request::GetFile {
+      target: source.clone(),
+    })
+    .unwrap()
+  else {
+    panic!("file")
+  };
+  let target = FileTarget::Run {
+    scope: Fixture::scope("release"),
+    path: "outputs/datasets/paired/source.tar.gz".into(),
+  };
+  fixture
+    .store
+    .execute(Request::ReferenceFile {
+      source: source.clone(),
+      target,
+      size: file.size,
+      sha256: file.sha256.unwrap(),
+    })
+    .unwrap();
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let catalog = dashboard
+    .artifacts("hosted:project:worker", "release")
+    .unwrap();
+  assert_eq!(catalog["files"][0]["cloud"], true);
+  assert_eq!(catalog["files"][0]["size"], 13);
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  let Download::Cloud { url, .. } = dashboard
+    .artifact_download(
+      "hosted:project:worker",
+      "release",
+      "outputs/datasets/paired/source.tar.gz",
+    )
+    .unwrap()
+  else {
+    panic!("redirect")
+  };
+  let Response::Url { url: original } = fixture
+    .store
+    .execute(Request::DownloadUrl { target: source })
+    .unwrap()
+  else {
+    panic!("url")
+  };
+  assert_eq!(url, original);
 }

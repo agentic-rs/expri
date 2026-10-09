@@ -441,3 +441,90 @@ fn run_target(scope: &RunScope, path: &str) -> FileTarget {
     path: path.to_string(),
   }
 }
+
+/// Create an identity-pinned reference; the service performs no object transfer.
+pub fn reference(options: super::ReferenceOptions) -> Result<Value> {
+  let source: FileTarget = serde_json::from_str(&options.source)?;
+  let target: FileTarget = serde_json::from_str(&options.target)?;
+  validate_target(&source)?;
+  validate_target(&target)?;
+  validate_digest(&options.sha256)?;
+  let api = Api::new(&options.config)?;
+  let Response::File { file } = api.request(&Request::ReferenceFile {
+    source: source.clone(),
+    target: target.clone(),
+    size: options.size,
+    sha256: options.sha256.clone(),
+  })?
+  else {
+    return Err(message("service did not return a file reference"));
+  };
+  if file.target != target
+    || file.size != options.size
+    || file.sha256.as_deref() != Some(&options.sha256)
+    || !matches!(file.storage, FileStorage::Object)
+  {
+    return Err(message("service returned an inconsistent file reference"));
+  }
+  Ok(json!({"source":source,"target":file.target,"size":file.size,"sha256":file.sha256}))
+}
+
+/// Explicit single-file publication, without sealing or archiving a historical run.
+pub fn file_put(options: super::FilePutOptions) -> Result<Value> {
+  let target: FileTarget = serde_json::from_str(&options.target)?;
+  validate_target(&target)?;
+  if matches!(&target, FileTarget::Run { path, .. } if path == "result.zip") {
+    return Err(message("result.zip is managed by the server"));
+  }
+  let api = Api::new(&options.config)?;
+  let path = std::path::absolute(&options.file)?;
+  let mut source = fs::open(&path)?;
+  let initial = source.metadata()?;
+  let size = initial.len();
+  let digest = fs::digest(&mut source, size)?;
+  if !fs::unchanged(&initial, &source.metadata()?) {
+    return Err(message("finalized artifact changed while reading"));
+  }
+  // An existing output may be a reference adopted from an older input upload.
+  // Keep that object key instead of uploading identical bytes under a new key.
+  match api.request(&Request::GetFile {
+    target: target.clone(),
+  }) {
+    Ok(Response::File { file }) if file.target == target => {
+      if matches!(file.storage, FileStorage::Object)
+        && file.size == size
+        && file.sha256.as_deref() == Some(&digest)
+      {
+        if !fs::unchanged(&initial, &fs::open(&path)?.metadata()?) {
+          return Err(message("finalized artifact changed while reading"));
+        }
+        return Ok(json!({"target":target,"size":size,"sha256":digest,"reused":true}));
+      }
+    }
+    Err(crate::error::ExpriError::ServiceRejected { status: 404, .. }) => {}
+    Err(error) => return Err(error),
+    _ => return Err(message("service returned an inconsistent file record")),
+  }
+  let target_bytes = serde_json::to_vec(&target)?;
+  use sha2::{Digest, Sha256};
+  let identity = Sha256::digest(&target_bytes)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+  let mut queue = Queue::new(
+    std::path::absolute(options.queue_dir)?
+      .join("files")
+      .join(identity),
+    json!({"endpoint":api.endpoint,"target":target}),
+  )?;
+  sync_file(
+    &api,
+    &mut queue,
+    "file",
+    target.clone(),
+    &std::path::absolute(options.file)?,
+    false,
+  )?;
+  let file = &queue.state.files["file"];
+  Ok(json!({"target":target,"size":file.size,"sha256":file.sha256,"queue_dir":queue.directory}))
+}

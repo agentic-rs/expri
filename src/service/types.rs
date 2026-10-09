@@ -143,6 +143,13 @@ pub enum Request {
     project_id: String,
     origin: String,
   },
+  /// Reference a completed object without copying its bytes. Owner-only.
+  ReferenceFile {
+    source: FileTarget,
+    target: FileTarget,
+    size: u64,
+    sha256: String,
+  },
   GetFile {
     target: FileTarget,
   },

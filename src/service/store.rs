@@ -12,6 +12,7 @@ use super::types::*;
 
 mod archive;
 mod dashboard_storage;
+mod references;
 mod tracking;
 
 const MAX_PARTS: u64 = 1000;
@@ -811,7 +812,7 @@ impl<S: ObjectStorage> Store<S> {
   pub fn execute(&self, request: Request) -> ApiResult<Response> {
     match request {
       Request::Capabilities => Ok(Response::Capabilities {
-        features: vec!["tracking-v1".into()],
+        features: vec!["tracking-v1".into(), "file-references-v1".into()],
       }),
       Request::PutDocument {
         scope,
@@ -866,6 +867,12 @@ impl<S: ObjectStorage> Store<S> {
       Request::CompleteUpload { upload_id } => self.complete(&upload_id),
       Request::ListFiles { scope } => self.list_files(&scope),
       Request::ListRuns { project_id, origin } => self.list_runs(&project_id, &origin),
+      Request::ReferenceFile {
+        source,
+        target,
+        size,
+        sha256,
+      } => self.reference_file(source, target, size, sha256),
       Request::GetFile { target } => Ok(Response::File {
         file: self.file(&target)?,
       }),
