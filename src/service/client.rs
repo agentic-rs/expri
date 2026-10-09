@@ -477,6 +477,27 @@ pub fn file_put(options: super::FilePutOptions) -> Result<Value> {
     return Err(message("result.zip is managed by the server"));
   }
   let api = Api::new(&options.config)?;
+  let path = std::path::absolute(&options.file)?;
+  let mut source = fs::open(&path)?;
+  let size = source.metadata()?.len();
+  let digest = fs::digest(&mut source, size)?;
+  // An existing output may be a reference adopted from an older input upload.
+  // Keep that object key instead of uploading identical bytes under a new key.
+  match api.request(&Request::GetFile {
+    target: target.clone(),
+  }) {
+    Ok(Response::File { file }) if file.target == target => {
+      if matches!(file.storage, FileStorage::Object)
+        && file.size == size
+        && file.sha256.as_deref() == Some(&digest)
+      {
+        return Ok(json!({"target":target,"size":size,"sha256":digest,"reused":true}));
+      }
+    }
+    Err(crate::error::ExpriError::ServiceRejected { status: 404, .. }) => {}
+    Err(error) => return Err(error),
+    _ => return Err(message("service returned an inconsistent file record")),
+  }
   let target_bytes = serde_json::to_vec(&target)?;
   use sha2::{Digest, Sha256};
   let identity = Sha256::digest(&target_bytes)

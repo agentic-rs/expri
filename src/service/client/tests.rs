@@ -1238,3 +1238,51 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
   );
   task.join().unwrap();
 }
+
+#[test]
+fn explicit_file_put_reuses_completed_objects_even_without_a_local_queue() {
+  let (_temporary, root) = root();
+  let path = root.join("archive.tar.gz");
+  std::fs::write(&path, b"existing").unwrap();
+  let mut file = fs::open(&path).unwrap();
+  let digest = fs::digest(&mut file, 8).unwrap();
+  let target = run_target(
+    &RunScope {
+      project_id: "project".into(),
+      origin: "worker".into(),
+      run_id: "release".into(),
+    },
+    "outputs/archive.tar.gz",
+  );
+  let expected = target.clone();
+  let hash = digest.clone();
+  let (url, task) = mock(1, move |request, _| {
+    let request: Request = serde_json::from_slice(&request.body).unwrap();
+    assert!(matches!(request, Request::GetFile { target } if target == expected));
+    (
+      200,
+      vec![],
+      serde_json::to_vec(&Response::File {
+        file: FileRecord {
+          target: expected.clone(),
+          size: 8,
+          sha256: Some(hash.clone()),
+          storage: FileStorage::Object,
+        },
+      })
+      .unwrap(),
+    )
+  });
+  let queue = root.join("absent-queue");
+  let report = file_put(super::super::FilePutOptions {
+    config: config(&root, &url),
+    target: serde_json::to_string(&target).unwrap(),
+    file: path,
+    queue_dir: queue.clone(),
+  })
+  .unwrap();
+  assert_eq!(report["reused"], true);
+  assert_eq!(report["sha256"], digest);
+  assert!(!queue.exists());
+  task.join().unwrap();
+}
