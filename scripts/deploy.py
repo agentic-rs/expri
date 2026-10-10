@@ -12,7 +12,7 @@ import tempfile
 from deploy_install import WEB_FILES, digest
 
 SCRIPTS = Path(__file__).resolve().parent
-WEB_PREFIX = 'crates/expri-dashboard/dashboard_web'
+WEB_PREFIX = 'crates/dashboard/dashboard_web'
 
 
 def command(args, *, cwd=None, timeout=60):

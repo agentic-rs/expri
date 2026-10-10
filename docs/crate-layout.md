@@ -4,6 +4,8 @@ The Cargo workspace builds one `expri` executable. Controllers, workers, the
 local dashboard, and the hosted service keep the same commands, configuration,
 run directories, and wire formats.
 
+Directories under `crates/` omit the `expri-` prefix; Cargo package names retain it.
+
 | Package | Responsibility | Internal dependencies |
 | --- | --- | --- |
 | `expri-core` | Protocol and service contracts, validated configuration values, identifiers, errors, filesystem leases | None |
@@ -45,7 +47,7 @@ cargo +1.89.0 build --locked --bin expri
 The Python, frontend, host/worker, and self-hosted S3 suites continue to exercise
 the existing workflow. The container builder copies all crates; deployment
 builds receive the complete Git source archive. Dashboard build commands and AB
-bundles use `crates/expri-dashboard/dashboard_web`.
+bundles use `crates/dashboard/dashboard_web`.
 
 Internal dependencies specify both a local path and an exact version. Cargo
 removes dependency paths when packaging, so an ordinary dependent-package dry

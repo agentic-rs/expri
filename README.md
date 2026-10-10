@@ -316,7 +316,7 @@ an upgrade error when the installed node lacks the requested capability.
 
 ## Metrics and comparison charts
 
-Copy [expri_metrics.py](crates/expri-worker/python/expri_metrics.py) into your experiment's
+Copy [expri_metrics.py](crates/worker/python/expri_metrics.py) into your experiment's
 source directory. The helper uses the Python standard library and works in the
 run's uv environment. Log effective parameters after applying configuration
 defaults and command-line overrides, then record scalar metrics during training:
@@ -336,7 +336,7 @@ By default, the helper writes `metrics.jsonl` and optional `params.json` into
 an explicit directory to `MetricsLogger("outputs")`. Parameters are immutable:
 repeating identical values is allowed, while changing saved parameters fails.
 Each event is flushed before `log()` returns. For distributed training, log from
-rank 0 and create the logger within that process. See [Python metrics guide](crates/expri-worker/python/README.md)
+rank 0 and create the logger within that process. See [Python metrics guide](crates/worker/python/README.md)
 for the complete producer contract.
 
 Inspect one run or compare runs locally:
@@ -506,13 +506,13 @@ UI into one JavaScript asset embedded in the Rust binary, so viewing runs requir
 no Node.js, CDN, or hosted service. For frontend development:
 
 ```sh
-pnpm --dir crates/expri-dashboard/dashboard_web install --frozen-lockfile
-pnpm --dir crates/expri-dashboard/dashboard_web check
-pnpm --dir crates/expri-dashboard/dashboard_web test
-pnpm --dir crates/expri-dashboard/dashboard_web build
+pnpm --dir crates/dashboard/dashboard_web install --frozen-lockfile
+pnpm --dir crates/dashboard/dashboard_web check
+pnpm --dir crates/dashboard/dashboard_web test
+pnpm --dir crates/dashboard/dashboard_web build
 ```
 
-Commit the generated `crates/expri-dashboard/dashboard_web/app.js` with its
+Commit the generated `crates/dashboard/dashboard_web/app.js` with its
 TypeScript and TSX source.
 The controller owns requests and refresh scheduling; React owns the workspace
 UI, while the chart controller keeps its stable iframe and interactive state.

@@ -56,17 +56,17 @@ jobs:
         run: npm install --global pnpm@10.30.3
 
       - name: Install frontend dependencies
-        run: pnpm --dir crates/expri-dashboard/dashboard_web install --frozen-lockfile
+        run: pnpm --dir crates/dashboard/dashboard_web install --frozen-lockfile
 
       - name: Check frontend types and behavior
         run: |
-          pnpm --dir crates/expri-dashboard/dashboard_web check
-          pnpm --dir crates/expri-dashboard/dashboard_web test
+          pnpm --dir crates/dashboard/dashboard_web check
+          pnpm --dir crates/dashboard/dashboard_web test
 
       - name: Verify embedded frontend asset
         run: |
-          pnpm --dir crates/expri-dashboard/dashboard_web build
-          git diff --exit-code -- crates/expri-dashboard/dashboard_web/app.js
+          pnpm --dir crates/dashboard/dashboard_web build
+          git diff --exit-code -- crates/dashboard/dashboard_web/app.js
 
   container-workflow:
     name: Host and worker workflow
@@ -138,18 +138,18 @@ jobs:
           uv pip install --system --python python3 packaging==25.0 tomli==2.2.1
 
       - name: Run dependency graph and offline uv integration tests
-        run: python3 -B crates/expri-worker/src/environment/runtime_tests.py
+        run: python3 -B crates/worker/src/environment/runtime_tests.py
 
       - name: Run binary and live subprocess logging tests
-        run: python3 -B crates/expri-worker/src/run_logs_tests.py
+        run: python3 -B crates/worker/src/run_logs_tests.py
 
       - name: Run detached supervision and job controls tests
         run: |
-          python3 -B crates/expri-worker/src/jobs_tests.py
-          python3 -B crates/expri-worker/src/run_lifecycle_tests.py
+          python3 -B crates/worker/src/jobs_tests.py
+          python3 -B crates/worker/src/run_lifecycle_tests.py
 
       - name: Run metrics producer tests
-        run: python3 -B crates/expri-worker/python/expri_metrics_tests.py
+        run: python3 -B crates/worker/python/expri_metrics_tests.py
 
       - name: Verify installed-package fixture wheels
         run: python3 -B tests/containers/fixtures_tests.py
