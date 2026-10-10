@@ -136,18 +136,31 @@ fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation(
     "project_id":"project", "revision":"7", "file_count":1, "logical_bytes":8,
     "object_count":1, "object_bytes":8, "shared_reference_count":0,
     "retained_object_count":0, "retained_object_bytes":0,
+    "s3_object_count":1, "s3_storage_bytes":8,
     "pending_upload_count":0, "pending_upload_bytes":0, "tracking_bytes":0,
+    "local_archive_bytes":0, "local_storage_bytes":0,
     "reclaimable_object_count":1, "reclaimable_object_bytes":8,
   });
+  let mut legacy_stats = stats.clone();
+  let added_fields = [
+    "s3_object_count",
+    "s3_storage_bytes",
+    "local_archive_bytes",
+    "local_storage_bytes",
+  ];
+  for field in added_fields {
+    legacy_stats.as_object_mut().unwrap().remove(field);
+  }
   let deletion = json!({"project_id":"project","status":"pending","pending_tasks":1,"deleted_objects":0,"aborted_uploads":0,"last_error":null});
   let replies = [
     json!({"kind":"project_storage","stats":stats}),
     json!({"kind":"project_delete_preview","preview":{"project_id":"project","revision":"7","run_count":0,"stats":stats}}),
     json!({"kind":"project_deletion","deletion":deletion}),
     json!({"kind":"project_deletion","deletion":deletion}),
+    json!({"kind":"project_storage","stats":legacy_stats}),
   ];
   let mut index = 0;
-  let (url, task) = mock(4, move |request, _| {
+  let (url, task) = mock(5, move |request, _| {
     let operation: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(request.path, "/v1/request");
     assert!(
@@ -163,7 +176,8 @@ fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation(
         "project_storage",
         "preview_project_delete",
         "delete_project",
-        "project_deletion"
+        "project_deletion",
+        "project_storage"
       ][index]
     );
     if index == 2 {
@@ -176,10 +190,10 @@ fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation(
     (200, Vec::new(), serde_json::to_vec(&reply).unwrap())
   });
   let config = config(&root, &url);
-  assert_eq!(
-    project_stats(&config, "project").unwrap()["logical_bytes"],
-    8
-  );
+  let current = project_stats(&config, "project").unwrap();
+  assert_eq!(current["logical_bytes"], 8);
+  assert_eq!(current["s3_storage_bytes"], 8);
+  assert_eq!(current["local_storage_bytes"], 0);
   assert_eq!(
     project_delete_preview(&config, "project").unwrap()["revision"],
     "7"
@@ -192,6 +206,14 @@ fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation(
     project_deletion(&config, "project").unwrap()["project_id"],
     "project"
   );
+  let legacy = project_stats(&config, "project").unwrap();
+  assert_eq!(legacy["object_bytes"], 8);
+  for field in added_fields {
+    assert!(
+      legacy.get(field).is_none(),
+      "an older server has no {field} total"
+    );
+  }
   task.join().unwrap();
   assert!(
     project_delete(&root.join("missing.toml"), "project", "7", "other")

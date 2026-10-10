@@ -246,9 +246,22 @@ pub struct ProjectStorageStats {
   pub shared_reference_count: u64,
   pub retained_object_count: u64,
   pub retained_object_bytes: u64,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub s3_object_count: Option<u64>,
+  /// Recorded completed object payloads, including retained uploads and counting each key once.
+  /// This excludes pending multipart parts and provider-managed historical object versions.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub s3_storage_bytes: Option<u64>,
   pub pending_upload_count: u64,
   pub pending_upload_bytes: u64,
   pub tracking_bytes: u64,
+  /// Saved result.zip payloads owned by registered archive jobs, including retained archives.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub local_archive_bytes: Option<u64>,
+  /// Acknowledged tracking payloads and saved archives on the server, excluding shared SQLite
+  /// metadata, projections, filesystem allocation overhead, and unregistered temporary files.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub local_storage_bytes: Option<u64>,
   pub reclaimable_object_count: u64,
   pub reclaimable_object_bytes: u64,
 }

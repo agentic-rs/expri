@@ -166,6 +166,10 @@ fn project_stats_distinguish_shared_references_retained_and_pending_objects() {
     ),
     (1, 7)
   );
+  assert_eq!(
+    (shared.s3_object_count, shared.s3_storage_bytes),
+    (Some(1), Some(7))
+  );
   publish(&store, &backend, output.clone(), "replacement");
   publish(&store, &backend, output, "newest");
   begin(
@@ -188,6 +192,11 @@ fn project_stats_distinguish_shared_references_retained_and_pending_objects() {
     (1, 7)
   );
   assert_eq!(
+    (selected.s3_object_count, selected.s3_storage_bytes),
+    (Some(3), Some(21)),
+    "retained objects consume storage, references and pending declared bytes do not"
+  );
+  assert_eq!(
     (
       selected.reclaimable_object_count,
       selected.reclaimable_object_bytes
@@ -195,6 +204,104 @@ fn project_stats_distinguish_shared_references_retained_and_pending_objects() {
     (3, 21)
   );
   assert_ne!(selected.revision, shared.revision);
+}
+
+#[test]
+fn project_local_storage_counts_tracking_versions_legacy_streams_and_registered_archives() {
+  use std::os::unix::fs::symlink;
+  let directory = tempfile::tempdir().unwrap();
+  let outside = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), CleanupStorage::default()).unwrap();
+  for (revision, total_size, bytes) in [(1, 2, b"{}".as_slice()), (2, 6, b"{\"a".as_slice())] {
+    store
+      .execute(Request::PutDocument {
+        scope: scope(),
+        path: "run-state.json".into(),
+        revision,
+        offset: 0,
+        total_size,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+      })
+      .unwrap();
+  }
+  for request in [
+    Request::AppendTracking {
+      scope: scope(),
+      path: "outputs/metrics.jsonl".into(),
+      offset: 0,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(b"{}\n"),
+    },
+    Request::AppendStream {
+      scope: scope(),
+      path: "logs/stdout.log".into(),
+      offset: 0,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(b"old\n"),
+    },
+  ] {
+    store.execute(request).unwrap();
+  }
+  let mut foreign = scope();
+  foreign.project_id = "foreign".into();
+  for (id, owner, status, contents) in [
+    (1, scope(), "uploading", b"stage".as_slice()),
+    (2, scope(), "archived", b"archive".as_slice()),
+    (3, foreign, "archived", b"foreign archive".as_slice()),
+  ] {
+    store
+      .db()
+      .unwrap()
+      .execute(
+        "INSERT INTO result_archives(id,scope,snapshot,status) VALUES(?1,?2,'{}',?3)",
+        params![id, serde_json::to_string(&owner).unwrap(), status],
+      )
+      .unwrap();
+    let archive = directory.path().join("archives").join(id.to_string());
+    fs::create_dir_all(&archive).unwrap();
+    fs::write(archive.join("result.zip"), contents).unwrap();
+  }
+  // Queued archives have no local payload yet; links and unregistered leftovers are not owned bytes.
+  for id in [4, 5] {
+    store
+      .db()
+      .unwrap()
+      .execute(
+        "INSERT INTO result_archives(id,scope,snapshot) VALUES(?1,?2,'{}')",
+        params![id, serde_json::to_string(&scope()).unwrap()],
+      )
+      .unwrap();
+  }
+  fs::create_dir_all(directory.path().join("archives/4")).unwrap();
+  fs::write(outside.path().join("private.zip"), b"private contents").unwrap();
+  symlink(
+    outside.path().join("private.zip"),
+    directory.path().join("archives/4/result.zip"),
+  )
+  .unwrap();
+  fs::create_dir_all(directory.path().join("archives/999")).unwrap();
+  fs::write(directory.path().join("archives/999/result.zip"), b"orphan").unwrap();
+  let stats = store.project_storage("project").unwrap();
+  assert_eq!(stats.tracking_bytes, 12);
+  assert_eq!(stats.local_archive_bytes, Some(12));
+  assert_eq!(stats.local_storage_bytes, Some(24));
+  assert_eq!(
+    (stats.s3_object_count, stats.s3_storage_bytes),
+    (Some(0), Some(0))
+  );
+  assert_eq!(
+    store
+      .project_storage("foreign")
+      .unwrap()
+      .local_storage_bytes,
+    Some(15)
+  );
+  assert_eq!(
+    store
+      .preview_project_delete("project")
+      .unwrap()
+      .stats
+      .local_storage_bytes,
+    Some(24)
+  );
 }
 
 #[test]

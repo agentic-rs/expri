@@ -61,6 +61,11 @@ test("storage management validates scope and all counters without treating file 
   assert.equal(storageStatsValid({ ...stats(), object_bytes: -1 }, project_id), false);
   assert.equal(storageStatsValid({ ...stats(), tracking_bytes: Number.MAX_SAFE_INTEGER + 1 }, project_id), false);
   assert.equal(storageStatsValid({ ...stats(), retained_object_count: undefined }, project_id), false);
+  assert.equal(storageStatsValid({ ...stats(), s3_object_count: 3, s3_storage_bytes: 9_216,
+    local_storage_bytes: 1_024, local_archive_bytes: 768 }, project_id), true);
+  assert.equal(storageStatsValid({ ...stats(), s3_storage_bytes: -1 }, project_id), false);
+  assert.equal(storageStatsValid({ ...stats(), local_storage_bytes: Number.MAX_SAFE_INTEGER + 1 }, project_id), false);
+  assert.equal(storageStatsValid({ ...stats(), local_archive_bytes: null }, project_id), false);
   assert.equal(deletionPreviewValid({ ...preview(), stats: stats("other") }, project_id), false);
   assert.equal(projectDeletionValid(deletion(), project_id), true);
   assert.equal(projectDeletionValid(deletion(project_id, "needs_attention"), project_id), true);

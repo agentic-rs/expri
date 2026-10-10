@@ -2008,7 +2008,9 @@ function managementStats(project_id = "vision", revision = "storage-1") {
     object_count: 2, object_bytes: 8_192, shared_reference_count: 2,
     retained_object_count: 1, retained_object_bytes: 1_024, pending_upload_count: 1,
     pending_upload_bytes: 512, tracking_bytes: 256,
-    reclaimable_object_count: 3, reclaimable_object_bytes: 9_216 };
+    reclaimable_object_count: 3, reclaimable_object_bytes: 9_216,
+    s3_object_count: 3, s3_storage_bytes: 9_216,
+    local_storage_bytes: 1_024, local_archive_bytes: 768 };
 }
 function managementPreview(project_id = "vision", revision = "preview-1") {
   return { project_id, revision, run_count: 2, stats: managementStats(project_id) };
@@ -2018,21 +2020,34 @@ function managementDeletion(status = "pending") {
     deleted_objects: status === "deleted" ? 3 : 1, aborted_uploads: 1, last_error: null };
 }
 
-test("storage usage explains deduplicated object bytes and file totals while disabled dashboards omit deletion", async t => {
+test("project usage shows stored S3 and server local bytes instead of reference-expanded totals", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
   await click(nodes.get("workspace-view-storage"));
-  await settled(() => nodes.get("storage-usage").textContent.includes("8 KiB"));
+  await settled(() => nodes.get("storage-usage").textContent.includes("9 KiB"));
   const usage = nodes.get("storage-usage");
-  assert.match(usage.textContent, /Referenced object storage8 KiB2 unique objects/);
-  assert.match(usage.textContent, /File totals16 KiB4 file entries/);
-  assert.match(usage.textContent, /Shared references2Additional entries/);
-  assert.match(usage.textContent, /Retained objects1 KiB/);
+  assert.match(usage.textContent, /S3 storage9 KiB3 stored objects, including retained uploads/);
+  assert.match(usage.textContent, /Local storage1 KiBTracking files and result archives on the server/);
+  assert.doesNotMatch(usage.textContent, /File totals|Shared references|16 KiB/);
   assert.match(usage.textContent, /Pending uploads512 B declared/);
-  assert.match(usage.textContent, /Tracking data256 B/);
-  assert.match(usage.textContent, /not the full bucket bill/);
+  assert.match(usage.textContent, /Shared inputs and outputs count once/);
+  assert.match(usage.textContent, /historical S3 versions and shared database overhead are excluded/);
   assert.equal(nodes.document.getElementById("delete-project-button"), null);
   assert.equal(nodes.get("delete-project-dialog").open, false);
   assert.equal(nodes.document.querySelectorAll("#storage-kind-options input[type=radio]").length, 2);
+});
+
+test("older servers show unique S3 totals and leave incomplete local usage unavailable", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [], override: (parsed) => {
+    if (parsed.pathname !== "/api/storage/stats") return null;
+    const { s3_object_count, s3_storage_bytes, local_storage_bytes, local_archive_bytes, ...legacy } = managementStats(parsed.searchParams.get("project_id"));
+    return response({ stats: legacy, delete_enabled: false });
+  } }), { nodes } = model;
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-usage").textContent.includes("9 KiB"));
+  assert.match(nodes.get("storage-usage").textContent, /S3 storage9 KiB3 stored objects/);
+  assert.match(nodes.get("storage-usage").textContent, /Local storageUnavailable/);
+  assert.match(nodes.get("storage-usage").textContent, /Upgrade the server/);
+  assert.doesNotMatch(nodes.get("storage-usage").textContent, /256 B|16 KiB/);
 });
 
 test("project deletion preview is scoped and cancel clears the password without a destructive request", async t => {
@@ -2049,8 +2064,9 @@ test("project deletion preview is scoped and cancel clears the password without 
   await settled(() => nodes.document.getElementById("delete-project-preview"));
   assert.equal(nodes.get("delete-project-dialog").open, true);
   assert.match(nodes.get("delete-project-preview").textContent, /vision/);
-  assert.match(nodes.get("delete-project-preview").textContent, /Local files remain/);
-  assert.match(nodes.get("delete-project-preview").textContent, /Runs2.*File entries4.*Storage to reclaim9 KiB/);
+  assert.match(nodes.get("delete-project-preview").textContent, /Files on workers and your laptop remain/);
+  assert.match(nodes.get("delete-project-preview").textContent, /Runs2.*S3 storage to reclaim9 KiB.*Local storage to remove1 KiB/);
+  assert.doesNotMatch(nodes.get("delete-project-preview").textContent, /File entries/);
   assert.equal(nodes.get("delete-project-submit").disabled, true);
   setValue(nodes.get("delete-project-confirmation"), "vision"); await emit(nodes.get("delete-project-confirmation"), "input");
   assert.equal(nodes.get("delete-project-submit").disabled, true, "a password is required before enabling deletion");

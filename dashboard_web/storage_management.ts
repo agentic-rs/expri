@@ -15,6 +15,10 @@ export type StorageStats = {
   tracking_bytes: number;
   reclaimable_object_count: number;
   reclaimable_object_bytes: number;
+  s3_object_count?: number;
+  s3_storage_bytes?: number;
+  local_storage_bytes?: number;
+  local_archive_bytes?: number;
 };
 export type DeletePreview = {
   project_id: string;
@@ -57,12 +61,14 @@ const STATS_COUNTS = [
   "retained_object_count", "retained_object_bytes", "pending_upload_count", "pending_upload_bytes",
   "tracking_bytes", "reclaimable_object_count", "reclaimable_object_bytes",
 ] as const;
+const STORAGE_TOTALS = ["s3_object_count", "s3_storage_bytes", "local_storage_bytes", "local_archive_bytes"] as const;
 export function storageStatsValid(value: unknown, project_id: string): value is StorageStats {
   if (value === null || typeof value !== "object") return false;
   const stats = value as StorageStats;
   return validProject(project_id) && stats.project_id === project_id &&
     typeof stats.revision === "string" && stats.revision.length > 0 &&
-    STATS_COUNTS.every((key) => count(stats[key]));
+    STATS_COUNTS.every((key) => count(stats[key])) &&
+    STORAGE_TOTALS.every((key) => stats[key] === undefined || count(stats[key]));
 }
 export function deletionPreviewValid(value: unknown, project_id: string): value is DeletePreview {
   if (value === null || typeof value !== "object") return false;
