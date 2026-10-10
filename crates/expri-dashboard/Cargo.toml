@@ -1,0 +1,20 @@
+[package]
+name = "expri-dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared experiment dashboard views, charts, and browser assets for expri"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+expri-core.workspace = true
+expri-run-data.workspace = true
+chrono.workspace = true
+form_urlencoded.workspace = true
+http.workspace = true
+httparse.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

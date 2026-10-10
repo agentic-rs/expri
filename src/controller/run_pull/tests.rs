@@ -1,4 +1,5 @@
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use super::*;

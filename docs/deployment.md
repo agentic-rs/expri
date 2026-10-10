@@ -5,7 +5,8 @@ Backblaze/S3 storage, and recorded run data. Each hostname has its own browser
 sessions. The dashboard password is shared, but signing in or out on one site
 does not sign in or out on the other.
 
-AB previews the selected branch's `dashboard_web` HTML, JavaScript, and CSS.
+AB previews the selected branch's HTML, JavaScript, and CSS from
+`crates/expri-dashboard/dashboard_web`.
 The API and Rust chart renderer come from the main service. Interactive chart
 controls are bundled into `app.js` and enhance the sampled SVG returned by that
 service, so an AB asset deployment can preview those controls too. Do not start
@@ -135,7 +136,7 @@ Omitting `--ref` selects the current named branch. Feature branches resolve
 locally; `main` always fetches `origin/main` before a real deployment. A main
 dry run reports the cached remote commit and does not fetch. Commit and build
 the TypeScript and TSX changes before deploying; the release uses the committed
-`dashboard_web/app.js`, which CI checks against its source.
+`crates/expri-dashboard/dashboard_web/app.js`, which CI checks against its source.
 React is bundled into that asset; neither AB nor the main service needs a
 Node.js runtime or a frontend dependency installation.
 

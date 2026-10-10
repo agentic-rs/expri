@@ -47,15 +47,15 @@ class SourceTests(unittest.TestCase):
     self.git('config', 'user.email', 'deployment@example.invalid')
     self.git('config', 'commit.gpgsign', 'false')
     self.git('config', 'core.hooksPath', '/dev/null')
-    (self.repo / 'dashboard_web').mkdir()
+    (self.repo / deploy.WEB_PREFIX).mkdir(parents=True)
     for name, content in web_files('main').items():
-      (self.repo / 'dashboard_web' / name).write_bytes(content)
+      (self.repo / deploy.WEB_PREFIX / name).write_bytes(content)
     self.git('add', '.')
     self.git('commit', '-m', 'main fixture')
     self.main = self.git('rev-parse', 'HEAD')
     self.git('update-ref', 'refs/remotes/origin/main', self.main)
     self.git('checkout', '-b', 'feature/demo')
-    (self.repo / 'dashboard_web/index.html').write_bytes(b'<p>feature</p>')
+    (self.repo / deploy.WEB_PREFIX / 'index.html').write_bytes(b'<p>feature</p>')
     self.git('commit', '-am', 'feature fixture')
     self.feature = self.git('rev-parse', 'HEAD')
 

@@ -537,14 +537,14 @@ def prepare_environment(environment, repo_root, state_dir, extras, sync_args, in
 
 pub(crate) fn python_run_script(request_path: &str) -> String {
   let request_path = serde_json::to_string(request_path).expect("request path string");
-  let snapshot = serde_json::to_string(include_str!("../environment/snapshot.py"))
-    .expect("snapshot script string");
-  let maintenance = serde_json::to_string(include_str!("../environment/maintenance.py"))
-    .expect("maintenance script string");
+  let snapshot =
+    serde_json::to_string(expri_worker::SNAPSHOT_SCRIPT).expect("snapshot script string");
+  let maintenance =
+    serde_json::to_string(expri_worker::MAINTENANCE_SCRIPT).expect("maintenance script string");
   let run_logs =
-    serde_json::to_string(include_str!("../run_logs.py")).expect("run logging script string");
-  let lifecycle = serde_json::to_string(include_str!("../run_lifecycle.py"))
-    .expect("run lifecycle script string");
+    serde_json::to_string(expri_worker::RUN_LOGS_SCRIPT).expect("run logging script string");
+  let lifecycle =
+    serde_json::to_string(expri_worker::RUN_LIFECYCLE_SCRIPT).expect("run lifecycle script string");
   let common = format!(
     r#"import json, os, pathlib, subprocess, sys
 {preamble}
@@ -591,8 +591,8 @@ pub(crate) fn python_environment_script(request: &EnvironmentCommandRequest) -> 
   let request =
     serde_json::to_string(&serde_json::to_string(request).expect("environment request"))
       .expect("request string");
-  let maintenance = serde_json::to_string(include_str!("../environment/maintenance.py"))
-    .expect("maintenance script string");
+  let maintenance =
+    serde_json::to_string(expri_worker::MAINTENANCE_SCRIPT).expect("maintenance script string");
   python_preserve_command_exit_code(format!(
     r#"import json, os, pathlib, subprocess, sys
 {preamble}

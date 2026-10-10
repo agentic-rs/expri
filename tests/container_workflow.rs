@@ -112,7 +112,7 @@ impl Fixture {
     fs::write(self.repo.join("train.py"), TRAIN).unwrap();
     fs::write(
       self.repo.join("expri_metrics.py"),
-      include_str!("../python/expri_metrics.py"),
+      expri_worker::METRICS_PRODUCER_SCRIPT,
     )
     .unwrap();
     fs::write(self.repo.join(".gitignore"), ".expri/\nresults/\n.venv/\n").unwrap();

@@ -226,8 +226,7 @@ fn parse_source(value: &str, client_config: Option<&Path>) -> Result<Source> {
       requested_revision: Some(revision.into()),
     }
   } else if value.starts_with("expri://") {
-    let parsed =
-      reqwest::Url::parse(value).map_err(|_| message("invalid private asset reference"))?;
+    let parsed = url::Url::parse(value).map_err(|_| message("invalid private asset reference"))?;
     if !parsed.username().is_empty()
       || parsed.password().is_some()
       || parsed.query().is_some()
@@ -266,10 +265,10 @@ fn parse_source(value: &str, client_config: Option<&Path>) -> Result<Source> {
       }
       let text =
         std::str::from_utf8(&bytes).map_err(|_| message("service client config must be UTF-8"))?;
-      let config: crate::service::types::ClientConfig =
+      let config: expri_core::service::ClientConfig =
         toml::from_str(text).map_err(|_| message("service client configuration is invalid"))?;
       let configured =
-        reqwest::Url::parse(&config.url).map_err(|_| message("invalid client service URL"))?;
+        url::Url::parse(&config.url).map_err(|_| message("invalid client service URL"))?;
       if configured.host_str() != Some(host) || configured.port() != parsed.port() {
         return Err(message(
           "client configuration points at a different asset server",

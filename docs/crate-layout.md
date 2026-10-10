@@ -1,34 +1,39 @@
 # Internal crate layout
 
-The workspace builds one `expri` executable. Its commands, configuration, run
-directories, and wire formats remain shared across controller, worker, and
-server modes.
+The Cargo workspace builds one `expri` executable. Controllers, workers, the
+local dashboard, and the hosted service keep the same commands, configuration,
+run directories, and wire formats.
 
 | Package | Responsibility | Internal dependencies |
 | --- | --- | --- |
-| `expri-core` | Shared protocol and configuration values, identifiers, errors, and filesystem leases | None |
-| `expri-run-data` | Run catalogs, metric readers, and artifact inventories | `expri-core` |
-| `expri` | CLI, configuration loading, controller and worker execution, transfers, dashboards, and hosted server | Both libraries |
+| `expri-core` | Protocol and service contracts, validated configuration values, identifiers, errors, filesystem leases | None |
+| `expri-run-data` | Run catalogs, metric readers, artifact inventories | `expri-core` |
+| `expri-client` | Publishing, durable transfer queues, checkpoint registration, downloads | `expri-core`, `expri-run-data` |
+| `expri-assets` | Git-tracked asset descriptors, acquisition, verified cache, binding inputs | `expri-core`, `expri-client` |
+| `expri-worker` | Python environments, snapshots, execution, supervision, logs, job controls | `expri-core`, `expri-run-data`, `expri-client`, `expri-assets` |
+| `expri-dashboard` | Shared dashboard views, tables, charts, previews, HTTP routes, embedded frontend | `expri-core`, `expri-run-data` |
+| `expri-server` | Hosted API, authentication, SQLite tracking, S3, project management, retention | `expri-core`, `expri-run-data`, `expri-dashboard` |
+| `expri` | CLI, repository configuration loading, SSH/controller orchestration, local adapters and composition | All seven libraries |
 
-Dependency direction is `expri` → `expri-run-data` → `expri-core`; the CLI also
-uses core directly. Neither library depends on the CLI, HTTP clients, SQLite,
-or S3. CLI parsing and chart rendering tests stay with the executable rather
-than introducing dependencies from run data into those layers. The Python run
-catalog is packaged with `expri-run-data`; other embedded Python and dashboard
-assets remain with `expri`.
+Shared contracts flow from core into data and subsystem implementations; the
+executable composes those implementations. Libraries never depend on the CLI.
+The client does not depend on the hosted server, and the shared dashboard does
+not depend on either worker execution or server storage.
 
-The CLI's run inspection adapter adds publisher status to the stored run report.
-The data library reads records without depending on publisher execution.
+The local dashboard adapter resolves repository and cached-run paths. It adds
+publisher status through the CLI's run inspection adapter and implements the
+same `DashboardView` as the hosted adapter. Shared routes consume that interface
+without loading CLI configuration or invoking an SSH controller.
 
-Future extractions can separate the client and transfer queues, asset
-acquisition, and worker execution, followed by dashboard presentation and the
-hosted server. Preserve this dependency direction and the single executable
-while moving each subsystem. Split shared contracts before their consumers;
-avoid a generic utility crate that absorbs unrelated implementation details.
+Embedded resources live with the subsystem that uses them: `catalog.py` belongs
+to run data; Python environment, logging, supervision, and metrics producer
+scripts belong to the worker; the complete `dashboard_web` directory belongs
+to the dashboard. Its generated `app.js` stays committed, so building or
+installing the Rust CLI does not require Node.js.
 
 ## Validation and packaging
 
-Run all workspace libraries and the existing CLI integration tests:
+Check every workspace library and the existing CLI integration tests:
 
 ```sh
 cargo fmt --all -- --check
@@ -37,57 +42,63 @@ cargo test --workspace --all-targets --all-features --locked
 cargo +1.89.0 build --locked --bin expri
 ```
 
-The existing Python, frontend, host/worker, and self-hosted S3 suites still
-exercise the executable. The container builder copies the workspace crates;
-deployment builds already receive the complete Git source archive.
+The Python, frontend, host/worker, and self-hosted S3 suites continue to exercise
+the existing workflow. The container builder copies all crates; deployment
+builds receive the complete Git source archive. Dashboard build commands and AB
+bundles use `crates/expri-dashboard/dashboard_web`.
 
 Internal dependencies specify both a local path and an exact version. Cargo
-removes those paths when packaging, so an ordinary dependent-package dry run
-needs the library versions to exist in the registry. Before their first
-publication, verify packaged sources using temporary local patches instead:
+removes dependency paths when packaging, so an ordinary dependent-package dry
+run needs the library versions to exist in the registry. Before their initial
+publication, verify packaged sources using temporary local patches:
 
 1. Package `expri-core` with `cargo +1.89.0 package --locked -p expri-core`.
 2. Extract its `.crate` archive from `target/package/` into a temporary directory
    outside the checkout, so Cargo does not discover the parent workspace.
-3. Package `expri-run-data`, passing
-   `--config 'patch.crates-io.expri-core.path="/absolute/extracted/expri-core-VERSION"'`.
-4. Extract that package too, then package `expri` with patches pointing to both
-   extracted libraries.
+3. Package remaining libraries in the release order below. Supply patches for
+   internal dependencies pointing to their already extracted archives, for
+   example `--config 'patch.crates-io.expri-core.path="/absolute/extracted/expri-core-VERSION"'`.
+4. Extract each new package before packaging its consumers, then package
+   `expri` with all internal dependencies patched to those extracted sources.
 
-Use `cargo +1.89.0 package -p PACKAGE` in steps 3 and 4. Temporary path patches
+Use `cargo +1.89.0 package -p PACKAGE` for each package. Temporary path patches
 can change lockfile source entries, so these verification commands may need to
-omit `--locked`; keep the committed workspace lockfile unchanged. When checking
-uncommitted changes, add `--allow-dirty`. Inspect each archive's manifest and
-embedded assets, and run the packaged CLI's `--version`. This verifies shipped
-sources locally without claiming a normal registry dry run succeeded.
+omit `--locked`; preserve the committed workspace lockfile byte-for-byte. For
+uncommitted changes, add `--allow-dirty`. A shared `CARGO_TARGET_DIR` can reuse
+compiled dependencies. Inspect normalized manifests and embedded resources,
+run tests from extracted packages, and check the packaged CLI's `--version`.
+These checks verify shipped sources without claiming a normal registry dry run
+succeeded.
 
 ## Release
 
 The libraries remain internal implementation boundaries, but must be published
 so `cargo install expri --locked` can resolve them. Keep all package versions and
-their exact internal dependency versions aligned. The release following
-v0.1.5 needs a new version because that CLI version is already published.
+exact internal dependency versions aligned. The release following v0.1.5 needs
+a new version because that CLI version is already published.
 
-Configure crates.io trusted publishing for **each** of `expri-core`,
-`expri-run-data`, and `expri`, using this repository's `release.yml` workflow
-and `cargo` environment. The existing CLI publisher registration does not
-authorize publishing the two new package names automatically.
-
+Configure crates.io trusted publishing for each library and `expri`, using this
+repository's `release.yml` workflow and `cargo` environment. The existing CLI
+publisher registration does not authorize the new package names automatically.
 New crate names need an initial manual publication before their trusted
 publisher can be configured, as described in the
 [Rust trusted publishing design](https://rust-lang.github.io/rfcs/3691-trusted-publishing-cratesio.html#trusted-publisher-configuration-on-cratesio).
 Complete that one-time bootstrap separately before using the tag workflow;
-the versions selected for a tag must still be unpublished for all three
-packages.
+versions selected for a tag must still be unpublished for every package.
 
 The tag workflow publishes in dependency order:
 
 ```sh
 cargo publish --locked -p expri-core
 cargo publish --locked -p expri-run-data
+cargo publish --locked -p expri-client
+cargo publish --locked -p expri-assets
+cargo publish --locked -p expri-worker
+cargo publish --locked -p expri-dashboard
+cargo publish --locked -p expri-server
 cargo publish --locked -p expri
 ```
 
 These explicit package commands work with Rust 1.89, where workspace-wide
-publication is unstable. Publishing is a release action; crate extraction and
-packaging validation do not publish anything.
+publication is unstable. Crate extraction and packaging checks do not publish
+anything.

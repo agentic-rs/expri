@@ -12,6 +12,7 @@ import tempfile
 from deploy_install import WEB_FILES, digest
 
 SCRIPTS = Path(__file__).resolve().parent
+WEB_PREFIX = 'crates/expri-dashboard/dashboard_web'
 
 
 def command(args, *, cwd=None, timeout=60):
@@ -44,13 +45,13 @@ def source(repo, ref, *, fetch=False):
 
 def bundle(repo, branch, commit, target, directory):
   archive = directory / 'source.tar'
-  files = [f'dashboard_web/{name}' for name in WEB_FILES] if target == 'ab' else []
+  files = [f'{WEB_PREFIX}/{name}' for name in WEB_FILES] if target == 'ab' else []
   command(['git', '-C', str(repo), 'archive', '--format=tar', '--output', str(archive), commit, *files])
   if target == 'ab':
     with tarfile.open(archive) as source_archive:
       payloads = {}
       for name in WEB_FILES:
-        member = source_archive.getmember('dashboard_web/' + name)
+        member = source_archive.getmember(WEB_PREFIX + '/' + name)
         if not member.isfile() or not 0 < member.size <= 2 * 1024 * 1024:
           raise ValueError('dashboard bundle contains an invalid asset')
         payloads[name] = source_archive.extractfile(member).read()

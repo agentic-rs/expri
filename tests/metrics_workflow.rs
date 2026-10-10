@@ -246,7 +246,7 @@ mod python_producer {
   use expri_run_data::metrics::read;
   use serde_json::json;
   use std::fs;
-  use std::path::{Path, PathBuf};
+  use std::path::PathBuf;
 
   struct Fixture {
     _root: tempfile::TempDir,
@@ -285,9 +285,9 @@ mod python_producer {
     let run = fixture.run("run-python", b"");
     let code = run.join("code");
     fs::create_dir(&code).unwrap();
-    fs::copy(
-      Path::new(env!("CARGO_MANIFEST_DIR")).join("python/expri_metrics.py"),
+    fs::write(
       code.join("expri_metrics.py"),
+      expri_worker::METRICS_PRODUCER_SCRIPT,
     )
     .unwrap();
     fs::write(

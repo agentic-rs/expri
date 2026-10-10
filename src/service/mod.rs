@@ -1,19 +1,8 @@
-mod browser;
-mod browser_assets;
-mod browser_auth;
-mod client;
-mod dashboard_data;
-mod notifications;
-pub(crate) mod publishing;
-pub(crate) mod registrations;
-mod server;
-mod storage;
-mod store;
-pub(crate) mod types;
-
-pub(crate) use client::fetch_files;
-pub(crate) use client::input_download_prepared;
-pub(crate) use types::validate_component;
+pub use expri_client::FetchOptions;
+use expri_client::client;
+pub(crate) use expri_client::{fetch_files, publishing, registrations, validate_component};
+use expri_core::service as types;
+use expri_server as server;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -21,20 +10,6 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::error::{ExpriError, Result};
-
-#[derive(Clone, Debug)]
-pub struct FetchOptions {
-  pub config: PathBuf,
-  pub project_id: String,
-  pub origins: Vec<String>,
-  pub repo: PathBuf,
-  pub results_dir: PathBuf,
-  pub artifacts: Vec<String>,
-  pub labels: Vec<String>,
-  pub watch: bool,
-  pub dry_run: bool,
-  pub quiet: bool,
-}
 
 #[derive(Debug, Args)]
 pub struct ServiceCommand {
@@ -320,10 +295,10 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       let config = toml::from_str(&std::fs::read_to_string(config)?)?;
       return server::serve(config, listen, data_dir, create_bucket);
     }
-    ServiceSubcommand::Publish(options) => client::publish(options)?,
+    ServiceSubcommand::Publish(options) => client::publish(options.into())?,
     ServiceSubcommand::Resume { run_dir } => publishing::resume(&run_dir)?,
     ServiceSubcommand::PublishWorker { run_dir } => return publishing::worker(&run_dir),
-    ServiceSubcommand::Fetch(options) => client::fetch(options)?,
+    ServiceSubcommand::Fetch(options) => client::fetch(options.into())?,
     ServiceSubcommand::List {
       config,
       project_id,
@@ -338,15 +313,90 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       },
       options.partial,
     )?,
-    ServiceSubcommand::FileUpload(options) => client::file_upload(options)?,
-    ServiceSubcommand::Reference(options) => client::reference(options)?,
+    ServiceSubcommand::FileUpload(options) => client::file_upload(options.into())?,
+    ServiceSubcommand::Reference(options) => client::reference(options.into())?,
     ServiceSubcommand::Input { command } => match command {
-      InputCommand::Upload(options) => client::input_upload(options)?,
-      InputCommand::Download(options) => client::input_download(options)?,
+      InputCommand::Upload(options) => client::input_upload(options.into())?,
+      InputCommand::Download(options) => client::input_download(options.into())?,
     },
   };
   println!("{}", serde_json::to_string(&report)?);
   Ok(())
+}
+
+impl From<PublishOptions> for expri_client::PublishOptions {
+  fn from(options: PublishOptions) -> Self {
+    Self {
+      config: options.config,
+      run_dir: options.run_dir,
+      project_id: options.project_id,
+      origin: options.origin,
+      artifacts: options.artifacts,
+      watch: options.watch,
+      queue_dir: options.queue_dir,
+    }
+  }
+}
+
+impl From<ServiceFetchOptions> for expri_client::ServiceFetchOptions {
+  fn from(options: ServiceFetchOptions) -> Self {
+    Self {
+      config: options.config,
+      project_id: options.project_id,
+      origin: options.origin,
+      run_id: options.run_id,
+      repo: options.repo,
+      results_dir: options.results_dir,
+      source: options.source,
+      artifacts: options.artifacts,
+    }
+  }
+}
+
+impl From<FileUploadOptions> for expri_client::FileUploadOptions {
+  fn from(options: FileUploadOptions) -> Self {
+    Self {
+      config: options.config,
+      target: options.target,
+      file: options.file,
+      queue_dir: options.queue_dir,
+    }
+  }
+}
+
+impl From<ReferenceOptions> for expri_client::ReferenceOptions {
+  fn from(options: ReferenceOptions) -> Self {
+    Self {
+      config: options.config,
+      source: options.source,
+      target: options.target,
+      size: options.size,
+      sha256: options.sha256,
+    }
+  }
+}
+
+impl From<InputUploadOptions> for expri_client::InputUploadOptions {
+  fn from(options: InputUploadOptions) -> Self {
+    Self {
+      config: options.config,
+      project_id: options.project_id,
+      input_id: options.input_id,
+      file: options.file,
+      queue_dir: options.queue_dir,
+    }
+  }
+}
+
+impl From<InputDownloadOptions> for expri_client::InputDownloadOptions {
+  fn from(options: InputDownloadOptions) -> Self {
+    Self {
+      config: options.config,
+      project_id: options.project_id,
+      input_id: options.input_id,
+      destination: options.destination,
+    }
+  }
 }
 
 #[cfg(test)]

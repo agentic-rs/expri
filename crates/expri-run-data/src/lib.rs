@@ -7,3 +7,5 @@ use expri_core::{error, protocol};
 pub mod metrics;
 pub mod run_artifacts;
 pub mod runs;
+
+pub mod cache;

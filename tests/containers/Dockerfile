@@ -9,8 +9,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY src/ src/
 COPY tests/container_workflow.rs tests/container_workflow.rs
-COPY python/expri_metrics.py python/expri_metrics.py
-COPY dashboard_web/index.html dashboard_web/login.html dashboard_web/styles.css dashboard_web/app.js dashboard_web/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
   --mount=type=cache,target=/build/target \
   cargo build --release --locked --bin expri \

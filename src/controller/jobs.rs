@@ -131,7 +131,7 @@ except (OSError, ValueError, RuntimeError) as error:
   print(str(error), file=sys.stderr)
   sys.exit(1)
 "#,
-    jobs = serde_json::to_string(include_str!("../jobs.py"))?,
+    jobs = serde_json::to_string(expri_worker::JOBS_SCRIPT)?,
     request = serde_json::to_string(&serde_json::to_string(request)?)?,
   ))
 }
