@@ -67,7 +67,7 @@ fn both_catalog_entrypoints_preserve_publishing_status_and_errors() {
   let request = RunQueryRequest::Show {
     run_id: "run-publisher".into(),
   };
-  let pure = expri_run_data::runs::query_directory(&runs_dir, &request).unwrap();
+  let pure = expri_runs::runs::query_directory(&runs_dir, &request).unwrap();
   assert!(pure.get("publishing").is_none());
   assert_eq!(query(&root, &request).unwrap(), pure);
 
@@ -105,7 +105,7 @@ fn both_catalog_entrypoints_preserve_publishing_status_and_errors() {
   );
   assert_eq!(report, super::query_directory(&runs_dir, &request).unwrap());
   assert!(
-    expri_run_data::runs::query_directory(&runs_dir, &request)
+    expri_runs::runs::query_directory(&runs_dir, &request)
       .unwrap()
       .get("publishing")
       .is_none()

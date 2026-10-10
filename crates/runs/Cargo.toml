@@ -1,5 +1,5 @@
 [package]
-name = "expri-run-data"
+name = "expri-runs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

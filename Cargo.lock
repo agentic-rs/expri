@@ -490,7 +490,7 @@ dependencies = [
  "expri-client",
  "expri-core",
  "expri-dashboard",
- "expri-run-data",
+ "expri-runs",
  "expri-server",
  "expri-worker",
  "serde",
@@ -523,7 +523,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "expri-core",
- "expri-run-data",
+ "expri-runs",
  "libc",
  "reqwest",
  "rustls",
@@ -553,7 +553,7 @@ version = "0.1.5"
 dependencies = [
  "chrono",
  "expri-core",
- "expri-run-data",
+ "expri-runs",
  "form_urlencoded",
  "http",
  "httparse",
@@ -564,7 +564,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "expri-run-data"
+name = "expri-runs"
 version = "0.1.5"
 dependencies = [
  "chrono",
@@ -584,7 +584,7 @@ dependencies = [
  "chrono",
  "expri-core",
  "expri-dashboard",
- "expri-run-data",
+ "expri-runs",
  "form_urlencoded",
  "http",
  "httparse",
@@ -611,7 +611,7 @@ dependencies = [
  "expri-assets",
  "expri-client",
  "expri-core",
- "expri-run-data",
+ "expri-runs",
  "libc",
  "serde",
  "serde_json",

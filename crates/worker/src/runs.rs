@@ -7,17 +7,15 @@ use serde_json::{Value, json};
 use crate::error::Result;
 use crate::protocol::RunQueryRequest;
 
-pub use expri_run_data::runs::{
-  CATALOG_SCRIPT, summary_directory, summary_from_state, validate_id,
-};
+pub use expri_runs::runs::{CATALOG_SCRIPT, summary_directory, summary_from_state, validate_id};
 
 pub fn query(repo_root: &Path, request: &RunQueryRequest) -> Result<Value> {
-  let report = expri_run_data::runs::query(repo_root, request)?;
+  let report = expri_runs::runs::query(repo_root, request)?;
   with_publishing(report, &repo_root.join(".expri/runs"), request)
 }
 
 pub fn query_directory(runs_dir: &Path, request: &RunQueryRequest) -> Result<Value> {
-  let report = expri_run_data::runs::query_directory(runs_dir, request)?;
+  let report = expri_runs::runs::query_directory(runs_dir, request)?;
   with_publishing(report, runs_dir, request)
 }
 

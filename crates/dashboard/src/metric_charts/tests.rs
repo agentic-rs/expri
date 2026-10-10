@@ -758,7 +758,7 @@ fn dashboard_html_budget_reports_when_metadata_alone_exceeds_the_limit() {
 
 #[test]
 fn hosted_sampled_metrics_keep_time_axis_chart_and_omission_count() {
-  use expri_run_data::metrics::{RunMetrics, read_event_data};
+  use expri_runs::metrics::{RunMetrics, read_event_data};
   use std::collections::BTreeMap;
   use std::io::Write;
   let mut bytes = Vec::new();

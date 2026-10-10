@@ -471,7 +471,7 @@ fn selected_label_identity_is_pinned_across_sequential_and_background_catalog_re
     }
     assert_eq!(report["status"], "pending");
     assert_eq!(report["retrying_runs"], 0);
-    let cached = expri_run_data::cache::cached_runs_dir(&root, "results", "service-project-worker")
+    let cached = expri_runs::cache::cached_runs_dir(&root, "results", "service-project-worker")
       .unwrap()
       .join("run-sync");
     assert!(!cached.join("outputs/checkpoint.pt").exists());

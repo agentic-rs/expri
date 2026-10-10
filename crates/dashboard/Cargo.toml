@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 expri-core.workspace = true
-expri-run-data.workspace = true
+expri-runs.workspace = true
 chrono.workspace = true
 form_urlencoded.workspace = true
 http.workspace = true

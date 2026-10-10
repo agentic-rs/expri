@@ -9,12 +9,12 @@ Directories under `crates/` omit the `expri-` prefix; Cargo package names retain
 | Package | Responsibility | Internal dependencies |
 | --- | --- | --- |
 | `expri-core` | Protocol and service contracts, validated configuration values, identifiers, errors, filesystem leases | None |
-| `expri-run-data` | Run catalogs, metric readers, artifact inventories | `expri-core` |
-| `expri-client` | Publishing, durable transfer queues, checkpoint registration, downloads | `expri-core`, `expri-run-data` |
+| `expri-runs` | Run catalogs, metric readers, artifact inventories | `expri-core` |
+| `expri-client` | Publishing, durable transfer queues, checkpoint registration, downloads | `expri-core`, `expri-runs` |
 | `expri-assets` | Git-tracked asset descriptors, acquisition, verified cache, binding inputs | `expri-core`, `expri-client` |
-| `expri-worker` | Python environments, snapshots, execution, supervision, logs, job controls | `expri-core`, `expri-run-data`, `expri-client`, `expri-assets` |
-| `expri-dashboard` | Shared dashboard views, tables, charts, previews, HTTP routes, embedded frontend | `expri-core`, `expri-run-data` |
-| `expri-server` | Hosted API, authentication, SQLite tracking, S3, project management, retention | `expri-core`, `expri-run-data`, `expri-dashboard` |
+| `expri-worker` | Python environments, snapshots, execution, supervision, logs, job controls | `expri-core`, `expri-runs`, `expri-client`, `expri-assets` |
+| `expri-dashboard` | Shared dashboard views, tables, charts, previews, HTTP routes, embedded frontend | `expri-core`, `expri-runs` |
+| `expri-server` | Hosted API, authentication, SQLite tracking, S3, project management, retention | `expri-core`, `expri-runs`, `expri-dashboard` |
 | `expri` | CLI, repository configuration loading, SSH/controller orchestration, local adapters and composition | All seven libraries |
 
 Shared contracts flow from core into data and subsystem implementations; the
@@ -92,7 +92,7 @@ The tag workflow publishes in dependency order:
 
 ```sh
 cargo publish --locked -p expri-core
-cargo publish --locked -p expri-run-data
+cargo publish --locked -p expri-runs
 cargo publish --locked -p expri-client
 cargo publish --locked -p expri-assets
 cargo publish --locked -p expri-worker

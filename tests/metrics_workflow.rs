@@ -243,7 +243,7 @@ fn forced_older_nodes_refuse_metric_selection_before_creating_a_cache() {
 
 #[cfg(unix)]
 mod python_producer {
-  use expri_run_data::metrics::read;
+  use expri_runs::metrics::read;
   use serde_json::json;
   use std::fs;
   use std::path::PathBuf;

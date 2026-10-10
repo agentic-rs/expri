@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 expri-core.workspace = true
-expri-run-data.workspace = true
+expri-runs.workspace = true
 base64.workspace = true
 chrono.workspace = true
 reqwest.workspace = true

@@ -2,7 +2,7 @@
 
 use expri_core::service as types;
 use expri_core::{config, error, lock};
-use expri_run_data::run_artifacts;
+use expri_runs::run_artifacts;
 
 pub mod client;
 pub mod options;

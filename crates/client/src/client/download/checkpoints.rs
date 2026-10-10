@@ -62,7 +62,7 @@ pub(in crate::client) fn fetch_objects(
     .results_dir
     .to_str()
     .ok_or_else(|| message("results directory must be UTF-8"))?;
-  let runs_dir = expri_run_data::cache::cached_runs_dir(&options.repo, results_dir, &source)?;
+  let runs_dir = expri_runs::cache::cached_runs_dir(&options.repo, results_dir, &source)?;
   let destination = runs_dir.join(&scope.run_id);
   let owner =
     json!({"schema_version":1,"service_endpoint":api.endpoint,"source":source,"scope":scope});

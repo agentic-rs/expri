@@ -2,7 +2,7 @@
 
 use expri_core::{error, lock};
 use expri_dashboard::{dashboard, metric_charts};
-use expri_run_data::{metrics, run_artifacts, runs};
+use expri_runs::{metrics, run_artifacts, runs};
 
 mod service;
 

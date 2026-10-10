@@ -30,7 +30,7 @@ jobs:
       - name: Publish
         run: |
           cargo publish --locked -p expri-core
-          cargo publish --locked -p expri-run-data
+          cargo publish --locked -p expri-runs
           cargo publish --locked -p expri-client
           cargo publish --locked -p expri-assets
           cargo publish --locked -p expri-worker

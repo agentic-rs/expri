@@ -1,7 +1,7 @@
 [workspace]
 members = [
   "crates/core",
-  "crates/run-data",
+  "crates/runs",
   "crates/client",
   "crates/assets",
   "crates/worker",
@@ -19,7 +19,7 @@ repository = "https://github.com/agentic-rs/expri"
 
 [workspace.dependencies]
 expri-core = { version = "=0.1.5", path = "crates/core" }
-expri-run-data = { version = "=0.1.5", path = "crates/run-data" }
+expri-runs = { version = "=0.1.5", path = "crates/runs" }
 expri-client = { version = "=0.1.5", path = "crates/client" }
 expri-assets = { version = "=0.1.5", path = "crates/assets" }
 expri-worker = { version = "=0.1.5", path = "crates/worker" }
@@ -60,7 +60,7 @@ repository.workspace = true
 chrono.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
 expri-core.workspace = true
-expri-run-data.workspace = true
+expri-runs.workspace = true
 expri-client.workspace = true
 expri-assets.workspace = true
 expri-worker.workspace = true

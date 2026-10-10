@@ -138,8 +138,8 @@ pub fn pull(
   Ok(report)
 }
 
-use expri_run_data::cache::validate_parents;
-pub use expri_run_data::cache::{cached_runs_dir, validate_component, validate_results_dir};
+use expri_runs::cache::validate_parents;
+pub use expri_runs::cache::{cached_runs_dir, validate_component, validate_results_dir};
 
 fn validate_remote_run_dir(value: &str, run_id: &str) -> Result<()> {
   // This is a Unix target path, regardless of the controller's host platform.

@@ -16,7 +16,7 @@ mod service;
 use expri_assets as assets;
 use expri_core::{error, filter, lock, protocol};
 use expri_dashboard::metric_charts;
-use expri_run_data::{metrics, run_artifacts};
+use expri_runs::{metrics, run_artifacts};
 use expri_worker::{archive, git, jobs, shell};
 
 use std::path::PathBuf;
