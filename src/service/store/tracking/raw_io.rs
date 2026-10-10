@@ -190,6 +190,7 @@ pub(super) fn append_raw(file: &mut File, size: u64, offset: u64, bytes: &[u8]) 
 
 impl<S: ObjectStorage> Store<S> {
   pub(in crate::service) fn tracking_open(&self, record: &FileRecord) -> ApiResult<File> {
+    super::run_retention::ensure_target_available(&*self.db()?, &record.target)?;
     let FileStorage::Tracking { revision, .. } = record.storage else {
       return Err(ApiError::new(400, "file is not in tracking storage"));
     };

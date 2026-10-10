@@ -1064,6 +1064,9 @@ def previews(run_id, second_run_id):
     return browser.call('POST', '/execute/async', {'script': '''const done = arguments[0];
       fetch('/api/catalog').then(async response => done({status: response.status,
         catalog: response.ok ? await response.json() : null})).catch(() => done({status: 0}));''', 'args': []})
+  def shared_catalog(result):
+    return {**result, 'catalog': {name: value for name, value in result['catalog'].items()
+      if name != 'run_management_enabled'}}
   def pause_dashboard():
     # Cookie replay intentionally presents a revoked/other-host session. Finish
     # initial page requests and pause automatic checks so those checks do not
@@ -1093,6 +1096,7 @@ def previews(run_id, second_run_id):
     catalog_with_wire_check(browser, 200, 1)
     main_cookie = browser.cookies()[0]
     main_catalog = catalog()
+    assert main_catalog['status'] == 200 and main_catalog['catalog']['run_management_enabled'] is True, 'primary dashboard did not allow run management'
     assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/app.js', 'main did not serve its embedded assets'
 
     start = len(trace_records())
@@ -1109,7 +1113,9 @@ def previews(run_id, second_run_id):
     catalog_with_wire_check(browser, 200, 1)
     ab_cookie = browser.cookies()[0]
     assert ab_cookie['value'] != main_cookie['value'], 'preview reused the main session'
-    assert catalog() == main_catalog, 'preview and main do not share one catalog'
+    ab_catalog = catalog()
+    assert ab_catalog['status'] == 200 and ab_catalog['catalog']['run_management_enabled'] is False, 'read-only preview unexpectedly allowed run management'
+    assert shared_catalog(ab_catalog) == shared_catalog(main_catalog), 'preview and main do not share one catalog'
     assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/assets/' + 'a' * 40 + '/app.js', 'preview did not serve pinned branch assets'
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'shared run list is missing in preview')
     assert_provenance()

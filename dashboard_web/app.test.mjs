@@ -184,7 +184,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
   const project_sources = [{ source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] }];
-  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
+  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -195,8 +195,24 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       const missing = model.missing_run_ids.has(run_id) || !runs.some(run => runIdentity(run) === run_id);
       return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, missing };
     }) }) : response({ error: "Unknown endpoint" }, 404);
-    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local" });
-    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [] }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local", run_management_enabled: model.run_management_enabled });
+    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [], run_management_enabled: model.run_management_enabled }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    if (parsed.pathname === "/api/runs/archive" || parsed.pathname === "/api/runs/restore") {
+      assert.equal(options.method, "POST");
+      assert.equal(options.credentials, "same-origin");
+      assert.equal(options.headers["content-type"], "application/json");
+      const scope = JSON.parse(options.body);
+      assert.deepEqual(Object.keys(scope).sort(), ["origin", "project_id", "run_id"]);
+      const run = runs.find(run => JSON.stringify(run.archival?.scope) === JSON.stringify(scope));
+      assert.ok(run, "archive mutations must target the exact project and worker run");
+      const archive = parsed.pathname.endsWith("/archive");
+      run.archival = { ...run.archival, status: archive ? "archived" : "active",
+        archived_at: archive ? new Date().toISOString() : null,
+        delete_after: archive ? new Date(Date.now() + 15 * 86_400_000).toISOString() : null };
+      model.list_revision += "-changed";
+      model.metadata_revision += "-changed";
+      return response(run.archival);
+    }
     if (parsed.pathname === "/api/storage/stats") return response({ stats: managementStats(query.get("project_id")), delete_enabled: false });
     if (parsed.pathname === "/api/storage") {
       const project_id = query.get("project_id"), kind = query.get("kind"),
@@ -225,7 +241,8 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     });
     if (parsed.pathname === "/api/runs") {
       if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
-      const visible = runs.filter(run => (!query.get("search") || run.run_id.includes(query.get("search"))) && (!query.get("origin") || run.origin === query.get("origin")));
+      const visible = runs.filter(run => (!query.get("search") || run.run_id.includes(query.get("search"))) && (!query.get("origin") || run.origin === query.get("origin")) &&
+        (!hosted || (!!run.archival?.status && run.archival.status !== "active") === (query.get("archival") === "archived")));
       const offset = Number(query.get("offset"));
       const limit = Number(query.get("limit"));
       const rows = visible.slice(offset, offset + limit).map(run => ({ ...run,
@@ -2218,6 +2235,225 @@ test("cleanup needing attention renders an actionable cause and recovers after r
   assert.match(nodes.get("project-cleanup-status").textContent, /Cleanup completed/);
   assert.equal(nodes.document.defaultView.sessionStorage.length, 0);
   assert.equal(posts.length, 1);
+});
+
+function archivalRun(run_id, { origin = "gpu-a", status = "completed", archived = false } = {}) {
+  return {
+    run_id, run_key: `${origin}:${run_id}`, origin, task: "train", status,
+    started_at: "2026-10-03T01:00:00Z", finished_at: status === "running" ? null : "2026-10-03T01:00:03Z", exit_code: 0,
+    archival: {
+      scope: { project_id: "vision", origin, run_id }, status: archived ? "archived" : "active",
+      archived_at: archived ? new Date().toISOString() : null,
+      delete_after: archived ? new Date(Date.now() + 15 * 86_400_000).toISOString() : null,
+      pending_tasks: 0, last_error: null,
+    },
+  };
+}
+
+test("hosted archive tags filter in one click without replacing training statuses", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    project_runs: [archivalRun("active"), archivalRun("archived", { archived: true })] }), { nodes } = model;
+  await settledTable(nodes);
+  assert.equal(nodes.get("archival-active").checked, true);
+  assert.equal(latestRunQuery(model).get("archival"), "active");
+  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runButton(nodes, 0).textContent, "active");
+  await selectRow(nodes, 0);
+  await settled(() => nodes.get("selected-runs").textContent.includes("active"));
+  await click(nodes.get("archival-archived")); await settledTable(nodes);
+  assert.equal(nodes.get("archival-archived").checked, true);
+  assert.equal(nodes.get("archival-options").querySelector("legend").textContent, "Run history");
+  assert.equal(nodes.get("archival-archived").type, "radio");
+  assert.equal(nodes.document.activeElement, nodes.get("archival-archived"));
+  assert.equal(latestRunQuery(model).get("archival"), "archived");
+  assert.equal(nodes.get("selected-runs").textContent, "");
+  assert.equal(runButton(nodes, 0).textContent, "archived");
+  assert.match(nodes.get("run-rows").textContent, /completed/);
+  assert.match(nodes.get("run-rows").textContent, /Archived · Deletes/);
+  assert.equal(nodes.document.querySelector('#status-options input[value="archived"]'), null);
+  await click(nodes.get("clear-filters")); await settledTable(nodes);
+  assert.equal(nodes.get("archival-active").checked, true);
+});
+
+test("local dashboards omit the hosted archive controls and query", async t => {
+  const model = await reviewFixture(t); await settledTable(model.nodes);
+  assert.equal(model.nodes.document.getElementById("archival-options"), null);
+  assert.equal(latestRunQuery(model).has("archival"), false);
+  await click(runButton(model.nodes, 0));
+  assert.equal(model.nodes.document.getElementById("run-archival-panel"), null);
+});
+
+test("archiving confirms the exact worker run, clears its selection, and preserves the review", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    project_runs: [archivalRun("same"), archivalRun("same", { origin: "gpu-b" })] }), { nodes } = model;
+  await settledTable(nodes); await selectRow(nodes, 0);
+  await settled(() => nodes.document.getElementById("archive-run-button"));
+  const frame = nodes.get("chart-frame"), navigations = frameNavigations(nodes);
+  await click(nodes.get("archive-run-button"));
+  assert.match(nodes.get("archive-run-confirmation").textContent, /automatically deleted after 15 days.*restore.*Local copies and project private inputs are kept/s);
+  assert.equal(model.requests.some(url => url === "/api/runs/archive"), false);
+  await click(nodes.get("cancel-archive-run"));
+  assert.equal(nodes.document.getElementById("archive-run-confirmation"), null);
+  await click(nodes.get("archive-run-button")); await click(nodes.get("confirm-archive-run"));
+  await settled(() => nodes.document.getElementById("restore-run-button") && nodes.get("run-rows").children.length === 1);
+  assert.equal(model.runs[0].archival.status, "archived");
+  assert.equal(model.runs[1].archival.status, "active");
+  assert.equal(nodes.get("selected-runs").textContent, "");
+  assert.equal(nodes.get("review-section").hidden, false);
+  assert.match(nodes.get("review-title").textContent, /gpu-a:same|same · gpu-a/);
+  assert.match(nodes.get("run-archival-summary").textContent, /Archived run.*Scheduled deletion/s);
+  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(frameNavigations(nodes), navigations);
+  assert.equal(model.requests.filter(url => url === "/api/runs/archive").length, 1);
+  await click(nodes.get("review-tab-overview"));
+  assert.match(nodes.get("run-detail").textContent, /completed/);
+  await click(nodes.get("restore-run-button"));
+  await settled(() => nodes.document.getElementById("archive-run-button") && nodes.get("run-rows").children.length === 2);
+  assert.equal(model.runs[0].archival.status, "active");
+  assert.equal(model.requests.filter(url => url === "/api/runs/restore").length, 1);
+  assert.equal(nodes.document.getElementById("run-archival-summary"), null);
+});
+
+test("archived direct links open from the active list and restoration leaves the archived view", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    url: "http://localhost/?project_id=vision&origin=gpu-a&run_id=old",
+    project_runs: [archivalRun("active"), archivalRun("old", { archived: true })] }), { nodes } = model;
+  await settled(() => nodes.document.getElementById("restore-run-button"));
+  assert.equal(latestRunQuery(model).get("archival"), "active");
+  assert.equal(runButton(nodes, 0).textContent, "active");
+  assert.match(nodes.get("review-title").textContent, /old/);
+  await click(nodes.get("archival-archived")); await settledTable(nodes);
+  await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("restore-run-button"));
+  await click(nodes.get("restore-run-button")); await settledTable(nodes);
+  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.match(nodes.get("list-empty").textContent, /No archived runs.*15 days/s);
+  assert.equal(nodes.get("review-section").hidden, false);
+  assert.equal(nodes.document.getElementById("archive-run-button")?.disabled, false);
+});
+
+test("running runs and read-only previews cannot archive but archived runs remain inspectable", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    project_runs: [archivalRun("running", { status: "running" }), archivalRun("old", { archived: true })] }), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0));
+  assert.equal(nodes.document.getElementById("archive-run-button"), null);
+  assert.match(nodes.get("run-archival-panel").textContent, /Only finished runs/);
+  model.run_management_enabled = false;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  await click(nodes.get("archival-archived")); await settledTable(nodes); await click(runButton(nodes, 0));
+  await settled(() => nodes.document.getElementById("run-archival-summary"));
+  assert.equal(nodes.document.getElementById("restore-run-button"), null);
+  assert.match(nodes.get("run-archival-panel").textContent, /Run management is disabled/);
+  assert.equal(model.requests.some(url => url === "/api/runs/archive" || url === "/api/runs/restore"), false);
+});
+
+test("expired retention and failed cleanup keep status visible without offering restore", async t => {
+  const run = archivalRun("old", { archived: true });
+  run.archival.delete_after = "2000-01-01T00:00:00Z";
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    url: "http://localhost/?project_id=vision&origin=gpu-a&run_id=old", project_runs: [run] }), { nodes } = model;
+  await settled(() => nodes.document.getElementById("run-archival-summary"));
+  assert.equal(nodes.document.getElementById("restore-run-button"), null);
+  assert.match(nodes.get("run-archival-summary").textContent, /retention period has ended/);
+  run.archival.status = "needs_attention"; run.archival.pending_tasks = 2; run.archival.last_error = "Storage rejected <script>";
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.match(nodes.get("run-archival-summary").textContent, /Deletion needs attention.*2 tasks remaining.*Storage rejected <script>/s);
+  assert.equal(nodes.get("run-archival-summary").querySelector("script"), null);
+  assert.equal(nodes.document.getElementById("restore-run-button"), null);
+});
+
+test("archive failures preserve the row and confirmation, with no automatic retry", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    project_runs: [archivalRun("run")], override: parsed => parsed.pathname === "/api/runs/archive" ?
+      response({ error: "Run is still running" }, 409) : null }), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0));
+  await settled(() => nodes.document.getElementById("archive-run-button"));
+  await click(nodes.get("archive-run-button")); await click(nodes.get("confirm-archive-run"));
+  await settled(() => nodes.document.getElementById("run-archival-error"));
+  assert.match(nodes.get("run-archival-error").textContent, /Refresh the run before trying again.*Run is still running/);
+  assert.equal(model.runs[0].archival.status, "active");
+  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.get("confirm-archive-run").disabled, false);
+  assert.equal(model.requests.filter(url => url === "/api/runs/archive").length, 1);
+  await click(nodes.get("cancel-archive-run"));
+  assert.equal(nodes.document.getElementById("run-archival-error"), null);
+});
+
+test("busy archive requests prevent duplicate submits and ignore successes after changing source", async t => {
+  const pending = deferred(); let signal;
+  const sources = ["gpu-a", "gpu-b"].map(origin => ({ source_id: `hosted:vision:${origin}`, project_id: "vision", origin,
+    label: origin, kind: "service", target_name: null }));
+  const first = archivalRun("run"); delete first.run_key;
+  const model = await reviewFixture(t, { hosted: true, sources, project_runs: [first],
+    override: (parsed, options) => {
+      if (parsed.pathname === "/api/runs/archive") { signal = options.signal; return pending.promise; }
+    } }), { nodes } = model;
+  t.after(() => pending.resolve(response({ ...first.archival, status: "archived", archived_at: new Date().toISOString(),
+    delete_after: new Date(Date.now() + 15 * 86_400_000).toISOString() })));
+  await settledTable(nodes); await click(runButton(nodes, 0));
+  await settled(() => nodes.document.getElementById("archive-run-button"));
+  await click(nodes.get("archive-run-button")); await click(nodes.get("confirm-archive-run"));
+  assert.equal(nodes.get("confirm-archive-run").disabled, true);
+  await click(nodes.get("confirm-archive-run"));
+  assert.equal(model.requests.filter(url => url === "/api/runs/archive").length, 1);
+  setValue(nodes.get("source-select"), sources[1].source_id); await emit(nodes.get("source-select"), "change");
+  await settledTable(nodes);
+  assert.equal(signal.aborted, true);
+  pending.resolve(response({ ...first.archival, status: "archived", archived_at: new Date().toISOString(),
+    delete_after: new Date(Date.now() + 15 * 86_400_000).toISOString() })); await flush();
+  assert.equal(nodes.get("source-select").value, sources[1].source_id);
+  assert.equal(nodes.get("review-section").hidden, true);
+  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.document.getElementById("run-archival-error"), null);
+});
+
+test("an external archive refreshes the detail and removes hidden selections without navigating the chart", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [archivalRun("run")] }), { nodes } = model;
+  await settledTable(nodes); await selectRow(nodes, 0);
+  await settled(() => nodes.document.getElementById("archive-run-button"));
+  await model.clock.advance(5_000);
+  const frame = nodes.get("chart-frame"), navigations = frameNavigations(nodes);
+  model.runs[0].archival = { ...archivalRun("run", { archived: true }).archival };
+  model.model.list_revision = "archived-elsewhere"; model.model.metadata_revision = "archived-elsewhere";
+  await model.clock.advance(5_000);
+  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(nodes.get("selected-runs").textContent, "");
+  assert.equal(nodes.document.getElementById("archive-run-button"), null);
+  assert.ok(nodes.document.getElementById("restore-run-button"));
+  assert.equal(nodes.get("review-section").hidden, false);
+  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(frameNavigations(nodes), navigations);
+});
+
+test("external archival removes only that run from a comparison and retains the remaining selection", async t => {
+  const model = await autoFixture(t, { projects: true,
+    project_runs: [archivalRun("first"), archivalRun("second")] }), { nodes } = model;
+  await settledTable(nodes); await selectRow(nodes, 0); await selectRow(nodes, 1);
+  await settled(() => nodes.get("review-title").textContent === "2 runs" && comparisonRows(nodes).length === 2);
+  await model.clock.advance(5_000);
+  model.runs[0].archival = archivalRun("first", { archived: true }).archival;
+  model.model.list_revision = "first-archived"; model.model.metadata_revision = "first-archived";
+  await model.clock.advance(5_000);
+  await settled(() => nodes.get("review-title").textContent.includes("second") && nodes.document.getElementById("archive-run-button"));
+  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.match(nodes.get("selected-runs").textContent, /second/);
+  assert.equal(nodes.get("selected-runs").textContent.includes("first"), false);
+  assert.equal(runCheckbox(nodes, 0).checked, true);
+  assert.deepEqual(chartQuery(nodes).getAll("run_id"), ["gpu-a:second"]);
+});
+
+test("a successful response for another worker never hides or alters the reviewed run", async t => {
+  const run = archivalRun("run");
+  const wrong = archivalRun("run", { origin: "gpu-b", archived: true }).archival;
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run],
+    override: parsed => parsed.pathname === "/api/runs/archive" ? response(wrong) : null }), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0));
+  await settled(() => nodes.document.getElementById("archive-run-button"));
+  await click(nodes.get("archive-run-button")); await click(nodes.get("confirm-archive-run"));
+  await settled(() => nodes.document.getElementById("run-archival-error"));
+  assert.match(nodes.get("run-archival-error").textContent, /different run or archive state/);
+  assert.equal(run.archival.status, "active");
+  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.document.getElementById("run-archival-summary"), null);
 });
 
 test("stale deletion previews clear secrets and require another reviewed preview before submission", async t => {

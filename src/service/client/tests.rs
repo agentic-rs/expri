@@ -320,6 +320,103 @@ fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation(
   );
 }
 
+#[test]
+fn run_management_client_uses_exact_scope_and_returns_deadline() {
+  let (_temporary, root) = root();
+  let scope = RunScope {
+    project_id: "vision".into(),
+    origin: "gpu-1".into(),
+    run_id: "run-1".into(),
+  };
+  let expected = scope.clone();
+  let mut index = 0;
+  let (url, task) = mock(3, move |request, _| {
+    let operation: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(operation["scope"], json!(expected));
+    assert_eq!(
+      operation["action"],
+      ["archive_run", "restore_run", "run_archival"][index]
+    );
+    assert_eq!(request.path, "/v1/request");
+    assert!(
+      request
+        .headers
+        .to_ascii_lowercase()
+        .contains("authorization: bearer ")
+    );
+    let status = if index == 1 { "active" } else { "archived" };
+    let archived_at = (index != 1).then(|| "2026-10-10T00:00:00Z".to_string());
+    let delete_after = (index != 1).then(|| "2026-10-25T00:00:00Z".to_string());
+    let reply = Response::RunArchival {
+      archival: RunArchival {
+        scope: expected.clone(),
+        status: status.into(),
+        archived_at,
+        delete_after,
+        pending_tasks: 0,
+        last_error: None,
+      },
+    };
+    index += 1;
+    (200, Vec::new(), serde_json::to_vec(&reply).unwrap())
+  });
+  let config = config(&root, &url);
+  assert_eq!(
+    archive_run(&config, &scope).unwrap()["delete_after"],
+    "2026-10-25T00:00:00Z"
+  );
+  assert_eq!(restore_run(&config, &scope).unwrap()["status"], "active");
+  assert_eq!(
+    run_archival(&config, &scope).unwrap()["scope"],
+    json!(scope)
+  );
+  task.join().unwrap();
+}
+
+#[test]
+fn run_management_client_rejects_invalid_scope_and_mismatched_receipts() {
+  let (_temporary, root) = root();
+  let invalid = RunScope {
+    project_id: "../vision".into(),
+    origin: "gpu-1".into(),
+    run_id: "run-1".into(),
+  };
+  assert!(
+    archive_run(&root.join("missing.toml"), &invalid)
+      .unwrap_err()
+      .to_string()
+      .contains("invalid service identifier")
+  );
+  let scope = RunScope {
+    project_id: "vision".into(),
+    origin: "gpu-1".into(),
+    run_id: "run-1".into(),
+  };
+  let mut foreign = scope.clone();
+  foreign.origin = "other-worker".into();
+  let (url, task) = mock(1, move |_, _| {
+    let reply = Response::RunArchival {
+      archival: RunArchival {
+        scope: foreign.clone(),
+        status: "active".into(),
+        archived_at: None,
+        delete_after: None,
+        pending_tasks: 0,
+        last_error: None,
+      },
+    };
+    (200, Vec::new(), serde_json::to_vec(&reply).unwrap())
+  });
+  let config = config(&root, &url);
+  assert!(
+    run_archival(&config, &scope)
+      .unwrap_err()
+      .to_string()
+      .contains("another run")
+  );
+  task.join().unwrap();
+}
+
 fn mark_synced_metadata(queue: &mut Queue, scope: &RunScope, run_dir: &Path, paths: &[&str]) {
   for (index, path) in paths.iter().enumerate() {
     let mut file = fs::open(&run_dir.join(path)).unwrap();
@@ -717,6 +814,12 @@ fn permanent_rejections_require_attention_while_transient_errors_remain_retryabl
     } else {
       "credentials"
     }));
+    if status == 410 {
+      assert!(reason.contains("run or project"));
+      assert!(reason.contains("expired"));
+      assert!(reason.contains("new run identifier"));
+      assert!(reason.contains("new project identifier if the project was deleted"));
+    }
   }
   for status in [400, 404, 409, 429, 500, 503] {
     assert!(

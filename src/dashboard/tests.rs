@@ -17,6 +17,7 @@ fn local_scalar_cache_refreshes_appended_metrics_and_replaced_parameter_files() 
   )
   .unwrap();
   let query = table::ListQuery {
+    archived: false,
     origin: None,
     search: None,
     task: None,
@@ -83,6 +84,7 @@ fn configurable_columns_sort_the_filtered_history_before_pagination() {
   )
   .unwrap();
   let query = table::ListQuery {
+    archived: false,
     origin: None,
     search: Some("TRAIN"),
     task: Some("train"),
@@ -121,6 +123,7 @@ fn configurable_columns_sort_the_filtered_history_before_pagination() {
   )
   .unwrap();
   let query = table::ListQuery {
+    archived: false,
     origin: None,
     search: None,
     task: None,
@@ -165,6 +168,7 @@ fn parameter_only_tables_do_not_open_metrics_and_long_values_have_explicit_previ
     .list_table(
       "local",
       &table::ListQuery {
+        archived: false,
         origin: None,
         search: None,
         task: None,
@@ -184,6 +188,7 @@ fn parameter_only_tables_do_not_open_metrics_and_long_values_have_explicit_previ
       .list_table(
         "local",
         &table::ListQuery {
+          archived: false,
           origin: None,
           search: None,
           task: None,

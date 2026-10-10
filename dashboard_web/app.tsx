@@ -29,6 +29,7 @@ import {
   type Review,
   type ReviewTab,
   type Run,
+  type RunArchival,
   type RunColumn,
   type RunColumns,
   type RunList,
@@ -36,6 +37,7 @@ import {
   type Source,
   type Updates,
 } from "./dashboard_model";
+import { canArchiveRun, canRestoreRun, runArchivalMatchesScope, runArchivalScope, runIsArchived, type ArchivalAction } from "./run_archival";
 import { artifactCanSelect } from "./dashboard_files";
 import {
   boundedStorageSearch,
@@ -60,6 +62,7 @@ export * from "./dashboard_files";
 export * from "./dashboard_storage";
 export * from "./storage_management";
 export * from "./live_updates";
+export * from "./run_archival";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -78,6 +81,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const chart_lane = new RequestLane(() => pending_deep_link);
   const deep_link_lane = new RequestLane(() => pending_deep_link);
   const artifact_lane = new RequestLane(() => pending_deep_link);
+  const archival_lane = new RequestLane(() => pending_deep_link);
   const storage_lane = new RequestLane(() => pending_deep_link);
   const quiet_lanes = {
     updates: new RequestLane(() => pending_deep_link),
@@ -100,6 +104,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     chart_lane,
     deep_link_lane,
     artifact_lane,
+    archival_lane,
     storage_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
@@ -180,6 +185,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     task: "",
     status: "",
     origin: "",
+    archival: "active",
+    run_management_enabled: false,
+    archival_confirming: false,
+    archival_busy: false,
+    archival_error: null,
     project_catalog_note: null,
     refreshing: true,
     controls_disabled: true,
@@ -281,6 +291,22 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     publish();
   }
   const actions: DashboardActions = {
+    archival: (value) => {
+      if (access_mode !== "hosted" || ui.archival === value) return;
+      discardDeepLink();
+      ui.archival = value;
+      filtersChanged();
+    },
+    archival_confirm: () => {
+      if (ui.archival_busy) return;
+      updateUi({ archival_confirming: true, archival_error: null });
+    },
+    archival_cancel: () => {
+      if (!ui.archival_busy) updateUi({ archival_confirming: false, archival_error: null });
+    },
+    archival_mutate: (action) => {
+      void mutateRunArchival(action);
+    },
     filter: (field, value) => {
       discardDeepLink();
       ui[field] = value;
@@ -299,6 +325,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       ui.status = "";
       ui.origin = "";
       clearSearchTimeout();
+      ui.archival = "active";
       filtersChanged();
     },
     source: (value) => {
@@ -308,6 +335,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       source_id = value;
       resetStorage();
       ui.origin = "";
+      ui.archival = "active";
       if (run_sort.key === "origin" && currentSource()?.kind !== "hosted_project")
         run_sort = { key: "started_at", direction: "desc" };
       resetRunColumns();
@@ -625,6 +653,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       task: ui.task.trim(),
       status: ui.status,
       origin: currentSource()?.kind === "hosted_project" ? ui.origin : null,
+      archival: access_mode === "hosted" ? ui.archival : null,
       limit: page_size,
       offset,
       param: ui.run_columns_supported
@@ -753,6 +782,16 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   function showEmptyRuns(filtered: boolean, source?: Source): void {
     const server_results = access_mode === "hosted" || source?.kind === "service";
+    if (access_mode === "hosted" && source && !filtered) {
+      updateUi({ list_empty: {
+        title: ui.archival === "archived" ? "No archived runs" : "No active runs",
+        message: ui.archival === "archived"
+          ? "Archived runs can be restored for 15 days before their hosted data is automatically deleted."
+          : "Publish results from a worker, or choose Archived to review retained runs.",
+        setup: false,
+      } });
+      return;
+    }
     updateUi({
       list_empty: {
         title: server_results && !filtered ? "No published runs yet" : "No runs found",
@@ -780,6 +819,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     last_list_snapshot = now();
     if (quiet && unchanged && was_ready) return;
     runs = result.runs;
+    reconcileArchivedSelection(runs);
     offset = result.offset;
     next_offset = result.next_offset;
     updateUi({
@@ -828,6 +868,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({ refreshing: false });
   }
   function hideReview(): void {
+    resetArchivalAction();
     clearSelectionTimeout();
     review_lane.cancel();
     log_lane.cancel();
@@ -880,6 +921,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     ids: string[],
     origin: Review["origin"] = "inspection",
   ): void {
+    resetArchivalAction();
     clearSelectionTimeout();
     review_lane.cancel();
     log_lane.cancel();
@@ -1092,6 +1134,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     const choices_changed = JSON.stringify(metric_names) !== JSON.stringify(names);
     if (preserve && choices_changed && containsFocus(picker)) return false;
     rendered_detail = detail;
+    reconcileArchivedSelection([detail.run]);
+    if (ui.archival_confirming && !canArchiveRun(detail.run)) ui.archival_confirming = false;
     metric_names = names;
     if (review && !review.metric_selection_set) {
       review.metric_names = names.slice(0, 4);
@@ -1109,6 +1153,69 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     ensureArtifacts();
     if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
     return true;
+  }
+  function resetArchivalAction(): void {
+    archival_lane.cancel();
+    ui.archival_confirming = false;
+    ui.archival_busy = false;
+    ui.archival_error = null;
+  }
+  function reconcileArchivedSelection(records: Run[]): boolean {
+    if (access_mode !== "hosted") return false;
+    const hidden = records.filter((run) => run.archival &&
+      runIsArchived(run) !== (ui.archival === "archived")).map(runIdentity);
+    let changed = false;
+    for (const id of hidden) {
+      changed = selected.delete(id) || changed;
+      detail_cache.delete(id);
+    }
+    if (!changed || !review) return false;
+    if (review.kind === "run" && hidden.includes(review.run_ids[0] ?? "")) {
+      review.origin = "inspection";
+      return false;
+    }
+    if (review.kind === "compare" && review.run_ids.some((id) => hidden.includes(id))) {
+      showSelection(false);
+      return true;
+    }
+    return false;
+  }
+  async function mutateRunArchival(action: ArchivalAction): Promise<void> {
+    const detail = rendered_detail;
+    const current_review = review;
+    const source = source_id;
+    const scope = detail ? runArchivalScope(detail.run, currentSource()) : null;
+    if (ui.archival_busy || !ui.run_management_enabled || access_mode !== "hosted" ||
+      !detail || !scope || current_review?.kind !== "run" ||
+      (action === "archive" ? !ui.archival_confirming || !canArchiveRun(detail.run) : !canRestoreRun(detail.run))) return;
+    cancelRefresh();
+    list_lane.cancel();
+    review_lane.cancel();
+    const current = () => !disposed && source_id === source && review === current_review;
+    updateUi({ archival_busy: true, archival_error: null });
+    try {
+      const result = await archival_lane.post<RunArchival>(`/api/runs/${action}`, { ...scope });
+      if (!result || !current()) return;
+      if (!runArchivalMatchesScope(result, scope) ||
+        result.status !== (action === "archive" ? "archived" : "active"))
+        throw new Error("The server returned a different run or archive state. Refresh the run before trying again.");
+      const id = runIdentity(detail.run);
+      detail_cache.delete(id);
+      detail_revisions.delete(apiUrl("/api/run", { source, run_id: id }));
+      rendered_detail = { ...detail, run: { ...detail.run, archival: result } };
+      runs = runs.map((run) => runIdentity(run) === id ? { ...run, archival: result } : run)
+        .filter((run) => runIsArchived(run) === (ui.archival === "archived"));
+      reconcileArchivedSelection([rendered_detail.run]);
+      updateUi({ archival_confirming: false });
+      announce(action === "archive" ? "Run archived. Automatic deletion is scheduled in 15 days." : "Run restored.");
+      await loadRuns();
+      if (!current()) return;
+      auto_refresh?.requestRefresh();
+    } catch (error) {
+      if (current()) updateUi({ archival_error: `Could not confirm that the run was ${action === "archive" ? "archived" : "restored"}. Refresh the run before trying again. ${errorText(error)}` });
+    } finally {
+      if (current()) updateUi({ archival_busy: false });
+    }
   }
   async function openRun(
     id: string,
@@ -1199,10 +1306,12 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       return false;
     }
   }
-  function renderComparison(result: Comparison): void {
-    if (JSON.stringify(rendered_comparison) === JSON.stringify(result)) return;
+  function renderComparison(result: Comparison): boolean {
+    if (reconcileArchivedSelection(result.comparison.runs.map((item) => item.run))) return false;
+    if (JSON.stringify(rendered_comparison) === JSON.stringify(result)) return true;
     rendered_comparison = result;
     updateUi({ review_warnings: result.comparison.warnings });
+    return true;
   }
   async function loadComparison(preserve = false): Promise<boolean> {
     if (!review || review.kind !== "compare") return false;
@@ -1220,7 +1329,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       }
       updateUi({ review_loading: false });
       publish();
-      renderComparison(result);
+      if (!renderComparison(result)) return false;
       updateUi({ comparison_busy: false });
       publish();
       if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
@@ -1291,6 +1400,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     return projects === null ? catalog : projects;
   }
   function applyCatalog(catalog: Catalog, quiet = false): void {
+    ui.run_management_enabled = catalog.access_mode === "hosted" && catalog.run_management_enabled === true;
     last_catalog_snapshot = now();
     if (quiet && JSON.stringify(last_catalog) === JSON.stringify(catalog)) return;
     last_catalog = catalog;
@@ -1313,6 +1423,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       resetRunColumns();
       offset = 0;
       ui.origin = "";
+      ui.archival = "active";
       if (run_sort.key === "origin" && currentSource()?.kind !== "hosted_project")
         run_sort = { key: "started_at", direction: "desc" };
       runs = [];
@@ -1726,7 +1837,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
               current_review.metric_names = result.comparison.metric_names.slice(0, 4);
               current_review.metric_selection_set = true;
             }
-            renderComparison(result);
+            if (!renderComparison(result)) return "cancelled";
             updateUi({ review_loading: false });
             publish();
             updateUi({ review_error: null });

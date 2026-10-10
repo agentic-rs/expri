@@ -71,13 +71,14 @@ when using an existing bucket.
 Persist and back up the entire service data directory. It contains SQLite,
 original tracking files under `tracking/`, staged result ZIPs under `archives/`, and
 multipart receipts. The S3 bucket alone does not replace this directory.
-Server uploads retain the hot files and SQLite data; expri does not delete them
-automatically. Only one service process may use a data directory. Keep the storage
+Server uploads retain the hot files and SQLite data. Archived runs are removed
+after their 15-day retention period; project deletion also removes hosted data.
+Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 3. Older binaries
-refuse that directory because they cannot enforce project deletion records. Back up the
+Opening this version upgrades the SQLite schema to version 4. Older binaries
+refuse that directory because they cannot enforce run retention and project deletion records. Back up the
 entire service directory before upgrading; restoring that backup is required
 for a backend downgrade. Existing S3 runs remain readable after the upgrade.
 
@@ -175,8 +176,9 @@ The run detail displays server upload progress separately from training status, 
 provides an authenticated **Download result.zip** link after upload succeeds.
 A recovery export is visibly marked as a partial result.
 
-Browser access is read-only unless project deletion is explicitly enabled on the
-primary dashboard. Sign-in issues an eight-hour Secure, HttpOnly,
+The primary dashboard allows archiving and restoring finished runs. Project
+deletion requires explicit configuration. Preview dashboards remain read-only.
+Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
 Logout revokes the session. Restart the service after changing its password;
 restarts invalidate existing sessions. The CLI continues to use its existing
@@ -368,8 +370,8 @@ The server builds `result.zip` from its acknowledged files and includes a
 The ZIP contains run state, snapshot/environment metadata, parameters, artifact
 inventory, metrics JSONL, stdout and stderr as available. It excludes datasets
 and checkpoints. Persistent jobs and multipart receipts resume result ZIP uploads
-after a service restart or storage outage. No tracking file is deleted after
-upload.
+after a service restart or storage outage. Tracking files remain after upload
+until run retention or project deletion removes them.
 
 The client negotiates `tracking-v1` and pins that protocol in its durable queue.
 Existing queues that already published files remain on their legacy protocol;
@@ -569,6 +571,55 @@ This command does not seal the run or create `result.zip`. If the destination
 already stores an object with matching size and digest, it returns `reused: true`
 without uploading or creating a local queue. Otherwise it uses a resumable upload
 queue under `.expri/publish/files/`, configurable with `--queue-dir`.
+
+## Run archival and retention
+
+Archiving hides a finished hosted run from the default run list and schedules
+deletion **15 days from the time it was archived**. The deadline is displayed in
+the Archived view. Only `completed`, `failed`, `cancelled`, and `lost` runs can be
+archived; a running or incompletely received run must finish publishing its
+authoritative run state first. Archiving does not stop training or create a ZIP.
+`expri service upload` remains the server's result ZIP upload command.
+
+On the primary hosted dashboard, use **Archive** on a finished run. Select the
+**Archived** view to review its deadline or **Restore** it before that deadline.
+Restoring returns the run to the normal list and cancels retention. Archiving an
+already archived run preserves its original deadline; restoring and later
+archiving it starts a new 15-day period. Preview dashboards, including AB, can
+review archived runs but cannot archive or restore them. These actions use the
+existing signed-in dashboard session; they do not require enabling project
+deletion or re-entering its password.
+
+Owner tokens can manage the same lifecycle from the CLI:
+
+```sh
+expri service run archive --config owner.toml --project-id vision \
+  --origin gpu-1 --run-id run-1
+expri service run status --config owner.toml --project-id vision \
+  --origin gpu-1 --run-id run-1
+expri service run restore --config owner.toml --project-id vision \
+  --origin gpu-1 --run-id run-1
+```
+
+At the deadline, the server removes only the run's hosted metadata, metrics,
+logs, tracking files, staged result ZIPs, and unreferenced S3 outputs. Worker and
+laptop copies remain. Project private inputs and objects still referenced by
+other runs or inputs remain. Eligible S3 object versions and pending multipart
+uploads are cleaned up using the same object safety checks as project deletion.
+The server retains a small tombstone to reject late worker uploads; publishing
+cannot resurrect an expired run. Use a new run ID for a new run.
+Continuous fetch retains saved local files and continues watching the remaining
+runs when one hosted run expires; deleting the project still stops its watcher.
+
+Deletion begins automatically when the deadline is reached, or after the service
+returns if it was offline then. Restore is unavailable at or after the deadline.
+Cleanup has a durable queue independent of ingestion and result ZIP production.
+Cleanup serializes with file publication in the same project, so slow storage
+cleanup can delay that project's publishing; other projects use separate gates.
+Failures retain the cleanup status and retry after server restarts or S3 outages.
+Inspect `service run status` for `deleting`, `needs_attention`, the pending task
+count and the last error; `deleted` means hosted cleanup has finished. Failed
+cleanup does not extend the deadline or make the run restorable.
 
 ## Storage usage and project deletion
 

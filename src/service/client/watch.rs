@@ -202,10 +202,58 @@ impl<'a> Watcher<'a> {
     }
   }
 
+  fn run_failed(
+    &mut self,
+    scope: &RunScope,
+    error: &ExpriError,
+    phase: &'static str,
+  ) -> Result<Value> {
+    if !matches!(error, ExpriError::ServiceRejected { status: 410, .. }) {
+      return failed(error, phase);
+    }
+    // A run can expire between catalog selection and a download. Probe only
+    // the scoped catalog so project deletion and auth failures remain fatal.
+    let scopes = match self.api.request(&Request::ListRuns {
+      project_id: scope.project_id.clone(),
+      origin: scope.origin.clone(),
+    }) {
+      Ok(Response::Runs { runs }) if runs.len() <= 1000 => runs,
+      Ok(_) => return Err(fs::message("service did not return a bounded run catalog")),
+      Err(error) => return failed(&error, "run_catalog"),
+    };
+    let mut seen = BTreeSet::new();
+    for returned in &scopes {
+      validate_scope(returned)?;
+      if returned.project_id != scope.project_id
+        || returned.origin != scope.origin
+        || !seen.insert(&returned.run_id)
+      {
+        return Err(fs::message(
+          "service returned a run from another origin or a duplicate run",
+        ));
+      }
+    }
+    if scopes.iter().any(|returned| returned == scope) {
+      return Ok(
+        json!({"status":"retrying", "phase":phase, "status_code":410,
+        "message":"Run availability changed; saved local files were retained. Fetch will check again."}),
+      );
+    }
+    self
+      .cache
+      .remove(&(scope.origin.clone(), scope.run_id.clone()));
+    self
+      .verified
+      .retain(|(origin, run_id, _), _| origin != &scope.origin || run_id != &scope.run_id);
+    self.candidates.retain(|(candidate, _)| candidate != scope);
+    Ok(json!({"status":"unavailable", "phase":phase,
+      "message":"This run is no longer hosted; saved local files were retained."}))
+  }
+
   fn run_sequential(&mut self, scope: &RunScope) -> Result<Value> {
     let records = match self.catalog(scope) {
       Ok(records) => records,
-      Err(error) => return failed(&error, "file_catalog"),
+      Err(error) => return self.run_failed(scope, &error, "file_catalog"),
     };
     let key = (scope.origin.clone(), scope.run_id.clone());
     let resolved = self
@@ -234,14 +282,14 @@ impl<'a> Watcher<'a> {
     }
     let first = match self.fetch_selected(scope, artifacts.clone(), &records) {
       Ok(report) => report,
-      Err(error) => return failed(&error, "download"),
+      Err(error) => return self.run_failed(scope, &error, "download"),
     };
     let resolved = if self.options.labels.is_empty() {
       BTreeMap::new()
     } else {
       match self.resolve_labels(&PathBuf::from(first["destination"].as_str().unwrap())) {
         Ok(resolved) => resolved,
-        Err(error) => return failed(&error, "checkpoint_labels"),
+        Err(error) => return self.run_failed(scope, &error, "checkpoint_labels"),
       }
     };
     let (selected, pending) = self.selection(&records, &resolved);
@@ -250,7 +298,7 @@ impl<'a> Watcher<'a> {
     } else {
       match self.fetch_selected(scope, selected, &records) {
         Ok(report) => report,
-        Err(error) => return failed(&error, "download"),
+        Err(error) => return self.run_failed(scope, &error, "download"),
       }
     };
     if report != first {
@@ -281,7 +329,7 @@ impl<'a> Watcher<'a> {
   fn run_live(&mut self, scope: &RunScope) -> Result<Value> {
     let records = match self.catalog(scope) {
       Ok(records) => records,
-      Err(error) => return failed(&error, "file_catalog"),
+      Err(error) => return self.run_failed(scope, &error, "file_catalog"),
     };
     if !records.contains_key("run-state.json") {
       return Ok(json!({"status":"pending","message":"Run metadata has not been published yet."}));
@@ -301,13 +349,13 @@ impl<'a> Watcher<'a> {
     {
       let report = match self.fetch(scope, Vec::new()) {
         Ok(report) => report,
-        Err(error) => return failed(&error, "metadata_download"),
+        Err(error) => return self.run_failed(scope, &error, "metadata_download"),
       };
       downloaded_bytes = report["downloaded_bytes"].as_u64().unwrap_or(0);
       let resolved =
         match self.resolve_labels(&PathBuf::from(report["destination"].as_str().unwrap())) {
           Ok(resolved) => resolved,
-          Err(error) => return failed(&error, "checkpoint_labels"),
+          Err(error) => return self.run_failed(scope, &error, "checkpoint_labels"),
         };
       let mut cached = CachedRun::capture(metadata, &report, resolved)?;
       // Checkpoint publication merges this receipt independently of metadata.
@@ -577,7 +625,7 @@ impl<'a> Watcher<'a> {
           downloaded_bytes = self.accept_objects(&task.scope, result)?;
         }
         Ok(Err(error)) => {
-          let mut report = failed(&error, "checkpoint_download")?;
+          let mut report = self.run_failed(&task.scope, &error, "checkpoint_download")?;
           report["scope"] = json!(task.scope);
           retrying += usize::from(report["status"] == "retrying");
           pending += usize::from(report["status"] == "pending");
@@ -626,7 +674,7 @@ impl<'a> Watcher<'a> {
           Some("pending" | "queued" | "downloading")
         ));
         retrying += usize::from(report["status"] == "retrying");
-        count += 1;
+        count += usize::from(report["status"] != "unavailable");
         report["scope"] = json!(scope);
         if runs.len() < 200 {
           runs.push(report);

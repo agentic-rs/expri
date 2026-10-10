@@ -14,6 +14,7 @@ mod archive;
 mod dashboard_storage;
 mod projects;
 mod references;
+mod run_retention;
 mod tracking;
 
 const MAX_PARTS: u64 = 1000;
@@ -133,7 +134,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot read service metadata version".into())
       })?;
-    if version > 3 {
+    if version > 4 {
       return Err(crate::error::ExpriError::Message(
         "service metadata schema is newer than this binary".into(),
       ));
@@ -187,9 +188,10 @@ impl<S: ObjectStorage> Store<S> {
     archive::initialize(&connection)
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
     projects::initialize(&connection)?;
-    // Older binaries must not ignore project tombstones and resurrect deleted data.
+    run_retention::initialize(&connection)?;
+    // Older binaries must not ignore project/run tombstones and resurrect deleted data.
     connection
-      .pragma_update(None, "user_version", 3)
+      .pragma_update(None, "user_version", 4)
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot upgrade service metadata version".into())
       })?;
@@ -276,17 +278,40 @@ impl<S: ObjectStorage> Store<S> {
     limit: usize,
     offset: usize,
   ) -> ApiResult<DashboardPage<RunScope>> {
+    self.dashboard_project_runs_filtered(project_id, origin, limit, offset, None)
+  }
+
+  pub(in crate::service) fn dashboard_project_runs_with_archival(
+    &self,
+    project_id: &str,
+    origin: Option<&str>,
+    limit: usize,
+    offset: usize,
+    archived: bool,
+  ) -> ApiResult<DashboardPage<RunScope>> {
+    self.dashboard_project_runs_filtered(project_id, origin, limit, offset, Some(archived))
+  }
+
+  fn dashboard_project_runs_filtered(
+    &self,
+    project_id: &str,
+    origin: Option<&str>,
+    limit: usize,
+    offset: usize,
+    archived: Option<bool>,
+  ) -> ApiResult<DashboardPage<RunScope>> {
     validate_component(project_id).map_err(bad)?;
     if let Some(origin) = origin {
       validate_component(origin).map_err(bad)?;
     }
     dashboard_page_bounds(limit, offset)?;
     let db = self.db()?;
-    let selection = "SELECT DISTINCT json_extract(target,'$.scope.origin') AS origin,json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND (?2 IS NULL OR json_extract(target,'$.scope.origin')=?2)";
+    let at = run_retention::now();
+    let selection = "SELECT DISTINCT json_extract(target,'$.scope.origin') AS origin,json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND (?2 IS NULL OR json_extract(target,'$.scope.origin')=?2) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id'))=?5) AND NOT EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id') AND (status<>'archived' OR delete_after<=?6))";
     let total_count = db
       .query_row(
         &format!("SELECT COUNT(*) FROM ({selection})"),
-        params![project_id, origin],
+        params![project_id, origin, limit, offset, archived, at],
         |row| row.get(0),
       )
       .map_err(database)?;
@@ -296,16 +321,19 @@ impl<S: ObjectStorage> Store<S> {
       ))
       .map_err(database)?;
     let rows = statement
-      .query_map(params![project_id, origin, limit, offset], |row| {
-        Ok((
-          RunScope {
-            project_id: project_id.into(),
-            origin: row.get(0)?,
-            run_id: row.get(1)?,
-          },
-          row.get::<_, bool>(2)?,
-        ))
-      })
+      .query_map(
+        params![project_id, origin, limit, offset, archived, at],
+        |row| {
+          Ok((
+            RunScope {
+              project_id: project_id.into(),
+              origin: row.get(0)?,
+              run_id: row.get(1)?,
+            },
+            row.get::<_, bool>(2)?,
+          ))
+        },
+      )
       .map_err(database)?;
     let mut items = Vec::with_capacity(limit);
     let mut legacy_order = false;
@@ -339,6 +367,7 @@ impl<S: ObjectStorage> Store<S> {
   pub fn dashboard_output_objects(&self, scope: &RunScope) -> ApiResult<(Vec<FileRecord>, bool)> {
     validate_scope(scope).map_err(bad)?;
     let db = self.db()?;
+    run_retention::ensure_available(&db, scope, run_retention::now())?;
     let mut statement = db.prepare("SELECT record FROM files WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3 AND substr(json_extract(target,'$.path'),1,8)='outputs/' AND json_extract(target,'$.path')<>?4 AND json_extract(record,'$.storage')='object' ORDER BY target LIMIT ?5").map_err(database)?;
     let records = statement
       .query_map(
@@ -386,6 +415,7 @@ impl<S: ObjectStorage> Store<S> {
     disposition: &str,
   ) -> ApiResult<(String, u64)> {
     validate_target(target).map_err(bad)?;
+    run_retention::ensure_target_available(&*self.db()?, target)?;
     let (key, raw) = self
       .db()?
       .query_row(
@@ -412,6 +442,7 @@ impl<S: ObjectStorage> Store<S> {
 
   pub fn dashboard_archive_attachment(&self, scope: &RunScope) -> ApiResult<(String, u64)> {
     validate_scope(scope).map_err(bad)?;
+    run_retention::ensure_available(&*self.db()?, scope, run_retention::now())?;
     let target = FileTarget::Run {
       scope: scope.clone(),
       path: "result.zip".into(),
@@ -583,6 +614,7 @@ impl<S: ObjectStorage> Store<S> {
         .optional()
         .map_err(database)?;
       metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
+      metadata_revision.push(run_retention::revision(&db, scope)?);
       runs.push(RunUpdate {
         run_id: run_id.clone(),
         metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
@@ -611,6 +643,7 @@ impl<S: ObjectStorage> Store<S> {
       return Err(ApiError::new(413, "stream reads are limited to 64 KiB"));
     }
     let db = self.db()?;
+    run_retention::ensure_available(&db, scope, run_retention::now())?;
     let size = db
       .query_row(
         "SELECT size FROM streams WHERE target=?1",
@@ -741,6 +774,7 @@ impl<S: ObjectStorage> Store<S> {
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;
     projects::ensure_active(&transaction, &scope.project_id)?;
+    run_retention::ensure_available(&transaction, scope, run_retention::now())?;
     transaction
       .execute(
         "INSERT OR REPLACE INTO dashboard_overviews(target,version,record) VALUES(?1,?2,?3)",
@@ -831,7 +865,17 @@ impl<S: ObjectStorage> Store<S> {
     if let Some(project) = &project {
       projects::ensure_active(&*self.db()?, project)?;
     }
+    self.ensure_request_runs(&request)?;
     match request {
+      Request::ArchiveRun { scope } => Ok(Response::RunArchival {
+        archival: self.archive_run(&scope)?,
+      }),
+      Request::RestoreRun { scope } => Ok(Response::RunArchival {
+        archival: self.restore_run(&scope)?,
+      }),
+      Request::RunArchival { scope } => Ok(Response::RunArchival {
+        archival: self.run_archival(&scope)?,
+      }),
       Request::ProjectStorage { project_id } => Ok(Response::ProjectStorage {
         stats: self.project_storage(&project_id)?,
       }),
@@ -853,6 +897,7 @@ impl<S: ObjectStorage> Store<S> {
           "tracking-v1".into(),
           "file-references-v1".into(),
           "project-storage-management-v1".into(),
+          "run-retention-v1".into(),
         ],
       }),
       Request::PutDocument {
@@ -954,6 +999,7 @@ impl<S: ObjectStorage> Store<S> {
   fn begin(&self, id: &str, target: FileTarget, size: u64, sha256: String) -> ApiResult<Response> {
     validate_component(id).map_err(bad)?;
     validate_target(&target).map_err(bad)?;
+    run_retention::ensure_target_available(&*self.db()?, &target)?;
     self.reject_managed_tracking(&target)?;
     if sha256.len() != 64
       || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1020,6 +1066,7 @@ impl<S: ObjectStorage> Store<S> {
       .lock()
       .map_err(|_| ApiError::new(503, "upload operation unavailable"))?;
     let upload = self.upload(id)?;
+    run_retention::ensure_target_available(&*self.db()?, &upload.target)?;
     self.reject_managed_tracking(&upload.target)?;
     check_part(&upload, part.part_number)?;
     if part.etag.is_empty()
@@ -1048,6 +1095,7 @@ impl<S: ObjectStorage> Store<S> {
       .lock()
       .map_err(|_| ApiError::new(503, "upload operation unavailable"))?;
     let upload = self.upload(id)?;
+    run_retention::ensure_target_available(&*self.db()?, &upload.target)?;
     self.reject_managed_tracking(&upload.target)?;
     let state = self.state(id, &upload)?;
     if upload.complete {
@@ -1102,6 +1150,7 @@ impl<S: ObjectStorage> Store<S> {
     };
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;
+    run_retention::ensure_target_available(&transaction, &upload.target)?;
     tracking::reject_managed(&transaction, &upload.target)?;
     if let FileTarget::Input { .. } = upload.target {
       let existing: Option<String> = transaction
@@ -1173,6 +1222,7 @@ impl<S: ObjectStorage> Store<S> {
     validate_target(target).map_err(bad)?;
     let encoded = target_json(target)?;
     let db = self.db()?;
+    run_retention::ensure_target_available(&db, target)?;
     let object: Option<String> = db
       .query_row(
         "SELECT record FROM files WHERE target=?1",
@@ -1204,6 +1254,7 @@ impl<S: ObjectStorage> Store<S> {
   fn list_files(&self, scope: &RunScope) -> ApiResult<Response> {
     validate_scope(scope).map_err(bad)?;
     let db = self.db()?;
+    run_retention::ensure_available(&db, scope, run_retention::now())?;
     let filter = "json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3";
     let mut files = BTreeMap::new();
     let mut statement = db
@@ -1261,9 +1312,11 @@ impl<S: ObjectStorage> Store<S> {
     validate_component(project).map_err(bad)?;
     validate_component(origin).map_err(bad)?;
     let db = self.db()?;
-    let mut statement = db.prepare("SELECT DISTINCT json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 ORDER BY run_id DESC LIMIT 501").map_err(database)?;
+    let mut statement = db.prepare("SELECT DISTINCT json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND NOT EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=?2 AND run_id=json_extract(target,'$.scope.run_id') AND (status<>'archived' OR delete_after<=?3)) ORDER BY run_id DESC LIMIT 501").map_err(database)?;
     let runs = statement
-      .query_map(params![project, origin], |row| row.get::<_, String>(0))
+      .query_map(params![project, origin, run_retention::now()], |row| {
+        row.get::<_, String>(0)
+      })
       .map_err(database)?
       .map(|row| {
         row.map(|run_id| RunScope {

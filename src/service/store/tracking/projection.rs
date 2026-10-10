@@ -231,6 +231,7 @@ impl<S: ObjectStorage> Store<S> {
       path: "outputs/metrics.jsonl".into(),
     })?;
     let db = self.db()?;
+    super::run_retention::ensure_available(&db, scope, super::run_retention::now())?;
     let saved: Option<(String, Vec<u8>)> = db
       .query_row(
         "SELECT record,pending FROM tracking_metric_state WHERE target=?1",

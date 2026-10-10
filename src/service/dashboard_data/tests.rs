@@ -57,6 +57,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     .list_table(
       "hosted:project:worker",
       &ListQuery {
+        archived: false,
         origin: None,
         search: None,
         task: Some("train"),
@@ -80,6 +81,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     .list_table(
       "hosted:project:worker",
       &ListQuery {
+        archived: false,
         origin: None,
         search: None,
         task: None,
@@ -112,6 +114,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     .list_table(
       "hosted:project:worker",
       &ListQuery {
+        archived: false,
         origin: None,
         search: None,
         task: None,
@@ -194,6 +197,7 @@ fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_sto
   )
   .unwrap();
   let query = ListQuery {
+    archived: false,
     origin: None,
     search: None,
     task: None,
@@ -246,7 +250,7 @@ fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_sto
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    3
+    4
   );
 }
 

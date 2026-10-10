@@ -2,16 +2,16 @@ use rusqlite::params;
 
 use super::*;
 
-/// Project discovery includes projects that have published only private inputs.
+/// Project discovery includes private-input-only projects and pending run cleanup.
 /// The legacy machine catalog continues to enumerate run sources alone.
 impl<S: ObjectStorage> Store<S> {
-  pub(in crate::service) fn dashboard_input_project_exists(
+  pub(in crate::service) fn dashboard_project_exists_without_runs(
     &self,
     project_id: &str,
   ) -> ApiResult<bool> {
     validate_component(project_id).map_err(bad)?;
     self.db()?.query_row(
-      "SELECT EXISTS(SELECT 1 FROM files WHERE json_extract(target,'$.kind')='input' AND json_extract(target,'$.project_id')=?1 AND json_extract(record,'$.storage')='object')",
+      "SELECT EXISTS(SELECT 1 FROM files WHERE json_extract(target,'$.kind')='input' AND json_extract(target,'$.project_id')=?1 AND json_extract(record,'$.storage')='object' UNION ALL SELECT 1 FROM run_cleanup_tasks WHERE project_id=?1 AND done=0 UNION ALL SELECT 1 FROM run_retention WHERE project_id=?1 AND status<>'deleted')",
       [project_id],
       |row| row.get(0),
     ).map_err(database)
@@ -33,7 +33,8 @@ impl<S: ObjectStorage> Store<S> {
         WHERE json_extract(target,'$.kind')='run' \
       UNION ALL SELECT json_extract(target,'$.project_id'),NULL FROM files \
         WHERE json_extract(target,'$.kind')='input' \
-          AND json_extract(record,'$.storage')='object')";
+          AND json_extract(record,'$.storage')='object' \
+      UNION ALL SELECT project_id,NULL FROM run_cleanup_tasks WHERE done=0)";
     let total_count = db
       .query_row(&format!("SELECT COUNT(*) FROM ({selection})"), [], |row| {
         row.get(0)

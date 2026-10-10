@@ -524,6 +524,13 @@ that provenance visible. Runs from different machines can be compared even
 when their recorded run IDs match. Their logs, files, browser downloads, and
 generated CLI commands keep each run's original project and machine scope.
 Existing worker run links continue to open the exact recorded run.
+Finished hosted runs can be archived on the primary dashboard. They disappear
+from the normal list and can be restored from the **Archived** view for 15 days.
+After that deadline, durable cleanup removes their hosted data and unreferenced
+S3 outputs, preserving private inputs, shared objects, and worker/laptop copies.
+Owner CLI commands are `expri service run archive`, `restore`, and `status`;
+`service upload` still produces result ZIPs. AB remains read-only. See
+[run retention](docs/self-hosted-service.md#run-archival-and-retention).
 The project's **Storage** view lists completed private inputs and uploaded
 outputs across its machines and runs; the per-run **Files** tab also shows
 worker-reported outputs that have not yet been uploaded.

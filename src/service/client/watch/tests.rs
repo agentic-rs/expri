@@ -168,6 +168,216 @@ fn authentication_rejection_stops_watch_without_replaying_or_printing_credential
 }
 
 #[test]
+fn expired_run_between_catalog_and_fetch_preserves_local_data_and_continues_other_runs() {
+  let (_temporary, root) = root();
+  let expired = scope();
+  let mut survivor = expired.clone();
+  survivor.run_id = "survivor".into();
+  let survivor_scope = survivor.clone();
+  let state = br#"{"run_id":"run-sync","status":"completed"}"#.to_vec();
+  let expected = state.clone();
+  let survivor_state = br#"{"run_id":"survivor","status":"running"}"#.to_vec();
+  let mut catalogs = 0;
+  let (url, task) = mock(15, move |request, origin| {
+    if request.path == "/v1/request" {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::ListRuns { project_id, origin } => {
+          assert_eq!(project_id, expired.project_id);
+          assert_eq!(origin, expired.origin);
+          catalogs += 1;
+          Response::Runs {
+            runs: if catalogs <= 2 {
+              vec![expired.clone(), survivor.clone()]
+            } else {
+              vec![survivor.clone()]
+            },
+          }
+        }
+        Request::ListFiles { scope } => {
+          if scope == expired && catalogs >= 2 {
+            return (
+              410,
+              Vec::new(),
+              br#"{"error":"run expired private-token"}"#.to_vec(),
+            );
+          }
+          let bytes = if scope == expired {
+            &state
+          } else {
+            &survivor_state
+          };
+          let mut file = record("run-state.json", bytes);
+          file.target = FileTarget::Run {
+            scope,
+            path: "run-state.json".into(),
+          };
+          Response::Files { files: vec![file] }
+        }
+        Request::DownloadUrl {
+          target: FileTarget::Run { scope, .. },
+        } => {
+          assert!(
+            catalogs <= 1,
+            "a gone run must not trigger another file download"
+          );
+          Response::Url {
+            url: format!("{origin}/{}/run-state.json", scope.run_id),
+          }
+        }
+        other => panic!("unexpected expiry race request: {other:?}"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    } else {
+      let bytes = if request.path.starts_with("/run-sync/") {
+        &state
+      } else {
+        &survivor_state
+      };
+      (
+        206,
+        vec![(
+          "Content-Range".into(),
+          format!("bytes 0-{}/{}", bytes.len() - 1, bytes.len()),
+        )],
+        bytes.clone(),
+      )
+    }
+  });
+  let mut options = options(&root, config(&root, &url));
+  options.watch = true;
+  options.artifacts.clear();
+  let mut watcher = Watcher::new(&options).unwrap();
+  let initial = watcher.cycle().unwrap();
+  let destination = PathBuf::from(initial["runs"][0]["destination"].as_str().unwrap());
+  assert_eq!(
+    std::fs::read(destination.join("run-state.json")).unwrap(),
+    expected
+  );
+  let race = watcher.cycle().unwrap();
+  assert_eq!(race["status"], "fetched");
+  assert_eq!(race["run_count"], 1);
+  assert_eq!(race["runs"][0]["status"], "unavailable");
+  assert_eq!(race["runs"][1]["scope"], json!(survivor_scope));
+  assert!(!race.to_string().contains("private-token"));
+  assert_eq!(
+    std::fs::read(destination.join("run-state.json")).unwrap(),
+    expected
+  );
+  let current = watcher.cycle().unwrap();
+  assert_eq!(current["run_count"], 1);
+  assert_eq!(current["runs"][0]["scope"], json!(survivor_scope));
+  assert_eq!(current["runs"][0]["downloaded_bytes"], 0);
+  task.join().unwrap();
+}
+
+#[test]
+fn expired_run_probe_still_stops_for_deleted_project_or_authentication_failure() {
+  for status in [410, 401, 403] {
+    let (_temporary, root) = root();
+    let mut index = 0;
+    let (url, task) = mock(3, move |request, _| {
+      let operation: Request = serde_json::from_slice(&request.body).unwrap();
+      index += 1;
+      match index {
+        1 => {
+          assert!(matches!(operation, Request::ListRuns { .. }));
+          (
+            200,
+            Vec::new(),
+            serde_json::to_vec(&Response::Runs {
+              runs: vec![scope()],
+            })
+            .unwrap(),
+          )
+        }
+        2 => {
+          assert!(matches!(operation, Request::ListFiles { .. }));
+          (
+            410,
+            Vec::new(),
+            br#"{"error":"run expired private-token"}"#.to_vec(),
+          )
+        }
+        3 => {
+          assert!(matches!(operation, Request::ListRuns { .. }));
+          (
+            status,
+            Vec::new(),
+            br#"{"error":"provider private-token"}"#.to_vec(),
+          )
+        }
+        _ => unreachable!(),
+      }
+    });
+    let marker = root.join("saved-local-result");
+    std::fs::write(&marker, b"keep").unwrap();
+    let mut options = options(&root, config(&root, &url));
+    options.watch = true;
+    let mut watcher = Watcher::new(&options).unwrap();
+    let error = watcher.cycle().unwrap_err().to_string();
+    assert!(error.contains(if status == 410 {
+      "project was deleted"
+    } else {
+      "authorization"
+    }));
+    assert!(!error.contains("private-token"));
+    assert_eq!(std::fs::read(marker).unwrap(), b"keep");
+    task.join().unwrap();
+  }
+}
+
+#[test]
+fn completed_checkpoint_task_for_expired_run_keeps_watching_the_remaining_catalog() {
+  let (_temporary, root) = root();
+  let mut survivor = scope();
+  survivor.run_id = "survivor".into();
+  let expected = survivor.clone();
+  let mut probes = 0;
+  let (url, task) = mock(3, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::ListRuns { .. } => {
+        probes += 1;
+        Response::Runs {
+          runs: vec![survivor.clone()],
+        }
+      }
+      Request::ListFiles { scope } => {
+        assert_eq!(scope, survivor);
+        assert_eq!(probes, 2);
+        Response::Files { files: Vec::new() }
+      }
+      other => panic!("expired checkpoint was unexpectedly downloaded again: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let mut options = options(&root, config(&root, &url));
+  options.watch = true;
+  let mut watcher = Watcher::new(&options).unwrap();
+  let worker = thread::spawn(|| {
+    Err(ExpriError::ServiceRejected {
+      status: 410,
+      detail: "private-token".into(),
+    })
+  });
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  while !worker.is_finished() {
+    assert!(std::time::Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(5));
+  }
+  watcher.task = Some(ObjectTask {
+    scope: scope(),
+    worker,
+  });
+  let report = watcher.cycle().unwrap();
+  assert_eq!(report["retrying_runs"], 0);
+  assert_eq!(report["active_transfers"], 0);
+  assert_eq!(report["runs"][0]["status"], "unavailable");
+  assert_eq!(report["runs"][1]["scope"], json!(expected));
+  assert!(!report.to_string().contains("private-token"));
+  task.join().unwrap();
+}
+
+#[test]
 fn one_shot_fetch_returns_a_safe_error_when_the_service_is_unavailable() {
   let (_temporary, root) = root();
   let (url, task) = mock(1, |_, _| {

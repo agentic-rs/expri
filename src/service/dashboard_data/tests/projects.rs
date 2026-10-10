@@ -82,6 +82,7 @@ fn list<'a>(
   offset: usize,
 ) -> ListQuery<'a> {
   ListQuery {
+    archived: false,
     origin,
     search: None,
     task: None,
@@ -89,6 +90,118 @@ fn list<'a>(
     limit,
     offset,
     table: options,
+  }
+}
+
+#[test]
+fn archival_filters_keep_machine_scope_training_state_and_cached_views_current() {
+  let fixture = Fixture::new();
+  let archived_scope = run(&fixture, "project", "worker-a", "shared", 2.);
+  run(&fixture, "project", "worker-b", "shared", 4.);
+  run(&fixture, "other", "worker-a", "shared", 8.);
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let source = "hosted-project:project";
+  let query = list(None, None, 100, 0);
+  let first = dashboard.list_table(source, &query).unwrap();
+  assert_eq!(first["total_count"], 2);
+  let before = dashboard
+    .updates(
+      source,
+      &["worker-a:shared".into(), "worker-b:shared".into()],
+    )
+    .unwrap();
+
+  let archival = dashboard.archive_run(&archived_scope).unwrap();
+  assert_eq!(archival.status, "archived");
+  let active = dashboard.list_table(source, &query).unwrap();
+  assert_eq!(active["total_count"], 1);
+  assert_eq!(active["runs"][0]["origin"], "worker-b");
+  let mut archived_query = list(None, None, 100, 0);
+  archived_query.archived = true;
+  let archived = dashboard.list_table(source, &archived_query).unwrap();
+  assert_eq!(archived["total_count"], 1);
+  assert_eq!(archived["runs"][0]["origin"], "worker-a");
+  assert_eq!(archived["runs"][0]["status"], "completed");
+  assert_eq!(
+    archived["runs"][0]["archival"]["delete_after"],
+    json!(archival.delete_after)
+  );
+  let after = dashboard
+    .updates(
+      source,
+      &["worker-a:shared".into(), "worker-b:shared".into()],
+    )
+    .unwrap();
+  assert_ne!(before["source_revision"], after["source_revision"]);
+  let detail = dashboard.detail(source, "worker-a:shared").unwrap();
+  assert_eq!(detail["run"]["status"], "completed");
+  assert_eq!(detail["run"]["archival"]["status"], "archived");
+  let comparison = dashboard
+    .compare(
+      source,
+      &["worker-a:shared".into(), "worker-b:shared".into()],
+      &["loss".into()],
+      Reduction::Last,
+    )
+    .unwrap();
+  assert!(
+    comparison["comparison"]["runs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|run| {
+        run["run"]["origin"] == "worker-a" && run["run"]["archival"]["status"] == "archived"
+      })
+  );
+
+  dashboard.restore_run(&archived_scope).unwrap();
+  let restored = dashboard.list_table(source, &query).unwrap();
+  assert_eq!(restored["total_count"], 2);
+  assert!(
+    restored["runs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .all(|run| run["archival"]["status"] == "active")
+  );
+  assert_eq!(
+    dashboard.list_table(source, &archived_query).unwrap()["total_count"],
+    0
+  );
+  assert_eq!(
+    dashboard
+      .list_table("hosted-project:other", &query)
+      .unwrap()["total_count"],
+    1
+  );
+}
+
+#[test]
+fn archived_only_sources_keep_empty_active_views_and_column_discovery_available() {
+  let fixture = Fixture::new();
+  let scope = run(&fixture, "project", "worker-a", "only-run", 2.);
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  dashboard.archive_run(&scope).unwrap();
+  for source in ["hosted-project:project", "hosted:project:worker-a"] {
+    let query = list(None, None, 100, 0);
+    assert_eq!(
+      dashboard.list_table(source, &query).unwrap()["total_count"],
+      0
+    );
+    let columns = dashboard.columns(source).unwrap();
+    assert!(
+      columns["available_columns"]["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|column| column["key"] == "loss")
+    );
+    let mut archived = list(None, None, 100, 0);
+    archived.archived = true;
+    assert_eq!(
+      dashboard.list_table(source, &archived).unwrap()["total_count"],
+      1
+    );
   }
 }
 

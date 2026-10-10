@@ -72,7 +72,7 @@ impl Publisher {
         status: 401 | 403, ..
       } => Some("Service authentication rejected; repair credentials and resume publishing"),
       crate::error::ExpriError::ServiceRejected { status: 410, .. } => Some(
-        "Service project has been deleted; publishing stopped. Use a new project identifier to publish",
+        "Service run or project has expired or been deleted; publishing stopped. Use a new run identifier, or a new project identifier if the project was deleted",
       ),
       _ => None,
     }
@@ -507,6 +507,47 @@ pub fn project_stats(config: &Path, project_id: &str) -> Result<Value> {
     ));
   }
   serde_json::to_value(stats).map_err(Into::into)
+}
+
+pub fn archive_run(config: &Path, scope: &RunScope) -> Result<Value> {
+  run_management(
+    config,
+    scope,
+    Request::ArchiveRun {
+      scope: scope.clone(),
+    },
+  )
+}
+
+pub fn restore_run(config: &Path, scope: &RunScope) -> Result<Value> {
+  run_management(
+    config,
+    scope,
+    Request::RestoreRun {
+      scope: scope.clone(),
+    },
+  )
+}
+
+pub fn run_archival(config: &Path, scope: &RunScope) -> Result<Value> {
+  run_management(
+    config,
+    scope,
+    Request::RunArchival {
+      scope: scope.clone(),
+    },
+  )
+}
+
+fn run_management(config: &Path, scope: &RunScope, request: Request) -> Result<Value> {
+  validate_scope(scope)?;
+  let Response::RunArchival { archival } = Api::new(config)?.request(&request)? else {
+    return Err(message("service did not return run archival status"));
+  };
+  if archival.scope != *scope {
+    return Err(message("service returned archival status for another run"));
+  }
+  serde_json::to_value(archival).map_err(Into::into)
 }
 
 pub fn project_delete_preview(config: &Path, project_id: &str) -> Result<Value> {

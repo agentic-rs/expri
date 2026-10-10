@@ -655,7 +655,13 @@ fn route_content_checked(
         "sort",
         "direction",
         "origin",
+        "archival",
       ])?;
+      let archived = match query.optional("archival").unwrap_or("active") {
+        "active" => false,
+        "archived" => true,
+        _ => return Err(Reply::error(400, "archival must be active or archived")),
+      };
       let limit = query.number("limit", 100, 1, 1000)?;
       let offset = query.number("offset", 0, 0, usize::MAX)?;
       let table = ["param", "metric", "reduction", "sort", "direction"]
@@ -677,6 +683,7 @@ fn route_content_checked(
           .list_table(
             source,
             &super::table::ListQuery {
+              archived,
               origin: query.optional("origin"),
               search: query.optional("search"),
               task: query.optional("task"),

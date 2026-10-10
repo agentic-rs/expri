@@ -3,6 +3,8 @@ import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
 import { ProjectStorageManagement } from "./storage_management_view";
+import { RunArchivalPanel } from "./run_archival_view";
+import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
   MAX_RUN_COLUMNS,
   formatRunTableValue,
@@ -47,6 +49,11 @@ export type DashboardUi = {
   task: string;
   status: string;
   origin: string;
+  archival: ArchivalView;
+  run_management_enabled: boolean;
+  archival_confirming: boolean;
+  archival_busy: boolean;
+  archival_error: string | null;
   project_catalog_note: string | null;
   refreshing: boolean;
   controls_disabled: boolean;
@@ -113,6 +120,10 @@ export type DashboardSnapshot = DashboardUi & {
   reduction: ComparisonReduction;
 };
 export type DashboardActions = {
+  archival: (value: ArchivalView) => void;
+  archival_confirm: () => void;
+  archival_cancel: () => void;
+  archival_mutate: (action: ArchivalAction) => void;
   filter: (field: "search" | "task" | "status" | "origin", value: string) => void;
   clear_filters: () => void;
   run_column: (column: RunColumn, checked: boolean) => void;
@@ -487,6 +498,18 @@ function RunBrowser({
         </div>
       </div>
       <div className="filters">
+        {s.access_mode === "hosted" && <RadioTags
+          id="archival-options"
+          name="archival"
+          legend="Run history"
+          value={s.archival}
+          disabled={s.controls_disabled}
+          options={[
+            { id: "archival-active", value: "active", label: "Active" },
+            { id: "archival-archived", value: "archived", label: "Archived" },
+          ]}
+          on_change={a.archival}
+        />}
         {project && <MachineFilter key={project.source_id} source={project} snapshot={s} actions={a} />}
         <label className="field search-field">
           Search
@@ -675,6 +698,10 @@ function RunBrowser({
                     </button>
                     <div className="run-task">{run.task ?? "No task recorded"}</div>
                     <div className="run-meta">{metadata.join(" · ")}</div>
+                    {run.archival && run.archival.status !== "active" && <div className="run-meta">
+                      {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` :
+                        run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
+                    </div>}
                     {run.table_values_truncated && (
                       <div
                         className="run-value-warning"
@@ -1114,7 +1141,10 @@ function ReviewWorkspace({
           </button>
         </div>
         {s.access_mode === "hosted" && s.review?.kind === "run" && (
-          <ResultUploadSummary detail={s.detail} />
+          <>
+            <RunArchivalPanel snapshot={s} actions={a} />
+            <ResultUploadSummary detail={s.detail} />
+          </>
         )}
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {tabs.map((tab) => (

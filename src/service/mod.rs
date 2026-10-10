@@ -44,6 +44,11 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSubcommand {
+  /// Archive finished hosted runs, restore them, or inspect their retention status.
+  Run {
+    #[command(subcommand)]
+    command: RunCommand,
+  },
   /// Inspect project storage or delete a project with an owner token.
   Project {
     #[command(subcommand)]
@@ -130,6 +135,38 @@ struct ProjectOptions {
   config: PathBuf,
   #[arg(long)]
   project_id: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunCommand {
+  /// Hide a finished run; its hosted data is deleted after 15 days.
+  Archive(RunOptions),
+  /// Restore an archived run before its deletion deadline.
+  Restore(RunOptions),
+  /// Show the run's archival deadline and durable cleanup status.
+  Status(RunOptions),
+}
+
+#[derive(Debug, Args)]
+struct RunOptions {
+  #[arg(long)]
+  config: PathBuf,
+  #[arg(long)]
+  project_id: String,
+  #[arg(long)]
+  origin: String,
+  #[arg(long)]
+  run_id: String,
+}
+
+impl RunOptions {
+  fn scope(&self) -> types::RunScope {
+    types::RunScope {
+      project_id: self.project_id.clone(),
+      origin: self.origin.clone(),
+      run_id: self.run_id.clone(),
+    }
+  }
 }
 
 #[derive(Debug, Args)]
@@ -248,6 +285,11 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
     ));
   }
   let report = match command.command {
+    ServiceSubcommand::Run { command } => match command {
+      RunCommand::Archive(options) => client::archive_run(&options.config, &options.scope())?,
+      RunCommand::Restore(options) => client::restore_run(&options.config, &options.scope())?,
+      RunCommand::Status(options) => client::run_archival(&options.config, &options.scope())?,
+    },
     ServiceSubcommand::Project { command } => match command {
       ProjectCommand::Stats(options) => {
         client::project_stats(&options.config, &options.project_id)?
@@ -358,6 +400,38 @@ mod tests {
       assert!(Cli::try_parse_from(["expri", "input", name]).is_err());
     }
     assert!(!help.contains("archive"));
+  }
+
+  #[test]
+  fn run_archival_requires_a_complete_scope_and_keeps_zip_upload_separate() {
+    for operation in ["archive", "restore", "status"] {
+      let args = [
+        "expri",
+        "run",
+        operation,
+        "--config",
+        "owner.toml",
+        "--project-id",
+        "vision",
+        "--origin",
+        "gpu-1",
+        "--run-id",
+        "run-1",
+      ];
+      let parsed = Cli::try_parse_from(args).unwrap();
+      let ServiceSubcommand::Run { command } = parsed.service.command else {
+        panic!("expected scoped run command");
+      };
+      let options = match command {
+        RunCommand::Archive(options)
+        | RunCommand::Restore(options)
+        | RunCommand::Status(options) => options,
+      };
+      assert_eq!(options.scope().run_id, "run-1");
+      assert_eq!(options.scope().origin, "gpu-1");
+      assert!(Cli::try_parse_from(&args[..args.len() - 2]).is_err());
+      assert!(Cli::try_parse_from(["expri", operation, "--config", "owner.toml"]).is_err());
+    }
   }
 
   #[test]

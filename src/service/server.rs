@@ -279,7 +279,10 @@ fn authorize<S: ObjectStorage>(
     | Request::ProjectStorage { .. }
     | Request::PreviewProjectDelete { .. }
     | Request::DeleteProject { .. }
-    | Request::ProjectDeletion { .. } => false,
+    | Request::ProjectDeletion { .. }
+    | Request::ArchiveRun { .. }
+    | Request::RestoreRun { .. }
+    | Request::RunArchival { .. } => false,
     Request::Capabilities => true,
     Request::SealRun {
       incomplete: true, ..
@@ -382,6 +385,20 @@ pub fn serve(
         let _ = cleanup_store.project_deletion_cycle();
         for _ in 0..10 {
           if cleanup_stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+          }
+          std::thread::sleep(Duration::from_millis(500));
+        }
+      }
+    });
+    let retention_store = &store;
+    let retention_stop = &stop;
+    scope.spawn(move || {
+      while !retention_stop.load(std::sync::atomic::Ordering::Acquire) {
+        // Bounded durable cleanup runs independently of ingestion and ZIP production.
+        let _ = retention_store.run_retention_cycle();
+        for _ in 0..10 {
+          if retention_stop.load(std::sync::atomic::Ordering::Acquire) {
             break;
           }
           std::thread::sleep(Duration::from_millis(500));
@@ -511,6 +528,7 @@ fn dispatch<S: ObjectStorage>(
         &site.auth,
         &site.assets,
         site.allow_project_deletion && !site.preview,
+        !site.preview,
         &request,
       ),
       Ok(None) => api_reply(Err(ApiError::new(403, "dashboard host is not allowed"))),
@@ -1358,7 +1376,7 @@ mod tests {
   }
 
   #[test]
-  fn project_management_service_requests_are_owner_only() {
+  fn hosted_management_service_requests_are_owner_only() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), MockStorage::default()).unwrap();
     let auth = auth();
@@ -1378,6 +1396,9 @@ mod tests {
       Request::ProjectDeletion {
         project_id: "project".into(),
       },
+      Request::ArchiveRun { scope: scope() },
+      Request::RestoreRun { scope: scope() },
+      Request::RunArchival { scope: scope() },
     ] {
       assert_eq!(
         authorize(&store, Some(worker), &operation)
@@ -1433,6 +1454,41 @@ mod tests {
         .unwrap()
         .contains("disabled")
     );
+  }
+
+  #[test]
+  fn preview_sites_cannot_archive_or_restore_shared_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let auth = dashboard_auth();
+    let site = &auth.sites[1];
+    let login = HttpRequest::builder()
+      .method("POST")
+      .uri("/login")
+      .header("Host", PREVIEW_AUTHORITY)
+      .header("Origin", format!("https://{PREVIEW_AUTHORITY}"))
+      .body(Vec::<u8>::new())
+      .unwrap();
+    let issued = site.auth.login(&login, DASHBOARD_PASSWORD).unwrap();
+    for path in ["/api/runs/archive", "/api/runs/restore"] {
+      let write = HttpRequest::builder()
+        .method("POST")
+        .uri(path)
+        .header("Host", PREVIEW_AUTHORITY)
+        .header("Origin", format!("https://{PREVIEW_AUTHORITY}"))
+        .header("Cookie", issued.split(';').next().unwrap())
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_vec(&scope()).unwrap())
+        .unwrap();
+      let reply = dispatch(&store, &auth, Some(&dashboard), write);
+      assert_eq!(reply.status(), 403);
+      assert!(
+        std::str::from_utf8(reply.body())
+          .unwrap()
+          .contains("disabled")
+      );
+    }
   }
 
   #[test]

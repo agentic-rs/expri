@@ -194,6 +194,7 @@ mod tests {
       auth,
       &DashboardAssets::embedded(),
       enabled,
+      true,
       request,
     )
   }
