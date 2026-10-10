@@ -1503,6 +1503,17 @@ def storage_management(project_id):
   browser = Firefox()
   def evaluate(script, *args):
     return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  def assert_storage_usage(dashboard):
+    usage = evaluate('''const panel = document.querySelector('#storage-usage');
+      const cards = Array.from(panel?.querySelectorAll('.storage-usage-grid > div') ?? []);
+      return {
+        card_count: cards.length,
+        labels: cards.map(card => card.querySelector('dt')?.textContent.trim()),
+        reference_totals: /File totals|Shared references/.test(panel?.textContent ?? ''),
+      };''')
+    assert usage['card_count'] == 2, dashboard + ' did not show exactly two storage usage cards'
+    assert usage['labels'] == ['S3 storage', 'Local storage'], dashboard + ' changed storage usage labels'
+    assert not usage['reference_totals'], dashboard + ' showed reference-expanded file totals'
   try:
     browser.set_viewport(1440, 1000)
     browser.navigate('/login')
@@ -1512,7 +1523,7 @@ def storage_management(project_id):
     browser.click(selector)
     browser.click('#workspace-view-storage + span')
     wait_for(lambda: evaluate("return document.querySelector('#delete-project-button') !== null && !document.querySelector('#delete-project-button').disabled;"), 'primary dashboard did not enable project deletion')
-    assert evaluate("return document.querySelector('#storage-usage')?.textContent.length > 0;"), 'project usage statistics were absent'
+    assert_storage_usage('Primary dashboard')
     start = len(trace_records())
     browser.click('#delete-project-button')
     wait_for(lambda: evaluate("return document.querySelector('#delete-project-preview') !== null;"), 'project deletion preview did not load')
@@ -1538,8 +1549,9 @@ def storage_management(project_id):
     browser.click(selector)
     browser.click('#workspace-view-storage + span')
     wait_for(lambda: evaluate("return document.querySelector('#storage-usage .storage-usage-grid') !== null;"), 'AB did not show shared storage statistics')
+    assert_storage_usage('AB dashboard')
     assert evaluate("return document.querySelector('#delete-project-button') === null || document.querySelector('#delete-project-button').disabled;"), 'AB enabled destructive project controls'
-    print('Firefox storage management passed: usage, scoped preview, name/password requirement, narrow layout, cancel and read-only AB.', flush=True)
+    print('Firefox storage management passed: S3/local usage, scoped preview, name/password requirement, narrow layout, cancel and read-only AB.', flush=True)
   finally:
     browser.close()
 

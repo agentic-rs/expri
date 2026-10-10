@@ -518,8 +518,9 @@ Existing worker run links continue to open the exact recorded run.
 The project's **Storage** view lists completed private inputs and uploaded
 outputs across its machines and runs; the per-run **Files** tab also shows
 worker-reported outputs that have not yet been uploaded.
-Storage usage distinguishes file references from unique S3 objects, retained
-uploads, pending uploads, and server tracking bytes. Optional project deletion
+Storage usage shows **S3 storage**, counting each recorded object once including
+retained uploads, and **Local storage** for server tracking files and staged
+archives. Pending upload sizes appear separately. Optional project deletion
 requires a preview, the exact project name, and the dashboard password; durable
 cleanup retries interruptions and removes eligible S3 versions. AB remains
 read-only. See [storage management](docs/self-hosted-service.md#storage-usage-and-project-deletion)

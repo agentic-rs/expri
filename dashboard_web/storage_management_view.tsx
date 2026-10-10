@@ -3,25 +3,26 @@ import { formatFileSize } from "./dashboard_files";
 import { StorageManagementController, type DeletePreview, type StorageStats } from "./storage_management";
 
 function Usage({ stats }: { stats: StorageStats }) {
+  const s3_bytes = stats.s3_storage_bytes ?? stats.object_bytes + stats.retained_object_bytes;
+  const s3_objects = stats.s3_object_count ?? stats.object_count + stats.retained_object_count;
   return (
     <>
       <dl className="storage-usage-grid">
-        <div><dt>Referenced object storage</dt><dd>{formatFileSize(stats.object_bytes)}</dd>
-          <dd className="storage-usage-description">{stats.object_count.toLocaleString()} unique objects</dd></div>
-        <div><dt>File totals</dt><dd>{formatFileSize(stats.logical_bytes)}</dd>
-          <dd className="storage-usage-description">{stats.file_count.toLocaleString()} file entries</dd></div>
-        <div><dt>Shared references</dt><dd>{stats.shared_reference_count.toLocaleString()}</dd>
-          <dd className="storage-usage-description">Additional entries that reuse an object</dd></div>
+        <div><dt>S3 storage</dt><dd>{formatFileSize(s3_bytes)}</dd>
+          <dd className="storage-usage-description">{s3_objects.toLocaleString()} stored objects, including retained uploads</dd></div>
+        <div><dt>Local storage</dt><dd>{stats.local_storage_bytes === undefined ? "Unavailable" : formatFileSize(stats.local_storage_bytes)}</dd>
+          <dd className="storage-usage-description">Tracking files and result archives on the server</dd></div>
       </dl>
       <dl className="storage-usage-details">
-        <div><dt>Retained objects</dt><dd>{formatFileSize(stats.retained_object_bytes)} · {stats.retained_object_count.toLocaleString()} objects</dd></div>
         <div><dt>Pending uploads</dt><dd>{formatFileSize(stats.pending_upload_bytes)} declared · {stats.pending_upload_count.toLocaleString()} uploads</dd></div>
-        <div><dt>Tracking data</dt><dd>{formatFileSize(stats.tracking_bytes)}</dd></div>
       </dl>
       <p className="muted storage-usage-note">
-        Inputs and outputs can share an object. File totals count each entry; object storage counts each object once.
-        Retained objects are older completed uploads kept by this project. These totals cover expri-managed data, not the full bucket bill.
+        Shared inputs and outputs count once in S3 storage. Totals cover recorded project data;
+        historical S3 versions and shared database overhead are excluded.
       </p>
+      {stats.local_storage_bytes === undefined && <p className="muted storage-usage-note">
+        Upgrade the server to see local storage usage.
+      </p>}
     </>
   );
 }
@@ -31,13 +32,13 @@ function Preview({ preview }: { preview: DeletePreview }) {
     <div id="delete-project-preview">
       <p>Delete <strong>{preview.project_id}</strong> from this hosted service?</p>
       <p>This removes all project runs, metadata, metrics, logs, private inputs, and run outputs on the server.
-        Local files remain. Objects referenced by another project remain available there.
+        Files on workers and your laptop remain. Objects referenced by another project remain available there.
         This project ID cannot be reused on this service.</p>
       <dl className="delete-preview-counts">
         <div><dt>Runs</dt><dd>{preview.run_count.toLocaleString()}</dd></div>
-        <div><dt>File entries</dt><dd>{preview.stats.file_count.toLocaleString()}</dd></div>
         <div><dt>Objects to reclaim</dt><dd>{preview.stats.reclaimable_object_count.toLocaleString()}</dd></div>
-        <div><dt>Storage to reclaim</dt><dd>{formatFileSize(preview.stats.reclaimable_object_bytes)}</dd></div>
+        <div><dt>S3 storage to reclaim</dt><dd>{formatFileSize(preview.stats.reclaimable_object_bytes)}</dd></div>
+        {preview.stats.local_storage_bytes !== undefined && <div><dt>Local storage to remove</dt><dd>{formatFileSize(preview.stats.local_storage_bytes)}</dd></div>}
       </dl>
       {preview.stats.pending_upload_count > 0 && <p className="notice">
         {preview.stats.pending_upload_count.toLocaleString()} pending uploads will be aborted.

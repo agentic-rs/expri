@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::*;
 use crate::service::storage::{CleanupError, CleanupResult};
 
+mod local_storage;
+
 const TARGET_PROJECT: &str =
   "COALESCE(json_extract(target,'$.scope.project_id'),json_extract(target,'$.project_id'))";
 
@@ -141,7 +143,7 @@ fn count_sum(db: &Connection, query: &str, project_id: &str) -> ApiResult<(u64, 
     .map_err(database)
 }
 
-fn stats(db: &Connection, project_id: &str) -> ApiResult<ProjectStorageStats> {
+fn stats(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<ProjectStorageStats> {
   let current = format!(
     "SELECT object_key,MAX(json_extract(record,'$.size')) AS size FROM files WHERE {TARGET_PROJECT}=?1 AND json_extract(record,'$.storage')='object' GROUP BY object_key"
   );
@@ -169,6 +171,11 @@ fn stats(db: &Connection, project_id: &str) -> ApiResult<ProjectStorageStats> {
     &format!("SELECT COUNT(*),COALESCE(SUM(size),0) FROM ({retained})"),
     project_id,
   )?;
+  let (s3_object_count, s3_storage_bytes) = count_sum(
+    db,
+    &format!("SELECT COUNT(*),COALESCE(SUM(size),0) FROM ({candidates})"),
+    project_id,
+  )?;
   let (pending_upload_count, pending_upload_bytes) = count_sum(
     db,
     &format!(
@@ -184,6 +191,7 @@ fn stats(db: &Connection, project_id: &str) -> ApiResult<ProjectStorageStats> {
     project_id,
   )?;
   let tracking_bytes = db.query_row(&format!("SELECT COALESCE(SUM(size),0) FROM (SELECT size FROM tracking_versions WHERE {TARGET_PROJECT}=?1 UNION ALL SELECT size FROM streams WHERE {TARGET_PROJECT}=?1)"), [project_id], |row| row.get(0)).map_err(database)?;
+  let local_archive_bytes = local_storage::archive_bytes(directory, db, project_id)?;
   Ok(ProjectStorageStats {
     project_id: project_id.into(),
     revision: revision(db, project_id)?,
@@ -194,9 +202,13 @@ fn stats(db: &Connection, project_id: &str) -> ApiResult<ProjectStorageStats> {
     shared_reference_count: file_count.saturating_sub(object_count),
     retained_object_count,
     retained_object_bytes,
+    s3_object_count: Some(s3_object_count),
+    s3_storage_bytes: Some(s3_storage_bytes),
     pending_upload_count,
     pending_upload_bytes,
     tracking_bytes,
+    local_archive_bytes: Some(local_archive_bytes),
+    local_storage_bytes: Some(tracking_bytes.saturating_add(local_archive_bytes)),
     reclaimable_object_count,
     reclaimable_object_bytes,
   })
@@ -208,7 +220,7 @@ fn outside_references(key: &str) -> String {
   )
 }
 
-fn preview(db: &Connection, project_id: &str) -> ApiResult<ProjectDeletePreview> {
+fn preview(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<ProjectDeletePreview> {
   ensure_active(db, project_id)?;
   let exists: bool = db
     .query_row(
@@ -226,7 +238,7 @@ fn preview(db: &Connection, project_id: &str) -> ApiResult<ProjectDeletePreview>
   if !exists {
     return Err(ApiError::new(404, "project is missing"));
   }
-  let stats = stats(db, project_id)?;
+  let stats = stats(directory, db, project_id)?;
   let run_count = db.query_row("SELECT COUNT(*) FROM (SELECT DISTINCT origin,run_id FROM (
     SELECT json_extract(target,'$.scope.origin') AS origin,json_extract(target,'$.scope.run_id') AS run_id FROM files WHERE json_extract(target,'$.scope.project_id')=?1
     UNION ALL SELECT json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id') FROM uploads WHERE json_extract(target,'$.scope.project_id')=?1
@@ -309,12 +321,12 @@ impl<S: ObjectStorage> Store<S> {
 
   pub fn project_storage(&self, project_id: &str) -> ApiResult<ProjectStorageStats> {
     validate_component(project_id).map_err(bad)?;
-    stats(&*self.db()?, project_id)
+    stats(&self.directory, &*self.db()?, project_id)
   }
 
   pub fn preview_project_delete(&self, project_id: &str) -> ApiResult<ProjectDeletePreview> {
     validate_component(project_id).map_err(bad)?;
-    preview(&*self.db()?, project_id)
+    preview(&self.directory, &*self.db()?, project_id)
   }
 
   pub fn project_deletion(&self, project_id: &str) -> ApiResult<ProjectDeletionStatus> {
@@ -355,7 +367,7 @@ impl<S: ObjectStorage> Store<S> {
       return status(&db, project_id);
     }
     let transaction = db.transaction().map_err(database)?;
-    let selected = preview(&transaction, project_id)?;
+    let selected = preview(&self.directory, &transaction, project_id)?;
     if selected.revision != expected_revision {
       return Err(ApiError::new(
         409,

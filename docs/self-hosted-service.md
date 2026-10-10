@@ -442,17 +442,20 @@ queue under `.expri/service-sync/files/`, configurable with `--queue-dir`.
 ## Storage usage and project deletion
 
 The project's **Storage** page shows usage across all of its service records,
-independent of the selected list, search, or page. **File totals** count each
-current input, output, and archive reference; **Unique objects** count each
-referenced S3 key once. Referencing the same dataset as an input and output adds
-a file reference without another stored copy. Retained objects are older
-completed uploads that no current file uses. Pending uploads show declared file
-sizes, rather than bytes received. Tracking bytes are acknowledged documents,
-metrics, and logs stored in the service data directory.
+independent of the selected list, search, or page. **S3 storage** counts each
+recorded S3 key once, including retained completed uploads that no current file
+uses. Referencing the same dataset as an input and output does not increase this
+total. **Local storage** counts acknowledged tracking documents, metrics, logs,
+and staged or retained `result.zip` archives in the server's service data
+directory. It does not measure files on workers or your laptop. Pending uploads
+show declared file sizes separately, rather than bytes received.
 
 These are catalog statistics, not the bucket's total billable storage. They do
-not include unrelated or unrecorded objects, historical S3 versions, or database
-overhead. The deletion preview estimates reclaimable objects, excluding keys
+not include unrelated or unrecorded objects, historical S3 versions, temporary
+archive-building files, filesystem allocation overhead, or shared database
+overhead. Projects that share an S3 key each include that key once in their own
+total; adding project totals can still count cross-project shared objects more
+than once. The deletion preview estimates reclaimable objects, excluding keys
 referenced by another project. Inspect the same figures from the owner CLI:
 
 ```sh

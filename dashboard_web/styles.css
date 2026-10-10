@@ -326,7 +326,7 @@ footer { color: #8690a2; font-size: 10px; display: flex; justify-content: space-
 .storage-usage { margin-bottom: 20px; min-width: 0; }
 .storage-usage .section-heading { flex-wrap: wrap; gap: 12px; }
 .storage-management-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
-.storage-usage-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 22px 0 18px; }
+.storage-usage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 22px 0 18px; }
 .storage-usage-grid > div { min-width: 0; padding: 14px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
 .storage-usage-grid dt, .storage-usage-details dt, .delete-preview-counts dt { font-size: 12px; color: var(--muted); }
 .storage-usage-grid dd { margin: 6px 0; font-size: 24px; font-weight: 650; }
