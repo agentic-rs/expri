@@ -738,7 +738,10 @@ Use `--dry-run` to print the selected transport's commands without executing the
 
 ## Testing
 
-Run Rust checks with `cargo test --all-targets --all-features --locked`. CI also
+The single `expri` executable uses internal workspace crates. See
+[crate layout](docs/crate-layout.md) for boundaries and release ordering.
+
+Run Rust checks with `cargo test --workspace --all-targets --all-features --locked`. CI also
 runs the Python runtime/metrics tests and dashboard frontend checks.
 
 The [host and worker suite](tests/containers/README.md) runs real uv, SSH and

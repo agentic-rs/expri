@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ExpriError, Result};
 
-pub(crate) const FILE_LIMIT: usize = 200;
-pub(crate) const INVENTORY_LIMIT: usize = 64 * 1024;
-pub(crate) const INVENTORY_PATH: &str = "outputs/.expri-artifacts.json";
+pub const FILE_LIMIT: usize = 200;
+pub const INVENTORY_LIMIT: usize = 64 * 1024;
+pub const INVENTORY_PATH: &str = "outputs/.expri-artifacts.json";
 const ENTRY_LIMIT: usize = 2000;
 const DEPTH_LIMIT: usize = 16;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct Artifact {
+pub struct Artifact {
   pub path: String,
   pub size: u64,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -29,12 +29,12 @@ pub(crate) struct Artifact {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct Inventory {
+pub struct Inventory {
   pub files: Vec<Artifact>,
   pub truncated: bool,
 }
 
-pub(crate) fn validate_path(path: &str) -> Result<()> {
+pub fn validate_path(path: &str) -> Result<()> {
   if !path.starts_with("outputs/")
     || path.len() > 1024
     || path.contains('\\')
@@ -50,7 +50,7 @@ pub(crate) fn validate_path(path: &str) -> Result<()> {
   Ok(())
 }
 
-pub(crate) fn scan(run_dir: &Path) -> Result<Inventory> {
+pub fn scan(run_dir: &Path) -> Result<Inventory> {
   let metadata = fs::symlink_metadata(run_dir)?;
   if !metadata.is_dir() || metadata.file_type().is_symlink() {
     return Err(ExpriError::Message(

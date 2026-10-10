@@ -488,6 +488,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "expri-core",
+ "expri-run-data",
  "form_urlencoded",
  "globset",
  "http",
@@ -505,6 +507,31 @@ dependencies = [
  "tempfile",
  "toml",
  "zip",
+]
+
+[[package]]
+name = "expri-core"
+version = "0.1.5"
+dependencies = [
+ "globset",
+ "http",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "url",
+]
+
+[[package]]
+name = "expri-run-data"
+version = "0.1.5"
+dependencies = [
+ "chrono",
+ "expri-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

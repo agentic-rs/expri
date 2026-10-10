@@ -265,50 +265,6 @@ fn symlink_run_output_and_metric_paths_are_not_followed() {
   assert!(read(&fixture.runs, "../outside", &[]).is_err());
 }
 
-#[cfg(unix)]
-#[test]
-fn vendored_python_producer_is_readable_without_site_packages_or_pythonpath() {
-  let fixture = Fixture::new();
-  let run = fixture.run("run-python", b"");
-  let code = run.join("code");
-  fs::create_dir(&code).unwrap();
-  fs::copy(
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("python/expri_metrics.py"),
-    code.join("expri_metrics.py"),
-  )
-  .unwrap();
-  fs::write(
-    code.join("train.py"),
-    r#"from expri_metrics import MetricsLogger
-with MetricsLogger() as logger:
-  logger.params({"learning_rate": 0.01, "model": {"width": 64}, "seed": 42})
-  logger.log(0, {"train/loss": 4, "train/accuracy": 0.25})
-  logger.log(18446744073709551615, {"train/loss": 0.5})
-"#,
-  )
-  .unwrap();
-  let output = std::process::Command::new("python3")
-    .args(["-B", "-S", "train.py"])
-    .current_dir(&code)
-    .env_remove("PYTHONPATH")
-    .env("EXPRI_OUTPUT_DIR", run.join("outputs"))
-    .output()
-    .unwrap();
-  assert!(
-    output.status.success(),
-    "{}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  let read = read(&fixture.runs, "run-python", &[]).unwrap();
-  assert!(read.warnings.is_empty(), "{:?}", read.warnings);
-  assert_eq!(read.params.as_ref().unwrap()["model"]["width"], 64);
-  assert_eq!(read.metrics["train/loss"].summary.count, 2);
-  assert_eq!(read.metrics["train/loss"].summary.last.step, u64::MAX);
-  assert_eq!(read.metrics["train/loss"].summary.last.value, 0.5);
-  assert!(read.metrics["train/loss"].points[0].timestamp.is_some());
-  assert_eq!(read.metrics["train/accuracy"].summary.count, 1);
-}
-
 #[test]
 fn long_fractional_timestamps_cannot_amplify_memory_across_metric_points() {
   let fixture = Fixture::new();
@@ -507,15 +463,6 @@ fn hosted_thinning_retains_timestamped_endpoints_and_exact_missing_counts() {
     );
     assert_eq!(series.summary.count, 10000);
     assert_eq!(series.summary.missing_timestamp_count, 9998);
-    let html = crate::metric_charts::render_dashboard_chart(
-      &[record],
-      &[],
-      crate::metric_charts::ChartXAxis::Elapsed,
-    )
-    .unwrap();
-    assert_eq!(html.matches("<circle ").count(), 2);
-    assert!(html.contains("9998 of 10000 samples omitted"));
-    assert!(html.contains("data-x-max=\"1000000000\""));
   }
 }
 

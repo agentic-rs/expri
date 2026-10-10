@@ -755,3 +755,61 @@ fn dashboard_html_budget_reports_when_metadata_alone_exceeds_the_limit() {
       .contains("select fewer metrics or runs")
   );
 }
+
+#[test]
+fn hosted_sampled_metrics_keep_time_axis_chart_and_omission_count() {
+  use expri_run_data::metrics::{RunMetrics, read_event_data};
+  use std::collections::BTreeMap;
+  use std::io::Write;
+  let mut bytes = Vec::new();
+  for step in 0..10000 {
+    let mut row = json!({"step": step, "metrics": {"loss": step}});
+    if step == 1 || step == 9998 {
+      row["timestamp"] = json!(format!(
+        "2026-10-03T01:00:{}Z",
+        if step == 1 { "00" } else { "01" }
+      ));
+    }
+    writeln!(&mut bytes, "{row}").unwrap();
+  }
+  for limit in [4, 16] {
+    let mut record = RunMetrics {
+      run_id: "preview".into(),
+      run: json!({}),
+      params: None,
+      first_metric_timestamp: None,
+      metrics: BTreeMap::new(),
+      warnings: Vec::new(),
+    };
+    read_event_data(
+      bytes.as_slice(),
+      bytes.len() as u64,
+      &mut record,
+      &[],
+      true,
+      Some(limit),
+    )
+    .unwrap();
+    let series = &record.metrics["loss"];
+    assert!(series.points.len() <= limit);
+    assert_eq!(series.points.first().unwrap().step, 0);
+    assert_eq!(series.points.last().unwrap().step, 9999);
+    assert!(series.points.iter().any(|point| point.step == 1));
+    assert!(series.points.iter().any(|point| point.step == 9998));
+    assert_eq!(
+      record.first_metric_timestamp.as_deref(),
+      Some("2026-10-03T01:00:00Z")
+    );
+    assert_eq!(series.summary.count, 10000);
+    assert_eq!(series.summary.missing_timestamp_count, 9998);
+    let html = crate::metric_charts::render_dashboard_chart(
+      &[record],
+      &[],
+      crate::metric_charts::ChartXAxis::Elapsed,
+    )
+    .unwrap();
+    assert_eq!(html.matches("<circle ").count(), 2);
+    assert!(html.contains("9998 of 10000 samples omitted"));
+    assert!(html.contains("data-x-max=\"1000000000\""));
+  }
+}

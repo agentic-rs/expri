@@ -159,7 +159,7 @@ fn validate_request(request: &RunQueryRequest) -> Result<()> {
   Ok(())
 }
 
-pub(crate) fn validate_id(run_id: &str) -> Result<()> {
+pub fn validate_id(run_id: &str) -> Result<()> {
   let mut bytes = run_id.bytes();
   if !bytes
     .next()
@@ -243,26 +243,10 @@ fn show(run_dir: &Path) -> Value {
     &mut record.warnings,
     true,
   );
-  let publishing = match crate::service::publishing::status(run_dir) {
-    Ok(publishing) => publishing,
-    Err(_) => {
-      let detail = "Service publishing status could not be read.";
-      warn(
-        &mut record.warnings,
-        &run_dir.file_name().unwrap().to_string_lossy(),
-        detail,
-      );
-      Some(json!({"status": "error", "last_error": detail}))
-    }
-  };
-  let mut report = json!({
+  json!({
     "run": record.summary, "state": record.state, "snapshot": snapshot,
     "environment": environment, "warnings": record.warnings,
-  });
-  if let Some(publishing) = publishing {
-    report["publishing"] = publishing;
-  }
-  report
+  })
 }
 
 fn record(run_dir: &Path) -> Record {
@@ -276,7 +260,7 @@ fn record(run_dir: &Path) -> Record {
 }
 
 /// Apply the same catalog validation to locally saved and hosted run states.
-pub(crate) fn summary_from_state(run_id: &str, state: Option<Value>) -> Value {
+pub fn summary_from_state(run_id: &str, state: Option<Value>) -> Value {
   let record = record_from_state(run_id, state);
   json!({"run": record.summary, "state": record.state, "warnings": record.warnings})
 }

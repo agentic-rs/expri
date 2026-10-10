@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub use expri_core::identifiers::validate_component;
+
 pub const STREAM_BATCH: usize = 64 * 1024;
 pub const MAX_REQUEST: usize = 1024 * 1024;
 
@@ -333,22 +335,6 @@ pub fn document_path(path: &str) -> bool {
       | "outputs/params.json"
       | "outputs/.expri-artifacts.json"
   )
-}
-
-pub fn validate_component(value: &str) -> crate::error::Result<()> {
-  if value.is_empty()
-    || value.len() > 96
-    || value == "."
-    || value == ".."
-    || !value
-      .bytes()
-      .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-  {
-    return Err(crate::error::ExpriError::Message(
-      "invalid service identifier".into(),
-    ));
-  }
-  Ok(())
 }
 
 pub fn validate_scope(scope: &RunScope) -> crate::error::Result<()> {

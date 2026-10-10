@@ -207,7 +207,8 @@ fn apply_patch_zip(
     path: patch_path.display().to_string(),
     source,
   })?;
-  let mut archive = ZipArchive::new(file)?;
+  let mut archive =
+    ZipArchive::new(file).map_err(|error| ExpriError::Message(error.to_string()))?;
   let deleted = read_deleted_paths(&mut archive)?;
   for path in deleted {
     if is_remote_managed(&path, remote_managed) {
@@ -217,7 +218,9 @@ fn apply_patch_zip(
   }
 
   for index in 0..archive.len() {
-    let mut entry = archive.by_index(index)?;
+    let mut entry = archive
+      .by_index(index)
+      .map_err(|error| ExpriError::Message(error.to_string()))?;
     let Some(relative_path) = entry.enclosed_name() else {
       return Err(ExpriError::Message(format!(
         "patch archive contains unsafe path: {}",

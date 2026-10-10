@@ -35,11 +35,15 @@ pub fn build_patch_archive(repo_root: &Path, dirty: &DirtyPaths) -> Result<Patch
     deleted.push_str(&path.to_string_lossy());
     deleted.push('\n');
   }
-  archive.start_file(".deleted", options)?;
+  archive
+    .start_file(".deleted", options)
+    .map_err(|error| ExpriError::Message(error.to_string()))?;
   archive.write_all(deleted.as_bytes())?;
 
   for relative_path in &dirty.files {
-    archive.start_file(relative_path.to_string_lossy(), options)?;
+    archive
+      .start_file(relative_path.to_string_lossy(), options)
+      .map_err(|error| ExpriError::Message(error.to_string()))?;
     let absolute_path = repo_root.join(relative_path);
     let mut file = File::open(&absolute_path).map_err(|source| ExpriError::IoContext {
       action: "open",
@@ -48,7 +52,9 @@ pub fn build_patch_archive(repo_root: &Path, dirty: &DirtyPaths) -> Result<Patch
     })?;
     io::copy(&mut file, &mut archive)?;
   }
-  archive.finish()?;
+  archive
+    .finish()
+    .map_err(|error| ExpriError::Message(error.to_string()))?;
 
   let (digest, size) = sha256_file(&path)?;
   Ok(PatchArchive {

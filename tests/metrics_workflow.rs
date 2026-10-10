@@ -240,3 +240,85 @@ fn forced_older_nodes_refuse_metric_selection_before_creating_a_cache() {
   assert!(String::from_utf8_lossy(&output.stderr).contains("run-metrics-v1"));
   assert!(!fixture.cache("run-one").exists());
 }
+
+#[cfg(unix)]
+mod python_producer {
+  use expri_run_data::metrics::read;
+  use serde_json::json;
+  use std::fs;
+  use std::path::{Path, PathBuf};
+
+  struct Fixture {
+    _root: tempfile::TempDir,
+    runs: PathBuf,
+  }
+
+  impl Fixture {
+    fn new() -> Self {
+      let root = tempfile::tempdir().unwrap();
+      let runs = fs::canonicalize(root.path()).unwrap().join(".expri/runs");
+      fs::create_dir_all(&runs).unwrap();
+      Self { _root: root, runs }
+    }
+
+    fn run(&self, id: &str, metrics: &[u8]) -> PathBuf {
+      let run = self.runs.join(id);
+      fs::create_dir_all(run.join("outputs")).unwrap();
+      fs::write(
+        run.join("run-state.json"),
+        serde_json::to_vec(&json!({
+          "schema_version": 1, "run_id": id, "task": "train", "status": "running",
+          "started_at": "2026-10-03T01:00:00Z"
+        }))
+        .unwrap(),
+      )
+      .unwrap();
+      fs::write(run.join("outputs/metrics.jsonl"), metrics).unwrap();
+      run
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn vendored_python_producer_is_readable_without_site_packages_or_pythonpath() {
+    let fixture = Fixture::new();
+    let run = fixture.run("run-python", b"");
+    let code = run.join("code");
+    fs::create_dir(&code).unwrap();
+    fs::copy(
+      Path::new(env!("CARGO_MANIFEST_DIR")).join("python/expri_metrics.py"),
+      code.join("expri_metrics.py"),
+    )
+    .unwrap();
+    fs::write(
+      code.join("train.py"),
+      r#"from expri_metrics import MetricsLogger
+with MetricsLogger() as logger:
+  logger.params({"learning_rate": 0.01, "model": {"width": 64}, "seed": 42})
+  logger.log(0, {"train/loss": 4, "train/accuracy": 0.25})
+  logger.log(18446744073709551615, {"train/loss": 0.5})
+  "#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("python3")
+      .args(["-B", "-S", "train.py"])
+      .current_dir(&code)
+      .env_remove("PYTHONPATH")
+      .env("EXPRI_OUTPUT_DIR", run.join("outputs"))
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "{}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let read = read(&fixture.runs, "run-python", &[]).unwrap();
+    assert!(read.warnings.is_empty(), "{:?}", read.warnings);
+    assert_eq!(read.params.as_ref().unwrap()["model"]["width"], 64);
+    assert_eq!(read.metrics["train/loss"].summary.count, 2);
+    assert_eq!(read.metrics["train/loss"].summary.last.step, u64::MAX);
+    assert_eq!(read.metrics["train/loss"].summary.last.value, 0.5);
+    assert!(read.metrics["train/loss"].points[0].timestamp.is_some());
+    assert_eq!(read.metrics["train/accuracy"].summary.count, 1);
+  }
+}

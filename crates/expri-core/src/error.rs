@@ -30,7 +30,6 @@ pub enum ExpriError {
   Toml(toml::de::Error),
   Json(serde_json::Error),
   Glob(globset::Error),
-  Zip(zip::result::ZipError),
   CommandFailed {
     program: String,
     code: Option<i32>,
@@ -75,13 +74,12 @@ impl Display for ExpriError {
       Self::Toml(error) => write!(formatter, "{error}"),
       Self::Json(error) => write!(formatter, "{error}"),
       Self::Glob(error) => write!(formatter, "{error}"),
-      Self::Zip(error) => write!(formatter, "{error}"),
       Self::CommandFailed { program, code } => match code {
         Some(code) => write!(formatter, "{program} exited with status {code}"),
         None => write!(formatter, "{program} terminated by signal"),
       },
       Self::ServiceRejected { status, detail } => {
-        let status = reqwest::StatusCode::from_u16(*status)
+        let status = http::StatusCode::from_u16(*status)
           .map(|value| value.to_string())
           .unwrap_or_else(|_| status.to_string());
         write!(formatter, "service returned {status}: {detail}")
@@ -140,8 +138,33 @@ impl From<globset::Error> for ExpriError {
   }
 }
 
-impl From<zip::result::ZipError> for ExpriError {
-  fn from(error: zip::result::ZipError) -> Self {
-    Self::Zip(error)
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn service_rejections_preserve_status_descriptions() {
+    for (status, expected) in [
+      (401, "service returned 401 Unauthorized: denied"),
+      (503, "service returned 503 Service Unavailable: denied"),
+      (42, "service returned 42: denied"),
+    ] {
+      let error = ExpriError::ServiceRejected {
+        status,
+        detail: "denied".into(),
+      };
+      assert_eq!(error.to_string(), expected);
+      assert_eq!(error.exit_code(), 1);
+    }
+  }
+
+  #[test]
+  fn failed_commands_preserve_their_exit_code() {
+    let error = ExpriError::CommandFailed {
+      program: "python".into(),
+      code: Some(137),
+    };
+    assert_eq!(error.exit_code(), 137);
+    assert_eq!(error.to_string(), "python exited with status 137");
   }
 }

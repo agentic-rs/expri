@@ -6,6 +6,7 @@ RUN apt-get update \
   && apt-get install --yes --no-install-recommends cmake \
   && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
 COPY src/ src/
 COPY tests/container_workflow.rs tests/container_workflow.rs
 COPY python/expri_metrics.py python/expri_metrics.py

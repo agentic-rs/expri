@@ -119,7 +119,7 @@ pub fn read_summaries(runs_dir: &Path, run_id: &str, filters: &[String]) -> Resu
   )
 }
 
-pub(crate) fn read_summary_files(
+pub fn read_summary_files(
   runs_dir: &Path,
   run_id: &str,
   filters: &[String],
@@ -263,7 +263,7 @@ fn read_params(run_dir: &Path) -> Result<Option<Value>> {
 }
 
 /// Parse the same parameter envelope for local files and bounded hosted reads.
-pub(crate) fn parse_parameters(raw: &[u8]) -> Result<Value> {
+pub fn parse_parameters(raw: &[u8]) -> Result<Value> {
   if raw.len() > LINE_LIMIT {
     return Err(message("outputs/params.json exceeds the 1 MiB size limit"));
   }
@@ -360,7 +360,7 @@ fn read_events(
 /// Hosted readers keep complete scalar summaries while bounding retained curve
 /// data independently of the input length. Local CLI reads retain their existing
 /// point limit and exported chart behavior.
-pub(crate) fn read_event_data(
+pub fn read_event_data(
   reader: impl Read,
   size: u64,
   result: &mut RunMetrics,
@@ -512,9 +512,9 @@ fn read_line(
   }
 }
 
-pub(crate) type ParsedEvent = (u64, Option<String>, BTreeMap<String, f64>);
+pub type ParsedEvent = (u64, Option<String>, BTreeMap<String, f64>);
 
-pub(crate) fn event(value: Value) -> std::result::Result<ParsedEvent, String> {
+pub fn event(value: Value) -> std::result::Result<ParsedEvent, String> {
   let object = value.as_object().ok_or("event must be an object")?;
   if object
     .get("schema_version")
@@ -612,7 +612,7 @@ fn thin_points(points: &mut Vec<MetricPoint>, limit: usize) {
     .collect();
 }
 
-pub(crate) fn validate_filters(filters: &[String]) -> Result<()> {
+pub fn validate_filters(filters: &[String]) -> Result<()> {
   for name in filters {
     validate_name(name)?;
   }

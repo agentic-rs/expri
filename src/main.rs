@@ -7,24 +7,22 @@ mod context;
 mod controller;
 mod dashboard;
 mod environment;
-mod error;
 mod fetch_cli;
 mod filter;
 mod git;
 mod jobs;
-mod lock;
 mod metric_charts;
-mod metrics;
 mod metrics_cli;
 mod node;
-mod protocol;
 mod push_cli;
-mod run_artifacts;
 mod run_logs;
 mod runs;
 mod runs_cli;
 mod service;
 mod shell;
+
+use expri_core::{error, lock, protocol};
+use expri_run_data::{metrics, run_artifacts};
 
 use std::path::PathBuf;
 
