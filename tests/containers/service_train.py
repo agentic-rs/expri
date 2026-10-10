@@ -9,7 +9,7 @@ import torch
 from expri_metrics import MetricsLogger
 
 out = Path(os.environ['EXPRI_OUTPUT_DIR'])
-private = (Path(os.environ['EXPRI_INPUT_DIR']) / 'dataset.bin').read_bytes()
+private = Path('data/dataset.bin').read_bytes()
 assert private == b'private-input-fixture' * 1024
 assert (torch.ones(1, device='cuda') + 1).item() == 2
 print('STDOUT_BURST:' + 'x' * (256 * 1024), flush=True)

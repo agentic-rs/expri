@@ -48,6 +48,8 @@ fn sync_target_with_output(
   options: SyncOptions,
   diagnostic_stdout: bool,
 ) -> Result<Option<SyncIdentity>> {
+  // Filtering a patch cannot remove a tracked blob from a Git source bundle.
+  git::reject_tracked_assets(&options.repo_root)?;
   let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
   let node_bin = options
     .target
@@ -175,6 +177,18 @@ fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
   validate_sync_paths(&options.paths)?;
   remote.connect()?;
   let list = git::ls_files(&options.repo_root, &options.paths)?;
+  let mut filtered = Vec::new();
+  for value in list
+    .split(|byte| *byte == 0)
+    .filter(|value| !value.is_empty())
+  {
+    let path = git::path_from_git(value)?;
+    if options.sync.should_include(&path) && !git::is_managed_asset(&options.repo_root, &path) {
+      filtered.extend_from_slice(value);
+      filtered.push(0);
+    }
+  }
+  let list = filtered;
   if list.is_empty() && options.verbosity > 0 && !options.quiet {
     eprintln!("no tracked files matched");
   }

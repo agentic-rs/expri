@@ -1150,7 +1150,7 @@ print(process.pid)
   offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
   offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
-  assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its configured private input'
+  assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its pinned private asset'
   assert publishing(offline_run['run_dir'])['status'] != 'published', 'offline checkpoint registration claimed completed cloud sync'
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
@@ -1175,7 +1175,7 @@ print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
   assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
   assert offline_artifact['file']['downloaded'] is True, 'offline Files lost its verified checkpoint download receipt'
   assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
-  print('Service workflow passed: tracking-v1 publishing, configured private-input cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial result uploads, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
+  print('Service workflow passed: tracking-v1 publishing, private asset sidecars/cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial result uploads, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
 finally:
   if result_fetch_pid is not None:
     try:

@@ -21,6 +21,16 @@ pub const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
 pub const DEFAULT_EXCLUDED_FILES: &[&str] =
   &[".env", "*.pyc", "*.pyo", "*.log", "*.tmp", ".DS_Store"];
 
+pub const ASSET_STAGING_PREFIX: &str = ".expri-asset-";
+
+pub(crate) fn is_private_source_path(path: &Path) -> bool {
+  path.components().any(|component| {
+    matches!(component, Component::Normal(name) if name == ".expri"
+      || name == ".expri-input-downloads"
+      || name.to_string_lossy().starts_with(ASSET_STAGING_PREFIX))
+  })
+}
+
 #[derive(Clone, Debug)]
 pub struct SyncRules {
   exclude_dirs: Vec<String>,
@@ -80,9 +90,7 @@ impl SyncRules {
     }
     // Expri state contains private inputs, run snapshots, and transfer receipts.
     // A custom source exclusion list must not turn it into a source patch.
-    if relative_path.components().any(|component| {
-      matches!(component, Component::Normal(value) if value == ".expri" || value == ".expri-input-downloads")
-    }) {
+    if is_private_source_path(relative_path) {
       return false;
     }
     if self
@@ -133,6 +141,8 @@ mod tests {
       ".expri/inputs/train.bin",
       "nested/.expri/runs/one/code/train.py",
       "data/.expri-input-downloads/train.bin/input-record.json",
+      ".expri-asset-crashed/binding",
+      "data/.expri-asset-crashed/previous-binding",
     ] {
       assert!(!rules.should_include(Path::new(path)), "{path}");
     }

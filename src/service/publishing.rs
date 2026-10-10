@@ -433,7 +433,6 @@ mod tests {
       project_id: "project".into(),
       origin: "worker".into(),
       dashboard_url: Some("https://example.invalid/".into()),
-      inputs: Vec::new(),
       publish: true,
     };
     (temporary, repo, run, config)

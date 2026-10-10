@@ -94,7 +94,8 @@ runs retain their frozen snapshots. Separately, configure `[fetch]` and run
 `expri fetch --watch` on the laptop to receive live run metadata and selected
 finalized checkpoints through the service. Training registers ready
 files with `expri artifact register "$EXPRI_OUTPUT_DIR/checkpoint-1000.pt" --label best`.
-See [result fetching and private input preparation](docs/self-hosted-service.md#local-download-and-dashboard)
+See [managed assets](docs/assets.md) for public URL, Hugging Face, and private
+input sidecars, and [result fetching](docs/self-hosted-service.md#local-download-and-dashboard)
 for laptop selection, offline reuse, and resumable transfers.
 
 ## Transport

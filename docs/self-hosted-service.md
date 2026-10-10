@@ -20,7 +20,7 @@ Each transfer has a direction and a named action:
 | Source and config | Laptop → worker checkout | `expri -T gpu-1 push` |
 | Live tracking and registered checkpoints | Worker → server/S3 | Automatic publisher, or `expri service publish --watch` |
 | Completed private input files | Owner → S3 | `expri service input upload` |
-| Required private input files | S3 → worker cache | Automatic preparation, or `expri service input download` |
+| Required private input files | S3 → worker asset cache | `expri assets import`/`download` and automatic run preparation |
 | Tracking bundle (`result.zip`) | Server → S3 | Automatic server upload, or `expri service upload` |
 | Run metadata and selected outputs | Server/S3 → laptop | `expri fetch --watch` |
 
@@ -508,26 +508,22 @@ Pass the downloaded path to the experiment as needed. Keep input files outside
 Git and code snapshots. This version handles datasets/files; credentials and
 secret injection are outside its scope.
 
-For automatic preparation before training, add required inputs to the executing
-worker's service configuration:
+For automatic preparation, import a registered input as a managed asset:
 
-```toml
-[[service.inputs]]
-input_id = "dataset-v1"
-destination = "train.bin"
+```sh
+expri assets import expri://expri.clouds56.top/vision/inputs/dataset-v1 \
+  data/train.bin --client-config /etc/expri/worker.toml
 ```
 
-For a target-specific service table, use `[[target.gpu.service.inputs]]`.
-Inputs download to the checkout's `.expri/inputs/<project_id>/<input_id>/file`;
-each run binds those verified files at `.expri/runs/<run_id>/inputs/<destination>`.
-`EXPRI_INPUT_DIR` points at that run's input directory during training. Bindings
-reuse cached bytes through hard links when possible, so a later dataset version
-can keep the same task-facing filename without changing an active run's input.
-Prepared inputs are read-only. Read them from this directory and write derived
-files to `EXPRI_OUTPUT_DIR`; copy an input before modifying it.
-Preparation records input IDs, sizes, and existing SHA256 digests in the run
-state. It finishes before environment setup and task launch. Missing required inputs fail
-preparation; there is no silently incomplete training run.
+Commit `data/train.bin.expri.toml` and the generated ignore rule. Training reads
+`data/train.bin` from its isolated code directory. Runs prepare the snapshotted
+descriptor before environment setup and task launch, reusing verified bytes
+under `.expri/assets/<sha256>/file`. Cached assets work offline and running
+experiments keep their original bytes across later workspace updates. Private
+cache misses use the executing worker's `service.client_config`.
+
+See [managed assets](assets.md) for public URL and Hugging Face imports,
+explicit updates, safe ordinary file paths, and migration from `service.inputs`.
 
 Private input downloads retain range receipts beside the destination under
 `.expri-input-downloads/`. Repeating a download verifies and reuses matching
@@ -535,9 +531,8 @@ bytes. An unavailable service can use the last acknowledged input record only
 when the cached file still passes its size and full-file SHA256 check; rejected
 credentials or a deleted project never permit that fallback. A failed download
 preserves the previous destination. Keep the cache private and outside Git.
-Configured input preparation requires a native worker advertising
-`run-inputs-v1`. `--no-publish` disables uploads while retaining required input
-preparation.
+Asset preparation requires a native worker advertising `assets-v1`.
+`--no-publish` disables uploads while retaining private download credentials.
 
 ### Reuse an uploaded file
 

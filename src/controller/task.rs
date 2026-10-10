@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{EnvironmentConfig, RunServiceConfig, TargetConfig, TaskConfig};
 use crate::controller::protocol::{ProtocolPreference, apply_run_with_preference};
 use crate::controller::transport::Remote;
 use crate::error::{ExpriError, Result, command_exit_code};
+use crate::filter::SyncRules;
 use crate::protocol::{RunRequest, SyncIdentity};
 use crate::shell;
 
@@ -74,18 +75,63 @@ fn require_service(
   node_bin: &str,
   service: Option<&RunServiceConfig>,
 ) -> Result<()> {
-  if let Some(service) = service {
-    if service.publish {
-      super::protocol::require_run_publishing(remote, preference, node_bin)?;
-    }
-    if !service.inputs.is_empty() {
-      super::protocol::require_run_inputs(remote, preference, node_bin)?;
-    }
+  if let Some(service) = service
+    && service.publish
+  {
+    super::protocol::require_run_publishing(remote, preference, node_bin)?;
+  }
+  Ok(())
+}
+
+pub struct RunAssetsTargetOptions<'a> {
+  pub repo_root: &'a Path,
+  pub rules: &'a SyncRules,
+  pub target: &'a TargetConfig,
+  pub control_path: &'a str,
+  pub control_persist: &'a str,
+  pub dry_run: bool,
+  pub verbosity: u8,
+  pub quiet: bool,
+}
+
+pub fn check_run_assets_target(options: RunAssetsTargetOptions<'_>) -> Result<()> {
+  let has_assets = crate::git::source_paths(options.repo_root, options.rules)?
+    .iter()
+    .any(|path| crate::git::is_asset_sidecar(path));
+  if !has_assets {
+    return Ok(());
+  }
+  require_asset_environment(options.target.environment.as_ref())?;
+  let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
+  let remote = Remote::new(
+    options.target.clone(),
+    options.control_path.into(),
+    options.control_persist.into(),
+    options.dry_run,
+    options.verbosity,
+    options.quiet,
+  )?;
+  remote.connect()?;
+  super::protocol::require_run_assets(
+    &remote,
+    preference,
+    options.target.node_bin.as_deref().unwrap_or("expri"),
+  )
+}
+
+fn require_asset_environment(environment: Option<&EnvironmentConfig>) -> Result<()> {
+  if environment.is_none() {
+    return Err(ExpriError::Message(
+      "asset preparation requires a configured environment; add [environment]".into(),
+    ));
   }
   Ok(())
 }
 
 pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
+  if crate::environment::snapshot::has_assets(&options.repo_root, &options.remote_managed)? {
+    require_asset_environment(options.environment.as_ref())?;
+  }
   if let Some(environment) = &options.environment {
     let mut command = options.task.command.clone();
     command.extend(options.args.clone());
@@ -108,14 +154,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
     }
     return crate::node::run::apply_request_at(&request, &options.repo_root);
   }
-  if options.service.is_some() {
-    if options
-      .service
-      .as_ref()
-      .is_some_and(|service| !service.inputs.is_empty())
-    {
-      return Err(ExpriError::Message("private input preparation requires a configured environment; add [environment], or download inputs manually and remove service.inputs".into()));
-    }
+  if options
+    .service
+    .as_ref()
+    .is_some_and(|service| service.publish)
+  {
     return Err(ExpriError::Message(
       "automatic publishing requires a configured environment; add [environment] or use --no-publish".into(),
     ));
@@ -162,6 +205,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
 }
 
 pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
+  let has_assets =
+    crate::environment::snapshot::has_assets(&options.repo_root, &options.remote_managed)?;
+  if has_assets {
+    require_asset_environment(options.target.environment.as_ref())?;
+  }
   if let Some(environment) = &options.target.environment {
     let mut command = options.task.command.clone();
     command.extend(options.args.clone());
@@ -192,9 +240,17 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     )?
     .with_diagnostic_stdout(options.detach);
     remote.connect()?;
-    if request.service.is_some() {
+    if request
+      .service
+      .as_ref()
+      .is_some_and(|service| service.publish)
+    {
       require_service(&remote, preference, &node_bin, request.service.as_ref())?;
       // Never fall back to a protocol that silently ignores publishing intent.
+      preference = ProtocolPreference::ExpriNode;
+    }
+    if has_assets {
+      super::protocol::require_run_assets(&remote, preference, &node_bin)?;
       preference = ProtocolPreference::ExpriNode;
     }
     let request_dir = tempfile::Builder::new().prefix("expri-run-").tempdir()?;
@@ -216,15 +272,12 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     }
     return apply_run_with_preference(&remote, &request_path, preference, &node_bin);
   }
-  if options.target.service.is_some() {
-    if options
-      .target
-      .service
-      .as_ref()
-      .is_some_and(|service| !service.inputs.is_empty())
-    {
-      return Err(ExpriError::Message("private input preparation requires a configured target environment; add [environment], or download inputs manually and remove service.inputs".into()));
-    }
+  if options
+    .target
+    .service
+    .as_ref()
+    .is_some_and(|service| service.publish)
+  {
     return Err(ExpriError::Message(
       "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
     ));
@@ -273,4 +326,96 @@ fn task_argv(task: &TaskConfig, args: &[String]) -> Result<Vec<String>> {
   argv.extend(task.command.iter().cloned());
   argv.extend(args.iter().cloned());
   Ok(argv)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+
+  fn repository() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+      Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root.path())
+        .status()
+        .unwrap()
+        .success()
+    );
+    root
+  }
+
+  #[test]
+  fn assets_require_environment_and_native_worker_before_source_push() {
+    let root = repository();
+    fs::write(root.path().join("data.bin.expri.toml"), "descriptor").unwrap();
+    let mut target: TargetConfig = toml::from_str(
+      "host='not-contacted.example'\nremote_dir='/srv/project'\nprotocol='python'\n",
+    )
+    .unwrap();
+    let rules = SyncRules::defaults().unwrap();
+    let error = check_run_assets_target(RunAssetsTargetOptions {
+      repo_root: root.path(),
+      rules: &rules,
+      target: &target,
+      control_path: "/tmp/control",
+      control_persist: "10m",
+      dry_run: true,
+      verbosity: 0,
+      quiet: true,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("add [environment]"), "{error}");
+    target.environment = Some(toml::from_str("").unwrap());
+    let error = check_run_assets_target(RunAssetsTargetOptions {
+      repo_root: root.path(),
+      rules: &rules,
+      target: &target,
+      control_path: "/tmp/control",
+      control_persist: "10m",
+      dry_run: true,
+      verbosity: 0,
+      quiet: true,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("native expri worker"), "{error}");
+    target.environment = None;
+    let excluded = SyncRules::new(
+      Vec::new(),
+      vec!["*.expri.toml".into()],
+      Vec::new(),
+      Vec::new(),
+    )
+    .unwrap();
+    check_run_assets_target(RunAssetsTargetOptions {
+      repo_root: root.path(),
+      rules: &excluded,
+      target: &target,
+      control_path: "/tmp/control",
+      control_persist: "10m",
+      dry_run: true,
+      verbosity: 0,
+      quiet: true,
+    })
+    .unwrap();
+  }
+
+  #[test]
+  fn credentials_only_service_does_not_require_publishing_for_an_ordinary_task() {
+    let root = tempfile::tempdir().unwrap();
+    let options = LocalTaskOptions {
+      repo_root: root.path().into(), project_name: None, name: "train".into(),
+      task: TaskConfig { command: vec!["python".into(), "train.py".into()], uv: false },
+      args: Vec::new(), dry_run: true, detach: false, verbosity: 0, quiet: true,
+      environment: None,
+      service: Some(toml::from_str(
+        "client_config='/etc/expri/worker.toml'\nproject_id='project'\norigin='local'\npublish=false\n",
+      ).unwrap()),
+      remote_managed: Vec::new(), extras: Vec::new(), sync_args: Vec::new(),
+    };
+    run_local_task(options).unwrap();
+  }
 }

@@ -1,5 +1,7 @@
 mod archive;
 mod artifacts_cli;
+mod assets;
+mod assets_cli;
 mod config;
 mod context;
 mod controller;
@@ -59,6 +61,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+  /// Import, download, update, and inspect Git-tracked asset descriptors.
+  Assets(assets_cli::AssetsCommand),
   /// Push source and configuration changes to a worker checkout.
   Push(PushCommand),
   /// Fetch run data and selected outputs from the expri service and S3.
@@ -254,6 +258,7 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
+    Command::Assets(command) => assets_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Push(command) => push_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Fetch(command) => fetch_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Artifact(command) => artifacts_cli::run(command, cli.target.as_deref()),
@@ -449,19 +454,27 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     if command.no_publish {
       disable_publishing(&mut context.target.service);
     }
-    if context.target.service.is_some() && context.target.environment.is_none() {
-      if context
-        .target
-        .service
-        .as_ref()
-        .is_some_and(|service| !service.inputs.is_empty())
-      {
-        return Err(ExpriError::Message("private input preparation requires a configured target environment; add [environment], or download inputs manually and remove service.inputs".into()));
-      }
+    if context
+      .target
+      .service
+      .as_ref()
+      .is_some_and(|service| service.publish)
+      && context.target.environment.is_none()
+    {
       return Err(ExpriError::Message(
         "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
       ));
     }
+    controller::task::check_run_assets_target(controller::task::RunAssetsTargetOptions {
+      repo_root: &context.repo_root,
+      rules: &context.config.push_rules()?,
+      target: &context.target,
+      control_path: &context.control_path,
+      control_persist: &command.control_persist,
+      dry_run: command.dry_run,
+      verbosity,
+      quiet,
+    })?;
     if command.detach && context.target.environment.is_none() {
       return Err(ExpriError::Message(
         "--detach requires a configured target environment".to_string(),
@@ -556,11 +569,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
 
 fn disable_publishing(service: &mut Option<config::RunServiceConfig>) {
   if let Some(config) = service {
-    if config.inputs.is_empty() {
-      *service = None;
-    } else {
-      config.publish = false;
-    }
+    config.publish = false;
   }
 }
 
@@ -681,18 +690,16 @@ mod tests {
       project_id: "demo".into(),
       origin: "worker".into(),
       dashboard_url: None,
-      inputs: vec![config::RunInputConfig {
-        input_id: "dataset".into(),
-        destination: "data.bin".into(),
-      }],
       publish: true,
     });
     disable_publishing(&mut service);
     assert!(!service.as_ref().unwrap().publish);
-    assert_eq!(service.as_ref().unwrap().inputs.len(), 1);
-    service.as_mut().unwrap().inputs.clear();
+    assert_eq!(
+      service.as_ref().unwrap().client_config,
+      PathBuf::from("/etc/expri/worker.toml")
+    );
     disable_publishing(&mut service);
-    assert!(service.is_none());
+    assert!(!service.as_ref().unwrap().publish);
   }
 
   #[test]
