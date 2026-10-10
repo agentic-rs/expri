@@ -606,7 +606,19 @@ def storage_management_checks():
     'size': 1024, 'sha256': hashlib.sha256(b'x' * 1024).hexdigest(),
   })
   assert pending['status'] == 200
+  part_status = python(host, '''import json, os
+from urllib.request import Request, urlopen
+request = Request('http://service:8787/v1/request',
+  data=json.dumps({'action':'part_url','upload_id':'management-pending','part_number':1}).encode(),
+  headers={'Authorization':'Bearer '+os.environ['EXPRI_OWNER_TOKEN'],'Content-Type':'application/json'})
+with urlopen(request,timeout=10) as response:
+  url = json.load(response)['url']
+with urlopen(Request(url,data=b'x'*1024,method='PUT'),timeout=10) as response:
+  print(response.status)
+''')
+  assert part_status == '200', 'fixture multipart part was not stored'
   prefix = 'acceptance/projects/' + project_id + '/'
+  pending_key = prefix + 'runs/fixture/release/objects/management-pending'
   def s3_state(action, object_prefix=prefix):
     return json.loads(execute(host, 'python3', '/tmp/s3_fixture.py', action, '--prefix', object_prefix).stdout)
   surviving_prefix = 'acceptance/projects/demo/inputs/dataset-v1/'
@@ -616,7 +628,8 @@ def storage_management_checks():
   original_key = next(item['key'] for item in originals if '/inputs/blob/' in item['key'])
   execute(host, 'python3', '/tmp/s3_fixture.py', 'put', '--key', original_key, '--file', path)
   assert len(s3_state('versions')['versions']) == len(originals) + 1, 'fixture bucket did not retain a historical version'
-  assert len(s3_state('uploads')['uploads']) == 1, 'fixture multipart session was not created'
+  # MinIO's multipart listing supports exact object keys rather than directory prefixes.
+  assert s3_state('uploads', pending_key)['uploads'] == [pending_key], 'fixture multipart session was not created'
   cookie = dashboard_login()
   stats_path = '/api/storage/stats?' + urlencode({'project_id': project_id})
   stats = browser_json(stats_path, cookie)
@@ -677,7 +690,7 @@ def storage_management_checks():
   wait_for(lambda: browser_json(status_path, cookie)['status'] == 'deleted',
     'project cleanup did not resume after restart', timeout=90)
   assert s3_state('versions')['versions'] == [], 'project deletion retained S3 versions or delete markers'
-  assert s3_state('uploads')['uploads'] == [], 'project deletion retained a multipart upload'
+  assert s3_state('uploads', pending_key)['uploads'] == [], 'project deletion retained a multipart upload'
   assert python(service, "from pathlib import Path;print(Path('/home/tester/state/tracking/delete-me').exists())") == 'False', 'project tracking files remained on the server'
   assert 'demo' in {item['project_id'] for item in browser_json('/api/projects', cookie)['sources']}, 'cleanup deleted another project'
   assert s3_state('versions', surviving_prefix)['versions'] == surviving_versions, 'cleanup changed another project\'s S3 versions'
