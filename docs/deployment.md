@@ -169,7 +169,14 @@ the release is still being prepared; the installer checks configured previews
 before activation. Record the backup time and old binary revision so a recovery
 has a known boundary.
 
-For the version 2 upgrade, older binaries refuse the upgraded directory. Prefer
+The version 3 upgrade adds durable project deletion records. Older binaries
+refuse the upgraded directory so they cannot bypass those records. Browser
+deletion remains disabled until `dashboard.allow_project_deletion = true` is
+configured on the primary dashboard. Check the storage permissions described
+in [project deletion](self-hosted-service.md#storage-usage-and-project-deletion)
+before enabling it; versioned buckets need version deletion permissions.
+
+For this upgrade, prefer
 repairing or restarting the new release while retaining received data. A backend
 downgrade requires an explicit operator decision: stop the service, preserve
 the upgraded directory separately, restore the complete pre-upgrade backup with

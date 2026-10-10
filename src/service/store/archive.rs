@@ -182,12 +182,21 @@ impl<S: ObjectStorage> Store<S> {
     let Some((id, encoded)) = row else {
       return Ok(false);
     };
+    let snapshot: ArchiveSnapshot =
+      serde_json::from_str(&encoded).map_err(|_| ApiError::new(500, "invalid archive snapshot"))?;
+    let project_gate = self.project_gate(&snapshot.scope.project_id)?;
+    let _project = project_gate
+      .read()
+      .map_err(|_| ApiError::new(503, "project operation unavailable"))?;
+    match projects::ensure_active(&*self.db()?, &snapshot.scope.project_id) {
+      Err(error) if error.status == 410 => return Ok(false),
+      Err(error) => return Err(error),
+      Ok(()) => {}
+    }
     let gate = self.upload_gate(&format!("archive-job-{id}"))?;
     let _gate = gate
       .lock()
       .map_err(|_| ApiError::new(503, "archive worker unavailable"))?;
-    let snapshot: ArchiveSnapshot =
-      serde_json::from_str(&encoded).map_err(|_| ApiError::new(500, "invalid archive snapshot"))?;
     {
       let mut db = self.db()?;
       let transaction = db.transaction().map_err(database)?;

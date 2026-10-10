@@ -94,6 +94,28 @@ fn mock(
   (url, task)
 }
 
+pub(in crate::service) fn reject_publishing(status: u16) -> (String, thread::JoinHandle<()>) {
+  let mut capabilities = true;
+  mock(2, move |request, _| {
+    let operation: Request = serde_json::from_slice(&request.body).unwrap();
+    if capabilities {
+      assert!(matches!(operation, Request::Capabilities));
+      capabilities = false;
+      return (
+        200,
+        Vec::new(),
+        br#"{"kind":"capabilities","features":[]}"#.to_vec(),
+      );
+    }
+    assert!(matches!(operation, Request::BeginUpload { .. }));
+    (
+      status,
+      Vec::new(),
+      br#"{"error":"project has been deleted; use a new project identifier"}"#.to_vec(),
+    )
+  })
+}
+
 fn config(root: &Path, url: &str) -> PathBuf {
   let path = root.join("client.toml");
   // Use an existing non-secret variable rather than mutating process environment.
@@ -105,6 +127,84 @@ fn root() -> (tempfile::TempDir, PathBuf) {
   let temporary = tempfile::tempdir().unwrap();
   let path = std::fs::canonicalize(temporary.path()).unwrap();
   (temporary, path)
+}
+
+#[test]
+fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation() {
+  let (_temporary, root) = root();
+  let stats = json!({
+    "project_id":"project", "revision":"7", "file_count":1, "logical_bytes":8,
+    "object_count":1, "object_bytes":8, "shared_reference_count":0,
+    "retained_object_count":0, "retained_object_bytes":0,
+    "pending_upload_count":0, "pending_upload_bytes":0, "tracking_bytes":0,
+    "reclaimable_object_count":1, "reclaimable_object_bytes":8,
+  });
+  let deletion = json!({"project_id":"project","status":"pending","pending_tasks":1,"deleted_objects":0,"aborted_uploads":0,"last_error":null});
+  let replies = [
+    json!({"kind":"project_storage","stats":stats}),
+    json!({"kind":"project_delete_preview","preview":{"project_id":"project","revision":"7","run_count":0,"stats":stats}}),
+    json!({"kind":"project_deletion","deletion":deletion}),
+    json!({"kind":"project_deletion","deletion":deletion}),
+  ];
+  let mut index = 0;
+  let (url, task) = mock(4, move |request, _| {
+    let operation: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(request.path, "/v1/request");
+    assert!(
+      request
+        .headers
+        .to_ascii_lowercase()
+        .contains("authorization: bearer ")
+    );
+    assert_eq!(operation["project_id"], "project");
+    assert_eq!(
+      operation["action"],
+      [
+        "project_storage",
+        "preview_project_delete",
+        "delete_project",
+        "project_deletion"
+      ][index]
+    );
+    if index == 2 {
+      assert_eq!(operation["revision"], "7");
+      assert_eq!(operation["confirmation"], "project");
+    }
+    assert!(operation.get("password").is_none());
+    let reply = replies[index].clone();
+    index += 1;
+    (200, Vec::new(), serde_json::to_vec(&reply).unwrap())
+  });
+  let config = config(&root, &url);
+  assert_eq!(
+    project_stats(&config, "project").unwrap()["logical_bytes"],
+    8
+  );
+  assert_eq!(
+    project_delete_preview(&config, "project").unwrap()["revision"],
+    "7"
+  );
+  assert_eq!(
+    project_delete(&config, "project", "7", "project").unwrap()["pending_tasks"],
+    1
+  );
+  assert_eq!(
+    project_deletion(&config, "project").unwrap()["project_id"],
+    "project"
+  );
+  task.join().unwrap();
+  assert!(
+    project_delete(&root.join("missing.toml"), "project", "7", "other")
+      .unwrap_err()
+      .to_string()
+      .contains("--confirm-project")
+  );
+  assert!(
+    project_delete(&root.join("missing.toml"), "project", "", "project")
+      .unwrap_err()
+      .to_string()
+      .contains("--revision")
+  );
 }
 
 fn mark_synced_metadata(queue: &mut Queue, scope: &RunScope, run_dir: &Path, paths: &[&str]) {
@@ -474,7 +574,7 @@ fn rejected_authentication_keeps_pending_queue_and_redacts_the_response_before_b
   publisher.queue.state.protocol = Some(queue::Protocol::Legacy);
   publisher.queue.save().unwrap();
   let failure = publisher.cycle(&mut |_| Ok(())).unwrap_err();
-  assert!(Publisher::authentication_rejected(&failure));
+  assert!(Publisher::permanent_rejection(&failure).is_some());
   let detail = publisher.error_text(&failure);
   assert!(!detail.contains(&token));
   assert!(!detail.contains(token.chars().take(20).collect::<String>().as_str()));
@@ -489,6 +589,87 @@ fn rejected_authentication_keeps_pending_queue_and_redacts_the_response_before_b
   );
   assert!(publisher.queue.directory.join("queue.json").is_file());
   task.join().unwrap();
+}
+
+#[test]
+fn permanent_rejections_require_attention_while_transient_errors_remain_retryable() {
+  for status in [401, 403, 410] {
+    let failure = crate::error::ExpriError::ServiceRejected {
+      status,
+      detail: "fixture rejection".into(),
+    };
+    let reason = Publisher::permanent_rejection(&failure).unwrap();
+    assert!(reason.contains(if status == 410 {
+      "deleted"
+    } else {
+      "credentials"
+    }));
+  }
+  for status in [400, 404, 409, 429, 500, 503] {
+    assert!(
+      Publisher::permanent_rejection(&crate::error::ExpriError::ServiceRejected {
+        status,
+        detail: "fixture rejection".into(),
+      })
+      .is_none()
+    );
+  }
+  assert!(Publisher::permanent_rejection(&message("fixture network error")).is_none());
+}
+
+#[test]
+fn deleted_project_stops_watch_and_preserves_pending_uploads_and_local_data() {
+  let (_temporary, root) = root();
+  let (url, task) = reject_publishing(410);
+  let run_dir = root.join("run-deleted");
+  fs::directories(&run_dir.join("outputs")).unwrap();
+  let snapshot = br#"{"run_id":"run-deleted"}"#;
+  let run_state = br#"{"run_id":"run-deleted","status":"running"}"#;
+  let metrics = b"{\"step\":1,\"loss\":0.5}\n";
+  std::fs::write(run_dir.join("snapshot.json"), snapshot).unwrap();
+  std::fs::write(run_dir.join("run-state.json"), run_state).unwrap();
+  std::fs::write(run_dir.join("outputs/metrics.jsonl"), metrics).unwrap();
+  let queue_dir = root.join("queue");
+  let options = PushOptions {
+    config: config(&root, &url),
+    run_dir: run_dir.clone(),
+    project_id: "project".into(),
+    origin: "worker".into(),
+    artifacts: Vec::new(),
+    watch: true,
+    queue_dir: queue_dir.clone(),
+  };
+  let (send, receive) = std::sync::mpsc::channel();
+  let watcher = thread::spawn(move || send.send(push(options)).unwrap());
+  let failure = receive
+    .recv_timeout(Duration::from_secs(4))
+    .expect("a permanent rejection must exit before the five-second retry")
+    .unwrap_err();
+  watcher.join().unwrap();
+  task.join().unwrap();
+  assert!(failure.to_string().contains("deleted"));
+  assert!(failure.to_string().contains("new project identifier"));
+  assert_eq!(
+    std::fs::read(run_dir.join("run-state.json")).unwrap(),
+    run_state
+  );
+  assert_eq!(
+    std::fs::read(run_dir.join("outputs/metrics.jsonl")).unwrap(),
+    metrics
+  );
+  let queue_dir = queue_dir.join("runs/project/worker/run-deleted");
+  let queue: Value =
+    serde_json::from_slice(&std::fs::read(queue_dir.join("queue.json")).unwrap()).unwrap();
+  let saved = &queue["files"]["snapshot.json"];
+  assert_eq!(saved["upload"]["complete"], false);
+  assert_eq!(
+    std::fs::read(queue_dir.join(saved["snapshot"].as_str().unwrap())).unwrap(),
+    snapshot,
+  );
+  assert!(matches!(
+    crate::lock::try_lock_file(&queue_dir.join(".sync.lock"), false).unwrap(),
+    crate::lock::LockAttempt::Acquired(_)
+  ));
 }
 
 #[test]

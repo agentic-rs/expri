@@ -27,6 +27,11 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSubcommand {
+  /// Inspect project storage or delete a project with an owner token.
+  Project {
+    #[command(subcommand)]
+    command: ProjectCommand,
+  },
   /// Run the optional self-hosted catalog and artifact service.
   Serve {
     #[arg(long)]
@@ -91,6 +96,33 @@ enum ServiceSubcommand {
 enum InputCommand {
   Put(InputPutOptions),
   Get(InputGetOptions),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProjectCommand {
+  /// Show recorded project storage usage, including retained objects.
+  Stats(ProjectOptions),
+  /// Preview the project records and objects affected by deletion.
+  DeletePreview(ProjectOptions),
+  /// Delete a project using a current preview revision and its exact name.
+  Delete {
+    #[command(flatten)]
+    options: ProjectOptions,
+    #[arg(long)]
+    revision: String,
+    #[arg(long)]
+    confirm_project: String,
+  },
+  /// Show the durable object cleanup status after project deletion.
+  Deletion(ProjectOptions),
+}
+
+#[derive(Debug, Args)]
+struct ProjectOptions {
+  #[arg(long)]
+  config: PathBuf,
+  #[arg(long)]
+  project_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -194,6 +226,27 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
     ));
   }
   let report = match command.command {
+    ServiceSubcommand::Project { command } => match command {
+      ProjectCommand::Stats(options) => {
+        client::project_stats(&options.config, &options.project_id)?
+      }
+      ProjectCommand::DeletePreview(options) => {
+        client::project_delete_preview(&options.config, &options.project_id)?
+      }
+      ProjectCommand::Delete {
+        options,
+        revision,
+        confirm_project,
+      } => client::project_delete(
+        &options.config,
+        &options.project_id,
+        &revision,
+        &confirm_project,
+      )?,
+      ProjectCommand::Deletion(options) => {
+        client::project_deletion(&options.config, &options.project_id)?
+      }
+    },
     ServiceSubcommand::Serve {
       config,
       listen,
@@ -236,4 +289,63 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
   };
   println!("{}", serde_json::to_string(&report)?);
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use clap::Parser;
+
+  #[derive(Parser)]
+  struct Cli {
+    #[command(flatten)]
+    service: ServiceCommand,
+  }
+
+  #[test]
+  fn project_cli_requires_explicit_delete_revision_and_project_confirmation() {
+    for operation in ["stats", "delete-preview", "deletion"] {
+      assert!(
+        Cli::try_parse_from([
+          "expri",
+          "project",
+          operation,
+          "--config",
+          "owner.toml",
+          "--project-id",
+          "vision"
+        ])
+        .is_ok()
+      );
+    }
+    let command = [
+      "expri",
+      "project",
+      "delete",
+      "--config",
+      "owner.toml",
+      "--project-id",
+      "vision",
+      "--revision",
+      "7",
+      "--confirm-project",
+      "vision",
+    ];
+    assert!(Cli::try_parse_from(command).is_ok());
+    assert!(Cli::try_parse_from(&command[..9]).is_err());
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "project",
+        "delete",
+        "--config",
+        "owner.toml",
+        "--project-id",
+        "vision",
+        "--confirm-project",
+        "vision"
+      ])
+      .is_err()
+    );
+  }
 }

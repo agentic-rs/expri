@@ -508,7 +508,7 @@ acknowledged tracking files into `result.zip` in S3; checkpoints and inputs
 remain separate objects.
 
 An optional hosted dashboard reviews synced runs through HTTPS with a separate
-dashboard password and read-only browser sessions. Choose a project to review
+dashboard password and authenticated browser sessions. Choose a project to review
 its runs across recorded machines; **All machines** is the default. Machine
 tags filter by the publishing origin, and the sortable **Machine** column keeps
 that provenance visible. Runs from different machines can be compared even
@@ -518,6 +518,12 @@ Existing worker run links continue to open the exact recorded run.
 The project's **Storage** view lists completed private inputs and uploaded
 outputs across its machines and runs; the per-run **Files** tab also shows
 worker-reported outputs that have not yet been uploaded.
+Storage usage distinguishes file references from unique S3 objects, retained
+uploads, pending uploads, and server tracking bytes. Optional project deletion
+requires a preview, the exact project name, and the dashboard password; durable
+cleanup retries interruptions and removes eligible S3 versions. AB remains
+read-only. See [storage management](docs/self-hosted-service.md#storage-usage-and-project-deletion)
+for configuration and owner CLI commands.
 The local dashboard remains available for offline review after downloading
 results.
 

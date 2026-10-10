@@ -26,6 +26,7 @@ struct DashboardSite {
   auth: BrowserAuth,
   assets: DashboardAssets,
   preview: bool,
+  allow_project_deletion: bool,
 }
 
 struct Auth {
@@ -183,12 +184,14 @@ fn dashboard_sites(config: &DashboardConfig, credential: &[u8]) -> Result<Vec<Da
     auth: main,
     assets: DashboardAssets::embedded(),
     preview: false,
+    allow_project_deletion: config.allow_project_deletion,
   });
   for (auth, config) in previews.into_iter().zip(&config.previews) {
     sites.push(DashboardSite {
       auth,
       assets: DashboardAssets::external(config.assets_dir.clone())?,
       preview: true,
+      allow_project_deletion: false,
     });
   }
   Ok(sites)
@@ -272,7 +275,11 @@ fn authorize<S: ObjectStorage>(
       incomplete: false,
       ..
     } => worker.project_id == scope.project_id && worker.origin == scope.origin,
-    Request::ReferenceFile { .. } => false,
+    Request::ReferenceFile { .. }
+    | Request::ProjectStorage { .. }
+    | Request::PreviewProjectDelete { .. }
+    | Request::DeleteProject { .. }
+    | Request::ProjectDeletion { .. } => false,
     Request::Capabilities => true,
     Request::SealRun {
       incomplete: true, ..
@@ -360,6 +367,21 @@ pub fn serve(
         let _ = archive_store.archive_cycle();
         for _ in 0..10 {
           if archive_stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+          }
+          std::thread::sleep(Duration::from_millis(500));
+        }
+      }
+    });
+    let cleanup_store = &store;
+    let cleanup_stop = &stop;
+    scope.spawn(move || {
+      while !cleanup_stop.load(std::sync::atomic::Ordering::Acquire) {
+        // Each durable cleanup cycle is bounded. S3 failures retry independently
+        // of ingestion and archive production, including after a restart.
+        let _ = cleanup_store.project_deletion_cycle();
+        for _ in 0..10 {
+          if cleanup_stop.load(std::sync::atomic::Ordering::Acquire) {
             break;
           }
           std::thread::sleep(Duration::from_millis(500));
@@ -488,6 +510,7 @@ fn dispatch<S: ObjectStorage>(
         dashboard.expect("configured browser dashboard"),
         &site.auth,
         &site.assets,
+        site.allow_project_deletion && !site.preview,
         &request,
       ),
       Ok(None) => api_reply(Err(ApiError::new(403, "dashboard host is not allowed"))),
@@ -761,6 +784,7 @@ mod tests {
     DashboardConfig {
       public_url: format!("https://{MAIN_AUTHORITY}"),
       password_env: "unused".into(),
+      allow_project_deletion: false,
       previews: previews
         .iter()
         .map(|public_url| DashboardPreviewConfig {
@@ -778,6 +802,7 @@ mod tests {
         auth: BrowserAuth::new(&format!("https://{authority}"), DASHBOARD_PASSWORD).unwrap(),
         assets: DashboardAssets::embedded(),
         preview,
+        allow_project_deletion: false,
       });
     }
     auth
@@ -1282,6 +1307,7 @@ mod tests {
       .unwrap(),
       assets: DashboardAssets::embedded(),
       preview: false,
+      allow_project_deletion: false,
     });
     let browser = &auth.sites[0].auth;
     let login = HttpRequest::builder()
@@ -1329,6 +1355,84 @@ mod tests {
       .headers_mut()
       .insert("Cookie", cookie.parse().unwrap());
     assert!(route(&store, &auth, owner).is_ok());
+  }
+
+  #[test]
+  fn project_management_service_requests_are_owner_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let worker = &auth.workers[0].1;
+    for operation in [
+      Request::ProjectStorage {
+        project_id: "project".into(),
+      },
+      Request::PreviewProjectDelete {
+        project_id: "project".into(),
+      },
+      Request::DeleteProject {
+        project_id: "project".into(),
+        revision: "1".into(),
+        confirmation: "project".into(),
+      },
+      Request::ProjectDeletion {
+        project_id: "project".into(),
+      },
+    ] {
+      assert_eq!(
+        authorize(&store, Some(worker), &operation)
+          .unwrap_err()
+          .status,
+        403
+      );
+      assert!(authorize(&store, None, &operation).is_ok());
+      assert_eq!(
+        route(
+          &store,
+          &auth,
+          request(Some("worker-token-with-at-least-24-characters"), &operation)
+        )
+        .unwrap_err()
+        .status,
+        403
+      );
+    }
+  }
+
+  #[test]
+  fn project_deletion_is_opt_in_and_previews_remain_read_only() {
+    let mut config = dashboard_config(&[]);
+    config.allow_project_deletion = true;
+    let sites = dashboard_sites(&config, DASHBOARD_PASSWORD).unwrap();
+    assert!(sites[0].allow_project_deletion);
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let mut auth = dashboard_auth();
+    // Even an incorrectly populated preview capability cannot enable writes.
+    for site in &mut auth.sites {
+      site.allow_project_deletion = true;
+    }
+    let site = &auth.sites[1];
+    let login = HttpRequest::builder()
+      .method("POST")
+      .uri("/login")
+      .header("Host", PREVIEW_AUTHORITY)
+      .header("Origin", format!("https://{PREVIEW_AUTHORITY}"))
+      .body(Vec::<u8>::new())
+      .unwrap();
+    let issued = site.auth.login(&login, DASHBOARD_PASSWORD).unwrap();
+    let deletion = HttpRequest::builder().method("POST").uri("/api/projects/delete")
+      .header("Host", PREVIEW_AUTHORITY).header("Origin", format!("https://{PREVIEW_AUTHORITY}"))
+      .header("Cookie", issued.split(';').next().unwrap()).header("Content-Type", "application/json")
+      .body(br#"{"project_id":"project","revision":"1","confirmation":"project","password":"a-dedicated-dashboard-password"}"#.to_vec()).unwrap();
+    let reply = dispatch(&store, &auth, Some(&dashboard), deletion);
+    assert_eq!(reply.status(), 403);
+    assert!(
+      std::str::from_utf8(reply.body())
+        .unwrap()
+        .contains("disabled")
+    );
   }
 
   #[test]

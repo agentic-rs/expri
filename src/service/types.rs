@@ -25,6 +25,9 @@ pub struct ServerConfig {
 pub struct DashboardConfig {
   pub public_url: String,
   pub password_env: String,
+  /// Allow password-confirmed project deletion on the primary dashboard.
+  #[serde(default)]
+  pub allow_project_deletion: bool,
   #[serde(default)]
   pub previews: Vec<DashboardPreviewConfig>,
 }
@@ -95,6 +98,20 @@ pub struct FileRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  ProjectStorage {
+    project_id: String,
+  },
+  PreviewProjectDelete {
+    project_id: String,
+  },
+  DeleteProject {
+    project_id: String,
+    revision: String,
+    confirmation: String,
+  },
+  ProjectDeletion {
+    project_id: String,
+  },
   Capabilities,
   PutDocument {
     scope: RunScope,
@@ -173,6 +190,15 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  ProjectStorage {
+    stats: ProjectStorageStats,
+  },
+  ProjectDeletePreview {
+    preview: ProjectDeletePreview,
+  },
+  ProjectDeletion {
+    deletion: ProjectDeletionStatus,
+  },
   Capabilities {
     features: Vec<String>,
   },
@@ -207,6 +233,42 @@ pub enum Response {
     total_size: u64,
     data_base64: String,
   },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectStorageStats {
+  pub project_id: String,
+  pub revision: String,
+  pub file_count: u64,
+  pub logical_bytes: u64,
+  pub object_count: u64,
+  pub object_bytes: u64,
+  pub shared_reference_count: u64,
+  pub retained_object_count: u64,
+  pub retained_object_bytes: u64,
+  pub pending_upload_count: u64,
+  pub pending_upload_bytes: u64,
+  pub tracking_bytes: u64,
+  pub reclaimable_object_count: u64,
+  pub reclaimable_object_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectDeletePreview {
+  pub project_id: String,
+  pub revision: String,
+  pub run_count: u64,
+  pub stats: ProjectStorageStats,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectDeletionStatus {
+  pub project_id: String,
+  pub status: String,
+  pub pending_tasks: u64,
+  pub deleted_objects: u64,
+  pub aborted_uploads: u64,
+  pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

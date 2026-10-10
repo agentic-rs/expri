@@ -1499,6 +1499,51 @@ def automatic_refresh(run_id, updated_run_id):
     browser.close()
 
 
+def storage_management(project_id):
+  browser = Firefox()
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  try:
+    browser.set_viewport(1440, 1000)
+    browser.navigate('/login')
+    browser.login()
+    selector = '#project-options input[value="hosted-project:' + project_id + '"] + span'
+    wait_for(lambda: evaluate('return document.querySelector(arguments[0]) !== null;', selector), 'management fixture project was not discovered')
+    browser.click(selector)
+    browser.click('#workspace-view-storage + span')
+    wait_for(lambda: evaluate("return document.querySelector('#delete-project-button') !== null && !document.querySelector('#delete-project-button').disabled;"), 'primary dashboard did not enable project deletion')
+    assert evaluate("return document.querySelector('#storage-usage')?.textContent.length > 0;"), 'project usage statistics were absent'
+    start = len(trace_records())
+    browser.click('#delete-project-button')
+    wait_for(lambda: evaluate("return document.querySelector('#delete-project-preview') !== null;"), 'project deletion preview did not load')
+    assert project_id in evaluate("return document.querySelector('#delete-project-dialog').textContent;"), 'delete preview changed its project'
+    assert evaluate("return document.querySelector('#delete-project-submit').disabled;"), 'project deletion did not require confirmation and password'
+    browser.keys('#delete-project-confirmation', project_id)
+    assert evaluate("return document.querySelector('#delete-project-submit').disabled;"), 'project name alone authorized deletion'
+    browser.set_viewport(360, 800)
+    assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow deletion preview overflowed the page'
+    assert evaluate('''return ['#delete-project-confirmation', '#delete-project-password', '#delete-project-cancel'].every(selector => {
+      const box = document.querySelector(selector).getBoundingClientRect();
+      return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
+    });'''), 'narrow deletion controls were clipped'
+    Path('/tmp/workspace-storage-management.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
+    browser.click('#delete-project-cancel')
+    wait_for(lambda: evaluate("return !document.querySelector('#delete-project-dialog')?.open;"), 'cancel did not close deletion preview')
+    assert not any(record['path'] == '/api/projects/delete' and record['method'] == 'POST'
+      for record in trace_records()[start:]), 'cancel submitted a destructive request'
+    browser.set_viewport(1440, 1000)
+    browser.navigate('/login', origin='https://ab.expri.example.net')
+    browser.login()
+    wait_for(lambda: evaluate('return document.querySelector(arguments[0]) !== null;', selector), 'AB did not share the management fixture catalog')
+    browser.click(selector)
+    browser.click('#workspace-view-storage + span')
+    wait_for(lambda: evaluate("return document.querySelector('#storage-usage .storage-usage-grid') !== null;"), 'AB did not show shared storage statistics')
+    assert evaluate("return document.querySelector('#delete-project-button') === null || document.querySelector('#delete-project-button').disabled;"), 'AB enabled destructive project controls'
+    print('Firefox storage management passed: usage, scoped preview, name/password requirement, narrow layout, cancel and read-only AB.', flush=True)
+  finally:
+    browser.close()
+
+
 if __name__ == '__main__':
   if len(sys.argv) == 4 and sys.argv[1] == '--deep-link':
     deep_link(sys.argv[2], sys.argv[3])
@@ -1514,5 +1559,7 @@ if __name__ == '__main__':
     project_storage()
   elif len(sys.argv) == 3 and sys.argv[1] == '--storage':
     project_storage(sys.argv[2])
+  elif len(sys.argv) == 3 and sys.argv[1] == '--storage-management':
+    storage_management(sys.argv[2])
   else:
     forms()

@@ -106,7 +106,7 @@ def client(container, action, *args, check=True, config=None):
   return execute(container, 'expri', 'service', *action.split(), '--config', config, *args, check=check)
 
 def browser(path, *, method='GET', cookie=None, bearer_env=None, password_env=None,
-    origin='https://expri.example.net', payload=None, limit=512 * 1024):
+    json_password_env=None, origin='https://expri.example.net', payload=None, limit=512 * 1024):
   # Simulate the TLS reverse proxy inside the private Docker network. The Secure
   # cookie is sent explicitly, without an HTTP cookie jar or published host port.
   code = f'''
@@ -129,6 +129,8 @@ if password_env is not None:
   body = urlencode({{'password': os.environ[password_env]}}).encode()
 elif payload is not None:
   headers['Content-Type'] = 'application/json'
+  if {json_password_env!r} is not None:
+    payload['password'] = os.environ[{json_password_env!r}]
   body = json.dumps(payload).encode()
 connection = http.client.HTTPConnection('service', 8787, timeout=40)
 try:
@@ -561,6 +563,147 @@ def project_artifact_checks(first, second):
     assert browser(artifact['download_url'],cookie=cookie,origin='https://outside.invalid')['status']==403, 'cross-origin project artifact request was accepted'
   browser('/logout',method='POST',cookie=cookie)
 
+
+def storage_management_checks():
+  """Delete only an isolated fixture project; verify real versioned S3 cleanup."""
+  import base64
+
+  project_id = 'delete-me'
+  scope = {'project_id': project_id, 'origin': 'fixture', 'run_id': 'release'}
+  source = {'kind': 'input', 'project_id': project_id, 'input_id': 'blob'}
+  shared = {'kind': 'run', 'scope': scope, 'path': 'outputs/shared.bin'}
+  alias = {'kind': 'input', 'project_id': project_id, 'input_id': 'alias'}
+  old = {'kind': 'run', 'scope': scope, 'path': 'outputs/old.bin'}
+  contents = b'shared-dataset-fixture'
+  digest = hashlib.sha256(contents).hexdigest()
+  path = '/home/tester/management.bin'
+  python(host, f'from pathlib import Path;Path({path!r}).write_bytes({contents!r})')
+  client(host, 'input put', '--project-id', project_id, '--input-id', 'blob', '--file', path,
+    '--queue-dir', '/home/tester/management-queue')
+  for target in [shared, alias]:
+    result = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+      'action': 'reference_file', 'source': source, 'target': target, 'size': len(contents), 'sha256': digest,
+    })
+    assert result['status'] == 200, 'owner could not create the shared-object fixture'
+  for value in [b'old', b'next']:
+    python(host, f'from pathlib import Path;Path("/home/tester/old.bin").write_bytes({value!r})')
+    client(host, 'file-put', '--target', json.dumps(old), '--file', '/home/tester/old.bin',
+      '--queue-dir', '/home/tester/management-queue')
+  document = json.dumps({'run_id': 'release', 'task': 'fixture', 'status': 'completed'}).encode()
+  metrics = b'{"schema_version":1,"step":0,"metrics":{"loss":1}}\n'
+  for action, remote_path, value, extra in [
+    ('put_document', 'run-state.json', document, {'revision': 1, 'total_size': len(document)}),
+    ('append_tracking', 'outputs/metrics.jsonl', metrics, {}),
+  ]:
+    result = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+      'action': action, 'scope': scope, 'path': remote_path, 'offset': 0,
+      'data_base64': base64.b64encode(value).decode(), **extra,
+    })
+    assert result['status'] == 200, 'tracking cleanup fixture was not acknowledged'
+  pending = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+    'action': 'begin_upload', 'upload_id': 'management-pending',
+    'target': {'kind': 'run', 'scope': scope, 'path': 'outputs/pending.bin'},
+    'size': 1024, 'sha256': hashlib.sha256(b'x' * 1024).hexdigest(),
+  })
+  assert pending['status'] == 200
+  part_status = python(host, '''import json, os
+from urllib.request import Request, urlopen
+request = Request('http://service:8787/v1/request',
+  data=json.dumps({'action':'part_url','upload_id':'management-pending','part_number':1}).encode(),
+  headers={'Authorization':'Bearer '+os.environ['EXPRI_OWNER_TOKEN'],'Content-Type':'application/json'})
+with urlopen(request,timeout=10) as response:
+  url = json.load(response)['url']
+with urlopen(Request(url,data=b'x'*1024,method='PUT'),timeout=10) as response:
+  print(response.status)
+''')
+  assert part_status == '200', 'fixture multipart part was not stored'
+  prefix = 'acceptance/projects/' + project_id + '/'
+  pending_key = prefix + 'runs/fixture/release/objects/management-pending'
+  def s3_state(action, object_prefix=prefix):
+    return json.loads(execute(host, 'python3', '/tmp/s3_fixture.py', action, '--prefix', object_prefix).stdout)
+  surviving_prefix = 'acceptance/projects/demo/inputs/dataset-v1/'
+  surviving_versions = s3_state('versions', surviving_prefix)['versions']
+  assert surviving_versions, 'another project had no S3 data to preserve'
+  originals = s3_state('versions')['versions']
+  original_key = next(item['key'] for item in originals if '/inputs/blob/' in item['key'])
+  execute(host, 'python3', '/tmp/s3_fixture.py', 'put', '--key', original_key, '--file', path)
+  assert len(s3_state('versions')['versions']) == len(originals) + 1, 'fixture bucket did not retain a historical version'
+  # MinIO's multipart listing supports exact object keys rather than directory prefixes.
+  assert s3_state('uploads', pending_key)['uploads'] == [pending_key], 'fixture multipart session was not created'
+  cookie = dashboard_login()
+  stats_path = '/api/storage/stats?' + urlencode({'project_id': project_id})
+  stats = browser_json(stats_path, cookie)
+  assert stats['delete_enabled'] is True
+  stats = stats['stats']
+  assert stats['file_count'] == 4 and stats['logical_bytes'] == len(contents) * 3 + 4
+  assert stats['object_count'] == 2 and stats['object_bytes'] == len(contents) + 4, 'shared references counted as extra physical objects'
+  assert stats['shared_reference_count'] == 2
+  assert stats['retained_object_count'] == 1 and stats['retained_object_bytes'] == 3, 'superseded upload was absent from retained-object stats'
+  assert stats['pending_upload_count'] == 1 and stats['pending_upload_bytes'] == 1024
+  assert stats['tracking_bytes'] == len(document) + len(metrics)
+  assert stats['reclaimable_object_count'] == 3 and stats['reclaimable_object_bytes'] == len(contents) + 7
+  assert browser(stats_path)['status'] == 401
+  forbidden = client(worker, 'project stats', '--project-id', project_id, check=False)
+  assert forbidden.returncode != 0, 'worker acquired project-management authority'
+  preview_path = '/api/projects/delete-preview?' + urlencode({'project_id': project_id})
+  preview = browser_json(preview_path, cookie)
+  assert preview['run_count'] == 1 and preview['stats'] == stats
+  changed = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+    'action': 'append_tracking', 'scope': scope, 'path': 'logs/stdout.log', 'offset': 0,
+    'data_base64': base64.b64encode(b'new log\n').decode(),
+  })
+  assert changed['status'] == 200
+  payload = {'project_id': project_id, 'revision': preview['revision'], 'confirmation': project_id}
+  stale = browser('/api/projects/delete', method='POST', cookie=cookie, payload=payload,
+    json_password_env='EXPRI_DASHBOARD_PASSWORD')
+  assert stale['status'] == 409, 'changed project was deleted from a stale preview'
+  preview = browser_json(preview_path, cookie)
+  payload['revision'] = preview['revision']
+  assert browser('/api/projects/delete', method='POST', cookie=cookie,
+    payload={**payload, 'password': 'incorrect-password'})['status'] == 403
+  assert browser('/api/projects/delete', method='POST', cookie=cookie,
+    payload={**payload, 'confirmation': 'another-project'}, json_password_env='EXPRI_DASHBOARD_PASSWORD')['status'] == 400
+  assert browser('/api/projects/delete', method='POST', cookie=cookie,
+    payload=payload, json_password_env='EXPRI_DASHBOARD_PASSWORD', origin='https://outside.invalid')['status'] == 403
+  assert browser_json(stats_path, cookie)['stats']['file_count'] == 4, 'rejected deletions changed project data'
+  logged('browser-storage-management.log', ['docker', 'exec', '--user', 'tester', firefox,
+    'python3', '/opt/expri-browser/browser_forms.py', '--storage-management', project_id], timeout=90)
+  docker('stop', '--time', '1', s3)
+  accepted = browser('/api/projects/delete', method='POST', cookie=cookie, payload=payload,
+    json_password_env='EXPRI_DASHBOARD_PASSWORD')
+  assert accepted['status'] == 202 and json.loads(accepted['body'])['status'] == 'pending'
+  status_path = '/api/projects/deletion?' + urlencode({'project_id': project_id})
+  wait_for(lambda: browser_json(status_path, cookie)['last_error'] is not None,
+    'S3 outage did not leave a visible retryable deletion', timeout=45)
+  interrupted = browser_json(status_path, cookie)
+  assert interrupted['status'] == 'pending' and interrupted['pending_tasks'] > 0, 'temporary S3 outage was treated as needing operator attention'
+  assert 'request failed' in interrupted['last_error'], 'cleanup discarded its safe storage failure reason'
+  assert project_id not in {item['project_id'] for item in browser_json('/api/projects', cookie)['sources']}
+  blocked = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+    'action': 'append_tracking', 'scope': scope, 'path': 'logs/stdout.log', 'offset': 0,
+    'data_base64': base64.b64encode(b'recreated\n').decode(),
+  })
+  assert blocked['status'] == 410, 'a publisher resurrected the deleted project'
+  docker('stop', '--time', '1', service)
+  docker('start', s3)
+  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://s3:9000/minio/health/ready',timeout=1).status)") == '200', 'S3 fixture did not restart')
+  docker('start', service)
+  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service did not resume durable project deletion')
+  cookie = dashboard_login()
+  wait_for(lambda: browser_json(status_path, cookie)['status'] == 'deleted',
+    'project cleanup did not resume after restart', timeout=90)
+  completed = browser_json(status_path, cookie)
+  assert completed['last_error'] is None and completed['pending_tasks'] == 0, 'completed cleanup retained a stale failure'
+  assert s3_state('versions')['versions'] == [], 'project deletion retained S3 versions or delete markers'
+  assert s3_state('uploads', pending_key)['uploads'] == [], 'project deletion retained a multipart upload'
+  assert python(service, "from pathlib import Path;print(Path('/home/tester/state/tracking/delete-me').exists())") == 'False', 'project tracking files remained on the server'
+  assert 'demo' in {item['project_id'] for item in browser_json('/api/projects', cookie)['sources']}, 'cleanup deleted another project'
+  assert s3_state('versions', surviving_prefix)['versions'] == surviving_versions, 'cleanup changed another project\'s S3 versions'
+  survivor = json.loads(execute(host, 'python3', '/tmp/s3_fixture.py', 'head', '--key', surviving_versions[0]['key']).stdout)
+  assert survivor['status'] == 200, 'another project\'s object became unavailable in S3'
+  assert browser('/api/input?project_id=demo&input_id=dataset-v1', method='HEAD', cookie=cookie)['status'] == 200
+  browser('/logout', method='POST', cookie=cookie)
+
 try:
   if not options.no_build:
     for target in ['worker', 'host', 'service', 'browser']:
@@ -590,6 +733,7 @@ token_env = "EXPRI_MACHINE_TOKEN"
 [dashboard]
 public_url = "https://expri.example.net"
 password_env = "EXPRI_DASHBOARD_PASSWORD"
+allow_project_deletion = true
 [[dashboard.previews]]
 public_url = "https://ab.expri.example.net"
 assets_dir = "/home/tester/preview"
@@ -615,7 +759,7 @@ prefix = "acceptance"
   (release / 'deployment.json').write_text(json.dumps({'commit': revision, 'branch': 'fixture/ab'}))
   (preview / 'current').symlink_to('releases/' + revision)
   copy(preview, service, '/home/tester/preview')
-  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'], entrypoint='sleep')
+  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'], entrypoint='sleep')
   worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
   proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
   firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net', 's3.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
@@ -624,6 +768,7 @@ prefix = "acceptance"
   copy(state / 'owner.toml', host, '/tmp/owner.toml')
   copy(state / 'machine-worker.toml', host, '/tmp/machine-worker.toml')
   copy(state / 'worker.toml', worker, '/tmp/worker.toml')
+  copy(ROOT / 'tests/containers/s3_fixture.py', host, '/tmp/s3_fixture.py')
   docker('start', host)
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://s3:9000/minio/health/ready',timeout=1).status)") == '200', 'S3 fixture not ready')
   docker('start', service)
@@ -631,6 +776,7 @@ prefix = "acceptance"
   docker('start', worker)
   wait_for(lambda: docker('exec', worker, 'test', '-f', '/tmp/expri-worker.ready', check=False).returncode == 0, 'worker not ready')
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service not ready')
+  execute(host, 'python3', '/tmp/s3_fixture.py', 'versioning')
   wait_for(lambda: api_proxy('/test/state') is not None, 'fault proxy not ready')
   docker('start', firefox)
   wait_for(lambda: python(firefox, "import ssl;from urllib.request import urlopen;print(urlopen('https://expri.example.net/login',context=ssl._create_unverified_context(),timeout=2).status)") == '200', 'Firefox HTTPS proxy not ready')
@@ -797,6 +943,7 @@ print(process.pid)
     detail = browser_json('/api/run?' + urlencode({'source': terminal_source, 'run_id': result['run_id']}), terminal_session)
     assert detail['run']['status'] == expected, 'hosted result does not show the terminal training status'
   browser('/logout', method='POST', cookie=terminal_session)
+  storage_management_checks()
   docker('stop', '--time', '1', service, s3)
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
@@ -820,7 +967,7 @@ print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
 '''))
   assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
   assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
-  print('Service workflow passed: tracking-v1 publishing, acknowledged-prefix recovery, complete/partial archives, Firefox native downloads/SSE/chart review, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
+  print('Service workflow passed: tracking-v1 publishing, acknowledged-prefix recovery, complete/partial archives, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
 finally:
   if refresh_browser is not None and refresh_browser.poll() is None:
     refresh_browser.terminate()
@@ -836,6 +983,7 @@ finally:
         for name in [
           'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
           'workspace-storage-input-only', 'workspace-storage-inputs', 'workspace-storage', 'workspace-storage-narrow',
+          'workspace-storage-management',
           'workspace-columns-desktop', 'workspace-columns-1024', 'workspace-columns-320', 'workspace-columns-360',
           'workspace-project-default-desktop', 'workspace-project-default-1024',
           'workspace-project-desktop', 'workspace-project-1024',
