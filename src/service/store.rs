@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::Duration;
 
 use base64::Engine;
@@ -12,6 +12,7 @@ use super::types::*;
 
 mod archive;
 mod dashboard_storage;
+mod projects;
 mod references;
 mod tracking;
 
@@ -64,6 +65,7 @@ pub(super) struct Store<S> {
   // Network calls never hold the database lock. This gate prevents simultaneous
   // begin/complete retries from creating conflicting sessions for one upload.
   upload_gates: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+  project_gates: Mutex<BTreeMap<String, Weak<RwLock<()>>>>,
   storage: S,
   _lease: crate::lock::FileLock,
 }
@@ -131,7 +133,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot read service metadata version".into())
       })?;
-    if version > 2 {
+    if version > 3 {
       return Err(crate::error::ExpriError::Message(
         "service metadata schema is newer than this binary".into(),
       ));
@@ -184,9 +186,10 @@ impl<S: ObjectStorage> Store<S> {
     tracking::recover(&directory, &connection)?;
     archive::initialize(&connection)
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
-    // Older binaries cannot decode Tracking records; refuse unsafe downgrades.
+    projects::initialize(&connection)?;
+    // Older binaries must not ignore project tombstones and resurrect deleted data.
     connection
-      .pragma_update(None, "user_version", 2)
+      .pragma_update(None, "user_version", 3)
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot upgrade service metadata version".into())
       })?;
@@ -194,6 +197,7 @@ impl<S: ObjectStorage> Store<S> {
       directory,
       connection: Mutex::new(connection),
       upload_gates: Mutex::new(BTreeMap::new()),
+      project_gates: Mutex::new(BTreeMap::new()),
       storage,
       _lease: lease,
     })
@@ -523,7 +527,7 @@ impl<S: ObjectStorage> Store<S> {
     let db = self.db()?;
     let catalog_revision = db
       .query_row(
-        "SELECT COALESCE(MAX(sequence),0) FROM dashboard_run_activity",
+        "SELECT revision FROM dashboard_catalog_revision WHERE id=1",
         [],
         |row| row.get::<_, i64>(0),
       )
@@ -736,6 +740,7 @@ impl<S: ObjectStorage> Store<S> {
     })?;
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;
+    projects::ensure_active(&transaction, &scope.project_id)?;
     transaction
       .execute(
         "INSERT OR REPLACE INTO dashboard_overviews(target,version,record) VALUES(?1,?2,?3)",
@@ -810,9 +815,45 @@ impl<S: ObjectStorage> Store<S> {
   }
 
   pub fn execute(&self, request: Request) -> ApiResult<Response> {
+    let project = self.request_project(&request)?;
+    let gate = project
+      .as_deref()
+      .map(|project| self.project_gate(project))
+      .transpose()?;
+    let _operation = gate
+      .as_ref()
+      .map(|gate| {
+        gate
+          .read()
+          .map_err(|_| ApiError::new(503, "project operation unavailable"))
+      })
+      .transpose()?;
+    if let Some(project) = &project {
+      projects::ensure_active(&*self.db()?, project)?;
+    }
     match request {
+      Request::ProjectStorage { project_id } => Ok(Response::ProjectStorage {
+        stats: self.project_storage(&project_id)?,
+      }),
+      Request::PreviewProjectDelete { project_id } => Ok(Response::ProjectDeletePreview {
+        preview: self.preview_project_delete(&project_id)?,
+      }),
+      Request::DeleteProject {
+        project_id,
+        revision,
+        confirmation,
+      } => Ok(Response::ProjectDeletion {
+        deletion: self.delete_project(&project_id, &revision, &confirmation)?,
+      }),
+      Request::ProjectDeletion { project_id } => Ok(Response::ProjectDeletion {
+        deletion: self.project_deletion(&project_id)?,
+      }),
       Request::Capabilities => Ok(Response::Capabilities {
-        features: vec!["tracking-v1".into(), "file-references-v1".into()],
+        features: vec![
+          "tracking-v1".into(),
+          "file-references-v1".into(),
+          "project-storage-management-v1".into(),
+        ],
       }),
       Request::PutDocument {
         scope,

@@ -4,7 +4,7 @@ mod http;
 mod inventory;
 mod queue;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 mod tracking;
 mod upload;
 
@@ -61,14 +61,16 @@ pub(super) struct Publisher {
 }
 
 impl Publisher {
-  pub(super) fn authentication_rejected(error: &crate::error::ExpriError) -> bool {
-    matches!(
-      error,
+  pub(super) fn permanent_rejection(error: &crate::error::ExpriError) -> Option<&'static str> {
+    match error {
       crate::error::ExpriError::ServiceRejected {
-        status: 401 | 403,
-        ..
-      }
-    )
+        status: 401 | 403, ..
+      } => Some("Service authentication rejected; repair credentials and resume publishing"),
+      crate::error::ExpriError::ServiceRejected { status: 410, .. } => Some(
+        "Service project has been deleted; publishing stopped. Use a new project identifier to publish",
+      ),
+      _ => None,
+    }
   }
 
   pub(super) fn new(options: &PushOptions) -> Result<Self> {
@@ -167,6 +169,9 @@ pub fn push(options: PushOptions) -> Result<Value> {
       }
       Err(error) if !options.watch => return Err(error),
       Err(error) => {
+        if let Some(reason) = Publisher::permanent_rejection(&error) {
+          return Err(message(reason));
+        }
         let detail = publisher.error_text(&error);
         if last_error != detail || failures.is_multiple_of(15) {
           eprintln!("Service sync pending; saved work will retry: {detail}");
@@ -422,6 +427,88 @@ pub fn list(config: PathBuf, project_id: String, origin: String) -> Result<Value
     return Err(message("service did not return a run catalog"));
   };
   Ok(json!({"runs": runs}))
+}
+
+pub fn project_stats(config: &Path, project_id: &str) -> Result<Value> {
+  validate_component(project_id)?;
+  let Response::ProjectStorage { stats } = Api::new(config)?.request(&Request::ProjectStorage {
+    project_id: project_id.into(),
+  })?
+  else {
+    return Err(message("service did not return project storage usage"));
+  };
+  if stats.project_id != project_id {
+    return Err(message(
+      "service returned storage usage for another project",
+    ));
+  }
+  serde_json::to_value(stats).map_err(Into::into)
+}
+
+pub fn project_delete_preview(config: &Path, project_id: &str) -> Result<Value> {
+  validate_component(project_id)?;
+  let Response::ProjectDeletePreview { preview } =
+    Api::new(config)?.request(&Request::PreviewProjectDelete {
+      project_id: project_id.into(),
+    })?
+  else {
+    return Err(message("service did not return a project deletion preview"));
+  };
+  if preview.project_id != project_id || preview.stats.project_id != project_id {
+    return Err(message("service returned a preview for another project"));
+  }
+  serde_json::to_value(preview).map_err(Into::into)
+}
+
+pub fn project_delete(
+  config: &Path,
+  project_id: &str,
+  revision: &str,
+  confirmation: &str,
+) -> Result<Value> {
+  validate_component(project_id)?;
+  if confirmation != project_id {
+    return Err(message("--confirm-project must match --project-id exactly"));
+  }
+  if revision.is_empty()
+    || revision.len() > 128
+    || !revision.bytes().all(|byte| byte.is_ascii_graphic())
+  {
+    return Err(message(
+      "--revision must be the current deletion preview revision",
+    ));
+  }
+  let Response::ProjectDeletion { deletion } =
+    Api::new(config)?.request(&Request::DeleteProject {
+      project_id: project_id.into(),
+      revision: revision.into(),
+      confirmation: confirmation.into(),
+    })?
+  else {
+    return Err(message("service did not acknowledge project deletion"));
+  };
+  project_deletion_value(project_id, deletion)
+}
+
+pub fn project_deletion(config: &Path, project_id: &str) -> Result<Value> {
+  validate_component(project_id)?;
+  let Response::ProjectDeletion { deletion } =
+    Api::new(config)?.request(&Request::ProjectDeletion {
+      project_id: project_id.into(),
+    })?
+  else {
+    return Err(message("service did not return project deletion status"));
+  };
+  project_deletion_value(project_id, deletion)
+}
+
+fn project_deletion_value(project_id: &str, deletion: ProjectDeletionStatus) -> Result<Value> {
+  if deletion.project_id != project_id {
+    return Err(message(
+      "service returned deletion status for another project",
+    ));
+  }
+  serde_json::to_value(deletion).map_err(Into::into)
 }
 
 fn validate_digest(value: &str) -> Result<()> {

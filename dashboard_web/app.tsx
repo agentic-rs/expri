@@ -58,6 +58,7 @@ export * from "./interactive_charts";
 export * from "./auto_refresh";
 export * from "./dashboard_files";
 export * from "./dashboard_storage";
+export * from "./storage_management";
 export * from "./live_updates";
 
 function required<T extends HTMLElement>(id: string): T {

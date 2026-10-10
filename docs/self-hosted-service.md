@@ -61,8 +61,8 @@ automatically. Only one service process may use a data directory. Keep the stora
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 2. Older binaries
-refuse that directory because they cannot read tracking records. Back up the
+Opening this version upgrades the SQLite schema to version 3. Older binaries
+refuse that directory because they cannot enforce project deletion records. Back up the
 entire service directory before upgrading; restoring that backup is required
 for a backend downgrade. Existing S3 runs remain readable after the upgrade.
 
@@ -438,6 +438,74 @@ already stores an object with matching size and digest, it returns `reused: true
 without uploading or creating a local queue. Otherwise it uses a resumable upload
 queue under `.expri/service-sync/files/`, configurable with `--queue-dir`.
 
+## Storage usage and project deletion
+
+The project's **Storage** page shows usage across all of its service records,
+independent of the selected list, search, or page. **File totals** count each
+current input, output, and archive reference; **Unique objects** count each
+referenced S3 key once. Referencing the same dataset as an input and output adds
+a file reference without another stored copy. Retained objects are older
+completed uploads that no current file uses. Pending uploads show declared file
+sizes, rather than bytes received. Tracking bytes are acknowledged documents,
+metrics, and logs stored in the service data directory.
+
+These are catalog statistics, not the bucket's total billable storage. They do
+not include unrelated or unrecorded objects, historical S3 versions, or database
+overhead. The deletion preview estimates reclaimable objects, excluding keys
+referenced by another project. Inspect the same figures from the owner CLI:
+
+```sh
+expri service project stats --config owner.toml --project-id vision
+expri service project delete-preview --config owner.toml --project-id vision
+```
+
+Project deletion removes its server-side runs, private inputs, tracking files,
+staged archives, and eligible S3 objects. It does not stop training or remove
+worker and laptop files. Stop publishers before deleting a project. The service
+permanently rejects further writes to that project ID, including delayed retries
+from old publishers; use a new project ID for subsequent experiments. Current
+publishers stop on this permanent rejection, leaving training and local files
+intact.
+
+Browser deletion is disabled by default. Enable it in the existing dashboard
+configuration:
+
+```toml
+[dashboard]
+public_url = "https://expri.example.net"
+password_env = "EXPRI_DASHBOARD_PASSWORD"
+allow_project_deletion = true
+```
+
+Only the primary dashboard can delete; AB previews remain read-only. **Delete
+project** opens a preview. Enter the exact project ID and the dashboard password
+to submit it. Cancel sends no deletion request. If project data changed after
+the preview, refresh and review the new preview before submitting again.
+
+The owner CLI also requires the preview's revision and exact project ID:
+
+```sh
+expri service project delete --config owner.toml --project-id vision \
+  --revision 'REVISION_FROM_PREVIEW' --confirm-project vision
+expri service project deletion --config owner.toml --project-id vision
+```
+
+Metadata removal and a durable cleanup queue are committed together. Cleanup
+aborts pending multipart uploads, removes eligible objects and local tracking
+files, and retries after storage outages or a service restart. The dashboard
+shows pending cleanup even after the project leaves the catalog; checking its
+status does not submit another deletion.
+
+For a versioned bucket, cleanup permanently removes all versions and delete
+markers of each eligible exact object key. It does not sweep the bucket or an
+arbitrary prefix. This matters for Backblaze, where a plain deletion can retain
+older versions. The storage credentials need permission to inspect bucket
+versioning, list versions, delete object versions, and abort multipart uploads,
+in addition to the existing upload/download permissions. Missing permissions or
+object retention leave cleanup pending with retries. See [Backblaze's deletion
+behavior](https://www.backblaze.com/apidocs/s3-delete-object) and [AWS S3 deletion
+semantics](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html).
+
 ## Acceptance tests
 
 ```sh
@@ -459,6 +527,12 @@ reviews downloaded data offline. It verifies independent server ZIP completion,
 original tracking bytes without per-file S3 uploads, recovery of an acknowledged
 prefix while the worker is offline, and owner-requested partial archives. Failed and cancelled runs also finish publishing
 their original task status and logs without selecting a checkpoint.
+Versioned MinIO also exercises usage totals for shared references, retained
+uploads, pending multipart uploads, and tracking bytes. An isolated project is
+deleted during an S3 outage, then cleanup resumes after a service restart. The
+test checks that all of its object versions and multipart uploads are removed
+while another project's data survives. Native browser checks cover deletion
+preview and cancel, password requirements, narrow layouts, and read-only AB.
 An isolated Firefox image submits the native login and logout forms over an
 internal HTTPS fixture. It reproduces the rejected null origins under
 `no-referrer`, then checks successful forms under `same-origin`, secure cookie

@@ -13,7 +13,10 @@ use source::{Source, parse_source, source_record};
 
 use super::storage::ObjectStorage;
 use super::store::{ApiError, ApiResult, Store};
-use super::types::{FileRecord, FileTarget, RunScope, STREAM_BATCH, validate_component};
+use super::types::{
+  FileRecord, FileTarget, ProjectDeletePreview, ProjectDeletionStatus, ProjectStorageStats,
+  RunScope, STREAM_BATCH, validate_component,
+};
 use crate::dashboard::artifacts::Download;
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
 use crate::dashboard::table::{self, ListQuery};
@@ -106,6 +109,29 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
 }
 
 impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
+  pub fn project_storage(&self, project_id: &str) -> ApiResult<ProjectStorageStats> {
+    self.store.project_storage(project_id)
+  }
+
+  pub fn project_delete_preview(&self, project_id: &str) -> ApiResult<ProjectDeletePreview> {
+    self.store.preview_project_delete(project_id)
+  }
+
+  pub fn delete_project(
+    &self,
+    project_id: &str,
+    revision: &str,
+    confirmation: &str,
+  ) -> ApiResult<ProjectDeletionStatus> {
+    self
+      .store
+      .delete_project(project_id, revision, confirmation)
+  }
+
+  pub fn project_deletion(&self, project_id: &str) -> ApiResult<ProjectDeletionStatus> {
+    self.store.project_deletion(project_id)
+  }
+
   pub fn new(store: &'a Store<S>) -> Result<Self> {
     super::storage::init_tls();
     let client = Client::builder()

@@ -323,6 +323,39 @@ footer { color: #8690a2; font-size: 10px; display: flex; justify-content: space-
 .file-command { display: block; width: 100%; max-height: 240px; resize: vertical; box-sizing: border-box; padding: 11px; font: 11px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; border: 1px solid var(--line); border-radius: 6px; background: #f7f8fb; color: #39445b; }
 #workspace-view-options { margin: 14px 0 18px; }
 .storage-page { min-width: 0; }
+.storage-usage { margin-bottom: 20px; min-width: 0; }
+.storage-usage .section-heading { flex-wrap: wrap; gap: 12px; }
+.storage-management-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
+.storage-usage-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin: 22px 0 18px; }
+.storage-usage-grid > div { min-width: 0; padding: 14px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+.storage-usage-grid dt, .storage-usage-details dt, .delete-preview-counts dt { font-size: 12px; color: var(--muted); }
+.storage-usage-grid dd { margin: 6px 0; font-size: 24px; font-weight: 650; }
+.storage-usage-grid dd.storage-usage-description { color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.5; margin: 0; }
+.storage-usage-details { display: flex; flex-wrap: wrap; gap: 16px 32px; margin: 0 0 14px; }
+.storage-usage-details dd { margin: 4px 0 0; font-size: 12px; }
+.storage-usage-note { font-size: 11px; line-height: 1.6; margin-top: 12px; }
+.button.danger { background: #b42318; color: white; border-color: #b42318; }
+.button.danger.secondary { background: transparent; color: #b42318; }
+.button.danger:hover:not(:disabled) { background: #8f1c13; color: white; }
+.project-delete-dialog { color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 10px; padding: 24px; width: min(580px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow: auto; }
+.project-delete-dialog::backdrop { background: rgb(16 24 40 / 55%); }
+.project-delete-dialog p { line-height: 1.6; font-size: 12px; margin: 12px 0; }
+.project-delete-dialog .section-heading { gap: 16px; }
+.project-delete-dialog .section-heading h2 { font-size: 18px; }
+.project-delete-dialog strong { overflow-wrap: anywhere; }
+.delete-preview-counts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+.delete-preview-counts dd { margin: 5px 0 0; font-size: 15px; font-weight: 600; }
+.delete-confirmation-fields { padding: 0; border: 0; min-width: 0; margin: 18px 0; }
+.delete-confirmation-fields .field { margin-bottom: 14px; }
+.delete-confirmation-fields input { width: 100%; }
+#delete-project-cancel { margin-top: 12px; }
+#project-cleanup-summary { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+@media (max-width: 650px) {
+  .storage-usage-grid { grid-template-columns: 1fr; gap: 8px; }
+  .storage-usage-grid > div { padding: 12px; }
+  .storage-usage-grid dd { font-size: 22px; }
+  .project-delete-dialog { padding: 18px; }
+}
 .storage-intro { font-size: 12px; margin-bottom: 18px; }
 .storage-kinds { margin-bottom: 16px; }
 .storage-card { min-width: 0; }

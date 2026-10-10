@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 use crate::error::{ExpriError, Result};
 
+mod project_deletion;
+
 pub use super::types::CompletedPart;
 
 pub const MAX_PRESIGN_EXPIRY_SECS: u32 = 3600;
@@ -51,6 +53,16 @@ pub trait ObjectStorage: Send + Sync {
     _disposition: &str,
   ) -> Result<String> {
     self.presign_get(key, expires_secs)
+  }
+  fn delete_object(&self, _key: &str) -> Result<()> {
+    Err(invalid(
+      "object deletion is not supported by this storage backend",
+    ))
+  }
+  fn abort_upload(&self, _key: &str, _upload_id: &str) -> Result<()> {
+    Err(invalid(
+      "multipart cancellation is not supported by this storage backend",
+    ))
   }
 }
 
@@ -159,6 +171,21 @@ impl S3Storage {
 }
 
 impl ObjectStorage for S3Storage {
+  fn delete_object(&self, key: &str) -> Result<()> {
+    self.purge_object(key)
+  }
+
+  fn abort_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+    validate_upload_id(upload_id)?;
+    let key = self.object_key(key)?;
+    // Like completion, the sync client inserts the opaque ID before signing.
+    let upload_id = s3::signing::uri_encode(upload_id, true);
+    match self.bucket.abort_upload(&key, &upload_id) {
+      Ok(()) | Err(S3Error::HttpFailWithBody(404, _)) => Ok(()),
+      Err(error) => Err(backend_error("abort upload", error)),
+    }
+  }
+
   fn begin_upload(&self, key: &str, content_type: &str) -> Result<String> {
     validate_content_type(content_type)?;
     let key = self.object_key(key)?;
@@ -744,6 +771,310 @@ mod tests {
     )
     .to_string();
     assert_eq!(error, "S3 download request failed");
+  }
+
+  #[test]
+  fn cleanup_requests_sign_exact_object_versions_and_opaque_multipart_ids() {
+    use std::{io::Write, net::TcpListener, thread};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+      let responses = [
+        (
+          200,
+          "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+        ),
+        (
+          200,
+          "<ListVersionsResult><Prefix>expri/runs/a/key</Prefix><IsTruncated>false</IsTruncated><Version><Key>expri/runs/a/key</Key><VersionId>v+/=&amp;?#</VersionId></Version><DeleteMarker><Key>expri/runs/a/key</Key><VersionId>marker</VersionId></DeleteMarker><Version><Key>expri/runs/a/key-neighbor</Key><VersionId>neighbor</VersionId></Version></ListVersionsResult>",
+        ),
+        (204, ""),
+        (
+          404,
+          "<Error><Code>NoSuchVersion</Code><Message>secret</Message></Error>",
+        ),
+        (
+          404,
+          "<Error><Code>NoSuchUpload</Code><Message>secret</Message></Error>",
+        ),
+      ];
+      for (index, (status, body)) in responses.into_iter().enumerate() {
+        let mut stream = accept_peer(&listener);
+        let request = read_http_request(&mut stream);
+        let fields: Vec<_> = request.lines().next().unwrap().split_whitespace().collect();
+        let uri: http::Uri = fields[1].parse().unwrap();
+        let query: BTreeMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+          .into_owned()
+          .collect();
+        assert!(
+          request
+            .to_ascii_lowercase()
+            .contains("authorization: aws4-hmac-sha256")
+        );
+        assert!(
+          request
+            .to_ascii_lowercase()
+            .contains("x-amz-security-token: test-session")
+        );
+        assert!(!request.contains("test-secret"));
+        match index {
+          0 => {
+            assert_eq!(fields[0], "GET");
+            assert!(query.contains_key("versioning"));
+          }
+          1 => {
+            assert_eq!(fields[0], "GET");
+            assert_eq!(query["prefix"], "expri/runs/a/key");
+            assert_eq!(query["max-keys"], "16");
+            assert!(query.contains_key("versions"));
+          }
+          2 | 3 => {
+            assert_eq!(fields[0], "DELETE");
+            assert_eq!(uri.path(), "/test-bucket/expri/runs/a/key");
+            assert_eq!(
+              query["versionId"],
+              if index == 2 { "v+/=&?#" } else { "marker" }
+            );
+          }
+          _ => {
+            assert_eq!(fields[0], "DELETE");
+            assert_eq!(uri.path(), "/test-bucket/expri/runs/a/key");
+            assert_eq!(query["uploadId"], "id+/=token&next?#");
+          }
+        }
+        write!(
+          stream,
+          "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+      }
+    });
+    let mut config = config();
+    config.endpoint = Some(format!("http://{address}"));
+    let storage = storage(config);
+    storage.delete_object("runs/a/key").unwrap();
+    storage
+      .abort_upload("runs/a/key", "id+/=token&next?#")
+      .unwrap();
+    peer.join().unwrap();
+  }
+
+  #[test]
+  fn cleanup_does_not_fallback_when_versioning_or_version_listing_is_unavailable() {
+    use std::{io::Write, net::TcpListener, thread};
+    for fail_listing in [false, true] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      listener.set_nonblocking(true).unwrap();
+      let address = listener.local_addr().unwrap();
+      let peer = thread::spawn(move || {
+        if fail_listing {
+          let mut stream = accept_peer(&listener);
+          assert!(read_http_request(&mut stream).starts_with("GET "));
+          let body =
+            "<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>";
+          write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+          )
+          .unwrap();
+        }
+        let mut stream = accept_peer(&listener);
+        assert!(read_http_request(&mut stream).starts_with("GET "));
+        let body = "<Error><Code>AccessDenied</Code><Message>signed-secret</Message></Error>";
+        write!(
+          stream,
+          "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+      });
+      let mut config = config();
+      config.endpoint = Some(format!("http://{address}"));
+      let result = storage(config)
+        .delete_object("runs/a/key")
+        .unwrap_err()
+        .to_string();
+      assert!(result.contains("403"));
+      assert!(!result.contains("signed-secret"));
+      peer.join().unwrap();
+    }
+  }
+
+  #[test]
+  fn version_cleanup_leaves_truncated_work_pending_and_resumes_remaining_versions() {
+    use std::{io::Write, net::TcpListener, thread};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+      for version in ["first", "second"] {
+        let mut stream = accept_peer(&listener);
+        let request = read_http_request(&mut stream);
+        assert!(request.starts_with("GET ") && request.contains("versioning"));
+        let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        write!(
+          stream,
+          "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+        drop(stream);
+        let mut stream = accept_peer(&listener);
+        assert!(read_http_request(&mut stream).starts_with("GET "));
+        let markers = if version == "first" {
+          "<NextKeyMarker>expri/runs/a/key</NextKeyMarker><NextVersionIdMarker>first</NextVersionIdMarker>"
+        } else {
+          ""
+        };
+        let body = format!(
+          "<ListVersionsResult><Prefix>expri/runs/a/key</Prefix><IsTruncated>{}</IsTruncated>{markers}<Version><Key>expri/runs/a/key</Key><VersionId>{version}</VersionId></Version></ListVersionsResult>",
+          version == "first"
+        );
+        write!(
+          stream,
+          "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+        drop(stream);
+        let mut stream = accept_peer(&listener);
+        let request = read_http_request(&mut stream);
+        assert!(request.starts_with("DELETE "));
+        let uri: http::Uri = request
+          .lines()
+          .next()
+          .unwrap()
+          .split_whitespace()
+          .nth(1)
+          .unwrap()
+          .parse()
+          .unwrap();
+        let query: BTreeMap<_, _> = form_urlencoded::parse(uri.query().unwrap().as_bytes())
+          .into_owned()
+          .collect();
+        assert_eq!(query["versionId"], version);
+        stream
+          .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+          .unwrap();
+      }
+    });
+    let mut config = config();
+    config.endpoint = Some(format!("http://{address}"));
+    let storage = storage(config);
+    assert!(
+      storage
+        .delete_object("runs/a/key")
+        .unwrap_err()
+        .to_string()
+        .contains("cleanup will retry")
+    );
+    storage.delete_object("runs/a/key").unwrap();
+    peer.join().unwrap();
+  }
+
+  #[test]
+  fn version_cleanup_ignores_prefix_neighbors_and_fails_closed_on_invalid_metadata() {
+    use std::{io::Write, net::TcpListener, thread};
+    for case in [
+      "neighbor",
+      "wrong-prefix",
+      "foreign-key",
+      "unknown-status",
+      "malformed",
+    ] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      listener.set_nonblocking(true).unwrap();
+      let address = listener.local_addr().unwrap();
+      let peer = thread::spawn(move || {
+        let body = match case {
+          "unknown-status" => {
+            "<VersioningConfiguration><Status>Unknown</Status></VersioningConfiguration>"
+          }
+          "malformed" => "<Error><Message>signed-secret</Message></Error>",
+          _ => "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+        };
+        let mut stream = accept_peer(&listener);
+        assert!(read_http_request(&mut stream).starts_with("GET "));
+        write!(
+          stream,
+          "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+        drop(stream);
+        if !matches!(case, "unknown-status" | "malformed") {
+          let mut stream = accept_peer(&listener);
+          assert!(read_http_request(&mut stream).starts_with("GET "));
+          let body = match case {
+            "neighbor" => {
+              "<ListVersionsResult><Prefix>expri/runs/a/key</Prefix><IsTruncated>true</IsTruncated><NextKeyMarker>expri/runs/a/key-neighbor</NextKeyMarker><NextVersionIdMarker>v1</NextVersionIdMarker><Version><Key>expri/runs/a/key-neighbor</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
+            }
+            "wrong-prefix" => {
+              "<ListVersionsResult><Prefix>foreign/</Prefix><IsTruncated>false</IsTruncated><Version><Key>foreign/key</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
+            }
+            _ => {
+              "<ListVersionsResult><Prefix>expri/runs/a/key</Prefix><IsTruncated>false</IsTruncated><Version><Key>foreign/key</Key><VersionId>v1</VersionId></Version></ListVersionsResult>"
+            }
+          };
+          write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+          )
+          .unwrap();
+        }
+      });
+      let mut config = config();
+      config.endpoint = Some(format!("http://{address}"));
+      let result = storage(config).delete_object("runs/a/key");
+      if case == "neighbor" {
+        assert!(result.is_ok());
+      } else {
+        assert!(!result.unwrap_err().to_string().contains("signed-secret"));
+      }
+      peer.join().unwrap();
+    }
+  }
+
+  #[test]
+  fn unversioned_cleanup_and_missing_uploads_are_idempotent() {
+    use std::{io::Write, net::TcpListener, thread};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+      for (index, (status, body)) in [
+        (200, "<VersioningConfiguration/>"),
+        (404, ""),
+        (403, "secret"),
+      ]
+      .into_iter()
+      .enumerate()
+      {
+        let mut stream = accept_peer(&listener);
+        let request = read_http_request(&mut stream);
+        assert!(request.starts_with(if index == 0 { "GET " } else { "DELETE " }));
+        write!(
+          stream,
+          "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+      }
+    });
+    let mut config = config();
+    config.endpoint = Some(format!("http://{address}"));
+    let storage = storage(config);
+    storage.delete_object("runs/a/key").unwrap();
+    let error = storage
+      .abort_upload("runs/a/key", "upload")
+      .unwrap_err()
+      .to_string();
+    assert_eq!(error, "S3 abort upload failed (HTTP 403)");
+    peer.join().unwrap();
   }
 
   #[test]

@@ -20,8 +20,8 @@ struct Session {
   expires_at: Instant,
 }
 
-/// Browser sessions authorize read-only dashboard routes only. API bearer roles
-/// stay separate so an owner or worker token never needs to reach the browser.
+/// Browser sessions stay separate from API bearer roles. Project deletion also
+/// requires a fresh password, so bearer credentials never reach the browser.
 pub(super) struct BrowserAuth {
   origin: String,
   host: String,
@@ -105,6 +105,16 @@ impl BrowserAuth {
   pub fn authorized<T>(&self, request: &HttpRequest<T>) -> ApiResult<()> {
     self.check_boundary(request, false)?;
     self.authorized_session(request)
+  }
+
+  /// Destructive actions require the password again without issuing a session.
+  pub fn reauthenticate<T>(&self, request: &HttpRequest<T>, supplied: &[u8]) -> ApiResult<()> {
+    self.check_boundary(request, true)?;
+    self.authorized_session(request)?;
+    if !bool::from(supplied.ct_eq(self.credential.as_slice())) {
+      return Err(ApiError::new(403, "dashboard password is incorrect"));
+    }
+    Ok(())
   }
 
   /// HTML navigation can arrive from another site; Strict cookies prevent such

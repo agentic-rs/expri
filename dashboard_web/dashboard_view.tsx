@@ -2,6 +2,7 @@ import { Fragment, useSyncExternalStore, useState, type KeyboardEvent } from "re
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
+import { ProjectStorageManagement } from "./storage_management_view";
 import {
   MAX_RUN_COLUMNS,
   formatRunTableValue,
@@ -1427,6 +1428,12 @@ export function DashboardView({
           on_change={actions.workspace_view}
         />
       )}
+      <ProjectStorageManagement
+        project_id={project_id ?? null}
+        active={s.workspace_view === "storage" && !!project_id}
+        auto_enabled={s.auto_enabled}
+        on_project_removed={actions.refresh}
+      />
       <div id="workspace-page" hidden={s.workspace_view !== "workspace"}>
         <div id="source-note" className="source-note" hidden={s.source_note === null}>
           {s.source_note}

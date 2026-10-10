@@ -1,6 +1,8 @@
 use http::{Request as HttpRequest, Response as HttpResponse};
 use serde_json::json;
 
+mod project_management;
+
 use super::browser_assets::{Asset, DashboardAssets};
 use super::browser_auth::BrowserAuth;
 use super::dashboard_data::HostedDashboard;
@@ -29,9 +31,10 @@ pub(super) fn handle<S: ObjectStorage>(
   dashboard: &HostedDashboard<'_, S>,
   auth: &BrowserAuth,
   assets: &DashboardAssets,
+  allow_project_deletion: bool,
   request: &HttpRequest<Vec<u8>>,
 ) -> HttpResponse<Vec<u8>> {
-  match route(dashboard, auth, assets, request) {
+  match route(dashboard, auth, assets, allow_project_deletion, request) {
     Ok(reply) => reply,
     Err(error) => response(
       error.status,
@@ -158,6 +161,7 @@ fn route<S: ObjectStorage>(
   dashboard: &HostedDashboard<'_, S>,
   auth: &BrowserAuth,
   assets: &DashboardAssets,
+  allow_project_deletion: bool,
   request: &HttpRequest<Vec<u8>>,
 ) -> ApiResult<HttpResponse<Vec<u8>>> {
   auth.check_host(request)?;
@@ -187,6 +191,9 @@ fn route<S: ObjectStorage>(
         return Err(ApiError::new(400, "logout does not accept fields"));
       }
       return Ok(redirect("/login", Some(auth.logout(request)?)));
+    }
+    ("POST", "/api/projects/delete") => {
+      return project_management::delete(dashboard, auth, allow_project_deletion, request);
     }
     _ if !matches!(method, "GET" | "HEAD") => {
       return Err(ApiError::new(405, "dashboard routes require GET or HEAD"));
@@ -224,6 +231,9 @@ fn route<S: ObjectStorage>(
     .uri()
     .path_and_query()
     .map_or("/", |uri| uri.as_str());
+  if let Some(reply) = project_management::read(dashboard, allow_project_deletion, request)? {
+    return Ok(reply);
+  }
   if path == "/api/artifact" {
     return match crate::dashboard::server::artifact_download(dashboard, uri) {
       Ok(download) => download_response(method, download),
@@ -371,6 +381,7 @@ mod tests {
       &HostedDashboard::new(store).unwrap(),
       auth,
       &DashboardAssets::embedded(),
+      false,
       request,
     )
   }
@@ -945,7 +956,7 @@ mod tests {
   }
 
   #[test]
-  fn authenticated_dashboard_has_no_data_mutation_routes() {
+  fn authenticated_dashboard_rejects_general_data_mutations() {
     let temporary = tempfile::tempdir().unwrap();
     let store = Store::open(temporary.path(), MockStorage::default()).unwrap();
     let auth = BrowserAuth::new(
@@ -1050,7 +1061,7 @@ mod external_tests {
     )
     .unwrap();
     let handle =
-      |request: &HttpRequest<Vec<u8>>| super::handle(&dashboard, &auth, &assets, request);
+      |request: &HttpRequest<Vec<u8>>| super::handle(&dashboard, &auth, &assets, false, request);
     assert_eq!(handle(&request("GET", "/", None)).status(), 303);
     assert_eq!(handle(&request("GET", "/api/catalog", None)).status(), 401);
     let login = handle(&request("GET", "/login", None));

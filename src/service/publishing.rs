@@ -390,14 +390,9 @@ pub(super) fn worker(run_dir: &Path) -> Result<()> {
         thread::sleep(Duration::from_secs(5));
       }
       Err(failure) => {
-        if Publisher::authentication_rejected(&failure) {
-          state.fail(
-            &directory,
-            safe_error(&error(publisher.error_text(&failure))),
-          )?;
-          return Err(error(
-            "Service authentication rejected; repair credentials and resume publishing",
-          ));
+        if let Some(reason) = Publisher::permanent_rejection(&failure) {
+          state.fail(&directory, reason.into())?;
+          return Err(error(reason));
         }
         let delay = (5u64 << failures.min(4)).min(60);
         failures = failures.saturating_add(1);
@@ -506,6 +501,80 @@ mod tests {
         .unwrap()
         .contains("outside")
     );
+  }
+
+  #[test]
+  fn deleted_project_stops_publisher_without_changing_active_training_or_local_data() {
+    let (_temporary, repo, run, config) = fixture();
+    let (url, task) = client::tests::reject_publishing(410);
+    std::fs::write(
+      &config.client_config,
+      format!("url={url:?}\ntoken_env='PATH'\n"),
+    )
+    .unwrap();
+    fs::atomic_json(
+      &run.join("run-state.json"),
+      &json!({"run_id": "run-fixture", "status": "running"}),
+    )
+    .unwrap();
+    let run_before = std::fs::read(run.join("run-state.json")).unwrap();
+    let snapshot = br#"{"run_id":"run-fixture"}"#;
+    let metrics = b"{\"step\":1,\"loss\":0.5}\n";
+    std::fs::write(run.join("snapshot.json"), snapshot).unwrap();
+    std::fs::create_dir(run.join("outputs")).unwrap();
+    std::fs::write(run.join("outputs/metrics.jsonl"), metrics).unwrap();
+    let intent = Intent {
+      schema_version: 1,
+      repo_root: repo.clone(),
+      run_dir: run.clone(),
+      config,
+    };
+    fs::atomic_json(&run.join(REQUEST), &intent).unwrap();
+    PublishingState::new(&intent)
+      .unwrap()
+      .save(&run, "pending")
+      .unwrap();
+    let _training_lease = crate::lock::run_lock(&run).unwrap();
+    let directory = run.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let publisher = thread::spawn(move || send.send(worker(&directory)).unwrap());
+    let failure = receive
+      .recv_timeout(Duration::from_secs(4))
+      .expect("a deleted project must stop its publisher before the retry")
+      .unwrap_err();
+    publisher.join().unwrap();
+    task.join().unwrap();
+    assert!(failure.to_string().contains("new project identifier"));
+    let recorded = status(&run).unwrap().unwrap();
+    assert_eq!(recorded["status"], "error");
+    assert_eq!(recorded["retry_after_seconds"], Value::Null);
+    assert_eq!(recorded["worker_active"], false);
+    assert!(recorded["last_error"].as_str().unwrap().contains("deleted"));
+    assert_eq!(
+      std::fs::read(run.join("run-state.json")).unwrap(),
+      run_before
+    );
+    assert_eq!(
+      std::fs::read(run.join("outputs/metrics.jsonl")).unwrap(),
+      metrics
+    );
+    assert!(matches!(
+      try_lock_file(&run.join(".run.lock"), false).unwrap(),
+      LockAttempt::Busy
+    ));
+    let queue_dir = repo.join(".expri/service-sync/runs/project/worker/run-fixture");
+    let queue: Value =
+      serde_json::from_slice(&std::fs::read(queue_dir.join("queue.json")).unwrap()).unwrap();
+    let saved = &queue["files"]["snapshot.json"];
+    assert_eq!(saved["upload"]["complete"], false);
+    assert_eq!(
+      std::fs::read(queue_dir.join(saved["snapshot"].as_str().unwrap())).unwrap(),
+      snapshot,
+    );
+    assert!(matches!(
+      try_lock_file(&queue_dir.join(".sync.lock"), false).unwrap(),
+      LockAttempt::Acquired(_)
+    ));
   }
 
   #[test]

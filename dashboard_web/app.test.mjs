@@ -197,6 +197,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     }) }) : response({ error: "Unknown endpoint" }, 404);
     if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local" });
     if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [] }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    if (parsed.pathname === "/api/storage/stats") return response({ stats: managementStats(query.get("project_id")), delete_enabled: false });
     if (parsed.pathname === "/api/storage") {
       const project_id = query.get("project_id"), kind = query.get("kind"),
         offset = Number(query.get("offset")), limit = Number(query.get("limit")),
@@ -1750,7 +1751,7 @@ test("project Storage loads lazily, shows inputs and uploaded outputs, and prese
   assert.equal(nodes.get("storage-kind-input").checked, true);
   assert.match(nodes.get("storage-rows").textContent, /dataset-v1.*1 KiB/);
   assert.equal(new URL(nodes.get("storage-rows").querySelector("a").href).searchParams.get("input_id"), "dataset-v1");
-  const first_query = new URL(model.requests.find(url => url.startsWith("/api/storage")), "http://localhost").searchParams;
+  const first_query = new URL(model.requests.find(url => url.startsWith("/api/storage?")), "http://localhost").searchParams;
   assert.deepEqual(Object.fromEntries(first_query), { project_id: "vision", kind: "input", limit: "100", offset: "0" });
   await click(nodes.get("storage-kind-output"));
   await settled(() => nodes.get("storage-rows").textContent.includes("outputs/checkpoint.pt"));
@@ -1784,14 +1785,14 @@ test("Storage searches and pages on the server, including a project with no runs
   await click(nodes.get("storage-next-page"));
   await settled(() => nodes.get("storage-rows").children.length === 5);
   assert.equal(nodes.get("storage-page-label").textContent, "101–105 of 105");
-  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/storage")).at(-1), "http://localhost").searchParams.get("offset"), "100");
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/storage?")).at(-1), "http://localhost").searchParams.get("offset"), "100");
   await click(nodes.get("storage-previous-page"));
   await settled(() => nodes.get("storage-rows").children.length === 100);
   const search = nodes.get("storage-search");
   setValue(search, "dataset-104"); await emit(search, "input");
   await settled(() => nodes.document.getElementById("storage-rows")?.children.length === 1);
   assert.equal(nodes.get("storage-rows").textContent.includes("dataset-104"), true);
-  const query = new URL(model.requests.filter(url => url.startsWith("/api/storage")).at(-1), "http://localhost").searchParams;
+  const query = new URL(model.requests.filter(url => url.startsWith("/api/storage?")).at(-1), "http://localhost").searchParams;
   assert.equal(query.get("search"), "dataset-104");
   assert.equal(query.get("offset"), "0");
   setValue(search, "not-published"); await emit(search, "input");
@@ -1870,7 +1871,7 @@ test("Storage follows a project switch and discards the previous project query",
   assert.equal(nodes.get("storage-search").value, "", "project switch clears the old search");
   assert.equal(nodes.get("project-name").textContent, "other");
   assert.equal(nodes.get("workspace-view-storage").checked, true);
-  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/storage")).at(-1), "http://localhost").searchParams.get("project_id"), "other");
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/storage?")).at(-1), "http://localhost").searchParams.get("project_id"), "other");
 });
 
 test("project browsing selects projects and preserves duplicate run IDs across recorded machines", async t => {
@@ -2000,4 +2001,141 @@ test("a late project catalog cannot replace an explicit project choice", async t
   assert.equal(nodes.get("project-other").checked, true);
   assert.equal(nodes.get("project-name").textContent, "other");
   assert.equal(latestRunQuery(model).get("source"), "hosted-project:other");
+});
+
+function managementStats(project_id = "vision", revision = "storage-1") {
+  return { project_id, revision, file_count: 4, logical_bytes: 16_384,
+    object_count: 2, object_bytes: 8_192, shared_reference_count: 2,
+    retained_object_count: 1, retained_object_bytes: 1_024, pending_upload_count: 1,
+    pending_upload_bytes: 512, tracking_bytes: 256,
+    reclaimable_object_count: 3, reclaimable_object_bytes: 9_216 };
+}
+function managementPreview(project_id = "vision", revision = "preview-1") {
+  return { project_id, revision, run_count: 2, stats: managementStats(project_id) };
+}
+function managementDeletion(status = "pending") {
+  return { project_id: "vision", status, pending_tasks: status === "deleted" ? 0 : 2,
+    deleted_objects: status === "deleted" ? 3 : 1, aborted_uploads: 1, last_error: null };
+}
+
+test("storage usage explains deduplicated object bytes and file totals while disabled dashboards omit deletion", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-usage").textContent.includes("8 KiB"));
+  const usage = nodes.get("storage-usage");
+  assert.match(usage.textContent, /Referenced object storage8 KiB2 unique objects/);
+  assert.match(usage.textContent, /File totals16 KiB4 file entries/);
+  assert.match(usage.textContent, /Shared references2Additional entries/);
+  assert.match(usage.textContent, /Retained objects1 KiB/);
+  assert.match(usage.textContent, /Pending uploads512 B declared/);
+  assert.match(usage.textContent, /Tracking data256 B/);
+  assert.match(usage.textContent, /not the full bucket bill/);
+  assert.equal(nodes.document.getElementById("delete-project-button"), null);
+  assert.equal(nodes.get("delete-project-dialog").open, false);
+  assert.equal(nodes.document.querySelectorAll("#storage-kind-options input[type=radio]").length, 2);
+});
+
+test("project deletion preview is scoped and cancel clears the password without a destructive request", async t => {
+  const posts = [];
+  const model = await autoFixture(t, { projects: true, project_runs: [], override: (parsed, init) => {
+    if (parsed.pathname === "/api/storage/stats") return response({ stats: managementStats(parsed.searchParams.get("project_id")), delete_enabled: true });
+    if (parsed.pathname === "/api/projects/delete-preview") return response(managementPreview(parsed.searchParams.get("project_id")));
+    if (init.method === "POST") { posts.push(init); return response(managementDeletion(), 202); }
+    return null;
+  } }), { nodes } = model;
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("delete-project-button"));
+  await click(nodes.get("delete-project-button"));
+  await settled(() => nodes.document.getElementById("delete-project-preview"));
+  assert.equal(nodes.get("delete-project-dialog").open, true);
+  assert.match(nodes.get("delete-project-preview").textContent, /vision/);
+  assert.match(nodes.get("delete-project-preview").textContent, /Local files remain/);
+  assert.match(nodes.get("delete-project-preview").textContent, /Runs2.*File entries4.*Storage to reclaim9 KiB/);
+  assert.equal(nodes.get("delete-project-submit").disabled, true);
+  setValue(nodes.get("delete-project-confirmation"), "vision"); await emit(nodes.get("delete-project-confirmation"), "input");
+  assert.equal(nodes.get("delete-project-submit").disabled, true, "a password is required before enabling deletion");
+  setValue(nodes.get("delete-project-password"), "private-password"); await emit(nodes.get("delete-project-password"), "input");
+  assert.equal(nodes.get("delete-project-submit").disabled, false);
+  await click(nodes.get("delete-project-cancel"));
+  assert.equal(nodes.get("delete-project-dialog").open, false);
+  assert.equal(posts.length, 0);
+  assert.equal(nodes.document.defaultView.sessionStorage.length, 0);
+  assert.equal(nodes.document.defaultView.localStorage.length, 0);
+  await click(nodes.get("delete-project-button"));
+  await settled(() => nodes.document.getElementById("delete-project-password"));
+  assert.equal(nodes.get("delete-project-password").value, "");
+  assert.equal(nodes.get("delete-project-confirmation").value, "");
+  model.model.project_sources.push({ ...project_source, project_id: "other", source_id: "hosted-project:other", label: "other" });
+  await click(nodes.get("delete-project-close"));
+  await click(nodes.get("refresh-button"));
+  await settled(() => nodes.document.getElementById("project-other"));
+  await click(nodes.get("delete-project-button"));
+  await settled(() => nodes.document.getElementById("delete-project-preview"));
+  await click(nodes.get("project-other"));
+  assert.equal(nodes.get("delete-project-dialog").open, false);
+  assert.equal(posts.length, 0, "a source change cannot submit an old confirmation");
+});
+
+test("project deletion sends one reviewed POST and retains cleanup status after the project leaves the catalog", async t => {
+  const posts = []; let completed = false, accepted = false;
+  const model = await autoFixture(t, { projects: true, project_runs: [], override: (parsed, init) => {
+    if (parsed.pathname === "/api/storage/stats") return response({ stats: managementStats(parsed.searchParams.get("project_id")), delete_enabled: true });
+    if (parsed.pathname === "/api/projects/delete-preview") return response(managementPreview());
+    if (parsed.pathname === "/api/projects/delete") { posts.push(JSON.parse(init.body)); accepted = true; return response(managementDeletion(), 202); }
+    if (parsed.pathname === "/api/projects/deletion") return response(managementDeletion(completed ? "deleted" : "pending"));
+    if (parsed.pathname === "/api/projects" && accepted) return response({ project_name: "Hosted experiments", sources: [], initial_source: "", access_mode: "hosted", warnings: [] });
+    return null;
+  } }), { nodes } = model;
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("delete-project-button"));
+  await click(nodes.get("delete-project-button"));
+  await settled(() => nodes.document.getElementById("delete-project-password"));
+  const password_node = nodes.get("delete-project-password");
+  setValue(nodes.get("delete-project-confirmation"), "vision"); await emit(nodes.get("delete-project-confirmation"), "input");
+  setValue(password_node, "private-password"); await emit(password_node, "input");
+  await emit(nodes.get("delete-project-submit").form, "submit");
+  await settled(() => nodes.document.getElementById("project-cleanup-status"));
+  assert.deepEqual(posts, [{ project_id: "vision", revision: "preview-1", confirmation: "vision", password: "private-password" }]);
+  assert.equal(password_node.value, "", "the password input clears immediately when submitting");
+  assert.equal(nodes.document.defaultView.localStorage.length, 0);
+  assert.deepEqual(Object.values(nodes.document.defaultView.sessionStorage), ["vision"], "only the pending project identity is stored");
+  await settled(() => nodes.document.getElementById("project-vision") === null && !nodes.get("refresh-button").disabled);
+  assert.match(nodes.get("project-cleanup-status").textContent, /vision.*cleanup is in progress/);
+  const catalogs = requestCounts(model.requests)["/api/projects"];
+  assert.equal(catalogs, 2, "accepted deletion refreshes the project catalog once");
+  await click(nodes.get("check-project-cleanup"));
+  assert.equal(requestCounts(model.requests)["/api/projects"], catalogs, "pending status reads do not repeat catalog refreshes");
+  completed = true;
+  await click(nodes.get("check-project-cleanup"));
+  await settled(() => nodes.get("project-cleanup-status").textContent.includes("Cleanup completed"));
+  assert.equal(posts.length, 1, "checking status must not replay the deletion");
+  assert.equal(nodes.document.defaultView.sessionStorage.length, 0);
+});
+
+test("stale deletion previews clear secrets and require another reviewed preview before submission", async t => {
+  const posts = []; let revision = "preview-1";
+  const model = await autoFixture(t, { projects: true, project_runs: [], override: (parsed, init) => {
+    if (parsed.pathname === "/api/storage/stats") return response({ stats: managementStats(), delete_enabled: true });
+    if (parsed.pathname === "/api/projects/delete-preview") return response(managementPreview("vision", revision));
+    if (parsed.pathname === "/api/projects/delete") { posts.push(JSON.parse(init.body)); return response({ error: "Project changed" }, 409); }
+    return null;
+  } }), { nodes } = model;
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("delete-project-button"));
+  await click(nodes.get("delete-project-button"));
+  await settled(() => nodes.document.getElementById("delete-project-password"));
+  const password_node = nodes.get("delete-project-password");
+  setValue(nodes.get("delete-project-confirmation"), "vision"); await emit(nodes.get("delete-project-confirmation"), "input");
+  setValue(password_node, "private-password");
+  await emit(nodes.get("delete-project-submit").form, "submit");
+  await settled(() => nodes.document.getElementById("refresh-delete-preview"));
+  assert.match(nodes.get("delete-project-error").textContent, /Review a fresh preview/);
+  assert.equal(password_node.value, "");
+  assert.equal(nodes.document.getElementById("delete-project-submit"), null);
+  revision = "preview-2";
+  await click(nodes.get("refresh-delete-preview"));
+  await settled(() => nodes.document.getElementById("delete-project-password"));
+  assert.equal(nodes.get("delete-project-password").value, "");
+  assert.equal(nodes.get("delete-project-confirmation").value, "");
+  assert.equal(posts.length, 1);
 });
