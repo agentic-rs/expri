@@ -136,7 +136,7 @@ pub fn dirty_paths(repo_root: &Path, rules: &SyncRules) -> Result<DirtyPaths> {
   let mut files = Vec::new();
   let mut deleted = Vec::new();
   for relative_path in relative_paths {
-    if !rules.should_include(&relative_path) {
+    if !rules.should_include(&relative_path) || is_managed_asset(repo_root, &relative_path) {
       continue;
     }
     let absolute_path = repo_root.join(&relative_path);
@@ -147,6 +147,110 @@ pub fn dirty_paths(repo_root: &Path, rules: &SyncRules) -> Result<DirtyPaths> {
     }
   }
   Ok(DirtyPaths { files, deleted })
+}
+
+pub(crate) fn is_asset_sidecar(path: &Path) -> bool {
+  path
+    .file_name()
+    .is_some_and(|name| name.to_string_lossy().ends_with(".expri.toml"))
+}
+
+pub(crate) fn is_managed_asset(repo_root: &Path, path: &Path) -> bool {
+  let mut sidecar = path.as_os_str().to_os_string();
+  sidecar.push(".expri.toml");
+  std::fs::symlink_metadata(repo_root.join(PathBuf::from(sidecar))).is_ok()
+}
+
+pub(crate) fn is_worktree(repo_root: &Path) -> Result<bool> {
+  let output = match Command::new("git")
+    .current_dir(repo_root)
+    .args(["rev-parse", "--is-inside-work-tree"])
+    .output()
+  {
+    Ok(output) => output,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+    Err(source) => {
+      return Err(ExpriError::IoContext {
+        action: "run git in",
+        path: repo_root.display().to_string(),
+        source,
+      });
+    }
+  };
+  Ok(output.status.success() && output.stdout.as_slice() == b"true\n")
+}
+
+/// Paths that can become source code, including explicitly selected ignored files.
+pub(crate) fn source_paths(repo_root: &Path, rules: &SyncRules) -> Result<Vec<PathBuf>> {
+  // A --no-push controller may contain only configuration, without a Git checkout.
+  if !is_worktree(repo_root)? {
+    return Ok(Vec::new());
+  }
+  let mut paths = BTreeSet::new();
+  for value in git_capture_bytes(
+    repo_root,
+    [
+      "ls-files",
+      "--cached",
+      "--others",
+      "--exclude-standard",
+      "-z",
+    ],
+  )?
+  .split(|byte| *byte == 0)
+  .filter(|value| !value.is_empty())
+  {
+    paths.insert(path_from_git(value)?);
+  }
+  paths.extend(rules.include_ignored().iter().map(PathBuf::from));
+  Ok(
+    paths
+      .into_iter()
+      .filter(|path| {
+        rules.should_include(path)
+          && !is_managed_asset(repo_root, path)
+          && std::fs::symlink_metadata(repo_root.join(path)).is_ok()
+      })
+      .collect(),
+  )
+}
+
+/// A Git bundle includes tracked blobs before source exclusions are applied.
+pub(crate) fn reject_tracked_assets(repo_root: &Path) -> Result<()> {
+  for value in git_capture_bytes(repo_root, ["ls-files", "--cached", "-z"])?
+    .split(|byte| *byte == 0)
+    .filter(|value| !value.is_empty())
+  {
+    let path = path_from_git(value)?;
+    if path.components().any(|component| {
+      matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().starts_with(crate::filter::ASSET_STAGING_PREFIX))
+    }) {
+      return Err(ExpriError::Message(format!(
+        "temporary asset data is tracked by Git: {}; remove it from Git tracking before pushing source",
+        path.display()
+      )));
+    }
+    if is_managed_asset(repo_root, &path) {
+      return Err(ExpriError::Message(format!(
+        "asset data is tracked by Git: {}; remove it from Git tracking before pushing source (asset descriptors should be tracked)",
+        path.display()
+      )));
+    }
+  }
+  Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
+  use std::os::unix::ffi::OsStringExt;
+  Ok(std::ffi::OsString::from_vec(bytes.to_vec()).into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn path_from_git(bytes: &[u8]) -> Result<PathBuf> {
+  std::str::from_utf8(bytes)
+    .map(PathBuf::from)
+    .map_err(|error| ExpriError::Message(format!("Git source path is not UTF-8: {error}")))
 }
 
 pub fn ls_files(repo_root: &Path, paths: &[PathBuf]) -> Result<Vec<u8>> {
@@ -253,4 +357,97 @@ fn git_run<const N: usize>(repo_root: &Path, args: [&OsStr; N]) -> Result<()> {
     });
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod asset_tests {
+  use super::*;
+  use std::fs;
+
+  fn repository() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    git_capture(root.path(), ["init", "--quiet"]).unwrap();
+    fs::write(root.path().join("train.py"), "train").unwrap();
+    commit(root.path());
+    root
+  }
+
+  fn commit(root: &Path) {
+    git_capture(root, ["add", "."]).unwrap();
+    git_capture(
+      root,
+      [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.net",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "test",
+      ],
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn source_and_patch_omit_managed_data_even_when_ignored_is_requested() {
+    let root = repository();
+    fs::write(
+      root.path().join(".gitignore"),
+      "data.bin\nignored.expri.toml\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("data.bin"), "heavy").unwrap();
+    fs::write(root.path().join("data.bin.expri.toml"), "descriptor").unwrap();
+    fs::write(root.path().join("ignored.expri.toml"), "ignored descriptor").unwrap();
+    let rules =
+      SyncRules::new(Vec::new(), Vec::new(), vec!["data.bin".into()], Vec::new()).unwrap();
+    let selected = source_paths(root.path(), &rules).unwrap();
+    assert!(!selected.contains(&PathBuf::from("data.bin")));
+    assert!(selected.contains(&PathBuf::from("data.bin.expri.toml")));
+    assert!(!selected.contains(&PathBuf::from("ignored.expri.toml")));
+    let dirty = dirty_paths(root.path(), &rules).unwrap();
+    assert!(!dirty.files.contains(&PathBuf::from("data.bin")));
+    assert!(dirty.files.contains(&PathBuf::from("data.bin.expri.toml")));
+    assert!(reject_tracked_assets(root.path()).is_ok());
+  }
+
+  #[test]
+  fn tracked_asset_bytes_are_rejected_before_git_bundle_creation() {
+    let root = repository();
+    fs::write(root.path().join("data.bin"), "heavy").unwrap();
+    fs::write(root.path().join("data.bin.expri.toml"), "descriptor").unwrap();
+    commit(root.path());
+    fs::write(root.path().join("data.bin"), "changed heavy").unwrap();
+    let dirty = dirty_paths(root.path(), &SyncRules::defaults().unwrap()).unwrap();
+    assert!(dirty.files.is_empty());
+    assert!(
+      reject_tracked_assets(root.path())
+        .unwrap_err()
+        .to_string()
+        .contains("data.bin")
+    );
+    git_capture(root.path(), ["rm", "--cached", "data.bin"]).unwrap();
+    assert!(reject_tracked_assets(root.path()).is_ok());
+  }
+
+  #[test]
+  fn deleted_descriptors_are_source_deletions_and_do_not_require_assets() {
+    let root = repository();
+    fs::write(root.path().join("data.bin.expri.toml"), "descriptor").unwrap();
+    commit(root.path());
+    fs::remove_file(root.path().join("data.bin.expri.toml")).unwrap();
+    let rules = SyncRules::defaults().unwrap();
+    let dirty = dirty_paths(root.path(), &rules).unwrap();
+    assert_eq!(dirty.deleted, [PathBuf::from("data.bin.expri.toml")]);
+    assert!(
+      !source_paths(root.path(), &rules)
+        .unwrap()
+        .iter()
+        .any(|path| is_asset_sidecar(path))
+    );
+  }
 }

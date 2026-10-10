@@ -318,7 +318,7 @@ pub(crate) fn require_run_publishing(
   )
 }
 
-pub(crate) fn require_run_inputs(
+pub(crate) fn require_run_assets(
   remote: &Remote,
   preference: ProtocolPreference,
   node_bin: &str,
@@ -327,9 +327,9 @@ pub(crate) fn require_run_inputs(
     remote,
     preference,
     node_bin,
-    crate::node::cli::RUN_INPUTS_CAPABILITY,
-    "private input preparation",
-    "or download inputs manually and remove service.inputs",
+    crate::node::cli::ASSETS_CAPABILITY,
+    "asset preparation",
+    "or remove asset descriptors from the run source",
   )
 }
 

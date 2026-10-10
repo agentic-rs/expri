@@ -3,7 +3,6 @@ mod browser_assets;
 mod browser_auth;
 mod client;
 mod dashboard_data;
-pub(crate) mod inputs;
 mod notifications;
 pub(crate) mod publishing;
 pub(crate) mod registrations;
@@ -13,6 +12,7 @@ mod store;
 pub(crate) mod types;
 
 pub(crate) use client::fetch_files;
+pub(crate) use client::input_download_prepared;
 pub(crate) use types::validate_component;
 
 use std::net::SocketAddr;

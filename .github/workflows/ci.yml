@@ -100,6 +100,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Verify service workflow progress reporting
+        run: python3 -B tests/containers/workflow_progress_tests.py
+
       - name: Test private inputs, offline runs, resumable checkpoints and local review
         env:
           EXPRI_CONTAINER_ARTIFACTS: ${{ runner.temp }}/expri-service-containers

@@ -64,8 +64,6 @@ pub struct RunServiceConfig {
   pub origin: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub dashboard_url: Option<String>,
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub inputs: Vec<RunInputConfig>,
   #[serde(default = "publish_enabled", skip_serializing_if = "is_enabled")]
   pub publish: bool,
 }
@@ -75,14 +73,6 @@ fn publish_enabled() -> bool {
 }
 fn is_enabled(value: &bool) -> bool {
   *value
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RunInputConfig {
-  pub input_id: String,
-  /// Relative to each run's private input directory.
-  pub destination: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -150,34 +140,6 @@ impl RunServiceConfig {
     for (name, value) in [("project_id", &self.project_id), ("origin", &self.origin)] {
       crate::service::validate_component(value)
         .map_err(|_| ExpriError::Message(format!("invalid service.{name}")))?;
-    }
-    if self.inputs.len() > 64 {
-      return Err(ExpriError::Message(
-        "service.inputs supports at most 64 private input files".into(),
-      ));
-    }
-    let mut destinations = std::collections::BTreeSet::new();
-    for input in &self.inputs {
-      crate::service::validate_component(&input.input_id)?;
-      let path = Path::new(&input.destination);
-      if input.destination.is_empty() || input.destination.len() > 1024
-        || input.destination.contains('\\') || input.destination.chars().any(char::is_control)
-        || input.destination.split('/').any(|part| part.is_empty() || part.starts_with('.'))
-        || path.components().any(|part| !matches!(part, Component::Normal(name) if !name.to_string_lossy().starts_with('.')))
-        || !destinations.insert(&input.destination)
-      {
-        return Err(ExpriError::Message("service.inputs destinations must be distinct relative paths without hidden components or '..'".into()));
-      }
-    }
-    for destination in &destinations {
-      if destinations
-        .iter()
-        .any(|other| other != destination && Path::new(destination).starts_with(other))
-      {
-        return Err(ExpriError::Message(
-          "service.inputs destinations must not overlap".into(),
-        ));
-      }
     }
     if let Some(value) = &self.dashboard_url {
       let url = reqwest::Url::parse(value)
@@ -545,43 +507,25 @@ mod tests {
   use super::*;
 
   #[test]
-  fn private_input_destinations_are_safe_distinct_and_compatible_with_old_requests() {
-    let mut service: RunServiceConfig = toml::from_str(
-      "client_config='/etc/expri/worker.toml'\nproject_id='vision'\norigin='gpu-1'\n",
-    )
-    .unwrap();
+  fn service_rejects_removed_input_configuration() {
+    let raw = "client_config='/etc/expri/worker.toml'\nproject_id='vision'\norigin='gpu-1'\n";
+    let service: RunServiceConfig = toml::from_str(raw).unwrap();
     assert!(service.publish);
-    assert!(service.inputs.is_empty());
-    let old = serde_json::to_value(&service).unwrap();
-    assert!(old.get("inputs").is_none());
-    assert!(old.get("publish").is_none());
-    for path in [
-      "../input",
-      "/private/input",
-      "a//b",
-      "a/./b",
-      "a/../b",
-      ".private",
-      "a\\b",
-      "a\tb",
-      "",
+    assert!(
+      serde_json::to_value(&service)
+        .unwrap()
+        .get("publish")
+        .is_none()
+    );
+    for inputs in [
+      "inputs=[]\n",
+      "[[inputs]]\ninput_id='dataset-v1'\ndestination='train.bin'\n",
     ] {
-      service.inputs = vec![RunInputConfig {
-        input_id: "dataset-v1".into(),
-        destination: path.into(),
-      }];
-      assert!(service.validate().is_err(), "{path:?}");
+      let error = toml::from_str::<RunServiceConfig>(&format!("{raw}{inputs}"))
+        .unwrap_err()
+        .to_string();
+      assert!(error.contains("unknown field `inputs`"), "{error}");
     }
-    service.inputs = vec![RunInputConfig {
-      input_id: "dataset-v1".into(),
-      destination: "train/data.bin".into(),
-    }];
-    assert!(service.validate().is_ok());
-    service.inputs.push(RunInputConfig {
-      input_id: "other".into(),
-      destination: "train".into(),
-    });
-    assert!(service.validate().is_err());
   }
 
   #[test]
@@ -686,7 +630,6 @@ origin = "gpu-2"
       project_id: "vision".into(),
       origin: "gpu-1".into(),
       dashboard_url: None,
-      inputs: Vec::new(),
       publish: true,
     };
     assert!(base.validate().is_ok());

@@ -88,6 +88,18 @@ It checks immutable private inputs, automatic worker input provisioning and
 offline cache reuse, upload recovery, continuous selected checkpoint downloads,
 and offline review without shared project directories or published ports.
 
+The self-hosted workflow reports named phases for image builds, fixture startup,
+transfer recovery, and browser checks. A heartbeat every 20 seconds names the
+active phase and its elapsed time while commands or waits are still running.
+Each phase finishes with a status and duration; the GitHub job summary lists
+these measurements and the total elapsed time. The compact progress log and
+full command logs are retained in `service-workflow-logs`, with credentials and
+signed URL queries redacted. CI checks the reporter before building images and
+starting acceptance tests in the same job. Run those checks locally with
+`python3 -B tests/containers/workflow_progress_tests.py`. They include real runner
+subprocesses with fake command executables to check fixture failures and cleanup;
+these checks require no Docker daemon or network access.
+
 Configured runs start their own native publishers in this suite. Training
 finishes through a service outage; killing and resuming the publisher reuses
 its saved intent and acknowledged stream/upload offsets. Failed and cancelled

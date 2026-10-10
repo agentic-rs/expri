@@ -27,15 +27,14 @@ client_config = "/tmp/worker.toml"
 project_id = "demo"
 origin = "worker"
 dashboard_url = "https://expri.example.net/"
-[[service.inputs]]
-input_id = "dataset-v1"
-destination = "dataset.bin"
 [tasks]
 train = ["python", "train.py"]
 fail = ["python", "-c", "raise SystemExit(7)"]
 wait = ["python", "-c", "import time; print('waiting', flush=True); time.sleep(120)"]
 ''')
 for command in [
+  ['expri', 'assets', 'import', 'expri://proxy:8001/demo/inputs/dataset-v1',
+    'data/dataset.bin', '--repo', str(root), '--client-config', '/tmp/worker.toml', '--json'],
   ['uv', 'lock', '--python', '/usr/local/bin/python3'],
   ['git', 'init', '--quiet'], ['git', 'add', '.'],
   ['git', '-c', 'user.name=Expri CI', '-c', 'user.email=ci@expri.invalid',

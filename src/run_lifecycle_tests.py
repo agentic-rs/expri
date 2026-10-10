@@ -92,6 +92,15 @@ class RunLifecycleTests(unittest.TestCase):
       self.start()
     self.assertFalse((self.repo / ".expri/runs").exists())
 
+  def test_disabled_publishing_preserves_ordinary_python_fallback(self):
+    self.request["service"] = {
+      "project_id": "vision", "origin": "gpu-1", "publish": False,
+      "client_config": "/missing/credentials-are-unused.toml",
+    }
+    self.start()
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "completed", state)
+
   def state(self):
     return json.loads((self.run / "run-state.json").read_text())
 

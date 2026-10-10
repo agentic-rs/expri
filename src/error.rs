@@ -108,7 +108,7 @@ impl Display for ExpriError {
         formatter,
         "selected checkpoint changed; waiting for its registered file record"
       ),
-      Self::DownloadCancelled => write!(formatter, "private input preparation was cancelled"),
+      Self::DownloadCancelled => write!(formatter, "input or asset preparation was cancelled"),
       Self::Message(message) => write!(formatter, "{message}"),
     }
   }

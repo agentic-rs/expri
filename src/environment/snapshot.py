@@ -14,7 +14,7 @@ import tempfile as _snapshot_tempfile
 
 
 _SNAPSHOT_EXCLUDED_DIRS = {
-  ".expri", ".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+  ".expri", ".expri-input-downloads", ".git", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache",
   ".ruff_cache", ".pyre", ".hypothesis", "out", "target", "node_modules",
 }
 
@@ -60,6 +60,14 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
       if expected_identity is None or actual_sync != expected_identity:
         raise RuntimeError("target checkout changed after push; retry run")
     source = _snapshot_select_source(root, remote_managed)
+    if any(
+      name.endswith(".expri.toml") and _snapshot_metadata(root / name) is not None
+      for name in source["paths"]
+    ):
+      raise RuntimeError(
+        "asset preparation requires assets-v1 on a native expri worker; "
+        "upgrade expri on the target and use protocol = \"auto\" or \"expri-node\""
+      )
     runs_dir = state_dir / "runs"
     _snapshot_private_directory(runs_dir)
     run_dir = _snapshot_pathlib.Path(_snapshot_tempfile.mkdtemp(prefix="run-", dir=runs_dir))
@@ -162,7 +170,10 @@ def _snapshot_select_source(root, remote_managed):
     path = _snapshot_validate_path(name)
     if _snapshot_should_include(path):
       paths.add(str(path))
-  source["paths"] = sorted(paths)
+  source["paths"] = sorted(
+    name for name in paths
+    if _snapshot_metadata(root / (name + ".expri.toml")) is None
+  )
   return source
 
 
@@ -177,7 +188,10 @@ def _snapshot_validate_path(name):
 
 
 def _snapshot_should_include(path):
-  return not any(part in _SNAPSHOT_EXCLUDED_DIRS for part in path.parts)
+  return not any(
+    part in _SNAPSHOT_EXCLUDED_DIRS or part.startswith(".expri-asset-")
+    for part in path.parts
+  )
 
 
 def _snapshot_safe_parents(root, relative_path):

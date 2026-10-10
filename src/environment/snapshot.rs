@@ -18,6 +18,7 @@ pub struct RunSnapshot {
   pub run_id: String,
   pub run_dir: PathBuf,
   pub code_dir: PathBuf,
+  pub assets: Vec<crate::assets::Asset>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -137,11 +138,14 @@ pub fn create_expected(
   let manifest_path = run_dir.join("snapshot.json");
   fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
     .map_err(|error| io_context("write", &manifest_path, error))?;
+  // Discover from the copied source selection, never from the live workspace.
+  let assets = crate::assets::discover(&code_dir)?;
   let run_dir = temporary.keep();
   Ok(RunSnapshot {
     run_id,
     run_dir,
     code_dir,
+    assets,
   })
 }
 
@@ -242,14 +246,34 @@ fn select_source(repo_root: &Path, remote_managed: &[String]) -> Result<SourceSe
       paths.insert(path);
     }
   }
+  paths.retain(|path| !crate::git::is_managed_asset(repo_root, path));
   source.paths = paths;
   Ok(source)
 }
 
+pub(crate) fn has_assets(repo_root: &Path, remote_managed: &[String]) -> Result<bool> {
+  let repo_root = fs::canonicalize(repo_root)?;
+  if source_metadata(&repo_root.join(".expri/checkout.manifest"))?.is_none()
+    && !crate::git::is_worktree(&repo_root)?
+  {
+    // Legacy tasks and --no-push controllers need not be source checkouts.
+    return Ok(!crate::assets::discover(&repo_root)?.is_empty());
+  }
+  Ok(
+    select_source(&repo_root, remote_managed)?
+      .paths
+      .iter()
+      .any(|path| {
+        crate::git::is_asset_sidecar(path) && fs::symlink_metadata(repo_root.join(path)).is_ok()
+      }),
+  )
+}
+
 fn should_include(path: &Path) -> bool {
-  !path.components().any(|component| {
-    matches!(component, Component::Normal(name) if name == ".expri" || DEFAULT_EXCLUDED_DIRS.iter().any(|excluded| name == *excluded))
-  })
+  !crate::filter::is_private_source_path(path)
+    && !path.components().any(|component| {
+      matches!(component, Component::Normal(name) if DEFAULT_EXCLUDED_DIRS.iter().any(|excluded| name == *excluded))
+    })
 }
 
 fn validate_source_path(path: &Path) -> Result<()> {
@@ -529,6 +553,171 @@ mod tests {
     fs::create_dir(root.path().join(".expri")).expect("state directory");
     fs::write(root.path().join(".expri/checkout.manifest"), manifest).expect("manifest");
     root
+  }
+
+  fn asset_descriptor(root: &Path, path: &str) {
+    let root = root.canonicalize().unwrap();
+    let sidecar = root.join(format!("{path}.expri.toml"));
+    fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    crate::assets::save(
+      &sidecar,
+      &crate::assets::Descriptor {
+        version: 1,
+        source: crate::assets::Source::Url {
+          url: "https://example.net/data.bin".into(),
+        },
+        size: 3,
+        sha256: digest(b"abc"),
+      },
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn legacy_asset_probe_accepts_directories_without_git_and_detects_descriptors() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+      root.path().join("expri.toml"),
+      "[tasks]\ntrain=['python', 'train.py']\n",
+    )
+    .unwrap();
+    assert!(!has_assets(root.path(), &[]).unwrap());
+    asset_descriptor(root.path(), "data.bin");
+    assert!(has_assets(root.path(), &[]).unwrap());
+  }
+
+  #[test]
+  fn asset_crash_staging_is_excluded_from_snapshots_and_source_patches() {
+    let root = repository();
+    fs::write(root.path().join("train.py"), "train").unwrap();
+    git(root.path(), &["add", "train.py"]);
+    git(
+      root.path(),
+      &[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.net",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "test",
+      ],
+    );
+    fs::write(root.path().join(".gitignore"), ".expri-asset-*/\n").unwrap();
+    let paths = [
+      ".expri-asset-crashed/binding",
+      "data/.expri-asset-crashed/previous-binding",
+      "data/.expri-asset-crashed/bad.bin.expri.toml",
+    ];
+    for path in paths {
+      let absolute = root.path().join(path);
+      fs::create_dir_all(absolute.parent().unwrap()).unwrap();
+      fs::write(absolute, "private asset transfer bytes").unwrap();
+    }
+    let selected = paths
+      .iter()
+      .map(|path| path.to_string())
+      .collect::<Vec<_>>();
+    let native = create(root.path(), &selected).unwrap();
+    let python = python_snapshot(root.path(), &selected).unwrap();
+    let python_code = Path::new(python["code_dir"].as_str().unwrap());
+    for path in paths {
+      assert!(!native.code_dir.join(path).exists());
+      assert!(!python_code.join(path).exists());
+    }
+    assert!(
+      crate::assets::discover(&root.path().canonicalize().unwrap())
+        .unwrap()
+        .is_empty()
+    );
+    let rules =
+      crate::filter::SyncRules::new(Vec::new(), Vec::new(), selected, Vec::new()).unwrap();
+    let dirty = crate::git::dirty_paths(root.path(), &rules).unwrap();
+    assert_eq!(dirty.files, [PathBuf::from(".gitignore")]);
+    assert!(
+      crate::git::source_paths(root.path(), &rules)
+        .unwrap()
+        .iter()
+        .all(|path| !crate::filter::is_private_source_path(path))
+    );
+    git(root.path(), &["add", "--force", paths[0]]);
+    assert!(
+      crate::git::reject_tracked_assets(root.path())
+        .unwrap_err()
+        .to_string()
+        .contains("temporary asset data is tracked")
+    );
+  }
+
+  #[test]
+  fn snapshots_capture_selected_descriptors_without_copying_managed_bytes() {
+    let root = repository();
+    asset_descriptor(root.path(), "data/train.bin");
+    fs::write(root.path().join("data/train.bin"), "heavy managed data").unwrap();
+    git(root.path(), &["add", "."]);
+    let first = create(root.path(), &[]).unwrap();
+    assert!(!first.code_dir.join("data/train.bin").exists());
+    assert_eq!(first.assets.len(), 1);
+    assert_eq!(first.assets[0].path, Path::new("data/train.bin"));
+    fs::write(
+      root.path().join("data/train.bin.expri.toml"),
+      "changed after snapshot",
+    )
+    .unwrap();
+    assert_eq!(first.assets[0].descriptor.sha256, digest(b"abc"));
+    assert_eq!(
+      crate::assets::load(&first.code_dir.join("data/train.bin.expri.toml")).unwrap(),
+      first.assets[0].descriptor
+    );
+  }
+
+  #[test]
+  fn ignored_and_unselected_descriptors_are_not_prepared() {
+    let root = repository();
+    fs::write(root.path().join(".gitignore"), "ignored.bin.expri.toml\n").unwrap();
+    fs::write(
+      root.path().join("ignored.bin.expri.toml"),
+      "malformed ignored descriptor",
+    )
+    .unwrap();
+    fs::write(root.path().join("ignored.bin"), "managed data").unwrap();
+    fs::write(root.path().join("train.py"), "train").unwrap();
+    let snapshot = create(root.path(), &[]).unwrap();
+    assert!(snapshot.assets.is_empty());
+    assert!(!snapshot.code_dir.join("ignored.bin").exists());
+    let python = python_snapshot(root.path(), &[]).unwrap();
+    assert!(
+      !Path::new(python["code_dir"].as_str().unwrap())
+        .join("ignored.bin")
+        .exists()
+    );
+
+    let synced = synced_repository("train.py\ndata.bin\n");
+    fs::write(synced.path().join("train.py"), "train").unwrap();
+    fs::write(synced.path().join("data.bin"), "managed data").unwrap();
+    asset_descriptor(synced.path(), "data.bin");
+    let snapshot = create(synced.path(), &[]).unwrap();
+    assert!(snapshot.assets.is_empty());
+    assert!(!snapshot.code_dir.join("data.bin").exists());
+  }
+
+  #[test]
+  fn python_snapshots_reject_selected_assets_in_git_and_synced_checkouts() {
+    for synced in [false, true] {
+      let root = if synced {
+        synced_repository("data.bin.expri.toml\n")
+      } else {
+        repository()
+      };
+      asset_descriptor(root.path(), "data.bin");
+      let error = python_snapshot(root.path(), &[]).unwrap_err();
+      assert!(error.contains("assets-v1"), "{error}");
+      assert!(error.contains("native expri worker"), "{error}");
+      assert!(!root.path().join(".expri/runs").exists());
+    }
   }
 
   #[test]

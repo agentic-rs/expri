@@ -10,7 +10,7 @@ use crate::protocol::RunQueryRequest;
 use crate::shell;
 
 #[test]
-fn automatic_publishing_never_falls_back_to_an_older_node_or_python() {
+fn automatic_publishing_and_assets_never_fall_back_to_an_older_node_or_python() {
   let fixture = tempfile::tempdir().unwrap();
   let repo = fixture.path().join("repo with spaces");
   fs::create_dir(&repo).unwrap();
@@ -38,7 +38,12 @@ fn automatic_publishing_never_falls_back_to_an_older_node_or_python() {
     true,
   )
   .unwrap();
-  for capability in ["run-records-v1", "durable-runs-v1", "run-publishing-v1"] {
+  for capability in [
+    "run-records-v1",
+    "durable-runs-v1",
+    "run-publishing-v1",
+    "assets-v1",
+  ] {
     fs::write(
       &node,
       format!("#!/bin/sh\n[ \"$2\" = capabilities ] && [ \"$4\" = {capability} ]\n"),
@@ -51,8 +56,14 @@ fn automatic_publishing_never_falls_back_to_an_older_node_or_python() {
       if let Err(error) = result {
         assert!(error.to_string().contains("run-publishing-v1"));
       }
+      let result = super::require_run_assets(&remote, preference, "./expri");
+      assert_eq!(result.is_ok(), capability == "assets-v1");
+      if let Err(error) = result {
+        assert!(error.to_string().contains("assets-v1"));
+      }
     }
   }
+  fs::write(&node, "#!/bin/sh\n[ \"$2\" = capabilities ] && { [ \"$4\" = run-publishing-v1 ] || [ \"$4\" = assets-v1 ]; }\n").unwrap();
   let mut fresh = remote.clone();
   fresh.remote_dir = fixture
     .path()
@@ -60,6 +71,7 @@ fn automatic_publishing_never_falls_back_to_an_older_node_or_python() {
     .to_string_lossy()
     .into();
   super::require_run_publishing(&fresh, ProtocolPreference::Auto, node.to_str().unwrap()).unwrap();
+  super::require_run_assets(&fresh, ProtocolPreference::Auto, node.to_str().unwrap()).unwrap();
   assert!(!std::path::Path::new(&fresh.remote_dir).exists());
   let blocked = fixture.path().join("not-a-directory");
   fs::write(&blocked, b"file").unwrap();
@@ -71,6 +83,9 @@ fn automatic_publishing_never_falls_back_to_an_older_node_or_python() {
   fs::remove_file(node).unwrap();
   let error = super::require_run_publishing(&remote, ProtocolPreference::Python, "/missing-node")
     .unwrap_err();
+  assert!(error.to_string().contains("native expri worker"));
+  let error =
+    super::require_run_assets(&remote, ProtocolPreference::Python, "/missing-node").unwrap_err();
   assert!(error.to_string().contains("native expri worker"));
 }
 

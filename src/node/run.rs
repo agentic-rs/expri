@@ -23,13 +23,14 @@ pub fn apply_request(request: &RunRequest) -> Result<()> {
 }
 
 pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
+  let repo_root = fs::canonicalize(repo_root)?;
   request.environment.validate()?;
   if let Some(service) = &request.service {
     service.validate()?;
   }
   environment::task_argv(&request.command)?;
   let snapshot = environment::snapshot::create_expected(
-    repo_root,
+    &repo_root,
     &request.remote_managed,
     request.expected_sync.as_ref(),
   )?;
@@ -45,6 +46,12 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
     "detached": request.detach,
     "started_at": chrono::Utc::now().to_rfc3339(),
     "logs": {"stdout": STDOUT_LOG, "stderr": STDERR_LOG},
+    "assets": snapshot.assets.iter().map(|asset| json!({
+      "path": asset.path,
+      "source": asset.descriptor.source,
+      "size": asset.descriptor.size,
+      "sha256": asset.descriptor.sha256,
+    })).collect::<Vec<_>>(),
   });
   write_state(&state_path, &state)?;
   let _ = writeln!(std::io::stderr(), "run: {}", snapshot.run_id);
@@ -64,10 +71,10 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
     );
   }
   if request.detach {
-    return start_detached(request, repo_root, &snapshot, &mut state);
+    return start_detached(request, &repo_root, &snapshot, &mut state);
   }
   let _run_lock = crate::lock::run_lock(&snapshot.run_dir)?;
-  execute_snapshot(request, repo_root, &snapshot, state, false)
+  execute_snapshot(request, &repo_root, &snapshot, state, false)
 }
 
 fn execute_snapshot(
@@ -109,23 +116,19 @@ fn execute_snapshot(
         "run cancellation requested".to_string(),
       ));
     }
-    let private_inputs = request
-      .service
-      .as_ref()
-      .map(|service| {
-        crate::service::inputs::prepare(repo_root, &snapshot.run_dir, service, &mut || {
-          let requested = logs.cancel_requested()?;
-          cancelled |= requested;
-          Ok(requested)
-        })
-      })
-      .transpose()?
-      .flatten();
-    if let Some((directory, inputs)) = &private_inputs {
-      state["input_dir"] = json!(directory);
-      state["inputs"] = json!(inputs);
-      write_state(&state_path, &state)?;
-    }
+    prepare_assets(
+      repo_root,
+      snapshot,
+      request
+        .service
+        .as_ref()
+        .map(|service| service.client_config.as_path()),
+      &mut || {
+        let requested = logs.cancel_requested()?;
+        cancelled |= requested;
+        Ok(requested)
+      },
+    )?;
     if logs.cancel_requested()? {
       cancelled = true;
       return Err(ExpriError::Message("run cancellation requested".into()));
@@ -167,11 +170,7 @@ fn execute_snapshot(
       .env("EXPRI_RUN_ID", &snapshot.run_id)
       .env("EXPRI_RUN_DIR", &snapshot.run_dir)
       .env("EXPRI_OUTPUT_DIR", snapshot.run_dir.join("outputs"));
-    if let Some((directory, _)) = &private_inputs {
-      command.env("EXPRI_INPUT_DIR", directory);
-    } else {
-      command.env_remove("EXPRI_INPUT_DIR");
-    }
+    command.env_remove("EXPRI_INPUT_DIR");
     let output = logs.task(&mut command)?;
     state["task_exit_code"] = json!(command_exit_code(&output.status));
     if let Some(error) = &output.log_error {
@@ -225,6 +224,28 @@ fn execute_snapshot(
   result
 }
 
+fn prepare_assets(
+  repo_root: &Path,
+  snapshot: &RunSnapshot,
+  client_config: Option<&Path>,
+  cancel: &mut dyn FnMut() -> Result<bool>,
+) -> Result<()> {
+  for asset in &snapshot.assets {
+    if cancel()? {
+      return Err(ExpriError::Message("run cancellation requested".into()));
+    }
+    let cached =
+      crate::assets::download::ensure(repo_root, &asset.descriptor, client_config, cancel)?;
+    crate::assets::bind_verified(
+      &cached,
+      &snapshot.code_dir.join(&asset.path),
+      &asset.descriptor,
+      cancel,
+    )?;
+  }
+  Ok(())
+}
+
 fn regular_cancel_request(run_dir: &Path) -> Result<bool> {
   match fs::symlink_metadata(run_dir.join(".cancel-request")) {
     Ok(metadata)
@@ -241,8 +262,15 @@ fn regular_cancel_request(run_dir: &Path) -> Result<bool> {
 }
 
 fn write_state(path: &Path, state: &serde_json::Value) -> Result<()> {
+  let bytes = serde_json::to_vec_pretty(state)?;
+  // Jobs, dashboard discovery, and detached launch receipts use this same limit.
+  if bytes.len() > 256 * 1024 {
+    return Err(ExpriError::Message(
+      "run-state.json exceeds the 256 KiB metadata size limit; reduce command or asset source metadata".into(),
+    ));
+  }
   let mut temporary = tempfile::NamedTempFile::new_in(path.parent().expect("state directory"))?;
-  serde_json::to_writer_pretty(&mut temporary, state)?;
+  temporary.write_all(&bytes)?;
   temporary.persist(path).map_err(|error| error.error)?;
   Ok(())
 }
@@ -394,6 +422,7 @@ pub fn worker(run_dir: &Path) -> Result<()> {
     run_id: run_id.to_string(),
     code_dir: run_dir.join("code"),
     run_dir: run_dir.clone(),
+    assets: crate::assets::discover(&run_dir.join("code"))?,
   };
   execute_snapshot(&request, repo_root, &snapshot, state, true)
 }
@@ -427,4 +456,115 @@ fn read_record(path: &Path, limit: u64) -> Result<serde_json::Value> {
     ));
   }
   Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::assets::{Descriptor, Source};
+
+  fn asset_repository() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+      Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root.path())
+        .status()
+        .unwrap()
+        .success()
+    );
+    root
+  }
+
+  fn cached_asset(root: &Path, bytes: &[u8]) -> Descriptor {
+    let root = &root.canonicalize().unwrap();
+    let temporary = root.join("hash-source");
+    fs::write(&temporary, bytes).unwrap();
+    let (sha256, size) = crate::archive::sha256_file(&temporary).unwrap();
+    fs::remove_file(temporary).unwrap();
+    let descriptor = Descriptor {
+      version: 1,
+      source: Source::Url {
+        url: "https://unavailable.invalid/data.bin".into(),
+      },
+      size,
+      sha256,
+    };
+    let cache = crate::assets::cache_file(root, &descriptor.sha256);
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::write(cache, bytes).unwrap();
+    crate::assets::save(&root.join("data/train.bin.expri.toml"), &descriptor).unwrap();
+    descriptor
+  }
+
+  #[test]
+  fn preparation_uses_snapshot_descriptor_and_pins_old_cache_bytes() {
+    let root = asset_repository();
+    let first_descriptor = cached_asset(root.path(), b"first");
+    let first = environment::snapshot::create(root.path(), &[]).unwrap();
+    let second_descriptor = cached_asset(root.path(), b"second");
+    let second = environment::snapshot::create(root.path(), &[]).unwrap();
+    let canonical = root.path().canonicalize().unwrap();
+    prepare_assets(&canonical, &first, None, &mut || Ok(false)).unwrap();
+    prepare_assets(&canonical, &second, None, &mut || Ok(false)).unwrap();
+    assert_eq!(first.assets[0].descriptor, first_descriptor);
+    assert_eq!(second.assets[0].descriptor, second_descriptor);
+    assert_eq!(
+      fs::read(first.code_dir.join("data/train.bin")).unwrap(),
+      b"first"
+    );
+    assert_eq!(
+      fs::read(second.code_dir.join("data/train.bin")).unwrap(),
+      b"second"
+    );
+    let cache = crate::assets::cache_file(root.path(), &first_descriptor.sha256);
+    let mut replacement = tempfile::NamedTempFile::new_in(cache.parent().unwrap()).unwrap();
+    replacement.write_all(b"later").unwrap();
+    replacement.persist(&cache).unwrap();
+    assert_eq!(
+      fs::read(first.code_dir.join("data/train.bin")).unwrap(),
+      b"first"
+    );
+    assert!(
+      fs::metadata(first.code_dir.join("data/train.bin"))
+        .unwrap()
+        .permissions()
+        .readonly()
+    );
+  }
+
+  #[test]
+  fn cancellation_prevents_asset_binding_before_environment_preparation() {
+    let root = asset_repository();
+    cached_asset(root.path(), b"data");
+    let snapshot = environment::snapshot::create(root.path(), &[]).unwrap();
+    let error = prepare_assets(
+      &root.path().canonicalize().unwrap(),
+      &snapshot,
+      None,
+      &mut || Ok(true),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("cancellation"), "{error}");
+    assert!(!snapshot.code_dir.join("data/train.bin").exists());
+    assert!(!snapshot.run_dir.join(".venv").exists());
+  }
+
+  #[test]
+  fn oversized_provenance_is_rejected_before_publishing_a_run_state() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("run-state.json");
+    let state = json!({"assets": [{"source": {"url": "x".repeat(256 * 1024)}}]});
+    assert!(
+      write_state(&path, &state)
+        .unwrap_err()
+        .to_string()
+        .contains("metadata size limit")
+    );
+    assert!(!path.exists());
+    fs::write(&path, "original").unwrap();
+    assert!(write_state(&path, &state).is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), "original");
+  }
 }
