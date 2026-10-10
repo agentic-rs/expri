@@ -521,7 +521,7 @@ fn project_detail_logs_artifacts_comparisons_and_charts_resolve_full_scopes() {
     );
     assert!(
       dashboard
-        .archive_download("hosted-project:project", key)
+        .result_zip_download("hosted-project:project", key)
         .is_err(),
       "{key}"
     );
@@ -703,7 +703,7 @@ fn archived(fixture: &Fixture, scope: &RunScope) {
 }
 
 #[test]
-fn project_archive_links_and_downloads_resolve_the_selected_machine_scope() {
+fn project_result_upload_links_and_downloads_resolve_the_selected_machine_scope() {
   let fixture = Fixture::new();
   let a = run(&fixture, "project", "worker-a", "shared", 10.);
   let b = run(&fixture, "project", "worker-b", "shared", 2.);
@@ -716,6 +716,9 @@ fn project_archive_links_and_downloads_resolve_the_selected_machine_scope() {
     let key = format!("{origin}:shared");
     let detail = dashboard.detail("hosted-project:project", &key).unwrap();
     assert_eq!(detail["archive"]["status"], "archived");
+    assert_eq!(detail["result_upload"]["status"], "uploaded");
+    assert_eq!(detail["result_upload"]["file"], detail["archive"]["file"]);
+    assert_eq!(detail["result_upload"]["incomplete"], true);
     assert_eq!(
       detail["archive"]["file"]["target"]["scope"]["origin"],
       origin
@@ -726,8 +729,17 @@ fn project_archive_links_and_downloads_resolve_the_selected_machine_scope() {
         .unwrap()
         .contains(&format!("run_id={origin}%3Ashared"))
     );
+    assert!(
+      detail["archive"]["download_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("/api/archive?")
+    );
+    let result_url = detail["result_upload"]["download_url"].as_str().unwrap();
+    assert!(result_url.starts_with("/api/result-zip?"));
+    assert!(result_url.contains(&format!("run_id={origin}%3Ashared")));
     let Download::Cloud { url, .. } = dashboard
-      .archive_download("hosted-project:project", &key)
+      .result_zip_download("hosted-project:project", &key)
       .unwrap()
     else {
       panic!("cloud archive expected")
@@ -737,16 +749,53 @@ fn project_archive_links_and_downloads_resolve_the_selected_machine_scope() {
   }
   assert!(
     dashboard
-      .archive_download("hosted-project:unknown", "worker-a:shared")
+      .result_zip_download("hosted-project:unknown", "worker-a:shared")
       .is_err()
   );
   let Download::Cloud { url, .. } = dashboard
-    .archive_download("hosted:project:worker-a", "shared")
+    .result_zip_download("hosted:project:worker-a", "shared")
     .unwrap()
   else {
     panic!("legacy archive expected")
   };
   assert!(url.contains("projects/project/runs/worker-a/shared/"));
+}
+
+#[test]
+fn result_upload_detail_exposes_progress_alongside_legacy_archive_status() {
+  let fixture = Fixture::new();
+  let scope = run(&fixture, "project", "worker", "run", 1.);
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let detail = dashboard
+    .detail("hosted-project:project", "worker:run")
+    .unwrap();
+  assert_eq!(detail["result_upload"]["status"], "none");
+  assert_eq!(detail["result_upload"]["download_url"], Value::Null);
+  archived(&fixture, &scope);
+  let db = rusqlite::Connection::open(fixture._directory.path().join("metadata.sqlite3")).unwrap();
+  for status in ["pending", "uploading", "failed"] {
+    db.execute(
+      "UPDATE result_archives SET status=?1,last_error=?2 WHERE scope=?3",
+      rusqlite::params![
+        status,
+        "Upload was interrupted",
+        serde_json::to_string(&scope).unwrap()
+      ],
+    )
+    .unwrap();
+    let detail = dashboard
+      .detail("hosted-project:project", "worker:run")
+      .unwrap();
+    assert_eq!(detail["result_upload"]["status"], status);
+    assert_eq!(detail["archive"]["status"], status);
+    assert_eq!(
+      detail["result_upload"]["last_error"],
+      "Upload was interrupted"
+    );
+    assert_eq!(detail["result_upload"]["download_url"], Value::Null);
+    assert_eq!(detail["archive"]["download_url"], Value::Null);
+    assert_eq!(detail["run"]["status"], "completed");
+  }
 }
 
 #[test]

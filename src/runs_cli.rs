@@ -18,8 +18,9 @@ enum RunsSubcommand {
   List(RunsListCommand),
   /// Inspect a run's status, provenance, and environment record.
   Show(RunsShowCommand),
-  /// Download remote metadata and logs, with optional artifacts.
-  Pull(RunsPullCommand),
+  /// Fetch metadata and logs directly from a worker, with optional artifacts.
+  #[command(alias = "pull")]
+  Fetch(RunsFetchCommand),
   /// Check recorded status and detached supervisor liveness.
   Status(RunsJobCommand),
   /// Read saved stdout or stderr, optionally following a running task.
@@ -77,7 +78,7 @@ struct RunsLogsCommand {
 struct RunsListCommand {
   #[command(flatten)]
   options: RunsArgs,
-  /// Inspect previously pulled records without contacting the target.
+  /// Inspect previously fetched records without contacting the target.
   #[arg(long)]
   cached: bool,
   #[arg(long)]
@@ -98,7 +99,7 @@ struct RunsShowCommand {
 }
 
 #[derive(Debug, Args)]
-struct RunsPullCommand {
+struct RunsFetchCommand {
   #[command(flatten)]
   options: RunsArgs,
   run_id: String,
@@ -108,7 +109,7 @@ struct RunsPullCommand {
   /// Include the entire outputs/ directory.
   #[arg(long)]
   outputs: bool,
-  /// Pull metrics and parameters with metadata, without logs or checkpoints.
+  /// Fetch metrics and parameters with metadata, without logs or checkpoints.
   #[arg(long)]
   metrics: bool,
   /// Inspect the remote selection and preview its download without writing locally.
@@ -181,10 +182,10 @@ pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: boo
       },
       false,
     ),
-    RunsSubcommand::Pull(mut command) => {
+    RunsSubcommand::Fetch(mut command) => {
       if target.is_none() {
         return Err(ExpriError::Message(
-          "runs pull requires --target (-T)".to_string(),
+          "runs fetch requires --target (-T); use expri fetch for service results".to_string(),
         ));
       }
       if command.outputs {
@@ -304,11 +305,11 @@ fn print_service_sync(report: &serde_json::Value) {
   let status = sync["status"].as_str().unwrap_or("unknown");
   let active = sync["worker_active"].as_bool().unwrap_or(false);
   println!(
-    "Service sync: {status} (publisher {})",
+    "Publishing: {status} (publisher {})",
     if active { "active" } else { "stopped" }
   );
   if let Some(detail) = sync["last_error"].as_str() {
-    println!("Service sync detail: {detail}");
+    println!("Publishing detail: {detail}");
   }
   if let Some(url) = sync["dashboard_url"].as_str() {
     println!("Dashboard: {url}");
@@ -404,9 +405,9 @@ fn print_runs_report(report: &serde_json::Value, request: &protocol::RunQueryReq
       println!(
         "{} {} to {}",
         if report["dry_run"] == true {
-          "Would pull"
+          "Would fetch"
         } else {
-          "Pulled"
+          "Fetched"
         },
         field(report, "run_id"),
         field(report, "destination")
@@ -446,6 +447,42 @@ mod tests {
   use crate::{Cli, Command};
 
   #[test]
+  fn worker_fetch_keeps_pull_as_hidden_compatibility_alias() {
+    use clap::CommandFactory;
+    for name in ["fetch", "pull"] {
+      let cli = Cli::try_parse_from([
+        "expri",
+        "-T",
+        "gpu",
+        "runs",
+        name,
+        "run-123",
+        "--metrics",
+        "--dry-run",
+      ])
+      .unwrap();
+      assert!(matches!(
+        cli.command,
+        Command::Runs(RunsCommand {
+          command: RunsSubcommand::Fetch(RunsFetchCommand {
+            metrics: true,
+            dry_run: true,
+            ..
+          })
+        })
+      ));
+    }
+    let mut command = Cli::command();
+    let help = command
+      .find_subcommand_mut("runs")
+      .unwrap()
+      .render_help()
+      .to_string();
+    assert!(help.contains("fetch"));
+    assert!(!help.contains("\n  pull "));
+  }
+
+  #[test]
   fn run_queries_keep_filters_cache_and_artifacts_separate() {
     let cli = Cli::try_parse_from([
       "expri", "-T", "gpu", "runs", "list", "--cached", "--task", "train", "--status", "failed",
@@ -479,10 +516,10 @@ mod tests {
     ])
     .unwrap();
     let Command::Runs(RunsCommand {
-      command: RunsSubcommand::Pull(command),
+      command: RunsSubcommand::Fetch(command),
     }) = cli.command
     else {
-      panic!("expected runs pull");
+      panic!("expected runs fetch");
     };
     assert_eq!(
       command.artifact,
@@ -511,10 +548,10 @@ mod tests {
     ])
     .unwrap();
     let Command::Runs(RunsCommand {
-      command: RunsSubcommand::Pull(command),
+      command: RunsSubcommand::Fetch(command),
     }) = cli.command
     else {
-      panic!("expected runs pull");
+      panic!("expected runs fetch");
     };
     assert!(command.metrics && command.outputs && command.dry_run);
     assert_eq!(command.artifact, ["code/out/evaluation.json"]);

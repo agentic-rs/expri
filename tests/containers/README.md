@@ -59,16 +59,16 @@ invoking machine.
 | `dependency-mismatch` | Matching Torch, CUDA runtime `12.8.91` | Doctor identifies the transitive lock mismatch; preparation fails before task execution |
 | `cuda-unavailable` | Matching graph, fake CUDA availability disabled | CUDA-required preparation fails; the same stack succeeds when CUDA is optional |
 
-The matching cases check sync, doctor, detached success and failure runs, exit
+The matching cases check source push, doctor, detached success and failure runs, exit
 codes, working directories inside code snapshots, separate run environments and
 a shared uv cache. They check that lightweight dependencies load from the
 overlay while Torch and the inherited `torchrun` use the worker base packages.
-Changing and syncing source preserves the earlier snapshot. Pruning removes
+Changing and pushing source preserves the earlier snapshot. Pruning removes
 finished environments while preserving outputs and an active environment;
 cancelling that active run reaches a terminal state. Host and worker base
 package inventories remain unchanged by the workflow.
 
-Selective pulls retrieve logs, parameters and metrics while leaving checkpoints
+Selective fetches retrieve logs, parameters and metrics while leaving checkpoints
 and environments on the worker. After removing target configuration, cached CLI
 inspection and comparison still work. Dashboard HTTP responses agree with the
 cached records, parameters, log tails and metric reductions; chart responses
@@ -93,7 +93,7 @@ finishes through a service outage; killing and resuming the publisher reuses
 its saved intent and acknowledged stream/upload offsets. Failed and cancelled
 runs also reach `synced`, with their original task status preserved in hosted
 review. A small finalized checkpoint registered with `best` and `latest` labels
-uploads during training; a laptop watcher configured for `best` commits its
+uploads during training; an `expri fetch --watch` laptop watcher configured for `best` commits its
 verified download receipt while the run is still active. The separate 17 MiB
 unregistered checkpoint remains absent until explicitly selected and retains
 the multipart recovery and interrupted range-download checks.
@@ -148,7 +148,7 @@ verifies project-scoped search and browser attachment links, and confirms that
 worker-only checkpoints do not appear as completed cloud objects. It reuses the
 published input and checkpoint fixtures and captures `workspace-storage.png`.
 The transfer acceptance
-kills a CLI pull after the first durable 8 MiB range, then reruns the same command
+kills a CLI fetch after the first durable 8 MiB range, then reruns the same command
 and verifies that the saved prefix is reused while prior cache files stay intact.
 
 The live-update check republishes new samples, metadata and logs from the

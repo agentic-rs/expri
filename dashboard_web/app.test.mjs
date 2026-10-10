@@ -241,7 +241,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
       const run = runs.find(item => runIdentity(item) === query.get("run_id"));
       if (!run) return response({ error: "Run not found" }, 404);
-      return response({ ...detailRecord(source, run, model.metric_value), archive: model.archive });
+      return response({ ...detailRecord(source, run, model.metric_value), result_upload: model.result_upload, archive: model.archive });
     }
     if (parsed.pathname === "/api/artifacts") {
       const selected_run = runs.find(run => runIdentity(run) === query.get("run_id"));
@@ -654,10 +654,10 @@ test("a tab change during Refresh does not strand an unfinished initial run revi
   assert.equal(model.requests.some(url => url.startsWith("/api/log")), false);
 });
 
-test("empty hosted catalog refreshes into synced runs with opaque source IDs and 20-row pagination", async t => {
+test("empty hosted catalog refreshes into published runs with opaque source IDs and 20-row pagination", async t => {
   const nodes = dashboard(t);
   const source = { source_id: "opaque&?/#λ", label: "Vision / gpu-1", kind: "service", target_name: null };
-  let catalog = { project_name: "Synced experiments", sources: [], initial_source: "", warnings: [], access_mode: "hosted" };
+  let catalog = { project_name: "Hosted experiments", sources: [], initial_source: "", warnings: [], access_mode: "hosted" };
   const requests = [];
   globalThis.fetch = async url => {
     requests.push(url);
@@ -671,11 +671,11 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
     return response({ source, runs, warnings: [], total_count: 60, offset, next_offset: offset < 40 ? offset + 20 : null });
   };
   await mountDashboard(nodes);
-  await settled(() => nodes.get("run-count").textContent === "No synced runs yet");
+  await settled(() => nodes.get("run-count").textContent === "No published runs yet");
   assert.deepEqual(requests, ["/api/catalog", "/api/projects"], "empty catalog must not request an invalid source");
   assert.equal(nodes.get("logout-form").hidden, false);
   assert.equal(nodes.get("source-select").disabled, true);
-  assert.match(text(nodes.get("list-empty")), /No synced runs yet/);
+  assert.match(text(nodes.get("list-empty")), /No published runs yet.*Publish results from a worker.*Set up result publishing/);
   const guide = Array.from(nodes.get("list-empty").children).at(-1).children[0];
   assert.match(guide.href, /github\.com\/agentic-rs\/expri\/.*self-hosted-service\.md$/);
   await settled(() => nodes.get("refresh-button").disabled === false);
@@ -685,8 +685,9 @@ test("empty hosted catalog refreshes into synced runs with opaque source IDs and
   assert.equal(nodes.get("source-select").value, source.source_id);
   assert.equal(nodes.get("source-select").disabled, false);
   assert.equal(nodes.get("search-input").disabled, false);
-  assert.equal(nodes.get("source-select").children[0].textContent, "Vision / gpu-1 · Synced");
-  assert.match(nodes.get("source-note").textContent, /^Synced results/);
+  assert.equal(nodes.get("source-select").children[0].textContent, "Vision / gpu-1 · Published");
+  assert.match(nodes.get("source-note").textContent, /^Published results.*workers publish their recorded files/);
+  assert.equal(nodes.get("dashboard-kind").textContent, "expri · Hosted experiment review");
   assert.match(text(nodes.get("catalog-warnings")), /limited to 500 runs/);
   await emit(nodes.get("next-page"), "click");
   await settled(() => nodes.get("page-label").textContent === "Page 2");
@@ -718,7 +719,8 @@ test("local catalogs retain cached labels, 100-row pages, and no logout control"
   assert.equal(nodes.get("logout-form").hidden, true);
   assert.equal(nodes.get("source-select").children[0].textContent, source.label);
   assert.match(nodes.get("source-note").textContent, /^Cached remote results/);
-  assert.match(text(nodes.get("list-empty")), /expri runs pull/);
+  assert.match(text(nodes.get("list-empty")), /expri runs fetch/);
+  assert.equal(text(nodes.get("list-empty")).includes("Publish results"), false);
   assert.equal(nodes.get("dashboard-kind").textContent, "expri · Local experiment review");
 });
 
@@ -1501,10 +1503,10 @@ test("file selection shows explicit native links and a copyable cloud-only resum
   assert.equal(model.nodes.get("selected-file-downloads").querySelectorAll("a").length, 2);
   assert.match(model.nodes.get("selected-file-downloads").textContent, /Browsers may restrict multiple downloads/);
   assert.equal(model.requests.length, requests, "checkpoint bytes are never fetched into JavaScript");
-  assert.equal(model.nodes.document.getElementById("artifact-pull-command"), null);
+  assert.equal(model.nodes.document.getElementById("artifact-fetch-command"), null);
   const input = model.nodes.get("artifact-config-path"); setValue(input, "/private/client's $HOME.toml"); await emit(input, "input");
-  const command = model.nodes.get("artifact-pull-command");
-  assert.match(command.value, /^expri service pull/); assert.equal(command.value.includes("outputs/local.pt"), false);
+  const command = model.nodes.get("artifact-fetch-command");
+  assert.match(command.value, /^expri service fetch/); assert.equal(command.value.includes("outputs/local.pt"), false);
   assert.match(model.nodes.get("review-panel-files").textContent, /Metadata, parameters, metrics, and logs are included automatically/);
   await click(model.nodes.get("copy-artifact-command"));
   assert.equal(model.nodes.document.activeElement, command, "insecure local browsers fall back to selecting the command");
@@ -1557,11 +1559,11 @@ test("cached cloud-only files remain selectable for the CLI while private invent
   await filesView(model);
   assert.equal(model.nodes.get("file-rows").children.length, 1);
   const row = fileRow(model.nodes, "outputs/remote.pt"), checkbox = fileCheckbox(model.nodes, "outputs/remote.pt");
-  assert.equal(checkbox.disabled, false); assert.equal(row.querySelector("a"), null); assert.match(row.textContent, /Pull with CLI/);
+  assert.equal(checkbox.disabled, false); assert.equal(row.querySelector("a"), null); assert.match(row.textContent, /Fetch with CLI/);
   await click(checkbox);
   assert.equal(model.nodes.get("download-selected-files").disabled, true, "a cloud-only cache cannot offer a browser download");
   const config = model.nodes.get("artifact-config-path"); setValue(config, "/private/owner.toml"); await emit(config, "input");
-  assert.match(model.nodes.get("artifact-pull-command").value, /--artifact 'outputs\/remote.pt'/);
+  assert.match(model.nodes.get("artifact-fetch-command").value, /--artifact 'outputs\/remote.pt'/);
   await click(model.nodes.get("refresh-files")); await settled(() => model.nodes.get("refresh-files").disabled === false);
   assert.equal(fileCheckbox(model.nodes, "outputs/remote.pt").checked, true, "refresh keeps valid CLI-only selections");
   await click([...model.nodes.get("review-panel-files").querySelectorAll("button")].find(node => node.textContent === "Clear file selection"));
@@ -1688,29 +1690,53 @@ test("live connections close while hidden offline disabled and disposed and reop
   await act(async () => { model.nodes.cleanup(); model.nodes.cleanup(); await microtasks(); }); assert.equal(stream.closed, 1);
 });
 
-test("archive state is separate from training and downloads only archived scoped snapshots", async t => {
+test("legacy result upload state preserves old-backend downloads and training status", async t => {
   const model = await autoFixture(t); await inspect(model);
-  assert.equal(model.nodes.document.getElementById("archive-summary"), null, "legacy records may omit archives");
+  assert.equal(model.nodes.document.getElementById("result-upload-summary"), null, "legacy records may omit archives");
   for (const status of ["none", "pending", "uploading", "failed"]) {
     model.model.archive = { status, incomplete: status === "failed", last_error: status === "failed" ? "Some output files were unavailable <script>" : null };
     await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
-    assert.equal(model.nodes.document.getElementById("download-archive"), null);
-    assert.equal(model.nodes.get("archive-summary").classList.contains("error"), false);
+    assert.equal(model.nodes.document.getElementById("download-result-zip"), null);
+    assert.equal(model.nodes.get("result-upload-summary").classList.contains("error"), false);
     assert.equal(model.nodes.get("run-detail").textContent.includes("completed"), true, "archive progress does not change training status");
   }
-  assert.match(model.nodes.get("archive-summary").textContent, /Partial archive.*Archive issue: Some output files were unavailable <script>/);
-  assert.equal(model.nodes.get("archive-summary").querySelector("script"), null);
+  assert.match(model.nodes.get("result-upload-summary").textContent, /Partial result.*Upload issue: Some output files were unavailable <script>/);
+  assert.equal(model.nodes.get("result-upload-summary").querySelector("script"), null);
   model.model.archive = { status: "archived", incomplete: true, file: { target: { kind: "run", scope: { project_id: "project", origin: "worker", run_id: "run-0" }, path: "result.zip" }, size: 1024, sha256: null, storage: "object" } };
   await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
-  const anchor = model.nodes.get("download-archive"), query = new URL(anchor.href).searchParams;
-  assert.match(anchor.textContent, /Download archive \(1 KiB\)/); assert.equal(query.get("source"), model.sources[0].source_id); assert.equal(query.get("run_id"), "run-0"); assert.equal(anchor.getAttribute("download"), "");
+  const anchor = model.nodes.get("download-result-zip"), url = new URL(anchor.href), query = url.searchParams;
+  assert.equal(url.pathname, "/api/archive", "legacy-only backends retain their protected endpoint");
+  assert.match(anchor.textContent, /Download result.zip \(1 KiB\)/); assert.equal(query.get("source"), model.sources[0].source_id); assert.equal(query.get("run_id"), "run-0"); assert.equal(anchor.getAttribute("download"), "");
   const requests = model.requests.length; await click(model.nodes.get("review-tab-logs")); await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
-  assert.equal(model.nodes.get("download-archive"), anchor); assert.equal(model.requests.slice(requests).some(url => url.startsWith("/api/archive")), false, "archive bytes stay out of JavaScript");
+  assert.equal(model.nodes.get("download-result-zip"), anchor); assert.equal(model.requests.slice(requests).some(url => url.startsWith("/api/archive")), false, "archive bytes stay out of JavaScript");
   await selectRow(model.nodes, 0); await selectRow(model.nodes, 1); await settled(() => model.nodes.get("review-title").textContent.includes("runs"));
-  assert.equal(model.nodes.document.getElementById("archive-summary"), null, "comparisons do not expose one run's archive");
+  assert.equal(model.nodes.document.getElementById("result-upload-summary"), null, "comparisons do not expose one run's archive");
 });
 
-test("archive metadata hints update the badge during Logs without fetching metric-only detail", async t => {
+test("canonical result upload state takes priority and downloads result ZIPs through the protected route", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.archive = { status: "archived", incomplete: true };
+  for (const [status, label] of [["none", "No result upload"], ["pending", "Result upload pending"], ["uploading", "Uploading result"], ["failed", "Result upload failed"]]) {
+    model.model.result_upload = { status, incomplete: false, last_error: status === "failed" ? "Could not upload <script>" : null };
+    await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
+    assert.equal(model.nodes.get("result-upload-status").textContent, label);
+    assert.equal(model.nodes.document.getElementById("download-result-zip"), null, "legacy success cannot override canonical pending or failed progress");
+    assert.equal(model.nodes.get("result-upload-summary").textContent.includes("Partial result"), false);
+  }
+  assert.match(model.nodes.get("result-upload-summary").textContent, /Upload issue: Could not upload <script>/);
+  assert.equal(model.nodes.get("result-upload-summary").querySelector("script"), null);
+  model.model.result_upload = { status: "uploaded", incomplete: true, file: { size: 1024 } };
+  await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
+  const anchor = model.nodes.get("download-result-zip"), url = new URL(anchor.href);
+  assert.equal(url.pathname, "/api/result-zip");
+  assert.equal(url.searchParams.get("source"), model.sources[0].source_id);
+  assert.equal(url.searchParams.get("run_id"), "run-0");
+  assert.match(anchor.textContent, /Download result\.zip \(1 KiB\)/);
+  assert.match(model.nodes.get("result-upload-summary").textContent, /Result uploaded.*Partial result/);
+  assert.equal(model.nodes.get("run-detail").textContent.includes("completed"), true);
+});
+
+test("result upload metadata hints update the badge during Logs without fetching metric-only detail", async t => {
   const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create });
   model.model.archive = { status: "pending", incomplete: false }; await inspect(model); await click(model.nodes.get("review-tab-logs"));
   await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
@@ -1722,7 +1748,7 @@ test("archive metadata hints update the badge during Logs without fetching metri
   await stream.emit("updates", '{"catalog_revision":"21"}'); await model.clock.advance(0);
   const next = requestCounts(model.requests);
   assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"]); assert.equal(next["/api/log"], counts["/api/log"]);
-  assert.match(model.nodes.get("archive-summary").textContent, /Archived.*Partial archive.*Download archive/);
+  assert.match(model.nodes.get("result-upload-summary").textContent, /Result uploaded.*Partial result.*Download result.zip/);
   assert.equal(model.nodes.get("review-tab-logs").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("log-output"), log); assert.equal(log.scrollTop, 24);
 });
 
@@ -1922,9 +1948,9 @@ test("project browsing selects projects and preserves duplicate run IDs across r
   assert.ok(requestCounts(model.requests)["/api/projects"] >= 2);
 });
 
-test("project inspection, logs, archives and CLI files bind machine identity while retaining actual run IDs", async t => {
+test("project inspection, logs, result ZIPs and CLI files bind machine identity while retaining actual run IDs", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
-  model.model.archive = { status: "archived", incomplete: false };
+  model.model.result_upload = { status: "uploaded", incomplete: false };
   await inspect(model, 1);
   assert.equal(nodes.get("review-title").textContent, "same-run · gpu-b");
   await click(nodes.get("review-tab-logs"));
@@ -1932,16 +1958,17 @@ test("project inspection, logs, archives and CLI files bind machine identity whi
   await click(nodes.get("log-tab-stderr"));
   await settled(() => nodes.get("log-output").textContent.includes("stderr training complete gpu-b:same-run"));
   await click(nodes.get("review-tab-overview"));
-  const archive = new URL(nodes.get("download-archive").href);
-  assert.equal(archive.searchParams.get("source"), project_source.source_id);
-  assert.equal(archive.searchParams.get("run_id"), "gpu-b:same-run");
+  const result_zip = new URL(nodes.get("download-result-zip").href);
+  assert.equal(result_zip.pathname, "/api/result-zip");
+  assert.equal(result_zip.searchParams.get("source"), project_source.source_id);
+  assert.equal(result_zip.searchParams.get("run_id"), "gpu-b:same-run");
   model.model.artifact_files = [checkpointFile("outputs/model.pt")];
   await filesView(model); await click(fileCheckbox(nodes, "outputs/model.pt"));
   const download = new URL(fileRow(nodes, "outputs/model.pt").querySelector("a").href);
   assert.equal(download.searchParams.get("run_id"), "gpu-b:same-run");
   setValue(nodes.get("artifact-config-path"), "/private/owner.toml"); await emit(nodes.get("artifact-config-path"), "input");
-  assert.match(nodes.get("artifact-pull-command").value, /--origin 'gpu-b' --run-id 'same-run'/);
-  assert.equal(nodes.get("artifact-pull-command").value.includes("gpu-b:same-run"), false);
+  assert.match(nodes.get("artifact-fetch-command").value, /--origin 'gpu-b' --run-id 'same-run'/);
+  assert.equal(nodes.get("artifact-fetch-command").value.includes("gpu-b:same-run"), false);
   await inspect(model, 0); await click(nodes.get("review-tab-logs"));
   await settled(() => nodes.get("log-output").textContent.includes("gpu-a:same-run"));
   assert.equal(nodes.get("review-title").textContent, "same-run · gpu-a");
@@ -2051,7 +2078,7 @@ test("project usage shows stored S3 and server local bytes instead of reference-
   await settled(() => nodes.get("storage-usage").textContent.includes("9 KiB"));
   const usage = nodes.get("storage-usage");
   assert.match(usage.textContent, /S3 storage9 KiB3 stored objects, including retained uploads/);
-  assert.match(usage.textContent, /Local storage1 KiBTracking files and result archives on the server/);
+  assert.match(usage.textContent, /Local storage1 KiBTracking files and result ZIPs on the server/);
   assert.doesNotMatch(usage.textContent, /File totals|Shared references|16 KiB/);
   assert.match(usage.textContent, /Pending uploads512 B declared/);
   assert.match(usage.textContent, /Shared inputs and outputs count once/);

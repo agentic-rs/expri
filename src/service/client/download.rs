@@ -433,7 +433,7 @@ fn pull_impl(
   }
   if !selected.contains_key("run-state.json") {
     return Err(message(
-      "run state is not synchronized yet; retry after its metadata upload",
+      "run state is not published yet; retry after its metadata upload",
     ));
   }
   if let Some(expected) = expected {
@@ -479,7 +479,7 @@ fn pull_impl(
       crate::lock::try_lock_file(&destination.join(".pull.lock"), true)?
     else {
       return Err(message(
-        "another pull is using this run cache; retry after it finishes",
+        "another download is using this run cache; retry after it finishes",
       ));
     };
     Some(lease)
@@ -521,7 +521,7 @@ fn pull_impl(
       crate::lock::try_lock_file(&destination.join(".pull.lock"), true)?
     else {
       return Err(message(
-        "another pull is using this run cache; retry after it finishes",
+        "another download is using this run cache; retry after it finishes",
       ));
     };
     cache_lease = Some(lease);

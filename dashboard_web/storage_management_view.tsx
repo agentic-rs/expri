@@ -11,7 +11,7 @@ function Usage({ stats }: { stats: StorageStats }) {
         <div><dt>S3 storage</dt><dd>{formatFileSize(s3_bytes)}</dd>
           <dd className="storage-usage-description">{s3_objects.toLocaleString()} stored objects, including retained uploads</dd></div>
         <div><dt>Local storage</dt><dd>{stats.local_storage_bytes === undefined ? "Unavailable" : formatFileSize(stats.local_storage_bytes)}</dd>
-          <dd className="storage-usage-description">Tracking files and result archives on the server</dd></div>
+          <dd className="storage-usage-description">Tracking files and result ZIPs on the server</dd></div>
       </dl>
       <dl className="storage-usage-details">
         <div><dt>Pending uploads</dt><dd>{formatFileSize(stats.pending_upload_bytes)} declared · {stats.pending_upload_count.toLocaleString()} uploads</dd></div>

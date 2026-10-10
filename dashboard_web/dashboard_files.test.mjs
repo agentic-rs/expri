@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { artifactCanSelect, artifactDownloadUrl, artifactLabels, artifactPullCommand, artifactScopeMatchesRun, artifactSyncError, artifactSyncStatus, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
+import { artifactCanSelect, artifactDownloadUrl, artifactLabels, artifactFetchCommand, artifactScopeMatchesRun, artifactSyncError, artifactSyncStatus, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
 
 const scope = { project_id: "vision", origin: "gpu-1", run_id: "run-123" };
 const source_id = "hosted:vision:gpu-1";
@@ -33,26 +33,26 @@ test("cached cloud files can be selected for the CLI without a native download U
   assert.equal(artifactCanSelect({ ...item, download_url: "https://evil.test/file" }, scope, source_id, scope.run_id), false);
 });
 
-test("resumable pull commands preserve literal shell arguments and include only selected cloud files", () => {
+test("resumable fetch commands preserve literal shell arguments and include only selected cloud files", () => {
   const path = "outputs/model 'two' $(printf unsafe) `echo unsafe` $HOME.pt";
   const files = [file(path), file("outputs/local.pt", { cloud: false, local: true }), file("outputs/unselected.pt")];
   const config = "/private/client's $(printf unsafe) $HOME.toml";
-  const command = artifactPullCommand(scope, files, [path, "outputs/local.pt", path], config);
+  const command = artifactFetchCommand(scope, files, [path, "outputs/local.pt", path], config);
   assert.ok(command);
   const output = execFileSync("/bin/sh", ["-c", "expri() { printf '%s\\0' \"$@\"; }\n" + command]);
   const args = output.toString().split("\0").slice(0, -1);
-  assert.deepEqual(args, ["service", "pull", "--config", config, "--project-id", "vision", "--origin", "gpu-1", "--run-id", "run-123", "--repo", ".", "--artifact", path]);
+  assert.deepEqual(args, ["service", "fetch", "--config", config, "--project-id", "vision", "--origin", "gpu-1", "--run-id", "run-123", "--repo", ".", "--artifact", path]);
 });
 
-test("pull commands require a client path and valid scope and bound artifact selection", () => {
+test("fetch commands require a client path and valid scope and bound artifact selection", () => {
   const files = Array.from({ length: 65 }, (_, index) => file(`outputs/${index}.pt`));
-  assert.equal(artifactPullCommand(scope, files, [files[0].path], ""), null);
-  assert.equal(artifactPullCommand(scope, files, [files[0].path], "client\0.toml"), null);
-  assert.equal(artifactPullCommand(null, files, [files[0].path], "owner.toml"), null);
-  assert.equal(artifactPullCommand({ ...scope, origin: "../worker" }, files, [files[0].path], "owner.toml"), null);
-  assert.equal(artifactPullCommand(scope, files, files.map(file => file.path), "owner.toml"), null);
-  assert.equal(artifactPullCommand(scope, [file("outputs/../secret")], ["outputs/../secret"], "owner.toml"), null);
-  assert.equal(artifactPullCommand(scope, [file("outputs/local.pt", { cloud: false })], ["outputs/local.pt"], "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, files, [files[0].path], ""), null);
+  assert.equal(artifactFetchCommand(scope, files, [files[0].path], "client\0.toml"), null);
+  assert.equal(artifactFetchCommand(null, files, [files[0].path], "owner.toml"), null);
+  assert.equal(artifactFetchCommand({ ...scope, origin: "../worker" }, files, [files[0].path], "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, files, files.map(file => file.path), "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, [file("outputs/../secret")], ["outputs/../secret"], "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, [file("outputs/local.pt", { cloud: false })], ["outputs/local.pt"], "owner.toml"), null);
 });
 
 test("file sizes distinguish unknown values and binary units", () => {

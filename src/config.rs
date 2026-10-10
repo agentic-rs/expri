@@ -16,6 +16,7 @@ pub struct Config {
   pub target: BTreeMap<String, TargetConfig>,
   #[serde(default)]
   pub tasks: BTreeMap<String, TaskDefinition>,
+  #[serde(rename = "push", alias = "sync")]
   pub sync: Option<SyncConfig>,
   pub setup: Option<SetupConfig>,
   pub download: Option<DownloadConfig>,
@@ -23,8 +24,8 @@ pub struct Config {
   pub environment: Option<EnvironmentConfig>,
   #[serde(default)]
   pub service: Option<RunServiceConfig>,
-  #[serde(default)]
-  pub file_sync: Option<FileSyncConfig>,
+  #[serde(default, alias = "file_sync")]
+  pub fetch: Option<FetchConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,13 +81,13 @@ fn is_enabled(value: &bool) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct RunInputConfig {
   pub input_id: String,
-  /// Relative to the worker's project-scoped private input cache.
+  /// Relative to each run's private input directory.
   pub destination: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileSyncConfig {
+pub struct FetchConfig {
   pub client_config: PathBuf,
   pub project_id: String,
   pub origins: Vec<String>,
@@ -96,7 +97,7 @@ pub struct FileSyncConfig {
   pub labels: Vec<String>,
 }
 
-impl FileSyncConfig {
+impl FetchConfig {
   pub fn validate(&self) -> Result<()> {
     crate::service::validate_component(&self.project_id)?;
     if self.client_config.as_os_str().is_empty()
@@ -104,7 +105,7 @@ impl FileSyncConfig {
       || self.origins.len() > 64
     {
       return Err(ExpriError::Message(
-        "file_sync requires a client_config and between 1 and 64 origins".into(),
+        "fetch requires a client_config and between 1 and 64 origins".into(),
       ));
     }
     for origin in &self.origins {
@@ -112,20 +113,20 @@ impl FileSyncConfig {
     }
     if self.artifacts.len() + self.labels.len() > 64 || self.labels.len() > 2 {
       return Err(ExpriError::Message(
-        "file_sync selects at most 64 artifact paths and two labels".into(),
+        "fetch selects at most 64 artifact paths and two labels".into(),
       ));
     }
     for path in &self.artifacts {
       if path != "result.zip" && crate::run_artifacts::validate_path(path).is_err() {
         return Err(ExpriError::Message(
-          "file_sync.artifacts must contain safe outputs/ paths or result.zip".into(),
+          "fetch.artifacts must contain safe outputs/ paths or result.zip".into(),
         ));
       }
     }
     for label in &self.labels {
       if !matches!(label.as_str(), "best" | "latest") {
         return Err(ExpriError::Message(
-          "file_sync.labels accepts best and latest".into(),
+          "fetch.labels accepts best and latest".into(),
         ));
       }
     }
@@ -362,8 +363,8 @@ impl Config {
     }
     config.local_environment()?;
     config.local_service()?;
-    if let Some(sync) = &config.file_sync {
-      sync.validate()?;
+    if let Some(fetch) = &config.fetch {
+      fetch.validate()?;
     }
     for name in config.target.keys() {
       config.target(name)?;
@@ -585,8 +586,8 @@ mod tests {
   }
 
   #[test]
-  fn file_sync_requires_explicit_origins_and_checkpoint_selection() {
-    let good: FileSyncConfig = toml::from_str("client_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1','gpu-2']\nlabels=['best']\nartifacts=['outputs/checkpoint-1000.pt']\n").unwrap();
+  fn fetch_requires_explicit_origins_and_checkpoint_selection() {
+    let good: FetchConfig = toml::from_str("client_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1','gpu-2']\nlabels=['best']\nartifacts=['outputs/checkpoint-1000.pt']\n").unwrap();
     assert!(good.validate().is_ok());
     let mut bad = good.clone();
     bad.origins.clear();
@@ -597,6 +598,42 @@ mod tests {
     bad = good;
     bad.artifacts = vec!["outputs/../private".into()];
     assert!(bad.validate().is_err());
+  }
+
+  #[test]
+  fn fetch_accepts_legacy_section_without_combining_directions() {
+    for section in ["fetch", "file_sync"] {
+      let config: Config = toml::from_str(&format!(
+        "[{section}]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\nlabels=['best']\n"
+      ))
+      .unwrap();
+      let fetch = config.fetch.unwrap();
+      fetch.validate().unwrap();
+      assert_eq!(fetch.origins, ["gpu-1"]);
+      assert_eq!(fetch.labels, ["best"]);
+      assert!(config.target.is_empty());
+    }
+    assert!(
+      toml::from_str::<Config>(
+        "[fetch]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\n[file_sync]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-2']\n"
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
+  fn push_accepts_legacy_source_policy_section() {
+    for section in ["push", "sync"] {
+      let config: Config = toml::from_str(&format!(
+        "[{section}]\nremote_managed=['datasets']\nexclude_dirs=['generated']\n"
+      ))
+      .unwrap();
+      let push = config.sync.as_ref().unwrap();
+      assert_eq!(push.remote_managed.as_ref().unwrap(), &["datasets"]);
+      assert_eq!(push.exclude_dirs.as_ref().unwrap(), &["generated"]);
+      assert!(config.fetch.is_none());
+    }
+    assert!(toml::from_str::<Config>("[push]\n[sync]\n").is_err());
   }
 
   #[test]

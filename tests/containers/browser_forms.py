@@ -646,9 +646,9 @@ def artifact_files(browser, run_id):
   assert any(record['path'] == '/api/artifacts' for record in trace_records()[start:]), 'Files did not lazily request the inventory'
   browser.click('input[aria-label="Select outputs/checkpoint.pt for download"]')
   browser.keys('#artifact-config-path', '/tmp/owner.toml')
-  command = wait_for(lambda: evaluate("return document.querySelector('#artifact-pull-command')?.value;"), 'selected checkpoint did not generate its CLI command')
+  command = wait_for(lambda: evaluate("return document.querySelector('#artifact-fetch-command')?.value;"), 'selected checkpoint did not generate its CLI command')
   args = shlex.split(command)
-  assert args[:3] == ['expri', 'service', 'pull'] and args[args.index('--config') + 1] == '/tmp/owner.toml', 'CLI command changed the existing client config path'
+  assert args[:3] == ['expri', 'service', 'fetch'] and args[args.index('--config') + 1] == '/tmp/owner.toml', 'CLI command changed the existing client config path'
   assert args[args.index('--project-id') + 1] == 'demo' and args[args.index('--origin') + 1] == 'worker' and args[args.index('--run-id') + 1] == run_id and args[args.index('--artifact') + 1] == 'outputs/checkpoint.pt', 'CLI command changed the selected run or checkpoint'
   assert 'included automatically' in evaluate("return document.querySelector('.file-cli').textContent;"), 'CLI instructions omitted automatic run metadata'
   browser.click('#download-selected-files')
@@ -657,7 +657,7 @@ def artifact_files(browser, run_id):
   capture('workspace-files')
   browser.set_viewport(500, 800)
   assert evaluate('return document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1;'), 'narrow Files view overflows horizontally'
-  assert evaluate('''return ['#refresh-files', '#files-search', '#download-selected-files', '#artifact-config-path', '#artifact-pull-command'].every(selector => {
+  assert evaluate('''return ['#refresh-files', '#files-search', '#download-selected-files', '#artifact-config-path', '#artifact-fetch-command'].every(selector => {
     const box = document.querySelector(selector).getBoundingClientRect();
     return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
   });'''), 'narrow Files controls are clipped'
@@ -691,11 +691,11 @@ def artifact_files(browser, run_id):
       browser.call('DELETE', '/window')
   browser.call('POST', '/window', {'handle': original_window})
   browser.click('#review-tab-charts')
-  wait_for(lambda: evaluate("return document.querySelector('#archive-status')?.textContent;") == 'Archived', 'completed run did not show its independent archive badge')
+  wait_for(lambda: evaluate("return document.querySelector('#result-upload-status')?.textContent;") == 'Result uploaded', 'completed run did not show its independent result upload badge')
   archive_path = DOWNLOADS / 'result.zip'
   archive_path.unlink(missing_ok=True)
   (DOWNLOADS / 'result.zip.part').unlink(missing_ok=True)
-  browser.click('#download-archive')
+  browser.click('#download-result-zip')
   wait_for(lambda: archive_path.exists() and archive_path.stat().st_size > 0 and not (DOWNLOADS / 'result.zip.part').exists(), 'native result archive download did not complete', timeout=60)
   with zipfile.ZipFile(archive_path) as archive:
     assert archive.testzip() is None, 'result archive contains corrupt entries'
@@ -1285,7 +1285,7 @@ def project_workspace(run_id):
       browser.click('input[aria-label="Select outputs/project-scope.txt for download"]')
       if not evaluate("return document.querySelector('#artifact-config-path').value;"):
         browser.keys('#artifact-config-path', '/tmp/client.toml')
-      command = wait_for(lambda: evaluate("return document.querySelector('#artifact-pull-command')?.value;"), 'project artifact did not generate its actual-scope CLI command')
+      command = wait_for(lambda: evaluate("return document.querySelector('#artifact-fetch-command')?.value;"), 'project artifact did not generate its actual-scope CLI command')
       args = shlex.split(command)
       assert args[args.index('--origin') + 1] == origin and args[args.index('--run-id') + 1] == run_id, 'project artifact CLI command contains the transport key or wrong origin'
       browser.click('#download-selected-files')

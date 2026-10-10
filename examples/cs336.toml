@@ -1,7 +1,7 @@
 [project]
 name = "cs336-assignment5-alignment"
 
-[sync]
+[push]
 exclude_dirs = [
   ".git",
   ".venv",

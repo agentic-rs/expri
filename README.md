@@ -1,18 +1,18 @@
 # expri
 
-`expri` is a repo-local experiment workflow tool. It syncs local code to a
+`expri` is a repo-local experiment workflow tool. It pushes local code to a
 target, prepares Python dependencies with uv, and runs configured tasks locally
 or remotely.
 
 Building expri requires Rust 1.89 or newer.
 
-## Sync
+## Push source and config
 
-Top-level commands are controller-side commands: they run from your workstation
-and operate on a configured target. `expri node ...` is the target-machine
-namespace for commands that run locally on a synced node.
+Source and worker commands such as `push`, `setup`, and `-T ... run` operate
+on a configured target from your workstation. `fetch` reads results from the
+service instead. `expri node ...` runs commands locally on a worker.
 
-Create an `expri.toml` in the repo you want to sync, and keep machine targets
+Create an `expri.toml` in the repo you want to push, and keep machine targets
 in a sibling target file. The target filename follows the config filename:
 `expri.toml` uses `expri.target.toml`, and `cs336.toml` uses
 `cs336.target.toml`. Target files are local/private; add them to that repo's
@@ -23,7 +23,7 @@ in a sibling target file. The target filename follows the config filename:
 [project]
 name = "my-project"
 
-[sync]
+[push]
 remote_managed = ["uv.lock"]
 
 [download.mappings]
@@ -46,13 +46,13 @@ node_bin = "expri"
 Then run:
 
 ```sh
-expri -T runpod sync --config cs336-assignment5-alignment/expri.toml
+expri -T runpod push --config cs336-assignment5-alignment/expri.toml
 ```
 
 Or from inside that repo:
 
 ```sh
-expri -T runpod sync
+expri -T runpod push
 ```
 
 See `examples/cs336.toml` for a CS336-shaped starting point.
@@ -71,31 +71,36 @@ capabilities and reports an error when an upgrade is needed.
 The `env doctor` and `env prune` commands also check for maintenance support
 and use the same automatic fallback for older nodes.
 
-The sync algorithm uploads committed history with a git bundle, stages `HEAD`
+The source push uploads committed history with a git bundle, stages `HEAD`
 plus a zip archive of local dirty and untracked files, then installs the staged
 files on the remote. It removes previously synced files absent from the staged
 tree and preserves unrelated remote-generated files. Remote tool state lives
 under `.expri/`.
 
-Use `sync.remote_managed` for repo-relative files that the target should own,
+Use `push.remote_managed` for repo-relative files that the target should own,
 even if they are tracked by Git or appear in the dirty patch. For example,
-`remote_managed = ["uv.lock"]` preserves the target's lockfile across syncs and
+`remote_managed = ["uv.lock"]` preserves the target's lockfile across pushes and
 excludes local changes to that file from `patch.zip`.
 
 For a path-scoped rsync, pass paths after `--`. Only files returned by
 `git ls-files` under those paths are transferred:
 
 ```sh
-expri -T runpod sync -- src scripts
-expri -T runpod sync --pull -- outputs/checkpoints
+expri -T runpod push -- src scripts
 ```
 
-`expri -T runpod sync --watch` keeps source/config synchronized while active runs
-retain their frozen snapshots. Add `[file_sync]` to also receive live run metadata
-and selected finalized checkpoints through the service. Training registers ready
+`expri -T runpod push --watch` keeps the worker checkout up to date while active
+runs retain their frozen snapshots. Separately, configure `[fetch]` and run
+`expri fetch --watch` on the laptop to receive live run metadata and selected
+finalized checkpoints through the service. Training registers ready
 files with `expri artifact register "$EXPRI_OUTPUT_DIR/checkpoint-1000.pt" --label best`.
-See [file sync and private input preparation](docs/self-hosted-service.md#local-download-and-dashboard)
+See [result fetching and private input preparation](docs/self-hosted-service.md#local-download-and-dashboard)
 for laptop selection, offline reuse, and resumable transfers.
+
+Older `sync` commands and `[sync]` configuration remain accepted for source
+transfers. The legacy path download form is
+`expri -T runpod sync --pull -- outputs/checkpoints`; use `download` mappings for
+named file downloads or `runs fetch` for experiment results.
 
 ## Transport
 
@@ -149,7 +154,7 @@ command with `uv run`. Existing task definitions keep this behavior.
 
 With an `[environment]` or target environment configured, every task uses uv
 and runs from its own code snapshot. Expri stores the snapshot, run environment,
-and output directory under `.expri/runs/<run_id>/`. A later sync cannot change
+and output directory under `.expri/runs/<run_id>/`. A later source push cannot change
 the copied code files of an active run. Base packages remain shared when reuse
 is enabled, and uv's cache avoids repeated downloads when it creates each run's
 environment.
@@ -162,7 +167,7 @@ the original checkout and remains stable across runs; otherwise an ambient
 snapshots, and outputs still accumulate; use `expri env prune` to review old run
 environments for removal.
 
-Local snapshots include explicit file paths listed in `sync.include_ignored`,
+Local snapshots include explicit file paths listed in `push.include_ignored`,
 such as a Git-ignored experiment configuration, alongside the usual tracked,
 dirty, and untracked source files. Other Git-ignored files stay excluded.
 
@@ -170,13 +175,13 @@ dirty, and untracked source files. Other Git-ignored files stay excluded.
 expri run dev
 expri run train --epochs 3
 expri -T runpod run train --epochs 3
-expri -T runpod run --no-sync train --epochs 3
+expri -T runpod run --no-push train --epochs 3
 expri -T runpod run --detach train --epochs 3
 ```
 
-When `-T/--target` is provided, `run` syncs the repo to the target before
-executing the task there. Pass `--no-sync` before the task name to skip that
-sync. Run options must appear before the task name; arguments after the task
+When `-T/--target` is provided, `run` pushes the repo to the target before
+executing the task there. Pass `--no-push` before the task name to skip that
+source push. Run options must appear before the task name; arguments after the task
 name are passed through to the task.
 
 An optional `[service]` or `[target.<name>.service]` starts a separate publisher
@@ -198,7 +203,7 @@ The task's working directory is its code snapshot. Relative output paths such
 as `outputs/checkpoint.pt` therefore live under the snapshot. Have the task
 write to `EXPRI_OUTPUT_DIR` when you want all outputs in the dedicated output
 directory. The existing `download` mappings still resolve from the target repo
-root. Use `runs pull` for files stored within an individual run.
+root. Use `runs fetch` for files stored within an individual run.
 
 Configured-environment runs save task stdout and stderr to
 `.expri/runs/<run_id>/logs/stdout.log` and `logs/stderr.log` while streaming both
@@ -213,7 +218,7 @@ run ID and directory after the supervisor owns the run and can accept requests.
 Environment preparation then continues in the background; inspect status and
 stderr for its progress. The run survives a terminal or SSH disconnect. Detach
 requires a configured environment, including an empty `[environment]` table
-for ordinary uv isolation; legacy tasks are rejected before remote sync.
+for ordinary uv isolation; legacy tasks are rejected before a remote source push.
 
 Detached runs use the same snapshot, environment, outputs, and log layout.
 They do not restart after a machine reboot or a lost supervisor. `runs status`
@@ -244,7 +249,7 @@ escalates after two seconds if needed. Inspect status again to confirm
 `cancelled`. Cancelling an already finished run leaves its result intact;
 active foreground or lost runs cannot be cancelled through this command.
 
-## Run records and selective pull
+## Run records and selective fetching
 
 List local runs or inspect the configured target directly:
 
@@ -261,15 +266,15 @@ Missing, malformed, or unsupported records produce warnings; incomplete runs
 can still be inspected. These commands read fixed records rather than scanning
 an environment's installed packages.
 
-Pull a target run's available metadata and logs into
+Fetch a target run's available metadata and logs into
 `results/<target>/runs/<run_id>/`:
 
 ```sh
-expri -T runpod runs pull run-abc123
-expri -T runpod runs pull run-abc123 --metrics
-expri -T runpod runs pull run-abc123 --outputs --dry-run
-expri -T runpod runs pull run-abc123 --artifact 'outputs/model one.pt'
-expri -T runpod runs pull run-abc123 --artifact code/out/jobs
+expri -T runpod runs fetch run-abc123
+expri -T runpod runs fetch run-abc123 --metrics
+expri -T runpod runs fetch run-abc123 --outputs --dry-run
+expri -T runpod runs fetch run-abc123 --artifact 'outputs/model one.pt'
+expri -T runpod runs fetch run-abc123 --artifact code/out/jobs
 ```
 
 The default selection contains `run-state.json`, `snapshot.json`, the
@@ -281,15 +286,15 @@ or directories from these transfers. Explicit selections into excluded paths
 fail. The configured `[download].results_dir` replaces the default `results`
 directory.
 
-A pull stages the selected files before updating its owned destination and
-writes `pull-state.json` after publication. Repeating a metadata-only pull
+A fetch stages the selected files before updating its owned destination and
+writes `pull-state.json` after publication. Repeating a metadata-only fetch
 refreshes the records and logs while retaining artifacts downloaded earlier.
 A failed transfer leaves the previous cache intact. Missing optional metadata
-is skipped, so partial records can still be pulled.
+is skipped, so partial records can still be fetched.
 
-`runs pull --dry-run` contacts the target to query the actual selection, then
+`runs fetch --dry-run` contacts the target to query the actual selection, then
 prints the destination and files without writing locally or transferring them.
-Use cached inspection to review previously pulled records without contacting
+Use cached inspection to review previously fetched records without contacting
 the target:
 
 ```sh
@@ -356,13 +361,13 @@ location. Use `--cached` to read that cache without contacting the target:
 ```sh
 expri -T runpod runs metrics run-abc123 --json
 expri -T runpod runs compare run-abc123 run-def456 --chart .expri/charts/remote.html
-expri -T runpod runs pull run-abc123 --metrics
+expri -T runpod runs fetch run-abc123 --metrics
 expri -T runpod runs compare run-abc123 run-def456 --cached --metric train/loss
 ```
 
-`runs pull --metrics` selects metadata, `outputs/metrics.jsonl`, and
+`runs fetch --metrics` selects metadata, `outputs/metrics.jsonl`, and
 `outputs/params.json`. Combine it with `--outputs` or `--artifact` when additional
-files are needed. Selective pulls retain artifacts downloaded earlier. Online
+files are needed. Selective fetches retain artifacts downloaded earlier. Online
 inspection ignores retained metric files absent from the current remote
 selection; cached inspection reads the retained files. Recorded status in a
 chart or cached response is a snapshot; use `runs status` for a live check.
@@ -401,10 +406,11 @@ Open the printed `http://127.0.0.1:<port>` URL. The dashboard lists local runs
 from `.expri/runs/` and downloaded runs from `results/<target>/runs/` (or your
 configured results directory). Cached sources remain available without target
 credentials. It never contacts a target or changes run files. Use the CLI to
-pull remote metrics and logs; the dashboard detects updated selected runs:
+fetch remote metrics and logs; the dashboard detects updated selected runs:
 
 ```sh
-expri -T runpod runs pull run-abc123 --metrics --logs
+expri -T runpod runs fetch run-abc123 --metrics
+expri -T runpod runs fetch run-abc123             # Refresh metadata and logs
 ```
 
 The run browser stays beside the review workspace at widths of at least 860 CSS
@@ -425,7 +431,7 @@ Opening a run starts with its curves. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads
 stdout/stderr tails when opened. **Files** lists regular outputs, sizes, and
 local or reported worker/cloud availability. Select files for individual browser
-downloads, or generate a service pull command for resumable checkpoint downloads.
+downloads, or generate a service fetch command for resumable checkpoint downloads.
 Files loads only when opened and keeps selection during refresh. Selecting runs updates the charts directly:
 one run opens its curves, and two to eight runs from one source show a comparison.
 Compare last, minimum or maximum metric values, and expand parameter differences
@@ -440,7 +446,7 @@ sizes; **Run outputs** shows uploaded files, including checkpoints, with their
 machine and run. Search and page through either list, then download a file
 through the authenticated dashboard. Storage records input IDs rather than
 original local filenames. Input and checkpoint uploads remain CLI operations;
-use `expri service pull` for resumable downloads of large checkpoints.
+use `expri service fetch` for resumable downloads of large checkpoints.
 
 **Auto refresh** checks every five seconds while the page is visible. Turn it
 off to pause updates; hidden tabs and offline browsers pause automatically.
@@ -507,14 +513,15 @@ bundle in Firefox. CI checks that rebuilding produces the checked-in asset.
 ## Optional self-hosted storage
 
 Use `expri service` to forward run metadata, metrics and logs to a service backed
-by durable tracking files and SQLite, publish private input files, and download selected
-checkpoints into the local review cache. A separate `push --watch` process retries
-outages while training continues. Uploads keep durable multipart receipts; pulls
-verify file SHA256 digests before publishing downloaded files. The server archives
+by durable tracking files and SQLite, upload private input files, and fetch selected
+checkpoints into the local review cache. The worker publisher retries outages
+while training continues; `expri service publish --watch` also forwards existing
+runs. Uploads keep durable multipart receipts; downloads verify file SHA256
+digests before publishing downloaded files. The server bundles and uploads
 acknowledged tracking files into `result.zip` in S3; checkpoints and inputs
 remain separate objects.
 
-An optional hosted dashboard reviews synced runs through HTTPS with a separate
+An optional hosted dashboard reviews published runs through HTTPS with a separate
 dashboard password and authenticated browser sessions. Choose a project to review
 its runs across recorded machines; **All machines** is the default. Machine
 tags filter by the publishing origin, and the sortable **Machine** column keeps
@@ -527,7 +534,7 @@ outputs across its machines and runs; the per-run **Files** tab also shows
 worker-reported outputs that have not yet been uploaded.
 Storage usage shows **S3 storage**, counting each recorded object once including
 retained uploads, and **Local storage** for server tracking files and staged
-archives. Pending upload sizes appear separately. Optional project deletion
+result ZIPs. Pending upload sizes appear separately. Optional project deletion
 requires a preview, the exact project name, and the dashboard password; durable
 cleanup retries interruptions and removes eligible S3 versions. AB remains
 read-only. See [storage management](docs/self-hosted-service.md#storage-usage-and-project-deletion)
@@ -614,7 +621,7 @@ Before preparing a rented machine's project environment, check its existing
 Python stack against the selected lockfile:
 
 ```sh
-expri -T runpod sync
+expri -T runpod push
 expri -T runpod env doctor
 expri -T runpod env doctor --json
 ```
@@ -676,10 +683,10 @@ environment; scripts after preparation run through uv in the selected
 environment. Place a `uv` setup step before scripts that need project
 dependencies. The project itself is installed in each isolated run environment.
 
-Prepare the target after syncing its project files:
+Prepare the target after pushing its project files:
 
 ```sh
-expri -T runpod sync
+expri -T runpod push
 expri -T runpod setup
 expri -T runpod run train --epochs 3
 ```

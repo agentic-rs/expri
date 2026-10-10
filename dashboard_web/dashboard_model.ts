@@ -91,10 +91,11 @@ export type Detail = {
   metrics_error: string | null;
   warnings: Warning[];
   cache: Json;
+  result_upload?: ResultUploadRecord | null;
   archive?: ArchiveRecord | null;
 };
-export type ArchiveRecord = {
-  status: "none" | "pending" | "uploading" | "archived" | "failed";
+export type ResultUploadRecord = {
+  status: "none" | "pending" | "uploading" | "uploaded" | "failed";
   incomplete: boolean;
   file?: {
     target: { kind: "run"; scope: RunDeepLink; path: string };
@@ -103,6 +104,9 @@ export type ArchiveRecord = {
     storage: "object";
   } | null;
   last_error?: string | null;
+};
+export type ArchiveRecord = Omit<ResultUploadRecord, "status"> & {
+  status: "none" | "pending" | "uploading" | "archived" | "failed";
 };
 export type Log = { content: string; stream: string; missing: boolean; truncated: boolean };
 export type Comparison = {

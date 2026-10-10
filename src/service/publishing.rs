@@ -91,7 +91,7 @@ fn safe_error(failure: &ExpriError) -> String {
     _ => failure.to_string(),
   };
   if detail.contains("http://") || detail.contains("https://") {
-    return "Service synchronization failed; saved work can be retried".into();
+    return "Service publishing failed; saved work can be retried".into();
   }
   detail
     .chars()
@@ -303,6 +303,7 @@ pub(crate) fn resume(run_dir: &Path) -> Result<Value> {
     launch(&intent, &mut state, lease)?;
   }
   let mut report = serde_json::to_value(&state)?;
+  client::add_result_upload(&mut report["progress"]);
   report["started"] = json!(state.status != "synced");
   Ok(report)
 }
@@ -316,6 +317,7 @@ pub(crate) fn status(run_dir: &Path) -> Result<Option<Value>> {
     return Ok(None);
   }
   let mut report = serde_json::to_value(read_state(&directory)?)?;
+  client::add_result_upload(&mut report["progress"]);
   report["worker_active"] = json!(matches!(
     try_lock_file(&directory.join(LEASE), false)?,
     LockAttempt::Busy
@@ -621,6 +623,26 @@ mod tests {
     assert!(status(&run).is_err());
     std::fs::write(run.join(STATE), b"{").unwrap();
     assert!(status(&run).is_err());
+  }
+
+  #[test]
+  fn status_exposes_result_upload_without_rewriting_saved_progress() {
+    let (_temporary, repo, run, config) = fixture();
+    let intent = Intent {
+      schema_version: 1,
+      repo_root: repo,
+      run_dir: run.clone(),
+      config,
+    };
+    let mut state = PublishingState::new(&intent).unwrap();
+    state.progress = json!({"archive":{"status":"archived","incomplete":false,
+      "file":null,"last_error":null}});
+    state.save(&run, "synced").unwrap();
+    let saved = std::fs::read(run.join(STATE)).unwrap();
+    let report = status(&run).unwrap().unwrap();
+    assert_eq!(report["progress"]["archive"]["status"], "archived");
+    assert_eq!(report["progress"]["result_upload"]["status"], "uploaded");
+    assert_eq!(std::fs::read(run.join(STATE)).unwrap(), saved);
   }
 
   #[test]

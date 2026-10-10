@@ -6,6 +6,7 @@ mod controller;
 mod dashboard;
 mod environment;
 mod error;
+mod fetch_cli;
 mod filter;
 mod git;
 mod jobs;
@@ -15,13 +16,13 @@ mod metrics;
 mod metrics_cli;
 mod node;
 mod protocol;
+mod push_cli;
 mod run_artifacts;
 mod run_logs;
 mod runs;
 mod runs_cli;
 mod service;
 mod shell;
-mod sync_cli;
 
 use std::path::PathBuf;
 
@@ -58,8 +59,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-  Sync(SyncCommand),
-  /// Register finalized training outputs for background cloud sync.
+  /// Push source and configuration changes to a worker checkout.
+  #[command(alias = "sync")]
+  Push(PushCommand),
+  /// Fetch run data and selected outputs from the expri service and S3.
+  Fetch(FetchCommand),
+  /// Register finalized training outputs for background upload.
   Artifact(artifacts_cli::ArtifactCommand),
   Download(DownloadCommand),
   Setup(SetupCommand),
@@ -68,7 +73,7 @@ enum Command {
   Runs(RunsCommand),
   /// Browse local and cached experiment results in a local dashboard.
   Dashboard(dashboard::DashboardCommand),
-  /// Sync experiments and private files through an optional self-hosted S3 service.
+  /// Publish experiment data and transfer files through a self-hosted service.
   Service(service::ServiceCommand),
   Node {
     #[command(subcommand)]
@@ -117,7 +122,7 @@ struct PruneCommand {
 }
 
 #[derive(Debug, Args)]
-struct SyncCommand {
+struct PushCommand {
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -136,15 +141,31 @@ struct SyncCommand {
   #[arg(long)]
   force: bool,
 
-  #[arg(long)]
+  #[arg(long, hide = true)]
   pull: bool,
 
-  /// Keep syncing source changes, metadata, and selected cloud outputs.
+  /// Keep pushing source and configuration changes to the worker checkout.
   #[arg(long, conflicts_with_all = ["pull", "paths"])]
   watch: bool,
 
   #[arg(value_name = "PATH", last = true)]
   paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct FetchCommand {
+  #[arg(long)]
+  config: Option<PathBuf>,
+
+  #[arg(long)]
+  repo: Option<PathBuf>,
+
+  #[arg(long)]
+  dry_run: bool,
+
+  /// Keep fetching new run data and selected outputs every five seconds.
+  #[arg(long)]
+  watch: bool,
 }
 
 #[derive(Debug, Args)]
@@ -206,7 +227,8 @@ struct RunCommand {
   #[arg(long)]
   dry_run: bool,
 
-  #[arg(long)]
+  /// Skip pushing source changes before starting the run.
+  #[arg(long = "no-push", alias = "no-sync")]
   no_sync: bool,
 
   /// Disable automatic publishing for this run.
@@ -237,7 +259,8 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Sync(command) => sync_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Push(command) => push_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Fetch(command) => fetch_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Artifact(command) => artifacts_cli::run(command, cli.target.as_deref()),
     Command::Download(command) => {
       run_download(command, cli.target.as_deref(), cli.verbose, cli.quiet)
@@ -552,18 +575,74 @@ mod tests {
   use super::*;
 
   #[test]
-  fn watch_preserves_direction_and_finalized_file_registration_choices() {
-    let cli = Cli::try_parse_from(["expri", "sync", "--watch", "--dry-run"]).unwrap();
+  fn push_and_fetch_select_separate_directions() {
+    for name in ["push", "sync"] {
+      let cli =
+        Cli::try_parse_from(["expri", "-T", "gpu-1", name, "--watch", "--dry-run"]).unwrap();
+      assert!(matches!(
+        cli.command,
+        Command::Push(PushCommand {
+          watch: true,
+          dry_run: true,
+          ..
+        })
+      ));
+      assert!(Cli::try_parse_from(["expri", name, "--watch", "--pull"]).is_err());
+      assert!(Cli::try_parse_from(["expri", name, "--watch", "--", "code.py"]).is_err());
+      let cli = Cli::try_parse_from(["expri", name, "--pull", "--", "code.py"]).unwrap();
+      assert!(matches!(
+        cli.command,
+        Command::Push(PushCommand { pull: true, .. })
+      ));
+    }
+    let cli = Cli::try_parse_from(["expri", "fetch", "--watch", "--dry-run"]).unwrap();
     assert!(matches!(
       cli.command,
-      Command::Sync(SyncCommand {
+      Command::Fetch(FetchCommand {
         watch: true,
         dry_run: true,
         ..
       })
     ));
-    assert!(Cli::try_parse_from(["expri", "sync", "--watch", "--pull"]).is_err());
-    assert!(Cli::try_parse_from(["expri", "sync", "--watch", "--", "code.py"]).is_err());
+    for flag in ["--pull", "--force", "--control-path"] {
+      assert!(Cli::try_parse_from(["expri", "fetch", flag]).is_err());
+    }
+    assert!(Cli::try_parse_from(["expri", "fetch", "--", "code.py"]).is_err());
+  }
+
+  #[test]
+  fn canonical_help_exposes_push_and_fetch() {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    let help = command.render_help().to_string();
+    assert!(help.contains("push"));
+    assert!(help.contains("fetch"));
+    assert!(!help.contains("\n  sync "));
+    let push = command
+      .find_subcommand_mut("push")
+      .unwrap()
+      .render_help()
+      .to_string();
+    assert!(push.contains("--watch"));
+    assert!(!push.contains("--pull"));
+    assert!(push.contains("[PATH]"));
+    assert!(!push.contains("cloud"));
+    let run = command
+      .find_subcommand_mut("run")
+      .unwrap()
+      .render_help()
+      .to_string();
+    assert!(run.contains("--no-push"));
+    assert!(!run.contains("--no-sync"));
+    let cli = Cli::try_parse_from(["expri", "run", "--no-push", "train"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Run(RunCommand { no_sync: true, .. })
+    ));
+  }
+
+  #[test]
+  fn finalized_file_registration_choices_and_publishing_inputs_are_preserved() {
     assert!(
       Cli::try_parse_from([
         "expri",

@@ -269,7 +269,7 @@ fn start(fixture: &Fixture, mode: &str, rate: &str, synchronize: bool) -> Value 
   let args = if synchronize {
     vec!["run", "--detach", "train", mode, rate]
   } else {
-    vec!["run", "--no-sync", "--detach", "train", mode, rate]
+    vec!["run", "--no-push", "--detach", "train", mode, rate]
   };
   let receipt = fixture.json(&args);
   assert_eq!(receipt["detached"], true);
@@ -457,8 +457,8 @@ fn review_cached(fixture: &Fixture, first: &Value, second: &Value) {
     second["run_id"].as_str().unwrap(),
   ];
   for (id, rate) in ids.iter().zip([0.01, 0.02]) {
-    fixture.json(&["runs", "pull", id, "--json"]);
-    fixture.json(&["runs", "pull", id, "--metrics", "--json"]);
+    fixture.json(&["runs", "fetch", id, "--json"]);
+    fixture.json(&["runs", "fetch", id, "--metrics", "--json"]);
     let cache = fixture.cache(id);
     assert!(cache.join("logs/stdout.log").is_file());
     assert!(cache.join("outputs/metrics.jsonl").is_file());
@@ -582,7 +582,7 @@ fn incompatible(fixture: &Fixture, base: &Value) {
     bounded(&serde_json::to_vec(&doctor).unwrap())
   );
   let failed = fixture
-    .command(&["run", "--no-sync", "train", "success", "0.01"])
+    .command(&["run", "--no-push", "train", "success", "0.01"])
     .output()
     .unwrap();
   assert!(
@@ -762,7 +762,7 @@ fn host_worker_workflow() {
   );
   let base = fixture.base();
   assert_ne!(base["torch_version"], host_before["torch_version"]);
-  fixture.run(&["sync"]);
+  fixture.run(&["push"]);
   if fixture.case.starts_with("matched-") {
     matched(&fixture, &base);
   } else {

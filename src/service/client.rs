@@ -26,7 +26,7 @@ use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
 pub use download::{input_get, input_get_prepared, pull};
-pub use watch::sync as sync_files;
+pub use watch::fetch as fetch_files;
 
 pub(super) fn validate_config(path: &Path) -> Result<()> {
   Api::new(path).map(|_| ())
@@ -99,7 +99,7 @@ impl Publisher {
     let artifacts = artifacts(&options.artifacts)?;
     if artifacts.contains("result.zip") {
       return Err(message(
-        "result.zip is created by the service; select it with service pull",
+        "result.zip is created by the service; select it with service fetch",
       ));
     }
     let queue_dir = std::path::absolute(&options.queue_dir)?
@@ -207,7 +207,7 @@ pub fn push(options: PushOptions) -> Result<Value> {
         }
         let detail = publisher.error_text(&error);
         if last_error != detail || failures.is_multiple_of(15) {
-          eprintln!("Service sync pending; saved work will retry: {detail}");
+          eprintln!("Service publishing pending; saved work will retry: {detail}");
           last_error = detail;
         }
         failures += 1;
@@ -217,6 +217,33 @@ pub fn push(options: PushOptions) -> Result<Value> {
   }
 }
 
+pub fn publish(options: PushOptions) -> Result<Value> {
+  let mut report = push(options)?;
+  add_result_upload(&mut report);
+  if let Some(fields) = report.as_object_mut() {
+    fields.remove("archive");
+  }
+  Ok(report)
+}
+
+/// Translate presentation fields without rewriting the deployed protocol or queue.
+pub(super) fn upload_report(mut report: Value) -> Value {
+  if report["status"] == "archived" {
+    report["status"] = json!("uploaded");
+  }
+  report
+}
+
+pub(super) fn add_result_upload(report: &mut Value) {
+  if let Some(archive) = report.get("archive") {
+    report["result_upload"] = upload_report(archive.clone());
+  }
+}
+
+pub fn server_upload(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
+  archive(config, scope, partial).map(upload_report)
+}
+
 pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
   validate_scope(scope)?;
   let api = Api::new(config)?;
@@ -224,7 +251,7 @@ pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> 
     return Err(message("service did not return protocol capabilities"));
   };
   if !features.iter().any(|feature| feature == "tracking-v1") {
-    return Err(message("service does not support tracking archives"));
+    return Err(message("service does not support server tracking uploads"));
   }
   let Response::Files { files } = api.request(&Request::ListFiles {
     scope: scope.clone(),
@@ -263,7 +290,7 @@ pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> 
     }
   }
   if documents.is_empty() && streams.is_empty() {
-    return Err(message("run has no synchronized tracking data to archive"));
+    return Err(message("run has no received tracking data to upload"));
   }
   let Response::Archive { archive } = api.request(&Request::SealRun {
     scope: scope.clone(),
@@ -272,7 +299,7 @@ pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> 
     incomplete: partial,
   })?
   else {
-    return Err(message("service did not acknowledge its tracking archive"));
+    return Err(message("service did not acknowledge its result.zip upload"));
   };
   serde_json::to_value(tracking::archive_receipt(&api, scope, archive, partial)?)
     .map_err(Into::into)
@@ -311,7 +338,7 @@ fn push_cycle(
     RECORD_LIMIT,
   )?)?;
   if state.get("run_id").and_then(Value::as_str) != Some(scope.run_id.as_str()) {
-    return Err(message("run identity changed while synchronizing"));
+    return Err(message("run identity changed while publishing"));
   }
   let done = terminal(&state);
   if !done && !artifacts.is_empty() && !watch {

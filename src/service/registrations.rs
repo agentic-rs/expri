@@ -217,7 +217,7 @@ pub(crate) fn register_with_labels(run_dir: &Path, path: &str, labels: &[String]
     let previous_labels = previous.labels.clone();
     if registry.closed && labels.iter().any(|label| !previous_labels.contains(label)) {
       return Err(message(
-        "run file inventory is sealed; use service file-put for post-run outputs",
+        "run file inventory is sealed; use service file-upload for post-run outputs",
       ));
     }
     assign_labels(&mut registry, path, labels);
@@ -228,7 +228,7 @@ pub(crate) fn register_with_labels(run_dir: &Path, path: &str, labels: &[String]
   }
   if registry.closed {
     return Err(message(
-      "run file inventory is sealed; use service file-put for post-run outputs",
+      "run file inventory is sealed; use service file-upload for post-run outputs",
     ));
   }
   if registry.retired_paths.contains(path) {

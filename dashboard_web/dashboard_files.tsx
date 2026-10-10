@@ -95,7 +95,7 @@ export function formatFileSize(size: number): string {
 export function posixQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
-export function artifactPullCommand(
+export function artifactFetchCommand(
   scope: ArtifactScope | null,
   files: ArtifactFile[],
   selected: string[],
@@ -125,7 +125,7 @@ export function artifactPullCommand(
     ".",
   ];
   for (const path of paths) args.push("--artifact", path);
-  return `expri service pull ${args.map((value, index) => (index % 2 === 0 ? value : posixQuote(value))).join(" ")}`;
+  return `expri service fetch ${args.map((value, index) => (index % 2 === 0 ? value : posixQuote(value))).join(" ")}`;
 }
 function Locations({ file }: { file: ArtifactFile }) {
   const labels = [
@@ -208,7 +208,7 @@ export function FilesPanel({
   const pull_scope = artifactScopeMatchesRun(scope, source_id, run_id) ? scope : null;
   const downloadable = chosen.filter((file) => artifactDownloadUrl(file, source_id, run_id, pull_scope));
   const cloud = chosen.filter((file) => file.cloud === true);
-  const command = artifactPullCommand(pull_scope, files, selected, config_path);
+  const command = artifactFetchCommand(pull_scope, files, selected, config_path);
   useEffect(() => {
     setCopyStatus("");
   }, [command]);
@@ -284,7 +284,7 @@ export function FilesPanel({
                   <th scope="col">File</th>
                   <th scope="col">Size</th>
                   <th scope="col">Available in</th>
-                  <th scope="col">Sync status</th>
+                  <th scope="col">Transfer status</th>
                   <th scope="col">
                     <span className="sr-only">Download</span>
                   </th>
@@ -357,7 +357,7 @@ export function FilesPanel({
                         ) : (
                           <span className="muted">
                             {selectable && file.cloud === true
-                              ? "Pull with CLI"
+                              ? "Fetch with CLI"
                               : file.worker === true && file.cloud !== true && file.local !== true
                                 ? "Upload to download"
                                 : "Unavailable"}
@@ -373,7 +373,7 @@ export function FilesPanel({
           <p id="files-empty" className="muted" hidden={visible.length > 0}>
             {files.length
               ? "No files match this search."
-              : "No output files are available. Have the experiment save checkpoints in EXPRI_OUTPUT_DIR; upload or pull them to review their availability here."}
+              : "No output files are available. Have the experiment save checkpoints in EXPRI_OUTPUT_DIR; upload or download them to review their availability here."}
           </p>
           {catalog.truncated && (
             <p className="notice">
@@ -382,9 +382,9 @@ export function FilesPanel({
             </p>
           )}
           <p className="muted file-location-note">
-            Register a completed checkpoint to sync it while training. Registered and uploading
+            Register a completed checkpoint to publish it while training. Registered and uploading
             are worker reports; available in cloud means the server recorded the completed upload.
-            Downloaded locally comes from a verified pull receipt. Worker availability is reported,
+            Downloaded locally comes from a verified download receipt. Worker availability is reported,
             not a live check.
             {catalog.inventory_recorded_at
               ? ` Inventory reported ${dateText(catalog.inventory_recorded_at)}.`
@@ -485,11 +485,11 @@ export function FilesPanel({
               {command ? (
                 <>
                   <textarea
-                    id="artifact-pull-command"
+                    id="artifact-fetch-command"
                     ref={command_node}
                     className="file-command"
                     readOnly
-                    aria-label="Resumable service pull command"
+                    aria-label="Resumable service fetch command"
                     value={command}
                     rows={5}
                     spellCheck={false}

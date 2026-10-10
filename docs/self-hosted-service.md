@@ -13,6 +13,21 @@ Runs can start their own uploader when service publishing is configured. Explici
 service commands remain available for existing runs and selected checkpoints.
 The service does not schedule experiments.
 
+Each transfer has a direction and a named action:
+
+| Data | Direction | Action |
+| --- | --- | --- |
+| Source and config | Laptop → worker checkout | `expri -T gpu-1 push` |
+| Live tracking and registered checkpoints | Worker → server/S3 | Automatic publisher, or `expri service publish --watch` |
+| Completed private input files | Owner → S3 | `expri service input upload` |
+| Required private input files | S3 → worker cache | Automatic preparation, or `expri service input download` |
+| Tracking bundle (`result.zip`) | Server → S3 | Automatic server upload, or `expri service upload` |
+| Run metadata and selected outputs | Server/S3 → laptop | `expri fetch --watch` |
+
+`--watch` repeats one action. Source pushing and result fetching run separately;
+each has its own retry loop. The server coordinates file transfers, while signed
+URLs let workers and laptops transfer large file bytes directly to or from S3.
+
 ## Service configuration
 
 Keep this configuration on the server:
@@ -54,9 +69,9 @@ address. `--create-bucket` explicitly provisions a private bucket; it is omitted
 when using an existing bucket.
 
 Persist and back up the entire service data directory. It contains SQLite,
-original tracking files under `tracking/`, staged archives under `archives/`, and
+original tracking files under `tracking/`, staged result ZIPs under `archives/`, and
 multipart receipts. The S3 bucket alone does not replace this directory.
-Archiving retains the hot files and SQLite data; expri does not delete them
+Server uploads retain the hot files and SQLite data; expri does not delete them
 automatically. Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
@@ -82,7 +97,7 @@ password_env = "EXPRI_DASHBOARD_PASSWORD"
 Provide a strong, separate `EXPRI_DASHBOARD_PASSWORD` containing 16 to 256
 printable ASCII bytes. It must differ from all owner and worker bearer tokens.
 Open the configured HTTPS URL and sign in with this dashboard password.
-The dashboard discovers synced projects and provides run details,
+The dashboard discovers published projects and provides run details,
 parameters, metric comparisons, charts, bounded log tails, and a **Files** tab.
 Select **Storage** in a project to browse completed cloud objects. Its
 **Private inputs** list shows input IDs and sizes, while **Run outputs** shows
@@ -107,13 +122,13 @@ are added. The run browser widens and contains the table's horizontal scrolling.
 Below 860 CSS pixels, the run browser stacks above the review with scrolling
 still contained in **Runs**. Sorting and column changes preserve the current
 review; these choices last for the current page.
-Workers must push a run before it appears. Files shows output names, sizes, and
+Workers must publish a run before it appears. Files shows output names, sizes, and
 availability without reading checkpoint contents. **Worker (reported)** reflects
 the last published inventory; **Cloud** means a finalized file is downloadable.
 The per-run **Files** tab can therefore show a checkpoint reported on its
 worker before it appears in project **Storage**. Storage shows only completed
 cloud objects for the selected project, across all its machines and runs.
-The **Sync status** column distinguishes **Registered**, **Uploading**,
+The **Transfer status** column distinguishes **Registered**, **Uploading**,
 **Available in cloud**, and **Needs attention**. Registration records the
 completed checkpoint locally; the background publisher handles hashing and
 transfer. A temporary upload failure shows **Retrying upload** with a concise
@@ -123,12 +138,12 @@ labels appear beside immutable checkpoint names; moving a label does not copy
 or upload the checkpoint again.
 Labels marked **pending** still refer to a registered checkpoint awaiting cloud
 confirmation. If an older cloud file exists at the same path, its download
-remains available while the sync status stays registered or uploading; it does
+remains available while the transfer status stays registered or uploading; it does
 not confirm the label until its recorded size and SHA256 match the registration.
 The hosted page cannot inspect your laptop's disk. Local dashboards show files
 actually present in the run or review cache; cached cloud availability is a
-record of the last pull rather than a live storage check.
-**Downloaded locally** requires a saved successful pull receipt matching the
+record of the last fetch rather than a live storage check.
+**Downloaded locally** requires a saved successful download receipt matching the
 current recorded object and the local file's size and modification time.
 The dashboard reads metadata rather than checkpoint contents. If a local file
 has changed or its cloud object has been replaced, its local location remains
@@ -138,11 +153,11 @@ receipts show local presence without claiming a verified download.
 Select up to 64 files. **Download selected files** provides individual browser
 download links; the browser handles file bytes directly. Cloud downloads require
 your dashboard session and use short-lived attachment links with no referrer.
-Browser restart recovery depends on your browser; use the generated CLI pull
+Browser restart recovery depends on your browser; use the generated CLI fetch
 command for expri's durable resume. Enter the path to an existing service client
 configuration on the computer running that command. No token is copied from the
 browser into the command. Browser downloads in Storage use the same authenticated
-attachment flow. For large checkpoints, use the generated CLI pull command for
+attachment flow. For large checkpoints, use the generated CLI fetch command for
 durable resume. Private input and checkpoint uploads remain CLI operations.
 
 The hosted dashboard listens for small server-sent revision notifications and
@@ -155,10 +170,10 @@ bounded previews and preserve selection, filters, the active tab, zoom, and
 hidden curves. **Auto refresh** pauses updates;
 hidden/offline pages pause automatically, and connection failures retry more
 slowly while keeping the current view. Configure automatic publishing or run
-`push --watch` for live forwarding; dashboard refresh does not initiate an upload.
-The run detail displays archive progress separately from training status, and
-provides an authenticated **Download archive** link after upload succeeds.
-A recovery export is visibly marked as a partial archive.
+`expri service publish --watch` for live forwarding; dashboard refresh does not initiate an upload.
+The run detail displays server upload progress separately from training status, and
+provides an authenticated **Download result.zip** link after upload succeeds.
+A recovery export is visibly marked as a partial result.
 
 Browser access is read-only unless project deletion is explicitly enabled on the
 primary dashboard. Sign-in issues an eight-hour Secure, HttpOnly,
@@ -212,14 +227,14 @@ than 16 MiB. Original timestamps and repeated or reset steps are preserved.
 Malformed or oversized metric rows stay in the raw file and produce preview
 warnings. Charts retain bounded sampled points, and log tails read at most
 64 KiB. Last/min/max summaries use every valid point. Legacy S3 metric previews
-retain their 16 MiB limit; pull larger legacy files for local review.
+retain their 16 MiB limit; fetch larger legacy files for local review.
 The local CLI remains available for complete files and older runs.
 
 For main and branch UIs sharing this service, see [dashboard deployments](deployment.md).
 
 ## Worker uploads
 
-Create a client configuration on the worker, outside the synced source repo:
+Create a client configuration on the worker, outside the pushed source repo:
 
 ```toml
 url = "https://expri.example.net"
@@ -270,8 +285,8 @@ It does not rerun training. The queue lives at the original checkout's
 `.expri/service-sync`; keep it and the original run files until publication is
 acknowledged. Publishers survive terminal closure and task completion, but must
 be resumed after a worker reboot. For new tracking runs, `synced` means all
-terminal tracking bytes and registered checkpoints were acknowledged and the archive job was accepted;
-it does not mean the independent S3 archive upload has finished. Archive
+terminal tracking bytes and registered checkpoints were acknowledged and the server upload job was accepted;
+it does not mean the independent result ZIP upload has finished. Upload
 failures retain tracking data and retry without restarting training. For legacy
 queues, `synced` retains its original upload-completion meaning. A completed task
 alone does not imply that its results reached the service. The optional dashboard link opens the run after sign-in and waits for
@@ -286,7 +301,7 @@ execution and fallback behavior.
 For existing runs, live publishing can also be started explicitly:
 
 ```sh
-expri service push --config worker.toml \
+expri service publish --config worker.toml \
   --project-id vision --origin gpu-1 \
   --run-dir .expri/runs/run-abc123 --watch
 ```
@@ -320,41 +335,41 @@ Keep each registered file unchanged until its status is **cloud**. Use a new
 filename for each completed checkpoint. `best` and `latest` are movable aliases
 in the inventory; they select existing files and create no extra S3 objects.
 Changing a registered file produces **needs attention**, which prevents the
-publisher from claiming final sync. Register the corrected file under a new
+publisher from claiming completed publication. Register the corrected file under a new
 path, then explicitly remove the failed handoff with
 `expri artifact unregister outputs/bad.pt --run-dir .expri/runs/run-abc123`.
 This leaves the file, cloud objects, and saved multipart receipts untouched.
 Active and successful registrations cannot be unregistered.
 
-The inventory closes before terminal archive sealing. Exact repeated
+The inventory closes before terminal result sealing. Exact repeated
 registrations remain idempotent, but adding files or moving aliases after
-closure is rejected. Use `service file-put` for post-run uploads. A training
+closure is rejected. Use `service file-upload` for post-run uploads. A training
 exit does not discard pending checkpoint transfers.
 
 If a training machine disappears, the server can recover its last acknowledged
 prefix. Data still waiting on the worker can be lost. Pull the received files
-normally, or use an owner configuration to create a recovery archive:
+normally, or use an owner configuration to request a recovery upload:
 
 ```sh
-expri service archive --config owner.toml --project-id vision --origin gpu-1 \
+expri service upload --config owner.toml --project-id vision --origin gpu-1 \
   --run-id run-abc123 --partial
 ```
 
 `--partial` captures received document versions and stream lengths without
 sealing a still-active run or changing its training status. Omit `--partial` to
-archive a terminal run. Normal archives require current revisions and lengths;
+upload a terminal run. Normal uploads require current revisions and lengths;
 refresh and retry if they changed during the request. Partial exports can use
 captured completed document revisions and stream prefixes while publication
 continues. Network silence does not mark a run as lost or trigger a partial
-archive.
+upload.
 
 The server builds `result.zip` from its acknowledged files and includes a
 `manifest.json` identifying scope, completeness, paths, revisions, and lengths.
 The ZIP contains run state, snapshot/environment metadata, parameters, artifact
 inventory, metrics JSONL, stdout and stderr as available. It excludes datasets
-and checkpoints. Persistent jobs and multipart receipts resume archive uploads
+and checkpoints. Persistent jobs and multipart receipts resume result ZIP uploads
 after a service restart or storage outage. No tracking file is deleted after
-archiving.
+upload.
 
 The client negotiates `tracking-v1` and pins that protocol in its durable queue.
 Existing queues that already published files remain on their legacy protocol;
@@ -365,7 +380,7 @@ leave negotiation pending for retry.
 Large result files are selected explicitly after the run is terminal:
 
 ```sh
-expri service push --config worker.toml \
+expri service publish --config worker.toml \
   --project-id vision --origin gpu-1 \
   --run-dir .expri/runs/run-abc123 --artifact outputs/checkpoint.pt
 ```
@@ -386,7 +401,7 @@ The service uses up to 1,000 parts per file, from 8 MiB to 5 GiB per part, and
 accepts files up to 1,000 × 5 GiB. This keeps resumable-upload receipts below the
 1 MiB control-response limit. Live stream batches are limited to 64 KiB. New
 tracking runs retain raw files
-and their SQLite projection after archiving. Legacy publishers continue removing
+and their SQLite projection after uploading. Legacy publishers continue removing
 completed stream records after their individual S3 objects are published.
 
 ## Local download and dashboard
@@ -395,7 +410,7 @@ To continuously receive metadata and selected checkpoints, configure the
 laptop's client separately from the worker's publishing credentials:
 
 ```toml
-[file_sync]
+[fetch]
 client_config = "/home/me/.config/expri/owner.toml"
 project_id = "vision"
 origins = ["gpu-1", "gpu-2"]
@@ -404,16 +419,15 @@ labels = ["best", "latest"]
 ```
 
 ```sh
-expri sync --watch
-expri -T gpu-1 sync --watch
+expri fetch --watch
+expri -T gpu-1 push --watch
 ```
 
-With `[file_sync]`, no `-T` watches only the listed service origins. With an
-explicit target, the same process also syncs source/config to that worker's
-checkout. Source changes do not modify a running experiment's frozen snapshot.
-Without `[file_sync]`, source syncing keeps its existing target selection.
-`--pull` and path-scoped transfers retain their source-only behavior and cannot
-be combined with `--watch`.
+`fetch` uses the listed service origins and runs on the laptop. `push` uses a
+selected worker target and updates its source/config checkout. Source changes
+do not modify a running experiment's frozen snapshot. `fetch` never pushes
+source changes, and `push` never downloads service results. Path-scoped source
+transfers cannot be combined with `push --watch`.
 
 The watcher polls every five seconds, slows retries during outages, and keeps
 verified local files available. Missing labels or checkpoints are pending until
@@ -421,22 +435,27 @@ the completed matching object arrives; partial bytes never enter the review
 cache. Unchanged catalogs skip transfers; restarting reuses verified checkpoint
 files and durable tracking offsets. The watcher retains previously selected
 files when aliases move. Stop it with Ctrl-C; training and publishing continue.
-Omit `--watch` for one sync pass, or add `--dry-run` to inspect selections without
+Omit `--watch` for one fetch pass, or add `--dry-run` to inspect selections without
 publishing files locally. Dry-run reports identify labels that need the run's
 inventory to resolve; they do not treat those labels as unavailable files.
 Reports are bounded and watch summaries stay compact.
 
+Existing `[file_sync]` configuration is accepted as an alias for `[fetch]`.
+Older `sync`, `service push`, `service pull`, `service archive`, `input put/get`,
+and `service file-put` commands remain available as hidden compatibility names;
+new commands use the direction-specific verbs above.
+
 Use an owner client configuration with the same URL and the owner token's
-variable name. Pull metadata, metrics, parameters, and logs by default, and
+variable name. Fetch metadata, metrics, parameters, and logs by default, and
 select checkpoints separately:
 
 ```sh
 expri service list --config owner.toml --project-id vision --origin gpu-1
-expri service pull --config owner.toml --project-id vision --origin gpu-1 \
+expri service fetch --config owner.toml --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo .
-expri service pull --config owner.toml --project-id vision --origin gpu-1 \
+expri service fetch --config owner.toml --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo . --artifact outputs/checkpoint.pt
-expri service pull --config owner.toml --project-id vision --origin gpu-1 \
+expri service fetch --config owner.toml --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo . --artifact result.zip
 expri dashboard
 ```
@@ -449,15 +468,15 @@ The existing cached CLI and dashboard read this directory without contacting
 any service or worker.
 Selected checkpoint downloads retry bounded 8 MiB ranges and save progress under
 `results/<source>/.service-pull/<run_id>/`, outside the visible review cache.
-After an interruption, run the same `service pull` command again. Unchanged
+After an interruption, run the same `service fetch` command again. Unchanged
 object records continue from their last durable range; new signed URLs are
 obtained for each request, and the existing full-file SHA256 check must pass
 before publication. Versioned tracking metadata refreshes when its revision
 changes; tracking
 metrics and logs append from their durable saved offsets, including across
-successful pulls. Legacy mutable metadata and logs refresh on each invocation.
+successful fetches. Legacy mutable metadata and logs refresh on each invocation.
 Previous cached files remain available during transfer, and checkpoints selected
-earlier stay in the cache. Pull reports include resumed file/byte counts. Keep
+earlier stay in the cache. Fetch reports include resumed file/byte counts. Keep
 the private staging directory to retain interrupted download progress; no tokens
 or signed URLs are saved there.
 
@@ -476,9 +495,9 @@ Input IDs are immutable within a project. Publish a changed dataset with a new
 ID rather than replacing bytes under the old ID:
 
 ```sh
-expri service input put --config owner.toml --project-id vision \
+expri service input upload --config owner.toml --project-id vision \
   --input-id dataset-v1 --file /private/data/train.bin
-expri service input get --config worker.toml --project-id vision \
+expri service input download --config worker.toml --project-id vision \
   --input-id dataset-v1 --destination .expri/inputs/dataset-v1.bin
 ```
 
@@ -543,10 +562,10 @@ Set `CHECKPOINT_SIZE` and `CHECKPOINT_SHA256` to the source's saved values. Refe
 the project's Storage view and use the usual input and artifact downloads.
 Workers may retrieve referenced inputs, but only the owner may create references.
 
-To publish one file independently of run completion, use `expri service file-put`:
+To publish one file independently of run completion, use `expri service file-upload`:
 
 ```sh
-expri service file-put --config owner.toml \
+expri service file-upload --config owner.toml \
   --target '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-1"},"path":"outputs/best.pt"}' \
   --file /private/checkpoints/best.pt
 ```
@@ -563,13 +582,13 @@ independent of the selected list, search, or page. **S3 storage** counts each
 recorded S3 key once, including retained completed uploads that no current file
 uses. Referencing the same dataset as an input and output does not increase this
 total. **Local storage** counts acknowledged tracking documents, metrics, logs,
-and staged or retained `result.zip` archives in the server's service data
+and staged or retained `result.zip` files in the server's service data
 directory. It does not measure files on workers or your laptop. Pending uploads
 show declared file sizes separately, rather than bytes received.
 
 These are catalog statistics, not the bucket's total billable storage. They do
 not include unrelated or unrecorded objects, historical S3 versions, temporary
-archive-building files, filesystem allocation overhead, or shared database
+ZIP-building files, filesystem allocation overhead, or shared database
 overhead. Projects that share an S3 key each include that key once in their own
 total; adding project totals can still count cross-project shared objects more
 than once. The deletion preview estimates reclaimable objects, excluding keys
@@ -581,7 +600,7 @@ expri service project delete-preview --config owner.toml --project-id vision
 ```
 
 Project deletion removes its server-side runs, private inputs, tracking files,
-staged archives, and eligible S3 objects. It does not stop training or remove
+staged result ZIPs, and eligible S3 objects. It does not stop training or remove
 worker and laptop files. Stop publishers before deleting a project. The service
 permanently rejects further writes to that project ID, including delayed retries
 from old publishers; use a new project ID for subsequent experiments. Current
@@ -665,7 +684,7 @@ training reaches a watching laptop while that run is still active. A later run
 reuses its verified private input with the service offline. The suite verifies
 independent server ZIP completion,
 original tracking bytes without per-file S3 uploads, recovery of an acknowledged
-prefix while the worker is offline, and owner-requested partial archives. Failed and cancelled runs also finish publishing
+prefix while the worker is offline, and owner-requested partial uploads. Failed and cancelled runs also finish publishing
 their original task status and logs without selecting a checkpoint.
 Versioned MinIO also exercises usage totals for shared references, retained
 uploads, pending multipart uploads, and tracking bytes. An isolated project is

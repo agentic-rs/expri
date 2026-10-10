@@ -37,8 +37,8 @@ fn record(path: &str, bytes: &[u8]) -> FileRecord {
   }
 }
 
-fn options(root: &Path, config: PathBuf) -> FileSyncOptions {
-  FileSyncOptions {
+fn options(root: &Path, config: PathBuf) -> FetchOptions {
+  FetchOptions {
     config,
     project_id: "project".into(),
     origins: vec!["worker".into()],
@@ -118,7 +118,7 @@ fn missing_checkpoint_stays_pending_then_downloads_and_unchanged_cycle_skips_tra
     json!(["outputs/checkpoint.pt"])
   );
   let second = watcher.cycle().unwrap();
-  assert_eq!(second["status"], "synchronized");
+  assert_eq!(second["status"], "fetched");
   let destination = PathBuf::from(second["runs"][0]["destination"].as_str().unwrap());
   assert_eq!(
     std::fs::read(destination.join("outputs/checkpoint.pt")).unwrap(),
@@ -161,19 +161,19 @@ fn authentication_rejection_stops_watch_without_replaying_or_printing_credential
     (401, Vec::new(), br#"{"error":"private-token"}"#.to_vec())
   });
   let options = options(&root, config(&root, &url));
-  let error = sync(options).unwrap_err().to_string();
+  let error = fetch(options).unwrap_err().to_string();
   task.join().unwrap();
   assert!(error.contains("authorization"));
   assert!(!error.contains("private-token"));
 }
 
 #[test]
-fn one_shot_sync_returns_a_safe_error_when_the_service_is_unavailable() {
+fn one_shot_fetch_returns_a_safe_error_when_the_service_is_unavailable() {
   let (_temporary, root) = root();
   let (url, task) = mock(1, |_, _| {
     (503, Vec::new(), br#"{"error":"private-token"}"#.to_vec())
   });
-  let error = sync(options(&root, config(&root, &url))).unwrap_err();
+  let error = fetch(options(&root, config(&root, &url))).unwrap_err();
   task.join().unwrap();
   assert_ne!(error.exit_code(), 0);
   assert!(error.to_string().contains("--watch"));
@@ -329,7 +329,7 @@ fn best_and_latest_labels_download_one_completed_object() {
   options.labels = vec!["best".into(), "latest".into()];
   let mut watcher = Watcher::new(&options).unwrap();
   let first = watcher.cycle().unwrap();
-  assert_eq!(first["status"], "synchronized");
+  assert_eq!(first["status"], "fetched");
   assert_eq!(first["runs"][0]["pending_files"], json!([]));
   let second = watcher.cycle().unwrap();
   assert_eq!(second["runs"][0]["downloaded_bytes"], 0);
@@ -520,7 +520,7 @@ fn blocked_checkpoint_get_does_not_block_new_metadata_or_overwrite_its_receipt()
     thread::sleep(Duration::from_millis(10));
   }
   let final_report = watcher.cycle().unwrap();
-  assert_eq!(final_report["status"], "synchronized");
+  assert_eq!(final_report["status"], "fetched");
   let final_receipt: Value =
     serde_json::from_slice(&std::fs::read(destination.join("pull-state.json")).unwrap()).unwrap();
   assert_eq!(final_receipt["pulled_at"], metadata_receipt["pulled_at"]);
@@ -556,7 +556,7 @@ fn dry_run_explains_unresolved_labels_without_creating_a_local_cache() {
   options.watch = true;
   options.artifacts.clear();
   options.labels = vec!["best".into()];
-  let report = sync(options).unwrap();
+  let report = fetch(options).unwrap();
   server.join().unwrap();
   assert_eq!(report["runs"][0]["must_read_inventory"], true);
   assert_eq!(report["runs"][0]["requested_labels"], json!(["best"]));

@@ -132,6 +132,98 @@ fn root() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
+fn server_upload_translates_completed_status_without_changing_legacy_receipts() {
+  let (_temporary, root) = root();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "run-upload".into(),
+  };
+  let expected = scope.clone();
+  let (url, task) = mock(6, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => Response::Capabilities {
+        features: vec!["tracking-v1".into()],
+      },
+      Request::ListFiles { scope } => {
+        assert_eq!(scope, expected);
+        Response::Files {
+          files: vec![FileRecord {
+            target: run_target(&scope, "run-state.json"),
+            size: 10,
+            sha256: None,
+            storage: FileStorage::Tracking {
+              revision: 7,
+              sealed: true,
+            },
+          }],
+        }
+      }
+      Request::SealRun {
+        scope,
+        documents,
+        streams,
+        incomplete,
+      } => {
+        assert_eq!(scope, expected);
+        assert_eq!(
+          documents,
+          std::collections::BTreeMap::from([("run-state.json".into(), 7)])
+        );
+        assert!(streams.is_empty());
+        assert!(!incomplete);
+        Response::Archive {
+          archive: ArchiveRecord {
+            status: "archived".into(),
+            incomplete: false,
+            file: Some(FileRecord {
+              target: run_target(&scope, "result.zip"),
+              size: 22,
+              sha256: Some("a".repeat(64)),
+              storage: FileStorage::Object,
+            }),
+            last_error: None,
+          },
+        }
+      }
+      other => panic!("unexpected upload request: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let config = config(&root, &url);
+  let legacy = archive(&config, &scope, false).unwrap();
+  let canonical = server_upload(&config, &scope, false).unwrap();
+  task.join().unwrap();
+  assert_eq!(legacy["status"], "archived");
+  assert_eq!(canonical["status"], "uploaded");
+  let mut expected = legacy.clone();
+  expected["status"] = json!("uploaded");
+  assert_eq!(canonical, expected);
+  assert!(!root.join(".expri").exists());
+}
+
+#[test]
+fn public_upload_report_keeps_queue_state_and_other_statuses_compatible() {
+  for status in ["pending", "uploading", "archived", "failed"] {
+    let saved = json!({"archive":{"status":status, "incomplete":false,
+      "file":null,"last_error":null},"stream_offsets":{"outputs/metrics.jsonl":12}});
+    let mut report = saved.clone();
+    add_result_upload(&mut report);
+    assert_eq!(report["archive"], saved["archive"]);
+    assert_eq!(
+      report["result_upload"]["status"],
+      if status == "archived" {
+        "uploaded"
+      } else {
+        status
+      }
+    );
+    assert_eq!(saved["archive"]["status"], status);
+    assert_eq!(report["stream_offsets"], saved["stream_offsets"]);
+  }
+}
+
+#[test]
 fn project_client_requests_preserve_exact_owner_scope_revision_and_confirmation() {
   let (_temporary, root) = root();
   let stats = json!({

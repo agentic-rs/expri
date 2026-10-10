@@ -1,4 +1,4 @@
-//! Pull a project's acknowledged metadata and selected completed objects.
+//! Fetch a project's acknowledged metadata and selected completed objects.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::super::types::*;
-use super::super::{FileSyncOptions, PullOptions};
+use super::super::{FetchOptions, PullOptions};
 use super::download::{ObjectResult, pull, pull_objects, pull_pinned, validate_record};
 use super::{Api, METADATA, STREAMS, artifacts, fs};
 use crate::error::{ExpriError, Result};
@@ -44,7 +44,7 @@ impl CachedRun {
     let destination = PathBuf::from(
       report["destination"]
         .as_str()
-        .ok_or_else(|| fs::message("pull did not return its destination"))?,
+        .ok_or_else(|| fs::message("fetch did not return its destination"))?,
     );
     let mut files = BTreeMap::new();
     for path in report["files"]
@@ -69,7 +69,7 @@ impl CachedRun {
 }
 
 struct Watcher<'a> {
-  options: &'a FileSyncOptions,
+  options: &'a FetchOptions,
   api: Api,
   selected: BTreeSet<String>,
   origins: BTreeSet<String>,
@@ -95,7 +95,7 @@ fn permanent_rejection(error: &ExpriError) -> Option<&'static str> {
   match error {
     ExpriError::ServiceRejected {
       status: 401 | 403, ..
-    } => Some("file sync authorization was rejected; check the service token and origin"),
+    } => Some("fetch authorization was rejected; check the service token and origin"),
     ExpriError::ServiceRejected { status: 410, .. } => {
       Some("this project was deleted; saved local files were retained")
     }
@@ -118,12 +118,12 @@ fn failed(error: &ExpriError, phase: &'static str) -> Result<Value> {
   };
   Ok(
     json!({"status":"retrying", "phase":phase, "status_code":status,
-    "message":"Saved local files and transfer progress were retained; sync will retry."}),
+    "message":"Saved local files and transfer progress were retained; fetch will retry."}),
   )
 }
 
 impl<'a> Watcher<'a> {
-  fn new(options: &'a FileSyncOptions) -> Result<Self> {
+  fn new(options: &'a FetchOptions) -> Result<Self> {
     validate_component(&options.project_id)?;
     if options.origins.is_empty() || options.origins.len() > 64 {
       return Err(fs::message(
@@ -215,7 +215,7 @@ impl<'a> Watcher<'a> {
     let (artifacts, pending) = self.selection(&records, &resolved);
     if !records.contains_key("run-state.json") {
       return Ok(json!({"status":"pending", "pending_files":pending,
-        "message":"Run metadata has not been synchronized yet."}));
+        "message":"Run metadata has not been published yet."}));
     }
     if self.options.dry_run {
       return Ok(json!({"status":"planned", "available_files":artifacts,
@@ -282,9 +282,7 @@ impl<'a> Watcher<'a> {
       Err(error) => return failed(&error, "file_catalog"),
     };
     if !records.contains_key("run-state.json") {
-      return Ok(
-        json!({"status":"pending","message":"Run metadata has not been synchronized yet."}),
-      );
+      return Ok(json!({"status":"pending","message":"Run metadata has not been published yet."}));
     }
     let key = (scope.origin.clone(), scope.run_id.clone());
     let metadata = serde_json::to_value(
@@ -654,7 +652,7 @@ impl<'a> Watcher<'a> {
     }
     Ok(
       json!({"project_id":self.options.project_id, "dry_run":self.options.dry_run,
-      "status":if retrying > 0 {"retrying"} else if pending > 0 {"pending"} else {"synchronized"},
+      "status":if retrying > 0 {"retrying"} else if pending > 0 {"pending"} else {"fetched"},
       "run_count":count, "pending_runs":pending, "retrying_runs":retrying, "downloaded_bytes":downloaded_bytes,
       "active_transfers":usize::from(self.task.is_some()),
       "runs":runs, "runs_truncated":truncated}),
@@ -662,7 +660,7 @@ impl<'a> Watcher<'a> {
   }
 }
 
-pub fn sync(options: FileSyncOptions) -> Result<Value> {
+pub fn fetch(options: FetchOptions) -> Result<Value> {
   let mut watcher = Watcher::new(&options)?;
   let mut last_report = None;
   let mut failures = 0;
@@ -671,7 +669,7 @@ pub fn sync(options: FileSyncOptions) -> Result<Value> {
     if !options.watch || options.dry_run {
       if report["retrying_runs"].as_u64().unwrap_or(0) > 0 {
         return Err(fs::message(
-          "file sync could not finish; saved local files and progress were retained. Rerun the command or use --watch to retry automatically.",
+          "fetch could not finish; saved local files and progress were retained. Rerun the command or use --watch to retry automatically.",
         ));
       }
       return Ok(report);

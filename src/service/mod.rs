@@ -12,7 +12,7 @@ mod storage;
 mod store;
 pub(crate) mod types;
 
-pub(crate) use client::sync_files;
+pub(crate) use client::fetch_files;
 pub(crate) use types::validate_component;
 
 use std::net::SocketAddr;
@@ -23,7 +23,7 @@ use clap::{Args, Subcommand};
 use crate::error::{ExpriError, Result};
 
 #[derive(Clone, Debug)]
-pub struct FileSyncOptions {
+pub struct FetchOptions {
   pub config: PathBuf,
   pub project_id: String,
   pub origins: Vec<String>,
@@ -61,7 +61,9 @@ enum ServiceSubcommand {
     #[arg(long)]
     create_bucket: bool,
   },
-  /// Upload saved run files; watch forwards live metrics without blocking training.
+  /// Publish saved run data; watch forwards live metrics without blocking training.
+  Publish(PushOptions),
+  #[command(hide = true)]
   Push(PushOptions),
   /// Resume the saved automatic publisher on this worker.
   Resume {
@@ -74,6 +76,8 @@ enum ServiceSubcommand {
     run_dir: PathBuf,
   },
   /// Download selected run files into the existing offline review cache.
+  Fetch(PullOptions),
+  #[command(hide = true)]
   Pull(PullOptions),
   /// List runs recorded by the service.
   List {
@@ -84,25 +88,17 @@ enum ServiceSubcommand {
     #[arg(long)]
     origin: String,
   },
-  /// Ask the server to archive received tracking files without downloading them first.
-  Archive {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
-    project_id: String,
-    #[arg(long)]
-    origin: String,
-    #[arg(long)]
-    run_id: String,
-    /// Export an acknowledged prefix of an unfinished run; requires an owner token.
-    #[arg(long)]
-    partial: bool,
-  },
+  /// Ask the server to bundle received tracking files and upload result.zip to S3.
+  Upload(UploadOptions),
+  #[command(hide = true)]
+  Archive(UploadOptions),
   /// Reference a completed object as an output or reusable input without copying bytes.
   Reference(ReferenceOptions),
-  /// Upload one explicit run output or metadata file without creating a run archive.
+  /// Upload one explicit run output or metadata file.
+  FileUpload(FilePutOptions),
+  #[command(hide = true)]
   FilePut(FilePutOptions),
-  /// Publish or retrieve an immutable private input file.
+  /// Upload or download an immutable private input file.
   Input {
     #[command(subcommand)]
     command: InputCommand,
@@ -111,7 +107,13 @@ enum ServiceSubcommand {
 
 #[derive(Debug, Subcommand)]
 enum InputCommand {
+  /// Upload an immutable private input to S3.
+  Upload(InputPutOptions),
+  /// Download a private input using verified local cache reuse.
+  Download(InputGetOptions),
+  #[command(hide = true)]
   Put(InputPutOptions),
+  #[command(hide = true)]
   Get(InputGetOptions),
 }
 
@@ -179,6 +181,21 @@ pub struct PullOptions {
   pub source: Option<String>,
   #[arg(long = "artifact")]
   pub artifacts: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct UploadOptions {
+  #[arg(long)]
+  config: PathBuf,
+  #[arg(long)]
+  project_id: String,
+  #[arg(long)]
+  origin: String,
+  #[arg(long)]
+  run_id: String,
+  /// Upload an acknowledged prefix of an unfinished run; requires an owner token.
+  #[arg(long)]
+  partial: bool,
 }
 
 #[derive(Debug, Args)]
@@ -273,35 +290,41 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       let config = toml::from_str(&std::fs::read_to_string(config)?)?;
       return server::serve(config, listen, data_dir, create_bucket);
     }
+    ServiceSubcommand::Publish(options) => client::publish(options)?,
     ServiceSubcommand::Push(options) => client::push(options)?,
     ServiceSubcommand::Resume { run_dir } => publishing::resume(&run_dir)?,
     ServiceSubcommand::PublishWorker { run_dir } => return publishing::worker(&run_dir),
-    ServiceSubcommand::Pull(options) => client::pull(options)?,
+    ServiceSubcommand::Fetch(options) | ServiceSubcommand::Pull(options) => client::pull(options)?,
     ServiceSubcommand::List {
       config,
       project_id,
       origin,
     } => client::list(config, project_id, origin)?,
-    ServiceSubcommand::Archive {
-      config,
-      project_id,
-      origin,
-      run_id,
-      partial,
-    } => client::archive(
-      &config,
+    ServiceSubcommand::Upload(options) => client::server_upload(
+      &options.config,
       &types::RunScope {
-        project_id,
-        origin,
-        run_id,
+        project_id: options.project_id,
+        origin: options.origin,
+        run_id: options.run_id,
       },
-      partial,
+      options.partial,
     )?,
-    ServiceSubcommand::FilePut(options) => client::file_put(options)?,
+    ServiceSubcommand::Archive(options) => client::archive(
+      &options.config,
+      &types::RunScope {
+        project_id: options.project_id,
+        origin: options.origin,
+        run_id: options.run_id,
+      },
+      options.partial,
+    )?,
+    ServiceSubcommand::FileUpload(options) | ServiceSubcommand::FilePut(options) => {
+      client::file_put(options)?
+    }
     ServiceSubcommand::Reference(options) => client::reference(options)?,
     ServiceSubcommand::Input { command } => match command {
-      InputCommand::Put(options) => client::input_put(options)?,
-      InputCommand::Get(options) => client::input_get(options)?,
+      InputCommand::Upload(options) | InputCommand::Put(options) => client::input_put(options)?,
+      InputCommand::Download(options) | InputCommand::Get(options) => client::input_get(options)?,
     },
   };
   println!("{}", serde_json::to_string(&report)?);
@@ -317,6 +340,74 @@ mod tests {
   struct Cli {
     #[command(flatten)]
     service: ServiceCommand,
+  }
+
+  #[test]
+  fn service_help_exposes_directional_verbs_and_hides_legacy_names() {
+    use clap::CommandFactory;
+    let mut cli = Cli::command();
+    let help = cli.render_long_help().to_string();
+    for name in ["publish", "fetch", "upload", "file-upload"] {
+      assert!(
+        help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+    }
+    for name in ["push", "pull", "archive", "file-put"] {
+      assert!(
+        !help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+      assert!(cli.find_subcommand(name).is_some());
+    }
+    let input = cli.find_subcommand_mut("input").unwrap();
+    let help = input.render_long_help().to_string();
+    for name in ["upload", "download"] {
+      assert!(
+        help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+    }
+    for name in ["put", "get"] {
+      assert!(
+        !help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+      assert!(input.find_subcommand(name).is_some());
+    }
+    assert!(!help.contains("archive"));
+  }
+
+  #[test]
+  fn canonical_and_legacy_server_upload_commands_accept_the_same_arguments() {
+    for operation in ["upload", "archive"] {
+      let cli = Cli::try_parse_from([
+        "expri",
+        operation,
+        "--config",
+        "owner.toml",
+        "--project-id",
+        "vision",
+        "--origin",
+        "gpu-1",
+        "--run-id",
+        "training-1",
+        "--partial",
+      ])
+      .unwrap();
+      let options = match cli.service.command {
+        ServiceSubcommand::Upload(options) | ServiceSubcommand::Archive(options) => options,
+        _ => panic!("unexpected operation"),
+      };
+      assert_eq!(options.project_id, "vision");
+      assert_eq!(options.origin, "gpu-1");
+      assert_eq!(options.run_id, "training-1");
+      assert!(options.partial);
+    }
   }
 
   #[test]

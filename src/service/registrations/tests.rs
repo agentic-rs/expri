@@ -123,7 +123,7 @@ fn sealed_inventory_rejects_new_handoffs_and_alias_moves_but_keeps_exact_repeats
     register(&root, "outputs/2.pt")
       .unwrap_err()
       .to_string()
-      .contains("file-put")
+      .contains("file-upload")
   );
 }
 

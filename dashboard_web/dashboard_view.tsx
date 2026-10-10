@@ -29,6 +29,7 @@ import {
   type Comparison,
   type ComparisonReduction,
   type Detail,
+  type ResultUploadRecord,
   type Json,
   type Review,
   type ReviewTab,
@@ -723,7 +724,7 @@ function RunBrowser({
                 target="_blank"
                 rel="noopener noreferrer"
               >
-                Set up result syncing
+                Set up result publishing
               </a>
             </p>
           )}
@@ -873,7 +874,7 @@ function Overview({ detail }: { detail: Detail | null }) {
                   </tbody>
                 </table>
               ) : (
-                <p className="muted">No parameters were recorded or pulled.</p>
+                <p className="muted">No parameters were recorded or downloaded.</p>
               )}
             </section>
           </div>
@@ -910,7 +911,7 @@ function Overview({ detail }: { detail: Detail | null }) {
               </div>
             ) : (
               <p className="muted">
-                No metric summaries are available. Record metrics in outputs/metrics.jsonl or pull
+                No metric summaries are available. Record metrics in outputs/metrics.jsonl or download
                 remote metrics.
               </p>
             )}
@@ -926,26 +927,29 @@ function Overview({ detail }: { detail: Detail | null }) {
     </div>
   );
 }
-function ArchiveSummary({ detail }: { detail: Detail | null }) {
-  const archive = detail?.archive;
-  if (!detail || !archive) return null;
+function ResultUploadSummary({ detail }: { detail: Detail | null }) {
+  const result_upload: ResultUploadRecord | null | undefined = detail?.result_upload ?? (detail?.archive ? {
+    ...detail.archive,
+    status: detail.archive.status === "archived" ? "uploaded" : detail.archive.status,
+  } : null);
+  if (!detail || !result_upload) return null;
   const labels = {
-    none: "No archive",
-    pending: "Archive pending",
-    uploading: "Archiving",
-    archived: "Archived",
-    failed: "Archive failed",
+    none: "No result upload",
+    pending: "Result upload pending",
+    uploading: "Uploading result",
+    uploaded: "Result uploaded",
+    failed: "Result upload failed",
   };
   return (
-    <div id="archive-summary" className="notice" role="status">
-      <strong id="archive-status">{labels[archive.status] ?? "Archive status unknown"}</strong>
-      {archive.incomplete && <span> · Partial archive</span>}
-      {archive.status === "archived" && (
+    <div id="result-upload-summary" className="notice" role="status">
+      <strong id="result-upload-status">{labels[result_upload.status] ?? "Result upload status unknown"}</strong>
+      {result_upload.incomplete && <span> · Partial result</span>}
+      {result_upload.status === "uploaded" && (
         <>
           {" · "}
           <a
-            id="download-archive"
-            href={apiUrl("/api/archive", {
+            id="download-result-zip"
+            href={apiUrl(detail.result_upload ? "/api/result-zip" : "/api/archive", {
               source: detail.source.source_id,
               run_id: runIdentity(detail.run),
             })}
@@ -953,11 +957,11 @@ function ArchiveSummary({ detail }: { detail: Detail | null }) {
             rel="noopener noreferrer"
             download
           >
-            Download archive{archive.file ? ` (${formatFileSize(archive.file.size)})` : ""}
+            Download result.zip{result_upload.file ? ` (${formatFileSize(result_upload.file.size)})` : ""}
           </a>
         </>
       )}
-      {archive.last_error && <p>Archive issue: {archive.last_error.slice(0, 512)}</p>}
+      {result_upload.last_error && <p>Upload issue: {result_upload.last_error.slice(0, 512)}</p>}
     </div>
   );
 }
@@ -1113,7 +1117,7 @@ function ReviewWorkspace({
           </button>
         </div>
         {s.access_mode === "hosted" && s.review?.kind === "run" && (
-          <ArchiveSummary detail={s.detail} />
+          <ResultUploadSummary detail={s.detail} />
         )}
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {tabs.map((tab) => (
@@ -1330,7 +1334,7 @@ export function DashboardView({
       {kind &&
         createPortal(
           s.access_mode === "hosted"
-            ? "expri · Synced experiment review"
+            ? "expri · Hosted experiment review"
             : "expri · Local experiment review",
           kind,
         )}
@@ -1363,14 +1367,14 @@ export function DashboardView({
                   {s.sources.length ? (
                     s.sources.map((source) => (
                       <option key={source.source_id} value={source.source_id}>
-                        {source.kind === "service" ? `${source.label} · Synced` : source.label}
+                        {source.kind === "service" ? `${source.label} · Published` : source.label}
                       </option>
                     ))
                   ) : (
                     <option value="">
                       {s.refreshing
                       ? s.project_catalog_enabled ? "Loading projects…" : "Loading sources…"
-                      : s.project_catalog_enabled ? "No synced projects" : "No synced sources"}
+                      : s.project_catalog_enabled ? "No published projects" : s.access_mode === "hosted" ? "No published sources" : "No sources"}
                     </option>
                   )}
                 </select>

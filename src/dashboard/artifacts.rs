@@ -350,7 +350,7 @@ pub(super) fn local_catalog(run_dir: &Path, source: &super::Source, run_id: &str
                   row.confirm_cloud(file.size, file.sha256.as_deref());
                 }
               }
-              warnings.push(json!({"message": "Cloud availability reflects the last service pull; refresh with the CLI for current availability."}));
+              warnings.push(json!({"message": "Cloud availability reflects the last service fetch; refresh with the CLI for current availability."}));
             }
             Err(_) => warnings.push(json!({"message": "Cached cloud artifact catalog is invalid; cloud availability is unknown."})),
           }
