@@ -19,7 +19,6 @@ enum RunsSubcommand {
   /// Inspect a run's status, provenance, and environment record.
   Show(RunsShowCommand),
   /// Fetch metadata and logs directly from a worker, with optional artifacts.
-  #[command(alias = "pull")]
   Fetch(RunsFetchCommand),
   /// Check recorded status and detached supervisor liveness.
   Status(RunsJobCommand),
@@ -295,23 +294,23 @@ fn print_job_report(report: &serde_json::Value) {
   if report["already_finished"] == true {
     println!("The run already finished; no cancellation was needed.");
   }
-  print_service_sync(report);
+  print_publishing(report);
 }
 
-fn print_service_sync(report: &serde_json::Value) {
-  let Some(sync) = report.get("service_sync") else {
+fn print_publishing(report: &serde_json::Value) {
+  let Some(publishing) = report.get("publishing") else {
     return;
   };
-  let status = sync["status"].as_str().unwrap_or("unknown");
-  let active = sync["worker_active"].as_bool().unwrap_or(false);
+  let status = publishing["status"].as_str().unwrap_or("unknown");
+  let active = publishing["worker_active"].as_bool().unwrap_or(false);
   println!(
     "Publishing: {status} (publisher {})",
     if active { "active" } else { "stopped" }
   );
-  if let Some(detail) = sync["last_error"].as_str() {
+  if let Some(detail) = publishing["last_error"].as_str() {
     println!("Publishing detail: {detail}");
   }
-  if let Some(url) = sync["dashboard_url"].as_str() {
+  if let Some(url) = publishing["dashboard_url"].as_str() {
     println!("Dashboard: {url}");
   }
 }
@@ -347,7 +346,7 @@ fn print_runs_report(report: &serde_json::Value, request: &protocol::RunQueryReq
       }
     }
     protocol::RunQueryRequest::Show { .. } => {
-      print_service_sync(report);
+      print_publishing(report);
       let summary = &report["run"];
       for (label, key) in [
         ("Run", "run_id"),
@@ -447,39 +446,34 @@ mod tests {
   use crate::{Cli, Command};
 
   #[test]
-  fn worker_fetch_keeps_pull_as_hidden_compatibility_alias() {
+  fn worker_fetch_has_no_pull_alias() {
     use clap::CommandFactory;
-    for name in ["fetch", "pull"] {
-      let cli = Cli::try_parse_from([
-        "expri",
-        "-T",
-        "gpu",
-        "runs",
-        name,
-        "run-123",
-        "--metrics",
-        "--dry-run",
-      ])
-      .unwrap();
-      assert!(matches!(
-        cli.command,
-        Command::Runs(RunsCommand {
-          command: RunsSubcommand::Fetch(RunsFetchCommand {
-            metrics: true,
-            dry_run: true,
-            ..
-          })
+    let cli = Cli::try_parse_from([
+      "expri",
+      "-T",
+      "gpu",
+      "runs",
+      "fetch",
+      "run-123",
+      "--metrics",
+      "--dry-run",
+    ])
+    .unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Runs(RunsCommand {
+        command: RunsSubcommand::Fetch(RunsFetchCommand {
+          metrics: true,
+          dry_run: true,
+          ..
         })
-      ));
-    }
+      })
+    ));
+    assert!(Cli::try_parse_from(["expri", "-T", "gpu", "runs", "pull", "run-123"]).is_err());
     let mut command = Cli::command();
-    let help = command
-      .find_subcommand_mut("runs")
-      .unwrap()
-      .render_help()
-      .to_string();
-    assert!(help.contains("fetch"));
-    assert!(!help.contains("\n  pull "));
+    let runs = command.find_subcommand_mut("runs").unwrap();
+    assert!(runs.find_subcommand("pull").is_none());
+    assert!(runs.render_help().to_string().contains("fetch"));
   }
 
   #[test]
@@ -505,7 +499,7 @@ mod tests {
       "-T",
       "gpu",
       "runs",
-      "pull",
+      "fetch",
       "run-123",
       "--artifact",
       "outputs/model one.pt",
@@ -528,17 +522,17 @@ mod tests {
     assert!(command.outputs && command.dry_run);
     assert!(!command.metrics);
     assert!(Cli::try_parse_from(["expri", "runs", "list", "--status", "success"]).is_err());
-    assert!(Cli::try_parse_from(["expri", "runs", "pull", "run-123", "--cached"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "runs", "fetch", "run-123", "--cached"]).is_err());
   }
 
   #[test]
-  fn metric_pulls_can_include_explicit_outputs_and_artifacts() {
+  fn metric_fetches_can_include_explicit_outputs_and_artifacts() {
     let cli = Cli::try_parse_from([
       "expri",
       "-T",
       "gpu",
       "runs",
-      "pull",
+      "fetch",
       "run-one",
       "--metrics",
       "--outputs",
@@ -558,11 +552,11 @@ mod tests {
   }
 
   #[test]
-  fn cached_queries_and_pulls_require_an_explicit_target() {
+  fn cached_queries_and_fetches_require_an_explicit_target() {
     for args in [
       vec!["expri", "runs", "list", "--cached"],
       vec!["expri", "runs", "show", "run-123", "--cached"],
-      vec!["expri", "runs", "pull", "run-123"],
+      vec!["expri", "runs", "fetch", "run-123"],
     ] {
       let cli = Cli::try_parse_from(args).unwrap();
       let Command::Runs(command) = cli.command else {

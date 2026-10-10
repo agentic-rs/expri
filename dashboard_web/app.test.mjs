@@ -241,7 +241,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
       const run = runs.find(item => runIdentity(item) === query.get("run_id"));
       if (!run) return response({ error: "Run not found" }, 404);
-      return response({ ...detailRecord(source, run, model.metric_value), result_upload: model.result_upload, archive: model.archive });
+      return response({ ...detailRecord(source, run, model.metric_value), result_upload: model.result_upload });
     }
     if (parsed.pathname === "/api/artifacts") {
       const selected_run = runs.find(run => runIdentity(run) === query.get("run_id"));
@@ -1690,38 +1690,16 @@ test("live connections close while hidden offline disabled and disposed and reop
   await act(async () => { model.nodes.cleanup(); model.nodes.cleanup(); await microtasks(); }); assert.equal(stream.closed, 1);
 });
 
-test("legacy result upload state preserves old-backend downloads and training status", async t => {
+test("result upload status preserves training state and downloads ZIPs through the protected route", async t => {
   const model = await autoFixture(t); await inspect(model);
-  assert.equal(model.nodes.document.getElementById("result-upload-summary"), null, "legacy records may omit archives");
-  for (const status of ["none", "pending", "uploading", "failed"]) {
-    model.model.archive = { status, incomplete: status === "failed", last_error: status === "failed" ? "Some output files were unavailable <script>" : null };
-    await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
-    assert.equal(model.nodes.document.getElementById("download-result-zip"), null);
-    assert.equal(model.nodes.get("result-upload-summary").classList.contains("error"), false);
-    assert.equal(model.nodes.get("run-detail").textContent.includes("completed"), true, "archive progress does not change training status");
-  }
-  assert.match(model.nodes.get("result-upload-summary").textContent, /Partial result.*Upload issue: Some output files were unavailable <script>/);
-  assert.equal(model.nodes.get("result-upload-summary").querySelector("script"), null);
-  model.model.archive = { status: "archived", incomplete: true, file: { target: { kind: "run", scope: { project_id: "project", origin: "worker", run_id: "run-0" }, path: "result.zip" }, size: 1024, sha256: null, storage: "object" } };
-  await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
-  const anchor = model.nodes.get("download-result-zip"), url = new URL(anchor.href), query = url.searchParams;
-  assert.equal(url.pathname, "/api/archive", "legacy-only backends retain their protected endpoint");
-  assert.match(anchor.textContent, /Download result.zip \(1 KiB\)/); assert.equal(query.get("source"), model.sources[0].source_id); assert.equal(query.get("run_id"), "run-0"); assert.equal(anchor.getAttribute("download"), "");
-  const requests = model.requests.length; await click(model.nodes.get("review-tab-logs")); await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
-  assert.equal(model.nodes.get("download-result-zip"), anchor); assert.equal(model.requests.slice(requests).some(url => url.startsWith("/api/archive")), false, "archive bytes stay out of JavaScript");
-  await selectRow(model.nodes, 0); await selectRow(model.nodes, 1); await settled(() => model.nodes.get("review-title").textContent.includes("runs"));
-  assert.equal(model.nodes.document.getElementById("result-upload-summary"), null, "comparisons do not expose one run's archive");
-});
-
-test("canonical result upload state takes priority and downloads result ZIPs through the protected route", async t => {
-  const model = await autoFixture(t); await inspect(model);
-  model.model.archive = { status: "archived", incomplete: true };
+  assert.equal(model.nodes.document.getElementById("result-upload-summary"), null, "runs without a result upload omit the summary");
   for (const [status, label] of [["none", "No result upload"], ["pending", "Result upload pending"], ["uploading", "Uploading result"], ["failed", "Result upload failed"]]) {
     model.model.result_upload = { status, incomplete: false, last_error: status === "failed" ? "Could not upload <script>" : null };
     await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
     assert.equal(model.nodes.get("result-upload-status").textContent, label);
-    assert.equal(model.nodes.document.getElementById("download-result-zip"), null, "legacy success cannot override canonical pending or failed progress");
+    assert.equal(model.nodes.document.getElementById("download-result-zip"), null, "only uploaded results offer downloads");
     assert.equal(model.nodes.get("result-upload-summary").textContent.includes("Partial result"), false);
+    assert.equal(model.nodes.get("run-detail").textContent.includes("completed"), true, "upload progress preserves the training status");
   }
   assert.match(model.nodes.get("result-upload-summary").textContent, /Upload issue: Could not upload <script>/);
   assert.equal(model.nodes.get("result-upload-summary").querySelector("script"), null);
@@ -1734,17 +1712,26 @@ test("canonical result upload state takes priority and downloads result ZIPs thr
   assert.match(anchor.textContent, /Download result\.zip \(1 KiB\)/);
   assert.match(model.nodes.get("result-upload-summary").textContent, /Result uploaded.*Partial result/);
   assert.equal(model.nodes.get("run-detail").textContent.includes("completed"), true);
+  assert.equal(anchor.getAttribute("download"), "");
+  const requests = model.requests.length;
+  await click(model.nodes.get("review-tab-logs"));
+  await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
+  assert.equal(model.nodes.get("download-result-zip"), anchor);
+  assert.equal(model.requests.slice(requests).some(url => url.startsWith("/api/result-zip")), false, "ZIP bytes stay out of JavaScript");
+  await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
+  await settled(() => model.nodes.get("review-title").textContent.includes("runs"));
+  assert.equal(model.nodes.document.getElementById("result-upload-summary"), null, "comparisons do not expose one run's upload");
 });
 
 test("result upload metadata hints update the badge during Logs without fetching metric-only detail", async t => {
   const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create });
-  model.model.archive = { status: "pending", incomplete: false }; await inspect(model); await click(model.nodes.get("review-tab-logs"));
+  model.model.result_upload = { status: "pending", incomplete: false }; await inspect(model); await click(model.nodes.get("review-tab-logs"));
   await settled(() => model.nodes.get("run-logs").textContent.includes("training complete"));
   const stream = live.latest(); stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
   const log = model.nodes.get("log-output"), counts = requestCounts(model.requests); log.scrollTop = 24;
   model.model.metrics_revision = "metric-only"; await stream.emit("updates", '{"catalog_revision":"20"}'); await model.clock.advance(0);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"], "active Logs skips metric-only details");
-  model.model.archive = { status: "archived", incomplete: true }; model.model.metadata_revision = "archive-finished";
+  model.model.result_upload = { status: "uploaded", incomplete: true }; model.model.metadata_revision = "result-upload-finished";
   await stream.emit("updates", '{"catalog_revision":"21"}'); await model.clock.advance(0);
   const next = requestCounts(model.requests);
   assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"]); assert.equal(next["/api/log"], counts["/api/log"]);

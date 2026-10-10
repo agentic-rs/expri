@@ -57,11 +57,11 @@ expri -T runpod push
 
 See `examples/cs336.toml` for a CS336-shaped starting point.
 
-Targets default to `protocol = "auto"`, which tries `expri node sync-apply`
-first and falls back to the Python sync protocol. Set `protocol = "expri-node"`
+Targets default to `protocol = "auto"`, which tries `expri node push-apply`
+first and falls back to the Python source push protocol. Set `protocol = "expri-node"`
 to require the node binary, or `protocol = "python"` for the fallback path.
 `protocol = "ssh"` remains an alias for `"python"`. The protocol chooses how
-sync is applied on the target; the transport chooses how commands and files
+source changes are applied on the target; the transport chooses how commands and files
 reach it.
 
 For configured environments, `auto` also checks whether the installed node
@@ -73,7 +73,7 @@ and use the same automatic fallback for older nodes.
 
 The source push uploads committed history with a git bundle, stages `HEAD`
 plus a zip archive of local dirty and untracked files, then installs the staged
-files on the remote. It removes previously synced files absent from the staged
+files on the remote. It removes previously pushed files absent from the staged
 tree and preserves unrelated remote-generated files. Remote tool state lives
 under `.expri/`.
 
@@ -96,11 +96,6 @@ finalized checkpoints through the service. Training registers ready
 files with `expri artifact register "$EXPRI_OUTPUT_DIR/checkpoint-1000.pt" --label best`.
 See [result fetching and private input preparation](docs/self-hosted-service.md#local-download-and-dashboard)
 for laptop selection, offline reuse, and resumable transfers.
-
-Older `sync` commands and `[sync]` configuration remain accepted for source
-transfers. The legacy path download form is
-`expri -T runpod sync --pull -- outputs/checkpoints`; use `download` mappings for
-named file downloads or `runs fetch` for experiment results.
 
 ## Transport
 
@@ -130,7 +125,7 @@ Remote commands run through `ctl ssh`, and transfers retain rsync with
 `rsync -e 'ctl ssh'` (including the configured binary and method). Expri does
 not need `ctl-agent` for this transport. Rsync must be installed locally and on
 the target. The target still needs a Unix shell and the usual tools required by
-the selected sync protocol and commands.
+the selected source push protocol and commands.
 
 The `[ssh]` control settings apply only to the SSH transport. With ctl, ctl
 manages connections and reuse. A target's explicit `port` is passed as `-p`;
@@ -729,7 +724,7 @@ runs the Python runtime/metrics tests and dashboard frontend checks.
 The [host and worker suite](tests/containers/README.md) runs real uv, SSH and
 rsync between isolated Docker containers with different installed fake Torch
 versions. It covers dependency reuse and incompatibility, detached runs,
-snapshot isolation, pruning, cancellation, selective pulls and cached dashboard
+snapshot isolation, pruning, cancellation, selective fetching and cached dashboard
 review across native and Python protocols. Run it from the repository root:
 
 ```sh

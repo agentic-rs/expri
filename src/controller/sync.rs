@@ -4,17 +4,14 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::archive::{PatchArchive, build_patch_archive, sha256_file};
+use crate::archive::{PatchArchive, build_patch_archive};
 use crate::config::TargetConfig;
-use crate::controller::protocol::{
-  ProtocolPreference, apply_sync_with_preference, prepare_pull_with_preference,
-};
+use crate::controller::protocol::{ProtocolPreference, apply_sync_with_preference};
 use crate::controller::transport::Remote;
 use crate::error::Result;
 use crate::filter::SyncRules;
 use crate::git::{self, RemoteCandidate, SourceBundle};
-use crate::protocol::{PullArtifacts, SyncApplyRequest, SyncIdentity};
-use crate::shell;
+use crate::protocol::{SyncApplyRequest, SyncIdentity};
 
 #[derive(Clone)]
 pub struct SyncOptions {
@@ -27,7 +24,6 @@ pub struct SyncOptions {
   pub control_persist: String,
   pub dry_run: bool,
   pub force: bool,
-  pub pull: bool,
   pub paths: Vec<PathBuf>,
   pub verbosity: u8,
   pub quiet: bool,
@@ -70,14 +66,11 @@ fn sync_target_with_output(
   if !options.paths.is_empty() {
     return sync_paths(options, remote).map(|_| None);
   }
-  if options.pull {
-    return pull_target(options, remote, preference, &node_bin).map(|_| None);
-  }
   if options.verbosity > 0 && !options.quiet {
     if let Some(project_name) = &options.project_name {
       eprintln!("project: {project_name}");
     }
-    eprintln!("sync target: {}", options.target_name);
+    eprintln!("push target: {}", options.target_name);
     eprintln!("repo root: {}", options.repo_root.display());
   }
 
@@ -118,7 +111,7 @@ fn sync_target_with_output(
   }
   if remote_sync_is_current(remote_sync_state.as_ref(), &head, &patch) {
     if !options.quiet {
-      eprintln!("sync skipped: target already has HEAD and patch");
+      eprintln!("push skipped: target already has HEAD and patch");
     }
     return Ok(Some(identity));
   }
@@ -174,46 +167,21 @@ fn sync_paths(options: SyncOptions, remote: Remote) -> Result<()> {
     if let Some(project_name) = &options.project_name {
       eprintln!("project: {project_name}");
     }
-    if options.pull {
-      eprintln!("pull paths target: {}", options.target_name);
-    } else {
-      eprintln!("sync paths target: {}", options.target_name);
-    }
+    eprintln!("push paths target: {}", options.target_name);
     for path in &options.paths {
       eprintln!("path: {}", path.display());
     }
   }
   validate_sync_paths(&options.paths)?;
   remote.connect()?;
-  let list = if options.pull {
-    remote_git_ls_files(&remote, &options.paths)?
-  } else {
-    git::ls_files(&options.repo_root, &options.paths)?
-  };
-  if list.is_empty()
-    && options.verbosity > 0
-    && !options.quiet
-    && !(options.pull && options.dry_run)
-  {
+  let list = git::ls_files(&options.repo_root, &options.paths)?;
+  if list.is_empty() && options.verbosity > 0 && !options.quiet {
     eprintln!("no tracked files matched");
   }
   let list_dir = tempfile::Builder::new().prefix("expri-files-").tempdir()?;
   let list_path = list_dir.path().join("files-from");
   fs::write(&list_path, &list)?;
-  if options.pull {
-    remote.download_files_from(&remote.remote_dir, &options.repo_root, &list_path)
-  } else {
-    remote.upload_files_from(&options.repo_root, &remote.remote_dir, &list_path)
-  }
-}
-
-fn remote_git_ls_files(remote: &Remote, paths: &[PathBuf]) -> Result<Vec<u8>> {
-  let mut command = format!("cd {} && git ls-files -z --", remote.quoted_remote_dir());
-  for path in paths {
-    command.push(' ');
-    command.push_str(&shell::quote(path.to_string_lossy()));
-  }
-  remote.capture_bytes(&command)
+  remote.upload_files_from(&options.repo_root, &remote.remote_dir, &list_path)
 }
 
 fn validate_sync_paths(paths: &[PathBuf]) -> Result<()> {
@@ -224,86 +192,10 @@ fn validate_sync_paths(paths: &[PathBuf]) -> Result<()> {
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
       return Err(crate::error::ExpriError::Message(format!(
-        "sync path must be relative and stay inside the repo: {}",
+        "push path must be relative and stay inside the repo: {}",
         path.display()
       )));
     }
-  }
-  Ok(())
-}
-
-fn pull_target(
-  options: SyncOptions,
-  remote: Remote,
-  preference: ProtocolPreference,
-  node_bin: &str,
-) -> Result<()> {
-  if options.verbosity > 0 && !options.quiet {
-    if let Some(project_name) = &options.project_name {
-      eprintln!("project: {project_name}");
-    }
-    eprintln!("pull target: {}", options.target_name);
-    eprintln!("repo root: {}", options.repo_root.display());
-  }
-  remote.connect()?;
-  prepare_pull_with_preference(&remote, preference, node_bin)?;
-
-  let local_dir = options
-    .repo_root
-    .join(".git")
-    .join("expri")
-    .join(&options.target_name);
-  fs::create_dir_all(&local_dir)?;
-  let artifacts_path = local_dir.join("pull-artifacts.json");
-  let bundle_path = local_dir.join("source.bundle");
-  let patch_path = local_dir.join("patch.zip");
-  remote.download_file(
-    &format!("{}/out/pull-artifacts.json", remote.meta_dir()),
-    &artifacts_path,
-  )?;
-  remote.download_file(
-    &format!("{}/out/pull-source.bundle", remote.meta_dir()),
-    &bundle_path,
-  )?;
-  remote.download_file(
-    &format!("{}/out/pull-patch.zip", remote.meta_dir()),
-    &patch_path,
-  )?;
-  if options.dry_run {
-    eprintln!(
-      "+ git -C {} fetch {} +HEAD:refs/remotes/expri/{}/synced",
-      options.repo_root.display(),
-      bundle_path.display(),
-      options.target_name
-    );
-    return Ok(());
-  }
-
-  let artifacts: PullArtifacts = serde_json::from_str(&fs::read_to_string(&artifacts_path)?)?;
-  verify_download(
-    &bundle_path,
-    &artifacts.source_bundle_sha256,
-    "source bundle",
-  )?;
-  verify_download(&patch_path, &artifacts.patch_sha256, "patch")?;
-  let ref_name = format!("refs/remotes/expri/{}/synced", options.target_name);
-  git::fetch_bundle_to_ref(&options.repo_root, &bundle_path, &ref_name)?;
-  if !options.quiet {
-    eprintln!(
-      "updated refs/remotes/expri/{}/synced to {}",
-      options.target_name, artifacts.head
-    );
-    eprintln!("stored remote patch at {}", patch_path.display());
-  }
-  Ok(())
-}
-
-fn verify_download(path: &Path, expected: &str, label: &str) -> Result<()> {
-  let (actual, _) = sha256_file(path)?;
-  if actual != expected {
-    return Err(crate::error::ExpriError::Message(format!(
-      "{label} sha256 mismatch: expected {expected}, got {actual}"
-    )));
   }
   Ok(())
 }
@@ -393,7 +285,7 @@ fn request_id(head: &str, patch_digest: &str) -> String {
   let head_prefix = head.get(..12).unwrap_or(head);
   let patch_prefix = patch_digest.get(..12).unwrap_or(patch_digest);
   let timestamp = utc_timestamp();
-  format!("sync-{head_prefix}-{patch_prefix}-{timestamp}")
+  format!("push-{head_prefix}-{patch_prefix}-{timestamp}")
 }
 
 fn utc_timestamp() -> String {

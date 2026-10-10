@@ -110,7 +110,7 @@ history, and the built-in **Machine** column sorts by origin. A machine label
 comes from the origin saved with a run; no additional registration is needed
 for existing history to appear. Select runs across machines to compare them.
 Equal run IDs from different origins remain distinct, with machine provenance
-shown in the comparison. Logs, files, browser downloads, and generated pull
+shown in the comparison. Logs, files, browser downloads, and generated fetch
 commands retain each run's actual project, origin, and run ID. Existing worker
 run links open the same exact run within the project view.
 Choose up to eight parameter or metric columns using the **Columns** checkbox
@@ -282,13 +282,13 @@ expri service resume --run-dir .expri/runs/run-abc123
 `service resume` runs on the worker and restarts publishing from its saved intent
 and queue after a publisher stops or a configuration/token problem is corrected.
 It does not rerun training. The queue lives at the original checkout's
-`.expri/service-sync`; keep it and the original run files until publication is
+`.expri/publish`; keep it and the original run files until publication is
 acknowledged. Publishers survive terminal closure and task completion, but must
-be resumed after a worker reboot. For new tracking runs, `synced` means all
+be resumed after a worker reboot. For new tracking runs, `published` means all
 terminal tracking bytes and registered checkpoints were acknowledged and the server upload job was accepted;
 it does not mean the independent result ZIP upload has finished. Upload
 failures retain tracking data and retry without restarting training. For legacy
-queues, `synced` retains its original upload-completion meaning. A completed task
+queues, `published` retains its original upload-completion meaning. A completed task
 alone does not imply that its results reached the service. The optional dashboard link opens the run after sign-in and waits for
 its first publication.
 
@@ -387,7 +387,7 @@ expri service publish --config worker.toml \
 
 Multipart upload IDs and acknowledged parts survive retries and service
 restarts. A lost acknowledgement is reconciled with the service's stored receipt.
-The client queue defaults to `.expri/service-sync`; use `--queue-dir` to keep its
+The client queue defaults to `.expri/publish`; use `--queue-dir` to keep its
 location stable across invocations. A one-shot failure exits nonzero and retains
 the queue. Watch mode retries service outages. Keep original output files until
 upload acknowledgement; expri never removes them automatically.
@@ -439,11 +439,6 @@ Omit `--watch` for one fetch pass, or add `--dry-run` to inspect selections with
 publishing files locally. Dry-run reports identify labels that need the run's
 inventory to resolve; they do not treat those labels as unavailable files.
 Reports are bounded and watch summaries stay compact.
-
-Existing `[file_sync]` configuration is accepted as an alias for `[fetch]`.
-Older `sync`, `service push`, `service pull`, `service archive`, `input put/get`,
-and `service file-put` commands remain available as hidden compatibility names;
-new commands use the direction-specific verbs above.
 
 Use an owner client configuration with the same URL and the owner token's
 variable name. Fetch metadata, metrics, parameters, and logs by default, and
@@ -573,7 +568,7 @@ expri service file-upload --config owner.toml \
 This command does not seal the run or create `result.zip`. If the destination
 already stores an object with matching size and digest, it returns `reused: true`
 without uploading or creating a local queue. Otherwise it uses a resumable upload
-queue under `.expri/service-sync/files/`, configurable with `--queue-dir`.
+queue under `.expri/publish/files/`, configurable with `--queue-dir`.
 
 ## Storage usage and project deletion
 

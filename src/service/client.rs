@@ -18,14 +18,14 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::types::*;
-use super::{InputPutOptions, PushOptions};
+use super::{InputUploadOptions, PublishOptions};
 use crate::error::Result;
 use fs::message;
 use http::Api;
 use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
-pub use download::{input_get, input_get_prepared, pull};
+pub use download::{fetch, input_download, input_download_prepared};
 pub use watch::fetch as fetch_files;
 
 pub(super) fn validate_config(path: &Path) -> Result<()> {
@@ -78,7 +78,7 @@ impl Publisher {
     }
   }
 
-  pub(super) fn new(options: &PushOptions) -> Result<Self> {
+  pub(super) fn new(options: &PublishOptions) -> Result<Self> {
     let api = Api::new(&options.config)?;
     let run_dir = std::path::absolute(&options.run_dir)?;
     fs::directory(&run_dir)?;
@@ -129,7 +129,7 @@ impl Publisher {
       &self.queue.directory,
       self.watch,
     )?;
-    let metadata_done = push_cycle(
+    let metadata_done = publish_cycle(
       &self.api,
       &mut self.queue,
       &self.scope,
@@ -163,7 +163,8 @@ impl Publisher {
       "scope": self.scope, "terminal": done,
       "files": files,
       "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
-      "protocol": self.queue.state.protocol, "archive": self.queue.state.archive,
+      "protocol": self.queue.state.protocol,
+      "result_upload": upload_report(json!(self.queue.state.archive)),
     })
   }
 
@@ -187,7 +188,7 @@ impl Publisher {
   }
 }
 
-pub fn push(options: PushOptions) -> Result<Value> {
+pub fn publish(options: PublishOptions) -> Result<Value> {
   let mut publisher = Publisher::new(&options)?;
   let mut last_error = String::new();
   let mut failures = 0u64;
@@ -217,15 +218,6 @@ pub fn push(options: PushOptions) -> Result<Value> {
   }
 }
 
-pub fn publish(options: PushOptions) -> Result<Value> {
-  let mut report = push(options)?;
-  add_result_upload(&mut report);
-  if let Some(fields) = report.as_object_mut() {
-    fields.remove("archive");
-  }
-  Ok(report)
-}
-
 /// Translate presentation fields without rewriting the deployed protocol or queue.
 pub(super) fn upload_report(mut report: Value) -> Value {
   if report["status"] == "archived" {
@@ -234,17 +226,15 @@ pub(super) fn upload_report(mut report: Value) -> Value {
   report
 }
 
-pub(super) fn add_result_upload(report: &mut Value) {
-  if let Some(archive) = report.get("archive") {
-    report["result_upload"] = upload_report(archive.clone());
+pub(super) fn project_result_upload(report: &mut Value) {
+  if let Some(fields) = report.as_object_mut()
+    && let Some(archive) = fields.remove("archive")
+  {
+    fields.insert("result_upload".into(), upload_report(archive));
   }
 }
 
-pub fn server_upload(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
-  archive(config, scope, partial).map(upload_report)
-}
-
-pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
+pub fn upload(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
   validate_scope(scope)?;
   let api = Api::new(config)?;
   let Response::Capabilities { features } = api.request(&Request::Capabilities)? else {
@@ -302,6 +292,7 @@ pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> 
     return Err(message("service did not acknowledge its result.zip upload"));
   };
   serde_json::to_value(tracking::archive_receipt(&api, scope, archive, partial)?)
+    .map(upload_report)
     .map_err(Into::into)
 }
 
@@ -323,7 +314,7 @@ fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
     .collect()
 }
 
-fn push_cycle(
+fn publish_cycle(
   api: &Api,
   queue: &mut Queue,
   scope: &RunScope,
@@ -456,7 +447,7 @@ fn queue_progress(queue: &Queue) -> Value {
   })
 }
 
-pub fn input_put(options: InputPutOptions) -> Result<Value> {
+pub fn input_upload(options: InputUploadOptions) -> Result<Value> {
   let api = Api::new(&options.config)?;
   let target = FileTarget::Input {
     project_id: options.project_id,
@@ -630,7 +621,7 @@ pub fn reference(options: super::ReferenceOptions) -> Result<Value> {
 }
 
 /// Explicit single-file publication, without sealing or archiving a historical run.
-pub fn file_put(options: super::FilePutOptions) -> Result<Value> {
+pub fn file_upload(options: super::FileUploadOptions) -> Result<Value> {
   let target: FileTarget = serde_json::from_str(&options.target)?;
   validate_target(&target)?;
   if matches!(&target, FileTarget::Run { path, .. } if path == "result.zip") {

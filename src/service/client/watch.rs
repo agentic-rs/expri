@@ -8,8 +8,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::super::types::*;
-use super::super::{FetchOptions, PullOptions};
-use super::download::{ObjectResult, pull, pull_objects, pull_pinned, validate_record};
+use super::super::{FetchOptions, ServiceFetchOptions};
+use super::download::{
+  ObjectResult, fetch as fetch_run, fetch_objects, fetch_pinned, validate_record,
+};
 use super::{Api, METADATA, STREAMS, artifacts, fs};
 use crate::error::{ExpriError, Result};
 
@@ -230,7 +232,7 @@ impl<'a> Watcher<'a> {
         "destination":cached.destination, "pending_files":pending, "downloaded_bytes":0}),
       );
     }
-    let first = match self.pull_selected(scope, artifacts.clone(), &records) {
+    let first = match self.fetch_selected(scope, artifacts.clone(), &records) {
       Ok(report) => report,
       Err(error) => return failed(&error, "download"),
     };
@@ -246,7 +248,7 @@ impl<'a> Watcher<'a> {
     let mut report = if selected == artifacts {
       first.clone()
     } else {
-      match self.pull_selected(scope, selected, &records) {
+      match self.fetch_selected(scope, selected, &records) {
         Ok(report) => report,
         Err(error) => return failed(&error, "download"),
       }
@@ -297,7 +299,7 @@ impl<'a> Watcher<'a> {
       .get(&key)
       .is_some_and(|cache| cache.unchanged(&metadata))
     {
-      let report = match self.pull(scope, Vec::new()) {
+      let report = match self.fetch(scope, Vec::new()) {
         Ok(report) => report,
         Err(error) => return failed(&error, "metadata_download"),
       };
@@ -404,7 +406,7 @@ impl<'a> Watcher<'a> {
       })
       .unwrap_or(0);
     let (scope, expected) = self.candidates.swap_remove(next);
-    let options = PullOptions {
+    let options = ServiceFetchOptions {
       config: self.options.config.clone(),
       project_id: scope.project_id.clone(),
       origin: scope.origin.clone(),
@@ -417,15 +419,15 @@ impl<'a> Watcher<'a> {
     self.last_scheduled = Some((scope.origin.clone(), scope.run_id.clone()));
     self.task = Some(ObjectTask {
       scope,
-      worker: thread::spawn(move || pull_objects(options, expected)),
+      worker: thread::spawn(move || fetch_objects(options, expected)),
     });
   }
 
-  fn pull(&self, scope: &RunScope, artifacts: Vec<String>) -> Result<Value> {
-    pull(self.pull_options(scope, artifacts))
+  fn fetch(&self, scope: &RunScope, artifacts: Vec<String>) -> Result<Value> {
+    fetch_run(self.fetch_options(scope, artifacts))
   }
 
-  fn pull_selected(
+  fn fetch_selected(
     &self,
     scope: &RunScope,
     artifacts: Vec<String>,
@@ -435,11 +437,11 @@ impl<'a> Watcher<'a> {
       .iter()
       .map(|path| (path.clone(), records[path].clone()))
       .collect();
-    pull_pinned(self.pull_options(scope, artifacts), &expected)
+    fetch_pinned(self.fetch_options(scope, artifacts), &expected)
   }
 
-  fn pull_options(&self, scope: &RunScope, artifacts: Vec<String>) -> PullOptions {
-    PullOptions {
+  fn fetch_options(&self, scope: &RunScope, artifacts: Vec<String>) -> ServiceFetchOptions {
+    ServiceFetchOptions {
       config: self.options.config.clone(),
       project_id: scope.project_id.clone(),
       origin: scope.origin.clone(),

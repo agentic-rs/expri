@@ -30,7 +30,7 @@ fn source_options(
 ) -> Result<SyncOptions> {
   let context = context.into_target(target, command.control_path)?;
   Ok(SyncOptions {
-    sync: context.config.sync_rules()?,
+    sync: context.config.push_rules()?,
     repo_root: context.repo_root,
     project_name: context.project_name,
     target_name: context.target_name,
@@ -39,7 +39,6 @@ fn source_options(
     control_persist: command.control_persist,
     dry_run: command.dry_run,
     force: command.force,
-    pull: command.pull,
     paths: command.paths,
     verbosity,
     quiet,
@@ -137,7 +136,6 @@ mod tests {
       control_persist: "30m".into(),
       dry_run: true,
       force: false,
-      pull: false,
       watch: true,
       paths: Vec::new(),
     }
@@ -174,13 +172,11 @@ mod tests {
   }
 
   #[test]
-  fn legacy_path_pull_stays_in_source_transfer() {
+  fn push_preserves_explicit_source_paths() {
     let mut command = command();
-    command.pull = true;
     command.watch = false;
     command.paths = vec!["code.py".into()];
     let options = source_options(context(), command, Some("gpu"), 0, true).unwrap();
-    assert!(options.pull);
     assert_eq!(options.paths, [PathBuf::from("code.py")]);
   }
 }

@@ -105,6 +105,52 @@ fn linked_sources_and_linked_registry_are_rejected() {
 }
 
 #[test]
+fn published_run_without_checkpoint_registry_remains_sealed() {
+  let (_temporary, root) = fixture();
+  let path = "outputs/late.pt";
+  std::fs::write(root.join(path), "late checkpoint").unwrap();
+  fs::atomic_json(
+    &root.join("run-state.json"),
+    &json!({"run_id":"run-fixture","status":"completed"}),
+  )
+  .unwrap();
+  let publisher_state = root.join("publishing-state.json");
+  fs::atomic_json(
+    &publisher_state,
+    &json!({"schema_version":1,"run_id":"run-fixture","status":"published"}),
+  )
+  .unwrap();
+  let saved_publisher = std::fs::read(&publisher_state).unwrap();
+  assert!(!root.join(RECORD).exists());
+  assert!(is_closed(&root).unwrap());
+  assert!(
+    register_with_labels(&root, path, &["latest".into()])
+      .unwrap_err()
+      .to_string()
+      .contains("file-upload")
+  );
+  assert!(!root.join(RECORD).exists());
+  assert_eq!(std::fs::read(root.join(path)).unwrap(), b"late checkpoint");
+  assert_eq!(std::fs::read(&publisher_state).unwrap(), saved_publisher);
+}
+
+#[test]
+fn unfinished_publication_without_checkpoint_registry_accepts_handoffs() {
+  for status in ["pending", "publishing", "retrying", "error"] {
+    let (_temporary, root) = fixture();
+    let path = "outputs/ready.pt";
+    std::fs::write(root.join(path), "checkpoint").unwrap();
+    fs::atomic_json(
+      &root.join("publishing-state.json"),
+      &json!({"schema_version":1,"run_id":"run-fixture","status":status}),
+    )
+    .unwrap();
+    assert!(!is_closed(&root).unwrap());
+    assert_eq!(register(&root, path).unwrap()["sync_status"], "registered");
+  }
+}
+
+#[test]
 fn sealed_inventory_rejects_new_handoffs_and_alias_moves_but_keeps_exact_repeats() {
   let (_temporary, root) = fixture();
   std::fs::write(root.join("outputs/1.pt"), "checkpoint").unwrap();

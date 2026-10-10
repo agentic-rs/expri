@@ -91,7 +91,7 @@ and offline review without shared project directories or published ports.
 Configured runs start their own native publishers in this suite. Training
 finishes through a service outage; killing and resuming the publisher reuses
 its saved intent and acknowledged stream/upload offsets. Failed and cancelled
-runs also reach `synced`, with their original task status preserved in hosted
+runs also reach `published`, with their original task status preserved in hosted
 review. A small finalized checkpoint registered with `best` and `latest` labels
 uploads during training; an `expri fetch --watch` laptop watcher configured for `best` commits its
 verified download receipt while the run is still active. The separate 17 MiB

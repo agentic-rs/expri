@@ -58,7 +58,7 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
         except (ValueError, UnicodeDecodeError):
           pass
       if expected_identity is None or actual_sync != expected_identity:
-        raise RuntimeError("target checkout changed after sync; retry run")
+        raise RuntimeError("target checkout changed after push; retry run")
     source = _snapshot_select_source(root, remote_managed)
     runs_dir = state_dir / "runs"
     _snapshot_private_directory(runs_dir)
@@ -89,7 +89,7 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
         if _snapshot_inspect_file(root, path) is not None:
           raise _snapshot_changed(path)
       if _snapshot_select_source(root, remote_managed) != source:
-        raise RuntimeError("checkout changed while preparing the run snapshot; retry after edits or sync finish")
+        raise RuntimeError("checkout changed while preparing the run snapshot; retry after edits or source pushing finish")
       manifest = {
         "run_id": run_dir.name,
         "created_at": _snapshot_datetime.datetime.now(_snapshot_datetime.timezone.utc).isoformat(),
@@ -139,7 +139,7 @@ def _snapshot_select_source(root, remote_managed):
     if result.returncode != 0:
       raise RuntimeError(
         "cannot select source files in " + str(root) +
-        ": use a Git checkout or sync the target to create .expri/checkout.manifest"
+        ": use a Git checkout or push source to the target to create .expri/checkout.manifest"
       )
     for raw_name in result.stdout.split(b"\0"):
       if not raw_name:
@@ -215,7 +215,7 @@ def _snapshot_copy_file(root, code_dir, path):
   if not _snapshot_stat.S_ISREG(metadata.st_mode):
     raise RuntimeError(
       "snapshot source must be a file or symlink: " + str(source) +
-      " (Git submodules need their own synced source files)"
+      " (Git submodules need their own source files pushed)"
     )
   flags = _snapshot_os.O_RDONLY | getattr(_snapshot_os, "O_NOFOLLOW", 0)
   with _snapshot_os.fdopen(_snapshot_os.open(source, flags), "rb") as input_file:
@@ -285,5 +285,5 @@ def _snapshot_digest(raw):
 def _snapshot_changed(path):
   return RuntimeError(
     "source changed while preparing the run snapshot: " + str(path) +
-    "; retry after edits or sync finish"
+    "; retry after edits or source pushing finish"
   )

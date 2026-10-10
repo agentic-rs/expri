@@ -65,10 +65,10 @@ pub fn status_at(repo_root: &Path, run_id: &str) -> Result<Value> {
     "cancel_requested": cancel_requested, "state": state,
   });
   match crate::service::publishing::status(&run_dir) {
-    Ok(Some(service_sync)) => report["service_sync"] = service_sync,
+    Ok(Some(publishing)) => report["publishing"] = publishing,
     Ok(None) => {}
     Err(_) => {
-      report["service_sync"] = json!({
+      report["publishing"] = json!({
         "status": "error", "last_error": "Service publishing status could not be read."
       });
     }

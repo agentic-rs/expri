@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::InputGetOptions;
+use super::InputDownloadOptions;
 use super::client::fs;
 use crate::config::RunServiceConfig;
 use crate::error::Result;
@@ -40,8 +40,8 @@ pub(crate) fn prepare(
         "run private input binding already exists; use a new run directory",
       ));
     }
-    let report = super::client::input_get_prepared(
-      InputGetOptions {
+    let report = super::client::input_download_prepared(
+      InputDownloadOptions {
         config: service.client_config.clone(),
         project_id: service.project_id.clone(),
         input_id: input.input_id.clone(),

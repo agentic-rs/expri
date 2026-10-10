@@ -146,7 +146,7 @@ fn ctl_dry_run_does_not_require_an_installed_executable() {
     .upload_file(temp.path(), "/tmp/file")
     .expect("dry-run upload");
   remote
-    .download_file("/tmp/file", temp.path())
+    .download_run_files_from("/tmp/run", temp.path(), &temp.path().join("files-from"))
     .expect("dry-run download");
 }
 
@@ -442,17 +442,13 @@ exec /bin/sh -c \"$*\"",
     remote
       .upload_file(&source.join("run.sh"), &uploaded_file.to_string_lossy())
       .expect("upload file through ctl");
-    let downloaded_file = fixture.root.path().join("downloaded.sh");
-    remote
-      .download_file(&uploaded_file.to_string_lossy(), &downloaded_file)
-      .expect("download file through ctl");
     assert_eq!(
-      fs::read(&downloaded_file).expect("read downloaded file"),
+      fs::read(&uploaded_file).expect("read uploaded file"),
       fs::read(source.join("run.sh")).expect("read original file")
     );
     assert_eq!(
-      fs::metadata(&downloaded_file)
-        .expect("downloaded metadata")
+      fs::metadata(&uploaded_file)
+        .expect("uploaded metadata")
         .permissions()
         .mode()
         & 0o777,
@@ -488,7 +484,7 @@ exec /bin/sh -c \"$*\"",
 
     let scoped = fixture.root.path().join("scoped-download");
     remote
-      .download_files_from(&full.to_string_lossy(), &scoped, &files_from)
+      .download_run_files_from(&full.to_string_lossy(), &scoped, &files_from)
       .expect("download selected files through ctl");
     assert_eq!(
       fs::read(scoped.join(selected_name)).expect("selected download"),

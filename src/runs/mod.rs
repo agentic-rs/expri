@@ -243,8 +243,8 @@ fn show(run_dir: &Path) -> Value {
     &mut record.warnings,
     true,
   );
-  let service_sync = match crate::service::publishing::status(run_dir) {
-    Ok(service_sync) => service_sync,
+  let publishing = match crate::service::publishing::status(run_dir) {
+    Ok(publishing) => publishing,
     Err(_) => {
       let detail = "Service publishing status could not be read.";
       warn(
@@ -259,8 +259,8 @@ fn show(run_dir: &Path) -> Value {
     "run": record.summary, "state": record.state, "snapshot": snapshot,
     "environment": environment, "warnings": record.warnings,
   });
-  if let Some(service_sync) = service_sync {
-    report["service_sync"] = service_sync;
+  if let Some(publishing) = publishing {
+    report["publishing"] = publishing;
   }
   report
 }

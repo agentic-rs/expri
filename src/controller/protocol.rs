@@ -8,7 +8,6 @@ trait RemoteProtocol {
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn apply_setup(&self, remote: &Remote, request_path: &str) -> Result<()>;
   fn apply_run(&self, remote: &Remote, request_path: &str) -> Result<()>;
-  fn prepare_pull(&self, remote: &Remote) -> Result<()>;
   fn apply_environment(&self, remote: &Remote, request: &EnvironmentCommandRequest) -> Result<()>;
   fn query_runs(&self, remote: &Remote, request: &RunQueryRequest) -> Result<serde_json::Value>;
 }
@@ -48,7 +47,7 @@ impl RemoteProtocol for ExpriNodeProtocol {
 
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()> {
     remote.execute(&format!(
-      "cd {} && {} node sync-apply --request {}",
+      "cd {} && {} node push-apply --request {}",
       remote.quoted_remote_dir(),
       shell::quote(&self.node_bin),
       shell::quote(request_path)
@@ -61,14 +60,6 @@ impl RemoteProtocol for ExpriNodeProtocol {
       remote.quoted_remote_dir(),
       shell::quote(&self.node_bin),
       shell::quote(request_path)
-    ))
-  }
-
-  fn prepare_pull(&self, remote: &Remote) -> Result<()> {
-    remote.execute(&format!(
-      "cd {} && {} node pull-prepare",
-      remote.quoted_remote_dir(),
-      shell::quote(&self.node_bin)
     ))
   }
 
@@ -132,14 +123,6 @@ impl RemoteProtocol for PythonProtocol {
       "cd {} && python3 - <<'PY'\n{}\nPY",
       remote.quoted_remote_dir(),
       python_run_script(request_path)
-    ))
-  }
-
-  fn prepare_pull(&self, remote: &Remote) -> Result<()> {
-    remote.execute(&format!(
-      "cd {} && python3 - <<'PY'\n{}\nPY",
-      remote.quoted_remote_dir(),
-      python_pull_prepare_script()
     ))
   }
 
@@ -217,7 +200,7 @@ pub fn apply_sync_with_preference(
   node_bin: &str,
   requires_environment: bool,
 ) -> Result<()> {
-  protocol_with_preference(remote, preference, node_bin, "sync", requires_environment)?
+  protocol_with_preference(remote, preference, node_bin, "push", requires_environment)?
     .apply_sync(remote, request_path)
 }
 
@@ -230,14 +213,6 @@ pub fn apply_setup_with_preference(
 ) -> Result<()> {
   protocol_with_preference(remote, preference, node_bin, "setup", requires_environment)?
     .apply_setup(remote, request_path)
-}
-
-pub fn prepare_pull_with_preference(
-  remote: &Remote,
-  preference: ProtocolPreference,
-  node_bin: &str,
-) -> Result<()> {
-  protocol_with_preference(remote, preference, node_bin, "pull", false)?.prepare_pull(remote)
 }
 
 pub fn apply_run_with_preference(
@@ -371,7 +346,7 @@ fn require_run_capability(
       "{feature} requires a native expri worker; upgrade the worker and use protocol = \"auto\" or \"expri-node\", {alternative}"
     )));
   }
-  // A first sync has not created the checkout yet. Installed PATH/absolute
+  // A first push has not created the checkout yet. Installed PATH/absolute
   // nodes can still be checked, while existing relative nodes resolve there.
   let directory = remote.quoted_remote_dir();
   let supported = remote.execute_success(&format!(
@@ -780,7 +755,7 @@ def install_staged_checkout(state_dir, stage_dir, previous, remote_managed):
 request = json.loads(pathlib.Path({request_path}).read_text())
 state_dir = pathlib.Path(request["state_dir"])
 if state_dir.is_symlink():
-  raise SystemExit("sync state directory must not be a symlink")
+  raise SystemExit("push state directory must not be a symlink")
 state_dir.mkdir(parents=True, exist_ok=True)
 if (state_dir / "worktree.lock").is_symlink():
   raise SystemExit("checkout lock must not be a symlink")
@@ -836,47 +811,6 @@ atomic_write(state_dir / "sync-state.json", json.dumps({{
 }}, indent=2, sort_keys=True))
 "#
   )
-}
-
-fn python_pull_prepare_script() -> String {
-  r#"import hashlib, json, pathlib, subprocess, zipfile
-
-def sha256(path):
-  h = hashlib.sha256()
-  with open(path, "rb") as f:
-    for chunk in iter(lambda: f.read(1024 * 1024), b""):
-      h.update(chunk)
-  return h.hexdigest()
-
-out = pathlib.Path(".expri/out")
-out.mkdir(parents=True, exist_ok=True)
-head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-bundle = out / "pull-source.bundle"
-patch = out / "pull-patch.zip"
-subprocess.run(["git", "bundle", "create", str(bundle), "HEAD"], check=True)
-changed = subprocess.check_output(["git", "diff", "--name-only", "-z", "HEAD", "--"])
-untracked = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"])
-paths = sorted({p for p in (changed + untracked).decode().split("\0") if p})
-with zipfile.ZipFile(patch, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-  deleted = []
-  for path in paths:
-    p = pathlib.Path(path)
-    if p.is_file():
-      archive.write(p, path)
-    else:
-      deleted.append(path)
-  archive.writestr(".deleted", "".join(f"{path}\n" for path in deleted))
-artifacts = {
-  "head": head,
-  "source_bundle": ".expri/out/pull-source.bundle",
-  "source_bundle_sha256": sha256(bundle),
-  "patch": ".expri/out/pull-patch.zip",
-  "patch_sha256": sha256(patch),
-  "state_dir": ".expri",
-}
-(out / "pull-artifacts.json").write_text(json.dumps(artifacts, indent=2, sort_keys=True))
-"#
-  .to_string()
 }
 
 #[cfg(test)]

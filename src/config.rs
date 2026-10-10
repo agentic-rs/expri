@@ -9,6 +9,7 @@ use crate::filter::{DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES, SyncRules};
 use crate::protocol::SetupStep;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
   pub project: Option<ProjectConfig>,
   pub ssh: Option<SshConfig>,
@@ -16,15 +17,14 @@ pub struct Config {
   pub target: BTreeMap<String, TargetConfig>,
   #[serde(default)]
   pub tasks: BTreeMap<String, TaskDefinition>,
-  #[serde(rename = "push", alias = "sync")]
-  pub sync: Option<SyncConfig>,
+  pub push: Option<PushConfig>,
   pub setup: Option<SetupConfig>,
   pub download: Option<DownloadConfig>,
   #[serde(default)]
   pub environment: Option<EnvironmentConfig>,
   #[serde(default)]
   pub service: Option<RunServiceConfig>,
-  #[serde(default, alias = "file_sync")]
+  #[serde(default)]
   pub fetch: Option<FetchConfig>,
 }
 
@@ -323,7 +323,7 @@ pub struct TaskConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SyncConfig {
+pub struct PushConfig {
   pub exclude_dirs: Option<Vec<String>>,
   pub exclude_files: Option<Vec<String>>,
   pub include_ignored: Option<Vec<String>>,
@@ -450,24 +450,23 @@ impl Config {
       .ok_or_else(|| ExpriError::Message(format!("unknown task: {name}")))
   }
 
-  pub fn sync_rules(&self) -> Result<SyncRules> {
-    let sync = self.sync.as_ref();
-    match sync {
-      Some(sync) => SyncRules::new(
-        sync.exclude_dirs.clone().unwrap_or_else(|| {
+  pub fn push_rules(&self) -> Result<SyncRules> {
+    match self.push.as_ref() {
+      Some(push) => SyncRules::new(
+        push.exclude_dirs.clone().unwrap_or_else(|| {
           DEFAULT_EXCLUDED_DIRS
             .iter()
             .map(ToString::to_string)
             .collect()
         }),
-        sync.exclude_files.clone().unwrap_or_else(|| {
+        push.exclude_files.clone().unwrap_or_else(|| {
           DEFAULT_EXCLUDED_FILES
             .iter()
             .map(ToString::to_string)
             .collect()
         }),
-        sync.include_ignored.clone().unwrap_or_default(),
-        sync.remote_managed.clone().unwrap_or_default(),
+        push.include_ignored.clone().unwrap_or_default(),
+        push.remote_managed.clone().unwrap_or_default(),
       ),
       None => SyncRules::defaults(),
     }
@@ -601,39 +600,54 @@ mod tests {
   }
 
   #[test]
-  fn fetch_accepts_legacy_section_without_combining_directions() {
-    for section in ["fetch", "file_sync"] {
-      let config: Config = toml::from_str(&format!(
-        "[{section}]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\nlabels=['best']\n"
-      ))
-      .unwrap();
-      let fetch = config.fetch.unwrap();
-      fetch.validate().unwrap();
-      assert_eq!(fetch.origins, ["gpu-1"]);
-      assert_eq!(fetch.labels, ["best"]);
-      assert!(config.target.is_empty());
-    }
-    assert!(
-      toml::from_str::<Config>(
-        "[fetch]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\n[file_sync]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-2']\n"
-      )
-      .is_err()
-    );
+  fn load_keeps_push_and_fetch_sections_independent() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("expri.toml");
+    fs::write(
+      &path,
+      "[push]\nremote_managed=['datasets']\nexclude_dirs=['generated']\n[fetch]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\nlabels=['best']\n",
+    )
+    .unwrap();
+    let config = Config::load(&path).unwrap();
+    let push = config.push.as_ref().unwrap();
+    assert_eq!(push.remote_managed.as_ref().unwrap(), &["datasets"]);
+    assert_eq!(push.exclude_dirs.as_ref().unwrap(), &["generated"]);
+    assert_eq!(config.push_rules().unwrap().remote_managed(), ["datasets"]);
+    let fetch = config.fetch.unwrap();
+    assert_eq!(fetch.origins, ["gpu-1"]);
+    assert_eq!(fetch.labels, ["best"]);
+    assert!(config.target.is_empty());
   }
 
   #[test]
-  fn push_accepts_legacy_source_policy_section() {
-    for section in ["push", "sync"] {
-      let config: Config = toml::from_str(&format!(
-        "[{section}]\nremote_managed=['datasets']\nexclude_dirs=['generated']\n"
-      ))
-      .unwrap();
-      let push = config.sync.as_ref().unwrap();
-      assert_eq!(push.remote_managed.as_ref().unwrap(), &["datasets"]);
-      assert_eq!(push.exclude_dirs.as_ref().unwrap(), &["generated"]);
-      assert!(config.fetch.is_none());
+  fn load_rejects_removed_sections_in_project_and_target_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("expri.toml");
+    let target_path = directory.path().join("expri.target.toml");
+    for section in ["sync", "file_sync"] {
+      let removed = format!("[{section}]\nprivate_value='never-echo-this-value'\n");
+      for canonical in [
+        "",
+        "[push]\n[fetch]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\n",
+      ] {
+        fs::write(&project_path, format!("{canonical}{removed}")).unwrap();
+        let error = Config::load(&project_path).unwrap_err().to_string();
+        assert!(
+          error.contains(&format!("unknown field `{section}`")),
+          "{error}"
+        );
+        assert!(!error.contains("never-echo-this-value"), "{error}");
+      }
+      fs::write(&project_path, "").unwrap();
+      fs::write(&target_path, &removed).unwrap();
+      let error = Config::load(&project_path).unwrap_err().to_string();
+      assert!(
+        error.contains(&format!("unknown field `{section}`")),
+        "{error}"
+      );
+      assert!(!error.contains("never-echo-this-value"), "{error}");
+      fs::remove_file(&target_path).unwrap();
     }
-    assert!(toml::from_str::<Config>("[push]\n[sync]\n").is_err());
   }
 
   #[test]

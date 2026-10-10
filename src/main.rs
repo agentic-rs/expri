@@ -60,7 +60,6 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
   /// Push source and configuration changes to a worker checkout.
-  #[command(alias = "sync")]
   Push(PushCommand),
   /// Fetch run data and selected outputs from the expri service and S3.
   Fetch(FetchCommand),
@@ -141,11 +140,8 @@ struct PushCommand {
   #[arg(long)]
   force: bool,
 
-  #[arg(long, hide = true)]
-  pull: bool,
-
   /// Keep pushing source and configuration changes to the worker checkout.
-  #[arg(long, conflicts_with_all = ["pull", "paths"])]
+  #[arg(long, conflicts_with = "paths")]
   watch: bool,
 
   #[arg(value_name = "PATH", last = true)]
@@ -228,8 +224,8 @@ struct RunCommand {
   dry_run: bool,
 
   /// Skip pushing source changes before starting the run.
-  #[arg(long = "no-push", alias = "no-sync")]
-  no_sync: bool,
+  #[arg(long)]
+  no_push: bool,
 
   /// Disable automatic publishing for this run.
   #[arg(long)]
@@ -243,8 +239,7 @@ struct RunCommand {
     value_name = "TASK",
     required = true,
     num_args = 1..,
-    trailing_var_arg = true,
-    allow_hyphen_values = true
+    trailing_var_arg = true
   )]
   task: Vec<String>,
 }
@@ -444,9 +439,9 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   let task = context.config.task(&name)?;
   let remote_managed = context
     .config
-    .sync
+    .push
     .as_ref()
-    .and_then(|sync| sync.remote_managed.clone())
+    .and_then(|push| push.remote_managed.clone())
     .unwrap_or_default();
   let (extras, sync_args) = environment_selection(&context.config);
   if target.is_some() {
@@ -482,8 +477,8 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
         quiet,
       )?;
     }
-    let expected_sync = if !command.no_sync {
-      let sync = context.config.sync_rules()?;
+    let expected_sync = if !command.no_push {
+      let sync = context.config.push_rules()?;
       let sync_with_receipt = if command.detach {
         sync_target_with_diagnostic_receipt
       } else {
@@ -499,7 +494,6 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
         control_persist: command.control_persist.clone(),
         dry_run: command.dry_run,
         force: false,
-        pull: false,
         paths: Vec::new(),
         verbosity,
         quiet,
@@ -536,9 +530,9 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   let mut local_sources = remote_managed;
   if let Some(paths) = context
     .config
-    .sync
+    .push
     .as_ref()
-    .and_then(|sync| sync.include_ignored.as_ref())
+    .and_then(|push| push.include_ignored.as_ref())
   {
     local_sources.extend(paths.iter().cloned());
   }
@@ -576,25 +570,25 @@ mod tests {
 
   #[test]
   fn push_and_fetch_select_separate_directions() {
-    for name in ["push", "sync"] {
-      let cli =
-        Cli::try_parse_from(["expri", "-T", "gpu-1", name, "--watch", "--dry-run"]).unwrap();
-      assert!(matches!(
-        cli.command,
-        Command::Push(PushCommand {
-          watch: true,
-          dry_run: true,
-          ..
-        })
-      ));
-      assert!(Cli::try_parse_from(["expri", name, "--watch", "--pull"]).is_err());
-      assert!(Cli::try_parse_from(["expri", name, "--watch", "--", "code.py"]).is_err());
-      let cli = Cli::try_parse_from(["expri", name, "--pull", "--", "code.py"]).unwrap();
-      assert!(matches!(
-        cli.command,
-        Command::Push(PushCommand { pull: true, .. })
-      ));
-    }
+    let cli =
+      Cli::try_parse_from(["expri", "-T", "gpu-1", "push", "--watch", "--dry-run"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Push(PushCommand {
+        watch: true,
+        dry_run: true,
+        ..
+      })
+    ));
+    assert!(Cli::try_parse_from(["expri", "push", "--watch", "--", "code.py"]).is_err());
+    let cli = Cli::try_parse_from(["expri", "push", "--", "code.py"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Push(PushCommand { paths, .. }) if paths == [PathBuf::from("code.py")]
+    ));
+    assert!(Cli::try_parse_from(["expri", "-T", "gpu-1", "sync", "--watch", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "push", "--pull", "--", "code.py"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "run", "--no-sync", "train"]).is_err());
     let cli = Cli::try_parse_from(["expri", "fetch", "--watch", "--dry-run"]).unwrap();
     assert!(matches!(
       cli.command,
@@ -608,6 +602,21 @@ mod tests {
       assert!(Cli::try_parse_from(["expri", "fetch", flag]).is_err());
     }
     assert!(Cli::try_parse_from(["expri", "fetch", "--", "code.py"]).is_err());
+  }
+
+  #[test]
+  fn node_apply_uses_push_without_a_sync_alias() {
+    let cli =
+      Cli::try_parse_from(["expri", "node", "push-apply", "--request", "request.json"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Node {
+        command: NodeCommand::PushApply(_)
+      }
+    ));
+    assert!(
+      Cli::try_parse_from(["expri", "node", "sync-apply", "--request", "request.json",]).is_err()
+    );
   }
 
   #[test]
@@ -637,7 +646,7 @@ mod tests {
     let cli = Cli::try_parse_from(["expri", "run", "--no-push", "train"]).unwrap();
     assert!(matches!(
       cli.command,
-      Command::Run(RunCommand { no_sync: true, .. })
+      Command::Run(RunCommand { no_push: true, .. })
     ));
   }
 
@@ -692,7 +701,7 @@ mod tests {
       "expri",
       "run",
       "--dry-run",
-      "--no-sync",
+      "--no-push",
       "--no-publish",
       "--detach",
       "train",
@@ -707,7 +716,7 @@ mod tests {
 
     assert_eq!(command.task[0], "train");
     assert!(command.dry_run);
-    assert!(command.no_sync);
+    assert!(command.no_push);
     assert!(command.no_publish);
     assert!(command.detach);
     assert_eq!(command.task[1..], ["--model", "tiny"]);
@@ -741,7 +750,7 @@ mod tests {
   }
 
   #[test]
-  fn detached_legacy_remote_tasks_fail_before_sync_or_transport() {
+  fn detached_legacy_remote_tasks_fail_before_push_or_transport() {
     let fixture = tempfile::tempdir().unwrap();
     let config = fixture.path().join("expri.toml");
     std::fs::write(

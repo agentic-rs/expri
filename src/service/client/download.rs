@@ -9,7 +9,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 use super::super::types::*;
-use super::super::{InputGetOptions, PullOptions};
+use super::super::{InputDownloadOptions, ServiceFetchOptions};
 use super::fs::message;
 use super::{Api, METADATA, OBJECT_BATCH, RECORD_LIMIT, STREAMS, artifacts, fs, validate_digest};
 use crate::error::Result;
@@ -23,7 +23,7 @@ mod staging;
 #[cfg(test)]
 mod tests;
 
-pub(super) use checkpoints::{ObjectResult, pull_objects};
+pub(super) use checkpoints::{ObjectResult, fetch_objects};
 
 pub(super) fn validate_record(record: &FileRecord) -> Result<()> {
   validate_target(&record.target)?;
@@ -329,15 +329,15 @@ fn cache_owner(destination: &Path, expected: &Value) -> Result<()> {
   Ok(())
 }
 
-pub fn pull(options: PullOptions) -> Result<Value> {
-  pull_impl(options, None)
+pub fn fetch(options: ServiceFetchOptions) -> Result<Value> {
+  fetch_impl(options, None)
 }
 
-pub(super) fn pull_pinned(
-  options: PullOptions,
+pub(super) fn fetch_pinned(
+  options: ServiceFetchOptions,
   expected: &BTreeMap<String, FileRecord>,
 ) -> Result<Value> {
-  pull_impl(options, Some(expected))
+  fetch_impl(options, Some(expected))
 }
 
 fn verify_expected_objects(
@@ -363,8 +363,8 @@ fn verify_expected_objects(
   Ok(())
 }
 
-fn pull_impl(
-  options: PullOptions,
+fn fetch_impl(
+  options: ServiceFetchOptions,
   expected: Option<&BTreeMap<String, FileRecord>>,
 ) -> Result<Value> {
   let api = Api::new(&options.config)?;
@@ -566,21 +566,21 @@ fn pull_impl(
   )
 }
 
-pub fn input_get(options: InputGetOptions) -> Result<Value> {
-  input_get_bound(&options, &mut || Ok(false), &mut |_, _, _| Ok(()))
+pub fn input_download(options: InputDownloadOptions) -> Result<Value> {
+  input_download_bound(&options, &mut || Ok(false), &mut |_, _, _| Ok(()))
 }
 
 type InputBinder<'a> =
   dyn FnMut(&Path, &Value, &mut dyn FnMut() -> Result<bool>) -> Result<()> + 'a;
 
-pub fn input_get_prepared(
-  options: InputGetOptions,
+pub fn input_download_prepared(
+  options: InputDownloadOptions,
   cancelled: &mut dyn FnMut() -> Result<bool>,
   bind: &mut InputBinder<'_>,
 ) -> Result<Value> {
   loop {
     fs::check_cancelled(cancelled)?;
-    match input_get_bound(&options, cancelled, bind) {
+    match input_download_bound(&options, cancelled, bind) {
       Err(crate::error::ExpriError::DownloadBusy { .. }) => {
         thread::sleep(Duration::from_millis(200));
       }
@@ -600,8 +600,8 @@ fn bound_input_report(
   Ok(report)
 }
 
-fn input_get_bound(
-  options: &InputGetOptions,
+fn input_download_bound(
+  options: &InputDownloadOptions,
   cancelled: &mut dyn FnMut() -> Result<bool>,
   bind: &mut InputBinder<'_>,
 ) -> Result<Value> {

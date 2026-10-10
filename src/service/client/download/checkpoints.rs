@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use super::{
-  Api, FileRecord, FileStorage, FileTarget, LockAttempt, PullOptions, Request, Response, Result,
-  artifacts, cache_owner, downloaded_files, fs, message, publish, staged_download, staging,
-  validate_record, validate_scope, verify_expected_objects,
+  Api, FileRecord, FileStorage, FileTarget, LockAttempt, Request, Response, Result,
+  ServiceFetchOptions, artifacts, cache_owner, downloaded_files, fs, message, publish,
+  staged_download, staging, validate_record, validate_scope, verify_expected_objects,
 };
 
 pub(in crate::service::client) struct ObjectResult {
@@ -15,8 +15,8 @@ pub(in crate::service::client) struct ObjectResult {
   pub(in crate::service::client) files: Vec<(FileRecord, std::fs::Metadata)>,
 }
 
-pub(in crate::service::client) fn pull_objects(
-  options: PullOptions,
+pub(in crate::service::client) fn fetch_objects(
+  options: ServiceFetchOptions,
   expected: BTreeMap<String, FileRecord>,
 ) -> Result<ObjectResult> {
   let api = Api::new(&options.config)?;

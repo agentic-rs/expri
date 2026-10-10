@@ -115,7 +115,7 @@ fn validate_remote_managed_path(path: &Path) -> Result<()> {
       .any(|component| !matches!(component, Component::Normal(_)))
   {
     return Err(crate::error::ExpriError::Message(format!(
-      "sync remote_managed path must be relative and stay inside the repo: {}",
+      "push remote_managed path must be relative and stay inside the repo: {}",
       path.display()
     )));
   }

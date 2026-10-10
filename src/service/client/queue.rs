@@ -62,14 +62,14 @@ impl Queue {
     let LockAttempt::Acquired(lease) =
       crate::lock::try_lock_file(&directory.join(".sync.lock"), true)?
     else {
-      return Err(message("another service sync is using this queue"));
+      return Err(message("another publisher is using this queue"));
     };
     let path = directory.join("queue.json");
     let state = if fs::inspect(&path)?.is_some() {
       let state: QueueState = serde_json::from_slice(&fs::read_bounded(&path, RECORD_LIMIT)?)?;
       if state.schema_version != 1 || state.owner != owner {
         return Err(message(
-          "service sync queue belongs to another endpoint or run",
+          "publishing queue belongs to another endpoint or run",
         ));
       }
       let mut state = state;

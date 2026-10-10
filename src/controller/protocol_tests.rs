@@ -1,15 +1,14 @@
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
 
-use super::{python_pull_prepare_script, python_sync_apply_script};
+use super::python_sync_apply_script;
 use crate::archive::{build_patch_archive, sha256_file};
 use crate::filter::SyncRules;
 use crate::git;
-use crate::protocol::{PullArtifacts, SyncApplyRequest, SyncIdentity};
+use crate::protocol::{SyncApplyRequest, SyncIdentity};
 
 struct SyncFixture {
   root: TempDir,
@@ -268,60 +267,6 @@ printf '%s\n' "$PWD" >> {log}
 }
 
 #[test]
-fn python_pull_prepare_packages_head_and_dirty_files() {
-  let fixture = SyncFixture::new(&[
-    (".gitignore", ".expri/\n"),
-    ("tracked.txt", "committed\n"),
-    ("deleted.txt", "remove me\n"),
-  ]);
-  fixture.write_source("tracked.txt", "changed\n");
-  fixture.write_source("untracked.txt", "new\n");
-  fs::remove_file(fixture.source.join("deleted.txt")).expect("delete tracked source");
-
-  let output = Command::new("python3")
-    .current_dir(&fixture.source)
-    .arg("-c")
-    .arg(python_pull_prepare_script())
-    .output()
-    .expect("run Python pull preparation");
-  assert!(
-    output.status.success(),
-    "Python pull preparation failed: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-
-  let artifacts: PullArtifacts = serde_json::from_slice(
-    &fs::read(fixture.source.join(".expri/out/pull-artifacts.json")).expect("read pull artifacts"),
-  )
-  .expect("parse pull artifacts");
-  assert_eq!(artifacts.head, git::head(&fixture.source).unwrap());
-  let bundle = fixture.source.join(&artifacts.source_bundle);
-  assert_eq!(
-    sha256_file(&bundle).unwrap().0,
-    artifacts.source_bundle_sha256
-  );
-  fixture.git(&["bundle", "verify", &artifacts.source_bundle]);
-
-  let patch = fixture.source.join(&artifacts.patch);
-  assert_eq!(sha256_file(&patch).unwrap().0, artifacts.patch_sha256);
-  let mut archive = zip::ZipArchive::new(fs::File::open(patch).unwrap()).unwrap();
-  for (path, expected) in [
-    ("tracked.txt", "changed\n"),
-    ("untracked.txt", "new\n"),
-    (".deleted", "deleted.txt\n"),
-  ] {
-    let mut contents = String::new();
-    archive
-      .by_name(path)
-      .unwrap()
-      .read_to_string(&mut contents)
-      .unwrap();
-    assert_eq!(contents, expected, "pull patch entry {path}");
-  }
-  assert_eq!(archive.len(), 3);
-}
-
-#[test]
 fn python_sync_keeps_dirty_file_after_it_is_committed() {
   let fixture = SyncFixture::new(&[("tracked.txt", "initial\n")]);
   fixture.write_source("tracked.txt", "dirty\n");
@@ -481,7 +426,7 @@ fn python_sync_invalidates_receipt_on_partial_install_and_recovers_owned_files()
       crate::environment::snapshot::create_expected(&fixture.worktree, &[], Some(&old_receipt),)
         .expect_err("old receipt must not launch partial b")
         .to_string()
-        .contains("target checkout changed after sync; retry run")
+        .contains("target checkout changed after push; retry run")
     );
 
     fixture.git(&["reset", "--hard", "--quiet", &old_head]);

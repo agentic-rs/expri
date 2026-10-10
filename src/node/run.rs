@@ -60,7 +60,7 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
   {
     let _ = writeln!(
       std::io::stderr(),
-      "dashboard: {url} (available after service sync)"
+      "dashboard: {url} (available after publishing)"
     );
   }
   if request.detach {
@@ -84,7 +84,7 @@ fn execute_snapshot(
   {
     let _ = writeln!(
       std::io::stderr(),
-      "warning: service publishing could not start; the run will continue. Inspect runs status for sync details."
+      "warning: service publishing could not start; the run will continue. Inspect runs status for publishing details."
     );
   }
   let mut cancelled = false;

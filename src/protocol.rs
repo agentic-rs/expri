@@ -156,13 +156,3 @@ pub struct SyncApplyRequest {
   pub remote_managed: Vec<String>,
   pub force: bool,
 }
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct PullArtifacts {
-  pub head: String,
-  pub source_bundle: String,
-  pub source_bundle_sha256: String,
-  pub patch: String,
-  pub patch_sha256: String,
-  pub state_dir: String,
-}

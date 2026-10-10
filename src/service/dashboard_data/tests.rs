@@ -916,6 +916,9 @@ fn live_metrics_logs_compare_and_chart_use_bounded_saved_streams() {
   let detail = dashboard
     .detail("hosted:project:worker", "run-one")
     .unwrap();
+  assert!(detail.get("archive").is_none());
+  assert_eq!(detail["result_upload"]["status"], "none");
+  assert!(detail["result_upload"]["download_url"].is_null());
   assert_eq!(detail["params"]["lr"], 0.001);
   assert_eq!(detail["metrics"]["loss"]["count"], 2);
   assert_eq!(detail["metrics"]["loss"]["last"]["value"], 1.0);

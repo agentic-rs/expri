@@ -230,7 +230,7 @@ impl Drop for Server {
   }
 }
 
-fn run(root: &Path, server: &Server) -> PushOptions {
+fn run(root: &Path, server: &Server) -> PublishOptions {
   let run = root.join("run-1");
   fs::directories(&run.join("outputs")).unwrap();
   fs::atomic_json(
@@ -242,7 +242,7 @@ fn run(root: &Path, server: &Server) -> PushOptions {
   std::fs::write(run.join("outputs/checkpoint.pt"), "completed-checkpoint").unwrap();
   std::fs::write(run.join("outputs/metrics.jsonl"), "{\"step\":1}\n").unwrap();
   registrations::register_with_labels(&run, "outputs/checkpoint.pt", &["latest".into()]).unwrap();
-  PushOptions {
+  PublishOptions {
     config: config(root, &server.url),
     run_dir: run,
     project_id: "project".into(),

@@ -280,8 +280,8 @@ fn config(root: &Path, url: &str) -> PathBuf {
   path
 }
 
-fn options(root: &Path, config: PathBuf) -> PullOptions {
-  PullOptions {
+fn options(root: &Path, config: PathBuf) -> ServiceFetchOptions {
+  ServiceFetchOptions {
     config,
     project_id: "project".into(),
     origin: "worker".into(),
@@ -387,14 +387,14 @@ fn tracking_pull_reopens_cursors_detaches_cache_and_reads_only_new_log_bytes() {
       } => Response::File {
         file: record(&path),
       },
-      other => panic!("unexpected tracking pull transport: {other:?}"),
+      other => panic!("unexpected tracking fetch transport: {other:?}"),
     };
     (200, Vec::new(), serde_json::to_vec(&response).unwrap())
   });
   let config = config(&root, &url);
   let mut selected = options(&root, config.clone());
   selected.artifacts.clear();
-  let first = pull(selected).unwrap();
+  let first = fetch(selected).unwrap();
   assert_eq!(first["resumed_bytes"], 0);
   assert_eq!(
     std::fs::read(cached.join("logs/stdout.log")).unwrap(),
@@ -402,7 +402,7 @@ fn tracking_pull_reopens_cursors_detaches_cache_and_reads_only_new_log_bytes() {
   );
   let mut selected = options(&root, config);
   selected.artifacts.clear();
-  let second = pull(selected).unwrap();
+  let second = fetch(selected).unwrap();
   assert_eq!(second["resumed_files"], 1);
   assert_eq!(second["resumed_bytes"], original_size);
   assert_eq!(second["downloaded_bytes"], 7 + new_state.len());
@@ -632,7 +632,7 @@ fn pull_reopens_durable_ranges_with_fresh_urls_and_keeps_previous_cache_until_ve
     b"previous checkpoint",
   )
   .unwrap();
-  assert!(pull(options(&root, config.clone())).is_err());
+  assert!(fetch(options(&root, config.clone())).is_err());
   assert_eq!(
     std::fs::read(destination.join("run-state.json")).unwrap(),
     b"previous state"
@@ -649,7 +649,7 @@ fn pull_reopens_durable_ranges_with_fresh_urls_and_keeps_previous_cache_until_ve
     saved["files"]["outputs/checkpoint.bin"]["offset"],
     OBJECT_BATCH
   );
-  let report = pull(options(&root, config)).unwrap();
+  let report = fetch(options(&root, config)).unwrap();
   task.join().unwrap();
   assert_eq!(
     *ranges.lock().unwrap(),
@@ -847,7 +847,7 @@ fn available_file_receipt_is_bounded_and_does_not_fetch_unselected_artifacts() {
   });
   let mut options = options(&root, config(&root, &url));
   options.artifacts.clear();
-  let report = pull(options).unwrap();
+  let report = fetch(options).unwrap();
   task.join().unwrap();
   let destination = PathBuf::from(report["destination"].as_str().unwrap());
   let receipt: Value =
@@ -951,7 +951,7 @@ fn private_inventory_is_pulled_without_hiding_valid_cached_cloud_artifacts() {
   });
   let mut options = options(&root, config(&root, &url));
   options.artifacts.clear();
-  let report = pull(options).unwrap();
+  let report = fetch(options).unwrap();
   task.join().unwrap();
   let destination = PathBuf::from(report["destination"].as_str().unwrap());
   assert!(
@@ -1360,25 +1360,25 @@ fn private_input_resumes_durable_ranges_reuses_verified_files_and_works_offline(
   let config = config(&root, &url);
   let destination = root.join("dataset.bin");
   std::fs::write(&destination, b"keep previous input").unwrap();
-  let input = || InputGetOptions {
+  let input = || InputDownloadOptions {
     config: config.clone(),
     project_id: "project".into(),
     input_id: "dataset".into(),
     destination: destination.clone(),
   };
-  assert!(input_get(input()).is_err());
+  assert!(input_download(input()).is_err());
   assert_eq!(std::fs::read(&destination).unwrap(), b"keep previous input");
   let progress: Value = serde_json::from_slice(
     &std::fs::read(root.join(".expri-input-downloads/dataset.bin/state.json")).unwrap(),
   )
   .unwrap();
   assert_eq!(progress["files"]["input"]["offset"], OBJECT_BATCH);
-  let report = input_get(input()).unwrap();
+  let report = input_download(input()).unwrap();
   assert_eq!(report["resumed_bytes"], OBJECT_BATCH);
   assert_eq!(report["downloaded_bytes"], 19);
   assert_eq!(std::fs::read(&destination).unwrap(), bytes);
   let before = std::fs::metadata(&destination).unwrap();
-  let reused = input_get(input()).unwrap();
+  let reused = input_download(input()).unwrap();
   assert_eq!(reused["reused"], true);
   assert_eq!(reused["downloaded_bytes"], 0);
   assert!(fs::unchanged(
@@ -1391,11 +1391,11 @@ fn private_input_resumes_durable_ranges_reuses_verified_files_and_works_offline(
     vec![0, OBJECT_BATCH, OBJECT_BATCH, OBJECT_BATCH, OBJECT_BATCH]
   );
   // The server is gone. Only the durable, target-owned receipt can permit reuse.
-  let offline = input_get(input()).unwrap();
+  let offline = input_download(input()).unwrap();
   assert_eq!(offline["offline"], true);
   assert_eq!(offline["reused"], true);
   std::fs::write(&destination, b"unverified replacement").unwrap();
-  assert!(input_get(input()).is_err());
+  assert!(input_download(input()).is_err());
   assert_eq!(
     std::fs::read(&destination).unwrap(),
     b"unverified replacement"
@@ -1431,7 +1431,7 @@ fn completed_checkpoint_is_reused_and_download_receipt_survives_metadata_only_pu
             url: format!("{origin}/{path}"),
           }
         }
-        other => panic!("unexpected pull request: {other:?}"),
+        other => panic!("unexpected fetch request: {other:?}"),
       };
       (200, Vec::new(), serde_json::to_vec(&response).unwrap())
     } else {
@@ -1451,12 +1451,12 @@ fn completed_checkpoint_is_reused_and_download_receipt_survives_metadata_only_pu
     }
   });
   let config = config(&root, &url);
-  let first = pull(options(&root, config.clone())).unwrap();
-  let second = pull(options(&root, config.clone())).unwrap();
+  let first = fetch(options(&root, config.clone())).unwrap();
+  let second = fetch(options(&root, config.clone())).unwrap();
   assert_eq!(second["reused_bytes"], checkpoint.len());
   let mut metadata = options(&root, config);
   metadata.artifacts.clear();
-  pull(metadata).unwrap();
+  fetch(metadata).unwrap();
   task.join().unwrap();
   let destination = PathBuf::from(first["destination"].as_str().unwrap());
   let receipt: Value =
@@ -1507,7 +1507,7 @@ fn matching_existing_input_is_reused_without_changing_its_permissions_or_inode()
       .unwrap(),
     )
   });
-  let report = input_get(InputGetOptions {
+  let report = input_download(InputDownloadOptions {
     config: config(&root, &url),
     project_id: "project".into(),
     input_id: "dataset".into(),
@@ -1547,22 +1547,22 @@ fn prepared_input_binds_verified_destination_while_transfer_lease_is_held() {
     )
   });
   let config = config(&root, &url);
-  let options = || InputGetOptions {
+  let options = || InputDownloadOptions {
     config: config.clone(),
     project_id: "project".into(),
     input_id: "dataset".into(),
     destination: destination.clone(),
   };
   let mut called = false;
-  input_get_prepared(options(), &mut || Ok(false), &mut |path, report, _| {
+  input_download_prepared(options(), &mut || Ok(false), &mut |path, report, _| {
     called = true;
     assert_eq!(path, destination);
     assert_eq!(report["reused"], true);
     assert!(
-      input_get(options())
+      input_download(options())
         .unwrap_err()
         .to_string()
-        .contains("another pull is downloading")
+        .contains("another fetch is downloading")
     );
     Ok(())
   })
@@ -1585,8 +1585,8 @@ fn prepared_input_waits_for_shared_transfer_but_cancel_does_not_touch_cache() {
   let _active =
     staging::Staging::open(root.join(".expri-input-downloads/dataset.bin"), &owner).unwrap();
   let mut checks = 0;
-  let error = input_get_prepared(
-    InputGetOptions {
+  let error = input_download_prepared(
+    InputDownloadOptions {
       config,
       project_id: "project".into(),
       input_id: "dataset".into(),
@@ -1651,14 +1651,14 @@ fn prepared_input_cancels_at_a_range_boundary_and_retains_resumable_progress() {
     }
   });
   let config = config(&root, &url);
-  let input = || InputGetOptions {
+  let input = || InputDownloadOptions {
     config: config.clone(),
     project_id: "project".into(),
     input_id: "dataset".into(),
     destination: destination.clone(),
   };
   let progress = root.join(".expri-input-downloads/dataset.bin/state.json");
-  let error = input_get_prepared(
+  let error = input_download_prepared(
     input(),
     &mut || {
       let offset = std::fs::read(&progress)
@@ -1675,7 +1675,7 @@ fn prepared_input_cancels_at_a_range_boundary_and_retains_resumable_progress() {
   assert_eq!(std::fs::read(&destination).unwrap(), b"keep previous input");
   let saved: Value = serde_json::from_slice(&std::fs::read(progress).unwrap()).unwrap();
   assert_eq!(saved["files"]["input"]["offset"], OBJECT_BATCH);
-  let report = input_get(input()).unwrap();
+  let report = input_download(input()).unwrap();
   assert_eq!(report["resumed_bytes"], OBJECT_BATCH);
   assert_eq!(report["downloaded_bytes"], 23);
   assert_eq!(std::fs::read(destination).unwrap(), bytes);
@@ -1709,8 +1709,8 @@ fn prepared_input_cancels_during_cached_file_hash_verification() {
     )
   });
   let mut checks = 0;
-  let error = input_get_prepared(
-    InputGetOptions {
+  let error = input_download_prepared(
+    InputDownloadOptions {
       config: config(&root, &url),
       project_id: "project".into(),
       input_id: "dataset".into(),
@@ -1781,14 +1781,14 @@ fn prepared_input_cancels_inside_an_object_range_without_acknowledging_partial_b
     }
   });
   let config = config(&root, &url);
-  let input = || InputGetOptions {
+  let input = || InputDownloadOptions {
     config: config.clone(),
     project_id: "project".into(),
     input_id: "dataset".into(),
     destination: destination.clone(),
   };
   let stage = root.join(".expri-input-downloads/dataset.bin");
-  let error = input_get_prepared(
+  let error = input_download_prepared(
     input(),
     &mut || {
       Ok(
@@ -1805,7 +1805,7 @@ fn prepared_input_cancels_inside_an_object_range_without_acknowledging_partial_b
     serde_json::from_slice(&std::fs::read(stage.join("state.json")).unwrap()).unwrap();
   assert_eq!(progress["files"]["input"]["offset"], 0);
   assert_eq!(progress["files"]["input"]["verified"], false);
-  let report = input_get(input()).unwrap();
+  let report = input_download(input()).unwrap();
   assert_eq!(report["resumed_bytes"], 0);
   assert_eq!(std::fs::read(destination).unwrap(), bytes);
   task.join().unwrap();
@@ -1836,7 +1836,7 @@ fn private_input_accepts_a_destination_at_the_filesystem_filename_limit() {
       .unwrap(),
     )
   });
-  let report = input_get(InputGetOptions {
+  let report = input_download(InputDownloadOptions {
     config: config(&root, &url),
     project_id: "project".into(),
     input_id: "dataset".into(),

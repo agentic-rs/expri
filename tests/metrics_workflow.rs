@@ -146,7 +146,7 @@ fn rsync_available() -> bool {
 }
 
 #[test]
-fn remote_metrics_compare_use_selective_pulls_and_remain_available_offline() {
+fn remote_metrics_compare_use_selective_fetches_and_remain_available_offline() {
   if !rsync_available() {
     eprintln!("skipping metrics transfer test: rsync unavailable");
     return;
@@ -155,7 +155,7 @@ fn remote_metrics_compare_use_selective_pulls_and_remain_available_offline() {
     let fixture = Fixture::new(protocol, old_node);
     let preview = fixture.json(&[
       "runs",
-      "pull",
+      "fetch",
       "run-one",
       "--metrics",
       "--dry-run",

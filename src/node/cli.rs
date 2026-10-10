@@ -16,7 +16,6 @@ pub const RUN_INPUTS_CAPABILITY: &str = "run-inputs-v1";
 pub enum NodeCommand {
   Ping,
   Capabilities(CapabilitiesCommand),
-  PullPrepare,
   Setup(SetupCommand),
   Run(SetupCommand),
   #[command(hide = true)]
@@ -24,7 +23,7 @@ pub enum NodeCommand {
   Env(RequestCommand),
   Runs(RequestCommand),
   Jobs(RequestCommand),
-  SyncApply(SyncApplyCommand),
+  PushApply(PushApplyCommand),
 }
 
 #[derive(Debug, Args)]
@@ -58,7 +57,7 @@ pub struct SetupCommand {
 }
 
 #[derive(Debug, Args)]
-pub struct SyncApplyCommand {
+pub struct PushApplyCommand {
   #[arg(long)]
   pub request: PathBuf,
 }
@@ -70,7 +69,6 @@ pub fn run(command: NodeCommand) -> Result<()> {
       Ok(())
     }
     NodeCommand::Capabilities(command) => capabilities(command),
-    NodeCommand::PullPrepare => crate::node::sync::prepare_pull(),
     NodeCommand::Setup(command) => crate::node::setup::apply_request_file(&command.request),
     NodeCommand::Run(command) => crate::node::run::apply_request_file(&command.request),
     NodeCommand::RunWorker(command) => crate::node::run::worker(&command.run_dir),
@@ -95,7 +93,7 @@ pub fn run(command: NodeCommand) -> Result<()> {
         crate::node::jobs::apply_request_stdin()
       }
     }
-    NodeCommand::SyncApply(command) => crate::node::sync::apply_request_file(&command.request),
+    NodeCommand::PushApply(command) => crate::node::sync::apply_request_file(&command.request),
   }
 }
 

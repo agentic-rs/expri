@@ -123,7 +123,7 @@ pub fn create_expected(
   }
   if select_source(&repo_root, remote_managed)? != source {
     return Err(ExpriError::Message(
-      "checkout changed while preparing the run snapshot; retry after edits or sync finish"
+      "checkout changed while preparing the run snapshot; retry after edits or source pushing finish"
         .to_string(),
     ));
   }
@@ -150,7 +150,7 @@ fn verify_sync_identity(state_dir: &Path, expected: &SyncIdentity) -> Result<()>
   let actual = raw.and_then(|raw| serde_json::from_slice::<SyncIdentity>(&raw).ok());
   if actual.as_ref() != Some(expected) {
     return Err(ExpriError::Message(
-      "target checkout changed after sync; retry run".to_string(),
+      "target checkout changed after push; retry run".to_string(),
     ));
   }
   Ok(())
@@ -202,7 +202,7 @@ fn select_source(repo_root: &Path, remote_managed: &[String]) -> Result<SourceSe
         .map_err(|error| io_context("run git in", repo_root, error))?;
       if !output.status.success() {
         return Err(ExpriError::Message(format!(
-          "cannot select source files in {}: use a Git checkout or sync the target to create .expri/checkout.manifest",
+          "cannot select source files in {}: use a Git checkout or push source to the target to create .expri/checkout.manifest",
           repo_root.display()
         )));
       }
@@ -340,7 +340,7 @@ fn copy_source_file(
   }
   if !metadata.is_file() {
     return Err(ExpriError::Message(format!(
-      "snapshot source must be a file or symlink: {} (Git submodules need their own synced source files)",
+      "snapshot source must be a file or symlink: {} (Git submodules need their own source files pushed)",
       source_path.display()
     )));
   }
@@ -488,7 +488,7 @@ fn digest(bytes: &[u8]) -> String {
 
 fn source_changed(path: &Path) -> ExpriError {
   ExpriError::Message(format!(
-    "source changed while preparing the run snapshot: {}; retry after edits or sync finish",
+    "source changed while preparing the run snapshot: {}; retry after edits or source pushing finish",
     path.display()
   ))
 }
@@ -635,7 +635,7 @@ mod tests {
     assert!(
       error
         .to_string()
-        .contains("Git checkout or sync the target")
+        .contains("Git checkout or push source to the target")
     );
   }
 
@@ -659,11 +659,11 @@ mod tests {
       assert!(
         native
           .to_string()
-          .contains("target checkout changed after sync; retry run")
+          .contains("target checkout changed after push; retry run")
       );
       let python = python_snapshot_expected(root.path(), &[], Some(&expected))
         .expect_err("wrong Python checkout");
-      assert!(python.contains("target checkout changed after sync; retry run"));
+      assert!(python.contains("target checkout changed after push; retry run"));
       assert!(!root.path().join(".expri/runs").exists());
     }
   }

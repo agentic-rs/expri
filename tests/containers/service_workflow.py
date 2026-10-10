@@ -13,7 +13,7 @@ import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKER_QUEUE = '/home/tester/experiment/.expri/service-sync'
+WORKER_QUEUE = '/home/tester/experiment/.expri/publish'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--no-build', action='store_true')
 options = parser.parse_args()
@@ -25,7 +25,7 @@ network = f'expri-service-{os.getpid()}'
 containers = []
 created_network = False
 refresh_browser = None
-file_sync_pid = None
+result_fetch_pid = None
 fixture_env = dict(os.environ)
 fixture_env.update({
   'EXPRI_OWNER_TOKEN': secrets.token_hex(24), 'EXPRI_WORKER_TOKEN': secrets.token_hex(24),
@@ -102,18 +102,18 @@ def wait_for(predicate, message, timeout=60):
     time.sleep(0.2)
   raise AssertionError(message)
 
-def stop_file_sync():
-  global file_sync_pid
-  if file_sync_pid is None:
+def stop_result_fetch():
+  global result_fetch_pid
+  if result_fetch_pid is None:
     return
   # The watcher owns its new process group; never target training or publishing.
   python(host, f'''import os, signal
 try:
-  os.killpg({file_sync_pid}, signal.SIGTERM)
+  os.killpg({result_fetch_pid}, signal.SIGTERM)
 except ProcessLookupError:
   pass
 ''')
-  file_sync_pid = None
+  result_fetch_pid = None
 
 def client(container, action, *args, check=True, config=None):
   config = config or ('/tmp/worker.toml' if container == worker else '/tmp/owner.toml')
@@ -205,8 +205,7 @@ def dashboard_public_checks():
   assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
   assert browser('/api/storage?project_id=demo&kind=input')['status'] == 401, 'unauthenticated project storage catalog exposed data'
   assert browser('/api/input?project_id=demo&input_id=dataset-v1')['status'] == 401, 'unauthenticated private input download exposed data'
-  for endpoint in ['/api/result-zip', '/api/archive']:
-    assert browser(endpoint + '?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated result ZIP download exposed data'
+  assert browser('/api/result-zip?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated result ZIP download exposed data'
   assert browser('/api/events')['status'] == 401, 'unauthenticated live updates exposed data'
   login = browser('/login')
   assert login['status'] == 200 and 'autocomplete="current-password"' in login['body'], 'public login form is unavailable'
@@ -297,15 +296,15 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert detail['run']['run_id'] == run_id and detail['metrics_error'] is None, 'hosted detail could not review the uploaded run'
   assert detail['params']['learning_rate'] == 0.001 and detail['params']['input_id'] == 'dataset-v1', 'hosted parameters differ from uploaded data'
   assert detail['metrics']['loss']['count'] == 80 and detail['metrics']['loss']['last']['step'] == 79, 'hosted metric summaries differ from uploaded data'
-  assert detail['archive']['status'] == 'archived' and detail['archive']['incomplete'] is False, 'terminal training did not retain a distinct completed archive status'
+  assert 'archive' not in detail, 'detail exposed the removed compatibility field'
   assert detail['result_upload']['status'] == 'uploaded' and detail['result_upload']['incomplete'] is False, 'terminal training did not expose its completed result upload'
   archive_url = '/api/result-zip?' + urlencode({'source': source_id, 'run_id': run_id})
-  legacy_download = browser('/api/archive?' + urlencode({'source': source_id, 'run_id': run_id}), cookie=cookie)
-  assert legacy_download['status'] == 303, 'legacy result ZIP route lost its authenticated download'
+  removed_download = browser('/api/archive?' + urlencode({'source': source_id, 'run_id': run_id}), cookie=cookie)
+  assert removed_download['status'] == 404, 'removed archive route still accepted downloads'
   archived = browser(archive_url, cookie=cookie)
   assert archived['status'] == 303 and archived['headers']['referrer-policy'] == 'no-referrer', 'archive download did not use a protected attachment redirect'
   archive_head = browser(archive_url, method='HEAD', cookie=cookie)
-  assert archive_head['status'] == 200 and int(archive_head['headers']['content-length']) == detail['archive']['file']['size'], 'archive HEAD did not describe its stored snapshot'
+  assert archive_head['status'] == 200 and int(archive_head['headers']['content-length']) == detail['result_upload']['file']['size'], 'archive HEAD did not describe its stored snapshot'
   assert browser(archive_url, cookie=cookie, origin='https://outside.invalid')['status'] == 403, 'cross-origin archive download was accepted'
   artifacts = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': run_id}), cookie)
   checkpoint = next(file for file in artifacts['files'] if file['path'] == 'outputs/checkpoint.pt')
@@ -858,7 +857,7 @@ prefix = "acceptance"
   assert json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'running', 'training finished before the service outage was injected'
   docker('stop', '--time', '1', service)
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'training did not complete while service was offline')
-  assert publishing(run_dir)['status'] != 'synced', 'publisher claimed synced during the outage'
+  assert publishing(run_dir)['status'] != 'published', 'publisher claimed published during the outage'
   # Kill only the independent publisher after training exits, then resume its
   # saved intent and queue while the service is still unavailable.
   killed = python(worker, f'''import os, signal
@@ -876,14 +875,14 @@ for process in Path('/proc').iterdir():
     pass
 print(count)''')
   assert killed == '1', 'did not find exactly one independent publisher'
-  wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['service_sync']['worker_active'] is False, 'stopped publisher retained its lease')
+  wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['publishing']['worker_active'] is False, 'stopped publisher retained its lease')
   resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--run-dir', run_dir).stdout)
   assert resumed['run_id'] == run_id, 'resume started a different run'
   docker('start', service)
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to restart')
   def drained(directory):
     report = json.loads(execute(worker, 'expri', 'runs', 'status', Path(directory).name, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)
-    return report['service_sync']['status'] == 'synced' and not report['service_sync']['worker_active']
+    return report['publishing']['status'] == 'published' and not report['publishing']['worker_active']
   wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
   queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
   assert queue_state['protocol'] == 'tracking_v1' and set(queue_state['files']) <= {'outputs/checkpoint-1000.pt'}, 'fresh publishing queue used per-file multipart for tracking metadata or streams'
@@ -918,8 +917,8 @@ labels = ["best"]
 '''
   python(host, f"from pathlib import Path;p=Path({live_repo!r});p.mkdir();(p/'expri.toml').write_text({watch_config!r})")
   watch_command = ['expri', 'fetch', '--watch', '--repo', live_repo, '--config', live_repo + '/expri.toml']
-  file_sync_pid = int(python(host, f'''import subprocess
-with open('/tmp/file-sync.stdout', 'wb') as output, open('/tmp/file-sync.stderr', 'wb') as error:
+  result_fetch_pid = int(python(host, f'''import subprocess
+with open('/tmp/result-fetch.stdout', 'wb') as output, open('/tmp/result-fetch.stderr', 'wb') as error:
   process = subprocess.Popen({watch_command!r}, stdout=output, stderr=error, start_new_session=True)
 print(process.pid)
 '''))
@@ -953,7 +952,7 @@ print(json.dumps({{'status':json.loads((root / 'run-state.json').read_text())['s
   'downloaded':[file['path'] for file in receipt['downloaded_files']]}}))
 '''))
   assert live_result['status'] == 'running' and 'outputs/checkpoint-1000.pt' in live_result['downloaded'], 'live watcher did not commit a verified running-run download receipt'
-  stop_file_sync()
+  stop_result_fetch()
   python(worker, f"from pathlib import Path;Path({sync_gate!r}).touch()")
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
   wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)
@@ -1044,7 +1043,7 @@ print(process.pid)
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
   offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
   assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its configured private input'
-  assert publishing(offline_run['run_dir'])['status'] != 'synced', 'offline checkpoint registration claimed completed cloud sync'
+  assert publishing(offline_run['run_dir'])['status'] != 'published', 'offline checkpoint registration claimed completed cloud sync'
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
   def review():
@@ -1070,11 +1069,11 @@ print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
   assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
   print('Service workflow passed: tracking-v1 publishing, configured private-input cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial result uploads, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
 finally:
-  if file_sync_pid is not None:
+  if result_fetch_pid is not None:
     try:
-      stop_file_sync()
+      stop_result_fetch()
     except (OSError, AssertionError):
-      print('File-sync watcher cleanup did not finish; container cleanup will stop it.', flush=True)
+      print('Result-fetch watcher cleanup did not finish; container cleanup will stop it.', flush=True)
   if refresh_browser is not None and refresh_browser.poll() is None:
     refresh_browser.terminate()
     try:
@@ -1100,7 +1099,7 @@ finally:
         ]:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
       if container.endswith('-host'):
-        for name in ['file-sync.stdout', 'file-sync.stderr']:
+        for name in ['result-fetch.stdout', 'result-fetch.stderr']:
           docker('cp', f'{container}:/tmp/{name}', str(logs / (name + '.log')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)

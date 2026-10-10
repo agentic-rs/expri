@@ -597,7 +597,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if metadata_truncated || params_truncated {
       warnings.push(json!({"message": "Hosted previews are limited; download the original run records for complete metadata and parameters."}));
     }
-    let archive = match self
+    let result_upload = match self
       .store
       .execute(super::types::Request::ArchiveStatus {
         scope: scope.clone(),
@@ -610,23 +610,16 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           let query = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([("source", source_id), ("run_id", run_id)])
             .finish();
-          json!(format!("/api/archive?{query}"))
+          json!(format!("/api/result-zip?{query}"))
         } else {
           Value::Null
         };
-        value
+        super::client::upload_report(value)
       }
       _ => return Err(message("invalid result upload response")),
     };
-    let mut result_upload = archive.clone();
-    if result_upload["status"] == "archived" {
-      result_upload["status"] = json!("uploaded");
-    }
-    if let Some(url) = archive["download_url"].as_str() {
-      result_upload["download_url"] = json!(url.replacen("/api/archive?", "/api/result-zip?", 1));
-    }
     Ok(
-      json!({"source": source, "result_upload": result_upload, "archive": archive, "run": run, "state": metadata["state"], "snapshot": metadata["snapshot"], "environment": metadata["environment"], "metadata_truncated": metadata_truncated, "params": params, "params_truncated": params_truncated, "metrics": summaries, "metric_count": metric_count, "metrics_truncated": metric_count > 50, "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": null}),
+      json!({"source": source, "result_upload": result_upload, "run": run, "state": metadata["state"], "snapshot": metadata["snapshot"], "environment": metadata["environment"], "metadata_truncated": metadata_truncated, "params": params, "params_truncated": params_truncated, "metrics": summaries, "metric_count": metric_count, "metrics_truncated": metric_count > 50, "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": null}),
     )
   }
 

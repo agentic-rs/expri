@@ -92,7 +92,6 @@ export type Detail = {
   warnings: Warning[];
   cache: Json;
   result_upload?: ResultUploadRecord | null;
-  archive?: ArchiveRecord | null;
 };
 export type ResultUploadRecord = {
   status: "none" | "pending" | "uploading" | "uploaded" | "failed";
@@ -104,9 +103,6 @@ export type ResultUploadRecord = {
     storage: "object";
   } | null;
   last_error?: string | null;
-};
-export type ArchiveRecord = Omit<ResultUploadRecord, "status"> & {
-  status: "none" | "pending" | "uploading" | "archived" | "failed";
 };
 export type Log = { content: string; stream: string; missing: boolean; truncated: boolean };
 export type Comparison = {

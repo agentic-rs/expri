@@ -928,10 +928,7 @@ function Overview({ detail }: { detail: Detail | null }) {
   );
 }
 function ResultUploadSummary({ detail }: { detail: Detail | null }) {
-  const result_upload: ResultUploadRecord | null | undefined = detail?.result_upload ?? (detail?.archive ? {
-    ...detail.archive,
-    status: detail.archive.status === "archived" ? "uploaded" : detail.archive.status,
-  } : null);
+  const result_upload: ResultUploadRecord | null | undefined = detail?.result_upload;
   if (!detail || !result_upload) return null;
   const labels = {
     none: "No result upload",
@@ -949,7 +946,7 @@ function ResultUploadSummary({ detail }: { detail: Detail | null }) {
           {" · "}
           <a
             id="download-result-zip"
-            href={apiUrl(detail.result_upload ? "/api/result-zip" : "/api/archive", {
+            href={apiUrl("/api/result-zip", {
               source: detail.source.source_id,
               run_id: runIdentity(detail.run),
             })}

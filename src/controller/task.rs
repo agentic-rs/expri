@@ -45,7 +45,7 @@ pub struct RemoteTaskOptions {
   pub expected_sync: Option<SyncIdentity>,
 }
 
-/// Check before syncing so an incompatible worker cannot receive a publishing run.
+/// Check before pushing so an incompatible worker cannot receive a publishing run.
 pub fn check_run_publishing_target(
   target: &TargetConfig,
   control_path: &str,

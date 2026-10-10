@@ -88,13 +88,13 @@ fn run_id(run_dir: &Path) -> Result<String> {
   Ok(run_id.into())
 }
 
-fn previously_synced(run_dir: &Path) -> Result<bool> {
+fn previously_published(run_dir: &Path) -> Result<bool> {
   let path = run_dir.join("publishing-state.json");
   if fs::inspect(&path)?.is_none() {
     return Ok(false);
   }
   let state: Value = serde_json::from_slice(&fs::read_bounded(&path, 32 * 1024)?)?;
-  Ok(state["status"] == "synced")
+  Ok(state["status"] == "published")
 }
 
 fn load(run_dir: &Path) -> Result<Registry> {
@@ -104,7 +104,7 @@ fn load(run_dir: &Path) -> Result<Registry> {
     return Ok(Registry {
       schema_version: 1,
       run_id,
-      closed: previously_synced(run_dir)?,
+      closed: previously_published(run_dir)?,
       retired_paths: std::collections::BTreeSet::new(),
       files: BTreeMap::new(),
     });
@@ -331,7 +331,7 @@ pub(super) fn verify_metadata(registration: &Registration, metadata: &Metadata) 
 
 pub(super) fn is_closed(run_dir: &Path) -> Result<bool> {
   if fs::inspect(&run_dir.join(RECORD))?.is_none() {
-    return previously_synced(run_dir);
+    return previously_published(run_dir);
   }
   Ok(load(run_dir)?.closed)
 }

@@ -244,7 +244,7 @@ fn route<S: ObjectStorage>(
     let (project_id, input_id) = input_selection(request)?;
     return download_response(method, dashboard.input_download(&project_id, &input_id)?);
   }
-  if matches!(path, "/api/result-zip" | "/api/archive") {
+  if path == "/api/result-zip" {
     let (source, run_id) = result_zip_selection(request)?;
     let download = dashboard
       .result_zip_download(&source, &run_id)
@@ -622,7 +622,7 @@ mod tests {
   }
 
   #[test]
-  fn result_zip_and_legacy_archive_routes_require_session_and_valid_selection() {
+  fn result_zip_route_requires_session_and_valid_selection() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), MockStorage::default()).unwrap();
     let auth = BrowserAuth::new("https://expri.example.com", b"dashboard-password").unwrap();
@@ -631,34 +631,33 @@ mod tests {
       .headers_mut()
       .insert("Origin", "https://expri.example.com".parse().unwrap());
     let cookie = auth.login(&login, b"dashboard-password").unwrap();
-    for endpoint in ["/api/result-zip", "/api/archive"] {
-      let valid = format!("{endpoint}?source=hosted:project:worker&run_id=run-1");
-      let mut download = request("GET", &valid, b"");
-      assert_eq!(handle(&store, &auth, &download).status(), 401);
-      download
-        .headers_mut()
-        .insert("Cookie", cookie.split(';').next().unwrap().parse().unwrap());
-      assert_eq!(handle(&store, &auth, &download).status(), 404);
-      for path in [
-        endpoint.to_owned(),
-        format!("{valid}&run_id=run-2"),
-        format!("{valid}&path=inputs/private"),
-        format!(
-          "{endpoint}?source=hosted-project:project&run_id={}",
-          "r".repeat(257)
-        ),
-      ] {
-        *download.uri_mut() = path.parse().unwrap();
-        let reply = handle(&store, &auth, &download);
-        assert_eq!(reply.status(), 400);
-        assert!(!reply.headers().contains_key("Location"));
-      }
-      *download.uri_mut() = valid.parse().unwrap();
-      download
-        .headers_mut()
-        .insert("Origin", "https://attacker.invalid".parse().unwrap());
-      assert_eq!(handle(&store, &auth, &download).status(), 403);
+    let endpoint = "/api/result-zip";
+    let valid = format!("{endpoint}?source=hosted:project:worker&run_id=run-1");
+    let mut download = request("GET", &valid, b"");
+    assert_eq!(handle(&store, &auth, &download).status(), 401);
+    download
+      .headers_mut()
+      .insert("Cookie", cookie.split(';').next().unwrap().parse().unwrap());
+    assert_eq!(handle(&store, &auth, &download).status(), 404);
+    for path in [
+      endpoint.to_owned(),
+      format!("{valid}&run_id=run-2"),
+      format!("{valid}&path=inputs/private"),
+      format!(
+        "{endpoint}?source=hosted-project:project&run_id={}",
+        "r".repeat(257)
+      ),
+    ] {
+      *download.uri_mut() = path.parse().unwrap();
+      let reply = handle(&store, &auth, &download);
+      assert_eq!(reply.status(), 400);
+      assert!(!reply.headers().contains_key("Location"));
     }
+    *download.uri_mut() = valid.parse().unwrap();
+    download
+      .headers_mut()
+      .insert("Origin", "https://attacker.invalid".parse().unwrap());
+    assert_eq!(handle(&store, &auth, &download).status(), 403);
   }
 
   #[test]

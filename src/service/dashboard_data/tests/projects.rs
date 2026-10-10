@@ -715,25 +715,12 @@ fn project_result_upload_links_and_downloads_resolve_the_selected_machine_scope(
   for origin in ["worker-a", "worker-b"] {
     let key = format!("{origin}:shared");
     let detail = dashboard.detail("hosted-project:project", &key).unwrap();
-    assert_eq!(detail["archive"]["status"], "archived");
+    assert!(detail.get("archive").is_none());
     assert_eq!(detail["result_upload"]["status"], "uploaded");
-    assert_eq!(detail["result_upload"]["file"], detail["archive"]["file"]);
     assert_eq!(detail["result_upload"]["incomplete"], true);
     assert_eq!(
-      detail["archive"]["file"]["target"]["scope"]["origin"],
+      detail["result_upload"]["file"]["target"]["scope"]["origin"],
       origin
-    );
-    assert!(
-      detail["archive"]["download_url"]
-        .as_str()
-        .unwrap()
-        .contains(&format!("run_id={origin}%3Ashared"))
-    );
-    assert!(
-      detail["archive"]["download_url"]
-        .as_str()
-        .unwrap()
-        .starts_with("/api/archive?")
     );
     let result_url = detail["result_upload"]["download_url"].as_str().unwrap();
     assert!(result_url.starts_with("/api/result-zip?"));
@@ -756,13 +743,13 @@ fn project_result_upload_links_and_downloads_resolve_the_selected_machine_scope(
     .result_zip_download("hosted:project:worker-a", "shared")
     .unwrap()
   else {
-    panic!("legacy archive expected")
+    panic!("machine-source result ZIP expected")
   };
   assert!(url.contains("projects/project/runs/worker-a/shared/"));
 }
 
 #[test]
-fn result_upload_detail_exposes_progress_alongside_legacy_archive_status() {
+fn result_upload_detail_exposes_canonical_progress_without_changing_training_status() {
   let fixture = Fixture::new();
   let scope = run(&fixture, "project", "worker", "run", 1.);
   let dashboard = HostedDashboard::new(&fixture.store).unwrap();
@@ -787,13 +774,12 @@ fn result_upload_detail_exposes_progress_alongside_legacy_archive_status() {
       .detail("hosted-project:project", "worker:run")
       .unwrap();
     assert_eq!(detail["result_upload"]["status"], status);
-    assert_eq!(detail["archive"]["status"], status);
+    assert!(detail.get("archive").is_none());
     assert_eq!(
       detail["result_upload"]["last_error"],
       "Upload was interrupted"
     );
     assert_eq!(detail["result_upload"]["download_url"], Value::Null);
-    assert_eq!(detail["archive"]["download_url"], Value::Null);
     assert_eq!(detail["run"]["status"], "completed");
   }
 }

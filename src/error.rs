@@ -97,7 +97,7 @@ impl Display for ExpriError {
       ),
       Self::DownloadBusy { initializing } => write!(
         formatter,
-        "another pull is {} this run; retry after it finishes",
+        "another fetch is {} this run; retry after it finishes",
         if *initializing {
           "initializing"
         } else {

@@ -964,7 +964,7 @@ fn local_cli_run_captures_configured_ignored_file_in_code_snapshot() {
 [environment.env]
 CUSTOM_RUNTIME = "active"
 
-[sync]
+[push]
 include_ignored = ["ignored.cfg"]
 remote_managed = ["uv.lock"]
 
