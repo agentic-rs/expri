@@ -59,16 +59,16 @@ invoking machine.
 | `dependency-mismatch` | Matching Torch, CUDA runtime `12.8.91` | Doctor identifies the transitive lock mismatch; preparation fails before task execution |
 | `cuda-unavailable` | Matching graph, fake CUDA availability disabled | CUDA-required preparation fails; the same stack succeeds when CUDA is optional |
 
-The matching cases check sync, doctor, detached success and failure runs, exit
+The matching cases check source push, doctor, detached success and failure runs, exit
 codes, working directories inside code snapshots, separate run environments and
 a shared uv cache. They check that lightweight dependencies load from the
 overlay while Torch and the inherited `torchrun` use the worker base packages.
-Changing and syncing source preserves the earlier snapshot. Pruning removes
+Changing and pushing source preserves the earlier snapshot. Pruning removes
 finished environments while preserving outputs and an active environment;
 cancelling that active run reaches a terminal state. Host and worker base
 package inventories remain unchanged by the workflow.
 
-Selective pulls retrieve logs, parameters and metrics while leaving checkpoints
+Selective fetches retrieve logs, parameters and metrics while leaving checkpoints
 and environments on the worker. After removing target configuration, cached CLI
 inspection and comparison still work. Dashboard HTTP responses agree with the
 cached records, parameters, log tails and metric reductions; chart responses
@@ -84,14 +84,19 @@ injects service outages and lost multipart acknowledgments, using these same
 host and worker images plus a service, a pinned MinIO fixture, a fault proxy and
 an independent Firefox image. The browser image uses Debian Firefox ESR and
 SHA256-pinned Mozilla geckodriver 0.36.0 release artifacts for amd64 and arm64.
-It checks immutable private inputs, upload recovery, selective downloads and
-offline review without shared project directories or published ports.
+It checks immutable private inputs, automatic worker input provisioning and
+offline cache reuse, upload recovery, continuous selected checkpoint downloads,
+and offline review without shared project directories or published ports.
 
 Configured runs start their own native publishers in this suite. Training
 finishes through a service outage; killing and resuming the publisher reuses
 its saved intent and acknowledged stream/upload offsets. Failed and cancelled
-runs also reach `synced`, with their original task status preserved in hosted
-review. Checkpoints remain absent until explicitly selected.
+runs also reach `published`, with their original task status preserved in hosted
+review. A small finalized checkpoint registered with `best` and `latest` labels
+uploads during training; an `expri fetch --watch` laptop watcher configured for `best` commits its
+verified download receipt while the run is still active. The separate 17 MiB
+unregistered checkpoint remains absent until explicitly selected and retains
+the multipart recovery and interrupted range-download checks.
 
 The service suite also submits real browser login and logout forms over a
 generated internal HTTPS certificate. It reproduces `Origin: null` failures
@@ -131,9 +136,10 @@ also verifies fallback to worker sources when an authenticated project-catalog
 request returns 404. Only a fixture-controlled file enables that proxy behavior;
 authentication failures and other endpoints retain their upstream responses.
 
-The Files check opens the fourth tab with native keyboard input, selects an
-uploaded checkpoint, generates a scoped CLI command, and downloads the actual
-17 MiB attachment through Firefox. It verifies its SHA256 and saves
+Hosted Files data checks verify the registered checkpoint's cloud status and
+labels. The browser Files check opens the fourth tab with native keyboard input,
+selects the separate uploaded 17 MiB checkpoint, generates a scoped CLI command,
+and downloads the actual attachment through Firefox. It verifies its SHA256 and saves
 `workspace-files.png` and `workspace-files-narrow.png`. A test-only HTTPS object
 proxy preserves the signed S3 path/query and streams attachments without forwarding
 dashboard credentials; Firefox's normal insecure-download protection stays enabled.
@@ -142,7 +148,7 @@ verifies project-scoped search and browser attachment links, and confirms that
 worker-only checkpoints do not appear as completed cloud objects. It reuses the
 published input and checkpoint fixtures and captures `workspace-storage.png`.
 The transfer acceptance
-kills a CLI pull after the first durable 8 MiB range, then reruns the same command
+kills a CLI fetch after the first durable 8 MiB range, then reruns the same command
 and verifies that the saved prefix is reused while prior cache files stay intact.
 
 The live-update check republishes new samples, metadata and logs from the

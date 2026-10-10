@@ -49,7 +49,7 @@ RUN apt-get update \
   && python -c 'import secrets; print("tester:" + secrets.token_urlsafe(32))' | chpasswd
 RUN uv pip install --system --no-index --find-links /opt/expri-fixtures/wheels \
   'torch==2.10.0+cu128' 'nvidia-cuda-runtime-cu12==12.8.90' 'nvidia-cublas-cu12==12.8.4.1'
-RUN printf '#!/bin/sh\nset -eu\nif [ "${1:-}" = node ] && [ "${2:-}" = pull-prepare ]; then\n  exec /usr/local/bin/expri "$@"\nfi\nexit 1\n' > /usr/local/bin/expri-old \
+RUN printf '#!/bin/sh\nset -eu\nif [ "${1:-}" = node ] && [ "${2:-}" = ping ]; then\n  echo ok\n  exit 0\nfi\nexit 1\n' > /usr/local/bin/expri-old \
   && chmod 755 /usr/local/bin/expri-old
 COPY --chmod=755 tests/containers/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
 EXPOSE 22 8000

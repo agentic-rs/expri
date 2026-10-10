@@ -365,7 +365,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let mut reports = Vec::with_capacity(page.items.len());
     let mut warnings = Vec::new();
     if page.total_count > OVERVIEW_LIMIT {
-      warnings.push(json!({"message": "Hosted browsing and filters cover the 500 runs most recently updated in this service; use expri service pull with a known run ID to inspect other runs."}));
+      warnings.push(json!({"message": "Hosted browsing and filters cover the 500 runs most recently updated in this service; use expri service fetch with a known run ID to inspect other runs."}));
     }
     if page.legacy_order {
       warnings.push(json!({"message": "Some legacy runs have reconstructed catalog order; their historical service update times are unknown. New uploads or stream bytes establish their current service update order."}));
@@ -597,7 +597,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if metadata_truncated || params_truncated {
       warnings.push(json!({"message": "Hosted previews are limited; download the original run records for complete metadata and parameters."}));
     }
-    let archive = match self
+    let result_upload = match self
       .store
       .execute(super::types::Request::ArchiveStatus {
         scope: scope.clone(),
@@ -610,33 +610,34 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           let query = form_urlencoded::Serializer::new(String::new())
             .extend_pairs([("source", source_id), ("run_id", run_id)])
             .finish();
-          json!(format!("/api/archive?{query}"))
+          json!(format!("/api/result-zip?{query}"))
         } else {
           Value::Null
         };
-        value
+        super::client::upload_report(value)
       }
-      _ => return Err(message("invalid result archive response")),
+      _ => return Err(message("invalid result upload response")),
     };
     Ok(
-      json!({"source": source, "archive": archive, "run": run, "state": metadata["state"], "snapshot": metadata["snapshot"], "environment": metadata["environment"], "metadata_truncated": metadata_truncated, "params": params, "params_truncated": params_truncated, "metrics": summaries, "metric_count": metric_count, "metrics_truncated": metric_count > 50, "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": null}),
+      json!({"source": source, "result_upload": result_upload, "run": run, "state": metadata["state"], "snapshot": metadata["snapshot"], "environment": metadata["environment"], "metadata_truncated": metadata_truncated, "params": params, "params_truncated": params_truncated, "metrics": summaries, "metric_count": metric_count, "metrics_truncated": metric_count > 50, "metrics_error": metrics_error, "warnings": bounded_warnings(&warnings), "cache": null}),
     )
   }
 
-  pub(super) fn archive_download(&self, source_id: &str, run_id: &str) -> Result<Download> {
+  pub(super) fn result_zip_download(&self, source_id: &str, run_id: &str) -> Result<Download> {
     let (_, scope) = self.scope(source_id, run_id)?;
     let (url, size) = self
       .store
       .dashboard_archive_attachment(&scope)
       .map_err(api_error)?;
-    let parsed = reqwest::Url::parse(&url).map_err(|_| message("invalid archive download URL"))?;
+    let parsed =
+      reqwest::Url::parse(&url).map_err(|_| message("invalid result ZIP download URL"))?;
     if !matches!(parsed.scheme(), "http" | "https")
       || parsed.host_str().is_none()
       || !parsed.username().is_empty()
       || parsed.password().is_some()
       || parsed.fragment().is_some()
     {
-      return Err(message("invalid archive download URL"));
+      return Err(message("invalid result ZIP download URL"));
     }
     Ok(Download::Cloud {
       url,
@@ -781,7 +782,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         recorded_at = inventory.recorded_at;
         for file in inventory.files {
           rows.insert(file.path.clone(), ArtifactRow { path: file.path, size: file.size,
-            local: None, cloud: None, worker: Some(true), download_url: None });
+            local: None, cloud: None, worker: Some(true), download_url: None,
+            sync_status: file.sync_status, sync_error: file.sync_error, downloaded: None,
+            labels_pending: !file.labels.is_empty(), labels: file.labels, reported_sha256: file.sha256 });
         }
       }
       Ok(None) => {}
@@ -803,9 +806,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         cloud: None,
         worker: None,
         download_url: None,
+        sync_status: None,
+        sync_error: None,
+        downloaded: None,
+        labels: Vec::new(),
+        labels_pending: false,
+        reported_sha256: None,
       });
-      row.size = object.size;
-      row.cloud = Some(true);
+      row.confirm_cloud(object.size, object.sha256.as_deref());
       row.download_url = Some(download_url(source_id, run_id, &path));
     }
     if !objects_truncated {

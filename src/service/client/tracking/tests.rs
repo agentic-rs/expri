@@ -220,7 +220,7 @@ fn terminal_tracking_seals_original_bytes_without_uploading_them_to_s3() {
   )
   .unwrap();
   assert!(
-    push_cycle(
+    publish_cycle(
       &api,
       &mut queue,
       &scope,
@@ -288,7 +288,7 @@ fn lost_tracking_append_ack_retries_the_prefix_and_new_tail_after_reopen() {
 }
 
 #[test]
-fn explicit_archive_captures_exact_tracking_revisions_and_partial_intent() {
+fn explicit_upload_captures_exact_tracking_revisions_and_partial_intent() {
   for partial in [false, true] {
     let (url, task) = mock::mock(3, move |request, _| {
       let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
@@ -341,12 +341,12 @@ fn explicit_archive_captures_exact_tracking_revisions_and_partial_intent() {
             },
           }
         }
-        other => panic!("unexpected archive action: {other:?}"),
+        other => panic!("unexpected upload action: {other:?}"),
       };
       (200, Vec::new(), serde_json::to_vec(&response).unwrap())
     });
     let (root, _api, scope) = fixture(&url);
-    let result = archive(&root.path().join("client.toml"), &scope, partial).unwrap();
+    let result = upload(&root.path().join("client.toml"), &scope, partial).unwrap();
     assert_eq!(result["status"], "pending");
     assert_eq!(result["incomplete"], partial);
     task.join().unwrap();
@@ -354,7 +354,7 @@ fn explicit_archive_captures_exact_tracking_revisions_and_partial_intent() {
 }
 
 #[test]
-fn explicit_archive_rejects_another_run_before_sealing() {
+fn explicit_upload_rejects_another_run_before_sealing() {
   let (url, task) = mock::mock(2, |request, _| {
     let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
       Request::Capabilities => Response::Capabilities {
@@ -374,11 +374,11 @@ fn explicit_archive_rejects_another_run_before_sealing() {
           }],
         }
       }
-      other => panic!("unsafe archive action: {other:?}"),
+      other => panic!("unsafe upload action: {other:?}"),
     };
     (200, Vec::new(), serde_json::to_vec(&response).unwrap())
   });
   let (root, _api, scope) = fixture(&url);
-  assert!(archive(&root.path().join("client.toml"), &scope, false).is_err());
+  assert!(upload(&root.path().join("client.toml"), &scope, false).is_err());
   task.join().unwrap();
 }

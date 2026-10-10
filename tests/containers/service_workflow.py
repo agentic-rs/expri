@@ -13,7 +13,7 @@ import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKER_QUEUE = '/home/tester/experiment/.expri/service-sync'
+WORKER_QUEUE = '/home/tester/experiment/.expri/publish'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--no-build', action='store_true')
 options = parser.parse_args()
@@ -25,6 +25,7 @@ network = f'expri-service-{os.getpid()}'
 containers = []
 created_network = False
 refresh_browser = None
+result_fetch_pid = None
 fixture_env = dict(os.environ)
 fixture_env.update({
   'EXPRI_OWNER_TOKEN': secrets.token_hex(24), 'EXPRI_WORKER_TOKEN': secrets.token_hex(24),
@@ -100,6 +101,19 @@ def wait_for(predicate, message, timeout=60):
       pass
     time.sleep(0.2)
   raise AssertionError(message)
+
+def stop_result_fetch():
+  global result_fetch_pid
+  if result_fetch_pid is None:
+    return
+  # The watcher owns its new process group; never target training or publishing.
+  python(host, f'''import os, signal
+try:
+  os.killpg({result_fetch_pid}, signal.SIGTERM)
+except ProcessLookupError:
+  pass
+''')
+  result_fetch_pid = None
 
 def client(container, action, *args, check=True, config=None):
   config = config or ('/tmp/worker.toml' if container == worker else '/tmp/owner.toml')
@@ -191,7 +205,7 @@ def dashboard_public_checks():
   assert browser('/api/artifact?source=service:demo:worker&run_id=run-a&path=outputs/checkpoint.pt')['status'] == 401, 'unauthenticated artifact download exposed data'
   assert browser('/api/storage?project_id=demo&kind=input')['status'] == 401, 'unauthenticated project storage catalog exposed data'
   assert browser('/api/input?project_id=demo&input_id=dataset-v1')['status'] == 401, 'unauthenticated private input download exposed data'
-  assert browser('/api/archive?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated archive download exposed data'
+  assert browser('/api/result-zip?source=service:demo:worker&run_id=run-a')['status'] == 401, 'unauthenticated result ZIP download exposed data'
   assert browser('/api/events')['status'] == 401, 'unauthenticated live updates exposed data'
   login = browser('/login')
   assert login['status'] == 200 and 'autocomplete="current-password"' in login['body'], 'public login form is unavailable'
@@ -282,18 +296,24 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert detail['run']['run_id'] == run_id and detail['metrics_error'] is None, 'hosted detail could not review the uploaded run'
   assert detail['params']['learning_rate'] == 0.001 and detail['params']['input_id'] == 'dataset-v1', 'hosted parameters differ from uploaded data'
   assert detail['metrics']['loss']['count'] == 80 and detail['metrics']['loss']['last']['step'] == 79, 'hosted metric summaries differ from uploaded data'
-  assert detail['archive']['status'] == 'archived' and detail['archive']['incomplete'] is False, 'terminal training did not retain a distinct completed archive status'
-  archive_url = '/api/archive?' + urlencode({'source': source_id, 'run_id': run_id})
+  assert 'archive' not in detail, 'detail exposed the removed compatibility field'
+  assert detail['result_upload']['status'] == 'uploaded' and detail['result_upload']['incomplete'] is False, 'terminal training did not expose its completed result upload'
+  archive_url = '/api/result-zip?' + urlencode({'source': source_id, 'run_id': run_id})
+  removed_download = browser('/api/archive?' + urlencode({'source': source_id, 'run_id': run_id}), cookie=cookie)
+  assert removed_download['status'] == 404, 'removed archive route still accepted downloads'
   archived = browser(archive_url, cookie=cookie)
   assert archived['status'] == 303 and archived['headers']['referrer-policy'] == 'no-referrer', 'archive download did not use a protected attachment redirect'
   archive_head = browser(archive_url, method='HEAD', cookie=cookie)
-  assert archive_head['status'] == 200 and int(archive_head['headers']['content-length']) == detail['archive']['file']['size'], 'archive HEAD did not describe its stored snapshot'
+  assert archive_head['status'] == 200 and int(archive_head['headers']['content-length']) == detail['result_upload']['file']['size'], 'archive HEAD did not describe its stored snapshot'
   assert browser(archive_url, cookie=cookie, origin='https://outside.invalid')['status'] == 403, 'cross-origin archive download was accepted'
   artifacts = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': run_id}), cookie)
   checkpoint = next(file for file in artifacts['files'] if file['path'] == 'outputs/checkpoint.pt')
   assert checkpoint['size'] == 17 * 1024 * 1024 and checkpoint['cloud'] is True and checkpoint['worker'] is True and checkpoint['local'] is None, 'artifact location or size differs from the published checkpoint'
   assert checkpoint['download_url'].startswith('/api/artifact?') and 'X-Amz-' not in json.dumps(artifacts), 'artifact catalog exposed a signed URL'
   assert artifacts['pull_scope'] == {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}, 'artifact pull command changed run scope'
+  live_checkpoint = next(file for file in artifacts['files'] if file['path'] == 'outputs/checkpoint-1000.pt')
+  assert live_checkpoint['cloud'] is True and live_checkpoint['sync_status'] == 'cloud' and set(live_checkpoint['labels']) == {'best', 'latest'}, 'hosted Files omitted registered checkpoint availability or aliases'
+  assert live_checkpoint['downloaded'] is None, 'hosted Files claimed access to laptop download receipts'
   other_files = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': second_run_id}), cookie)
   other_checkpoint = next(file for file in other_files['files'] if file['path'] == 'outputs/checkpoint.pt')
   assert other_checkpoint['worker'] is True and other_checkpoint['cloud'] is False and other_checkpoint['download_url'] is None, 'worker-only checkpoint was advertised as a cloud download'
@@ -348,7 +368,21 @@ if {log!r}:
     output.write('automatic refresh log fixture' + chr(10))
 '''
   python(worker, code)
-  client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+  client(worker, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+
+def reset_copied_run_handoffs(container, run_dir):
+  # Copies retain payload bytes, but checkpoint identities and publication state
+  # belong to the source run and origin. The synthetic publisher rebuilds them.
+  python(container, f'''from pathlib import Path
+root = Path({run_dir!r})
+for path in [
+  'checkpoint-registrations.json', '.checkpoint-registrations.lock',
+  'outputs/.expri-artifacts.json', 'publishing-request.json',
+  'publishing-state.json', '.publish.lock', 'run-request.json',
+  '.run.lock', '.worker-ready', '.cancel-request',
+]:
+  (root / path).unlink(missing_ok=True)
+''')
 
 def running_refresh_fixture(original):
   run_id = 'refresh-' + original['run_id']
@@ -360,8 +394,12 @@ shutil.copytree({original['run_dir']!r}, root)
 record = json.loads((root / 'run-state.json').read_text())
 record.update(run_id={run_id!r}, status='running', finished_at=None, exit_code=None)
 (root / 'run-state.json').write_text(json.dumps(record))
+snapshot = json.loads((root / 'snapshot.json').read_text())
+snapshot['run_id'] = {run_id!r}
+(root / 'snapshot.json').write_text(json.dumps(snapshot))
 ''')
-  client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+  reset_copied_run_handoffs(worker, run_dir)
+  client(worker, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
   return {'run_id': run_id, 'run_dir': run_dir}
 
 def acknowledged_prefix_checks(updated):
@@ -375,15 +413,15 @@ def acknowledged_prefix_checks(updated):
   docker('restart', '--time', '1', service)
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service did not recover its acknowledged raw tracking files')
   prefix_args = ['--project-id', 'demo', '--origin', 'worker', '--run-id', updated['run_id'], '--repo', '/home/tester/review', '--source', 'service']
-  client(host, 'pull', *prefix_args)
+  client(host, 'fetch', *prefix_args)
   local = f"/home/tester/review/results/service/runs/{updated['run_id']}"
   result = json.loads(python(host, f"import hashlib,json;from pathlib import Path;p=Path({local!r}+'/outputs/metrics.jsonl');print(json.dumps({{'size':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}}))"))
   assert result == {'size': size, 'sha256': expected}, 'offline worker pull exposed an unacknowledged tail or lost the acknowledged prefix'
-  partial = json.loads(client(host, 'archive', '--project-id', 'demo', '--origin', 'worker', '--run-id', updated['run_id'], '--partial').stdout)
-  assert partial['incomplete'] is True and partial['status'] in ['pending', 'uploading', 'archived', 'failed'], 'owner partial archive did not capture the acknowledged active prefix'
+  partial = json.loads(client(host, 'upload', '--project-id', 'demo', '--origin', 'worker', '--run-id', updated['run_id'], '--partial').stdout)
+  assert partial['incomplete'] is True and partial['status'] in ['pending', 'uploading', 'uploaded', 'failed'], 'owner partial archive did not capture the acknowledged active prefix'
   archive = wait_archive(updated['run_id'])
   assert archive['incomplete'] is True, 'interrupted run archive lost its partial marker'
-  client(host, 'pull', *prefix_args, '--artifact', 'result.zip')
+  client(host, 'fetch', *prefix_args, '--artifact', 'result.zip')
   manifest = json.loads(python(host, f"import json,zipfile;from pathlib import Path;z=zipfile.ZipFile(Path({local!r})/'result.zip');m=json.loads(z.read('manifest.json'));assert len(z.read('outputs/metrics.jsonl'))=={size};print(json.dumps(m))"))
   assert manifest['incomplete'] is True and manifest['scope']['run_id'] == updated['run_id'], 'partial ZIP changed its run identity or completeness'
   docker('start', worker)
@@ -434,6 +472,7 @@ def project_machine_fixture(original):
   docker('cp', f"{worker}:{original['run_dir']}", str(staging))
   copy(staging, host, run_dir)
   docker('exec', '--user', '0', host, 'chown', '-R', 'tester:tester', run_dir)
+  reset_copied_run_handoffs(host, run_dir)
   python(host, f'''import json
 from pathlib import Path
 root = Path({run_dir!r})
@@ -446,10 +485,10 @@ for row, value in [(timed[0], 0.7), (timed[-1], 0.07)]:
 (root / 'logs/stdout.log').write_text('project machine worker-b log' + chr(10))
 (root / 'outputs/project-scope.txt').write_text('worker-b scope fixture' + chr(10))
 ''')
-  client(host, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker-b',
+  client(host, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker-b',
     '--queue-dir', '/home/tester/project-machine-queue', config='/tmp/machine-worker.toml')
   python(worker, f"from pathlib import Path;Path({original['run_dir']!r}+'/outputs/project-scope.txt').write_text('worker scope fixture'+chr(10))")
-  client(worker, 'push', '--run-dir', original['run_dir'], '--project-id', 'demo', '--origin', 'worker',
+  client(worker, 'publish', '--run-dir', original['run_dir'], '--project-id', 'demo', '--origin', 'worker',
     '--queue-dir', WORKER_QUEUE)
   assert json.loads(python(host, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['run_id'] == original['run_id'], 'second recorded machine did not preserve the colliding run ID'
   return {'run_id': original['run_id'], 'run_dir': run_dir}
@@ -511,7 +550,7 @@ with (root / 'outputs/metrics.jsonl').open('a') as metrics:
 with (root / 'logs/stdout.log').open('a') as output:
   output.write('project live update from {origin}' + chr(10))
 ''')
-      client(container, 'push', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
+      client(container, 'publish', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
         '--queue-dir', queue, config=config)
       python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'published-{origin}'}}))")
     wait_for(lambda: phase() == 'finish-runs', 'Firefox did not request terminal project artifacts', timeout=90)
@@ -527,7 +566,7 @@ record=json.loads(path.read_text())
 record.update(status='completed', exit_code=0, finished_at=datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
 path.write_text(json.dumps(record))
 ''')
-      client(container, 'push', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
+      client(container, 'publish', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
         '--queue-dir', queue, '--artifact', 'outputs/project-scope.txt', config=config)
       python(container, f'''import json
 from pathlib import Path
@@ -578,7 +617,7 @@ def storage_management_checks():
   digest = hashlib.sha256(contents).hexdigest()
   path = '/home/tester/management.bin'
   python(host, f'from pathlib import Path;Path({path!r}).write_bytes({contents!r})')
-  client(host, 'input put', '--project-id', project_id, '--input-id', 'blob', '--file', path,
+  client(host, 'input upload', '--project-id', project_id, '--input-id', 'blob', '--file', path,
     '--queue-dir', '/home/tester/management-queue')
   for target in [shared, alias]:
     result = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
@@ -587,7 +626,7 @@ def storage_management_checks():
     assert result['status'] == 200, 'owner could not create the shared-object fixture'
   for value in [b'old', b'next']:
     python(host, f'from pathlib import Path;Path("/home/tester/old.bin").write_bytes({value!r})')
-    client(host, 'file-put', '--target', json.dumps(old), '--file', '/home/tester/old.bin',
+    client(host, 'file-upload', '--target', json.dumps(old), '--file', '/home/tester/old.bin',
       '--queue-dir', '/home/tester/management-queue')
   document = json.dumps({'run_id': 'release', 'task': 'fixture', 'status': 'completed'}).encode()
   metrics = b'{"schema_version":1,"step":0,"metrics":{"loss":1}}\n'
@@ -784,11 +823,11 @@ prefix = "acceptance"
     'python3', '/opt/expri-browser/browser_forms.py'], timeout=180)
   initial_session = dashboard_public_checks()
   python(host, "from pathlib import Path;Path('/home/tester/private.bin').write_bytes(b'private-input-fixture'*1024)")
-  client(host, 'input put', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/queue')
-  client(worker, 'input get', '--project-id', 'demo', '--input-id', 'dataset-v1', '--destination', '/home/tester/private.bin')
+  client(host, 'input upload', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/queue')
+  client(worker, 'input download', '--project-id', 'demo', '--input-id', 'dataset-v1', '--destination', '/home/tester/private.bin')
   python(host, "from pathlib import Path;Path('/home/tester/empty.bin').write_bytes(b'')")
-  client(host, 'input put', '--project-id', 'demo', '--input-id', 'empty-file', '--file', '/home/tester/empty.bin', '--queue-dir', '/home/tester/queue')
-  client(worker, 'input get', '--project-id', 'demo', '--input-id', 'empty-file', '--destination', '/home/tester/empty.bin')
+  client(host, 'input upload', '--project-id', 'demo', '--input-id', 'empty-file', '--file', '/home/tester/empty.bin', '--queue-dir', '/home/tester/queue')
+  client(worker, 'input download', '--project-id', 'demo', '--input-id', 'empty-file', '--destination', '/home/tester/empty.bin')
   assert python(worker, "from pathlib import Path;print(Path('/home/tester/empty.bin').stat().st_size)") == '0', 'empty input did not round-trip'
   assert python(worker, "from pathlib import Path;print(Path('/home/tester/private.bin').read_bytes() == b'private-input-fixture'*1024)") == 'True', 'private input bytes changed during worker download'
   input_only = browser_json('/api/projects', initial_session)
@@ -798,17 +837,17 @@ prefix = "acceptance"
   project_storage_checks(initial_session)
   logged('browser-storage-input-only.log', ['docker', 'exec', '--user', 'tester', firefox,
     'python3', '/opt/expri-browser/browser_forms.py', '--storage-input-only'], timeout=90)
-  forbidden = client(worker, 'input put', '--project-id', 'demo', '--input-id', 'forbidden', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/input-queue', check=False)
+  forbidden = client(worker, 'input upload', '--project-id', 'demo', '--input-id', 'forbidden', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/input-queue', check=False)
   assert forbidden.returncode != 0, 'worker unexpectedly uploaded a private input'
   python(host, "from pathlib import Path;Path('/home/tester/different.bin').write_bytes(b'different dataset')")
-  immutable = client(host, 'input put', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/different.bin', '--queue-dir', '/home/tester/queue', check=False)
+  immutable = client(host, 'input upload', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/different.bin', '--queue-dir', '/home/tester/queue', check=False)
   assert immutable.returncode != 0, 'input reference allowed replacement with different bytes'
   execute(worker, 'mkdir', '-p', '/home/tester/experiment')
   copy(ROOT / 'tests/containers/service_seed.py', worker, '/tmp/seed.py')
   copy(ROOT / 'tests/containers/service_train.py', worker, '/home/tester/experiment/train.py')
   copy(ROOT / 'python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
   execute(worker, 'python3', '/tmp/seed.py')
-  receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /home/tester/private.bin').stdout)
+  receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
   run_id, run_dir = receipt['run_id'], receipt['run_dir']
   assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
   push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
@@ -818,7 +857,7 @@ prefix = "acceptance"
   assert json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'running', 'training finished before the service outage was injected'
   docker('stop', '--time', '1', service)
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'training did not complete while service was offline')
-  assert publishing(run_dir)['status'] != 'synced', 'publisher claimed synced during the outage'
+  assert publishing(run_dir)['status'] != 'published', 'publisher claimed published during the outage'
   # Kill only the independent publisher after training exits, then resume its
   # saved intent and queue while the service is still unavailable.
   killed = python(worker, f'''import os, signal
@@ -836,42 +875,97 @@ for process in Path('/proc').iterdir():
     pass
 print(count)''')
   assert killed == '1', 'did not find exactly one independent publisher'
-  wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['service_sync']['worker_active'] is False, 'stopped publisher retained its lease')
+  wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['publishing']['worker_active'] is False, 'stopped publisher retained its lease')
   resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--run-dir', run_dir).stdout)
   assert resumed['run_id'] == run_id, 'resume started a different run'
   docker('start', service)
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to restart')
   def drained(directory):
     report = json.loads(execute(worker, 'expri', 'runs', 'status', Path(directory).name, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)
-    return report['service_sync']['status'] == 'synced' and not report['service_sync']['worker_active']
+    return report['publishing']['status'] == 'published' and not report['publishing']['worker_active']
   wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
   queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
-  assert queue_state['protocol'] == 'tracking_v1' and queue_state['files'] == {}, 'fresh publishing queue used terminal per-file multipart instead of tracking-v1'
+  assert queue_state['protocol'] == 'tracking_v1' and set(queue_state['files']) <= {'outputs/checkpoint-1000.pt'}, 'fresh publishing queue used per-file multipart for tracking metadata or streams'
+  registered = next(file for file in service_record('list_files', run_id)['files']
+    if file['target']['path'] == 'outputs/checkpoint-1000.pt')
+  assert registered['storage'] == 'object' and registered['size'] == len(b'registered-live-checkpoint') * 4096, 'registered checkpoint did not recover from the service outage'
   tracked = tracking_files(run_id)
   assert all(path in tracked for path in ['run-state.json', 'snapshot.json', 'outputs/params.json', 'outputs/metrics.jsonl', 'logs/stdout.log', 'logs/stderr.log']), 'terminal tracking catalog omitted run records or raw streams'
   assert tracked['outputs/metrics.jsonl']['storage']['tracking']['sealed'] is True, 'terminal metrics were not sealed at their acknowledged extent'
   api_proxy('/test/arm')
-  first = client(worker, 'push', *push_args, '--artifact', 'outputs/checkpoint.pt', check=False)
+  first = client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt', check=False)
   assert first.returncode != 0 and api_proxy('/test/state')['lost_ack'], 'lost part acknowledgement was not injected'
   docker('restart', '--time', '1', service)
   wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to recover multipart state')
-  client(worker, 'push', *push_args, '--artifact', 'outputs/checkpoint.pt')
+  client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt')
   counts = api_proxy('/test/state')['part_urls']
   assert counts.get('1') == 1 and counts.get('2') == 1 and counts.get('3') == 1, counts
-  second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /home/tester/private.bin').stdout)
+  sync_gate = '/tmp/expri-live-sync.release'
+  python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
+  second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /tmp/expri-live-sync.release').stdout)
   assert second['run_id'] != run_id, 'second experiment reused the first run identity'
+  live_repo = '/home/tester/live-review'
+  watch_config = '''[project]
+name = "Live result fetch"
+[download]
+results_dir = "results"
+[fetch]
+client_config = "/tmp/owner.toml"
+project_id = "demo"
+origins = ["worker"]
+labels = ["best"]
+'''
+  python(host, f"from pathlib import Path;p=Path({live_repo!r});p.mkdir();(p/'expri.toml').write_text({watch_config!r})")
+  watch_command = ['expri', 'fetch', '--watch', '--repo', live_repo, '--config', live_repo + '/expri.toml']
+  result_fetch_pid = int(python(host, f'''import subprocess
+with open('/tmp/result-fetch.stdout', 'wb') as output, open('/tmp/result-fetch.stderr', 'wb') as error:
+  process = subprocess.Popen({watch_command!r}, stdout=output, stderr=error, start_new_session=True)
+print(process.pid)
+'''))
+  live_cache = f"{live_repo}/results/service-demo-worker/runs/{second['run_id']}"
+  def live_checkpoint_received():
+    return python(host, f'''import hashlib, json
+from pathlib import Path
+root = Path({live_cache!r})
+checkpoint = root / 'outputs/checkpoint-1000.pt'
+metrics = root / 'outputs/metrics.jsonl'
+ready = checkpoint.exists() and metrics.exists() and (root / 'pull-state.json').exists()
+if ready:
+  rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+  receipt = json.loads((root / 'pull-state.json').read_text())
+  expected = b'registered-live-checkpoint' * 4096
+  completed = any(file['path'] == 'outputs/checkpoint-1000.pt'
+    and file['size'] == len(expected) and file['sha256'] == hashlib.sha256(expected).hexdigest()
+    for file in receipt.get('downloaded_files', []))
+  ready = completed and any(row['step'] >= 10 and 'loss' in row['metrics'] for row in rows)
+print(ready)
+''') == 'True'
+  wait_for(live_checkpoint_received, 'laptop watcher did not receive the registered checkpoint and live metrics', timeout=90)
+  assert json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'checkpoint sync waited until training completed'
+  live_result = json.loads(python(host, f'''import json
+from pathlib import Path
+root = Path({live_cache!r})
+receipt = json.loads((root / 'pull-state.json').read_text())
+assert (root / 'outputs/checkpoint-1000.pt').read_bytes() == b'registered-live-checkpoint' * 4096
+assert not (root / 'outputs/checkpoint.pt').exists(), 'label watch downloaded an unselected legacy checkpoint'
+print(json.dumps({{'status':json.loads((root / 'run-state.json').read_text())['status'],
+  'downloaded':[file['path'] for file in receipt['downloaded_files']]}}))
+'''))
+  assert live_result['status'] == 'running' and 'outputs/checkpoint-1000.pt' in live_result['downloaded'], 'live watcher did not commit a verified running-run download receipt'
+  stop_result_fetch()
+  python(worker, f"from pathlib import Path;Path({sync_gate!r}).touch()")
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
   wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)
   for archived_run in [run_id, second['run_id']]:
     archive = wait_archive(archived_run)
     assert archive['incomplete'] is False and archive['file']['target']['path'] == 'result.zip', 'terminal archive did not finish independently as a complete result ZIP'
-  assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
+  assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt', 'outputs/checkpoint-1000.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
   intent = python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/publishing-request.json').read_text())")
   assert fixture_env['EXPRI_WORKER_TOKEN'] not in intent, 'publishing intent exposed its token'
   assert 'X-Amz-' not in intent, 'publishing intent exposed a signed URL'
   python(host, "from pathlib import Path;p=Path('/home/tester/review');p.mkdir();(p/'expri.toml').write_text('[project]\\nname=\"Offline service review\"\\n[download]\\nresults_dir=\"results\"\\n')")
   pull_args = ['--project-id', 'demo', '--origin', 'worker', '--run-id', run_id, '--repo', '/home/tester/review', '--source', 'service']
-  client(host, 'pull', *pull_args)
+  client(host, 'fetch', *pull_args)
   local = f'/home/tester/review/results/service/runs/{run_id}'
   assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False'
   metrics = json.loads(execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json').stdout)
@@ -885,7 +979,7 @@ print(count)''')
   # Previous cached metadata and unselected files must remain intact throughout.
   previous_state = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())")
   api_proxy('/test/arm-download')
-  download_command = ['expri', 'service', 'pull', '--config', '/tmp/owner.toml', *pull_args,
+  download_command = ['expri', 'service', 'fetch', '--config', '/tmp/owner.toml', *pull_args,
     '--artifact', 'outputs/checkpoint.pt']
   pull_pid = int(python(host, f'''import subprocess
 from pathlib import Path
@@ -902,7 +996,7 @@ print(process.pid)
   saved_progress = python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())")
   assert 'X-Amz-' not in saved_progress and fixture_env['EXPRI_OWNER_TOKEN'] not in saved_progress, 'download progress exposed a credential'
   api_proxy('/test/release-download')
-  download_report = json.loads(client(host, 'pull', *pull_args, '--artifact', 'outputs/checkpoint.pt').stdout)
+  download_report = json.loads(client(host, 'fetch', *pull_args, '--artifact', 'outputs/checkpoint.pt').stdout)
   assert download_report['resumed_bytes'] >= 8 * 1024 * 1024 and download_report['resumed_files'] >= 1, 'pull did not resume its saved checkpoint range'
   assert api_proxy('/test/state')['download_ranges'].get('bytes=0-8388607') == 1, 'restart downloaded the acknowledged checkpoint prefix again'
   digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
@@ -945,6 +1039,11 @@ print(process.pid)
   browser('/logout', method='POST', cookie=terminal_session)
   storage_management_checks()
   docker('stop', '--time', '1', service, s3)
+  offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
+  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
+  offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
+  assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its configured private input'
+  assert publishing(offline_run['run_dir'])['status'] != 'published', 'offline checkpoint registration claimed completed cloud sync'
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
   def review():
@@ -966,9 +1065,15 @@ with urlopen(url + checkpoint['download_url'], timeout=5) as response:
 print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
 '''))
   assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
+  assert offline_artifact['file']['downloaded'] is True, 'offline Files lost its verified checkpoint download receipt'
   assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
-  print('Service workflow passed: tracking-v1 publishing, acknowledged-prefix recovery, complete/partial archives, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
+  print('Service workflow passed: tracking-v1 publishing, configured private-input cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial result uploads, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
 finally:
+  if result_fetch_pid is not None:
+    try:
+      stop_result_fetch()
+    except (OSError, AssertionError):
+      print('Result-fetch watcher cleanup did not finish; container cleanup will stop it.', flush=True)
   if refresh_browser is not None and refresh_browser.poll() is None:
     refresh_browser.terminate()
     try:
@@ -993,6 +1098,9 @@ finally:
           'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
         ]:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
+      if container.endswith('-host'):
+        for name in ['result-fetch.stdout', 'result-fetch.stderr']:
+          docker('cp', f'{container}:/tmp/{name}', str(logs / (name + '.log')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)
     except (OSError, subprocess.TimeoutExpired):

@@ -1,10 +1,12 @@
 mod archive;
+mod artifacts_cli;
 mod config;
 mod context;
 mod controller;
 mod dashboard;
 mod environment;
 mod error;
+mod fetch_cli;
 mod filter;
 mod git;
 mod jobs;
@@ -14,6 +16,7 @@ mod metrics;
 mod metrics_cli;
 mod node;
 mod protocol;
+mod push_cli;
 mod run_artifacts;
 mod run_logs;
 mod runs;
@@ -29,7 +32,7 @@ use crate::context::CommandContext;
 use crate::controller::download::{DownloadOptions, download_target};
 use crate::controller::setup::{SetupOptions, setup_target};
 use crate::controller::sync::{
-  SyncOptions, sync_target, sync_target_with_diagnostic_receipt, sync_target_with_receipt,
+  SyncOptions, sync_target_with_diagnostic_receipt, sync_target_with_receipt,
 };
 use crate::controller::task::{
   LocalTaskOptions, RemoteTaskOptions, run_local_task, run_remote_task,
@@ -56,7 +59,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-  Sync(SyncCommand),
+  /// Push source and configuration changes to a worker checkout.
+  Push(PushCommand),
+  /// Fetch run data and selected outputs from the expri service and S3.
+  Fetch(FetchCommand),
+  /// Register finalized training outputs for background upload.
+  Artifact(artifacts_cli::ArtifactCommand),
   Download(DownloadCommand),
   Setup(SetupCommand),
   Run(RunCommand),
@@ -64,7 +72,7 @@ enum Command {
   Runs(RunsCommand),
   /// Browse local and cached experiment results in a local dashboard.
   Dashboard(dashboard::DashboardCommand),
-  /// Sync experiments and private files through an optional self-hosted S3 service.
+  /// Publish experiment data and transfer files through a self-hosted service.
   Service(service::ServiceCommand),
   Node {
     #[command(subcommand)]
@@ -113,7 +121,7 @@ struct PruneCommand {
 }
 
 #[derive(Debug, Args)]
-struct SyncCommand {
+struct PushCommand {
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -132,11 +140,28 @@ struct SyncCommand {
   #[arg(long)]
   force: bool,
 
-  #[arg(long)]
-  pull: bool,
+  /// Keep pushing source and configuration changes to the worker checkout.
+  #[arg(long, conflicts_with = "paths")]
+  watch: bool,
 
   #[arg(value_name = "PATH", last = true)]
   paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct FetchCommand {
+  #[arg(long)]
+  config: Option<PathBuf>,
+
+  #[arg(long)]
+  repo: Option<PathBuf>,
+
+  #[arg(long)]
+  dry_run: bool,
+
+  /// Keep fetching new run data and selected outputs every five seconds.
+  #[arg(long)]
+  watch: bool,
 }
 
 #[derive(Debug, Args)]
@@ -198,8 +223,9 @@ struct RunCommand {
   #[arg(long)]
   dry_run: bool,
 
+  /// Skip pushing source changes before starting the run.
   #[arg(long)]
-  no_sync: bool,
+  no_push: bool,
 
   /// Disable automatic publishing for this run.
   #[arg(long)]
@@ -213,8 +239,7 @@ struct RunCommand {
     value_name = "TASK",
     required = true,
     num_args = 1..,
-    trailing_var_arg = true,
-    allow_hyphen_values = true
+    trailing_var_arg = true
   )]
   task: Vec<String>,
 }
@@ -229,7 +254,9 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Sync(command) => run_sync(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Push(command) => push_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Fetch(command) => fetch_cli::run(command, cli.target.as_deref(), cli.quiet),
+    Command::Artifact(command) => artifacts_cli::run(command, cli.target.as_deref()),
     Command::Download(command) => {
       run_download(command, cli.target.as_deref(), cli.verbose, cli.quiet)
     }
@@ -333,28 +360,6 @@ fn environment_selection(config: &config::Config) -> (Vec<String>, Vec<String>) 
   (extras, sync_args)
 }
 
-fn run_sync(command: SyncCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
-  let context = CommandContext::load(command.config, command.repo)?
-    .into_target(target, command.control_path)?;
-  let sync = context.config.sync_rules()?;
-
-  sync_target(SyncOptions {
-    repo_root: context.repo_root,
-    project_name: context.project_name,
-    target_name: context.target_name,
-    target: context.target,
-    sync,
-    control_path: context.control_path,
-    control_persist: command.control_persist,
-    dry_run: command.dry_run,
-    force: command.force,
-    pull: command.pull,
-    paths: command.paths,
-    verbosity,
-    quiet,
-  })
-}
-
 fn run_download(
   command: DownloadCommand,
   target: Option<&str>,
@@ -434,17 +439,25 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   let task = context.config.task(&name)?;
   let remote_managed = context
     .config
-    .sync
+    .push
     .as_ref()
-    .and_then(|sync| sync.remote_managed.clone())
+    .and_then(|push| push.remote_managed.clone())
     .unwrap_or_default();
   let (extras, sync_args) = environment_selection(&context.config);
   if target.is_some() {
     let mut context = context.into_target(target, command.control_path)?;
     if command.no_publish {
-      context.target.service = None;
+      disable_publishing(&mut context.target.service);
     }
     if context.target.service.is_some() && context.target.environment.is_none() {
+      if context
+        .target
+        .service
+        .as_ref()
+        .is_some_and(|service| !service.inputs.is_empty())
+      {
+        return Err(ExpriError::Message("private input preparation requires a configured target environment; add [environment], or download inputs manually and remove service.inputs".into()));
+      }
       return Err(ExpriError::Message(
         "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
       ));
@@ -464,8 +477,8 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
         quiet,
       )?;
     }
-    let expected_sync = if !command.no_sync {
-      let sync = context.config.sync_rules()?;
+    let expected_sync = if !command.no_push {
+      let sync = context.config.push_rules()?;
       let sync_with_receipt = if command.detach {
         sync_target_with_diagnostic_receipt
       } else {
@@ -481,7 +494,6 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
         control_persist: command.control_persist.clone(),
         dry_run: command.dry_run,
         force: false,
-        pull: false,
         paths: Vec::new(),
         verbosity,
         quiet,
@@ -511,17 +523,16 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   }
 
   let environment = context.config.local_environment()?;
-  let service = if command.no_publish {
-    None
-  } else {
-    context.config.local_service()?
-  };
+  let mut service = context.config.local_service()?;
+  if command.no_publish {
+    disable_publishing(&mut service);
+  }
   let mut local_sources = remote_managed;
   if let Some(paths) = context
     .config
-    .sync
+    .push
     .as_ref()
-    .and_then(|sync| sync.include_ignored.as_ref())
+    .and_then(|push| push.include_ignored.as_ref())
   {
     local_sources.extend(paths.iter().cloned());
   }
@@ -543,9 +554,146 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   })
 }
 
+fn disable_publishing(service: &mut Option<config::RunServiceConfig>) {
+  if let Some(config) = service {
+    if config.inputs.is_empty() {
+      *service = None;
+    } else {
+      config.publish = false;
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn push_and_fetch_select_separate_directions() {
+    let cli =
+      Cli::try_parse_from(["expri", "-T", "gpu-1", "push", "--watch", "--dry-run"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Push(PushCommand {
+        watch: true,
+        dry_run: true,
+        ..
+      })
+    ));
+    assert!(Cli::try_parse_from(["expri", "push", "--watch", "--", "code.py"]).is_err());
+    let cli = Cli::try_parse_from(["expri", "push", "--", "code.py"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Push(PushCommand { paths, .. }) if paths == [PathBuf::from("code.py")]
+    ));
+    assert!(Cli::try_parse_from(["expri", "-T", "gpu-1", "sync", "--watch", "--dry-run"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "push", "--pull", "--", "code.py"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "run", "--no-sync", "train"]).is_err());
+    let cli = Cli::try_parse_from(["expri", "fetch", "--watch", "--dry-run"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Fetch(FetchCommand {
+        watch: true,
+        dry_run: true,
+        ..
+      })
+    ));
+    for flag in ["--pull", "--force", "--control-path"] {
+      assert!(Cli::try_parse_from(["expri", "fetch", flag]).is_err());
+    }
+    assert!(Cli::try_parse_from(["expri", "fetch", "--", "code.py"]).is_err());
+  }
+
+  #[test]
+  fn node_apply_uses_push_without_a_sync_alias() {
+    let cli =
+      Cli::try_parse_from(["expri", "node", "push-apply", "--request", "request.json"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Node {
+        command: NodeCommand::PushApply(_)
+      }
+    ));
+    assert!(
+      Cli::try_parse_from(["expri", "node", "sync-apply", "--request", "request.json",]).is_err()
+    );
+  }
+
+  #[test]
+  fn canonical_help_exposes_push_and_fetch() {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    let help = command.render_help().to_string();
+    assert!(help.contains("push"));
+    assert!(help.contains("fetch"));
+    assert!(!help.contains("\n  sync "));
+    let push = command
+      .find_subcommand_mut("push")
+      .unwrap()
+      .render_help()
+      .to_string();
+    assert!(push.contains("--watch"));
+    assert!(!push.contains("--pull"));
+    assert!(push.contains("[PATH]"));
+    assert!(!push.contains("cloud"));
+    let run = command
+      .find_subcommand_mut("run")
+      .unwrap()
+      .render_help()
+      .to_string();
+    assert!(run.contains("--no-push"));
+    assert!(!run.contains("--no-sync"));
+    let cli = Cli::try_parse_from(["expri", "run", "--no-push", "train"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Run(RunCommand { no_push: true, .. })
+    ));
+  }
+
+  #[test]
+  fn finalized_file_registration_choices_and_publishing_inputs_are_preserved() {
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "artifact",
+        "register",
+        "outputs/1000.pt",
+        "--label",
+        "best",
+        "--label",
+        "latest"
+      ])
+      .is_ok()
+    );
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "artifact",
+        "register",
+        "outputs/1000.pt",
+        "--label",
+        "newest"
+      ])
+      .is_err()
+    );
+    let mut service = Some(config::RunServiceConfig {
+      client_config: "/etc/expri/worker.toml".into(),
+      project_id: "demo".into(),
+      origin: "worker".into(),
+      dashboard_url: None,
+      inputs: vec![config::RunInputConfig {
+        input_id: "dataset".into(),
+        destination: "data.bin".into(),
+      }],
+      publish: true,
+    });
+    disable_publishing(&mut service);
+    assert!(!service.as_ref().unwrap().publish);
+    assert_eq!(service.as_ref().unwrap().inputs.len(), 1);
+    service.as_mut().unwrap().inputs.clear();
+    disable_publishing(&mut service);
+    assert!(service.is_none());
+  }
 
   #[test]
   fn run_options_before_name_belong_to_expri() {
@@ -553,7 +701,7 @@ mod tests {
       "expri",
       "run",
       "--dry-run",
-      "--no-sync",
+      "--no-push",
       "--no-publish",
       "--detach",
       "train",
@@ -568,7 +716,7 @@ mod tests {
 
     assert_eq!(command.task[0], "train");
     assert!(command.dry_run);
-    assert!(command.no_sync);
+    assert!(command.no_push);
     assert!(command.no_publish);
     assert!(command.detach);
     assert_eq!(command.task[1..], ["--model", "tiny"]);
@@ -602,7 +750,7 @@ mod tests {
   }
 
   #[test]
-  fn detached_legacy_remote_tasks_fail_before_sync_or_transport() {
+  fn detached_legacy_remote_tasks_fail_before_push_or_transport() {
     let fixture = tempfile::tempdir().unwrap();
     let config = fixture.path().join("expri.toml");
     std::fs::write(

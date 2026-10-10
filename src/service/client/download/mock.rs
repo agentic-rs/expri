@@ -81,3 +81,53 @@ pub(in crate::service::client) fn mock(
   });
   (url, task)
 }
+
+pub(in crate::service::client) fn concurrent_mock(
+  count: usize,
+  handler: impl Fn(HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync + 'static,
+) -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+  listener.set_nonblocking(true).unwrap();
+  let url = format!("http://{}", listener.local_addr().unwrap());
+  let origin = url.clone();
+  let handler = std::sync::Arc::new(handler);
+  let task = thread::spawn(move || {
+    let mut workers = Vec::new();
+    for _ in 0..count {
+      let deadline = Instant::now() + Duration::from_secs(10);
+      let mut stream = loop {
+        match listener.accept() {
+          Ok((stream, _)) => break stream,
+          Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            assert!(
+              Instant::now() < deadline,
+              "concurrent test client did not connect"
+            );
+            thread::sleep(Duration::from_millis(5));
+          }
+          Err(error) => panic!("test accept: {error}"),
+        }
+      };
+      let handler = handler.clone();
+      let origin = origin.clone();
+      workers.push(thread::spawn(move || {
+        let (status, headers, body) = handler(read_request(&mut stream), &origin);
+        write!(
+          stream,
+          "HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Length: {}\r\n",
+          body.len()
+        )
+        .unwrap();
+        for (name, value) in headers {
+          write!(stream, "{name}: {value}\r\n").unwrap();
+        }
+        stream.write_all(b"\r\n").unwrap();
+        stream.write_all(&body).unwrap();
+      }));
+    }
+    for worker in workers {
+      worker.join().unwrap();
+    }
+  });
+  (url, task)
+}

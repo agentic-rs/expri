@@ -33,6 +33,33 @@ pub(crate) struct ArtifactRow {
   pub cloud: Option<bool>,
   pub worker: Option<bool>,
   pub download_url: Option<String>,
+  pub sync_status: Option<String>,
+  pub sync_error: Option<String>,
+  pub downloaded: Option<bool>,
+  pub labels: Vec<String>,
+  pub labels_pending: bool,
+  #[serde(skip)]
+  pub reported_sha256: Option<String>,
+}
+
+impl ArtifactRow {
+  pub(crate) fn confirm_cloud(&mut self, size: u64, digest: Option<&str>) {
+    let matches = (self.sync_status.is_none() && self.labels.is_empty())
+      || (self.sync_status.is_some()
+        && self.size == size
+        && digest.is_some()
+        && self.reported_sha256.as_deref() == digest);
+    self.cloud = Some(true);
+    if matches {
+      self.sync_status = Some("cloud".into());
+      self.sync_error = None;
+      self.labels_pending = false;
+    } else if self.sync_status.as_deref() == Some("cloud") {
+      self.sync_status = Some("needs_attention".into());
+      self.sync_error = Some("The cloud file does not match the registered checkpoint.".into());
+    }
+    self.size = size;
+  }
 }
 
 pub(crate) struct ReportedInventory {
@@ -116,12 +143,55 @@ fn parse_files(value: &Value) -> Result<Vec<crate::run_artifacts::Artifact>> {
     let size = file["size"]
       .as_u64()
       .ok_or_else(|| message("invalid artifact size"))?;
+    // Future worker states should not hide otherwise valid legacy files. Treat
+    // only the known lifecycle as reported state; cloud records remain authoritative.
+    let sync_status = file["sync_status"]
+      .as_str()
+      .filter(|status| {
+        matches!(
+          *status,
+          "registered" | "uploading" | "cloud" | "needs_attention"
+        )
+      })
+      .map(str::to_string);
+    let sync_error = sync_status.as_ref().and_then(|_| {
+      file["sync_error"]
+        .as_str()
+        .filter(|error| error.len() <= 512 && !error.chars().any(char::is_control))
+        .map(str::to_string)
+    });
+    let labels = file["labels"]
+      .as_array()
+      .filter(|labels| labels.len() <= 2)
+      .map(|labels| {
+        labels
+          .iter()
+          .filter_map(Value::as_str)
+          .filter(|label| matches!(*label, "best" | "latest"))
+          .map(str::to_string)
+          .collect::<std::collections::BTreeSet<_>>()
+          .into_iter()
+          .collect()
+      })
+      .unwrap_or_default();
     if parsed
       .insert(
         path.into(),
         crate::run_artifacts::Artifact {
           path: path.into(),
           size,
+          sha256: file["sha256"]
+            .as_str()
+            .filter(|digest| {
+              digest.len() == 64
+                && digest
+                  .bytes()
+                  .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+            .map(str::to_string),
+          sync_status,
+          sync_error,
+          labels,
         },
       )
       .is_some()
@@ -164,11 +234,78 @@ fn optional_json(run_dir: &Path, path: &str, limit: u64) -> Result<Option<Value>
   Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
+fn downloaded_records(receipt: &Value, available: &[Value]) -> BTreeMap<String, (u64, (u64, u32))> {
+  let Some(records) = receipt["downloaded_files"]
+    .as_array()
+    .filter(|records| records.len() <= crate::run_artifacts::FILE_LIMIT)
+  else {
+    return BTreeMap::new();
+  };
+  let mut downloaded = BTreeMap::new();
+  for record in records {
+    let Some(path) = record["path"]
+      .as_str()
+      .filter(|path| validate_output(path).is_ok())
+    else {
+      continue;
+    };
+    let Some(size) = record["size"].as_u64() else {
+      continue;
+    };
+    let Some(digest) = record["sha256"]
+      .as_str()
+      .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    else {
+      continue;
+    };
+    if !available
+      .iter()
+      .any(|file| file["path"] == path && file["size"] == size && file["sha256"] == digest)
+    {
+      continue;
+    }
+    let Some(modified) = record["modified"]
+      .as_array()
+      .filter(|modified| modified.len() == 2)
+    else {
+      continue;
+    };
+    let (Some(seconds), Some(nanos)) = (
+      modified[0].as_u64(),
+      modified[1].as_u64().filter(|nanos| *nanos < 1_000_000_000),
+    ) else {
+      continue;
+    };
+    downloaded.insert(path.into(), (size, (seconds, nanos as u32)));
+  }
+  downloaded
+}
+
+fn downloaded_matches(run_dir: &Path, path: &str, expected: &(u64, (u64, u32))) -> bool {
+  // Receipts were written after SHA verification. Size and mtime detect local
+  // edits without reading multi-gigabyte checkpoints for a dashboard request.
+  let Ok(Some(file)) = open_beneath(run_dir, Path::new(path)) else {
+    return false;
+  };
+  let Ok(metadata) = file.metadata() else {
+    return false;
+  };
+  let Some(modified) = metadata
+    .modified()
+    .ok()
+    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+  else {
+    return false;
+  };
+  metadata.len() == expected.0 && (modified.as_secs(), modified.subsec_nanos()) == expected.1
+}
+
 pub(super) fn local_catalog(run_dir: &Path, source: &super::Source, run_id: &str) -> Result<Value> {
   let mut rows = BTreeMap::new();
   let mut warnings = Vec::new();
   let mut truncated = false;
   let mut recorded_at = None;
+  let mut downloaded = BTreeMap::new();
   match optional_json(run_dir, crate::run_artifacts::INVENTORY_PATH, crate::run_artifacts::INVENTORY_LIMIT as u64)
     .and_then(|value| value.as_ref().map(parse_inventory).transpose()) {
     Ok(Some(inventory)) => {
@@ -176,7 +313,9 @@ pub(super) fn local_catalog(run_dir: &Path, source: &super::Source, run_id: &str
       recorded_at = inventory.recorded_at;
       for file in inventory.files {
         rows.insert(file.path.clone(), ArtifactRow { path: file.path, size: file.size,
-          local: Some(false), cloud: None, worker: Some(true), download_url: None });
+          local: Some(false), cloud: None, worker: Some(true), download_url: None,
+          sync_status: file.sync_status, sync_error: file.sync_error, downloaded: None,
+          labels_pending: !file.labels.is_empty(), labels: file.labels, reported_sha256: file.sha256 });
       }
     }
     Ok(None) => {}
@@ -186,25 +325,32 @@ pub(super) fn local_catalog(run_dir: &Path, source: &super::Source, run_id: &str
   if source.kind == "cached" {
     match optional_json(run_dir, "pull-state.json", CACHE_RECORD_LIMIT) {
       Ok(Some(receipt)) => {
+        let mut valid_scope = false;
         if let Ok(scope) = serde_json::from_value::<crate::service::types::RunScope>(receipt["scope"].clone())
           && scope.run_id == run_id && crate::service::types::validate_scope(&scope).is_ok() {
           pull_scope = serde_json::to_value(scope)?;
+          valid_scope = true;
         }
         if receipt.get("available_files").is_some() {
           match parse_files(&receipt["available_files"]) {
             Ok(files) => {
               truncated |= receipt["available_files_truncated"].as_bool().unwrap_or(false);
               let records = receipt["available_files"].as_array().expect("validated file array");
+              if valid_scope { downloaded = downloaded_records(&receipt, records); }
               for file in files {
                 let object = records.iter().find(|record| record["path"] == file.path)
                   .and_then(|record| record["sha256"].as_str())
                   .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
                 let row = rows.entry(file.path.clone()).or_insert_with(|| ArtifactRow { path: file.path,
-                  size: file.size, local: Some(false), cloud: None, worker: None, download_url: None });
+                  size: file.size, local: Some(false), cloud: None, worker: None, download_url: None,
+                  sync_status: None, sync_error: None, downloaded: Some(false), labels: Vec::new(),
+                  labels_pending: false, reported_sha256: None });
                 row.cloud = Some(object);
-                if object { row.size = file.size; }
+                if object {
+                  row.confirm_cloud(file.size, file.sha256.as_deref());
+                }
               }
-              warnings.push(json!({"message": "Cloud availability reflects the last service pull; refresh with the CLI for current availability."}));
+              warnings.push(json!({"message": "Cloud availability reflects the last service fetch; refresh with the CLI for current availability."}));
             }
             Err(_) => warnings.push(json!({"message": "Cached cloud artifact catalog is invalid; cloud availability is unknown."})),
           }
@@ -226,10 +372,28 @@ pub(super) fn local_catalog(run_dir: &Path, source: &super::Source, run_id: &str
         cloud: None,
         worker: None,
         download_url: None,
+        sync_status: None,
+        sync_error: None,
+        downloaded: None,
+        labels: Vec::new(),
+        labels_pending: false,
+        reported_sha256: None,
       });
     row.size = file.size;
     row.local = Some(true);
+    if source.kind == "cached" {
+      row.downloaded = Some(
+        downloaded
+          .get(&file.path)
+          .is_some_and(|record| downloaded_matches(run_dir, &file.path, record)),
+      );
+    }
     row.download_url = Some(download_url(&source.source_id, run_id, &file.path));
+  }
+  if source.kind == "cached" {
+    for row in rows.values_mut() {
+      row.downloaded.get_or_insert(false);
+    }
   }
   let files = bound_rows(rows, &mut truncated)?;
   if truncated {
@@ -388,4 +552,50 @@ pub(super) fn cache_record(run_dir: &Path, truncated: &mut bool) -> Result<Value
     ],
     truncated,
   ))
+}
+
+#[cfg(test)]
+mod sync_tests {
+  use super::*;
+
+  #[test]
+  fn reported_sync_state_is_optional_bounded_and_forward_compatible() {
+    let inventory = parse_inventory(&json!({"schema_version":1,"truncated":false,"files":[
+      {"path":"outputs/legacy.pt","size":2},
+      {"path":"outputs/new.pt","size":3,"sync_status":"registered","sync_error":"Upload will retry","sha256":"a".repeat(64),
+        "labels":["best","latest"]},
+      {"path":"outputs/future.pt","size":4,"sync_status":"future","sync_error":"not a supported status","sha256":"G".repeat(64),
+        "labels":["unknown","best"]},
+      {"path":"outputs/invalid-error.pt","size":5,"sync_status":"needs_attention","sync_error":"line\nbreak"},
+      {"path":"outputs/long-error.pt","size":6,"sync_status":"uploading","sync_error":"x".repeat(513)}
+    ]})).unwrap();
+    assert_eq!(inventory.files.len(), 5);
+    let file = |path: &str| {
+      inventory
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .unwrap()
+    };
+    assert!(file("outputs/legacy.pt").sync_status.is_none());
+    assert_eq!(
+      file("outputs/new.pt").sync_status.as_deref(),
+      Some("registered")
+    );
+    assert_eq!(
+      file("outputs/new.pt").sync_error.as_deref(),
+      Some("Upload will retry")
+    );
+    assert_eq!(file("outputs/new.pt").labels, ["best", "latest"]);
+    assert_eq!(
+      file("outputs/new.pt").sha256.as_deref(),
+      Some("a".repeat(64).as_str())
+    );
+    assert!(file("outputs/future.pt").sync_status.is_none());
+    assert!(file("outputs/future.pt").sync_error.is_none());
+    assert!(file("outputs/future.pt").sha256.is_none());
+    assert_eq!(file("outputs/future.pt").labels, ["best"]);
+    assert!(file("outputs/invalid-error.pt").sync_error.is_none());
+    assert!(file("outputs/long-error.pt").sync_error.is_none());
+  }
 }

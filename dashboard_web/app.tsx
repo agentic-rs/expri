@@ -752,18 +752,18 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({ live_status: message });
   }
   function showEmptyRuns(filtered: boolean, source?: Source): void {
-    const synced = access_mode === "hosted" || source?.kind === "service";
+    const server_results = access_mode === "hosted" || source?.kind === "service";
     updateUi({
       list_empty: {
-        title: synced && !filtered ? "No synced runs yet" : "No runs found",
+        title: server_results && !filtered ? "No published runs yet" : "No runs found",
         message: filtered
           ? "Try changing the filters."
-          : synced
-            ? "Sync results from a worker to see them here."
+          : server_results
+            ? "Publish results from a worker to see them here."
             : source?.kind === "cached"
-              ? "Pull results with expri runs pull, then Refresh."
+              ? "Download results with expri runs fetch, then Refresh."
               : "Start an experiment with expri run to record results here.",
-        setup: synced && !filtered,
+        setup: server_results && !filtered,
       },
     });
   }
@@ -1058,7 +1058,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (!log || log_view !== view) return;
       updateUi({
         log_content: log.missing
-          ? "This log has not been recorded or pulled."
+          ? "This log has not been recorded or downloaded."
           : log.content || "The log is empty.",
         log_note: log.truncated
           ? "Showing the last 100 lines, capped at 64 KiB. Use expri runs logs for more output."
@@ -1250,11 +1250,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         : !source
           ? null
           : source.kind === "service"
-            ? "Synced results · Updates arrive when workers sync their recorded files."
+            ? "Published results · Updates arrive when workers publish their recorded files."
             : source.kind === "hosted_project"
-              ? "Project results across recorded machines · Updates arrive when workers sync their recorded files."
+              ? "Project results across recorded machines · Updates arrive when workers publish their recorded files."
               : source.kind === "cached"
-                ? "Cached remote results · Pull updated results with expri runs pull; this dashboard watches the local cache."
+                ? "Cached remote results · Download updated results with expri runs fetch; this dashboard watches the local cache."
                 : "Local results · Status and updates come from recorded run files.",
     });
   }
@@ -1336,7 +1336,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({
       previous_disabled: true,
       next_disabled: true,
-      run_count: "No synced runs yet",
+      run_count: access_mode === "hosted" ? "No published runs yet" : "No runs found",
       page_label: "Page 1",
       list_warnings: [],
       list_busy: false,
@@ -1379,7 +1379,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   function applyLog(view: LogView, log: Log): void {
     const content = log.missing
-      ? "This log has not been recorded or pulled."
+      ? "This log has not been recorded or downloaded."
       : log.content || "The log is empty.";
     const output = required("log-output");
     const scroll_top = output.scrollTop,
@@ -1475,7 +1475,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         artifacts_loaded = true;
         updateUi({
           artifacts_error:
-            "This server does not provide file browsing yet, or the run is no longer available. Upgrade expri or use the CLI to pull selected run files.",
+            "This server does not provide file browsing yet, or the run is no longer available. Upgrade expri or use the CLI to fetch selected run files.",
         });
         return true;
       }

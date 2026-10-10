@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::PushOptions;
+use super::PublishOptions;
 use super::client::{self, Publisher, fs};
 use super::types::validate_component;
 use crate::config::RunServiceConfig;
@@ -91,7 +91,7 @@ fn safe_error(failure: &ExpriError) -> String {
     _ => failure.to_string(),
   };
   if detail.contains("http://") || detail.contains("https://") {
-    return "Service synchronization failed; saved work can be retried".into();
+    return "Service publishing failed; saved work can be retried".into();
   }
   detail
     .chars()
@@ -143,7 +143,7 @@ fn read_state(directory: &Path) -> Result<PublishingState> {
     || state.run_id != run_id(directory)?
     || !matches!(
       state.status.as_str(),
-      "pending" | "syncing" | "retrying" | "error" | "synced"
+      "pending" | "publishing" | "retrying" | "error" | "published"
     )
   {
     return Err(error("publisher status does not belong to this run"));
@@ -164,6 +164,9 @@ fn runtime_config(intent: &Intent) -> Result<PathBuf> {
 }
 
 pub(crate) fn dashboard_url(config: &RunServiceConfig, run_id: &str) -> Option<String> {
+  if !config.publish {
+    return None;
+  }
   let mut url = reqwest::Url::parse(config.dashboard_url.as_ref()?).ok()?;
   url
     .query_pairs_mut()
@@ -256,6 +259,9 @@ fn launch(intent: &Intent, state: &mut PublishingState, lease: FileLock) -> Resu
 }
 
 pub(crate) fn start(repo_root: &Path, run_dir: &Path, config: &RunServiceConfig) -> Result<()> {
+  if !config.publish {
+    return Ok(());
+  }
   let intent = Intent {
     schema_version: 1,
     repo_root: repo_root.canonicalize()?,
@@ -293,11 +299,12 @@ pub(crate) fn resume(run_dir: &Path) -> Result<Value> {
   };
   let intent = read_intent(&directory)?;
   let mut state = read_state(&directory)?;
-  if state.status != "synced" {
+  if state.status != "published" {
     launch(&intent, &mut state, lease)?;
   }
   let mut report = serde_json::to_value(&state)?;
-  report["started"] = json!(state.status != "synced");
+  client::project_result_upload(&mut report["progress"]);
+  report["started"] = json!(state.status != "published");
   Ok(report)
 }
 
@@ -310,6 +317,7 @@ pub(crate) fn status(run_dir: &Path) -> Result<Option<Value>> {
     return Ok(None);
   }
   let mut report = serde_json::to_value(read_state(&directory)?)?;
+  client::project_result_upload(&mut report["progress"]);
   report["worker_active"] = json!(matches!(
     try_lock_file(&directory.join(LEASE), false)?,
     LockAttempt::Busy
@@ -349,14 +357,14 @@ pub(super) fn worker(run_dir: &Path) -> Result<()> {
   let initialized = (|| {
     let intent = read_intent(&directory)?;
     let config = runtime_config(&intent)?;
-    Publisher::new(&PushOptions {
+    Publisher::new(&PublishOptions {
       config,
       run_dir: directory.clone(),
       project_id: intent.config.project_id,
       origin: intent.config.origin,
       artifacts: Vec::new(),
       watch: true,
-      queue_dir: intent.repo_root.join(".expri/service-sync"),
+      queue_dir: intent.repo_root.join(".expri/publish"),
     })
   })();
   let mut publisher = match initialized {
@@ -373,17 +381,17 @@ pub(super) fn worker(run_dir: &Path) -> Result<()> {
       return Err(error("Publisher cannot inspect the run lease"));
     }
     state.retry_after_seconds = None;
-    state.save(&directory, "syncing")?;
+    state.save(&directory, "publishing")?;
     match publisher.cycle(&mut |progress| {
       state.progress = progress;
-      state.save(&directory, "syncing")
+      state.save(&directory, "publishing")
     }) {
       Ok(done) => {
         failures = 0;
         state.last_success_at = Some(now());
         state.last_error = None;
         state.progress = publisher.progress(done);
-        state.save(&directory, if done { "synced" } else { "syncing" })?;
+        state.save(&directory, if done { "published" } else { "publishing" })?;
         if done {
           return Ok(());
         }
@@ -425,6 +433,8 @@ mod tests {
       project_id: "project".into(),
       origin: "worker".into(),
       dashboard_url: Some("https://example.invalid/".into()),
+      inputs: Vec::new(),
+      publish: true,
     };
     (temporary, repo, run, config)
   }
@@ -445,7 +455,7 @@ mod tests {
       std::fs::read(run.join("run-state.json")).unwrap(),
       run_before
     );
-    assert!(!repo.join(".expri/service-sync").exists());
+    assert!(!repo.join(".expri/publish").exists());
   }
 
   #[test]
@@ -562,7 +572,7 @@ mod tests {
       try_lock_file(&run.join(".run.lock"), false).unwrap(),
       LockAttempt::Busy
     ));
-    let queue_dir = repo.join(".expri/service-sync/runs/project/worker/run-fixture");
+    let queue_dir = repo.join(".expri/publish/runs/project/worker/run-fixture");
     let queue: Value =
       serde_json::from_slice(&std::fs::read(queue_dir.join("queue.json")).unwrap()).unwrap();
     let saved = &queue["files"]["snapshot.json"];
@@ -616,6 +626,27 @@ mod tests {
   }
 
   #[test]
+  fn status_exposes_result_upload_without_rewriting_saved_progress() {
+    let (_temporary, repo, run, config) = fixture();
+    let intent = Intent {
+      schema_version: 1,
+      repo_root: repo,
+      run_dir: run.clone(),
+      config,
+    };
+    let mut state = PublishingState::new(&intent).unwrap();
+    state.progress = json!({"archive":{"status":"archived","incomplete":false,
+      "file":null,"last_error":null}});
+    state.save(&run, "published").unwrap();
+    let saved = std::fs::read(run.join(STATE)).unwrap();
+    let report = status(&run).unwrap().unwrap();
+    assert_eq!(report["status"], "published");
+    assert!(report["progress"].get("archive").is_none());
+    assert_eq!(report["progress"]["result_upload"]["status"], "uploaded");
+    assert_eq!(std::fs::read(run.join(STATE)).unwrap(), saved);
+  }
+
+  #[test]
   fn status_limit_measures_the_pretty_record_that_will_be_read() {
     let (_temporary, repo, run, config) = fixture();
     let intent = Intent {
@@ -628,7 +659,7 @@ mod tests {
     state.progress = json!({"records": vec!["x"; 3_000]});
     assert!(serde_json::to_vec(&state).unwrap().len() < RECORD_LIMIT as usize);
     assert!(serde_json::to_vec_pretty(&state).unwrap().len() > RECORD_LIMIT as usize);
-    assert!(state.save(&run, "syncing").is_err());
+    assert!(state.save(&run, "publishing").is_err());
     assert!(
       !run.join(STATE).exists(),
       "an unreadable oversized status was published"
@@ -649,6 +680,9 @@ mod tests {
       ])
     );
     config.dashboard_url = None;
+    assert!(dashboard_url(&config, "run-fixture").is_none());
+    config.dashboard_url = Some("https://example.invalid/".into());
+    config.publish = false;
     assert!(dashboard_url(&config, "run-fixture").is_none());
   }
 }

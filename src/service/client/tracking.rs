@@ -216,20 +216,22 @@ pub(super) fn archive_receipt(
   ) || archive.incomplete != incomplete
   {
     return Err(message(
-      "service returned an invalid result archive receipt",
+      "service returned an invalid result.zip upload receipt",
     ));
   }
   if let Some(file) = &archive.file {
     if file.target != run_target(scope, "result.zip")
       || !matches!(file.storage, FileStorage::Object)
     {
-      return Err(message("service returned an archive from another run"));
+      return Err(message(
+        "service returned a result.zip upload from another run",
+      ));
     }
     validate_digest(
       file
         .sha256
         .as_deref()
-        .ok_or_else(|| message("archive receipt has no SHA256 digest"))?,
+        .ok_or_else(|| message("result.zip upload receipt has no SHA256 digest"))?,
     )?;
   }
   archive.last_error = archive.last_error.map(|detail| api.redact(&detail));

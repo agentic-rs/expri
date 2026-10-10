@@ -508,7 +508,9 @@ fn artifact_catalog_unions_worker_inventory_with_completed_cloud_objects_without
     },
     serde_json::to_vec(&json!({
       "schema_version":1,"recorded_at":"2026-10-07T02:03:04Z", "truncated":false,
-      "files":[{"path":"outputs/model one.pt","size":4},{"path":"outputs/worker-only.pt","size":99}]
+      "files":[{"path":"outputs/model one.pt","size":16 * 1024_u64 * 1024 * 1024,"sync_status":"uploading","sync_error":"Will retry",
+        "sha256":hex_digest(&Sha256::digest(b"unread-checkpoint")),
+        "labels":["best"]},{"path":"outputs/worker-only.pt","size":99,"sync_status":"registered"}]
     }))
     .unwrap(),
   );
@@ -526,6 +528,14 @@ fn artifact_catalog_unions_worker_inventory_with_completed_cloud_objects_without
   assert_eq!(model["cloud"], true);
   assert_eq!(model["worker"], true);
   assert!(model["local"].is_null());
+  assert_eq!(model["sync_status"], "cloud");
+  assert!(model["sync_error"].is_null());
+  assert!(
+    model["downloaded"].is_null(),
+    "hosted catalogs cannot observe laptop receipts"
+  );
+  assert_eq!(model["labels"], json!(["best"]));
+  assert_eq!(model["labels_pending"], false);
   assert!(
     model["download_url"]
       .as_str()
@@ -537,6 +547,7 @@ fn artifact_catalog_unions_worker_inventory_with_completed_cloud_objects_without
     .find(|row| row["path"] == "outputs/worker-only.pt")
     .unwrap();
   assert_eq!(worker["cloud"], false);
+  assert_eq!(worker["sync_status"], "registered");
   assert!(worker["download_url"].is_null());
   assert_eq!(catalog["pull_scope"]["project_id"], "project");
   let requests = fixture.backend.objects.lock().unwrap().requests.clone();
@@ -575,6 +586,45 @@ fn artifact_catalog_unions_worker_inventory_with_completed_cloud_objects_without
       .artifact_download("hosted:other:worker", "artifacts", "outputs/model one.pt")
       .is_err()
   );
+}
+
+#[test]
+fn existing_cloud_file_does_not_confirm_a_different_registered_checkpoint_or_alias() {
+  let fixture = Fixture::new();
+  let scope = Fixture::scope("same-path");
+  let path = "outputs/model.pt";
+  fixture.publish(
+    FileTarget::Run {
+      scope: scope.clone(),
+      path: path.into(),
+    },
+    b"old".to_vec(),
+  );
+  fixture.publish(FileTarget::Run { scope: scope.clone(), path: crate::run_artifacts::INVENTORY_PATH.into() },
+    serde_json::to_vec(&json!({"schema_version":1,"truncated":false,"files":[
+      {"path":path,"size":3,"sha256":hex_digest(&Sha256::digest(b"new")),"sync_status":"uploading","labels":["best"]}
+    ]})).unwrap());
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let older = dashboard
+    .artifacts("hosted:project:worker", "same-path")
+    .unwrap();
+  assert_eq!(older["files"][0]["cloud"], true);
+  assert_eq!(older["files"][0]["sync_status"], "uploading");
+  assert_eq!(older["files"][0]["labels"], json!(["best"]));
+  assert_eq!(older["files"][0]["labels_pending"], true);
+  assert!(older["files"][0]["download_url"].as_str().is_some());
+  fixture.publish(
+    FileTarget::Run {
+      scope,
+      path: path.into(),
+    },
+    b"new".to_vec(),
+  );
+  let matching = dashboard
+    .artifacts("hosted:project:worker", "same-path")
+    .unwrap();
+  assert_eq!(matching["files"][0]["sync_status"], "cloud");
+  assert_eq!(matching["files"][0]["labels_pending"], false);
 }
 
 #[test]
@@ -866,6 +916,9 @@ fn live_metrics_logs_compare_and_chart_use_bounded_saved_streams() {
   let detail = dashboard
     .detail("hosted:project:worker", "run-one")
     .unwrap();
+  assert!(detail.get("archive").is_none());
+  assert_eq!(detail["result_upload"]["status"], "none");
+  assert!(detail["result_upload"]["download_url"].is_null());
   assert_eq!(detail["params"]["lr"], 0.001);
   assert_eq!(detail["metrics"]["loss"]["count"], 2);
   assert_eq!(detail["metrics"]["loss"]["last"]["value"], 1.0);

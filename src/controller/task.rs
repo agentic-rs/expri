@@ -45,7 +45,7 @@ pub struct RemoteTaskOptions {
   pub expected_sync: Option<SyncIdentity>,
 }
 
-/// Check before syncing so an incompatible worker cannot receive a publishing run.
+/// Check before pushing so an incompatible worker cannot receive a publishing run.
 pub fn check_run_publishing_target(
   target: &TargetConfig,
   control_path: &str,
@@ -65,7 +65,24 @@ pub fn check_run_publishing_target(
     quiet,
   )?;
   remote.connect()?;
-  super::protocol::require_run_publishing(&remote, preference, node_bin)
+  require_service(&remote, preference, node_bin, target.service.as_ref())
+}
+
+fn require_service(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+  service: Option<&RunServiceConfig>,
+) -> Result<()> {
+  if let Some(service) = service {
+    if service.publish {
+      super::protocol::require_run_publishing(remote, preference, node_bin)?;
+    }
+    if !service.inputs.is_empty() {
+      super::protocol::require_run_inputs(remote, preference, node_bin)?;
+    }
+  }
+  Ok(())
 }
 
 pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
@@ -92,6 +109,13 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
     return crate::node::run::apply_request_at(&request, &options.repo_root);
   }
   if options.service.is_some() {
+    if options
+      .service
+      .as_ref()
+      .is_some_and(|service| !service.inputs.is_empty())
+    {
+      return Err(ExpriError::Message("private input preparation requires a configured environment; add [environment], or download inputs manually and remove service.inputs".into()));
+    }
     return Err(ExpriError::Message(
       "automatic publishing requires a configured environment; add [environment] or use --no-publish".into(),
     ));
@@ -169,7 +193,7 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     .with_diagnostic_stdout(options.detach);
     remote.connect()?;
     if request.service.is_some() {
-      super::protocol::require_run_publishing(&remote, preference, &node_bin)?;
+      require_service(&remote, preference, &node_bin, request.service.as_ref())?;
       // Never fall back to a protocol that silently ignores publishing intent.
       preference = ProtocolPreference::ExpriNode;
     }
@@ -193,6 +217,14 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     return apply_run_with_preference(&remote, &request_path, preference, &node_bin);
   }
   if options.target.service.is_some() {
+    if options
+      .target
+      .service
+      .as_ref()
+      .is_some_and(|service| !service.inputs.is_empty())
+    {
+      return Err(ExpriError::Message("private input preparation requires a configured target environment; add [environment], or download inputs manually and remove service.inputs".into()));
+    }
     return Err(ExpriError::Message(
       "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
     ));

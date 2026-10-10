@@ -3,13 +3,16 @@ mod browser_assets;
 mod browser_auth;
 mod client;
 mod dashboard_data;
+pub(crate) mod inputs;
 mod notifications;
 pub(crate) mod publishing;
+pub(crate) mod registrations;
 mod server;
 mod storage;
 mod store;
 pub(crate) mod types;
 
+pub(crate) use client::fetch_files;
 pub(crate) use types::validate_component;
 
 use std::net::SocketAddr;
@@ -18,6 +21,20 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::error::{ExpriError, Result};
+
+#[derive(Clone, Debug)]
+pub struct FetchOptions {
+  pub config: PathBuf,
+  pub project_id: String,
+  pub origins: Vec<String>,
+  pub repo: PathBuf,
+  pub results_dir: PathBuf,
+  pub artifacts: Vec<String>,
+  pub labels: Vec<String>,
+  pub watch: bool,
+  pub dry_run: bool,
+  pub quiet: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct ServiceCommand {
@@ -44,8 +61,8 @@ enum ServiceSubcommand {
     #[arg(long)]
     create_bucket: bool,
   },
-  /// Upload saved run files; watch forwards live metrics without blocking training.
-  Push(PushOptions),
+  /// Publish saved run data; watch forwards live metrics without blocking training.
+  Publish(PublishOptions),
   /// Resume the saved automatic publisher on this worker.
   Resume {
     #[arg(long)]
@@ -57,7 +74,7 @@ enum ServiceSubcommand {
     run_dir: PathBuf,
   },
   /// Download selected run files into the existing offline review cache.
-  Pull(PullOptions),
+  Fetch(ServiceFetchOptions),
   /// List runs recorded by the service.
   List {
     #[arg(long)]
@@ -67,25 +84,13 @@ enum ServiceSubcommand {
     #[arg(long)]
     origin: String,
   },
-  /// Ask the server to archive received tracking files without downloading them first.
-  Archive {
-    #[arg(long)]
-    config: PathBuf,
-    #[arg(long)]
-    project_id: String,
-    #[arg(long)]
-    origin: String,
-    #[arg(long)]
-    run_id: String,
-    /// Export an acknowledged prefix of an unfinished run; requires an owner token.
-    #[arg(long)]
-    partial: bool,
-  },
+  /// Ask the server to bundle received tracking files and upload result.zip to S3.
+  Upload(UploadOptions),
   /// Reference a completed object as an output or reusable input without copying bytes.
   Reference(ReferenceOptions),
-  /// Upload one explicit run output or metadata file without creating a run archive.
-  FilePut(FilePutOptions),
-  /// Publish or retrieve an immutable private input file.
+  /// Upload one explicit run output or metadata file.
+  FileUpload(FileUploadOptions),
+  /// Upload or download an immutable private input file.
   Input {
     #[command(subcommand)]
     command: InputCommand,
@@ -94,8 +99,10 @@ enum ServiceSubcommand {
 
 #[derive(Debug, Subcommand)]
 enum InputCommand {
-  Put(InputPutOptions),
-  Get(InputGetOptions),
+  /// Upload an immutable private input to S3.
+  Upload(InputUploadOptions),
+  /// Download a private input using verified local cache reuse.
+  Download(InputDownloadOptions),
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,7 +133,7 @@ struct ProjectOptions {
 }
 
 #[derive(Debug, Args)]
-pub struct PushOptions {
+pub struct PublishOptions {
   #[arg(long)]
   pub config: PathBuf,
   #[arg(long)]
@@ -139,12 +146,12 @@ pub struct PushOptions {
   pub artifacts: Vec<String>,
   #[arg(long)]
   pub watch: bool,
-  #[arg(long, default_value = ".expri/service-sync")]
+  #[arg(long, default_value = ".expri/publish")]
   pub queue_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct PullOptions {
+pub struct ServiceFetchOptions {
   #[arg(long)]
   pub config: PathBuf,
   #[arg(long)]
@@ -165,7 +172,22 @@ pub struct PullOptions {
 }
 
 #[derive(Debug, Args)]
-pub struct FilePutOptions {
+struct UploadOptions {
+  #[arg(long)]
+  config: PathBuf,
+  #[arg(long)]
+  project_id: String,
+  #[arg(long)]
+  origin: String,
+  #[arg(long)]
+  run_id: String,
+  /// Upload an acknowledged prefix of an unfinished run; requires an owner token.
+  #[arg(long)]
+  partial: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FileUploadOptions {
   #[arg(long)]
   pub config: PathBuf,
   /// Destination FileTarget as JSON.
@@ -173,7 +195,7 @@ pub struct FilePutOptions {
   pub target: String,
   #[arg(long)]
   pub file: PathBuf,
-  #[arg(long, default_value = ".expri/service-sync")]
+  #[arg(long, default_value = ".expri/publish")]
   pub queue_dir: PathBuf,
 }
 
@@ -194,7 +216,7 @@ pub struct ReferenceOptions {
 }
 
 #[derive(Debug, Args)]
-pub struct InputPutOptions {
+pub struct InputUploadOptions {
   #[arg(long)]
   pub config: PathBuf,
   #[arg(long)]
@@ -203,12 +225,12 @@ pub struct InputPutOptions {
   pub input_id: String,
   #[arg(long)]
   pub file: PathBuf,
-  #[arg(long, default_value = ".expri/service-sync")]
+  #[arg(long, default_value = ".expri/publish")]
   pub queue_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct InputGetOptions {
+pub struct InputDownloadOptions {
   #[arg(long)]
   pub config: PathBuf,
   #[arg(long)]
@@ -256,35 +278,29 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       let config = toml::from_str(&std::fs::read_to_string(config)?)?;
       return server::serve(config, listen, data_dir, create_bucket);
     }
-    ServiceSubcommand::Push(options) => client::push(options)?,
+    ServiceSubcommand::Publish(options) => client::publish(options)?,
     ServiceSubcommand::Resume { run_dir } => publishing::resume(&run_dir)?,
     ServiceSubcommand::PublishWorker { run_dir } => return publishing::worker(&run_dir),
-    ServiceSubcommand::Pull(options) => client::pull(options)?,
+    ServiceSubcommand::Fetch(options) => client::fetch(options)?,
     ServiceSubcommand::List {
       config,
       project_id,
       origin,
     } => client::list(config, project_id, origin)?,
-    ServiceSubcommand::Archive {
-      config,
-      project_id,
-      origin,
-      run_id,
-      partial,
-    } => client::archive(
-      &config,
+    ServiceSubcommand::Upload(options) => client::upload(
+      &options.config,
       &types::RunScope {
-        project_id,
-        origin,
-        run_id,
+        project_id: options.project_id,
+        origin: options.origin,
+        run_id: options.run_id,
       },
-      partial,
+      options.partial,
     )?,
-    ServiceSubcommand::FilePut(options) => client::file_put(options)?,
+    ServiceSubcommand::FileUpload(options) => client::file_upload(options)?,
     ServiceSubcommand::Reference(options) => client::reference(options)?,
     ServiceSubcommand::Input { command } => match command {
-      InputCommand::Put(options) => client::input_put(options)?,
-      InputCommand::Get(options) => client::input_get(options)?,
+      InputCommand::Upload(options) => client::input_upload(options)?,
+      InputCommand::Download(options) => client::input_download(options)?,
     },
   };
   println!("{}", serde_json::to_string(&report)?);
@@ -300,6 +316,226 @@ mod tests {
   struct Cli {
     #[command(flatten)]
     service: ServiceCommand,
+  }
+
+  #[test]
+  fn service_exposes_only_directional_verbs() {
+    use clap::CommandFactory;
+    let mut cli = Cli::command();
+    let help = cli.render_long_help().to_string();
+    for name in ["publish", "fetch", "upload", "file-upload"] {
+      assert!(
+        help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+    }
+    for name in ["push", "pull", "archive", "file-put"] {
+      assert!(
+        !help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+      assert!(cli.find_subcommand(name).is_none());
+      assert!(Cli::try_parse_from(["expri", name]).is_err());
+    }
+    let input = cli.find_subcommand_mut("input").unwrap();
+    let help = input.render_long_help().to_string();
+    for name in ["upload", "download"] {
+      assert!(
+        help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+    }
+    for name in ["put", "get"] {
+      assert!(
+        !help
+          .lines()
+          .any(|line| line.starts_with(&format!("  {name} ")))
+      );
+      assert!(input.find_subcommand(name).is_none());
+      assert!(Cli::try_parse_from(["expri", "input", name]).is_err());
+    }
+    assert!(!help.contains("archive"));
+  }
+
+  #[test]
+  fn removed_service_verbs_reject_complete_requests() {
+    let cases: [(&str, &str, &[&str]); 4] = [
+      (
+        "publish",
+        "push",
+        &[
+          "--config",
+          "worker.toml",
+          "--run-dir",
+          ".expri/runs/run-1",
+          "--project-id",
+          "vision",
+          "--origin",
+          "gpu-1",
+        ],
+      ),
+      (
+        "fetch",
+        "pull",
+        &[
+          "--config",
+          "owner.toml",
+          "--project-id",
+          "vision",
+          "--origin",
+          "gpu-1",
+          "--run-id",
+          "run-1",
+        ],
+      ),
+      (
+        "upload",
+        "archive",
+        &[
+          "--config",
+          "owner.toml",
+          "--project-id",
+          "vision",
+          "--origin",
+          "gpu-1",
+          "--run-id",
+          "run-1",
+          "--partial",
+        ],
+      ),
+      (
+        "file-upload",
+        "file-put",
+        &[
+          "--config",
+          "worker.toml",
+          "--target",
+          "{}",
+          "--file",
+          "outputs/checkpoint.pt",
+        ],
+      ),
+    ];
+    for (canonical, removed, options) in cases {
+      let request = |operation| {
+        let mut args = vec!["expri", operation];
+        args.extend_from_slice(options);
+        args
+      };
+      assert!(Cli::try_parse_from(request(canonical)).is_ok());
+      let error = Cli::try_parse_from(request(removed)).err().unwrap();
+      assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+    let cases: [(&str, &str, &[&str]); 2] = [
+      (
+        "upload",
+        "put",
+        &[
+          "--config",
+          "owner.toml",
+          "--project-id",
+          "vision",
+          "--input-id",
+          "dataset",
+          "--file",
+          "data/train.jsonl",
+        ],
+      ),
+      (
+        "download",
+        "get",
+        &[
+          "--config",
+          "owner.toml",
+          "--project-id",
+          "vision",
+          "--input-id",
+          "dataset",
+          "--destination",
+          "data/train.jsonl",
+        ],
+      ),
+    ];
+    for (canonical, removed, options) in cases {
+      let request = |operation| {
+        let mut args = vec!["expri", "input", operation];
+        args.extend_from_slice(options);
+        args
+      };
+      assert!(Cli::try_parse_from(request(canonical)).is_ok());
+      let error = Cli::try_parse_from(request(removed)).err().unwrap();
+      assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+  }
+
+  #[test]
+  fn server_upload_accepts_explicit_scope_and_partial_option() {
+    let cli = Cli::try_parse_from([
+      "expri",
+      "upload",
+      "--config",
+      "owner.toml",
+      "--project-id",
+      "vision",
+      "--origin",
+      "gpu-1",
+      "--run-id",
+      "training-1",
+      "--partial",
+    ])
+    .unwrap();
+    let ServiceSubcommand::Upload(options) = cli.service.command else {
+      panic!("unexpected operation");
+    };
+    assert_eq!(options.project_id, "vision");
+    assert_eq!(options.origin, "gpu-1");
+    assert_eq!(options.run_id, "training-1");
+    assert!(options.partial);
+  }
+
+  #[test]
+  fn uploads_use_the_publishing_queue_by_default() {
+    let command = Cli::try_parse_from([
+      "expri",
+      "publish",
+      "--config",
+      "worker.toml",
+      "--run-dir",
+      ".expri/runs/training-1",
+      "--project-id",
+      "vision",
+      "--origin",
+      "gpu-1",
+    ])
+    .unwrap();
+    let ServiceSubcommand::Publish(options) = command.service.command else {
+      panic!("unexpected operation");
+    };
+    assert_eq!(options.queue_dir, PathBuf::from(".expri/publish"));
+    let command = Cli::try_parse_from([
+      "expri",
+      "input",
+      "upload",
+      "--config",
+      "owner.toml",
+      "--project-id",
+      "vision",
+      "--input-id",
+      "dataset",
+      "--file",
+      "data/train.jsonl",
+    ])
+    .unwrap();
+    let ServiceSubcommand::Input {
+      command: InputCommand::Upload(options),
+    } = command.service.command
+    else {
+      panic!("unexpected operation");
+    };
+    assert_eq!(options.queue_dir, PathBuf::from(".expri/publish"));
   }
 
   #[test]

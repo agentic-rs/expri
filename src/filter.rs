@@ -21,7 +21,7 @@ pub const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
 pub const DEFAULT_EXCLUDED_FILES: &[&str] =
   &[".env", "*.pyc", "*.pyo", "*.log", "*.tmp", ".DS_Store"];
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SyncRules {
   exclude_dirs: Vec<String>,
   exclude_files: GlobSet,
@@ -78,6 +78,13 @@ impl SyncRules {
     if !relative_path.is_relative() {
       return false;
     }
+    // Expri state contains private inputs, run snapshots, and transfer receipts.
+    // A custom source exclusion list must not turn it into a source patch.
+    if relative_path.components().any(|component| {
+      matches!(component, Component::Normal(value) if value == ".expri" || value == ".expri-input-downloads")
+    }) {
+      return false;
+    }
     if self
       .remote_managed
       .iter()
@@ -108,9 +115,27 @@ fn validate_remote_managed_path(path: &Path) -> Result<()> {
       .any(|component| !matches!(component, Component::Normal(_)))
   {
     return Err(crate::error::ExpriError::Message(format!(
-      "sync remote_managed path must be relative and stay inside the repo: {}",
+      "push remote_managed path must be relative and stay inside the repo: {}",
       path.display()
     )));
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn private_sync_state_is_reserved_even_with_custom_source_rules() {
+    let rules = SyncRules::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    for path in [
+      ".expri/inputs/train.bin",
+      "nested/.expri/runs/one/code/train.py",
+      "data/.expri-input-downloads/train.bin/input-record.json",
+    ] {
+      assert!(!rules.should_include(Path::new(path)), "{path}");
+    }
+    assert!(rules.should_include(Path::new("src/train.py")));
+  }
 }

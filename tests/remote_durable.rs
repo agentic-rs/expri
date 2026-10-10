@@ -144,7 +144,7 @@ if '--progress' in sys.argv:
   }
 
   fn start(&self, mode: &str) -> Value {
-    let output = self.run(&["run", "--no-sync", "--detach", "train", mode]);
+    let output = self.run(&["run", "--no-push", "--detach", "train", mode]);
     let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["detached"], true);
     assert!(

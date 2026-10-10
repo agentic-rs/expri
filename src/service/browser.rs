@@ -244,11 +244,11 @@ fn route<S: ObjectStorage>(
     let (project_id, input_id) = input_selection(request)?;
     return download_response(method, dashboard.input_download(&project_id, &input_id)?);
   }
-  if path == "/api/archive" {
-    let (source, run_id) = archive_selection(request)?;
+  if path == "/api/result-zip" {
+    let (source, run_id) = result_zip_selection(request)?;
     let download = dashboard
-      .archive_download(&source, &run_id)
-      .map_err(|_| ApiError::new(404, "result archive is unavailable"))?;
+      .result_zip_download(&source, &run_id)
+      .map_err(|_| ApiError::new(404, "result ZIP is unavailable"))?;
     return download_response(method, download);
   }
   let reply = crate::dashboard::server::route_content(dashboard, uri);
@@ -267,10 +267,10 @@ fn route<S: ObjectStorage>(
   Ok(result)
 }
 
-fn archive_selection(request: &HttpRequest<Vec<u8>>) -> ApiResult<(String, String)> {
+fn result_zip_selection(request: &HttpRequest<Vec<u8>>) -> ApiResult<(String, String)> {
   let query = request.uri().query().unwrap_or_default();
   if query.len() > 8192 || !request.body().is_empty() {
-    return Err(ApiError::new(400, "invalid archive selection"));
+    return Err(ApiError::new(400, "invalid result ZIP selection"));
   }
   let mut fields = std::collections::BTreeMap::new();
   for (name, value) in form_urlencoded::parse(query.as_bytes()) {
@@ -280,17 +280,17 @@ fn archive_selection(request: &HttpRequest<Vec<u8>>) -> ApiResult<(String, Strin
         .insert(name.into_owned(), value.into_owned())
         .is_some()
     {
-      return Err(ApiError::new(400, "invalid archive selection"));
+      return Err(ApiError::new(400, "invalid result ZIP selection"));
     }
   }
   let source = fields
     .remove("source")
-    .ok_or_else(|| ApiError::new(400, "missing archive source"))?;
+    .ok_or_else(|| ApiError::new(400, "missing result ZIP source"))?;
   let run_id = fields
     .remove("run_id")
-    .ok_or_else(|| ApiError::new(400, "missing archive run"))?;
+    .ok_or_else(|| ApiError::new(400, "missing result ZIP run"))?;
   crate::dashboard::updates::validate_selection(&source, std::slice::from_ref(&run_id))
-    .map_err(|_| ApiError::new(400, "invalid archive selection"))?;
+    .map_err(|_| ApiError::new(400, "invalid result ZIP selection"))?;
   Ok((source, run_id))
 }
 
@@ -622,38 +622,38 @@ mod tests {
   }
 
   #[test]
-  fn archive_download_requires_session_and_rejects_invalid_or_unready_selection() {
+  fn result_zip_route_requires_session_and_valid_selection() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), MockStorage::default()).unwrap();
     let auth = BrowserAuth::new("https://expri.example.com", b"dashboard-password").unwrap();
-    let mut download = request(
-      "GET",
-      "/api/archive?source=hosted:project:worker&run_id=run-1",
-      b"",
-    );
-    assert_eq!(handle(&store, &auth, &download).status(), 401);
     let mut login = request("POST", "/login", b"");
     login
       .headers_mut()
       .insert("Origin", "https://expri.example.com".parse().unwrap());
     let cookie = auth.login(&login, b"dashboard-password").unwrap();
+    let endpoint = "/api/result-zip";
+    let valid = format!("{endpoint}?source=hosted:project:worker&run_id=run-1");
+    let mut download = request("GET", &valid, b"");
+    assert_eq!(handle(&store, &auth, &download).status(), 401);
     download
       .headers_mut()
       .insert("Cookie", cookie.split(';').next().unwrap().parse().unwrap());
     assert_eq!(handle(&store, &auth, &download).status(), 404);
     for path in [
-      "/api/archive",
-      "/api/archive?source=hosted:project:worker&run_id=run-1&run_id=run-2",
-      "/api/archive?source=hosted:project:worker&run_id=run-1&path=inputs/private",
+      endpoint.to_owned(),
+      format!("{valid}&run_id=run-2"),
+      format!("{valid}&path=inputs/private"),
+      format!(
+        "{endpoint}?source=hosted-project:project&run_id={}",
+        "r".repeat(257)
+      ),
     ] {
       *download.uri_mut() = path.parse().unwrap();
       let reply = handle(&store, &auth, &download);
       assert_eq!(reply.status(), 400);
       assert!(!reply.headers().contains_key("Location"));
     }
-    *download.uri_mut() = "/api/archive?source=hosted:project:worker&run_id=run-1"
-      .parse()
-      .unwrap();
+    *download.uri_mut() = valid.parse().unwrap();
     download
       .headers_mut()
       .insert("Origin", "https://attacker.invalid".parse().unwrap());

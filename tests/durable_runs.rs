@@ -192,7 +192,7 @@ fn publishing_error(fixture: &Fixture, id: &str) -> Value {
   loop {
     let report: Value =
       serde_json::from_slice(&fixture.run(&["runs", "status", id, "--json"]).stdout).unwrap();
-    if report["service_sync"]["status"] == "error" {
+    if report["publishing"]["status"] == "error" {
       return report;
     }
     assert!(
@@ -240,10 +240,10 @@ fn publishing_failure_preserves_foreground_success_and_preparation_failure() {
     assert_eq!(run.join("outputs/model.pt").exists(), !prepare_fails);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("dashboard: https://dashboard.example.net"));
-    assert!(stderr.contains("available after service sync"));
+    assert!(stderr.contains("available after publishing"));
     let shown: Value =
       serde_json::from_slice(&fixture.run(&["runs", "show", id, "--json"]).stdout).unwrap();
-    assert_eq!(shown["service_sync"]["status"], "error");
+    assert_eq!(shown["publishing"]["status"], "error");
     assert_eq!(shown["state"]["exit_code"], report["state"]["exit_code"]);
   }
 }
@@ -272,15 +272,15 @@ fn detached_publishing_error_keeps_receipt_and_training_result_available() {
   let unreadable: Value =
     serde_json::from_slice(&fixture.run(&["runs", "status", id, "--json"]).stdout).unwrap();
   assert_eq!(unreadable["status"], "completed");
-  assert_eq!(unreadable["service_sync"]["status"], "error");
+  assert_eq!(unreadable["publishing"]["status"], "error");
   assert_eq!(
-    unreadable["service_sync"]["last_error"],
+    unreadable["publishing"]["last_error"],
     "Service publishing status could not be read."
   );
   let shown: Value =
     serde_json::from_slice(&fixture.run(&["runs", "show", id, "--json"]).stdout).unwrap();
   assert_eq!(shown["run"]["status"], "completed");
-  assert_eq!(shown["service_sync"], unreadable["service_sync"]);
+  assert_eq!(shown["publishing"], unreadable["publishing"]);
 }
 
 #[test]

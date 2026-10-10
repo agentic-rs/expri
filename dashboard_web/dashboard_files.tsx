@@ -95,7 +95,7 @@ export function formatFileSize(size: number): string {
 export function posixQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
-export function artifactPullCommand(
+export function artifactFetchCommand(
   scope: ArtifactScope | null,
   files: ArtifactFile[],
   selected: string[],
@@ -125,7 +125,7 @@ export function artifactPullCommand(
     ".",
   ];
   for (const path of paths) args.push("--artifact", path);
-  return `expri service pull ${args.map((value, index) => (index % 2 === 0 ? value : posixQuote(value))).join(" ")}`;
+  return `expri service fetch ${args.map((value, index) => (index % 2 === 0 ? value : posixQuote(value))).join(" ")}`;
 }
 function Locations({ file }: { file: ArtifactFile }) {
   const labels = [
@@ -150,6 +150,28 @@ function Locations({ file }: { file: ArtifactFile }) {
       )}
     </span>
   );
+}
+export function artifactSyncStatus(file: ArtifactFile): string {
+  switch (file.sync_status) {
+    case "registered": return artifactSyncError(file) ? "Retrying upload" : "Registered";
+    case "uploading": return "Uploading";
+    case "needs_attention": return "Needs attention";
+    case "cloud": return file.downloaded === true ? "Downloaded locally" :
+      file.cloud === true ? "Available in cloud" : "Awaiting cloud confirmation";
+    default: return file.downloaded === true ? "Downloaded locally" :
+      file.cloud === true ? "Available in cloud" : "Not reported";
+  }
+}
+export function artifactSyncError(file: ArtifactFile): string | null {
+  if (!["registered", "uploading", "needs_attention"].includes(file.sync_status ?? "")) return null;
+  const error = file.sync_error;
+  return typeof error === "string" && new TextEncoder().encode(error).length <= 512 &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(error) ? error || null : null;
+}
+export function artifactLabels(file: ArtifactFile): string[] {
+  return Array.isArray(file.labels) && file.labels.length <= 2
+    ? [...new Set(file.labels.filter((label) => label === "best" || label === "latest"))]
+    : [];
 }
 export function FilesPanel({
   catalog,
@@ -186,7 +208,7 @@ export function FilesPanel({
   const pull_scope = artifactScopeMatchesRun(scope, source_id, run_id) ? scope : null;
   const downloadable = chosen.filter((file) => artifactDownloadUrl(file, source_id, run_id, pull_scope));
   const cloud = chosen.filter((file) => file.cloud === true);
-  const command = artifactPullCommand(pull_scope, files, selected, config_path);
+  const command = artifactFetchCommand(pull_scope, files, selected, config_path);
   useEffect(() => {
     setCopyStatus("");
   }, [command]);
@@ -262,6 +284,7 @@ export function FilesPanel({
                   <th scope="col">File</th>
                   <th scope="col">Size</th>
                   <th scope="col">Available in</th>
+                  <th scope="col">Transfer status</th>
                   <th scope="col">
                     <span className="sr-only">Download</span>
                   </th>
@@ -285,6 +308,15 @@ export function FilesPanel({
                       </td>
                       <th scope="row">
                         <code>{file.path}</code>
+                        {artifactLabels(file).length > 0 && (
+                          <span className="file-labels">
+                            {artifactLabels(file).map((label) => (
+                              <span key={label} className="file-location">
+                                {label}{file.labels_pending === true ? " (pending)" : ""}
+                              </span>
+                            ))}
+                          </span>
+                        )}
                       </th>
                       <td
                         className="number"
@@ -298,6 +330,17 @@ export function FilesPanel({
                       </td>
                       <td>
                         <Locations file={file} />
+                      </td>
+                      <td>
+                        <span className="file-sync-status">{artifactSyncStatus(file)}</span>
+                        {artifactSyncError(file) && (
+                          <p className="muted file-sync-error">{artifactSyncError(file)}</p>
+                        )}
+                        {file.cloud === true && ["registered", "uploading", "needs_attention"].includes(file.sync_status ?? "") && (
+                          <p className="muted file-sync-error">
+                            Cloud copy is not yet confirmed for this registration.
+                          </p>
+                        )}
                       </td>
                       <td>
                         {url ? (
@@ -314,7 +357,7 @@ export function FilesPanel({
                         ) : (
                           <span className="muted">
                             {selectable && file.cloud === true
-                              ? "Pull with CLI"
+                              ? "Fetch with CLI"
                               : file.worker === true && file.cloud !== true && file.local !== true
                                 ? "Upload to download"
                                 : "Unavailable"}
@@ -330,7 +373,7 @@ export function FilesPanel({
           <p id="files-empty" className="muted" hidden={visible.length > 0}>
             {files.length
               ? "No files match this search."
-              : "No output files are available. Have the experiment save checkpoints in EXPRI_OUTPUT_DIR; upload or pull them to review their availability here."}
+              : "No output files are available. Have the experiment save checkpoints in EXPRI_OUTPUT_DIR; upload or download them to review their availability here."}
           </p>
           {catalog.truncated && (
             <p className="notice">
@@ -339,7 +382,10 @@ export function FilesPanel({
             </p>
           )}
           <p className="muted file-location-note">
-            Cloud means a finalized stored file. Worker availability is reported, not a live check.
+            Register a completed checkpoint to publish it while training. Registered and uploading
+            are worker reports; available in cloud means the server recorded the completed upload.
+            Downloaded locally comes from a verified download receipt. Worker availability is reported,
+            not a live check.
             {catalog.inventory_recorded_at
               ? ` Inventory reported ${dateText(catalog.inventory_recorded_at)}.`
               : ""}
@@ -439,11 +485,11 @@ export function FilesPanel({
               {command ? (
                 <>
                   <textarea
-                    id="artifact-pull-command"
+                    id="artifact-fetch-command"
                     ref={command_node}
                     className="file-command"
                     readOnly
-                    aria-label="Resumable service pull command"
+                    aria-label="Resumable service fetch command"
                     value={command}
                     rows={5}
                     spellCheck={false}

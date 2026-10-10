@@ -10,8 +10,7 @@ use zip::ZipArchive;
 
 use crate::archive::sha256_file;
 use crate::error::{ExpriError, Result, command_exit_code};
-use crate::git;
-use crate::protocol::{PullArtifacts, SyncApplyRequest};
+use crate::protocol::SyncApplyRequest;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SyncState {
@@ -52,7 +51,7 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
   let _checkout_lock = crate::lock::worktree_lock(state_dir)?;
 
   if !request.force && sync_is_current(state_dir, request)? {
-    println!("node sync is current");
+    println!("node push is current");
     return Ok(());
   }
 
@@ -127,52 +126,6 @@ pub fn apply_request(request: &SyncApplyRequest) -> Result<()> {
     source,
   })?;
   write_state(state_dir, request, checkout_manifest_sha256)?;
-  Ok(())
-}
-
-pub fn prepare_pull() -> Result<()> {
-  let state_dir = Path::new(".expri");
-  let out_dir = state_dir.join("out");
-  fs::create_dir_all(&out_dir).map_err(|source| ExpriError::IoContext {
-    action: "create directory",
-    path: out_dir.display().to_string(),
-    source,
-  })?;
-  let head = git_capture(["rev-parse", "HEAD"])?;
-  let bundle_path = out_dir.join("pull-source.bundle");
-  run_git(vec![
-    "bundle".to_string(),
-    "create".to_string(),
-    bundle_path.to_string_lossy().to_string(),
-    "HEAD".to_string(),
-  ])?;
-  let dirty = git::dirty_paths(Path::new("."), &crate::filter::SyncRules::defaults()?)?;
-  let patch = crate::archive::build_patch_archive(Path::new("."), &dirty)?;
-  let patch_path = out_dir.join("pull-patch.zip");
-  fs::copy(&patch.path, &patch_path).map_err(|source| ExpriError::IoContext {
-    action: "copy",
-    path: patch_path.display().to_string(),
-    source,
-  })?;
-  let (source_bundle_sha256, _) = sha256_file(&bundle_path)?;
-  let (patch_sha256, _) = sha256_file(&patch_path)?;
-  let artifacts = PullArtifacts {
-    head,
-    source_bundle: ".expri/out/pull-source.bundle".to_string(),
-    source_bundle_sha256,
-    patch: ".expri/out/pull-patch.zip".to_string(),
-    patch_sha256,
-    state_dir: ".expri".to_string(),
-  };
-  fs::write(
-    out_dir.join("pull-artifacts.json"),
-    serde_json::to_string_pretty(&artifacts)?,
-  )
-  .map_err(|source| ExpriError::IoContext {
-    action: "write",
-    path: out_dir.join("pull-artifacts.json").display().to_string(),
-    source,
-  })?;
   Ok(())
 }
 
@@ -370,7 +323,7 @@ fn previous_installed_files(state_dir: &Path, git_dir: &Path) -> Result<BTreeSet
     .into_iter()
     .chain(read_manifest(manifest_path(state_dir))?)
     .collect::<BTreeSet<_>>();
-  // Legacy SSH syncs can leave a checkout manifest from an earlier node sync.
+  // Source pushes can leave a checkout manifest from an earlier node push.
   // The state digest distinguishes that stale manifest from the installed set.
   let state = read_sync_state(state_dir)?;
   if checkout_manifest.is_file()
@@ -557,7 +510,7 @@ fn invalidate_state(state_dir: &Path) -> Result<()> {
     Ok(()) => Ok(()),
     Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
     Err(source) => Err(ExpriError::IoContext {
-      action: "invalidate sync state",
+      action: "invalidate push state",
       path: path.display().to_string(),
       source,
     }),
@@ -567,7 +520,7 @@ fn invalidate_state(state_dir: &Path) -> Result<()> {
 fn atomic_write(path: &Path, raw: &[u8]) -> Result<()> {
   let parent = path.parent().ok_or_else(|| {
     ExpriError::Message(format!(
-      "sync metadata path has no parent: {}",
+      "push metadata path has no parent: {}",
       path.display()
     ))
   })?;
@@ -575,14 +528,14 @@ fn atomic_write(path: &Path, raw: &[u8]) -> Result<()> {
   temporary
     .write_all(raw)
     .map_err(|source| ExpriError::IoContext {
-      action: "write sync metadata",
+      action: "write push metadata",
       path: path.display().to_string(),
       source,
     })?;
   temporary
     .persist(path)
     .map_err(|error| ExpriError::IoContext {
-      action: "publish sync metadata",
+      action: "publish push metadata",
       path: path.display().to_string(),
       source: error.error,
     })?;
@@ -620,17 +573,6 @@ fn run_git(args: Vec<String>) -> Result<()> {
     });
   }
   Ok(())
-}
-
-fn git_capture<const N: usize>(args: [&str; N]) -> Result<String> {
-  let output = Command::new("git").args(args).output()?;
-  if !output.status.success() {
-    return Err(ExpriError::CommandFailed {
-      program: "git".to_string(),
-      code: command_exit_code(&output.status),
-    });
-  }
-  Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn run_git_success(args: Vec<String>) -> Result<bool> {
@@ -1058,7 +1000,7 @@ mod tests {
         crate::environment::snapshot::create_expected(root.path(), &[], Some(&expected))
           .expect_err("old receipt must not launch partial b")
           .to_string()
-          .contains("target checkout changed after sync; retry run")
+          .contains("target checkout changed after push; retry run")
       );
 
       let stage_a = state_dir.join("tmp/stage-a");

@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::super::InputGetOptions;
+use super::super::InputDownloadOptions;
 use super::*;
+
+mod checkpoints;
 
 struct HttpRequest {
   path: String,
@@ -127,6 +129,95 @@ fn root() -> (tempfile::TempDir, PathBuf) {
   let temporary = tempfile::tempdir().unwrap();
   let path = std::fs::canonicalize(temporary.path()).unwrap();
   (temporary, path)
+}
+
+#[test]
+fn upload_projects_completed_status_from_the_server_receipt() {
+  let (_temporary, root) = root();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "run-upload".into(),
+  };
+  let expected = scope.clone();
+  let (url, task) = mock(3, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => Response::Capabilities {
+        features: vec!["tracking-v1".into()],
+      },
+      Request::ListFiles { scope } => {
+        assert_eq!(scope, expected);
+        Response::Files {
+          files: vec![FileRecord {
+            target: run_target(&scope, "run-state.json"),
+            size: 10,
+            sha256: None,
+            storage: FileStorage::Tracking {
+              revision: 7,
+              sealed: true,
+            },
+          }],
+        }
+      }
+      Request::SealRun {
+        scope,
+        documents,
+        streams,
+        incomplete,
+      } => {
+        assert_eq!(scope, expected);
+        assert_eq!(
+          documents,
+          std::collections::BTreeMap::from([("run-state.json".into(), 7)])
+        );
+        assert!(streams.is_empty());
+        assert!(!incomplete);
+        Response::Archive {
+          archive: ArchiveRecord {
+            status: "archived".into(),
+            incomplete: false,
+            file: Some(FileRecord {
+              target: run_target(&scope, "result.zip"),
+              size: 22,
+              sha256: Some("a".repeat(64)),
+              storage: FileStorage::Object,
+            }),
+            last_error: None,
+          },
+        }
+      }
+      other => panic!("unexpected upload request: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let config = config(&root, &url);
+  let report = upload(&config, &scope, false).unwrap();
+  task.join().unwrap();
+  assert_eq!(report["status"], "uploaded");
+  assert_eq!(report["file"]["size"], 22);
+  assert_eq!(report["incomplete"], false);
+  assert!(!root.join(".expri").exists());
+}
+
+#[test]
+fn public_upload_report_projects_only_canonical_fields_without_rewriting_queue_state() {
+  for status in ["pending", "uploading", "archived", "failed"] {
+    let saved = json!({"archive":{"status":status, "incomplete":false,
+      "file":null,"last_error":null},"stream_offsets":{"outputs/metrics.jsonl":12}});
+    let mut report = saved.clone();
+    project_result_upload(&mut report);
+    assert!(report.get("archive").is_none());
+    assert_eq!(
+      report["result_upload"]["status"],
+      if status == "archived" {
+        "uploaded"
+      } else {
+        status
+      }
+    );
+    assert_eq!(saved["archive"]["status"], status);
+    assert_eq!(report["stream_offsets"], saved["stream_offsets"]);
+  }
 }
 
 #[test]
@@ -379,7 +470,7 @@ fn assert_core_sync_without_inventory(linked_outputs: bool) {
   )
   .unwrap();
   mark_synced_metadata(&mut queue, &scope, &run_dir, &["snapshot.json"]);
-  let result = push_cycle(
+  let result = publish_cycle(
     &api,
     &mut queue,
     &scope,
@@ -468,7 +559,7 @@ fn prepared_inventory_transport_failure_remains_retryable_after_core_publication
     &["snapshot.json", "run-state.json"],
   );
   assert!(
-    push_cycle(
+    publish_cycle(
       &api,
       &mut queue,
       &scope,
@@ -514,7 +605,7 @@ fn automatic_status_stays_small_when_manual_queue_has_long_artifact_names() {
     br#"{"run_id":"run-progress","status":"running"}"#,
   )
   .unwrap();
-  let options = PushOptions {
+  let options = PublishOptions {
     config: config(&root, "http://example.invalid"),
     run_dir,
     project_id: "project".into(),
@@ -583,7 +674,7 @@ fn rejected_authentication_keeps_pending_queue_and_redacts_the_response_before_b
     br#"{"run_id":"run-auth","status":"running"}"#,
   )
   .unwrap();
-  let options = PushOptions {
+  let options = PublishOptions {
     config: config(&root, &url),
     run_dir,
     project_id: "project".into(),
@@ -652,7 +743,7 @@ fn deleted_project_stops_watch_and_preserves_pending_uploads_and_local_data() {
   std::fs::write(run_dir.join("run-state.json"), run_state).unwrap();
   std::fs::write(run_dir.join("outputs/metrics.jsonl"), metrics).unwrap();
   let queue_dir = root.join("queue");
-  let options = PushOptions {
+  let options = PublishOptions {
     config: config(&root, &url),
     run_dir: run_dir.clone(),
     project_id: "project".into(),
@@ -662,7 +753,7 @@ fn deleted_project_stops_watch_and_preserves_pending_uploads_and_local_data() {
     queue_dir: queue_dir.clone(),
   };
   let (send, receive) = std::sync::mpsc::channel();
-  let watcher = thread::spawn(move || send.send(push(options)).unwrap());
+  let watcher = thread::spawn(move || send.send(publish(options)).unwrap());
   let failure = receive
     .recv_timeout(Duration::from_secs(4))
     .expect("a permanent rejection must exit before the five-second retry")
@@ -971,7 +1062,7 @@ fn private_input_digest_failure_preserves_old_file_and_signed_requests_have_no_b
   let destination = root.join("dataset.bin");
   std::fs::write(&destination, b"existing verified input").unwrap();
   let before = std::fs::metadata(&destination).unwrap().modified().unwrap();
-  let error = input_get(InputGetOptions {
+  let error = input_download(InputDownloadOptions {
     config: config(&root, &url),
     project_id: "project".into(),
     input_id: "dataset-v1".into(),
@@ -1042,7 +1133,7 @@ fn truncated_object_body_does_not_leak_signed_url_or_replace_previous_input() {
   });
   let destination = root.join("dataset.bin");
   std::fs::write(&destination, b"existing verified input").unwrap();
-  let error = input_get(InputGetOptions {
+  let error = input_download(InputDownloadOptions {
     config: config(&root, &url),
     project_id: "project".into(),
     input_id: "dataset-v1".into(),
@@ -1187,7 +1278,7 @@ fn watching_a_future_artifact_still_forwards_live_complete_metric_rows() {
   }
   let selected = BTreeSet::from(["outputs/checkpoint.pt".into()]);
   assert!(
-    !push_cycle(
+    !publish_cycle(
       &api,
       &mut queue,
       &scope,
@@ -1378,7 +1469,7 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
     br#"{"run_id":"run-1","status":"lost"}"#,
   )
   .unwrap();
-  let options = PushOptions {
+  let options = PublishOptions {
     config: config(&root, &url),
     run_dir,
     project_id: "project".into(),
@@ -1443,7 +1534,7 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
 }
 
 #[test]
-fn explicit_file_put_reuses_completed_objects_even_without_a_local_queue() {
+fn explicit_file_upload_reuses_completed_objects_even_without_a_local_queue() {
   let (_temporary, root) = root();
   let path = root.join("archive.tar.gz");
   std::fs::write(&path, b"existing").unwrap();
@@ -1477,7 +1568,7 @@ fn explicit_file_put_reuses_completed_objects_even_without_a_local_queue() {
     )
   });
   let queue = root.join("absent-queue");
-  let report = file_put(super::super::FilePutOptions {
+  let report = file_upload(super::super::FileUploadOptions {
     config: config(&root, &url),
     target: serde_json::to_string(&target).unwrap(),
     file: path,
@@ -1491,7 +1582,7 @@ fn explicit_file_put_reuses_completed_objects_even_without_a_local_queue() {
 }
 
 #[test]
-fn explicit_file_put_rejects_changes_while_checking_for_reuse() {
+fn explicit_file_upload_rejects_changes_while_checking_for_reuse() {
   for replace in [false, true] {
     let (_temporary, root) = root();
     let path = root.join("archive.tar.gz");
@@ -1538,7 +1629,7 @@ fn explicit_file_put_rejects_changes_while_checking_for_reuse() {
       )
     });
     let queue = root.join("absent-queue");
-    let error = file_put(super::super::FilePutOptions {
+    let error = file_upload(super::super::FileUploadOptions {
       config: config(&root, &url),
       target: serde_json::to_string(&target).unwrap(),
       file: path,

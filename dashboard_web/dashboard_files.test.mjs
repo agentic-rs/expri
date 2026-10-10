@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { artifactCanSelect, artifactDownloadUrl, artifactPullCommand, artifactScopeMatchesRun, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
+import { artifactCanSelect, artifactDownloadUrl, artifactLabels, artifactFetchCommand, artifactScopeMatchesRun, artifactSyncError, artifactSyncStatus, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
 
 const scope = { project_id: "vision", origin: "gpu-1", run_id: "run-123" };
 const source_id = "hosted:vision:gpu-1";
@@ -33,26 +33,26 @@ test("cached cloud files can be selected for the CLI without a native download U
   assert.equal(artifactCanSelect({ ...item, download_url: "https://evil.test/file" }, scope, source_id, scope.run_id), false);
 });
 
-test("resumable pull commands preserve literal shell arguments and include only selected cloud files", () => {
+test("resumable fetch commands preserve literal shell arguments and include only selected cloud files", () => {
   const path = "outputs/model 'two' $(printf unsafe) `echo unsafe` $HOME.pt";
   const files = [file(path), file("outputs/local.pt", { cloud: false, local: true }), file("outputs/unselected.pt")];
   const config = "/private/client's $(printf unsafe) $HOME.toml";
-  const command = artifactPullCommand(scope, files, [path, "outputs/local.pt", path], config);
+  const command = artifactFetchCommand(scope, files, [path, "outputs/local.pt", path], config);
   assert.ok(command);
   const output = execFileSync("/bin/sh", ["-c", "expri() { printf '%s\\0' \"$@\"; }\n" + command]);
   const args = output.toString().split("\0").slice(0, -1);
-  assert.deepEqual(args, ["service", "pull", "--config", config, "--project-id", "vision", "--origin", "gpu-1", "--run-id", "run-123", "--repo", ".", "--artifact", path]);
+  assert.deepEqual(args, ["service", "fetch", "--config", config, "--project-id", "vision", "--origin", "gpu-1", "--run-id", "run-123", "--repo", ".", "--artifact", path]);
 });
 
-test("pull commands require a client path and valid scope and bound artifact selection", () => {
+test("fetch commands require a client path and valid scope and bound artifact selection", () => {
   const files = Array.from({ length: 65 }, (_, index) => file(`outputs/${index}.pt`));
-  assert.equal(artifactPullCommand(scope, files, [files[0].path], ""), null);
-  assert.equal(artifactPullCommand(scope, files, [files[0].path], "client\0.toml"), null);
-  assert.equal(artifactPullCommand(null, files, [files[0].path], "owner.toml"), null);
-  assert.equal(artifactPullCommand({ ...scope, origin: "../worker" }, files, [files[0].path], "owner.toml"), null);
-  assert.equal(artifactPullCommand(scope, files, files.map(file => file.path), "owner.toml"), null);
-  assert.equal(artifactPullCommand(scope, [file("outputs/../secret")], ["outputs/../secret"], "owner.toml"), null);
-  assert.equal(artifactPullCommand(scope, [file("outputs/local.pt", { cloud: false })], ["outputs/local.pt"], "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, files, [files[0].path], ""), null);
+  assert.equal(artifactFetchCommand(scope, files, [files[0].path], "client\0.toml"), null);
+  assert.equal(artifactFetchCommand(null, files, [files[0].path], "owner.toml"), null);
+  assert.equal(artifactFetchCommand({ ...scope, origin: "../worker" }, files, [files[0].path], "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, files, files.map(file => file.path), "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, [file("outputs/../secret")], ["outputs/../secret"], "owner.toml"), null);
+  assert.equal(artifactFetchCommand(scope, [file("outputs/local.pt", { cloud: false })], ["outputs/local.pt"], "owner.toml"), null);
 });
 
 test("file sizes distinguish unknown values and binary units", () => {
@@ -61,6 +61,27 @@ test("file sizes distinguish unknown values and binary units", () => {
   assert.equal(formatFileSize(2 ** 30), "1 GiB");
   assert.equal(formatFileSize(-1), "Unknown");
   assert.equal(formatFileSize(Infinity), "Unknown");
+});
+
+test("sync states distinguish worker reports from confirmed cloud and local receipts", () => {
+  const item = file("outputs/model.pt", { cloud: false, sync_status: "registered" });
+  assert.equal(artifactSyncStatus(item), "Registered");
+  assert.equal(artifactSyncStatus({ ...item, sync_status: "uploading" }), "Uploading");
+  assert.equal(artifactSyncStatus({ ...item, sync_status: "needs_attention" }), "Needs attention");
+  assert.equal(artifactSyncStatus({ ...item, sync_error: "Upload will retry" }), "Retrying upload");
+  assert.equal(artifactSyncStatus({ ...item, sync_status: "cloud" }), "Awaiting cloud confirmation");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, sync_status: "uploading" }), "Uploading");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, sync_status: "cloud" }), "Available in cloud");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, sync_status: "cloud", downloaded: true }), "Downloaded locally");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, downloaded: true }), "Registered");
+  assert.equal(artifactSyncError({ ...item, cloud: true, sync_status: "cloud", sync_error: "stale error" }), null);
+  for (const sync_error of ["x".repeat(513), "line\nbreak", "\0private", 5])
+    assert.equal(artifactSyncError({ ...item, sync_error }), null);
+  assert.equal(artifactSyncError({ ...item, sync_status: "future", sync_error: "future error" }), null);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["best", "latest"] }), ["best", "latest"]);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["best", "best"] }), ["best"]);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["<script>", "latest"] }), ["latest"]);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["best", "latest", "unknown"] }), []);
 });
 
 test("project artifacts bind the recorded machine and actual run ID before browser or CLI selection", () => {

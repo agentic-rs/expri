@@ -9,6 +9,7 @@ use crate::filter::{DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES, SyncRules};
 use crate::protocol::SetupStep;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
   pub project: Option<ProjectConfig>,
   pub ssh: Option<SshConfig>,
@@ -16,13 +17,15 @@ pub struct Config {
   pub target: BTreeMap<String, TargetConfig>,
   #[serde(default)]
   pub tasks: BTreeMap<String, TaskDefinition>,
-  pub sync: Option<SyncConfig>,
+  pub push: Option<PushConfig>,
   pub setup: Option<SetupConfig>,
   pub download: Option<DownloadConfig>,
   #[serde(default)]
   pub environment: Option<EnvironmentConfig>,
   #[serde(default)]
   pub service: Option<RunServiceConfig>,
+  #[serde(default)]
+  pub fetch: Option<FetchConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +64,74 @@ pub struct RunServiceConfig {
   pub origin: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub dashboard_url: Option<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub inputs: Vec<RunInputConfig>,
+  #[serde(default = "publish_enabled", skip_serializing_if = "is_enabled")]
+  pub publish: bool,
+}
+
+fn publish_enabled() -> bool {
+  true
+}
+fn is_enabled(value: &bool) -> bool {
+  *value
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunInputConfig {
+  pub input_id: String,
+  /// Relative to each run's private input directory.
+  pub destination: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchConfig {
+  pub client_config: PathBuf,
+  pub project_id: String,
+  pub origins: Vec<String>,
+  #[serde(default)]
+  pub artifacts: Vec<String>,
+  #[serde(default)]
+  pub labels: Vec<String>,
+}
+
+impl FetchConfig {
+  pub fn validate(&self) -> Result<()> {
+    crate::service::validate_component(&self.project_id)?;
+    if self.client_config.as_os_str().is_empty()
+      || self.origins.is_empty()
+      || self.origins.len() > 64
+    {
+      return Err(ExpriError::Message(
+        "fetch requires a client_config and between 1 and 64 origins".into(),
+      ));
+    }
+    for origin in &self.origins {
+      crate::service::validate_component(origin)?;
+    }
+    if self.artifacts.len() + self.labels.len() > 64 || self.labels.len() > 2 {
+      return Err(ExpriError::Message(
+        "fetch selects at most 64 artifact paths and two labels".into(),
+      ));
+    }
+    for path in &self.artifacts {
+      if path != "result.zip" && crate::run_artifacts::validate_path(path).is_err() {
+        return Err(ExpriError::Message(
+          "fetch.artifacts must contain safe outputs/ paths or result.zip".into(),
+        ));
+      }
+    }
+    for label in &self.labels {
+      if !matches!(label.as_str(), "best" | "latest") {
+        return Err(ExpriError::Message(
+          "fetch.labels accepts best and latest".into(),
+        ));
+      }
+    }
+    Ok(())
+  }
 }
 
 impl RunServiceConfig {
@@ -79,6 +150,34 @@ impl RunServiceConfig {
     for (name, value) in [("project_id", &self.project_id), ("origin", &self.origin)] {
       crate::service::validate_component(value)
         .map_err(|_| ExpriError::Message(format!("invalid service.{name}")))?;
+    }
+    if self.inputs.len() > 64 {
+      return Err(ExpriError::Message(
+        "service.inputs supports at most 64 private input files".into(),
+      ));
+    }
+    let mut destinations = std::collections::BTreeSet::new();
+    for input in &self.inputs {
+      crate::service::validate_component(&input.input_id)?;
+      let path = Path::new(&input.destination);
+      if input.destination.is_empty() || input.destination.len() > 1024
+        || input.destination.contains('\\') || input.destination.chars().any(char::is_control)
+        || input.destination.split('/').any(|part| part.is_empty() || part.starts_with('.'))
+        || path.components().any(|part| !matches!(part, Component::Normal(name) if !name.to_string_lossy().starts_with('.')))
+        || !destinations.insert(&input.destination)
+      {
+        return Err(ExpriError::Message("service.inputs destinations must be distinct relative paths without hidden components or '..'".into()));
+      }
+    }
+    for destination in &destinations {
+      if destinations
+        .iter()
+        .any(|other| other != destination && Path::new(destination).starts_with(other))
+      {
+        return Err(ExpriError::Message(
+          "service.inputs destinations must not overlap".into(),
+        ));
+      }
     }
     if let Some(value) = &self.dashboard_url {
       let url = reqwest::Url::parse(value)
@@ -224,7 +323,7 @@ pub struct TaskConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SyncConfig {
+pub struct PushConfig {
   pub exclude_dirs: Option<Vec<String>>,
   pub exclude_files: Option<Vec<String>>,
   pub include_ignored: Option<Vec<String>>,
@@ -264,6 +363,9 @@ impl Config {
     }
     config.local_environment()?;
     config.local_service()?;
+    if let Some(fetch) = &config.fetch {
+      fetch.validate()?;
+    }
     for name in config.target.keys() {
       config.target(name)?;
     }
@@ -348,24 +450,23 @@ impl Config {
       .ok_or_else(|| ExpriError::Message(format!("unknown task: {name}")))
   }
 
-  pub fn sync_rules(&self) -> Result<SyncRules> {
-    let sync = self.sync.as_ref();
-    match sync {
-      Some(sync) => SyncRules::new(
-        sync.exclude_dirs.clone().unwrap_or_else(|| {
+  pub fn push_rules(&self) -> Result<SyncRules> {
+    match self.push.as_ref() {
+      Some(push) => SyncRules::new(
+        push.exclude_dirs.clone().unwrap_or_else(|| {
           DEFAULT_EXCLUDED_DIRS
             .iter()
             .map(ToString::to_string)
             .collect()
         }),
-        sync.exclude_files.clone().unwrap_or_else(|| {
+        push.exclude_files.clone().unwrap_or_else(|| {
           DEFAULT_EXCLUDED_FILES
             .iter()
             .map(ToString::to_string)
             .collect()
         }),
-        sync.include_ignored.clone().unwrap_or_default(),
-        sync.remote_managed.clone().unwrap_or_default(),
+        push.include_ignored.clone().unwrap_or_default(),
+        push.remote_managed.clone().unwrap_or_default(),
       ),
       None => SyncRules::defaults(),
     }
@@ -444,6 +545,112 @@ mod tests {
   use super::*;
 
   #[test]
+  fn private_input_destinations_are_safe_distinct_and_compatible_with_old_requests() {
+    let mut service: RunServiceConfig = toml::from_str(
+      "client_config='/etc/expri/worker.toml'\nproject_id='vision'\norigin='gpu-1'\n",
+    )
+    .unwrap();
+    assert!(service.publish);
+    assert!(service.inputs.is_empty());
+    let old = serde_json::to_value(&service).unwrap();
+    assert!(old.get("inputs").is_none());
+    assert!(old.get("publish").is_none());
+    for path in [
+      "../input",
+      "/private/input",
+      "a//b",
+      "a/./b",
+      "a/../b",
+      ".private",
+      "a\\b",
+      "a\tb",
+      "",
+    ] {
+      service.inputs = vec![RunInputConfig {
+        input_id: "dataset-v1".into(),
+        destination: path.into(),
+      }];
+      assert!(service.validate().is_err(), "{path:?}");
+    }
+    service.inputs = vec![RunInputConfig {
+      input_id: "dataset-v1".into(),
+      destination: "train/data.bin".into(),
+    }];
+    assert!(service.validate().is_ok());
+    service.inputs.push(RunInputConfig {
+      input_id: "other".into(),
+      destination: "train".into(),
+    });
+    assert!(service.validate().is_err());
+  }
+
+  #[test]
+  fn fetch_requires_explicit_origins_and_checkpoint_selection() {
+    let good: FetchConfig = toml::from_str("client_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1','gpu-2']\nlabels=['best']\nartifacts=['outputs/checkpoint-1000.pt']\n").unwrap();
+    assert!(good.validate().is_ok());
+    let mut bad = good.clone();
+    bad.origins.clear();
+    assert!(bad.validate().is_err());
+    bad = good.clone();
+    bad.labels = vec!["newest".into()];
+    assert!(bad.validate().is_err());
+    bad = good;
+    bad.artifacts = vec!["outputs/../private".into()];
+    assert!(bad.validate().is_err());
+  }
+
+  #[test]
+  fn load_keeps_push_and_fetch_sections_independent() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("expri.toml");
+    fs::write(
+      &path,
+      "[push]\nremote_managed=['datasets']\nexclude_dirs=['generated']\n[fetch]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\nlabels=['best']\n",
+    )
+    .unwrap();
+    let config = Config::load(&path).unwrap();
+    let push = config.push.as_ref().unwrap();
+    assert_eq!(push.remote_managed.as_ref().unwrap(), &["datasets"]);
+    assert_eq!(push.exclude_dirs.as_ref().unwrap(), &["generated"]);
+    assert_eq!(config.push_rules().unwrap().remote_managed(), ["datasets"]);
+    let fetch = config.fetch.unwrap();
+    assert_eq!(fetch.origins, ["gpu-1"]);
+    assert_eq!(fetch.labels, ["best"]);
+    assert!(config.target.is_empty());
+  }
+
+  #[test]
+  fn load_rejects_removed_sections_in_project_and_target_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("expri.toml");
+    let target_path = directory.path().join("expri.target.toml");
+    for section in ["sync", "file_sync"] {
+      let removed = format!("[{section}]\nprivate_value='never-echo-this-value'\n");
+      for canonical in [
+        "",
+        "[push]\n[fetch]\nclient_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1']\n",
+      ] {
+        fs::write(&project_path, format!("{canonical}{removed}")).unwrap();
+        let error = Config::load(&project_path).unwrap_err().to_string();
+        assert!(
+          error.contains(&format!("unknown field `{section}`")),
+          "{error}"
+        );
+        assert!(!error.contains("never-echo-this-value"), "{error}");
+      }
+      fs::write(&project_path, "").unwrap();
+      fs::write(&target_path, &removed).unwrap();
+      let error = Config::load(&project_path).unwrap_err().to_string();
+      assert!(
+        error.contains(&format!("unknown field `{section}`")),
+        "{error}"
+      );
+      assert!(!error.contains("never-echo-this-value"), "{error}");
+      fs::remove_file(&target_path).unwrap();
+    }
+  }
+
+  #[test]
   fn publishing_config_inherits_or_overrides_whole_worker_scope() {
     let config: Config = toml::from_str(
       r#"
@@ -479,6 +686,8 @@ origin = "gpu-2"
       project_id: "vision".into(),
       origin: "gpu-1".into(),
       dashboard_url: None,
+      inputs: Vec::new(),
+      publish: true,
     };
     assert!(base.validate().is_ok());
     for path in ["worker.toml", "/etc/../worker.toml"] {

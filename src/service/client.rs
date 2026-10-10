@@ -1,3 +1,4 @@
+mod checkpoints;
 mod download;
 pub(super) mod fs;
 mod http;
@@ -7,6 +8,7 @@ mod queue;
 pub(super) mod tests;
 mod tracking;
 mod upload;
+mod watch;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -16,14 +18,15 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::types::*;
-use super::{InputPutOptions, PushOptions};
+use super::{InputUploadOptions, PublishOptions};
 use crate::error::Result;
 use fs::message;
 use http::Api;
 use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
-pub use download::{input_get, pull};
+pub use download::{fetch, input_download, input_download_prepared};
+pub use watch::fetch as fetch_files;
 
 pub(super) fn validate_config(path: &Path) -> Result<()> {
   Api::new(path).map(|_| ())
@@ -53,6 +56,8 @@ fn terminal(state: &Value) -> bool {
 
 pub(super) struct Publisher {
   api: Api,
+  config: PathBuf,
+  checkpoints: checkpoints::CheckpointLane,
   run_dir: PathBuf,
   scope: RunScope,
   artifacts: BTreeSet<String>,
@@ -73,7 +78,7 @@ impl Publisher {
     }
   }
 
-  pub(super) fn new(options: &PushOptions) -> Result<Self> {
+  pub(super) fn new(options: &PublishOptions) -> Result<Self> {
     let api = Api::new(&options.config)?;
     let run_dir = std::path::absolute(&options.run_dir)?;
     fs::directory(&run_dir)?;
@@ -94,7 +99,7 @@ impl Publisher {
     let artifacts = artifacts(&options.artifacts)?;
     if artifacts.contains("result.zip") {
       return Err(message(
-        "result.zip is created by the service; select it with service pull",
+        "result.zip is created by the service; select it with service fetch",
       ));
     }
     let queue_dir = std::path::absolute(&options.queue_dir)?
@@ -106,6 +111,8 @@ impl Publisher {
     let queue = Queue::new(queue_dir, owner)?;
     Ok(Self {
       api,
+      config: options.config.clone(),
+      checkpoints: checkpoints::CheckpointLane::default(),
       run_dir,
       scope,
       artifacts,
@@ -115,7 +122,14 @@ impl Publisher {
   }
 
   pub(super) fn cycle(&mut self, progress: &mut dyn FnMut(Value) -> Result<()>) -> Result<bool> {
-    push_cycle(
+    let checkpoints_done = self.checkpoints.poll(
+      &self.config,
+      &self.run_dir,
+      &self.scope,
+      &self.queue.directory,
+      self.watch,
+    )?;
+    let metadata_done = publish_cycle(
       &self.api,
       &mut self.queue,
       &self.scope,
@@ -123,7 +137,8 @@ impl Publisher {
       &self.artifacts,
       self.watch,
       progress,
-    )
+    )?;
+    Ok(metadata_done && checkpoints_done)
   }
 
   pub(super) fn report(&self, done: bool) -> Value {
@@ -133,12 +148,23 @@ impl Publisher {
       .files
       .keys()
       .chain(self.queue.state.documents.keys())
+      .cloned()
       .collect::<BTreeSet<_>>();
+    let mut files = files;
+    if let Ok(checkpoints) = super::registrations::records(&self.run_dir) {
+      files.extend(
+        checkpoints
+          .into_iter()
+          .filter(|file| file.sync_status == "cloud")
+          .map(|file| file.path),
+      );
+    }
     json!({
       "scope": self.scope, "terminal": done,
       "files": files,
       "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
-      "protocol": self.queue.state.protocol, "archive": self.queue.state.archive,
+      "protocol": self.queue.state.protocol,
+      "result_upload": upload_report(json!(self.queue.state.archive)),
     })
   }
 
@@ -146,6 +172,14 @@ impl Publisher {
     let mut progress = queue_progress(&self.queue);
     progress["terminal"] = json!(done);
     progress["queue_dir"] = json!(self.queue.directory);
+    if let Ok(checkpoints) = super::registrations::records(&self.run_dir) {
+      progress["checkpoints"] = json!({
+        "registered": checkpoints.iter().filter(|file| file.sync_status == "registered").count(),
+        "uploading": checkpoints.iter().filter(|file| file.sync_status == "uploading").count(),
+        "cloud": checkpoints.iter().filter(|file| file.sync_status == "cloud").count(),
+        "needs_attention": checkpoints.iter().filter(|file| file.sync_status == "needs_attention").count(),
+      });
+    }
     progress
   }
 
@@ -154,7 +188,7 @@ impl Publisher {
   }
 }
 
-pub fn push(options: PushOptions) -> Result<Value> {
+pub fn publish(options: PublishOptions) -> Result<Value> {
   let mut publisher = Publisher::new(&options)?;
   let mut last_error = String::new();
   let mut failures = 0u64;
@@ -174,7 +208,7 @@ pub fn push(options: PushOptions) -> Result<Value> {
         }
         let detail = publisher.error_text(&error);
         if last_error != detail || failures.is_multiple_of(15) {
-          eprintln!("Service sync pending; saved work will retry: {detail}");
+          eprintln!("Service publishing pending; saved work will retry: {detail}");
           last_error = detail;
         }
         failures += 1;
@@ -184,14 +218,30 @@ pub fn push(options: PushOptions) -> Result<Value> {
   }
 }
 
-pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
+/// Translate presentation fields without rewriting the deployed protocol or queue.
+pub(super) fn upload_report(mut report: Value) -> Value {
+  if report["status"] == "archived" {
+    report["status"] = json!("uploaded");
+  }
+  report
+}
+
+pub(super) fn project_result_upload(report: &mut Value) {
+  if let Some(fields) = report.as_object_mut()
+    && let Some(archive) = fields.remove("archive")
+  {
+    fields.insert("result_upload".into(), upload_report(archive));
+  }
+}
+
+pub fn upload(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
   validate_scope(scope)?;
   let api = Api::new(config)?;
   let Response::Capabilities { features } = api.request(&Request::Capabilities)? else {
     return Err(message("service did not return protocol capabilities"));
   };
   if !features.iter().any(|feature| feature == "tracking-v1") {
-    return Err(message("service does not support tracking archives"));
+    return Err(message("service does not support server tracking uploads"));
   }
   let Response::Files { files } = api.request(&Request::ListFiles {
     scope: scope.clone(),
@@ -230,7 +280,7 @@ pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> 
     }
   }
   if documents.is_empty() && streams.is_empty() {
-    return Err(message("run has no synchronized tracking data to archive"));
+    return Err(message("run has no received tracking data to upload"));
   }
   let Response::Archive { archive } = api.request(&Request::SealRun {
     scope: scope.clone(),
@@ -239,9 +289,10 @@ pub fn archive(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> 
     incomplete: partial,
   })?
   else {
-    return Err(message("service did not acknowledge its tracking archive"));
+    return Err(message("service did not acknowledge its result.zip upload"));
   };
   serde_json::to_value(tracking::archive_receipt(&api, scope, archive, partial)?)
+    .map(upload_report)
     .map_err(Into::into)
 }
 
@@ -263,7 +314,7 @@ fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
     .collect()
 }
 
-fn push_cycle(
+fn publish_cycle(
   api: &Api,
   queue: &mut Queue,
   scope: &RunScope,
@@ -278,7 +329,7 @@ fn push_cycle(
     RECORD_LIMIT,
   )?)?;
   if state.get("run_id").and_then(Value::as_str) != Some(scope.run_id.as_str()) {
-    return Err(message("run identity changed while synchronizing"));
+    return Err(message("run identity changed while publishing"));
   }
   let done = terminal(&state);
   if !done && !artifacts.is_empty() && !watch {
@@ -317,7 +368,11 @@ fn push_cycle(
       progress(queue_progress(queue))?;
     }
   }
-  for path in artifacts.iter().filter(|_| done) {
+  let registrations = super::registrations::records(run_dir)?;
+  for path in artifacts
+    .iter()
+    .filter(|path| done && !registrations.iter().any(|file| file.path == **path))
+  {
     sync_file(
       api,
       queue,
@@ -343,9 +398,18 @@ fn push_cycle(
     sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
     progress(queue_progress(queue))?;
   }
-  if done && protocol == queue::Protocol::TrackingV1 {
-    tracking::seal(api, queue, scope)?;
-    progress(queue_progress(queue))?;
+  if done {
+    if !super::registrations::close_if_ready(run_dir, || inventory::record(run_dir))? {
+      return Ok(false);
+    }
+    if inventory::record(run_dir).is_ok() {
+      let path = crate::run_artifacts::INVENTORY_PATH;
+      sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
+    }
+    if protocol == queue::Protocol::TrackingV1 {
+      tracking::seal(api, queue, scope)?;
+      progress(queue_progress(queue))?;
+    }
   }
   Ok(done)
 }
@@ -383,7 +447,7 @@ fn queue_progress(queue: &Queue) -> Value {
   })
 }
 
-pub fn input_put(options: InputPutOptions) -> Result<Value> {
+pub fn input_upload(options: InputUploadOptions) -> Result<Value> {
   let api = Api::new(&options.config)?;
   let target = FileTarget::Input {
     project_id: options.project_id,
@@ -557,7 +621,7 @@ pub fn reference(options: super::ReferenceOptions) -> Result<Value> {
 }
 
 /// Explicit single-file publication, without sealing or archiving a historical run.
-pub fn file_put(options: super::FilePutOptions) -> Result<Value> {
+pub fn file_upload(options: super::FileUploadOptions) -> Result<Value> {
   let target: FileTarget = serde_json::from_str(&options.target)?;
   validate_target(&target)?;
   if matches!(&target, FileTarget::Run { path, .. } if path == "result.zip") {

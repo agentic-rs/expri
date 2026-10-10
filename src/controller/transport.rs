@@ -185,13 +185,6 @@ impl Remote {
     self.run("rsync", args)
   }
 
-  pub fn download_file(&self, remote_path: &str, local_path: &Path) -> Result<()> {
-    let mut args = self.rsync_base_args();
-    args.push(format!("{}:{}", self.host, remote_path));
-    args.push(local_path.to_string_lossy().to_string());
-    self.run("rsync", args)
-  }
-
   pub fn upload_files_from(
     &self,
     local_root: &Path,
@@ -211,18 +204,7 @@ impl Remote {
     self.run("rsync", args)
   }
 
-  pub fn download_files_from(
-    &self,
-    remote_dir: &str,
-    local_root: &Path,
-    files_from: &Path,
-  ) -> Result<()> {
-    let args =
-      self.download_files_from_args(&ensure_trailing_slash(remote_dir), local_root, files_from);
-    self.run("rsync", args)
-  }
-
-  /// Run pulls validate their selection and received staging tree before
+  /// Run fetches validate their selection and received staging tree before
   /// publishing. Limit legacy argument handling to that guarded transfer path.
   pub fn download_run_files_from(
     &self,

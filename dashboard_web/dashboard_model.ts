@@ -91,10 +91,10 @@ export type Detail = {
   metrics_error: string | null;
   warnings: Warning[];
   cache: Json;
-  archive?: ArchiveRecord | null;
+  result_upload?: ResultUploadRecord | null;
 };
-export type ArchiveRecord = {
-  status: "none" | "pending" | "uploading" | "archived" | "failed";
+export type ResultUploadRecord = {
+  status: "none" | "pending" | "uploading" | "uploaded" | "failed";
   incomplete: boolean;
   file?: {
     target: { kind: "run"; scope: RunDeepLink; path: string };
@@ -122,6 +122,11 @@ export type ArtifactFile = {
   cloud: boolean | null;
   worker: boolean | null;
   download_url: string | null;
+  sync_status?: "registered" | "uploading" | "cloud" | "needs_attention" | null;
+  sync_error?: string | null;
+  downloaded?: boolean | null;
+  labels?: string[];
+  labels_pending?: boolean;
 };
 export type ArtifactCatalog = {
   source: Source;
