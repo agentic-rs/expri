@@ -79,6 +79,7 @@ fn execute_snapshot(
 ) -> Result<()> {
   let state_path = snapshot.run_dir.join("run-state.json");
   if let Some(service) = &request.service
+    && service.publish
     && crate::service::publishing::start(repo_root, &snapshot.run_dir, service).is_err()
   {
     let _ = writeln!(
@@ -107,6 +108,27 @@ fn execute_snapshot(
       return Err(ExpriError::Message(
         "run cancellation requested".to_string(),
       ));
+    }
+    let private_inputs = request
+      .service
+      .as_ref()
+      .map(|service| {
+        crate::service::inputs::prepare(repo_root, &snapshot.run_dir, service, &mut || {
+          let requested = logs.cancel_requested()?;
+          cancelled |= requested;
+          Ok(requested)
+        })
+      })
+      .transpose()?
+      .flatten();
+    if let Some((directory, inputs)) = &private_inputs {
+      state["input_dir"] = json!(directory);
+      state["inputs"] = json!(inputs);
+      write_state(&state_path, &state)?;
+    }
+    if logs.cancel_requested()? {
+      cancelled = true;
+      return Err(ExpriError::Message("run cancellation requested".into()));
     }
     let prepared = environment::prepare_logged(
       &EnvironmentRequest {
@@ -141,9 +163,15 @@ fn execute_snapshot(
     command
       .args(&argv[1..])
       .current_dir(&snapshot.code_dir)
+      .env("EXPRI_BIN", std::env::current_exe()?)
       .env("EXPRI_RUN_ID", &snapshot.run_id)
       .env("EXPRI_RUN_DIR", &snapshot.run_dir)
       .env("EXPRI_OUTPUT_DIR", snapshot.run_dir.join("outputs"));
+    if let Some((directory, _)) = &private_inputs {
+      command.env("EXPRI_INPUT_DIR", directory);
+    } else {
+      command.env_remove("EXPRI_INPUT_DIR");
+    }
     let output = logs.task(&mut command)?;
     state["task_exit_code"] = json!(command_exit_code(&output.status));
     if let Some(error) = &output.log_error {

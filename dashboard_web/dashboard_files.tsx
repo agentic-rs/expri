@@ -151,6 +151,28 @@ function Locations({ file }: { file: ArtifactFile }) {
     </span>
   );
 }
+export function artifactSyncStatus(file: ArtifactFile): string {
+  switch (file.sync_status) {
+    case "registered": return artifactSyncError(file) ? "Retrying upload" : "Registered";
+    case "uploading": return "Uploading";
+    case "needs_attention": return "Needs attention";
+    case "cloud": return file.downloaded === true ? "Downloaded locally" :
+      file.cloud === true ? "Available in cloud" : "Awaiting cloud confirmation";
+    default: return file.downloaded === true ? "Downloaded locally" :
+      file.cloud === true ? "Available in cloud" : "Not reported";
+  }
+}
+export function artifactSyncError(file: ArtifactFile): string | null {
+  if (!["registered", "uploading", "needs_attention"].includes(file.sync_status ?? "")) return null;
+  const error = file.sync_error;
+  return typeof error === "string" && new TextEncoder().encode(error).length <= 512 &&
+    !/[\u0000-\u001f\u007f-\u009f]/.test(error) ? error || null : null;
+}
+export function artifactLabels(file: ArtifactFile): string[] {
+  return Array.isArray(file.labels) && file.labels.length <= 2
+    ? [...new Set(file.labels.filter((label) => label === "best" || label === "latest"))]
+    : [];
+}
 export function FilesPanel({
   catalog,
   source_id,
@@ -262,6 +284,7 @@ export function FilesPanel({
                   <th scope="col">File</th>
                   <th scope="col">Size</th>
                   <th scope="col">Available in</th>
+                  <th scope="col">Sync status</th>
                   <th scope="col">
                     <span className="sr-only">Download</span>
                   </th>
@@ -285,6 +308,15 @@ export function FilesPanel({
                       </td>
                       <th scope="row">
                         <code>{file.path}</code>
+                        {artifactLabels(file).length > 0 && (
+                          <span className="file-labels">
+                            {artifactLabels(file).map((label) => (
+                              <span key={label} className="file-location">
+                                {label}{file.labels_pending === true ? " (pending)" : ""}
+                              </span>
+                            ))}
+                          </span>
+                        )}
                       </th>
                       <td
                         className="number"
@@ -298,6 +330,17 @@ export function FilesPanel({
                       </td>
                       <td>
                         <Locations file={file} />
+                      </td>
+                      <td>
+                        <span className="file-sync-status">{artifactSyncStatus(file)}</span>
+                        {artifactSyncError(file) && (
+                          <p className="muted file-sync-error">{artifactSyncError(file)}</p>
+                        )}
+                        {file.cloud === true && ["registered", "uploading", "needs_attention"].includes(file.sync_status ?? "") && (
+                          <p className="muted file-sync-error">
+                            Cloud copy is not yet confirmed for this registration.
+                          </p>
+                        )}
                       </td>
                       <td>
                         {url ? (
@@ -339,7 +382,10 @@ export function FilesPanel({
             </p>
           )}
           <p className="muted file-location-note">
-            Cloud means a finalized stored file. Worker availability is reported, not a live check.
+            Register a completed checkpoint to sync it while training. Registered and uploading
+            are worker reports; available in cloud means the server recorded the completed upload.
+            Downloaded locally comes from a verified pull receipt. Worker availability is reported,
+            not a live check.
             {catalog.inventory_recorded_at
               ? ` Inventory reported ${dateText(catalog.inventory_recorded_at)}.`
               : ""}

@@ -7,11 +7,11 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{ExpriError, Result};
 
-pub(super) fn message(value: impl Into<String>) -> ExpriError {
+pub(in crate::service) fn message(value: impl Into<String>) -> ExpriError {
   ExpriError::Message(value.into())
 }
 
-pub(super) fn inspect(path: &Path) -> Result<Option<Metadata>> {
+pub(in crate::service) fn inspect(path: &Path) -> Result<Option<Metadata>> {
   match fs::symlink_metadata(path) {
     Ok(metadata) => Ok(Some(metadata)),
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -39,7 +39,7 @@ pub(in crate::service) fn directory(path: &Path) -> Result<()> {
   Ok(())
 }
 
-pub(super) fn directories(path: &Path) -> Result<()> {
+pub(in crate::service) fn directories(path: &Path) -> Result<()> {
   if let Some(parent) = path.parent()
     && !parent.as_os_str().is_empty()
   {
@@ -72,14 +72,14 @@ pub(in crate::service) fn optional_regular(path: &Path) -> Result<()> {
   Ok(())
 }
 
-pub(super) fn sync_directory(path: &Path) -> Result<()> {
+pub(in crate::service) fn sync_directory(path: &Path) -> Result<()> {
   directory(path)?;
   #[cfg(unix)]
   File::open(path)?.sync_all()?;
   Ok(())
 }
 
-pub(super) fn open(path: &Path) -> Result<File> {
+pub(in crate::service) fn open(path: &Path) -> Result<File> {
   optional_regular(path)?;
   let initial = fs::symlink_metadata(path)?;
   let mut options = OpenOptions::new();
@@ -113,7 +113,7 @@ pub(super) fn same_identity(first: &Metadata, second: &Metadata) -> bool {
   }
 }
 
-pub(super) fn unchanged(first: &Metadata, second: &Metadata) -> bool {
+pub(in crate::service) fn unchanged(first: &Metadata, second: &Metadata) -> bool {
   same_identity(first, second)
     && first.len() == second.len()
     && first.modified().ok() == second.modified().ok()
@@ -145,11 +145,30 @@ pub(in crate::service) fn atomic_json(path: &Path, value: &impl Serialize) -> Re
 }
 
 pub(super) fn digest(file: &mut File, size: u64) -> Result<String> {
+  digest_with_cancel(file, size, &mut || Ok(false))
+}
+
+pub(in crate::service) fn check_cancelled(
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<()> {
+  if cancelled()? {
+    return Err(ExpriError::DownloadCancelled);
+  }
+  Ok(())
+}
+
+pub(in crate::service) fn digest_with_cancel(
+  file: &mut File,
+  size: u64,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<String> {
+  check_cancelled(cancelled)?;
   file.seek(SeekFrom::Start(0))?;
   let mut hash = Sha256::new();
   let mut remaining = size;
   let mut buffer = [0u8; 64 * 1024];
   while remaining > 0 {
+    check_cancelled(cancelled)?;
     let length = remaining.min(buffer.len() as u64) as usize;
     let count = file.read(&mut buffer[..length])?;
     if count == 0 {
@@ -158,6 +177,7 @@ pub(super) fn digest(file: &mut File, size: u64) -> Result<String> {
     hash.update(&buffer[..count]);
     remaining -= count as u64;
   }
+  check_cancelled(cancelled)?;
   Ok(hex(&hash.finalize()))
 }
 

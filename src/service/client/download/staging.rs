@@ -95,20 +95,46 @@ fn record_matches(first: &FileRecord, second: &FileRecord) -> bool {
     }
 }
 
+pub(super) fn verified_source(
+  record: &FileRecord,
+  source: &Path,
+) -> Result<Option<std::fs::Metadata>> {
+  verified_source_with_cancel(record, source, &mut || Ok(false))
+}
+
+pub(super) fn verified_source_with_cancel(
+  record: &FileRecord,
+  source: &Path,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Option<std::fs::Metadata>> {
+  fs::check_cancelled(cancelled)?;
+  if !matches!(record.storage, FileStorage::Object) || fs::inspect(source)?.is_none() {
+    return Ok(None);
+  }
+  let mut input = fs::open(source)?;
+  let initial = input.metadata()?;
+  if initial.len() != record.size {
+    return Ok(None);
+  }
+  let digest = fs::digest_with_cancel(&mut input, record.size, cancelled)?;
+  if !fs::unchanged(&initial, &input.metadata()?)
+    || !fs::unchanged(&initial, &std::fs::symlink_metadata(source)?)
+  {
+    return Err(message(
+      "local download changed while verifying its contents",
+    ));
+  }
+  Ok((Some(digest.as_str()) == record.sha256.as_deref()).then_some(initial))
+}
+
 impl Staging {
   pub(super) fn open(directory: PathBuf, owner: &Value) -> Result<Self> {
     let parent = directory.parent().expect("staging has a parent");
     fs::directories(parent)?;
-    let name = directory
-      .file_name()
-      .and_then(|name| name.to_str())
-      .ok_or_else(|| message("download directory name must be UTF-8"))?;
     let LockAttempt::Acquired(_initialization) =
-      crate::lock::try_lock_file(&parent.join(format!(".pull-init-{name}.lock")), true)?
+      crate::lock::try_lock_file(&parent.join(".pull-init.lock"), true)?
     else {
-      return Err(message(
-        "another pull is initializing this run; retry after it finishes",
-      ));
+      return Err(crate::error::ExpriError::DownloadBusy { initializing: true });
     };
     super::initialization::initialize(
       &directory,
@@ -129,9 +155,9 @@ impl Staging {
     let LockAttempt::Acquired(lease) =
       crate::lock::try_lock_file(&directory.join(".pull.lock"), true)?
     else {
-      return Err(message(
-        "another pull is downloading this run; retry after it finishes",
-      ));
+      return Err(crate::error::ExpriError::DownloadBusy {
+        initializing: false,
+      });
     };
     let state_path = directory.join("state.json");
     private(&state_path, false)
@@ -142,15 +168,16 @@ impl Staging {
     }
     for (path, saved) in &state.files {
       validate_target(&saved.record.target)?;
-      let FileTarget::Run {
-        scope,
-        path: returned,
-      } = &saved.record.target
-      else {
-        return Err(message("download staging contains a private input record"));
+      let owned = match &saved.record.target {
+        FileTarget::Run {
+          scope,
+          path: returned,
+        } => returned == path && serde_json::to_value(scope)? == owner["scope"],
+        FileTarget::Input { .. } => {
+          path == "input" && serde_json::to_value(&saved.record.target)? == owner["target"]
+        }
       };
-      if returned != path
-        || serde_json::to_value(scope)? != owner["scope"]
+      if !owned
         || saved.offset > saved.record.size
         || (saved.verified && saved.offset != saved.record.size)
         || (matches!(saved.record.storage, FileStorage::Object)
@@ -190,6 +217,63 @@ impl Staging {
       .files
       .get(path)
       .is_some_and(|saved| saved.verified)
+  }
+
+  pub(super) fn ensure_verified(&self, path: &str) -> Result<()> {
+    let saved = self
+      .state
+      .files
+      .get(path)
+      .ok_or_else(|| message("download has no saved receipt"))?;
+    private(&self.path(path), false)?;
+    let metadata = std::fs::symlink_metadata(self.path(path))?;
+    if !saved.verified
+      || metadata.len() != saved.record.size
+      || modified(&metadata) != saved.modified
+    {
+      return Err(message(
+        "verified download changed before publication; previous files were retained",
+      ));
+    }
+    Ok(())
+  }
+
+  /// Reuse a matching local object without sending its bytes over the network.
+  /// The caller must hold the destination lease while this shared inode is used.
+  pub(super) fn reuse(&mut self, path: &str, record: &FileRecord, source: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    if let Some(metadata) = fs::inspect(source)? {
+      use std::os::unix::fs::MetadataExt;
+      if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        // Staging is private; an existing public file cannot be its shared inode.
+        return Ok(false);
+      }
+    }
+    let Some(initial) = verified_source(record, source)? else {
+      return Ok(false);
+    };
+    self.state.files.insert(
+      path.into(),
+      SavedFile {
+        record: record.clone(),
+        offset: 0,
+        verified: false,
+        modified: None,
+      },
+    );
+    self.save()?;
+    self.remove_data(path)?;
+    let data_path = self.path(path);
+    fs::directories(data_path.parent().unwrap())?;
+    std::fs::hard_link(source, &data_path)?;
+    fs::sync_directory(data_path.parent().unwrap())?;
+    let output = fs::open(&data_path)?;
+    if !fs::unchanged(&initial, &output.metadata()?) {
+      self.reset(path)?;
+      return Err(message("local download changed while saving its receipt"));
+    }
+    self.acknowledge(path, record.size, true, &output)?;
+    Ok(true)
   }
 
   pub(super) fn select(&mut self, selected: &BTreeMap<String, FileRecord>) -> Result<()> {

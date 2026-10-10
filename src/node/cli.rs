@@ -10,6 +10,7 @@ pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
 pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 pub const RUN_PUBLISHING_CAPABILITY: &str = "run-publishing-v1";
+pub const RUN_INPUTS_CAPABILITY: &str = "run-inputs-v1";
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {
@@ -107,6 +108,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
       RUN_METRICS_CAPABILITY,
       DURABLE_RUNS_CAPABILITY,
       RUN_PUBLISHING_CAPABILITY,
+      RUN_INPUTS_CAPABILITY,
     ]
     .contains(&requested.as_str())
     {
@@ -117,7 +119,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
   } else {
     println!(
       "{}",
-      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY, DURABLE_RUNS_CAPABILITY, RUN_METRICS_CAPABILITY, RUN_PUBLISHING_CAPABILITY]})
+      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY, DURABLE_RUNS_CAPABILITY, RUN_METRICS_CAPABILITY, RUN_PUBLISHING_CAPABILITY, RUN_INPUTS_CAPABILITY]})
     );
   }
   Ok(())

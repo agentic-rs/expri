@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use super::super::InputGetOptions;
 use super::*;
 
+mod checkpoints;
+
 struct HttpRequest {
   path: String,
   headers: String,

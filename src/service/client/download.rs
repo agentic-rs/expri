@@ -15,12 +15,15 @@ use super::{Api, METADATA, OBJECT_BATCH, RECORD_LIMIT, STREAMS, artifacts, fs, v
 use crate::error::Result;
 use crate::lock::LockAttempt;
 
+mod checkpoints;
 mod initialization;
 #[cfg(test)]
 pub(in crate::service::client) mod mock;
 mod staging;
 #[cfg(test)]
 mod tests;
+
+pub(super) use checkpoints::{ObjectResult, pull_objects};
 
 pub(super) fn validate_record(record: &FileRecord) -> Result<()> {
   validate_target(&record.target)?;
@@ -106,10 +109,13 @@ fn object_range(
   offset: u64,
   length: u64,
   output: &mut File,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
+  fs::check_cancelled(cancelled)?;
   let url = api.signed_url(Request::DownloadUrl {
     target: record.target.clone(),
   })?;
+  fs::check_cancelled(cancelled)?;
   let mut request = api.objects.get(&url);
   if record.size > 0 {
     request = request.header(
@@ -120,6 +126,7 @@ fn object_range(
   let response = request
     .send()
     .map_err(|_| message("object download failed"))?;
+  fs::check_cancelled(cancelled)?;
   let expected_status = if record.size == 0 {
     reqwest::StatusCode::OK
   } else {
@@ -144,8 +151,22 @@ fn object_range(
       ));
     }
   }
-  let copied = std::io::copy(&mut response.take(length + 1), output)
-    .map_err(|_| message("object download failed while reading or saving its bytes"))?;
+  let mut response = response.take(length + 1);
+  let mut copied = 0u64;
+  let mut buffer = [0u8; 64 * 1024];
+  loop {
+    fs::check_cancelled(cancelled)?;
+    let count = response
+      .read(&mut buffer)
+      .map_err(|_| message("object download failed while reading or saving its bytes"))?;
+    if count == 0 {
+      break;
+    }
+    output
+      .write_all(&buffer[..count])
+      .map_err(|_| message("object download failed while reading or saving its bytes"))?;
+    copied += count as u64;
+  }
   if copied != length {
     return Err(message(
       "object download size does not match its service record",
@@ -160,13 +181,16 @@ fn retry_range(
   offset: u64,
   length: u64,
   output: &mut File,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
   let mut last_error = None;
   for attempt in 0..3 {
+    fs::check_cancelled(cancelled)?;
     output.set_len(offset)?;
     output.seek(SeekFrom::Start(offset))?;
-    match object_range(api, record, offset, length, output) {
+    match object_range(api, record, offset, length, output, cancelled) {
       Ok(()) => return Ok(()),
+      Err(error @ crate::error::ExpriError::DownloadCancelled) => return Err(error),
       Err(error) => last_error = Some(error),
     }
     if attempt < 2 {
@@ -176,45 +200,23 @@ fn retry_range(
   Err(last_error.expect("range attempts return an error"))
 }
 
-fn download(api: &Api, record: &FileRecord, output: &mut File) -> Result<()> {
-  validate_target(&record.target)?;
-  match record.storage {
-    FileStorage::Stream | FileStorage::Tracking { .. } => read_stream(api, record, output)?,
-    FileStorage::Object => {
-      let digest = record
-        .sha256
-        .as_deref()
-        .ok_or_else(|| message("object record has no SHA256 digest"))?;
-      validate_digest(digest)?;
-      let mut offset = 0u64;
-      loop {
-        let length = (record.size - offset).min(OBJECT_BATCH);
-        retry_range(api, record, offset, length, output)?;
-        offset += length;
-        if offset == record.size {
-          break;
-        }
-      }
-      if fs::digest(output, record.size)? != digest {
-        return Err(message(
-          "download SHA256 does not match its service record; previous files were retained",
-        ));
-      }
-    }
-  }
-  if output.metadata()?.len() != record.size {
-    return Err(message("download has an unexpected size"));
-  }
-  output.sync_all()?;
-  Ok(())
-}
-
 fn staged_download(
   api: &Api,
   staging: &mut staging::Staging,
   path: &str,
   record: &FileRecord,
 ) -> Result<(u64, u64)> {
+  staged_download_with_cancel(api, staging, path, record, &mut || Ok(false))
+}
+
+fn staged_download_with_cancel(
+  api: &Api,
+  staging: &mut staging::Staging,
+  path: &str,
+  record: &FileRecord,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<(u64, u64)> {
+  fs::check_cancelled(cancelled)?;
   validate_record(record)?;
   let resumable = matches!(record.storage, FileStorage::Tracking { .. })
     || (matches!(record.storage, FileStorage::Object)
@@ -268,7 +270,8 @@ fn staged_download(
       let mut empty_get = record.size == 0 && !staging.verified(path);
       while offset < record.size || empty_get {
         let length = (record.size - offset).min(OBJECT_BATCH);
-        retry_range(api, record, offset, length, &mut output)?;
+        retry_range(api, record, offset, length, &mut output, cancelled)?;
+        fs::check_cancelled(cancelled)?;
         offset += length;
         empty_get = false;
         staging.acknowledge(path, offset, false, &output)?;
@@ -276,7 +279,9 @@ fn staged_download(
           break;
         }
       }
-      if fs::digest(&mut output, record.size)? != record.sha256.as_deref().unwrap() {
+      if fs::digest_with_cancel(&mut output, record.size, cancelled)?
+        != record.sha256.as_deref().unwrap()
+      {
         // A corrupt prefix must not make every subsequent retry fail forever.
         drop(output);
         staging.reset(path)?;
@@ -289,6 +294,7 @@ fn staged_download(
   if output.metadata()?.len() != record.size {
     return Err(message("download has an unexpected size"));
   }
+  fs::check_cancelled(cancelled)?;
   staging.acknowledge(path, record.size, true, &output)?;
   Ok((initial_offset, record.size - initial_offset))
 }
@@ -324,6 +330,43 @@ fn cache_owner(destination: &Path, expected: &Value) -> Result<()> {
 }
 
 pub fn pull(options: PullOptions) -> Result<Value> {
+  pull_impl(options, None)
+}
+
+pub(super) fn pull_pinned(
+  options: PullOptions,
+  expected: &BTreeMap<String, FileRecord>,
+) -> Result<Value> {
+  pull_impl(options, Some(expected))
+}
+
+fn verify_expected_objects(
+  selected: &BTreeMap<String, FileRecord>,
+  artifacts: &std::collections::BTreeSet<String>,
+  expected: &BTreeMap<String, FileRecord>,
+) -> Result<()> {
+  if expected.len() != artifacts.len()
+    || artifacts.iter().any(|path| {
+      !expected.get(path).is_some_and(|expected| {
+        selected.get(path).is_some_and(|current| {
+          matches!(expected.storage, FileStorage::Object)
+            && matches!(current.storage, FileStorage::Object)
+            && current.target == expected.target
+            && current.size == expected.size
+            && current.sha256 == expected.sha256
+        })
+      })
+    })
+  {
+    return Err(crate::error::ExpriError::DownloadChanged);
+  }
+  Ok(())
+}
+
+fn pull_impl(
+  options: PullOptions,
+  expected: Option<&BTreeMap<String, FileRecord>>,
+) -> Result<Value> {
   let api = Api::new(&options.config)?;
   let scope = RunScope {
     project_id: options.project_id,
@@ -342,6 +385,7 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     return Err(message("service file catalog exceeds its size limit"));
   }
   let mut selected = BTreeMap::new();
+  let mut object_records = BTreeMap::new();
   let mut available_files = Vec::new();
   let mut available_files_truncated = false;
   let mut seen = std::collections::BTreeSet::new();
@@ -363,6 +407,9 @@ pub fn pull(options: PullOptions) -> Result<Value> {
       return Err(message("service returned duplicate file records"));
     }
     if crate::run_artifacts::validate_path(path).is_ok() {
+      if matches!(file.storage, FileStorage::Object) {
+        object_records.insert(path.clone(), file.clone());
+      }
       if available_files.len() < 200 {
         let mut available = json!({"path": path, "size": file.size});
         if let Some(digest) = &file.sha256 {
@@ -388,6 +435,9 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     return Err(message(
       "run state is not synchronized yet; retry after its metadata upload",
     ));
+  }
+  if let Some(expected) = expected {
+    verify_expected_objects(&selected, &artifacts, expected)?;
   }
   for artifact in &artifacts {
     if !selected.contains_key(artifact) {
@@ -444,7 +494,14 @@ pub fn pull(options: PullOptions) -> Result<Value> {
   let mut resumed_files = 0usize;
   let mut resumed_bytes = 0u64;
   let mut downloaded_bytes = 0u64;
+  let mut reused_bytes = 0u64;
   for (path, record) in &selected {
+    if crate::run_artifacts::validate_path(path).is_ok()
+      && staging.reuse(path, record, &destination.join(path))?
+    {
+      reused_bytes = reused_bytes.saturating_add(record.size);
+      continue;
+    }
     let (resumed, downloaded) = staged_download(&api, &mut staging, path, record)?;
     resumed_files += usize::from(resumed > 0);
     resumed_bytes = resumed_bytes.saturating_add(resumed);
@@ -497,44 +554,211 @@ pub fn pull(options: PullOptions) -> Result<Value> {
     "pulled_at": chrono::Utc::now().to_rfc3339(), "selected_files": selected.keys().collect::<Vec<_>>(),
     "available_files": available_files,
     "available_files_truncated": available_files_truncated,
+    "downloaded_files": downloaded_files(&destination, &object_records, &selected)?,
   });
   fs::atomic_json(&destination.join("pull-state.json"), &receipt)?;
   staging.retain_tracking()?;
   drop(cache_lease);
   Ok(
     json!({"scope": scope, "source": source, "destination": destination, "files": selected.keys().collect::<Vec<_>>(),
-      "resumed_files": resumed_files, "resumed_bytes": resumed_bytes, "downloaded_bytes": downloaded_bytes}),
+      "resumed_files": resumed_files, "resumed_bytes": resumed_bytes,
+      "reused_bytes": reused_bytes, "downloaded_bytes": downloaded_bytes}),
   )
 }
 
 pub fn input_get(options: InputGetOptions) -> Result<Value> {
+  input_get_bound(&options, &mut || Ok(false), &mut |_, _, _| Ok(()))
+}
+
+type InputBinder<'a> =
+  dyn FnMut(&Path, &Value, &mut dyn FnMut() -> Result<bool>) -> Result<()> + 'a;
+
+pub fn input_get_prepared(
+  options: InputGetOptions,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+  bind: &mut InputBinder<'_>,
+) -> Result<Value> {
+  loop {
+    fs::check_cancelled(cancelled)?;
+    match input_get_bound(&options, cancelled, bind) {
+      Err(crate::error::ExpriError::DownloadBusy { .. }) => {
+        thread::sleep(Duration::from_millis(200));
+      }
+      result => return result,
+    }
+  }
+}
+
+fn bound_input_report(
+  destination: &Path,
+  report: Value,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+  bind: &mut InputBinder<'_>,
+) -> Result<Value> {
+  fs::check_cancelled(cancelled)?;
+  bind(destination, &report, cancelled)?;
+  Ok(report)
+}
+
+fn input_get_bound(
+  options: &InputGetOptions,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+  bind: &mut InputBinder<'_>,
+) -> Result<Value> {
+  fs::check_cancelled(cancelled)?;
   let api = Api::new(&options.config)?;
   let target = FileTarget::Input {
-    project_id: options.project_id,
-    input_id: options.input_id,
+    project_id: options.project_id.clone(),
+    input_id: options.input_id.clone(),
   };
   validate_target(&target)?;
-  let Response::File { file } = api.request(&Request::GetFile {
-    target: target.clone(),
-  })?
-  else {
-    return Err(message("service did not return an input record"));
-  };
-  if file.target != target || !matches!(file.storage, FileStorage::Object) {
-    return Err(message("service returned an inconsistent input record"));
-  }
-  let destination = std::path::absolute(options.destination)?;
+  let destination = std::path::absolute(&options.destination)?;
   let parent = destination
     .parent()
     .ok_or_else(|| message("input destination has no parent"))?;
   fs::directories(parent)?;
   fs::optional_regular(&destination)?;
-  let mut staging = tempfile::NamedTempFile::new_in(parent)?;
-  download(&api, &file, staging.as_file_mut())?;
-  fs::optional_regular(&destination)?;
-  staging.persist(&destination).map_err(|error| error.error)?;
-  fs::sync_directory(parent)?;
-  Ok(
-    json!({"target": target, "destination": destination, "size": file.size, "sha256": file.sha256}),
+  let filename = destination
+    .file_name()
+    .and_then(|name| name.to_str())
+    .ok_or_else(|| message("input destination filename must be UTF-8"))?;
+  let owner = json!({"schema_version": 1, "service_endpoint": api.endpoint,
+    "target": target, "destination": destination});
+  let mut staging =
+    staging::Staging::open(parent.join(".expri-input-downloads").join(filename), &owner)?;
+  let cached_record = staging.directory.join("input-record.json");
+  fs::check_cancelled(cancelled)?;
+  let file = match api.request(&Request::GetFile {
+    target: target.clone(),
+  }) {
+    Ok(Response::File { file }) => file,
+    Ok(_) => return Err(message("service did not return an input record")),
+    Err(error) if offline_input_error(&error) && fs::inspect(&cached_record)?.is_some() => {
+      let file: FileRecord = serde_json::from_slice(&fs::read_bounded(&cached_record, 16 * 1024)?)?;
+      validate_input_record(&file, &target)?;
+      if staging::verified_source_with_cancel(&file, &destination, cancelled)?.is_none() {
+        return Err(error);
+      }
+      return bound_input_report(
+        &destination,
+        json!({"target": target, "destination": destination, "size": file.size,
+        "sha256": file.sha256, "reused": true, "offline": true,
+        "resumed_bytes": 0, "downloaded_bytes": 0}),
+        cancelled,
+        bind,
+      );
+    }
+    Err(error) => return Err(error),
+  };
+  fs::check_cancelled(cancelled)?;
+  validate_input_record(&file, &target)?;
+  if staging::verified_source_with_cancel(&file, &destination, cancelled)?.is_some() {
+    fs::atomic_json(&cached_record, &file)?;
+    staging.clear()?;
+    return bound_input_report(
+      &destination,
+      json!({"target":target,"destination":destination,"size":file.size,"sha256":file.sha256,
+      "reused":true,"offline":false,"resumed_bytes":0,"downloaded_bytes":0}),
+      cancelled,
+      bind,
+    );
+  }
+  staging.select(&BTreeMap::from([("input".into(), file.clone())]))?;
+  let (resumed, downloaded) =
+    staged_download_with_cancel(&api, &mut staging, "input", &file, cancelled)?;
+  fs::check_cancelled(cancelled)?;
+  publish(&staging.path("input"), &destination)?;
+  fs::atomic_json(&cached_record, &file)?;
+  staging.clear()?;
+  bound_input_report(
+    &destination,
+    json!({"target": target, "destination": destination, "size": file.size, "sha256": file.sha256,
+      "reused": false, "offline": false, "resumed_bytes": resumed, "downloaded_bytes": downloaded}),
+    cancelled,
+    bind,
   )
+}
+
+fn validate_input_record(file: &FileRecord, target: &FileTarget) -> Result<()> {
+  if file.target != *target || !matches!(file.storage, FileStorage::Object) {
+    return Err(message("service returned an inconsistent input record"));
+  }
+  validate_record(file)
+}
+
+fn offline_input_error(error: &crate::error::ExpriError) -> bool {
+  matches!(
+    error,
+    crate::error::ExpriError::ServiceRejected {
+      status: 429 | 500..=599,
+      ..
+    } | crate::error::ExpriError::ServiceUnavailable { .. }
+  )
+}
+
+fn modified(metadata: &std::fs::Metadata) -> Option<Value> {
+  let time = metadata
+    .modified()
+    .ok()?
+    .duration_since(std::time::UNIX_EPOCH)
+    .ok()?;
+  Some(json!([time.as_secs(), time.subsec_nanos()]))
+}
+
+fn downloaded_files(
+  destination: &Path,
+  catalog: &BTreeMap<String, FileRecord>,
+  selected: &BTreeMap<String, FileRecord>,
+) -> Result<Vec<Value>> {
+  let mut downloaded = BTreeMap::new();
+  let previous = destination.join("pull-state.json");
+  if fs::inspect(&previous)?.is_some() {
+    let receipt: Value = serde_json::from_slice(&fs::read_bounded(&previous, 256 * 1024)?)?;
+    for saved in receipt["downloaded_files"]
+      .as_array()
+      .into_iter()
+      .flatten()
+      .take(200)
+    {
+      let Some(path) = saved["path"].as_str() else {
+        continue;
+      };
+      let Some(record) = catalog.get(path) else {
+        continue;
+      };
+      if saved["size"].as_u64() != Some(record.size)
+        || saved["sha256"].as_str() != record.sha256.as_deref()
+      {
+        continue;
+      }
+      fs::optional_regular(&destination.join(path))?;
+      if let Some(metadata) = fs::inspect(&destination.join(path))?
+        && metadata.len() == record.size
+        && modified(&metadata).as_ref() == Some(&saved["modified"])
+      {
+        downloaded.insert(path.to_string(), saved.clone());
+      }
+    }
+  }
+  for (path, record) in selected {
+    if !catalog.contains_key(path) {
+      continue;
+    }
+    let metadata = std::fs::symlink_metadata(destination.join(path))?;
+    downloaded.insert(
+      path.clone(),
+      json!({"path": path, "size": record.size,
+      "sha256": record.sha256, "modified": modified(&metadata)}),
+    );
+  }
+  // Receipts are bounded even if the selection changes many times.
+  let mut files = Vec::new();
+  for file in downloaded.into_values().take(200) {
+    files.push(file);
+    if serde_json::to_vec(&files)?.len() > 64 * 1024 {
+      files.pop();
+      break;
+    }
+  }
+  Ok(files)
 }

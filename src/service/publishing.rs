@@ -164,6 +164,9 @@ fn runtime_config(intent: &Intent) -> Result<PathBuf> {
 }
 
 pub(crate) fn dashboard_url(config: &RunServiceConfig, run_id: &str) -> Option<String> {
+  if !config.publish {
+    return None;
+  }
   let mut url = reqwest::Url::parse(config.dashboard_url.as_ref()?).ok()?;
   url
     .query_pairs_mut()
@@ -256,6 +259,9 @@ fn launch(intent: &Intent, state: &mut PublishingState, lease: FileLock) -> Resu
 }
 
 pub(crate) fn start(repo_root: &Path, run_dir: &Path, config: &RunServiceConfig) -> Result<()> {
+  if !config.publish {
+    return Ok(());
+  }
   let intent = Intent {
     schema_version: 1,
     repo_root: repo_root.canonicalize()?,
@@ -425,6 +431,8 @@ mod tests {
       project_id: "project".into(),
       origin: "worker".into(),
       dashboard_url: Some("https://example.invalid/".into()),
+      inputs: Vec::new(),
+      publish: true,
     };
     (temporary, repo, run, config)
   }
@@ -649,6 +657,9 @@ mod tests {
       ])
     );
     config.dashboard_url = None;
+    assert!(dashboard_url(&config, "run-fixture").is_none());
+    config.dashboard_url = Some("https://example.invalid/".into());
+    config.publish = false;
     assert!(dashboard_url(&config, "run-fixture").is_none());
   }
 }

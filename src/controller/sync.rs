@@ -16,6 +16,7 @@ use crate::git::{self, RemoteCandidate, SourceBundle};
 use crate::protocol::{PullArtifacts, SyncApplyRequest, SyncIdentity};
 use crate::shell;
 
+#[derive(Clone)]
 pub struct SyncOptions {
   pub repo_root: PathBuf,
   pub project_name: Option<String>,
@@ -37,10 +38,6 @@ struct RemoteSyncState {
   head: String,
   patch_sha256: String,
   checkout_manifest_sha256: Option<String>,
-}
-
-pub fn sync_target(options: SyncOptions) -> Result<()> {
-  sync_target_with_receipt(options).map(|_| ())
 }
 
 pub fn sync_target_with_receipt(options: SyncOptions) -> Result<Option<SyncIdentity>> {

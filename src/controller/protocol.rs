@@ -333,10 +333,43 @@ pub(crate) fn require_run_publishing(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<()> {
+  require_run_capability(
+    remote,
+    preference,
+    node_bin,
+    crate::node::cli::RUN_PUBLISHING_CAPABILITY,
+    "automatic publishing",
+    "or use --no-publish",
+  )
+}
+
+pub(crate) fn require_run_inputs(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  require_run_capability(
+    remote,
+    preference,
+    node_bin,
+    crate::node::cli::RUN_INPUTS_CAPABILITY,
+    "private input preparation",
+    "or download inputs manually and remove service.inputs",
+  )
+}
+
+fn require_run_capability(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+  capability: &str,
+  feature: &str,
+  alternative: &str,
+) -> Result<()> {
   if preference == ProtocolPreference::Python {
-    return Err(ExpriError::Message(
-      "automatic publishing requires a native expri worker; upgrade the worker and use protocol = \"auto\" or \"expri-node\", or use --no-publish".into(),
-    ));
+    return Err(ExpriError::Message(format!(
+      "{feature} requires a native expri worker; upgrade the worker and use protocol = \"auto\" or \"expri-node\", {alternative}"
+    )));
   }
   // A first sync has not created the checkout yet. Installed PATH/absolute
   // nodes can still be checked, while existing relative nodes resolve there.
@@ -344,12 +377,12 @@ pub(crate) fn require_run_publishing(
   let supported = remote.execute_success(&format!(
     "if [ -e {directory} ] || [ -L {directory} ]; then cd {directory} || exit 1; fi; {} node capabilities --has {}",
     shell::quote(node_bin),
-    shell::quote(crate::node::cli::RUN_PUBLISHING_CAPABILITY)
+    shell::quote(capability)
   ))?;
   if !remote.dry_run && !supported {
-    return Err(ExpriError::Message(
-      "automatic publishing requires run-publishing-v1; upgrade expri on the target or use --no-publish".into(),
-    ));
+    return Err(ExpriError::Message(format!(
+      "{feature} requires {capability}; upgrade expri on the target {alternative}"
+    )));
   }
   Ok(())
 }

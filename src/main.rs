@@ -1,4 +1,5 @@
 mod archive;
+mod artifacts_cli;
 mod config;
 mod context;
 mod controller;
@@ -20,6 +21,7 @@ mod runs;
 mod runs_cli;
 mod service;
 mod shell;
+mod sync_cli;
 
 use std::path::PathBuf;
 
@@ -29,7 +31,7 @@ use crate::context::CommandContext;
 use crate::controller::download::{DownloadOptions, download_target};
 use crate::controller::setup::{SetupOptions, setup_target};
 use crate::controller::sync::{
-  SyncOptions, sync_target, sync_target_with_diagnostic_receipt, sync_target_with_receipt,
+  SyncOptions, sync_target_with_diagnostic_receipt, sync_target_with_receipt,
 };
 use crate::controller::task::{
   LocalTaskOptions, RemoteTaskOptions, run_local_task, run_remote_task,
@@ -57,6 +59,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
   Sync(SyncCommand),
+  /// Register finalized training outputs for background cloud sync.
+  Artifact(artifacts_cli::ArtifactCommand),
   Download(DownloadCommand),
   Setup(SetupCommand),
   Run(RunCommand),
@@ -134,6 +138,10 @@ struct SyncCommand {
 
   #[arg(long)]
   pull: bool,
+
+  /// Keep syncing source changes, metadata, and selected cloud outputs.
+  #[arg(long, conflicts_with_all = ["pull", "paths"])]
+  watch: bool,
 
   #[arg(value_name = "PATH", last = true)]
   paths: Vec<PathBuf>,
@@ -229,7 +237,8 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Sync(command) => run_sync(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Sync(command) => sync_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
+    Command::Artifact(command) => artifacts_cli::run(command, cli.target.as_deref()),
     Command::Download(command) => {
       run_download(command, cli.target.as_deref(), cli.verbose, cli.quiet)
     }
@@ -333,28 +342,6 @@ fn environment_selection(config: &config::Config) -> (Vec<String>, Vec<String>) 
   (extras, sync_args)
 }
 
-fn run_sync(command: SyncCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
-  let context = CommandContext::load(command.config, command.repo)?
-    .into_target(target, command.control_path)?;
-  let sync = context.config.sync_rules()?;
-
-  sync_target(SyncOptions {
-    repo_root: context.repo_root,
-    project_name: context.project_name,
-    target_name: context.target_name,
-    target: context.target,
-    sync,
-    control_path: context.control_path,
-    control_persist: command.control_persist,
-    dry_run: command.dry_run,
-    force: command.force,
-    pull: command.pull,
-    paths: command.paths,
-    verbosity,
-    quiet,
-  })
-}
-
 fn run_download(
   command: DownloadCommand,
   target: Option<&str>,
@@ -442,9 +429,17 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   if target.is_some() {
     let mut context = context.into_target(target, command.control_path)?;
     if command.no_publish {
-      context.target.service = None;
+      disable_publishing(&mut context.target.service);
     }
     if context.target.service.is_some() && context.target.environment.is_none() {
+      if context
+        .target
+        .service
+        .as_ref()
+        .is_some_and(|service| !service.inputs.is_empty())
+      {
+        return Err(ExpriError::Message("private input preparation requires a configured target environment; add [environment], or download inputs manually and remove service.inputs".into()));
+      }
       return Err(ExpriError::Message(
         "automatic publishing requires a configured target environment; add [environment] or use --no-publish".into(),
       ));
@@ -511,11 +506,10 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   }
 
   let environment = context.config.local_environment()?;
-  let service = if command.no_publish {
-    None
-  } else {
-    context.config.local_service()?
-  };
+  let mut service = context.config.local_service()?;
+  if command.no_publish {
+    disable_publishing(&mut service);
+  }
   let mut local_sources = remote_managed;
   if let Some(paths) = context
     .config
@@ -543,9 +537,75 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   })
 }
 
+fn disable_publishing(service: &mut Option<config::RunServiceConfig>) {
+  if let Some(config) = service {
+    if config.inputs.is_empty() {
+      *service = None;
+    } else {
+      config.publish = false;
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn watch_preserves_direction_and_finalized_file_registration_choices() {
+    let cli = Cli::try_parse_from(["expri", "sync", "--watch", "--dry-run"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Sync(SyncCommand {
+        watch: true,
+        dry_run: true,
+        ..
+      })
+    ));
+    assert!(Cli::try_parse_from(["expri", "sync", "--watch", "--pull"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "sync", "--watch", "--", "code.py"]).is_err());
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "artifact",
+        "register",
+        "outputs/1000.pt",
+        "--label",
+        "best",
+        "--label",
+        "latest"
+      ])
+      .is_ok()
+    );
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "artifact",
+        "register",
+        "outputs/1000.pt",
+        "--label",
+        "newest"
+      ])
+      .is_err()
+    );
+    let mut service = Some(config::RunServiceConfig {
+      client_config: "/etc/expri/worker.toml".into(),
+      project_id: "demo".into(),
+      origin: "worker".into(),
+      dashboard_url: None,
+      inputs: vec![config::RunInputConfig {
+        input_id: "dataset".into(),
+        destination: "data.bin".into(),
+      }],
+      publish: true,
+    });
+    disable_publishing(&mut service);
+    assert!(!service.as_ref().unwrap().publish);
+    assert_eq!(service.as_ref().unwrap().inputs.len(), 1);
+    service.as_mut().unwrap().inputs.clear();
+    disable_publishing(&mut service);
+    assert!(service.is_none());
+  }
 
   #[test]
   fn run_options_before_name_belong_to_expri() {

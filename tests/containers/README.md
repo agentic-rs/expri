@@ -84,14 +84,19 @@ injects service outages and lost multipart acknowledgments, using these same
 host and worker images plus a service, a pinned MinIO fixture, a fault proxy and
 an independent Firefox image. The browser image uses Debian Firefox ESR and
 SHA256-pinned Mozilla geckodriver 0.36.0 release artifacts for amd64 and arm64.
-It checks immutable private inputs, upload recovery, selective downloads and
-offline review without shared project directories or published ports.
+It checks immutable private inputs, automatic worker input provisioning and
+offline cache reuse, upload recovery, continuous selected checkpoint downloads,
+and offline review without shared project directories or published ports.
 
 Configured runs start their own native publishers in this suite. Training
 finishes through a service outage; killing and resuming the publisher reuses
 its saved intent and acknowledged stream/upload offsets. Failed and cancelled
 runs also reach `synced`, with their original task status preserved in hosted
-review. Checkpoints remain absent until explicitly selected.
+review. A small finalized checkpoint registered with `best` and `latest` labels
+uploads during training; a laptop watcher configured for `best` commits its
+verified download receipt while the run is still active. The separate 17 MiB
+unregistered checkpoint remains absent until explicitly selected and retains
+the multipart recovery and interrupted range-download checks.
 
 The service suite also submits real browser login and logout forms over a
 generated internal HTTPS certificate. It reproduces `Origin: null` failures
@@ -131,9 +136,10 @@ also verifies fallback to worker sources when an authenticated project-catalog
 request returns 404. Only a fixture-controlled file enables that proxy behavior;
 authentication failures and other endpoints retain their upstream responses.
 
-The Files check opens the fourth tab with native keyboard input, selects an
-uploaded checkpoint, generates a scoped CLI command, and downloads the actual
-17 MiB attachment through Firefox. It verifies its SHA256 and saves
+Hosted Files data checks verify the registered checkpoint's cloud status and
+labels. The browser Files check opens the fourth tab with native keyboard input,
+selects the separate uploaded 17 MiB checkpoint, generates a scoped CLI command,
+and downloads the actual attachment through Firefox. It verifies its SHA256 and saves
 `workspace-files.png` and `workspace-files-narrow.png`. A test-only HTTPS object
 proxy preserves the signed S3 path/query and streams attachments without forwarding
 dashboard credentials; Firefox's normal insecure-download protection stays enabled.

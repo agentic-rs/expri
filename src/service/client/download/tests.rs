@@ -44,9 +44,23 @@ fn root() -> (tempfile::TempDir, PathBuf) {
 #[ignore = "subprocess fixture invoked by the interrupted-process test"]
 fn interrupted_download_child() {
   let directory = PathBuf::from(std::env::var_os("EXPRI_TEST_DOWNLOAD_STAGING").unwrap());
-  let mut staging = staging::Staging::open(directory.clone(), &owner()).unwrap();
-  let path = "outputs/checkpoint.bin";
-  let record = record(path, OBJECT_BATCH + 19);
+  let input = std::env::var_os("EXPRI_TEST_DOWNLOAD_INPUT_DEST").map(PathBuf::from);
+  let path = if input.is_some() {
+    "input"
+  } else {
+    "outputs/checkpoint.bin"
+  };
+  let mut record = record(path, OBJECT_BATCH + 19);
+  let mut owner = owner();
+  if let Some(destination) = input {
+    record.target = FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    };
+    owner = json!({"schema_version":1,"service_endpoint":"http://service.test/v1/request",
+      "target":record.target,"destination":destination});
+  }
+  let mut staging = staging::Staging::open(directory.clone(), &owner).unwrap();
   let (mut output, _) = staging.prepare(path, &record, true).unwrap();
   output
     .write_all(&vec![b'x'; OBJECT_BATCH as usize])
@@ -60,6 +74,54 @@ fn interrupted_download_child() {
   loop {
     thread::sleep(Duration::from_secs(1));
   }
+}
+
+#[test]
+fn killed_private_input_download_reopens_only_its_acknowledged_range() {
+  let (_temporary, root) = root();
+  let directory = root.join("input-transfer");
+  let destination = root.join("dataset.bin");
+  std::fs::write(&destination, b"previous dataset").unwrap();
+  let mut child = Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--exact",
+      "service::client::download::tests::interrupted_download_child",
+      "--ignored",
+    ])
+    .env("EXPRI_TEST_DOWNLOAD_STAGING", &directory)
+    .env("EXPRI_TEST_DOWNLOAD_INPUT_DEST", &destination)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while !root.join("ready").is_file() {
+    if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+      let _ = child.kill();
+      let _ = child.wait();
+      panic!("private-input child did not acknowledge a durable range");
+    }
+    thread::sleep(Duration::from_millis(10));
+  }
+  child.kill().unwrap();
+  child.wait().unwrap();
+  let target = FileTarget::Input {
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+  };
+  let owner = json!({"schema_version":1,"service_endpoint":"http://service.test/v1/request",
+    "target":target,"destination":destination});
+  let mut staging = staging::Staging::open(directory, &owner).unwrap();
+  let record = FileRecord {
+    target,
+    size: OBJECT_BATCH + 19,
+    sha256: Some("a".repeat(64)),
+    storage: FileStorage::Object,
+  };
+  let (file, offset) = staging.prepare("input", &record, true).unwrap();
+  assert_eq!(offset, OBJECT_BATCH);
+  assert_eq!(file.metadata().unwrap().len(), OBJECT_BATCH);
+  assert_eq!(std::fs::read(destination).unwrap(), b"previous dataset");
 }
 
 #[test]
@@ -1235,4 +1297,553 @@ fn finalized_stream_objects_refresh_instead_of_claiming_resumed_bytes() {
     }
   }
   task.join().unwrap();
+}
+
+#[test]
+fn private_input_resumes_durable_ranges_reuses_verified_files_and_works_offline() {
+  let (_temporary, root) = root();
+  let bytes = vec![b'd'; OBJECT_BATCH as usize + 19];
+  let target = FileTarget::Input {
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+  };
+  let record = FileRecord {
+    target,
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    storage: FileStorage::Object,
+  };
+  let expected = record.clone();
+  let payload = bytes.clone();
+  let seen = Arc::new(Mutex::new(Vec::new()));
+  let recorded = seen.clone();
+  let mut cycle = 0;
+  let (url, task) = mock(13, move |request, origin| {
+    if request.path == "/v1/request" {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::GetFile { target } => {
+          assert_eq!(target, expected.target);
+          cycle += 1;
+          Response::File {
+            file: expected.clone(),
+          }
+        }
+        Request::DownloadUrl { target } => {
+          assert_eq!(target, expected.target);
+          Response::Url {
+            url: format!("{origin}/dataset?private-signature"),
+          }
+        }
+        other => panic!("unexpected input request: {other:?}"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    } else {
+      assert!(!request.headers.contains_key("authorization"));
+      let range = request.headers["range"].strip_prefix("bytes=").unwrap();
+      let (start, end) = range.split_once('-').unwrap();
+      let start: usize = start.parse().unwrap();
+      let end: usize = end.parse().unwrap();
+      recorded.lock().unwrap().push(start as u64);
+      if cycle == 1 && start > 0 {
+        return (503, Vec::new(), Vec::new());
+      }
+      (
+        206,
+        vec![(
+          "Content-Range".into(),
+          format!("bytes {start}-{end}/{}", payload.len()),
+        )],
+        payload[start..=end].to_vec(),
+      )
+    }
+  });
+  let config = config(&root, &url);
+  let destination = root.join("dataset.bin");
+  std::fs::write(&destination, b"keep previous input").unwrap();
+  let input = || InputGetOptions {
+    config: config.clone(),
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+    destination: destination.clone(),
+  };
+  assert!(input_get(input()).is_err());
+  assert_eq!(std::fs::read(&destination).unwrap(), b"keep previous input");
+  let progress: Value = serde_json::from_slice(
+    &std::fs::read(root.join(".expri-input-downloads/dataset.bin/state.json")).unwrap(),
+  )
+  .unwrap();
+  assert_eq!(progress["files"]["input"]["offset"], OBJECT_BATCH);
+  let report = input_get(input()).unwrap();
+  assert_eq!(report["resumed_bytes"], OBJECT_BATCH);
+  assert_eq!(report["downloaded_bytes"], 19);
+  assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+  let before = std::fs::metadata(&destination).unwrap();
+  let reused = input_get(input()).unwrap();
+  assert_eq!(reused["reused"], true);
+  assert_eq!(reused["downloaded_bytes"], 0);
+  assert!(fs::unchanged(
+    &before,
+    &std::fs::metadata(&destination).unwrap()
+  ));
+  task.join().unwrap();
+  assert_eq!(
+    *seen.lock().unwrap(),
+    vec![0, OBJECT_BATCH, OBJECT_BATCH, OBJECT_BATCH, OBJECT_BATCH]
+  );
+  // The server is gone. Only the durable, target-owned receipt can permit reuse.
+  let offline = input_get(input()).unwrap();
+  assert_eq!(offline["offline"], true);
+  assert_eq!(offline["reused"], true);
+  std::fs::write(&destination, b"unverified replacement").unwrap();
+  assert!(input_get(input()).is_err());
+  assert_eq!(
+    std::fs::read(&destination).unwrap(),
+    b"unverified replacement"
+  );
+}
+
+#[test]
+fn completed_checkpoint_is_reused_and_download_receipt_survives_metadata_only_pull() {
+  let (_temporary, root) = root();
+  let state = br#"{"run_id":"run-test","status":"running"}"#.to_vec();
+  let checkpoint = b"completed checkpoint".to_vec();
+  let checkpoint_record = object_record("outputs/checkpoint.bin", &checkpoint);
+  let files = vec![
+    object_record("run-state.json", &state),
+    checkpoint_record.clone(),
+  ];
+  let checkpoint_bytes = checkpoint.clone();
+  let mut checkpoint_requests = 0;
+  let (url, task) = mock(11, move |request, origin| {
+    if request.path == "/v1/request" {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::ListFiles { .. } => Response::Files {
+          files: files.clone(),
+        },
+        Request::DownloadUrl {
+          target: FileTarget::Run { path, .. },
+        } => {
+          if path == "outputs/checkpoint.bin" {
+            checkpoint_requests += 1;
+            assert_eq!(checkpoint_requests, 1);
+          }
+          Response::Url {
+            url: format!("{origin}/{path}"),
+          }
+        }
+        other => panic!("unexpected pull request: {other:?}"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    } else {
+      let bytes = if request.path == "/run-state.json" {
+        &state
+      } else {
+        &checkpoint_bytes
+      };
+      (
+        206,
+        vec![(
+          "Content-Range".into(),
+          format!("bytes 0-{}/{}", bytes.len() - 1, bytes.len()),
+        )],
+        bytes.clone(),
+      )
+    }
+  });
+  let config = config(&root, &url);
+  let first = pull(options(&root, config.clone())).unwrap();
+  let second = pull(options(&root, config.clone())).unwrap();
+  assert_eq!(second["reused_bytes"], checkpoint.len());
+  let mut metadata = options(&root, config);
+  metadata.artifacts.clear();
+  pull(metadata).unwrap();
+  task.join().unwrap();
+  let destination = PathBuf::from(first["destination"].as_str().unwrap());
+  let receipt: Value =
+    serde_json::from_slice(&std::fs::read(destination.join("pull-state.json")).unwrap()).unwrap();
+  assert_eq!(receipt["downloaded_files"].as_array().unwrap().len(), 1);
+  assert_eq!(
+    receipt["downloaded_files"][0]["path"],
+    "outputs/checkpoint.bin"
+  );
+  assert_eq!(
+    receipt["downloaded_files"][0]["sha256"],
+    checkpoint_record.sha256.unwrap()
+  );
+}
+
+#[test]
+fn matching_existing_input_is_reused_without_changing_its_permissions_or_inode() {
+  let (_temporary, root) = root();
+  let destination = root.join("existing-dataset.bin");
+  let bytes = b"verified user input";
+  std::fs::write(&destination, bytes).unwrap();
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o644)).unwrap();
+  }
+  let before = std::fs::metadata(&destination).unwrap();
+  let record = FileRecord {
+    target: FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    },
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    storage: FileStorage::Object,
+  };
+  let (url, task) = mock(1, move |request, _| {
+    assert!(matches!(
+      serde_json::from_slice::<Request>(&request.body).unwrap(),
+      Request::GetFile { .. }
+    ));
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::File {
+        file: record.clone(),
+      })
+      .unwrap(),
+    )
+  });
+  let report = input_get(InputGetOptions {
+    config: config(&root, &url),
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+    destination: destination.clone(),
+  })
+  .unwrap();
+  task.join().unwrap();
+  assert_eq!(report["reused"], true);
+  let after = std::fs::metadata(&destination).unwrap();
+  assert!(fs::unchanged(&before, &after));
+  assert_eq!(before.permissions(), after.permissions());
+}
+
+#[test]
+fn prepared_input_binds_verified_destination_while_transfer_lease_is_held() {
+  let (_temporary, root) = root();
+  let destination = root.join("dataset.bin");
+  let bytes = b"existing dataset";
+  std::fs::write(&destination, bytes).unwrap();
+  let record = FileRecord {
+    target: FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    },
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    storage: FileStorage::Object,
+  };
+  let (url, server) = mock(1, move |_, _| {
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::File {
+        file: record.clone(),
+      })
+      .unwrap(),
+    )
+  });
+  let config = config(&root, &url);
+  let options = || InputGetOptions {
+    config: config.clone(),
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+    destination: destination.clone(),
+  };
+  let mut called = false;
+  input_get_prepared(options(), &mut || Ok(false), &mut |path, report, _| {
+    called = true;
+    assert_eq!(path, destination);
+    assert_eq!(report["reused"], true);
+    assert!(
+      input_get(options())
+        .unwrap_err()
+        .to_string()
+        .contains("another pull is downloading")
+    );
+    Ok(())
+  })
+  .unwrap();
+  server.join().unwrap();
+  assert!(called);
+}
+
+#[test]
+fn prepared_input_waits_for_shared_transfer_but_cancel_does_not_touch_cache() {
+  let (_temporary, root) = root();
+  let destination = root.join("dataset.bin");
+  let config = config(&root, "http://127.0.0.1:9");
+  let target = FileTarget::Input {
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+  };
+  let owner = json!({"schema_version":1,"service_endpoint":"http://127.0.0.1:9/v1/request",
+    "target":target,"destination":destination});
+  let _active =
+    staging::Staging::open(root.join(".expri-input-downloads/dataset.bin"), &owner).unwrap();
+  let mut checks = 0;
+  let error = input_get_prepared(
+    InputGetOptions {
+      config,
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+      destination: destination.clone(),
+    },
+    &mut || {
+      checks += 1;
+      Ok(checks >= 3)
+    },
+    &mut |_, _, _| panic!("cancelled input must not bind"),
+  )
+  .unwrap_err();
+  assert!(error.to_string().contains("cancelled"));
+  assert_eq!(checks, 3);
+  assert!(!destination.exists());
+}
+
+#[test]
+fn prepared_input_cancels_at_a_range_boundary_and_retains_resumable_progress() {
+  let (_temporary, root) = root();
+  let destination = root.join("dataset.bin");
+  std::fs::write(&destination, b"keep previous input").unwrap();
+  let bytes = vec![b'i'; OBJECT_BATCH as usize + 23];
+  let record = FileRecord {
+    target: FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    },
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    storage: FileStorage::Object,
+  };
+  let payload = bytes.clone();
+  let (url, task) = mock(6, move |request, origin| {
+    if request.path == "/v1/request" {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::GetFile { .. } => Response::File {
+          file: record.clone(),
+        },
+        Request::DownloadUrl { .. } => Response::Url {
+          url: format!("{origin}/dataset"),
+        },
+        other => panic!("unexpected cancelled input request: {other:?}"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    } else {
+      let (start, end) = request.headers["range"]
+        .strip_prefix("bytes=")
+        .unwrap()
+        .split_once('-')
+        .unwrap();
+      let start: usize = start.parse().unwrap();
+      let end: usize = end.parse().unwrap();
+      (
+        206,
+        vec![(
+          "Content-Range".into(),
+          format!("bytes {start}-{end}/{}", payload.len()),
+        )],
+        payload[start..=end].to_vec(),
+      )
+    }
+  });
+  let config = config(&root, &url);
+  let input = || InputGetOptions {
+    config: config.clone(),
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+    destination: destination.clone(),
+  };
+  let progress = root.join(".expri-input-downloads/dataset.bin/state.json");
+  let error = input_get_prepared(
+    input(),
+    &mut || {
+      let offset = std::fs::read(&progress)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|saved| saved["files"]["input"]["offset"].as_u64())
+        .unwrap_or(0);
+      Ok(offset == OBJECT_BATCH)
+    },
+    &mut |_, _, _| panic!("cancelled input must not bind"),
+  )
+  .unwrap_err();
+  assert!(matches!(error, crate::error::ExpriError::DownloadCancelled));
+  assert_eq!(std::fs::read(&destination).unwrap(), b"keep previous input");
+  let saved: Value = serde_json::from_slice(&std::fs::read(progress).unwrap()).unwrap();
+  assert_eq!(saved["files"]["input"]["offset"], OBJECT_BATCH);
+  let report = input_get(input()).unwrap();
+  assert_eq!(report["resumed_bytes"], OBJECT_BATCH);
+  assert_eq!(report["downloaded_bytes"], 23);
+  assert_eq!(std::fs::read(destination).unwrap(), bytes);
+  task.join().unwrap();
+}
+
+#[test]
+fn prepared_input_cancels_during_cached_file_hash_verification() {
+  let (_temporary, root) = root();
+  let destination = root.join("dataset.bin");
+  let bytes = vec![b'v'; 256 * 1024];
+  std::fs::write(&destination, &bytes).unwrap();
+  let before = std::fs::metadata(&destination).unwrap();
+  let record = FileRecord {
+    target: FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    },
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    storage: FileStorage::Object,
+  };
+  let (url, task) = mock(1, move |_, _| {
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::File {
+        file: record.clone(),
+      })
+      .unwrap(),
+    )
+  });
+  let mut checks = 0;
+  let error = input_get_prepared(
+    InputGetOptions {
+      config: config(&root, &url),
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+      destination: destination.clone(),
+    },
+    &mut || {
+      checks += 1;
+      Ok(checks == 8)
+    },
+    &mut |_, _, _| panic!("cancelled input must not bind"),
+  )
+  .unwrap_err();
+  task.join().unwrap();
+  assert!(matches!(error, crate::error::ExpriError::DownloadCancelled));
+  assert!(fs::unchanged(
+    &before,
+    &std::fs::metadata(&destination).unwrap()
+  ));
+  assert_eq!(std::fs::read(destination).unwrap(), bytes);
+  assert!(
+    !root
+      .join(".expri-input-downloads/dataset.bin/input-record.json")
+      .exists()
+  );
+}
+
+#[test]
+fn prepared_input_cancels_inside_an_object_range_without_acknowledging_partial_bytes() {
+  let (_temporary, root) = root();
+  let destination = root.join("dataset.bin");
+  std::fs::write(&destination, b"keep previous input").unwrap();
+  let bytes = vec![b'b'; 128 * 1024];
+  let record = FileRecord {
+    target: FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    },
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    storage: FileStorage::Object,
+  };
+  let payload = bytes.clone();
+  let (url, task) = mock(6, move |request, origin| {
+    if request.path == "/v1/request" {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::GetFile { .. } => Response::File {
+          file: record.clone(),
+        },
+        Request::DownloadUrl { .. } => Response::Url {
+          url: format!("{origin}/dataset"),
+        },
+        other => panic!("unexpected partial cancellation request: {other:?}"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    } else {
+      assert_eq!(
+        request.headers["range"],
+        format!("bytes=0-{}", payload.len() - 1)
+      );
+      (
+        206,
+        vec![(
+          "Content-Range".into(),
+          format!("bytes 0-{}/{}", payload.len() - 1, payload.len()),
+        )],
+        payload.clone(),
+      )
+    }
+  });
+  let config = config(&root, &url);
+  let input = || InputGetOptions {
+    config: config.clone(),
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+    destination: destination.clone(),
+  };
+  let stage = root.join(".expri-input-downloads/dataset.bin");
+  let error = input_get_prepared(
+    input(),
+    &mut || {
+      Ok(
+        std::fs::metadata(stage.join("files/input"))
+          .is_ok_and(|metadata| metadata.len() >= 64 * 1024),
+      )
+    },
+    &mut |_, _, _| panic!("cancelled input must not bind"),
+  )
+  .unwrap_err();
+  assert!(matches!(error, crate::error::ExpriError::DownloadCancelled));
+  assert_eq!(std::fs::read(&destination).unwrap(), b"keep previous input");
+  let progress: Value =
+    serde_json::from_slice(&std::fs::read(stage.join("state.json")).unwrap()).unwrap();
+  assert_eq!(progress["files"]["input"]["offset"], 0);
+  assert_eq!(progress["files"]["input"]["verified"], false);
+  let report = input_get(input()).unwrap();
+  assert_eq!(report["resumed_bytes"], 0);
+  assert_eq!(std::fs::read(destination).unwrap(), bytes);
+  task.join().unwrap();
+}
+
+#[test]
+fn private_input_accepts_a_destination_at_the_filesystem_filename_limit() {
+  let (_temporary, root) = root();
+  let destination = root.join(format!("{}.bin", "x".repeat(251)));
+  let bytes = b"long input filename";
+  std::fs::write(&destination, bytes).unwrap();
+  let record = FileRecord {
+    target: FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    },
+    size: bytes.len() as u64,
+    sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    storage: FileStorage::Object,
+  };
+  let (url, server) = mock(1, move |_, _| {
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::File {
+        file: record.clone(),
+      })
+      .unwrap(),
+    )
+  });
+  let report = input_get(InputGetOptions {
+    config: config(&root, &url),
+    project_id: "project".into(),
+    input_id: "dataset".into(),
+    destination: destination.clone(),
+  })
+  .unwrap();
+  server.join().unwrap();
+  assert_eq!(report["reused"], true);
+  assert_eq!(std::fs::read(destination).unwrap(), bytes);
 }

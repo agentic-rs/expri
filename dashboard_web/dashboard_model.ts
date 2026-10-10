@@ -122,6 +122,11 @@ export type ArtifactFile = {
   cloud: boolean | null;
   worker: boolean | null;
   download_url: string | null;
+  sync_status?: "registered" | "uploading" | "cloud" | "needs_attention" | null;
+  sync_error?: string | null;
+  downloaded?: boolean | null;
+  labels?: string[];
+  labels_pending?: boolean;
 };
 export type ArtifactCatalog = {
   source: Source;

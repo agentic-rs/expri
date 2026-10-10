@@ -90,6 +90,13 @@ expri -T runpod sync -- src scripts
 expri -T runpod sync --pull -- outputs/checkpoints
 ```
 
+`expri -T runpod sync --watch` keeps source/config synchronized while active runs
+retain their frozen snapshots. Add `[file_sync]` to also receive live run metadata
+and selected finalized checkpoints through the service. Training registers ready
+files with `expri artifact register "$EXPRI_OUTPUT_DIR/checkpoint-1000.pt" --label best`.
+See [file sync and private input preparation](docs/self-hosted-service.md#local-download-and-dashboard)
+for laptop selection, offline reuse, and resumable transfers.
+
 ## Transport
 
 Targets use SSH by default. Set `transport = "ctl"` on an individual target to

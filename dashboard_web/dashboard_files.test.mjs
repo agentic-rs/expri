@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { artifactCanSelect, artifactDownloadUrl, artifactPullCommand, artifactScopeMatchesRun, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
+import { artifactCanSelect, artifactDownloadUrl, artifactLabels, artifactPullCommand, artifactScopeMatchesRun, artifactSyncError, artifactSyncStatus, apiUrl, formatFileSize, parseProjectRunKey, runIdentity, safeArtifactPath } from "./.test/app.js";
 
 const scope = { project_id: "vision", origin: "gpu-1", run_id: "run-123" };
 const source_id = "hosted:vision:gpu-1";
@@ -61,6 +61,27 @@ test("file sizes distinguish unknown values and binary units", () => {
   assert.equal(formatFileSize(2 ** 30), "1 GiB");
   assert.equal(formatFileSize(-1), "Unknown");
   assert.equal(formatFileSize(Infinity), "Unknown");
+});
+
+test("sync states distinguish worker reports from confirmed cloud and local receipts", () => {
+  const item = file("outputs/model.pt", { cloud: false, sync_status: "registered" });
+  assert.equal(artifactSyncStatus(item), "Registered");
+  assert.equal(artifactSyncStatus({ ...item, sync_status: "uploading" }), "Uploading");
+  assert.equal(artifactSyncStatus({ ...item, sync_status: "needs_attention" }), "Needs attention");
+  assert.equal(artifactSyncStatus({ ...item, sync_error: "Upload will retry" }), "Retrying upload");
+  assert.equal(artifactSyncStatus({ ...item, sync_status: "cloud" }), "Awaiting cloud confirmation");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, sync_status: "uploading" }), "Uploading");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, sync_status: "cloud" }), "Available in cloud");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, sync_status: "cloud", downloaded: true }), "Downloaded locally");
+  assert.equal(artifactSyncStatus({ ...item, cloud: true, downloaded: true }), "Registered");
+  assert.equal(artifactSyncError({ ...item, cloud: true, sync_status: "cloud", sync_error: "stale error" }), null);
+  for (const sync_error of ["x".repeat(513), "line\nbreak", "\0private", 5])
+    assert.equal(artifactSyncError({ ...item, sync_error }), null);
+  assert.equal(artifactSyncError({ ...item, sync_status: "future", sync_error: "future error" }), null);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["best", "latest"] }), ["best", "latest"]);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["best", "best"] }), ["best"]);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["<script>", "latest"] }), ["latest"]);
+  assert.deepEqual(artifactLabels({ ...item, labels: ["best", "latest", "unknown"] }), []);
 });
 
 test("project artifacts bind the recorded machine and actual run ID before browser or CLI selection", () => {

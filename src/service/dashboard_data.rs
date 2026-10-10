@@ -781,7 +781,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         recorded_at = inventory.recorded_at;
         for file in inventory.files {
           rows.insert(file.path.clone(), ArtifactRow { path: file.path, size: file.size,
-            local: None, cloud: None, worker: Some(true), download_url: None });
+            local: None, cloud: None, worker: Some(true), download_url: None,
+            sync_status: file.sync_status, sync_error: file.sync_error, downloaded: None,
+            labels_pending: !file.labels.is_empty(), labels: file.labels, reported_sha256: file.sha256 });
         }
       }
       Ok(None) => {}
@@ -803,9 +805,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         cloud: None,
         worker: None,
         download_url: None,
+        sync_status: None,
+        sync_error: None,
+        downloaded: None,
+        labels: Vec::new(),
+        labels_pending: false,
+        reported_sha256: None,
       });
-      row.size = object.size;
-      row.cloud = Some(true);
+      row.confirm_cloud(object.size, object.sha256.as_deref());
       row.download_url = Some(download_url(source_id, run_id, &path));
     }
     if !objects_truncated {

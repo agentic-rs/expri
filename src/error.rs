@@ -39,6 +39,14 @@ pub enum ExpriError {
     status: u16,
     detail: String,
   },
+  ServiceUnavailable {
+    reading_response: bool,
+  },
+  DownloadBusy {
+    initializing: bool,
+  },
+  DownloadChanged,
+  DownloadCancelled,
   Message(String),
 }
 
@@ -78,6 +86,29 @@ impl Display for ExpriError {
           .unwrap_or_else(|_| status.to_string());
         write!(formatter, "service returned {status}: {detail}")
       }
+      Self::ServiceUnavailable { reading_response } => write!(
+        formatter,
+        "service {}; saved work can be retried",
+        if *reading_response {
+          "response could not be read"
+        } else {
+          "request failed"
+        }
+      ),
+      Self::DownloadBusy { initializing } => write!(
+        formatter,
+        "another pull is {} this run; retry after it finishes",
+        if *initializing {
+          "initializing"
+        } else {
+          "downloading"
+        }
+      ),
+      Self::DownloadChanged => write!(
+        formatter,
+        "selected checkpoint changed; waiting for its registered file record"
+      ),
+      Self::DownloadCancelled => write!(formatter, "private input preparation was cancelled"),
       Self::Message(message) => write!(formatter, "{message}"),
     }
   }

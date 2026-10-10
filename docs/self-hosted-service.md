@@ -113,9 +113,27 @@ the last published inventory; **Cloud** means a finalized file is downloadable.
 The per-run **Files** tab can therefore show a checkpoint reported on its
 worker before it appears in project **Storage**. Storage shows only completed
 cloud objects for the selected project, across all its machines and runs.
+The **Sync status** column distinguishes **Registered**, **Uploading**,
+**Available in cloud**, and **Needs attention**. Registration records the
+completed checkpoint locally; the background publisher handles hashing and
+transfer. A temporary upload failure shows **Retrying upload** with a concise
+reason. An upload reported by the worker is not shown as cloud availability
+until the service has a completed file record. Optional **best** and **latest**
+labels appear beside immutable checkpoint names; moving a label does not copy
+or upload the checkpoint again.
+Labels marked **pending** still refer to a registered checkpoint awaiting cloud
+confirmation. If an older cloud file exists at the same path, its download
+remains available while the sync status stays registered or uploading; it does
+not confirm the label until its recorded size and SHA256 match the registration.
 The hosted page cannot inspect your laptop's disk. Local dashboards show files
 actually present in the run or review cache; cached cloud availability is a
 record of the last pull rather than a live storage check.
+**Downloaded locally** requires a saved successful pull receipt matching the
+current recorded object and the local file's size and modification time.
+The dashboard reads metadata rather than checkpoint contents. If a local file
+has changed or its cloud object has been replaced, its local location remains
+visible while it loses the downloaded status. Legacy caches without these
+receipts show local presence without claiming a verified download.
 
 Select up to 64 files. **Download selected files** provides individual browser
 download links; the browser handles file bytes directly. Cloud downloads require
@@ -233,7 +251,8 @@ query parameters, or fragments.
 publisher before environment preparation. It forwards metadata, metrics, and
 logs, including preparation failures and cancellation. The task's exit code is
 independent of publishing: service outages leave queued work retrying after
-training finishes. Checkpoints are still selected explicitly. A lost supervisor
+training finishes. Training registers finalized checkpoints for live upload.
+A lost supervisor
 is recorded as `lost` once its run lease is released; surviving unsupervised
 children are not considered a completed experiment.
 
@@ -251,7 +270,7 @@ It does not rerun training. The queue lives at the original checkout's
 `.expri/service-sync`; keep it and the original run files until publication is
 acknowledged. Publishers survive terminal closure and task completion, but must
 be resumed after a worker reboot. For new tracking runs, `synced` means all
-terminal tracking bytes were acknowledged and the archive job was accepted;
+terminal tracking bytes and registered checkpoints were acknowledged and the archive job was accepted;
 it does not mean the independent S3 archive upload has finished. Archive
 failures retain tracking data and retry without restarting training. For legacy
 queues, `synced` retains its original upload-completion meaning. A completed task
@@ -279,6 +298,38 @@ commits offsets and metric indexes before acknowledging a batch. Retries compare
 overlapping bytes rather than duplicating them. Terminal publication also sends
 an unfinished final metric line and captures exact file revisions and lengths.
 The training process does not make service requests.
+
+Register a checkpoint only after closing the file (and any writer process):
+
+```sh
+"$EXPRI_BIN" artifact register "$EXPRI_OUTPUT_DIR/checkpoint-1000.pt" --label best --label latest
+expri artifact list --run-dir .expri/runs/run-abc123
+```
+
+`--run-dir` defaults to the task's `EXPRI_RUN_DIR`. Relative paths start with
+`outputs/` and are relative to the run directory. Registration saves a small
+local outbox; it does not read checkpoint contents, hash them, or contact the
+service. The independent publisher hashes and uploads through its existing
+resumable multipart queue. Object transfers have a separate lane so a slow
+checkpoint does not delay metrics and logs. Registrations made while offline
+wait for the publisher to reconnect or resume.
+`EXPRI_BIN` identifies the executing native worker binary, including a custom
+`target.node_bin` outside the task's PATH.
+
+Keep each registered file unchanged until its status is **cloud**. Use a new
+filename for each completed checkpoint. `best` and `latest` are movable aliases
+in the inventory; they select existing files and create no extra S3 objects.
+Changing a registered file produces **needs attention**, which prevents the
+publisher from claiming final sync. Register the corrected file under a new
+path, then explicitly remove the failed handoff with
+`expri artifact unregister outputs/bad.pt --run-dir .expri/runs/run-abc123`.
+This leaves the file, cloud objects, and saved multipart receipts untouched.
+Active and successful registrations cannot be unregistered.
+
+The inventory closes before terminal archive sealing. Exact repeated
+registrations remain idempotent, but adding files or moving aliases after
+closure is rejected. Use `service file-put` for post-run uploads. A training
+exit does not discard pending checkpoint transfers.
 
 If a training machine disappears, the server can recover its last acknowledged
 prefix. Data still waiting on the worker can be lost. Pull the received files
@@ -339,6 +390,41 @@ and their SQLite projection after archiving. Legacy publishers continue removing
 completed stream records after their individual S3 objects are published.
 
 ## Local download and dashboard
+
+To continuously receive metadata and selected checkpoints, configure the
+laptop's client separately from the worker's publishing credentials:
+
+```toml
+[file_sync]
+client_config = "/home/me/.config/expri/owner.toml"
+project_id = "vision"
+origins = ["gpu-1", "gpu-2"]
+labels = ["best", "latest"]
+# artifacts = ["outputs/checkpoint-1000.pt", "result.zip"]
+```
+
+```sh
+expri sync --watch
+expri -T gpu-1 sync --watch
+```
+
+With `[file_sync]`, no `-T` watches only the listed service origins. With an
+explicit target, the same process also syncs source/config to that worker's
+checkout. Source changes do not modify a running experiment's frozen snapshot.
+Without `[file_sync]`, source syncing keeps its existing target selection.
+`--pull` and path-scoped transfers retain their source-only behavior and cannot
+be combined with `--watch`.
+
+The watcher polls every five seconds, slows retries during outages, and keeps
+verified local files available. Missing labels or checkpoints are pending until
+the completed matching object arrives; partial bytes never enter the review
+cache. Unchanged catalogs skip transfers; restarting reuses verified checkpoint
+files and durable tracking offsets. The watcher retains previously selected
+files when aliases move. Stop it with Ctrl-C; training and publishing continue.
+Omit `--watch` for one sync pass, or add `--dry-run` to inspect selections without
+publishing files locally. Dry-run reports identify labels that need the run's
+inventory to resolve; they do not treat those labels as unavailable files.
+Reports are bounded and watch summaries stay compact.
 
 Use an owner client configuration with the same URL and the owner token's
 variable name. Pull metadata, metrics, parameters, and logs by default, and
@@ -405,6 +491,37 @@ project, while publishing a new input requires the owner client.
 Pass the downloaded path to the experiment as needed. Keep input files outside
 Git and code snapshots. This version handles datasets/files; credentials and
 secret injection are outside its scope.
+
+For automatic preparation before training, add required inputs to the executing
+worker's service configuration:
+
+```toml
+[[service.inputs]]
+input_id = "dataset-v1"
+destination = "train.bin"
+```
+
+For a target-specific service table, use `[[target.gpu.service.inputs]]`.
+Inputs download to the checkout's `.expri/inputs/<project_id>/<input_id>/file`;
+each run binds those verified files at `.expri/runs/<run_id>/inputs/<destination>`.
+`EXPRI_INPUT_DIR` points at that run's input directory during training. Bindings
+reuse cached bytes through hard links when possible, so a later dataset version
+can keep the same task-facing filename without changing an active run's input.
+Prepared inputs are read-only. Read them from this directory and write derived
+files to `EXPRI_OUTPUT_DIR`; copy an input before modifying it.
+Preparation records input IDs, sizes, and existing SHA256 digests in the run
+state. It finishes before environment setup and task launch. Missing required inputs fail
+preparation; there is no silently incomplete training run.
+
+Private input downloads retain range receipts beside the destination under
+`.expri-input-downloads/`. Repeating a download verifies and reuses matching
+bytes. An unavailable service can use the last acknowledged input record only
+when the cached file still passes its size and full-file SHA256 check; rejected
+credentials or a deleted project never permit that fallback. A failed download
+preserves the previous destination. Keep the cache private and outside Git.
+Configured input preparation requires a native worker advertising
+`run-inputs-v1`. `--no-publish` disables uploads while retaining required input
+preparation.
 
 ### Reuse an uploaded file
 
@@ -543,7 +660,10 @@ It runs an actual uv experiment with fake installed Torch and a private input,
 starts publishing automatically, interrupts the service during training, and
 loses metric and multipart part acknowledgements. It kills/resumes the publisher
 from its saved queue, restarts the service, resumes the selected checkpoint, and
-reviews downloaded data offline. It verifies independent server ZIP completion,
+reviews downloaded data offline. A finalized checkpoint registered during
+training reaches a watching laptop while that run is still active. A later run
+reuses its verified private input with the service offline. The suite verifies
+independent server ZIP completion,
 original tracking bytes without per-file S3 uploads, recovery of an acknowledged
 prefix while the worker is offline, and owner-requested partial archives. Failed and cancelled runs also finish publishing
 their original task status and logs without selecting a checkpoint.

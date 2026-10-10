@@ -25,6 +25,7 @@ network = f'expri-service-{os.getpid()}'
 containers = []
 created_network = False
 refresh_browser = None
+file_sync_pid = None
 fixture_env = dict(os.environ)
 fixture_env.update({
   'EXPRI_OWNER_TOKEN': secrets.token_hex(24), 'EXPRI_WORKER_TOKEN': secrets.token_hex(24),
@@ -100,6 +101,19 @@ def wait_for(predicate, message, timeout=60):
       pass
     time.sleep(0.2)
   raise AssertionError(message)
+
+def stop_file_sync():
+  global file_sync_pid
+  if file_sync_pid is None:
+    return
+  # The watcher owns its new process group; never target training or publishing.
+  python(host, f'''import os, signal
+try:
+  os.killpg({file_sync_pid}, signal.SIGTERM)
+except ProcessLookupError:
+  pass
+''')
+  file_sync_pid = None
 
 def client(container, action, *args, check=True, config=None):
   config = config or ('/tmp/worker.toml' if container == worker else '/tmp/owner.toml')
@@ -294,6 +308,9 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert checkpoint['size'] == 17 * 1024 * 1024 and checkpoint['cloud'] is True and checkpoint['worker'] is True and checkpoint['local'] is None, 'artifact location or size differs from the published checkpoint'
   assert checkpoint['download_url'].startswith('/api/artifact?') and 'X-Amz-' not in json.dumps(artifacts), 'artifact catalog exposed a signed URL'
   assert artifacts['pull_scope'] == {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}, 'artifact pull command changed run scope'
+  live_checkpoint = next(file for file in artifacts['files'] if file['path'] == 'outputs/checkpoint-1000.pt')
+  assert live_checkpoint['cloud'] is True and live_checkpoint['sync_status'] == 'cloud' and set(live_checkpoint['labels']) == {'best', 'latest'}, 'hosted Files omitted registered checkpoint availability or aliases'
+  assert live_checkpoint['downloaded'] is None, 'hosted Files claimed access to laptop download receipts'
   other_files = browser_json('/api/artifacts?' + urlencode({'source': source_id, 'run_id': second_run_id}), cookie)
   other_checkpoint = next(file for file in other_files['files'] if file['path'] == 'outputs/checkpoint.pt')
   assert other_checkpoint['worker'] is True and other_checkpoint['cloud'] is False and other_checkpoint['download_url'] is None, 'worker-only checkpoint was advertised as a cloud download'
@@ -350,6 +367,20 @@ if {log!r}:
   python(worker, code)
   client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
 
+def reset_copied_run_handoffs(container, run_dir):
+  # Copies retain payload bytes, but checkpoint identities and publication state
+  # belong to the source run and origin. The synthetic publisher rebuilds them.
+  python(container, f'''from pathlib import Path
+root = Path({run_dir!r})
+for path in [
+  'checkpoint-registrations.json', '.checkpoint-registrations.lock',
+  'outputs/.expri-artifacts.json', 'publishing-request.json',
+  'publishing-state.json', '.publish.lock', 'run-request.json',
+  '.run.lock', '.worker-ready', '.cancel-request',
+]:
+  (root / path).unlink(missing_ok=True)
+''')
+
 def running_refresh_fixture(original):
   run_id = 'refresh-' + original['run_id']
   run_dir = '/home/tester/refresh-run'
@@ -360,7 +391,11 @@ shutil.copytree({original['run_dir']!r}, root)
 record = json.loads((root / 'run-state.json').read_text())
 record.update(run_id={run_id!r}, status='running', finished_at=None, exit_code=None)
 (root / 'run-state.json').write_text(json.dumps(record))
+snapshot = json.loads((root / 'snapshot.json').read_text())
+snapshot['run_id'] = {run_id!r}
+(root / 'snapshot.json').write_text(json.dumps(snapshot))
 ''')
+  reset_copied_run_handoffs(worker, run_dir)
   client(worker, 'push', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
   return {'run_id': run_id, 'run_dir': run_dir}
 
@@ -434,6 +469,7 @@ def project_machine_fixture(original):
   docker('cp', f"{worker}:{original['run_dir']}", str(staging))
   copy(staging, host, run_dir)
   docker('exec', '--user', '0', host, 'chown', '-R', 'tester:tester', run_dir)
+  reset_copied_run_handoffs(host, run_dir)
   python(host, f'''import json
 from pathlib import Path
 root = Path({run_dir!r})
@@ -808,7 +844,7 @@ prefix = "acceptance"
   copy(ROOT / 'tests/containers/service_train.py', worker, '/home/tester/experiment/train.py')
   copy(ROOT / 'python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
   execute(worker, 'python3', '/tmp/seed.py')
-  receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /home/tester/private.bin').stdout)
+  receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
   run_id, run_dir = receipt['run_id'], receipt['run_dir']
   assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
   push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
@@ -846,7 +882,10 @@ print(count)''')
     return report['service_sync']['status'] == 'synced' and not report['service_sync']['worker_active']
   wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
   queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
-  assert queue_state['protocol'] == 'tracking_v1' and queue_state['files'] == {}, 'fresh publishing queue used terminal per-file multipart instead of tracking-v1'
+  assert queue_state['protocol'] == 'tracking_v1' and set(queue_state['files']) <= {'outputs/checkpoint-1000.pt'}, 'fresh publishing queue used per-file multipart for tracking metadata or streams'
+  registered = next(file for file in service_record('list_files', run_id)['files']
+    if file['target']['path'] == 'outputs/checkpoint-1000.pt')
+  assert registered['storage'] == 'object' and registered['size'] == len(b'registered-live-checkpoint') * 4096, 'registered checkpoint did not recover from the service outage'
   tracked = tracking_files(run_id)
   assert all(path in tracked for path in ['run-state.json', 'snapshot.json', 'outputs/params.json', 'outputs/metrics.jsonl', 'logs/stdout.log', 'logs/stderr.log']), 'terminal tracking catalog omitted run records or raw streams'
   assert tracked['outputs/metrics.jsonl']['storage']['tracking']['sealed'] is True, 'terminal metrics were not sealed at their acknowledged extent'
@@ -858,14 +897,66 @@ print(count)''')
   client(worker, 'push', *push_args, '--artifact', 'outputs/checkpoint.pt')
   counts = api_proxy('/test/state')['part_urls']
   assert counts.get('1') == 1 and counts.get('2') == 1 and counts.get('3') == 1, counts
-  second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /home/tester/private.bin').stdout)
+  sync_gate = '/tmp/expri-live-sync.release'
+  python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
+  second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /tmp/expri-live-sync.release').stdout)
   assert second['run_id'] != run_id, 'second experiment reused the first run identity'
+  live_repo = '/home/tester/live-review'
+  watch_config = '''[project]
+name = "Live file sync"
+[download]
+results_dir = "results"
+[file_sync]
+client_config = "/tmp/owner.toml"
+project_id = "demo"
+origins = ["worker"]
+labels = ["best"]
+'''
+  python(host, f"from pathlib import Path;p=Path({live_repo!r});p.mkdir();(p/'expri.toml').write_text({watch_config!r})")
+  watch_command = ['expri', 'sync', '--watch', '--repo', live_repo, '--config', live_repo + '/expri.toml']
+  file_sync_pid = int(python(host, f'''import subprocess
+with open('/tmp/file-sync.stdout', 'wb') as output, open('/tmp/file-sync.stderr', 'wb') as error:
+  process = subprocess.Popen({watch_command!r}, stdout=output, stderr=error, start_new_session=True)
+print(process.pid)
+'''))
+  live_cache = f"{live_repo}/results/service-demo-worker/runs/{second['run_id']}"
+  def live_checkpoint_received():
+    return python(host, f'''import hashlib, json
+from pathlib import Path
+root = Path({live_cache!r})
+checkpoint = root / 'outputs/checkpoint-1000.pt'
+metrics = root / 'outputs/metrics.jsonl'
+ready = checkpoint.exists() and metrics.exists() and (root / 'pull-state.json').exists()
+if ready:
+  rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+  receipt = json.loads((root / 'pull-state.json').read_text())
+  expected = b'registered-live-checkpoint' * 4096
+  completed = any(file['path'] == 'outputs/checkpoint-1000.pt'
+    and file['size'] == len(expected) and file['sha256'] == hashlib.sha256(expected).hexdigest()
+    for file in receipt.get('downloaded_files', []))
+  ready = completed and any(row['step'] >= 10 and 'loss' in row['metrics'] for row in rows)
+print(ready)
+''') == 'True'
+  wait_for(live_checkpoint_received, 'laptop watcher did not receive the registered checkpoint and live metrics', timeout=90)
+  assert json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'checkpoint sync waited until training completed'
+  live_result = json.loads(python(host, f'''import json
+from pathlib import Path
+root = Path({live_cache!r})
+receipt = json.loads((root / 'pull-state.json').read_text())
+assert (root / 'outputs/checkpoint-1000.pt').read_bytes() == b'registered-live-checkpoint' * 4096
+assert not (root / 'outputs/checkpoint.pt').exists(), 'label watch downloaded an unselected legacy checkpoint'
+print(json.dumps({{'status':json.loads((root / 'run-state.json').read_text())['status'],
+  'downloaded':[file['path'] for file in receipt['downloaded_files']]}}))
+'''))
+  assert live_result['status'] == 'running' and 'outputs/checkpoint-1000.pt' in live_result['downloaded'], 'live watcher did not commit a verified running-run download receipt'
+  stop_file_sync()
+  python(worker, f"from pathlib import Path;Path({sync_gate!r}).touch()")
   wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
   wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)
   for archived_run in [run_id, second['run_id']]:
     archive = wait_archive(archived_run)
     assert archive['incomplete'] is False and archive['file']['target']['path'] == 'result.zip', 'terminal archive did not finish independently as a complete result ZIP'
-  assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
+  assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt', 'outputs/checkpoint-1000.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
   intent = python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/publishing-request.json').read_text())")
   assert fixture_env['EXPRI_WORKER_TOKEN'] not in intent, 'publishing intent exposed its token'
   assert 'X-Amz-' not in intent, 'publishing intent exposed a signed URL'
@@ -945,6 +1036,11 @@ print(process.pid)
   browser('/logout', method='POST', cookie=terminal_session)
   storage_management_checks()
   docker('stop', '--time', '1', service, s3)
+  offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
+  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
+  offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
+  assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its configured private input'
+  assert publishing(offline_run['run_dir'])['status'] != 'synced', 'offline checkpoint registration claimed completed cloud sync'
   execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
   python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
   def review():
@@ -966,9 +1062,15 @@ with urlopen(url + checkpoint['download_url'], timeout=5) as response:
 print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
 '''))
   assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
+  assert offline_artifact['file']['downloaded'] is True, 'offline Files lost its verified checkpoint download receipt'
   assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
-  print('Service workflow passed: tracking-v1 publishing, acknowledged-prefix recovery, complete/partial archives, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
+  print('Service workflow passed: tracking-v1 publishing, configured private-input cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial archives, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
 finally:
+  if file_sync_pid is not None:
+    try:
+      stop_file_sync()
+    except (OSError, AssertionError):
+      print('File-sync watcher cleanup did not finish; container cleanup will stop it.', flush=True)
   if refresh_browser is not None and refresh_browser.poll() is None:
     refresh_browser.terminate()
     try:
@@ -993,6 +1095,9 @@ finally:
           'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
         ]:
           docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
+      if container.endswith('-host'):
+        for name in ['file-sync.stdout', 'file-sync.stderr']:
+          docker('cp', f'{container}:/tmp/{name}', str(logs / (name + '.log')), check=False, timeout=10)
       with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
         subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)
     except (OSError, subprocess.TimeoutExpired):

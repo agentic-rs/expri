@@ -18,7 +18,31 @@ pub(super) fn sync_file(
   path: &Path,
   snapshot: bool,
 ) -> Result<()> {
+  sync_file_checked(api, queue, key, target, path, snapshot, None)
+}
+
+pub(super) fn sync_registered(
+  api: &Api,
+  queue: &mut Queue,
+  key: &str,
+  target: FileTarget,
+  path: &Path,
+  registration: &crate::service::registrations::Registration,
+) -> Result<()> {
+  sync_file_checked(api, queue, key, target, path, false, Some(registration))
+}
+
+fn sync_file_checked(
+  api: &Api,
+  queue: &mut Queue,
+  key: &str,
+  target: FileTarget,
+  path: &Path,
+  snapshot: bool,
+  registration: Option<&crate::service::registrations::Registration>,
+) -> Result<()> {
   validate_target(&target)?;
+  verify_registration(path, registration)?;
   if queue
     .state
     .files
@@ -28,7 +52,7 @@ pub(super) fn sync_file(
     if queue.state.files[key].target != target {
       return Err(message("queued upload belongs to a different file"));
     }
-    finish_upload(api, queue, key, path)?;
+    finish_upload(api, queue, key, path, registration)?;
   }
   let mut source = fs::open(path)?;
   let initial = source.metadata()?;
@@ -36,6 +60,7 @@ pub(super) fn sync_file(
     return Err(message("run metadata exceeds the supported 16 MiB limit"));
   }
   let sha256 = fs::digest(&mut source, initial.len())?;
+  verify_registration(path, registration)?;
   if queue.state.files.get(key).is_some_and(|saved| {
     saved.target == target
       && saved.size == initial.len()
@@ -86,7 +111,17 @@ pub(super) fn sync_file(
   );
   // The generated upload ID is durable before the first server/object-store mutation.
   queue.save()?;
-  finish_upload(api, queue, key, path)
+  finish_upload(api, queue, key, path, registration)
+}
+
+fn verify_registration(
+  path: &Path,
+  registration: Option<&crate::service::registrations::Registration>,
+) -> Result<()> {
+  if let Some(registration) = registration {
+    crate::service::registrations::verify_metadata(registration, &fs::open(path)?.metadata()?)?;
+  }
+  Ok(())
 }
 
 pub(super) fn closed_prefix(file: &mut File, size: u64) -> Result<u64> {
@@ -184,7 +219,14 @@ pub(super) fn sync_stream(
   Ok(())
 }
 
-fn finish_upload(api: &Api, queue: &mut Queue, key: &str, source: &Path) -> Result<()> {
+fn finish_upload(
+  api: &Api,
+  queue: &mut Queue,
+  key: &str,
+  source: &Path,
+  registration: Option<&crate::service::registrations::Registration>,
+) -> Result<()> {
+  verify_registration(source, registration)?;
   let saved = queue
     .state
     .files
@@ -245,6 +287,7 @@ fn finish_upload(api: &Api, queue: &mut Queue, key: &str, source: &Path) -> Resu
       {
         continue;
       }
+      verify_registration(source, registration)?;
       let part_size = queue.state.files[key].upload.part_size;
       let offset = (number as u64 - 1) * part_size;
       let length = size.saturating_sub(offset).min(part_size);
@@ -287,6 +330,7 @@ fn finish_upload(api: &Api, queue: &mut Queue, key: &str, source: &Path) -> Resu
       {
         return Err(message("service returned inconsistent multipart progress"));
       }
+      verify_registration(source, registration)?;
       queue.state.files.get_mut(key).unwrap().upload = upload;
       queue.save()?;
     }
@@ -305,6 +349,7 @@ fn finish_upload(api: &Api, queue: &mut Queue, key: &str, source: &Path) -> Resu
         "finalized artifact changed or could not be verified while uploading; upload was not published and its receipts were discarded",
       ));
     }
+    verify_registration(source, registration)?;
     let Response::File { file: record } = api.request(&Request::CompleteUpload { upload_id })?
     else {
       return Err(message("service did not publish the completed upload"));

@@ -18,6 +18,14 @@ const DEPTH_LIMIT: usize = 16;
 pub(crate) struct Artifact {
   pub path: String,
   pub size: u64,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sha256: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sync_status: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub sync_error: Option<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,6 +128,10 @@ pub(crate) fn scan(run_dir: &Path) -> Result<Inventory> {
         let record = Artifact {
           path: relative.into(),
           size: metadata.len(),
+          sha256: None,
+          sync_status: None,
+          sync_error: None,
+          labels: Vec::new(),
         };
         // Leave space for indentation in the atomic pretty-printed manifest.
         let length = serde_json::to_vec_pretty(&record)?.len() + 24;
@@ -160,7 +172,11 @@ mod tests {
       inventory.files[0],
       Artifact {
         path: "outputs/model one.pt".into(),
-        size: 16 * 1024 * 1024 * 1024
+        size: 16 * 1024 * 1024 * 1024,
+        sha256: None,
+        sync_status: None,
+        sync_error: None,
+        labels: Vec::new(),
       }
     );
     assert!(!inventory.truncated);

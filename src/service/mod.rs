@@ -3,13 +3,16 @@ mod browser_assets;
 mod browser_auth;
 mod client;
 mod dashboard_data;
+pub(crate) mod inputs;
 mod notifications;
 pub(crate) mod publishing;
+pub(crate) mod registrations;
 mod server;
 mod storage;
 mod store;
 pub(crate) mod types;
 
+pub(crate) use client::sync_files;
 pub(crate) use types::validate_component;
 
 use std::net::SocketAddr;
@@ -18,6 +21,20 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::error::{ExpriError, Result};
+
+#[derive(Clone, Debug)]
+pub struct FileSyncOptions {
+  pub config: PathBuf,
+  pub project_id: String,
+  pub origins: Vec<String>,
+  pub repo: PathBuf,
+  pub results_dir: PathBuf,
+  pub artifacts: Vec<String>,
+  pub labels: Vec<String>,
+  pub watch: bool,
+  pub dry_run: bool,
+  pub quiet: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct ServiceCommand {

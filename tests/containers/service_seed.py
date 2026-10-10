@@ -27,6 +27,9 @@ client_config = "/tmp/worker.toml"
 project_id = "demo"
 origin = "worker"
 dashboard_url = "https://expri.example.net/"
+[[service.inputs]]
+input_id = "dataset-v1"
+destination = "dataset.bin"
 [tasks]
 train = ["python", "train.py"]
 fail = ["python", "-c", "raise SystemExit(7)"]

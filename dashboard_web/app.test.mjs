@@ -1512,6 +1512,31 @@ test("file selection shows explicit native links and a copyable cloud-only resum
   assert.equal(model.requests.length, requests, "the client config path stays entirely within the browser");
 });
 
+test("Files displays checkpoint progress and labels without trusting reports as cloud or laptop availability", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  model.model.artifact_files = [
+    checkpointFile("outputs/registered.pt", { cloud: false, sync_status: "registered", labels: ["latest"], labels_pending: true }),
+    checkpointFile("outputs/uploading.pt", { cloud: false, sync_status: "uploading" }),
+    checkpointFile("outputs/attention.pt", { cloud: false, sync_status: "needs_attention", sync_error: "Changed checkpoint <script>" }),
+    checkpointFile("outputs/cloud.pt", { cloud: true, sync_status: "cloud", labels: ["best"], sync_error: "stale error" }),
+    checkpointFile("outputs/older-cloud.pt", { cloud: true, sync_status: "uploading", labels: ["best"], labels_pending: true }),
+    checkpointFile("outputs/downloaded.pt", { cloud: true, local: true, downloaded: true }),
+    checkpointFile("outputs/reported.pt", { cloud: false, sync_status: "cloud" }),
+  ];
+  await filesView(model);
+  assert.match(fileRow(model.nodes, "outputs/registered.pt").textContent, /latest \(pending\).*Registered/);
+  assert.match(fileRow(model.nodes, "outputs/uploading.pt").textContent, /Uploading/);
+  assert.match(fileRow(model.nodes, "outputs/attention.pt").textContent, /Needs attention.*Changed checkpoint <script>/);
+  assert.equal(fileRow(model.nodes, "outputs/attention.pt").querySelector("script"), null);
+  assert.match(fileRow(model.nodes, "outputs/cloud.pt").textContent, /best.*Available in cloud/);
+  assert.equal(fileRow(model.nodes, "outputs/cloud.pt").textContent.includes("stale error"), false);
+  assert.match(fileRow(model.nodes, "outputs/older-cloud.pt").textContent, /best \(pending\).*Uploading.*Cloud copy is not yet confirmed/);
+  assert.match(fileRow(model.nodes, "outputs/downloaded.pt").textContent, /Downloaded locally/);
+  assert.match(fileRow(model.nodes, "outputs/reported.pt").textContent, /Awaiting cloud confirmation/);
+  assert.equal(fileCheckbox(model.nodes, "outputs/reported.pt").disabled, true);
+  assert.match(model.nodes.get("review-panel-files").textContent, /cannot see files downloaded to your laptop/);
+});
+
 test("file selections cap at 64 and search retains selected files outside the visible rows", async t => {
   const model = await autoFixture(t); await inspect(model);
   model.model.artifact_files = Array.from({ length: 65 }, (_, index) => checkpointFile(`outputs/${index}.pt`));

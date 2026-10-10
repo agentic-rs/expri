@@ -23,6 +23,8 @@ pub struct Config {
   pub environment: Option<EnvironmentConfig>,
   #[serde(default)]
   pub service: Option<RunServiceConfig>,
+  #[serde(default)]
+  pub file_sync: Option<FileSyncConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +63,74 @@ pub struct RunServiceConfig {
   pub origin: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub dashboard_url: Option<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub inputs: Vec<RunInputConfig>,
+  #[serde(default = "publish_enabled", skip_serializing_if = "is_enabled")]
+  pub publish: bool,
+}
+
+fn publish_enabled() -> bool {
+  true
+}
+fn is_enabled(value: &bool) -> bool {
+  *value
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunInputConfig {
+  pub input_id: String,
+  /// Relative to the worker's project-scoped private input cache.
+  pub destination: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSyncConfig {
+  pub client_config: PathBuf,
+  pub project_id: String,
+  pub origins: Vec<String>,
+  #[serde(default)]
+  pub artifacts: Vec<String>,
+  #[serde(default)]
+  pub labels: Vec<String>,
+}
+
+impl FileSyncConfig {
+  pub fn validate(&self) -> Result<()> {
+    crate::service::validate_component(&self.project_id)?;
+    if self.client_config.as_os_str().is_empty()
+      || self.origins.is_empty()
+      || self.origins.len() > 64
+    {
+      return Err(ExpriError::Message(
+        "file_sync requires a client_config and between 1 and 64 origins".into(),
+      ));
+    }
+    for origin in &self.origins {
+      crate::service::validate_component(origin)?;
+    }
+    if self.artifacts.len() + self.labels.len() > 64 || self.labels.len() > 2 {
+      return Err(ExpriError::Message(
+        "file_sync selects at most 64 artifact paths and two labels".into(),
+      ));
+    }
+    for path in &self.artifacts {
+      if path != "result.zip" && crate::run_artifacts::validate_path(path).is_err() {
+        return Err(ExpriError::Message(
+          "file_sync.artifacts must contain safe outputs/ paths or result.zip".into(),
+        ));
+      }
+    }
+    for label in &self.labels {
+      if !matches!(label.as_str(), "best" | "latest") {
+        return Err(ExpriError::Message(
+          "file_sync.labels accepts best and latest".into(),
+        ));
+      }
+    }
+    Ok(())
+  }
 }
 
 impl RunServiceConfig {
@@ -79,6 +149,34 @@ impl RunServiceConfig {
     for (name, value) in [("project_id", &self.project_id), ("origin", &self.origin)] {
       crate::service::validate_component(value)
         .map_err(|_| ExpriError::Message(format!("invalid service.{name}")))?;
+    }
+    if self.inputs.len() > 64 {
+      return Err(ExpriError::Message(
+        "service.inputs supports at most 64 private input files".into(),
+      ));
+    }
+    let mut destinations = std::collections::BTreeSet::new();
+    for input in &self.inputs {
+      crate::service::validate_component(&input.input_id)?;
+      let path = Path::new(&input.destination);
+      if input.destination.is_empty() || input.destination.len() > 1024
+        || input.destination.contains('\\') || input.destination.chars().any(char::is_control)
+        || input.destination.split('/').any(|part| part.is_empty() || part.starts_with('.'))
+        || path.components().any(|part| !matches!(part, Component::Normal(name) if !name.to_string_lossy().starts_with('.')))
+        || !destinations.insert(&input.destination)
+      {
+        return Err(ExpriError::Message("service.inputs destinations must be distinct relative paths without hidden components or '..'".into()));
+      }
+    }
+    for destination in &destinations {
+      if destinations
+        .iter()
+        .any(|other| other != destination && Path::new(destination).starts_with(other))
+      {
+        return Err(ExpriError::Message(
+          "service.inputs destinations must not overlap".into(),
+        ));
+      }
     }
     if let Some(value) = &self.dashboard_url {
       let url = reqwest::Url::parse(value)
@@ -264,6 +362,9 @@ impl Config {
     }
     config.local_environment()?;
     config.local_service()?;
+    if let Some(sync) = &config.file_sync {
+      sync.validate()?;
+    }
     for name in config.target.keys() {
       config.target(name)?;
     }
@@ -444,6 +545,61 @@ mod tests {
   use super::*;
 
   #[test]
+  fn private_input_destinations_are_safe_distinct_and_compatible_with_old_requests() {
+    let mut service: RunServiceConfig = toml::from_str(
+      "client_config='/etc/expri/worker.toml'\nproject_id='vision'\norigin='gpu-1'\n",
+    )
+    .unwrap();
+    assert!(service.publish);
+    assert!(service.inputs.is_empty());
+    let old = serde_json::to_value(&service).unwrap();
+    assert!(old.get("inputs").is_none());
+    assert!(old.get("publish").is_none());
+    for path in [
+      "../input",
+      "/private/input",
+      "a//b",
+      "a/./b",
+      "a/../b",
+      ".private",
+      "a\\b",
+      "a\tb",
+      "",
+    ] {
+      service.inputs = vec![RunInputConfig {
+        input_id: "dataset-v1".into(),
+        destination: path.into(),
+      }];
+      assert!(service.validate().is_err(), "{path:?}");
+    }
+    service.inputs = vec![RunInputConfig {
+      input_id: "dataset-v1".into(),
+      destination: "train/data.bin".into(),
+    }];
+    assert!(service.validate().is_ok());
+    service.inputs.push(RunInputConfig {
+      input_id: "other".into(),
+      destination: "train".into(),
+    });
+    assert!(service.validate().is_err());
+  }
+
+  #[test]
+  fn file_sync_requires_explicit_origins_and_checkpoint_selection() {
+    let good: FileSyncConfig = toml::from_str("client_config='owner.toml'\nproject_id='vision'\norigins=['gpu-1','gpu-2']\nlabels=['best']\nartifacts=['outputs/checkpoint-1000.pt']\n").unwrap();
+    assert!(good.validate().is_ok());
+    let mut bad = good.clone();
+    bad.origins.clear();
+    assert!(bad.validate().is_err());
+    bad = good.clone();
+    bad.labels = vec!["newest".into()];
+    assert!(bad.validate().is_err());
+    bad = good;
+    bad.artifacts = vec!["outputs/../private".into()];
+    assert!(bad.validate().is_err());
+  }
+
+  #[test]
   fn publishing_config_inherits_or_overrides_whole_worker_scope() {
     let config: Config = toml::from_str(
       r#"
@@ -479,6 +635,8 @@ origin = "gpu-2"
       project_id: "vision".into(),
       origin: "gpu-1".into(),
       dashboard_url: None,
+      inputs: Vec::new(),
+      publish: true,
     };
     assert!(base.validate().is_ok());
     for path in ["worker.toml", "/etc/../worker.toml"] {

@@ -312,6 +312,9 @@ footer { color: #8690a2; font-size: 10px; display: flex; justify-content: space-
 .files-table .text-button { white-space: nowrap; }
 .file-locations { display: flex; flex-wrap: wrap; gap: 5px; min-width: 100px; }
 .file-location { font-size: 10px; color: var(--muted); background: #f3f5f9; border: 1px solid var(--line); border-radius: 4px; padding: 2px 5px; white-space: nowrap; }
+.file-labels { display: inline-flex; flex-wrap: wrap; gap: 5px; margin-left: 8px; }
+.file-sync-status { display: inline-block; min-width: 100px; }
+.file-sync-error { max-width: 260px; margin: 4px 0 0; overflow-wrap: anywhere; }
 .file-location-note, .files-card .muted { font-size: 11px; }
 .file-location-note { margin-top: 12px; }
 .file-selection { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; margin-top: 16px; }

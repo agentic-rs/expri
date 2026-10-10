@@ -76,15 +76,35 @@ impl Api {
       .header(reqwest::header::CONTENT_TYPE, "application/json")
       .body(body)
       .send()
-      .map_err(|_| message("service request failed; saved work can be retried"))?;
+      .map_err(|_| ExpriError::ServiceUnavailable {
+        reading_response: false,
+      })?;
     let status = response.status();
     let mut bytes = Vec::new();
     response
       .take(MAX_REQUEST as u64 + 1)
       .read_to_end(&mut bytes)
-      .map_err(|_| message("service response could not be read; saved work can be retried"))?;
+      .map_err(|_| {
+        if status.is_success() {
+          ExpriError::ServiceUnavailable {
+            reading_response: true,
+          }
+        } else {
+          ExpriError::ServiceRejected {
+            status: status.as_u16(),
+            detail: "request rejected; response could not be read".into(),
+          }
+        }
+      })?;
     if bytes.len() > MAX_REQUEST {
-      return Err(message("service response exceeds its size limit"));
+      return Err(if status.is_success() {
+        message("service response exceeds its size limit")
+      } else {
+        ExpriError::ServiceRejected {
+          status: status.as_u16(),
+          detail: "request rejected; response exceeds its size limit".into(),
+        }
+      });
     }
     if !status.is_success() {
       let detail = serde_json::from_slice::<Value>(&bytes)
@@ -119,3 +139,6 @@ impl Api {
     Ok(url)
   }
 }
+
+#[cfg(test)]
+mod tests;

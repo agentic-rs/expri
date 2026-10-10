@@ -736,6 +736,11 @@ fn cached_artifact_catalog_reports_last_cloud_catalog_and_pull_scope() {
   assert_eq!(local["size"], 5);
   assert_eq!(local["local"], true);
   assert_eq!(local["cloud"], true);
+  assert_eq!(
+    local["downloaded"], false,
+    "a legacy cache without download receipts reports only local presence"
+  );
+  assert_eq!(local["sync_status"], "cloud");
   let cloud = rows
     .iter()
     .find(|row| row["path"] == "outputs/cloud-only.pt")
@@ -751,6 +756,58 @@ fn cached_artifact_catalog_reports_last_cloud_catalog_and_pull_scope() {
     false
   );
   assert!(!catalog["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cached_download_status_requires_a_current_receipt_and_unchanged_local_file() {
+  let fixture = Fixture::new();
+  let local = fixture.run("downloaded-files");
+  let run = fixture
+    .root
+    .join("results/service-worker/runs/downloaded-files");
+  fs::create_dir_all(run.join("outputs")).unwrap();
+  fs::copy(local.join("run-state.json"), run.join("run-state.json")).unwrap();
+  fs::write(run.join("outputs/model.pt"), b"checkpoint").unwrap();
+  let modified = fs::metadata(run.join("outputs/model.pt"))
+    .unwrap()
+    .modified()
+    .unwrap()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap();
+  let mut receipt = json!({"schema_version":1,
+    "scope":{"project_id":"project","origin":"worker","run_id":"downloaded-files"},
+    "available_files":[{"path":"outputs/model.pt","size":10,"sha256":"a".repeat(64)}],
+    "downloaded_files":[{"path":"outputs/model.pt","size":10,"sha256":"a".repeat(64),
+      "modified":[modified.as_secs(),modified.subsec_nanos()]}],"available_files_truncated":false});
+  fs::write(run.join("pull-state.json"), receipt.to_string()).unwrap();
+  let catalog = fixture
+    .dashboard
+    .artifacts("cached:service-worker", "downloaded-files")
+    .unwrap();
+  assert_eq!(catalog["files"][0]["downloaded"], true);
+  receipt["available_files"][0]["sha256"] = json!("b".repeat(64));
+  fs::write(run.join("pull-state.json"), receipt.to_string()).unwrap();
+  let changed_cloud = fixture
+    .dashboard
+    .artifacts("cached:service-worker", "downloaded-files")
+    .unwrap();
+  assert_eq!(changed_cloud["files"][0]["downloaded"], false);
+  receipt["available_files"][0]["sha256"] = json!("a".repeat(64));
+  fs::write(run.join("pull-state.json"), receipt.to_string()).unwrap();
+  fs::write(run.join("outputs/model.pt"), b"locally changed").unwrap();
+  let changed_local = fixture
+    .dashboard
+    .artifacts("cached:service-worker", "downloaded-files")
+    .unwrap();
+  assert_eq!(changed_local["files"][0]["local"], true);
+  assert_eq!(changed_local["files"][0]["downloaded"], false);
+  fs::remove_file(run.join("outputs/model.pt")).unwrap();
+  let missing_local = fixture
+    .dashboard
+    .artifacts("cached:service-worker", "downloaded-files")
+    .unwrap();
+  assert_eq!(missing_local["files"][0]["local"], false);
+  assert_eq!(missing_local["files"][0]["downloaded"], false);
 }
 
 #[test]

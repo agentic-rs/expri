@@ -1,3 +1,4 @@
+mod checkpoints;
 mod download;
 pub(super) mod fs;
 mod http;
@@ -7,6 +8,7 @@ mod queue;
 pub(super) mod tests;
 mod tracking;
 mod upload;
+mod watch;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -23,7 +25,8 @@ use http::Api;
 use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
-pub use download::{input_get, pull};
+pub use download::{input_get, input_get_prepared, pull};
+pub use watch::sync as sync_files;
 
 pub(super) fn validate_config(path: &Path) -> Result<()> {
   Api::new(path).map(|_| ())
@@ -53,6 +56,8 @@ fn terminal(state: &Value) -> bool {
 
 pub(super) struct Publisher {
   api: Api,
+  config: PathBuf,
+  checkpoints: checkpoints::CheckpointLane,
   run_dir: PathBuf,
   scope: RunScope,
   artifacts: BTreeSet<String>,
@@ -106,6 +111,8 @@ impl Publisher {
     let queue = Queue::new(queue_dir, owner)?;
     Ok(Self {
       api,
+      config: options.config.clone(),
+      checkpoints: checkpoints::CheckpointLane::default(),
       run_dir,
       scope,
       artifacts,
@@ -115,7 +122,14 @@ impl Publisher {
   }
 
   pub(super) fn cycle(&mut self, progress: &mut dyn FnMut(Value) -> Result<()>) -> Result<bool> {
-    push_cycle(
+    let checkpoints_done = self.checkpoints.poll(
+      &self.config,
+      &self.run_dir,
+      &self.scope,
+      &self.queue.directory,
+      self.watch,
+    )?;
+    let metadata_done = push_cycle(
       &self.api,
       &mut self.queue,
       &self.scope,
@@ -123,7 +137,8 @@ impl Publisher {
       &self.artifacts,
       self.watch,
       progress,
-    )
+    )?;
+    Ok(metadata_done && checkpoints_done)
   }
 
   pub(super) fn report(&self, done: bool) -> Value {
@@ -133,7 +148,17 @@ impl Publisher {
       .files
       .keys()
       .chain(self.queue.state.documents.keys())
+      .cloned()
       .collect::<BTreeSet<_>>();
+    let mut files = files;
+    if let Ok(checkpoints) = super::registrations::records(&self.run_dir) {
+      files.extend(
+        checkpoints
+          .into_iter()
+          .filter(|file| file.sync_status == "cloud")
+          .map(|file| file.path),
+      );
+    }
     json!({
       "scope": self.scope, "terminal": done,
       "files": files,
@@ -146,6 +171,14 @@ impl Publisher {
     let mut progress = queue_progress(&self.queue);
     progress["terminal"] = json!(done);
     progress["queue_dir"] = json!(self.queue.directory);
+    if let Ok(checkpoints) = super::registrations::records(&self.run_dir) {
+      progress["checkpoints"] = json!({
+        "registered": checkpoints.iter().filter(|file| file.sync_status == "registered").count(),
+        "uploading": checkpoints.iter().filter(|file| file.sync_status == "uploading").count(),
+        "cloud": checkpoints.iter().filter(|file| file.sync_status == "cloud").count(),
+        "needs_attention": checkpoints.iter().filter(|file| file.sync_status == "needs_attention").count(),
+      });
+    }
     progress
   }
 
@@ -317,7 +350,11 @@ fn push_cycle(
       progress(queue_progress(queue))?;
     }
   }
-  for path in artifacts.iter().filter(|_| done) {
+  let registrations = super::registrations::records(run_dir)?;
+  for path in artifacts
+    .iter()
+    .filter(|path| done && !registrations.iter().any(|file| file.path == **path))
+  {
     sync_file(
       api,
       queue,
@@ -343,9 +380,18 @@ fn push_cycle(
     sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
     progress(queue_progress(queue))?;
   }
-  if done && protocol == queue::Protocol::TrackingV1 {
-    tracking::seal(api, queue, scope)?;
-    progress(queue_progress(queue))?;
+  if done {
+    if !super::registrations::close_if_ready(run_dir, || inventory::record(run_dir))? {
+      return Ok(false);
+    }
+    if inventory::record(run_dir).is_ok() {
+      let path = crate::run_artifacts::INVENTORY_PATH;
+      sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
+    }
+    if protocol == queue::Protocol::TrackingV1 {
+      tracking::seal(api, queue, scope)?;
+      progress(queue_progress(queue))?;
+    }
   }
   Ok(done)
 }
