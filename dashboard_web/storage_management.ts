@@ -24,7 +24,7 @@ export type DeletePreview = {
 };
 export type ProjectDeletion = {
   project_id: string;
-  status: "pending" | "deleted";
+  status: "pending" | "needs_attention" | "deleted";
   pending_tasks: number;
   deleted_objects: number;
   aborted_uploads: number;
@@ -75,7 +75,7 @@ export function projectDeletionValid(value: unknown, project_id: string): value 
   if (value === null || typeof value !== "object") return false;
   const deletion = value as ProjectDeletion;
   return deletion.project_id === project_id &&
-    (deletion.status === "pending" || deletion.status === "deleted") &&
+    (deletion.status === "pending" || deletion.status === "needs_attention" || deletion.status === "deleted") &&
     count(deletion.pending_tasks) && count(deletion.deleted_objects) && count(deletion.aborted_uploads) &&
     (deletion.last_error === null || typeof deletion.last_error === "string");
 }
@@ -208,7 +208,7 @@ export class StorageManagementController {
   async openPreview(): Promise<void> {
     const project_id = this.state.project_id;
     if (!this.state.delete_enabled || !project_id || this.state.phase === "submitting") return;
-    if (this.unresolved_submission || this.state.deletion?.status === "pending") {
+    if (this.unresolved_submission || (this.state.deletion && this.state.deletion.status !== "deleted")) {
       this.update({ phase: "status" });
       await this.checkStatus();
       return;
@@ -279,7 +279,7 @@ export class StorageManagementController {
       this.rememberProject(null);
       return;
     }
-    if (this.state.deletion?.status !== "pending" || this.polling_attempts >= 12 || this.disposed) return;
+    if (!this.state.deletion || this.polling_attempts >= 12 || this.disposed) return;
     this.deletion_timer = this.schedule(() => {
       this.deletion_timer = null;
       if (this.visible()) {
@@ -301,6 +301,7 @@ export class StorageManagementController {
       if (this.disposed || project_id !== this.state.deletion_project_id) return;
       if (!projectDeletionValid(value, project_id)) throw new Error("The cleanup status does not match this project.");
       this.unresolved_submission = false;
+      this.rememberProject(value.status === "deleted" ? null : project_id);
       this.update({ deletion: value, error: null, preview: null });
       this.scheduleDeletion();
     } catch (error) {

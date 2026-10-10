@@ -142,7 +142,8 @@ The run detail displays archive progress separately from training status, and
 provides an authenticated **Download archive** link after upload succeeds.
 A recovery export is visibly marked as a partial archive.
 
-Browser access is read-only. Sign-in issues an eight-hour Secure, HttpOnly,
+Browser access is read-only unless project deletion is explicitly enabled on the
+primary dashboard. Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
 Logout revokes the session. Restart the service after changing its password;
 restarts invalidate existing sessions. The CLI continues to use its existing
@@ -496,13 +497,29 @@ files, and retries after storage outages or a service restart. The dashboard
 shows pending cleanup even after the project leaves the catalog; checking its
 status does not submit another deletion.
 
+Cleanup status distinguishes **Pending** work from **Needs attention**.
+Network failures, throttling, and server errors retry after at least 30 seconds.
+Storage permission, configuration, invalid provider response, or local filesystem
+permission problems show a safe explanation and recheck after at least five
+minutes. Correct the reported cause; the server resumes cleanup automatically.
+Restart the service if its credentials or configuration changed. Each unfinished
+task retains its own error, so completion of another task does not hide a problem.
+Status becomes **Deleted** only when every cleanup task is complete, and its
+error clears. Unfinished work and its status survive a service restart.
+
+An accepted deletion cannot be undone: its project records are removed and some
+files may already have been cleaned up. A failed browser request can have an
+unknown outcome; use **Check status** before reviewing a fresh deletion preview.
+The dashboard never automatically replays the deletion request.
+
 For a versioned bucket, cleanup permanently removes all versions and delete
 markers of each eligible exact object key. It does not sweep the bucket or an
 arbitrary prefix. This matters for Backblaze, where a plain deletion can retain
 older versions. The storage credentials need permission to inspect bucket
 versioning, list versions, delete object versions, and abort multipart uploads,
 in addition to the existing upload/download permissions. Missing permissions or
-object retention leave cleanup pending with retries. See [Backblaze's deletion
+object retention leave cleanup unfinished with a **Needs attention** status and
+periodic rechecks. See [Backblaze's deletion
 behavior](https://www.backblaze.com/apidocs/s3-delete-object) and [AWS S3 deletion
 semantics](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html).
 

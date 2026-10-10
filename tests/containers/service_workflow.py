@@ -675,6 +675,9 @@ with urlopen(Request(url,data=b'x'*1024,method='PUT'),timeout=10) as response:
   status_path = '/api/projects/deletion?' + urlencode({'project_id': project_id})
   wait_for(lambda: browser_json(status_path, cookie)['last_error'] is not None,
     'S3 outage did not leave a visible retryable deletion', timeout=45)
+  interrupted = browser_json(status_path, cookie)
+  assert interrupted['status'] == 'pending' and interrupted['pending_tasks'] > 0, 'temporary S3 outage was treated as needing operator attention'
+  assert 'request failed' in interrupted['last_error'], 'cleanup discarded its safe storage failure reason'
   assert project_id not in {item['project_id'] for item in browser_json('/api/projects', cookie)['sources']}
   blocked = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
     'action': 'append_tracking', 'scope': scope, 'path': 'logs/stdout.log', 'offset': 0,
@@ -689,6 +692,8 @@ with urlopen(Request(url,data=b'x'*1024,method='PUT'),timeout=10) as response:
   cookie = dashboard_login()
   wait_for(lambda: browser_json(status_path, cookie)['status'] == 'deleted',
     'project cleanup did not resume after restart', timeout=90)
+  completed = browser_json(status_path, cookie)
+  assert completed['last_error'] is None and completed['pending_tasks'] == 0, 'completed cleanup retained a stale failure'
   assert s3_state('versions')['versions'] == [], 'project deletion retained S3 versions or delete markers'
   assert s3_state('uploads', pending_key)['uploads'] == [], 'project deletion retained a multipart upload'
   assert python(service, "from pathlib import Path;print(Path('/home/tester/state/tracking/delete-me').exists())") == 'False', 'project tracking files remained on the server'

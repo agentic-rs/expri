@@ -2112,6 +2112,59 @@ test("project deletion sends one reviewed POST and retains cleanup status after 
   assert.equal(nodes.document.defaultView.sessionStorage.length, 0);
 });
 
+test("cleanup needing attention renders an actionable cause and recovers after reload without another POST", async t => {
+  const posts = [];
+  let status = "needs_attention", accepted = false;
+  const cause = "S3 access denied. Grant delete permission to the service credentials.";
+  const cleanupStatus = () => ({ ...managementDeletion(status),
+    last_error: status === "needs_attention" ? cause : status === "pending" ? "S3 is temporarily unavailable." : null });
+  const model = await autoFixture(t, { projects: true, project_runs: [], override: (parsed, init) => {
+    if (parsed.pathname === "/api/storage/stats") return response({ stats: managementStats(), delete_enabled: true });
+    if (parsed.pathname === "/api/projects/delete-preview") return response(managementPreview());
+    if (parsed.pathname === "/api/projects/delete") { posts.push(JSON.parse(init.body)); accepted = true; return response(cleanupStatus(), 202); }
+    if (parsed.pathname === "/api/projects/deletion") return response(cleanupStatus());
+    if (parsed.pathname === "/api/projects" && accepted) return response({ project_name: "Hosted experiments", sources: [], initial_source: "", access_mode: "hosted", warnings: [] });
+    return null;
+  } }), { nodes } = model;
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("delete-project-button"));
+  await click(nodes.get("delete-project-button"));
+  await settled(() => nodes.document.getElementById("delete-project-password"));
+  setValue(nodes.get("delete-project-confirmation"), "vision"); await emit(nodes.get("delete-project-confirmation"), "input");
+  setValue(nodes.get("delete-project-password"), "private-password"); await emit(nodes.get("delete-project-password"), "input");
+  await emit(nodes.get("delete-project-submit").form, "submit");
+  await settled(() => nodes.document.getElementById("project-cleanup-label")?.textContent === "Needs attention");
+  assert.equal(nodes.get("project-cleanup-status").getAttribute("role"), "status");
+  assert.equal(nodes.get("project-cleanup-status").getAttribute("aria-live"), "polite");
+  assert.equal(nodes.get("project-cleanup-error").textContent.trim(), cause, "the actionable server cause remains intact");
+  assert.match(nodes.get("project-cleanup-status").textContent, /Resolve the reported cause.*server rechecks automatically/);
+  assert.equal(nodes.get("check-project-cleanup").disabled, false);
+  assert.equal(nodes.document.getElementById("delete-project-submit"), null);
+  assert.deepEqual(Object.values(nodes.document.defaultView.sessionStorage), ["vision"]);
+  await click(nodes.get("delete-project-close"));
+  assert.match(nodes.get("project-cleanup-summary").textContent, /Needs attention.*vision/);
+  await act(async () => { nodes.cleanup(); await microtasks(); });
+  nodes.cleanup = null;
+  await mountDashboard(nodes);
+  await settled(() => nodes.document.getElementById("project-cleanup-label")?.textContent === "Needs attention");
+  assert.equal(posts.length, 1, "reload recovers deletion state with status reads only");
+  assert.equal(requestCounts(model.requests)["/api/projects/delete-preview"], 1);
+  assert.equal(nodes.document.getElementById("delete-project-password"), null);
+  assert.equal(nodes.document.defaultView.localStorage.length, 0);
+  status = "pending";
+  await click(nodes.get("check-project-cleanup"));
+  assert.equal(nodes.get("project-cleanup-label").textContent, "Retrying cleanup");
+  assert.match(nodes.get("project-cleanup-error").textContent, /Cleanup is retrying.*temporarily unavailable/);
+  assert.deepEqual(Object.values(nodes.document.defaultView.sessionStorage), ["vision"]);
+  status = "deleted";
+  await click(nodes.get("check-project-cleanup"));
+  assert.equal(nodes.get("project-cleanup-label").textContent, "Completed");
+  assert.equal(nodes.document.getElementById("project-cleanup-error"), null);
+  assert.match(nodes.get("project-cleanup-status").textContent, /Cleanup completed/);
+  assert.equal(nodes.document.defaultView.sessionStorage.length, 0);
+  assert.equal(posts.length, 1);
+});
+
 test("stale deletion previews clear secrets and require another reviewed preview before submission", async t => {
   const posts = []; let revision = "preview-1";
   const model = await autoFixture(t, { projects: true, project_runs: [], override: (parsed, init) => {

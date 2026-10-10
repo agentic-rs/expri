@@ -135,7 +135,8 @@ export function ProjectStorageManagement({
       )}
       {state.deletion_project_id && state.phase === "closed" && (state.deletion || state.error) && (
         <div id="project-cleanup-summary" className="notice" role="status">
-          <span>{state.deletion?.status === "deleted" ? "Deleted" : "Cleanup status for"} project <strong>{state.deletion_project_id}</strong>.</span>
+          <span>{state.deletion?.status === "deleted" ? "Deleted" : state.deletion?.status === "needs_attention"
+            ? "Needs attention: cleanup for" : "Cleanup status for"} project <strong>{state.deletion_project_id}</strong>.</span>
           <button type="button" className="text-button" onClick={() => controller.showStatus()}>View cleanup status</button>
         </div>
       )}
@@ -190,16 +191,25 @@ export function ProjectStorageManagement({
         )}
         {state.phase === "status" && (
           <div id="project-cleanup-status" role="status" aria-live="polite">
+            {state.deletion && <p><strong id="project-cleanup-label">{state.deletion.status === "needs_attention"
+              ? "Needs attention" : state.deletion.status === "deleted" ? "Completed"
+              : state.deletion.last_error ? "Retrying cleanup" : "Cleanup in progress"}</strong></p>}
             <p><strong>{state.deletion_project_id}</strong>: {state.deletion?.status === "deleted"
               ? "Project deleted. Cleanup completed."
+              : state.deletion?.status === "needs_attention" ? "Project removed from the catalog. Storage cleanup needs attention."
               : state.deletion ? "Project removed from the catalog. Storage cleanup is in progress." : "Deletion status needs to be checked."}</p>
             {state.deletion && <dl className="delete-preview-counts">
               <div><dt>Pending cleanup tasks</dt><dd>{state.deletion.pending_tasks.toLocaleString()}</dd></div>
               <div><dt>Objects deleted</dt><dd>{state.deletion.deleted_objects.toLocaleString()}</dd></div>
               <div><dt>Uploads aborted</dt><dd>{state.deletion.aborted_uploads.toLocaleString()}</dd></div>
             </dl>}
-            {state.deletion?.last_error && <p className="notice error">Cleanup will retry on the server. {state.deletion.last_error}</p>}
-            {state.deletion?.status === "pending" && <p className="muted">
+            {state.deletion?.last_error && state.deletion.status !== "deleted" && <p id="project-cleanup-error" className="notice error">
+              {state.deletion.status === "pending" && "Cleanup is retrying. "}{state.deletion.last_error}
+            </p>}
+            {state.deletion?.status === "needs_attention" && <p className="muted">
+              Resolve the reported cause. The server rechecks automatically. Check status again after correcting the problem.
+            </p>}
+            {state.deletion && state.deletion.status !== "deleted" && <p className="muted">
               Cleanup continues on the server if you leave this page or restart the service. Check status again if progress stops updating.
             </p>}
             <button id="check-project-cleanup" type="button" className="button secondary" disabled={pending}

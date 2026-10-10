@@ -63,6 +63,7 @@ test("storage management validates scope and all counters without treating file 
   assert.equal(storageStatsValid({ ...stats(), retained_object_count: undefined }, project_id), false);
   assert.equal(deletionPreviewValid({ ...preview(), stats: stats("other") }, project_id), false);
   assert.equal(projectDeletionValid(deletion(), project_id), true);
+  assert.equal(projectDeletionValid(deletion(project_id, "needs_attention"), project_id), true);
   assert.equal(projectDeletionValid({ ...deletion(), status: "failed" }, project_id), false);
 });
 
@@ -199,6 +200,66 @@ test("pending cleanup identity survives a page restart without saving or replayi
   assert.equal(f.controller.getSnapshot().deletion.status, "deleted");
   assert.equal(f.posts().length, 0);
   assert.equal(f.requests.length, 1);
+  assert.equal(f.stored.size, 0);
+});
+
+test("cleanup needing attention stays unfinished, polls only reads, and recovers without repeating deletion", async t => {
+  let status = "needs_attention";
+  const error = "S3 denied cleanup. Grant delete permission to the service credentials.";
+  const f = fixture(t, parsed => {
+    if (parsed.pathname === "/api/projects/delete" || parsed.pathname === "/api/projects/deletion")
+      return response({ ...deletion(project_id, status), last_error: status === "needs_attention" ? error : null });
+    return null;
+  });
+  f.controller.setContext(project_id, true, false);
+  await settled();
+  await f.controller.openPreview();
+  await f.controller.submit(project_id, "secret");
+  assert.equal(f.controller.getSnapshot().deletion.status, "needs_attention");
+  assert.equal(f.controller.getSnapshot().deletion.last_error, error);
+  assert.deepEqual([...f.stored.values()], [project_id]);
+  f.controller.close();
+  await f.controller.openPreview();
+  assert.equal(f.controller.getSnapshot().phase, "status");
+  assert.equal(f.requests.filter(item => item.url.pathname === "/api/projects/delete-preview").length, 1,
+    "an unfinished cleanup cannot obtain another destructive preview");
+  for (let index = 0; index < 15; index++) await f.tick();
+  assert.equal(f.requests.filter(item => item.url.pathname === "/api/projects/deletion").length, 13,
+    "attention status uses the same bounded twelve read polls after the manual status check");
+  assert.deepEqual([...f.stored.values()], [project_id]);
+  status = "pending";
+  await f.controller.checkStatus();
+  assert.equal(f.controller.getSnapshot().deletion.status, "pending");
+  assert.equal(f.controller.getSnapshot().deletion.last_error, null);
+  assert.deepEqual([...f.stored.values()], [project_id]);
+  status = "deleted";
+  await f.controller.checkStatus();
+  assert.equal(f.controller.getSnapshot().deletion.status, "deleted");
+  assert.equal(f.stored.size, 0);
+  assert.equal(f.posts().length, 1);
+});
+
+test("a page restart recovers cleanup needing attention through reads without storing credentials", async t => {
+  let status = "needs_attention", visible = true;
+  const f = fixture(t, parsed => parsed.pathname === "/api/projects/deletion"
+    ? response({ ...deletion(project_id, status), last_error: status === "needs_attention" ? "S3 access denied." : null })
+    : null, { visible: () => visible });
+  f.stored.set("expri.project_deletion", project_id);
+  f.controller.setContext(null, false, false);
+  await settled();
+  assert.equal(f.controller.getSnapshot().phase, "status");
+  assert.equal(f.controller.getSnapshot().deletion.status, "needs_attention");
+  assert.deepEqual([...f.stored.entries()], [["expri.project_deletion", project_id]]);
+  visible = false;
+  await f.tick();
+  assert.equal(f.requests.length, 1, "hidden recovery pauses status reads");
+  visible = true;
+  status = "deleted";
+  await f.tick();
+  assert.equal(f.controller.getSnapshot().deletion.status, "deleted");
+  assert.equal(f.controller.getSnapshot().deletion.last_error, null);
+  assert.equal(f.requests.length, 2);
+  assert.equal(f.posts().length, 0);
   assert.equal(f.stored.size, 0);
 });
 

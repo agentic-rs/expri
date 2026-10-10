@@ -12,6 +12,45 @@ pub use super::types::CompletedPart;
 
 pub const MAX_PRESIGN_EXPIRY_SECS: u32 = 3600;
 
+pub type CleanupResult<T> = std::result::Result<T, CleanupError>;
+
+/// Cleanup failures carry only an operator-safe explanation, never provider details.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupError {
+  message: String,
+  needs_attention: bool,
+}
+
+impl CleanupError {
+  /// Callers must supply a safe explanation rather than a raw backend error.
+  pub fn retryable(message: impl Into<String>) -> Self {
+    Self {
+      message: message.into(),
+      needs_attention: false,
+    }
+  }
+
+  /// Callers must supply a safe explanation rather than a raw backend error.
+  pub fn needs_attention(message: impl Into<String>) -> Self {
+    Self {
+      message: message.into(),
+      needs_attention: true,
+    }
+  }
+
+  pub fn is_needs_attention(&self) -> bool {
+    self.needs_attention
+  }
+}
+
+impl std::fmt::Display for CleanupError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter.write_str(&self.message)
+  }
+}
+
+impl std::error::Error for CleanupError {}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct S3Config {
   #[serde(default)]
@@ -54,14 +93,14 @@ pub trait ObjectStorage: Send + Sync {
   ) -> Result<String> {
     self.presign_get(key, expires_secs)
   }
-  fn delete_object(&self, _key: &str) -> Result<()> {
-    Err(invalid(
-      "object deletion is not supported by this storage backend",
+  fn delete_object(&self, _key: &str) -> CleanupResult<()> {
+    Err(CleanupError::needs_attention(
+      "Object deletion is unsupported; configure a storage backend that supports cleanup",
     ))
   }
-  fn abort_upload(&self, _key: &str, _upload_id: &str) -> Result<()> {
-    Err(invalid(
-      "multipart cancellation is not supported by this storage backend",
+  fn abort_upload(&self, _key: &str, _upload_id: &str) -> CleanupResult<()> {
+    Err(CleanupError::needs_attention(
+      "Multipart cancellation is unsupported; configure a storage backend that supports cleanup",
     ))
   }
 }
@@ -168,21 +207,33 @@ impl S3Storage {
     }
     Ok(key)
   }
+
+  fn cleanup_object_key(&self, operation: &str, key: &str) -> CleanupResult<String> {
+    self.object_key(key).map_err(|_| {
+      CleanupError::needs_attention(format!(
+        "S3 {operation} could not start; repair the invalid stored object key or storage prefix"
+      ))
+    })
+  }
 }
 
 impl ObjectStorage for S3Storage {
-  fn delete_object(&self, key: &str) -> Result<()> {
+  fn delete_object(&self, key: &str) -> CleanupResult<()> {
     self.purge_object(key)
   }
 
-  fn abort_upload(&self, key: &str, upload_id: &str) -> Result<()> {
-    validate_upload_id(upload_id)?;
-    let key = self.object_key(key)?;
+  fn abort_upload(&self, key: &str, upload_id: &str) -> CleanupResult<()> {
+    validate_upload_id(upload_id).map_err(|_| {
+      CleanupError::needs_attention(
+        "S3 abort upload could not start; repair the invalid stored multipart upload ID",
+      )
+    })?;
+    let key = self.cleanup_object_key("abort upload", key)?;
     // Like completion, the sync client inserts the opaque ID before signing.
     let upload_id = s3::signing::uri_encode(upload_id, true);
     match self.bucket.abort_upload(&key, &upload_id) {
       Ok(()) | Err(S3Error::HttpFailWithBody(404, _)) => Ok(()),
-      Err(error) => Err(backend_error("abort upload", error)),
+      Err(error) => Err(cleanup_backend_error("abort upload", error)),
     }
   }
 
@@ -485,6 +536,95 @@ fn backend_error(operation: &str, error: S3Error) -> ExpriError {
   }
 }
 
+fn cleanup_check_status(operation: &str, status: u16) -> CleanupResult<()> {
+  if (200..300).contains(&status) {
+    return Ok(());
+  }
+  let failure = format!("S3 {operation} failed (HTTP {status})");
+  if matches!(status, 401 | 403) {
+    Err(CleanupError::needs_attention(format!(
+      "{failure}; check storage credentials, bucket permissions, or retention settings"
+    )))
+  } else if matches!(status, 408 | 409 | 425 | 429) || (500..600).contains(&status) {
+    Err(CleanupError::retryable(format!(
+      "{failure}; cleanup will retry"
+    )))
+  } else {
+    Err(CleanupError::needs_attention(format!(
+      "{failure}; check the bucket, endpoint, retention policy, and storage API support"
+    )))
+  }
+}
+
+fn cleanup_backend_error(operation: &str, error: S3Error) -> CleanupError {
+  // Matching typed errors keeps provider bodies, signed URLs and credentials out of persisted status.
+  match error {
+    S3Error::HttpFailWithBody(status, _) => cleanup_check_status(operation, status)
+      .err()
+      .unwrap_or_else(|| {
+        CleanupError::needs_attention(format!(
+          "S3 {operation} returned an unexpected response; check storage API support"
+        ))
+      }),
+    S3Error::Io(_) => CleanupError::retryable(format!(
+      "S3 {operation} request failed; check connectivity if retries continue"
+    )),
+    S3Error::Atto(error) => cleanup_transport_error(operation, error),
+    S3Error::RLCredentials
+    | S3Error::WLCredentials
+    | S3Error::CredentialsReadLock
+    | S3Error::CredentialsWriteLock => CleanupError::retryable(format!(
+      "S3 {operation} could not access credentials; cleanup will retry"
+    )),
+    S3Error::Credentials(_)
+    | S3Error::Region(_)
+    | S3Error::UrlParse(_)
+    | S3Error::HmacInvalidLength(_)
+    | S3Error::InvalidHeaderValue(_)
+    | S3Error::AttoHeaderName(_) => CleanupError::needs_attention(format!(
+      "S3 {operation} could not start; check storage endpoint, region, and credentials"
+    )),
+    _ => CleanupError::needs_attention(format!(
+      "S3 {operation} returned an invalid or unsupported response; check storage API support"
+    )),
+  }
+}
+
+fn cleanup_transport_error(operation: &str, error: attohttpc::Error) -> CleanupError {
+  use attohttpc::ErrorKind;
+
+  match error.kind() {
+    ErrorKind::StatusCode(status)
+    | ErrorKind::ConnectError {
+      status_code: status,
+      ..
+    } => cleanup_backend_error(
+      operation,
+      S3Error::HttpFailWithBody(status.as_u16(), String::new()),
+    ),
+    ErrorKind::Io(_) => CleanupError::retryable(format!(
+      "S3 {operation} request failed; check connectivity if retries continue"
+    )),
+    ErrorKind::Tls(rustls::Error::InvalidCertificate(_))
+    | ErrorKind::InvalidDNSName(_)
+    | ErrorKind::ServerCertVerifier(_)
+    | ErrorKind::TlsDisabled => CleanupError::needs_attention(format!(
+      "S3 {operation} TLS setup failed; check the endpoint certificate and TLS configuration"
+    )),
+    ErrorKind::Tls(_) => CleanupError::retryable(format!(
+      "S3 {operation} TLS connection failed; cleanup will retry"
+    )),
+    ErrorKind::InvalidResponse(_) | ErrorKind::TooManyRedirections => {
+      CleanupError::needs_attention(format!(
+        "S3 {operation} returned an invalid HTTP response; check the endpoint and storage API support"
+      ))
+    }
+    _ => CleanupError::needs_attention(format!(
+      "S3 {operation} could not start; check storage endpoint and HTTP client configuration"
+    )),
+  }
+}
+
 fn invalid(message: impl Into<String>) -> ExpriError {
   ExpriError::Message(message.into())
 }
@@ -774,6 +914,172 @@ mod tests {
   }
 
   #[test]
+  fn cleanup_classifies_http_statuses_without_persisting_provider_details() {
+    for status in [400, 401, 403, 404, 408, 409, 425, 429, 500, 503] {
+      let error = cleanup_backend_error(
+        "delete object",
+        S3Error::HttpFailWithBody(
+          status,
+          "test-secret http://private/key?X-Amz-Signature=signed-secret".into(),
+        ),
+      );
+      assert_eq!(
+        error.is_needs_attention(),
+        matches!(status, 400 | 401 | 403 | 404),
+        "HTTP {status}: {error}"
+      );
+      let reason = error.to_string();
+      assert!(reason.contains(&format!("delete object failed (HTTP {status})")));
+      assert!(!reason.contains("secret") && !reason.contains("http://"));
+    }
+    let error = cleanup_backend_error(
+      "abort upload",
+      S3Error::Io(std::io::Error::other("signed-secret http://private/key")),
+    );
+    assert!(!error.is_needs_attention());
+    assert_eq!(
+      error.to_string(),
+      "S3 abort upload request failed; check connectivity if retries continue"
+    );
+    let error = cleanup_backend_error(
+      "delete object",
+      S3Error::UrlParse(reqwest::Url::parse("http://[signed-secret").unwrap_err()),
+    );
+    assert!(error.is_needs_attention());
+    assert!(error.to_string().contains("check storage endpoint"));
+  }
+
+  #[test]
+  fn cleanup_unsupported_backends_require_operator_attention() {
+    struct ReadOnlyStorage;
+    impl ObjectStorage for ReadOnlyStorage {
+      fn begin_upload(&self, _: &str, _: &str) -> Result<String> {
+        unreachable!()
+      }
+
+      fn presign_part(&self, _: &str, _: &str, _: u32, _: u32) -> Result<String> {
+        unreachable!()
+      }
+
+      fn complete_upload(&self, _: &str, _: &str, _: &[CompletedPart]) -> Result<ObjectMetadata> {
+        unreachable!()
+      }
+
+      fn head(&self, _: &str) -> Result<Option<ObjectMetadata>> {
+        unreachable!()
+      }
+
+      fn presign_get(&self, _: &str, _: u32) -> Result<String> {
+        unreachable!()
+      }
+    }
+
+    for error in [
+      ReadOnlyStorage.delete_object("signed-secret").unwrap_err(),
+      ReadOnlyStorage
+        .abort_upload("signed-secret", "secret-upload")
+        .unwrap_err(),
+    ] {
+      assert!(error.is_needs_attention());
+      assert!(error.to_string().contains("configure a storage backend"));
+      assert!(!error.to_string().contains("secret"));
+    }
+  }
+
+  #[test]
+  fn cleanup_http_permission_and_outage_failures_cover_each_operation() {
+    use std::{io::Write, net::TcpListener, thread};
+    for operation in [
+      "get bucket versioning",
+      "list object versions",
+      "delete object",
+      "delete object version",
+      "abort upload",
+    ] {
+      for status in [403, 503] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+          let mut replies = Vec::new();
+          if matches!(operation, "list object versions" | "delete object version") {
+            replies.push((
+              200,
+              "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            ));
+          } else if operation == "delete object" {
+            replies.push((200, "<VersioningConfiguration/>"));
+          }
+          if operation == "delete object version" {
+            replies.push((200, "<ListVersionsResult><Prefix>expri/runs/a/key</Prefix><IsTruncated>false</IsTruncated><Version><Key>expri/runs/a/key</Key><VersionId>first</VersionId></Version></ListVersionsResult>"));
+          }
+          replies.push((status, "<Error><Message>test-secret http://private/?X-Amz-Signature=signed-secret</Message></Error>"));
+          for (status, body) in replies {
+            let mut stream = accept_peer(&listener);
+            read_http_request(&mut stream);
+            write!(
+              stream,
+              "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+              body.len()
+            )
+            .unwrap();
+          }
+        });
+        let mut config = config();
+        config.endpoint = Some(format!("http://{address}"));
+        let storage = storage(config);
+        let result = if operation == "abort upload" {
+          storage.abort_upload("runs/a/key", "upload")
+        } else {
+          storage.delete_object("runs/a/key")
+        };
+        let error = result.unwrap_err();
+        assert_eq!(error.is_needs_attention(), status == 403);
+        let reason = error.to_string();
+        assert!(reason.contains(&format!("S3 {operation} failed (HTTP {status})")));
+        assert!(!reason.contains("secret") && !reason.contains("http://"));
+        assert!(!reason.contains(&address.to_string()));
+        peer.join().unwrap();
+      }
+    }
+  }
+
+  #[test]
+  fn cleanup_requires_attention_for_invalid_http_response_and_local_metadata() {
+    use std::{io::Write, net::TcpListener, thread};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let peer = thread::spawn(move || {
+      // The S3 client retries transport failures before returning its final typed error.
+      for _ in 0..=s3::get_retries() {
+        let mut stream = accept_peer(&listener);
+        read_http_request(&mut stream);
+        stream.write_all(b"HTTP/1.1 signed-secret\r\n\r\n").unwrap();
+      }
+    });
+    let mut config = config();
+    config.endpoint = Some(format!("http://{address}"));
+    let storage = storage(config);
+    let error = storage.delete_object("runs/a/key").unwrap_err();
+    assert!(error.is_needs_attention());
+    assert!(error.to_string().contains("invalid HTTP response"));
+    assert!(!error.to_string().contains("signed-secret"));
+    peer.join().unwrap();
+
+    for error in [
+      storage.delete_object("runs/../signed-secret").unwrap_err(),
+      storage
+        .abort_upload("runs/a/key", "signed-secret\n")
+        .unwrap_err(),
+    ] {
+      assert!(error.is_needs_attention());
+      assert!(error.to_string().contains("repair the invalid stored"));
+      assert!(!error.to_string().contains("signed-secret"));
+    }
+  }
+
+  #[test]
   fn cleanup_requests_sign_exact_object_versions_and_opaque_multipart_ids() {
     use std::{io::Write, net::TcpListener, thread};
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -893,12 +1199,10 @@ mod tests {
       });
       let mut config = config();
       config.endpoint = Some(format!("http://{address}"));
-      let result = storage(config)
-        .delete_object("runs/a/key")
-        .unwrap_err()
-        .to_string();
-      assert!(result.contains("403"));
-      assert!(!result.contains("signed-secret"));
+      let error = storage(config).delete_object("runs/a/key").unwrap_err();
+      assert!(error.is_needs_attention());
+      assert!(error.to_string().contains("403"));
+      assert!(!error.to_string().contains("signed-secret"));
       peer.join().unwrap();
     }
   }
@@ -964,13 +1268,9 @@ mod tests {
     let mut config = config();
     config.endpoint = Some(format!("http://{address}"));
     let storage = storage(config);
-    assert!(
-      storage
-        .delete_object("runs/a/key")
-        .unwrap_err()
-        .to_string()
-        .contains("cleanup will retry")
-    );
+    let error = storage.delete_object("runs/a/key").unwrap_err();
+    assert!(!error.is_needs_attention());
+    assert!(error.to_string().contains("cleanup will retry"));
     storage.delete_object("runs/a/key").unwrap();
     peer.join().unwrap();
   }
@@ -1033,8 +1333,73 @@ mod tests {
       if case == "neighbor" {
         assert!(result.is_ok());
       } else {
-        assert!(!result.unwrap_err().to_string().contains("signed-secret"));
+        let error = result.unwrap_err();
+        assert!(error.is_needs_attention());
+        assert!(!error.to_string().contains("signed-secret"));
       }
+      peer.join().unwrap();
+    }
+  }
+
+  #[test]
+  fn version_cleanup_rejects_oversized_deep_and_overfull_provider_responses() {
+    use std::{io::Write, net::TcpListener, thread};
+    for case in ["oversized", "deep", "overfull"] {
+      let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+      listener.set_nonblocking(true).unwrap();
+      let address = listener.local_addr().unwrap();
+      let peer = thread::spawn(move || {
+        let body = match case {
+          "oversized" => format!(
+            "<VersioningConfiguration><Secret>{}</Secret></VersioningConfiguration>",
+            "signed-secret".repeat(11_000)
+          ),
+          "deep" => format!(
+            "<VersioningConfiguration>{}signed-secret{}</VersioningConfiguration>",
+            "<Level>".repeat(16),
+            "</Level>".repeat(16)
+          ),
+          _ => "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".into(),
+        };
+        let mut stream = accept_peer(&listener);
+        assert!(read_http_request(&mut stream).starts_with("GET "));
+        write!(
+          stream,
+          "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .unwrap();
+        drop(stream);
+        if case == "overfull" {
+          let mut stream = accept_peer(&listener);
+          assert!(read_http_request(&mut stream).starts_with("GET "));
+          let versions: String = (0..17)
+            .map(|index| format!(
+              "<Version><Key>expri/runs/a/key</Key><VersionId>signed-secret-{index}</VersionId></Version>"
+            ))
+            .collect();
+          let body = format!(
+            "<ListVersionsResult><Prefix>expri/runs/a/key</Prefix><IsTruncated>false</IsTruncated>{versions}</ListVersionsResult>"
+          );
+          write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+          )
+          .unwrap();
+        }
+      });
+      let mut config = config();
+      config.endpoint = Some(format!("http://{address}"));
+      let error = storage(config).delete_object("runs/a/key").unwrap_err();
+      assert!(error.is_needs_attention());
+      let reason = error.to_string();
+      assert!(reason.contains(if case == "overfull" {
+        "invalid metadata"
+      } else {
+        "invalid XML response"
+      }));
+      assert!(!reason.contains("signed-secret"));
       peer.join().unwrap();
     }
   }
@@ -1069,11 +1434,12 @@ mod tests {
     config.endpoint = Some(format!("http://{address}"));
     let storage = storage(config);
     storage.delete_object("runs/a/key").unwrap();
-    let error = storage
-      .abort_upload("runs/a/key", "upload")
-      .unwrap_err()
-      .to_string();
-    assert_eq!(error, "S3 abort upload failed (HTTP 403)");
+    let error = storage.abort_upload("runs/a/key", "upload").unwrap_err();
+    assert!(error.is_needs_attention());
+    assert_eq!(
+      error.to_string(),
+      "S3 abort upload failed (HTTP 403); check storage credentials, bucket permissions, or retention settings"
+    );
     peer.join().unwrap();
   }
 

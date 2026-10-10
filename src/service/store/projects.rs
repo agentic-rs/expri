@@ -3,6 +3,7 @@ use std::sync::TryLockError;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
+use crate::service::storage::{CleanupError, CleanupResult};
 
 const TARGET_PROJECT: &str =
   "COALESCE(json_extract(target,'$.scope.project_id'),json_extract(target,'$.project_id'))";
@@ -10,11 +11,14 @@ const TARGET_PROJECT: &str =
 pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
   db.execute_batch("CREATE TABLE IF NOT EXISTS project_change_revisions(project_id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS project_deletions(project_id TEXT PRIMARY KEY,revision TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',last_error TEXT);
-    CREATE TABLE IF NOT EXISTS project_cleanup_tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,multipart TEXT NOT NULL DEFAULT '',done INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,UNIQUE(project_id,kind,value,multipart));
+    CREATE TABLE IF NOT EXISTS project_cleanup_tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,project_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,multipart TEXT NOT NULL DEFAULT '',done INTEGER NOT NULL DEFAULT 0,retry_at INTEGER NOT NULL DEFAULT 0,last_error TEXT,needs_attention INTEGER NOT NULL DEFAULT 0,UNIQUE(project_id,kind,value,multipart));
     CREATE INDEX IF NOT EXISTS project_cleanup_ready ON project_cleanup_tasks(done,retry_at,id);
     CREATE TABLE IF NOT EXISTS dashboard_catalog_revision(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL);
     INSERT OR IGNORE INTO dashboard_catalog_revision(id,revision) SELECT 1,COALESCE(MAX(sequence),0) FROM dashboard_run_activity;")
     .map_err(|_| crate::error::ExpriError::Message("cannot initialize project management".into()))?;
+  initialize_cleanup_failures(db).map_err(|_| {
+    crate::error::ExpriError::Message("cannot initialize project cleanup recovery".into())
+  })?;
   for event in ["INSERT", "UPDATE", "DELETE"] {
     let row = if event == "DELETE" { "OLD" } else { "NEW" };
     for (table, expression) in [
@@ -63,6 +67,36 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize catalog revision tracking".into()))?;
   }
   Ok(())
+}
+
+fn initialize_cleanup_failures(db: &Connection) -> rusqlite::Result<()> {
+  let columns = db
+    .prepare("PRAGMA table_info(project_cleanup_tasks)")?
+    .query_map([], |row| row.get::<_, String>(1))?
+    .collect::<rusqlite::Result<Vec<_>>>()?;
+  let transaction = db.unchecked_transaction()?;
+  if !columns.iter().any(|column| column == "last_error") {
+    transaction.execute_batch("ALTER TABLE project_cleanup_tasks ADD COLUMN last_error TEXT;
+      UPDATE project_cleanup_tasks SET last_error='Cleanup could not complete; check storage and network. Automatic retries continue.' WHERE done=0 AND retry_at>0;")?;
+  }
+  if !columns.iter().any(|column| column == "needs_attention") {
+    transaction.execute_batch(
+      "ALTER TABLE project_cleanup_tasks ADD COLUMN needs_attention INTEGER NOT NULL DEFAULT 0;",
+    )?;
+  }
+  transaction.execute_batch(&format!(
+    "UPDATE project_deletions SET {};",
+    deletion_state_update()
+  ))?;
+  transaction.commit()
+}
+
+fn deletion_state_update() -> &'static str {
+  "status=CASE
+    WHEN EXISTS(SELECT 1 FROM project_cleanup_tasks WHERE project_id=project_deletions.project_id AND done=0 AND needs_attention=1) THEN 'needs_attention'
+    WHEN EXISTS(SELECT 1 FROM project_cleanup_tasks WHERE project_id=project_deletions.project_id AND done=0) THEN 'pending'
+    ELSE 'deleted' END,
+  last_error=(SELECT last_error FROM project_cleanup_tasks WHERE project_id=project_deletions.project_id AND done=0 AND last_error IS NOT NULL ORDER BY needs_attention DESC,id LIMIT 1)"
 }
 
 pub(super) fn ensure_active(db: &Connection, project_id: &str) -> ApiResult<()> {
@@ -400,16 +434,16 @@ impl<S: ObjectStorage> Store<S> {
       Err(TryLockError::WouldBlock) => return Ok(false),
       Err(_) => return Err(ApiError::new(503, "project cleanup unavailable")),
     };
-    // Another cleanup worker may have completed this task while the gate was acquired.
-    let done: bool = self
+    // Another cleanup worker may have completed or delayed this task while the gate was acquired.
+    let unavailable: bool = self
       .db()?
       .query_row(
-        "SELECT done FROM project_cleanup_tasks WHERE id=?1",
-        [id],
+        "SELECT done=1 OR retry_at>?2 FROM project_cleanup_tasks WHERE id=?1",
+        params![id, now()],
         |row| row.get(0),
       )
       .map_err(database)?;
-    if done {
+    if unavailable {
       return Ok(true);
     }
     let mut preserved = false;
@@ -427,20 +461,16 @@ impl<S: ObjectStorage> Store<S> {
           preserved = true;
           Ok(())
         } else if kind == "object" {
-          self
-            .storage
-            .delete_object(&value)
-            .map_err(|_| ApiError::new(502, "object cleanup unavailable"))
+          self.storage.delete_object(&value)
         } else {
-          self
-            .storage
-            .abort_upload(&value, &multipart)
-            .map_err(|_| ApiError::new(502, "multipart cleanup unavailable"))
+          self.storage.abort_upload(&value, &multipart)
         }
       }
       "tracking" => remove_local_tree(&self.directory, "tracking", &value),
       "archive" => remove_local_tree(&self.directory, "archives", &value),
-      _ => Err(ApiError::new(500, "invalid project cleanup task")),
+      _ => Err(CleanupError::needs_attention(
+        "Cleanup task is invalid; check the service configuration or upgrade the service.",
+      )),
     };
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;
@@ -448,24 +478,34 @@ impl<S: ObjectStorage> Store<S> {
       Ok(()) => {
         transaction
           .execute(
-            "UPDATE project_cleanup_tasks SET done=1,retry_at=0,kind=CASE WHEN ?2 THEN 'preserved' ELSE kind END WHERE id=?1",
+            "UPDATE project_cleanup_tasks SET done=1,retry_at=0,last_error=NULL,needs_attention=0,kind=CASE WHEN ?2 THEN 'preserved' ELSE kind END WHERE id=?1",
             params![id, preserved],
           )
           .map_err(database)?;
-        transaction.execute("UPDATE project_deletions SET status=CASE WHEN EXISTS(SELECT 1 FROM project_cleanup_tasks WHERE project_id=?1 AND done=0) THEN 'pending' ELSE 'deleted' END,last_error=CASE WHEN EXISTS(SELECT 1 FROM project_cleanup_tasks WHERE project_id=?1 AND done=0 AND retry_at>0) THEN last_error ELSE NULL END WHERE project_id=?1", [&project_id]).map_err(database)?;
       }
-      Err(_) => {
+      Err(error) => {
+        let delay = if error.is_needs_attention() { 300 } else { 30 };
         transaction
           .execute(
-            "UPDATE project_cleanup_tasks SET retry_at=?2 WHERE id=?1",
-            params![id, now().saturating_add(30)],
+            "UPDATE project_cleanup_tasks SET retry_at=?2,last_error=?3,needs_attention=?4 WHERE id=?1",
+            params![id, now().saturating_add(delay), error.to_string(), error.is_needs_attention()],
           )
           .map_err(database)?;
-        transaction.execute("UPDATE project_deletions SET status='pending',last_error='Cleanup is pending; acknowledged deletion will retry.' WHERE project_id=?1", [&project_id]).map_err(database)?;
       }
     }
+    transaction
+      .execute(
+        &format!(
+          "UPDATE project_deletions SET {} WHERE project_id=?1",
+          deletion_state_update()
+        ),
+        [&project_id],
+      )
+      .map_err(database)?;
     transaction.commit().map_err(database)?;
-    result.map(|()| true)
+    result
+      .map(|()| true)
+      .map_err(|error| ApiError::new(502, error.to_string()))
   }
 }
 
@@ -478,10 +518,14 @@ fn now() -> i64 {
 }
 
 /// Delete only descriptor-relative entries; a swapped parent link cannot escape the service directory.
-fn remove_local_tree(directory: &Path, parent: &str, name: &str) -> ApiResult<()> {
+fn remove_local_tree(directory: &Path, parent: &str, name: &str) -> CleanupResult<()> {
   use std::os::fd::AsRawFd;
   use std::os::unix::fs::OpenOptionsExt;
-  validate_component(name).map_err(bad)?;
+  validate_component(name).map_err(|_| {
+    CleanupError::needs_attention(
+      "Cleanup directory is invalid; check the service configuration or upgrade the service.",
+    )
+  })?;
   let base = fs::OpenOptions::new()
     .read(true)
     .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -507,21 +551,43 @@ fn remove_local_tree(directory: &Path, parent: &str, name: &str) -> ApiResult<()
   let parent = unsafe { fs::File::from_raw_fd(fd) };
   remove_entry(
     parent.as_raw_fd(),
-    &std::ffi::CString::new(name).map_err(|_| ApiError::new(500, "invalid cleanup directory"))?,
+    &std::ffi::CString::new(name).map_err(|_| {
+      CleanupError::needs_attention(
+        "Cleanup directory is invalid; check the service configuration or upgrade the service.",
+      )
+    })?,
     0,
   )?;
   parent.sync_all().map_err(local_error)
 }
 
-fn local_error(_: std::io::Error) -> ApiError {
-  ApiError::new(500, "local project cleanup unavailable")
+fn local_error(error: std::io::Error) -> CleanupError {
+  match error.raw_os_error() {
+    Some(libc::EACCES | libc::EPERM) => CleanupError::needs_attention(
+      "Local cleanup permission denied; allow the service to remove files in its data directory.",
+    ),
+    Some(libc::EROFS) => CleanupError::needs_attention(
+      "Local cleanup storage is read-only; make the service data directory writable.",
+    ),
+    Some(libc::ENOTDIR | libc::ELOOP | libc::EINVAL | libc::ENAMETOOLONG) => {
+      CleanupError::needs_attention(
+        "Local cleanup directory is invalid; check the service data directory configuration.",
+      )
+    }
+    _ => CleanupError::retryable(
+      "Local cleanup could not complete; check disk availability. Automatic retries continue.",
+    ),
+  }
 }
 
-fn remove_entry(parent: std::os::fd::RawFd, name: &std::ffi::CStr, depth: usize) -> ApiResult<()> {
+fn remove_entry(
+  parent: std::os::fd::RawFd,
+  name: &std::ffi::CStr,
+  depth: usize,
+) -> CleanupResult<()> {
   if depth > 64 {
-    return Err(ApiError::new(
-      500,
-      "cleanup directory depth exceeds its limit",
+    return Err(CleanupError::needs_attention(
+      "Local cleanup exceeds its directory depth limit; reduce nesting in the service data directory.",
     ));
   }
   let fd = unsafe {
@@ -550,10 +616,11 @@ fn remove_entry(parent: std::os::fd::RawFd, name: &std::ffi::CStr, depth: usize)
   }
   let entries = unsafe { libc::fdopendir(fd) };
   if entries.is_null() {
+    let error = std::io::Error::last_os_error();
     unsafe {
       libc::close(fd);
     }
-    return Err(local_error(std::io::Error::last_os_error()));
+    return Err(local_error(error));
   }
   let result = (|| {
     loop {
