@@ -756,6 +756,7 @@ fn cleanup_failure_columns_migrate_existing_schema_three_without_losing_pending_
   let db = Connection::open(directory.path().join("metadata.sqlite3")).unwrap();
   db.execute_batch("ALTER TABLE project_cleanup_tasks DROP COLUMN last_error;
     ALTER TABLE project_cleanup_tasks DROP COLUMN needs_attention;
+    PRAGMA user_version=3;
     UPDATE project_deletions SET last_error='Cleanup is pending; acknowledged deletion will retry.';")
     .unwrap();
   assert_eq!(
@@ -779,7 +780,7 @@ fn cleanup_failure_columns_migrate_existing_schema_three_without_losing_pending_
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
       .unwrap(),
-    3
+    4
   );
   backend.state.0.lock().unwrap().fail_delete = false;
   reopened

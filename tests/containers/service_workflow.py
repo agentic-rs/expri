@@ -603,6 +603,113 @@ def project_artifact_checks(first, second):
   browser('/logout',method='POST',cookie=cookie)
 
 
+def run_retention_checks():
+  """Expire an isolated fixture run; verify durable cleanup against versioned S3."""
+  import base64
+  from datetime import datetime
+
+  project_id = 'run-retention'
+  scope = {'project_id': project_id, 'origin': 'fixture', 'run_id': 'release'}
+  survivor = {**scope, 'run_id': 'keep'}
+  contents = b'retention-shared-input'
+  digest = hashlib.sha256(contents).hexdigest()
+  path = '/home/tester/retention.bin'
+  python(host, f'from pathlib import Path;Path({path!r}).write_bytes({contents!r})')
+  client(host, 'input upload', '--project-id', project_id, '--input-id', 'blob', '--file', path,
+    '--queue-dir', '/home/tester/retention-queue')
+  for run_scope in [scope, survivor]:
+    shared = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+      'action': 'reference_file',
+      'source': {'kind': 'input', 'project_id': project_id, 'input_id': 'blob'},
+      'target': {'kind': 'run', 'scope': run_scope, 'path': 'outputs/shared.bin'},
+      'size': len(contents), 'sha256': digest,
+    })
+    assert shared['status'] == 200, 'retention fixture could not reference its private input'
+    document = json.dumps({'run_id': run_scope['run_id'], 'status': 'completed'}).encode()
+    result = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+      'action': 'put_document', 'scope': run_scope, 'path': 'run-state.json', 'revision': 1,
+      'offset': 0, 'total_size': len(document), 'data_base64': base64.b64encode(document).decode(),
+    })
+    assert result['status'] == 200, 'retention fixture run state was not acknowledged'
+  unique = {'kind': 'run', 'scope': scope, 'path': 'outputs/unique.bin'}
+  client(host, 'file-upload', '--target', json.dumps(unique), '--file', path,
+    '--queue-dir', '/home/tester/retention-queue')
+  prefix = 'acceptance/projects/' + project_id + '/'
+  def versions():
+    return json.loads(execute(host, 'python3', '/tmp/s3_fixture.py', 'versions', '--prefix', prefix).stdout)['versions']
+  originals = versions()
+  input_key = next(item['key'] for item in originals if '/inputs/blob/' in item['key'])
+  unique_key = next(item['key'] for item in originals if '/runs/fixture/release/' in item['key'])
+  execute(host, 'python3', '/tmp/s3_fixture.py', 'put', '--key', unique_key, '--file', path)
+  input_versions = [item for item in originals if item['key'] == input_key]
+  cookie = dashboard_login()
+  catalog = browser_json('/api/catalog', cookie)
+  assert catalog['run_management_enabled'] is True
+  source_id = next(item['source_id'] for item in catalog['sources']
+    if item['project_id'] == project_id and item['origin'] == scope['origin'])
+  args = ['--project-id', project_id, '--origin', scope['origin'], '--run-id', scope['run_id']]
+  archived = json.loads(client(host, 'run archive', *args).stdout)
+  deadline = datetime.fromisoformat(archived['delete_after'].replace('Z', '+00:00'))
+  start = datetime.fromisoformat(archived['archived_at'].replace('Z', '+00:00'))
+  assert (deadline - start).total_seconds() == 15 * 86400, 'archive restore window is not exactly 15 days'
+  repeated = browser('/api/runs/archive', method='POST', cookie=cookie, payload=scope)
+  assert repeated['status'] == 200 and json.loads(repeated['body']) == archived, 'repeated archival changed its deadline'
+  def runs(archival):
+    return browser_json('/api/runs?' + urlencode({'source': source_id, 'archival': archival}), cookie)
+  assert runs('active')['total_count'] == 1 and runs('archived')['total_count'] == 1
+  assert [item['run_id'] for item in runs('active')['runs']] == [survivor['run_id']]
+  assert [item['run_id'] for item in runs('archived')['runs']] == [scope['run_id']]
+  assert browser_json('/api/runs?' + urlencode({'source': source_id}), cookie)['runs'] == runs('active')['runs'], 'default run list includes archived runs'
+  detail = browser_json('/api/run?' + urlencode({'source': source_id, 'run_id': scope['run_id']}), cookie)
+  assert detail['run']['status'] == 'completed' and detail['run']['archival'] == archived
+  restored = browser('/api/runs/restore', method='POST', cookie=cookie, payload=scope)
+  assert restored['status'] == 200 and json.loads(restored['body'])['status'] == 'active'
+  assert runs('active')['total_count'] == 2 and runs('archived')['total_count'] == 0
+  client(host, 'run archive', *args)
+  # Advance only this fixture's persisted deadline under SQLite's write lock.
+  # Production has no API or CLI switch to override the server's retention clock.
+  docker('stop', '--time', '1', s3)
+  python(service, f'''import sqlite3,time
+with sqlite3.connect('/home/tester/state/metadata.sqlite3', timeout=10) as db:
+  db.execute('BEGIN IMMEDIATE')
+  due = int(time.time()) - 1
+  changed = db.execute('UPDATE run_retention SET archived_at=?,delete_after=? WHERE project_id=? AND origin=? AND run_id=?',
+    [due - 15 * 86400, due, {project_id!r}, {scope['origin']!r}, {scope['run_id']!r}]).rowcount
+  assert changed == 1, 'retention fixture did not locate its isolated archival row'
+''')
+  def status():
+    return json.loads(client(host, 'run status', *args).stdout)
+  wait_for(lambda: status()['last_error'] is not None, 'S3 outage did not retain a visible run cleanup retry', timeout=45)
+  pending = status()
+  assert pending['status'] == 'deleting' and pending['pending_tasks'] > 0
+  assert 'request failed' in pending['last_error'], 'run cleanup discarded its safe storage failure reason'
+  late = browser('/v1/request', method='POST', bearer_env='EXPRI_OWNER_TOKEN', payload={
+    'action': 'append_tracking', 'scope': scope, 'path': 'logs/stdout.log', 'offset': 0,
+    'data_base64': base64.b64encode(b'late publication\n').decode(),
+  })
+  assert late['status'] == 410, 'late publisher resurrected an expired run'
+  assert client(host, 'run restore', *args, check=False).returncode != 0, 'expired run was restored'
+  docker('stop', '--time', '1', service)
+  docker('start', s3)
+  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://s3:9000/minio/health/ready',timeout=1).status)") == '200', 'S3 did not restart for run cleanup')
+  docker('start', service)
+  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service did not resume durable run cleanup')
+  wait_for(lambda: status()['status'] == 'deleted', 'run cleanup did not finish after restart', timeout=90)
+  completed = status()
+  assert completed['pending_tasks'] == 0 and completed['last_error'] is None
+  remaining = versions()
+  assert [item for item in remaining if item['key'] == input_key] == input_versions, 'run cleanup changed shared private input versions'
+  assert not any(item['key'] == unique_key for item in remaining), 'run cleanup retained unique output versions or delete markers'
+  assert python(service, "from pathlib import Path;print(Path('/home/tester/state/tracking/run-retention/fixture/release').exists())") == 'False'
+  kept = json.loads(python(service, "from pathlib import Path;print(Path('/home/tester/state/tracking/run-retention/fixture/keep/documents/run-state.json/1').read_text())"))
+  assert kept['run_id'] == survivor['run_id'] and kept['status'] == 'completed', 'run cleanup removed another run\'s tracking state'
+  cookie = dashboard_login()
+  assert browser('/api/input?' + urlencode({'project_id': project_id, 'input_id': 'blob'}), method='HEAD', cookie=cookie)['status'] == 200
+  assert browser('/api/artifact?' + urlencode({'source': source_id, 'run_id': survivor['run_id'], 'path': 'outputs/shared.bin'}), method='HEAD', cookie=cookie)['status'] == 200
+  assert runs('active')['total_count'] == 1 and runs('archived')['total_count'] == 0
+  browser('/logout', method='POST', cookie=cookie)
+
+
 def storage_management_checks():
   """Delete only an isolated fixture project; verify real versioned S3 cleanup."""
   import base64
@@ -1037,6 +1144,7 @@ print(process.pid)
     detail = browser_json('/api/run?' + urlencode({'source': terminal_source, 'run_id': result['run_id']}), terminal_session)
     assert detail['run']['status'] == expected, 'hosted result does not show the terminal training status'
   browser('/logout', method='POST', cookie=terminal_session)
+  run_retention_checks()
   storage_management_checks()
   docker('stop', '--time', '1', service, s3)
   offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)

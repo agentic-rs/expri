@@ -14,6 +14,7 @@ const DISCOVERY_LIMIT: usize = 100;
 const STRING_LIMIT: usize = 256;
 
 pub(crate) struct ListQuery<'a> {
+  pub archived: bool,
   pub origin: Option<&'a str>,
   pub search: Option<&'a str>,
   pub task: Option<&'a str>,

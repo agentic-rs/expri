@@ -33,6 +33,8 @@ impl<S: ObjectStorage> Store<S> {
     }
     let mut db = self.db()?;
     let transaction = db.transaction().map_err(database)?;
+    run_retention::ensure_target_available(&transaction, &source)?;
+    run_retention::ensure_target_available(&transaction, &target)?;
     let (stored, key, sequence): (String, String, i64) = transaction
       .query_row(
         "SELECT record,object_key,sequence FROM files WHERE target=?1",

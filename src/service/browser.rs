@@ -2,6 +2,7 @@ use http::{Request as HttpRequest, Response as HttpResponse};
 use serde_json::json;
 
 mod project_management;
+mod run_management;
 
 use super::browser_assets::{Asset, DashboardAssets};
 use super::browser_auth::BrowserAuth;
@@ -32,9 +33,17 @@ pub(super) fn handle<S: ObjectStorage>(
   auth: &BrowserAuth,
   assets: &DashboardAssets,
   allow_project_deletion: bool,
+  allow_run_management: bool,
   request: &HttpRequest<Vec<u8>>,
 ) -> HttpResponse<Vec<u8>> {
-  match route(dashboard, auth, assets, allow_project_deletion, request) {
+  match route(
+    dashboard,
+    auth,
+    assets,
+    allow_project_deletion,
+    allow_run_management,
+    request,
+  ) {
     Ok(reply) => reply,
     Err(error) => response(
       error.status,
@@ -162,6 +171,7 @@ fn route<S: ObjectStorage>(
   auth: &BrowserAuth,
   assets: &DashboardAssets,
   allow_project_deletion: bool,
+  allow_run_management: bool,
   request: &HttpRequest<Vec<u8>>,
 ) -> ApiResult<HttpResponse<Vec<u8>>> {
   auth.check_host(request)?;
@@ -194,6 +204,9 @@ fn route<S: ObjectStorage>(
     }
     ("POST", "/api/projects/delete") => {
       return project_management::delete(dashboard, auth, allow_project_deletion, request);
+    }
+    ("POST", "/api/runs/archive" | "/api/runs/restore") => {
+      return run_management::mutate(dashboard, auth, allow_run_management, request);
     }
     _ if !matches!(method, "GET" | "HEAD") => {
       return Err(ApiError::new(405, "dashboard routes require GET or HEAD"));
@@ -251,7 +264,17 @@ fn route<S: ObjectStorage>(
       .map_err(|_| ApiError::new(404, "result ZIP is unavailable"))?;
     return download_response(method, download);
   }
-  let reply = crate::dashboard::server::route_content(dashboard, uri);
+  let mut reply = crate::dashboard::server::route_content(dashboard, uri);
+  if reply.status == 200 && matches!(path, "/api/catalog" | "/api/projects") {
+    let mut value: serde_json::Value = serde_json::from_slice(&reply.body)
+      .map_err(|_| ApiError::new(500, "cannot decode dashboard capabilities"))?;
+    let fields = value
+      .as_object_mut()
+      .ok_or_else(|| ApiError::new(500, "invalid dashboard capabilities"))?;
+    fields.insert("run_management_enabled".into(), json!(allow_run_management));
+    reply.body = serde_json::to_vec(&value)
+      .map_err(|_| ApiError::new(500, "cannot encode dashboard capabilities"))?;
+  }
   let mut result = response(reply.status, reply.content_type, reply.body);
   if let Some(revision) = assets.current_revision()? {
     result.headers_mut().insert(
@@ -382,6 +405,7 @@ mod tests {
       auth,
       &DashboardAssets::embedded(),
       false,
+      true,
       request,
     )
   }
@@ -1060,8 +1084,9 @@ mod external_tests {
       b"a-preview-dashboard-password",
     )
     .unwrap();
-    let handle =
-      |request: &HttpRequest<Vec<u8>>| super::handle(&dashboard, &auth, &assets, false, request);
+    let handle = |request: &HttpRequest<Vec<u8>>| {
+      super::handle(&dashboard, &auth, &assets, false, false, request)
+    };
     assert_eq!(handle(&request("GET", "/", None)).status(), 303);
     assert_eq!(handle(&request("GET", "/api/catalog", None)).status(), 401);
     let login = handle(&request("GET", "/login", None));

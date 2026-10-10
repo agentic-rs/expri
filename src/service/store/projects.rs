@@ -151,7 +151,7 @@ fn stats(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<Proje
     "SELECT object_key,MAX(size) AS size FROM uploads WHERE {TARGET_PROJECT}=?1 AND complete=1 AND object_key NOT IN (SELECT object_key FROM files WHERE {TARGET_PROJECT}=?1 AND json_extract(record,'$.storage')='object') GROUP BY object_key"
   );
   let candidates = format!(
-    "SELECT object_key,MAX(size) AS size FROM ({current} UNION ALL {retained}) GROUP BY object_key"
+    "SELECT object_key,MAX(size) AS size FROM ({current} UNION ALL {retained} UNION ALL SELECT value AS object_key,size FROM run_cleanup_tasks WHERE project_id=?1 AND kind='object' AND done=0 AND size IS NOT NULL) GROUP BY object_key"
   );
   let protected = outside_references("candidate.object_key");
   let (file_count, logical_bytes) = count_sum(
@@ -190,7 +190,7 @@ fn stats(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<Proje
     ),
     project_id,
   )?;
-  let tracking_bytes = db.query_row(&format!("SELECT COALESCE(SUM(size),0) FROM (SELECT size FROM tracking_versions WHERE {TARGET_PROJECT}=?1 UNION ALL SELECT size FROM streams WHERE {TARGET_PROJECT}=?1)"), [project_id], |row| row.get(0)).map_err(database)?;
+  let tracking_bytes = db.query_row(&format!("SELECT COALESCE(SUM(size),0) FROM (SELECT size FROM tracking_versions WHERE {TARGET_PROJECT}=?1 UNION ALL SELECT size FROM streams WHERE {TARGET_PROJECT}=?1 UNION ALL SELECT size FROM run_cleanup_tasks WHERE project_id=?1 AND kind='tracking' AND done=0)"), [project_id], |row| row.get(0)).map_err(database)?;
   let local_archive_bytes = local_storage::archive_bytes(directory, db, project_id)?;
   Ok(ProjectStorageStats {
     project_id: project_id.into(),
@@ -229,7 +229,8 @@ fn preview(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<Pro
     UNION ALL SELECT 1 FROM uploads WHERE {TARGET_PROJECT}=?1
     UNION ALL SELECT 1 FROM streams WHERE {TARGET_PROJECT}=?1
     UNION ALL SELECT 1 FROM tracking_versions WHERE {TARGET_PROJECT}=?1
-    UNION ALL SELECT 1 FROM result_archives WHERE json_extract(scope,'$.project_id')=?1)"
+    UNION ALL SELECT 1 FROM result_archives WHERE json_extract(scope,'$.project_id')=?1
+    UNION ALL SELECT 1 FROM run_cleanup_tasks WHERE project_id=?1 AND done=0)"
       ),
       [project_id],
       |row| row.get(0),
@@ -297,7 +298,10 @@ impl<S: ObjectStorage> Store<S> {
       | Request::ProjectStorage { .. }
       | Request::PreviewProjectDelete { .. }
       | Request::DeleteProject { .. }
-      | Request::ProjectDeletion { .. } => return Ok(None),
+      | Request::ProjectDeletion { .. }
+      | Request::ArchiveRun { .. }
+      | Request::RestoreRun { .. }
+      | Request::RunArchival { .. } => return Ok(None),
       Request::BeginUpload { target, .. }
       | Request::GetFile { target }
       | Request::DownloadUrl { target } => project_of(target),
@@ -386,6 +390,24 @@ impl<S: ObjectStorage> Store<S> {
     transaction.execute(&format!("INSERT OR IGNORE INTO project_cleanup_tasks(project_id,kind,value,multipart) SELECT ?1,'multipart',object_key,multipart FROM uploads AS candidate WHERE {TARGET_PROJECT}=?1 AND complete=0 AND multipart IS NOT NULL AND NOT ({protected})"), [project_id]).map_err(database)?;
     transaction.execute("INSERT OR IGNORE INTO project_cleanup_tasks(project_id,kind,value) VALUES(?1,'tracking',?1)", [project_id]).map_err(database)?;
     transaction.execute("INSERT OR IGNORE INTO project_cleanup_tasks(project_id,kind,value) SELECT ?1,'archive',CAST(id AS TEXT) FROM result_archives WHERE json_extract(scope,'$.project_id')=?1", [project_id]).map_err(database)?;
+    // Expired runs no longer have file rows. Transfer their outstanding cleanup,
+    // including retained ZIP payloads, before the project takes ownership.
+    let adopted_protection = outside_references("candidate.value");
+    transaction.execute(&format!("INSERT OR IGNORE INTO project_cleanup_tasks(project_id,kind,value,multipart,retry_at,last_error,needs_attention)
+      SELECT project_id,kind,value,multipart,retry_at,last_error,needs_attention FROM run_cleanup_tasks AS candidate
+      WHERE project_id=?1 AND done=0 AND kind IN ('object','multipart','archive')
+      AND (kind='archive' OR NOT ({adopted_protection}))"), [project_id]).map_err(database)?;
+    transaction.execute("UPDATE project_cleanup_tasks SET retry_at=MAX(retry_at,COALESCE((SELECT MAX(retry_at) FROM run_cleanup_tasks WHERE project_id=?1 AND done=0 AND kind='tracking'),0)),
+      last_error=COALESCE(last_error,(SELECT last_error FROM run_cleanup_tasks WHERE project_id=?1 AND done=0 AND kind='tracking' AND last_error IS NOT NULL ORDER BY needs_attention DESC,id LIMIT 1)),
+      needs_attention=MAX(needs_attention,COALESCE((SELECT MAX(needs_attention) FROM run_cleanup_tasks WHERE project_id=?1 AND done=0 AND kind='tracking'),0))
+      WHERE project_id=?1 AND kind='tracking'", [project_id]).map_err(database)?;
+    transaction.execute("UPDATE run_cleanup_tasks SET done=1,kind='transferred',last_error=NULL,needs_attention=0,retry_at=0 WHERE project_id=?1 AND done=0", [project_id]).map_err(database)?;
+    transaction
+      .execute(
+        "UPDATE run_retention SET status='deleted',last_error=NULL WHERE project_id=?1",
+        [project_id],
+      )
+      .map_err(database)?;
     transaction.execute(&format!("DELETE FROM parts WHERE upload_id IN (SELECT upload_id FROM uploads WHERE {TARGET_PROJECT}=?1)"), [project_id]).map_err(database)?;
     for table in [
       "chunks",
@@ -429,6 +451,15 @@ impl<S: ObjectStorage> Store<S> {
       .execute(
         "UPDATE dashboard_catalog_revision SET revision=revision+1 WHERE id=1",
         [],
+      )
+      .map_err(database)?;
+    transaction
+      .execute(
+        &format!(
+          "UPDATE project_deletions SET {} WHERE project_id=?1",
+          deletion_state_update()
+        ),
+        [project_id],
       )
       .map_err(database)?;
     transaction.commit().map_err(database)?;
@@ -530,7 +561,19 @@ fn now() -> i64 {
 }
 
 /// Delete only descriptor-relative entries; a swapped parent link cannot escape the service directory.
-fn remove_local_tree(directory: &Path, parent: &str, name: &str) -> CleanupResult<()> {
+pub(super) fn remove_local_tree(directory: &Path, parent: &str, name: &str) -> CleanupResult<()> {
+  remove_local_subtree(directory, &[parent], name)
+}
+
+pub(super) fn remove_local_run_tree(directory: &Path, scope: &RunScope) -> CleanupResult<()> {
+  remove_local_subtree(
+    directory,
+    &["tracking", &scope.project_id, &scope.origin],
+    &scope.run_id,
+  )
+}
+
+fn remove_local_subtree(directory: &Path, parents: &[&str], name: &str) -> CleanupResult<()> {
   use std::os::fd::AsRawFd;
   use std::os::unix::fs::OpenOptionsExt;
   validate_component(name).map_err(|_| {
@@ -538,29 +581,36 @@ fn remove_local_tree(directory: &Path, parent: &str, name: &str) -> CleanupResul
       "Cleanup directory is invalid; check the service configuration or upgrade the service.",
     )
   })?;
-  let base = fs::OpenOptions::new()
+  let mut parent = fs::OpenOptions::new()
     .read(true)
     .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
     .open(directory)
     .map_err(local_error)?;
-  let parent_name = std::ffi::CString::new(parent).expect("fixed cleanup parent");
-  let fd = unsafe {
-    libc::openat(
-      base.as_raw_fd(),
-      parent_name.as_ptr(),
-      libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-    )
-  };
-  if fd < 0 {
-    let error = std::io::Error::last_os_error();
-    return if error.kind() == std::io::ErrorKind::NotFound {
-      Ok(())
-    } else {
-      Err(local_error(error))
-    };
-  }
   use std::os::fd::FromRawFd;
-  let parent = unsafe { fs::File::from_raw_fd(fd) };
+  for component in parents {
+    validate_component(component).map_err(|_| {
+      CleanupError::needs_attention(
+        "Cleanup directory is invalid; check the service configuration.",
+      )
+    })?;
+    let component = std::ffi::CString::new(*component).expect("validated cleanup component");
+    let fd = unsafe {
+      libc::openat(
+        parent.as_raw_fd(),
+        component.as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+      )
+    };
+    if fd < 0 {
+      let error = std::io::Error::last_os_error();
+      return if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+      } else {
+        Err(local_error(error))
+      };
+    }
+    parent = unsafe { fs::File::from_raw_fd(fd) };
+  }
   remove_entry(
     parent.as_raw_fd(),
     &std::ffi::CString::new(name).map_err(|_| {

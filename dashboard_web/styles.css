@@ -157,6 +157,10 @@ tbody tr:last-child > * { border-bottom: 0; }
 .review-heading { padding: 2px 0 16px; align-items: start; }
 .review-heading > div { min-width: 0; }
 .review-heading h2 { font-size: 18px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.run-archival-panel { margin-bottom: 16px; font-size: 12px; }
+.run-archival-panel .notice p { margin-top: 8px; }
+.archival-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.archival-hint { font-size: 11px; }
 .review-tabs { display: flex; gap: 25px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
 .review-tab { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px 1px; font-size: 12px; font-weight: 600; }
 .review-tab[aria-selected="true"] { border-bottom-color: var(--accent); color: var(--accent); }

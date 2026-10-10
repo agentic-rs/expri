@@ -15,7 +15,7 @@ use super::storage::ObjectStorage;
 use super::store::{ApiError, ApiResult, Store};
 use super::types::{
   FileRecord, FileTarget, ProjectDeletePreview, ProjectDeletionStatus, ProjectStorageStats,
-  RunScope, STREAM_BATCH, validate_component,
+  RunArchival, RunScope, STREAM_BATCH, validate_component,
 };
 use crate::dashboard::artifacts::Download;
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
@@ -109,6 +109,18 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
 }
 
 impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
+  pub fn archive_run(&self, scope: &RunScope) -> ApiResult<RunArchival> {
+    self.store.archive_run(scope)
+  }
+
+  pub fn restore_run(&self, scope: &RunScope) -> ApiResult<RunArchival> {
+    self.store.restore_run(scope)
+  }
+
+  pub fn run_archival(&self, scope: &RunScope) -> ApiResult<RunArchival> {
+    self.store.run_archival(scope)
+  }
+
   pub fn project_storage(&self, project_id: &str) -> ApiResult<ProjectStorageStats> {
     self.store.project_storage(project_id)
   }
@@ -287,6 +299,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     self.list_table(
       source_id,
       &ListQuery {
+        archived: false,
         origin: None,
         search,
         task,
@@ -300,6 +313,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
 
   pub(super) fn list_table(&self, source_id: &str, query: &ListQuery<'_>) -> Result<Value> {
     let ListQuery {
+      archived,
       origin,
       search,
       task,
@@ -345,18 +359,25 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let page = self
       .store
-      .dashboard_project_runs(
+      .dashboard_project_runs_with_archival(
         &source.project_id,
         origin.or(source.origin.as_deref()),
         OVERVIEW_LIMIT,
         0,
+        archived,
       )
       .map_err(api_error)?;
     if page.total_count == 0
+      && self
+        .store
+        .dashboard_project_runs(&source.project_id, source.origin.as_deref(), 1, 0)
+        .map_err(api_error)?
+        .total_count
+        == 0
       && (source.origin.is_some()
         || !self
           .store
-          .dashboard_input_project_exists(&source.project_id)
+          .dashboard_project_exists_without_runs(&source.project_id)
           .map_err(api_error)?)
     {
       return Err(message(format!("unknown source: {source_id}")));
@@ -501,7 +522,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       && (source.origin.is_some()
         || !self
           .store
-          .dashboard_input_project_exists(&source.project_id)
+          .dashboard_project_exists_without_runs(&source.project_id)
           .map_err(api_error)?)
     {
       return Err(message(format!("unknown source: {source_id}")));
@@ -592,6 +613,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let mut metadata_truncated = false;
     let metadata = run_metadata(&record, &mut metadata_truncated);
     let mut run = preview(&record["run"], &mut metadata_truncated);
+    self
+      .decorate_archival(&mut run, &scope)
+      .map_err(api_error)?;
     source.decorate_run(&mut run, &scope);
     source.decorate_warnings(&mut warnings, &scope);
     if metadata_truncated || params_truncated {
@@ -881,9 +905,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         _ => record.sha256.clone().unwrap_or_else(|| "missing".into()),
       },
     );
-    if let Some(value) = self.store.dashboard_cached_overview(scope, &version)?
+    if let Some(mut value) = self.store.dashboard_cached_overview(scope, &version)?
       && value["overview_schema"] == 1
     {
+      self.decorate_archival(&mut value["run"], scope)?;
       return Ok(value);
     }
     let mut warnings = Vec::new();
@@ -915,7 +940,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut metadata_truncated = false;
     let run = preview(&normalized["run"], &mut metadata_truncated);
-    let result = json!({"overview_schema": 1, "run": run, "task_filter": task_filter, "metadata_truncated": metadata_truncated, "warnings": bounded_warnings(&warnings)});
+    let mut result = json!({"overview_schema": 1, "run": run, "task_filter": task_filter, "metadata_truncated": metadata_truncated, "warnings": bounded_warnings(&warnings)});
     // A failed network read must remain retryable; a missing or malformed
     // immutable state can safely share its versioned normalized preview.
     if record.is_none() || normalized["state"].is_object() {
@@ -923,7 +948,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         .store
         .dashboard_cache_overview(scope, &version, &result)?;
     }
+    self.decorate_archival(&mut result["run"], scope)?;
     Ok(result)
+  }
+
+  fn decorate_archival(&self, run: &mut Value, scope: &RunScope) -> ApiResult<()> {
+    run["archival"] = serde_json::to_value(self.run_archival(scope)?)
+      .map_err(|_| ApiError::new(500, "cannot encode run archival"))?;
+    Ok(())
   }
 
   fn json_artifact(

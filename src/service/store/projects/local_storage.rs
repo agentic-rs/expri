@@ -7,7 +7,7 @@ use super::*;
 
 pub(super) fn archive_bytes(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<u64> {
   let mut statement = db
-    .prepare("SELECT id FROM result_archives WHERE json_extract(scope,'$.project_id')=?1")
+    .prepare("SELECT id FROM result_archives WHERE json_extract(scope,'$.project_id')=?1 UNION SELECT CAST(value AS INTEGER) FROM run_cleanup_tasks WHERE project_id=?1 AND kind='archive' AND done=0")
     .map_err(database)?;
   let ids = statement
     .query_map([project_id], |row| row.get::<_, i64>(0))

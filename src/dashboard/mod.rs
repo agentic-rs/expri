@@ -331,6 +331,7 @@ impl Dashboard {
     self.list_table(
       source_id,
       &table::ListQuery {
+        archived: false,
         origin: None,
         search,
         task,
@@ -344,6 +345,7 @@ impl Dashboard {
 
   pub(crate) fn list_table(&self, source_id: &str, query: &table::ListQuery<'_>) -> Result<Value> {
     let table::ListQuery {
+      archived,
       origin,
       search,
       task,
@@ -352,6 +354,9 @@ impl Dashboard {
       offset,
       table,
     } = *query;
+    if archived {
+      return Err(message("run archival is available on the hosted dashboard"));
+    }
     if origin.is_some() {
       return Err(message("machine filters are available for hosted projects"));
     }

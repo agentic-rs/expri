@@ -112,6 +112,18 @@ pub enum Request {
   ProjectDeletion {
     project_id: String,
   },
+  /// Hide a finished run and schedule hosted cleanup after 15 days. Owner-only.
+  ArchiveRun {
+    scope: RunScope,
+  },
+  /// Cancel retention before deletion begins. Owner-only.
+  RestoreRun {
+    scope: RunScope,
+  },
+  /// Inspect the archived run lifecycle and cleanup status. Owner-only.
+  RunArchival {
+    scope: RunScope,
+  },
   Capabilities,
   PutDocument {
     scope: RunScope,
@@ -199,6 +211,9 @@ pub enum Response {
   ProjectDeletion {
     deletion: ProjectDeletionStatus,
   },
+  RunArchival {
+    archival: RunArchival,
+  },
   Capabilities {
     features: Vec<String>,
   },
@@ -281,6 +296,16 @@ pub struct ProjectDeletionStatus {
   pub pending_tasks: u64,
   pub deleted_objects: u64,
   pub aborted_uploads: u64,
+  pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunArchival {
+  pub scope: RunScope,
+  pub status: String,
+  pub archived_at: Option<String>,
+  pub delete_after: Option<String>,
+  pub pending_tasks: u64,
   pub last_error: Option<String>,
 }
 
@@ -450,5 +475,45 @@ assets_dir = "/opt/expri/preview"
       assert!(validate_component(value).is_err());
     }
     assert!(validate_component("gpu-1_a").is_ok());
+  }
+
+  #[test]
+  fn run_lifecycle_wire_actions_do_not_reuse_result_zip_archive_status() {
+    let scope = RunScope {
+      project_id: "vision".into(),
+      origin: "gpu-1".into(),
+      run_id: "run-1".into(),
+    };
+    for (request, action) in [
+      (
+        Request::ArchiveRun {
+          scope: scope.clone(),
+        },
+        "archive_run",
+      ),
+      (
+        Request::RestoreRun {
+          scope: scope.clone(),
+        },
+        "restore_run",
+      ),
+      (
+        Request::RunArchival {
+          scope: scope.clone(),
+        },
+        "run_archival",
+      ),
+      (
+        Request::ArchiveStatus {
+          scope: scope.clone(),
+        },
+        "archive_status",
+      ),
+    ] {
+      let value = serde_json::to_value(request).unwrap();
+      assert_eq!(value["action"], action);
+      assert_eq!(value["scope"], serde_json::to_value(&scope).unwrap());
+      assert!(serde_json::from_value::<Request>(value).is_ok());
+    }
   }
 }

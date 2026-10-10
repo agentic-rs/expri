@@ -100,6 +100,7 @@ impl<S: ObjectStorage> Store<S> {
     {
       let mut db = self.db()?;
       let transaction = db.transaction().map_err(database)?;
+      run_retention::ensure_available(&transaction, &snapshot.scope, run_retention::now())?;
       let previous: Option<String> = transaction
         .query_row(
           "SELECT snapshot FROM result_archives WHERE scope=?1 ORDER BY id DESC LIMIT 1",
@@ -189,6 +190,11 @@ impl<S: ObjectStorage> Store<S> {
       .read()
       .map_err(|_| ApiError::new(503, "project operation unavailable"))?;
     match projects::ensure_active(&*self.db()?, &snapshot.scope.project_id) {
+      Err(error) if error.status == 410 => return Ok(false),
+      Err(error) => return Err(error),
+      Ok(()) => {}
+    }
+    match run_retention::ensure_available(&*self.db()?, &snapshot.scope, run_retention::now()) {
       Err(error) if error.status == 410 => return Ok(false),
       Err(error) => return Err(error),
       Ok(()) => {}

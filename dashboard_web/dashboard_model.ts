@@ -40,11 +40,20 @@ export type Run = {
   started_at: string | null;
   finished_at: string | null;
   exit_code: number | null;
+  archival?: RunArchival | null;
   table_values?: {
     params: Record<string, RunTableValue>;
     metrics: Record<string, number | null>;
   };
   table_values_truncated?: boolean;
+};
+export type RunArchival = {
+  scope: RunDeepLink;
+  status: "active" | "archived" | "deleting" | "needs_attention" | "deleted";
+  archived_at: string | null;
+  delete_after: string | null;
+  pending_tasks: number;
+  last_error: string | null;
 };
 export type RunTableValue = null | boolean | number | string;
 export type RunColumnChoice = { key: string; label: string };
@@ -67,6 +76,7 @@ export type Catalog = {
   sources: Source[];
   warnings: Warning[];
   access_mode?: "local" | "hosted";
+  run_management_enabled?: boolean;
 };
 export type RunList = {
   source: Source;
@@ -300,12 +310,21 @@ export class RequestLane {
   run<T>(url: string): Promise<T | undefined> {
     return this.request(url, (response) => response.json() as Promise<T>);
   }
+  post<T>(url: string, body: Json): Promise<T | undefined> {
+    return this.request(url, (response) => response.json() as Promise<T>, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
   runText(url: string, maximum_bytes = 2 * 1024 * 1024): Promise<string | undefined> {
     return this.request(url, (response) => boundedText(response, maximum_bytes));
   }
   private async request<T>(
     url: string,
     parse: (response: Response) => Promise<T>,
+    init: RequestInit = {},
   ): Promise<T | undefined> {
     this.cancel();
     const generation = this.generation;
@@ -313,7 +332,7 @@ export class RequestLane {
     this.controller = controller;
     const timeout = setTimeout(() => controller.abort(), 30_000);
     try {
-      const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+      const response = await fetch(url, { ...init, signal: controller.signal, cache: "no-store" });
       if (generation !== this.generation) return undefined;
       if (response.status === 401) {
         if (typeof location !== "undefined") {
