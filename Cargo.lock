@@ -484,12 +484,108 @@ dependencies = [
 name = "expri"
 version = "0.1.5"
 dependencies = [
+ "chrono",
+ "clap",
+ "expri-assets",
+ "expri-client",
+ "expri-core",
+ "expri-dashboard",
+ "expri-runs",
+ "expri-server",
+ "expri-worker",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "url",
+]
+
+[[package]]
+name = "expri-assets"
+version = "0.1.5"
+dependencies = [
+ "expri-client",
+ "expri-core",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "expri-client"
+version = "0.1.5"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "expri-core",
+ "expri-runs",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "expri-core"
+version = "0.1.5"
+dependencies = [
+ "globset",
+ "http",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "url",
+]
+
+[[package]]
+name = "expri-dashboard"
+version = "0.1.5"
+dependencies = [
+ "chrono",
+ "expri-core",
+ "expri-runs",
+ "form_urlencoded",
+ "http",
+ "httparse",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "expri-runs"
+version = "0.1.5"
+dependencies = [
+ "chrono",
+ "expri-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "expri-server"
+version = "0.1.5"
+dependencies = [
  "attohttpc",
  "base64 0.22.1",
  "chrono",
- "clap",
+ "expri-core",
+ "expri-dashboard",
+ "expri-runs",
  "form_urlencoded",
- "globset",
  "http",
  "httparse",
  "libc",
@@ -504,6 +600,23 @@ dependencies = [
  "subtle",
  "tempfile",
  "toml",
+ "zip",
+]
+
+[[package]]
+name = "expri-worker"
+version = "0.1.5"
+dependencies = [
+ "chrono",
+ "expri-assets",
+ "expri-client",
+ "expri-core",
+ "expri-runs",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "zip",
 ]
 

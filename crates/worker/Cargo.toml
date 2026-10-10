@@ -1,0 +1,21 @@
+[package]
+name = "expri-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Experiment execution, uv environments, and durable supervision for expri"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+expri-core.workspace = true
+expri-runs.workspace = true
+expri-client.workspace = true
+expri-assets.workspace = true
+chrono.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+zip.workspace = true

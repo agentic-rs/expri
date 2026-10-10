@@ -1,0 +1,19 @@
+[package]
+name = "expri-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared contracts, configuration values, errors, and file leases for expri"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+globset.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

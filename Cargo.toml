@@ -1,19 +1,35 @@
-[package]
-name = "expri"
+[workspace]
+members = [
+  "crates/core",
+  "crates/runs",
+  "crates/client",
+  "crates/assets",
+  "crates/worker",
+  "crates/dashboard",
+  "crates/server",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.5"
 edition = "2024"
 rust-version = "1.89"
-description = "Repo-local remote experiment workflow tools"
 license = "MIT"
 repository = "https://github.com/agentic-rs/expri"
 
-[dependencies]
+[workspace.dependencies]
+expri-core = { version = "=0.1.5", path = "crates/core" }
+expri-runs = { version = "=0.1.5", path = "crates/runs" }
+expri-client = { version = "=0.1.5", path = "crates/client" }
+expri-assets = { version = "=0.1.5", path = "crates/assets" }
+expri-worker = { version = "=0.1.5", path = "crates/worker" }
+expri-dashboard = { version = "=0.1.5", path = "crates/dashboard" }
+expri-server = { version = "=0.1.5", path = "crates/server" }
 attohttpc = { version = "0.30.1", default-features = false }
 base64 = "0.22.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clap = { version = "4.6.1", features = ["derive"] }
-globset = "0.4.18"
 form_urlencoded = "1.2.2"
+globset = "0.4.18"
 http = "1.5.0"
 httparse = "1.10.1"
 libc = "0.2.186"
@@ -28,4 +44,30 @@ sha2 = "0.11.0"
 subtle = "2.6.1"
 tempfile = "3.27.0"
 toml = "1.1.2"
+url = "2.5.8"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[package]
+name = "expri"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Repo-local remote experiment workflow tools"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+clap = { version = "4.6.1", features = ["derive"] }
+expri-core.workspace = true
+expri-runs.workspace = true
+expri-client.workspace = true
+expri-assets.workspace = true
+expri-worker.workspace = true
+expri-dashboard.workspace = true
+expri-server.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+url.workspace = true

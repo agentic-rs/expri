@@ -923,7 +923,7 @@ prefix = "acceptance"
     release = preview / 'releases' / revision
     release.mkdir(parents=True)
     for name in ['index.html', 'login.html', 'app.js', 'styles.css']:
-      shutil.copyfile(ROOT / 'dashboard_web' / name, release / name)
+      shutil.copyfile(ROOT / 'crates/dashboard/dashboard_web' / name, release / name)
     (release / 'deployment.json').write_text(json.dumps({'commit': revision, 'branch': 'fixture/ab'}))
     (preview / 'current').symlink_to('releases/' + revision)
     copy(preview, service, '/home/tester/preview')
@@ -977,7 +977,7 @@ prefix = "acceptance"
     execute(worker, 'mkdir', '-p', '/home/tester/experiment')
     copy(ROOT / 'tests/containers/service_seed.py', worker, '/tmp/seed.py')
     copy(ROOT / 'tests/containers/service_train.py', worker, '/home/tester/experiment/train.py')
-    copy(ROOT / 'python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
+    copy(ROOT / 'crates/worker/python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
     execute(worker, 'python3', '/tmp/seed.py')
   with workflow_progress.phase('Training through a service outage and publisher resume'):
     receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
