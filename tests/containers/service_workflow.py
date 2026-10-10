@@ -12,6 +12,8 @@ import tempfile
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from workflow_progress import Progress
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKER_QUEUE = '/home/tester/experiment/.expri/publish'
 parser = argparse.ArgumentParser(description=__doc__)
@@ -47,8 +49,8 @@ def redact(text):
 def command(args, *, timeout=90, check=True):
   try:
     result = subprocess.run(args, cwd=ROOT, env=fixture_env, capture_output=True, timeout=timeout)
-  except subprocess.TimeoutExpired as error:
-    raise AssertionError(f'{args[0]} {args[1]} timed out after {timeout}s') from error
+  except subprocess.TimeoutExpired:
+    raise AssertionError(f'{args[0]} {args[1]} timed out after {timeout}s') from None
   if check and result.returncode:
     raise AssertionError(f'{args[0]} {args[1]} failed ({result.returncode}): ' + redact(result.stderr.decode(errors='replace'))[-4096:])
   return result
@@ -57,13 +59,26 @@ def docker(*args, **kwargs):
   return command(['docker', *args], **kwargs)
 
 def logged(name, args, timeout=600):
-  with (logs / name).open('wb') as output:
-    try:
-      result = subprocess.run(args, cwd=ROOT, env=fixture_env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-      raise AssertionError(f'{name} timed out after {timeout}s') from error
-  if result.returncode:
-    raise AssertionError(f'{name} failed: ' + redact((logs / name).read_text(errors='replace'))[-4096:])
+  label = name.removesuffix('.log').replace('-', ' ')
+  with workflow_progress.phase(label, log_name=name):
+    with (logs / name).open('wb') as output:
+      try:
+        result = subprocess.run(args, cwd=ROOT, env=fixture_env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
+      except subprocess.TimeoutExpired:
+        raise AssertionError(f'{name} timed out after {timeout}s: ' + log_tail(logs / name)) from None
+    if result.returncode:
+      raise AssertionError(f'{name} failed: ' + log_tail(logs / name))
+
+def log_tail(path, limit=4096):
+  with path.open('rb') as output:
+    size = output.seek(0, os.SEEK_END)
+    offset = max(0, size - limit)
+    output.seek(offset)
+    tail = output.read(limit)
+  # Drop a partial first line so a sliced credential cannot evade redaction.
+  if offset:
+    tail = tail.partition(b'\n')[2]
+  return redact(tail.decode(errors='replace'))
 
 def create(name, image, args=(), env=(), alias=None, entrypoint=None):
   full = f'{network}-{name}'
@@ -93,14 +108,16 @@ def api_proxy(path):
 
 def wait_for(predicate, message, timeout=60):
   deadline = time.monotonic() + timeout
+  last_error = None
   while time.monotonic() < deadline:
     try:
       if predicate():
         return
-    except AssertionError:
-      pass
+    except AssertionError as error:
+      last_error = redact(str(error))[-1024:]
     time.sleep(0.2)
-  raise AssertionError(message)
+  detail = f'; last check: {last_error}' if last_error else ''
+  raise AssertionError(f'{message} after {timeout}s{detail}')
 
 def stop_result_fetch():
   global result_fetch_pid
@@ -436,7 +453,7 @@ def automatic_dashboard_checks(run_id, updated):
   def phase():
     if refresh_browser.poll() is not None:
       raise RuntimeError('Firefox auto-refresh test exited before fixture coordination finished: ' +
-        redact((logs / 'browser-auto-refresh.log').read_text(errors='replace'))[-4096:])
+        log_tail(logs / 'browser-auto-refresh.log'))
     return python(firefox, f"import json;from pathlib import Path;p=Path({coordination!r});print(json.loads(p.read_text()).get('phase','') if p.exists() else '')")
   def set_phase(value):
     python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase':{value!r}}}))")
@@ -463,7 +480,7 @@ def automatic_dashboard_checks(run_id, updated):
     assert 'automatic refresh log fixture' in stdout['content'], 'service did not observe new worker log bytes'
     set_phase('published-log')
     assert refresh_browser.wait(timeout=90) == 0, ('Firefox auto-refresh acceptance failed: ' +
-      redact((logs / 'browser-auto-refresh.log').read_text(errors='replace'))[-4096:])
+      log_tail(logs / 'browser-auto-refresh.log'))
   assert browser('/logout', method='POST', cookie=cookie)['status'] == 303, 'auto-refresh fixture session did not close'
 
 def project_machine_fixture(original):
@@ -530,7 +547,7 @@ def project_dashboard_checks(first, second):
   python(firefox, f"from pathlib import Path;Path({coordination!r}).unlink(missing_ok=True)")
   def phase():
     if refresh_browser.poll() is not None:
-      raise RuntimeError('Firefox project test exited before publication: ' + redact((logs / 'browser-project.log').read_text(errors='replace'))[-4096:])
+      raise RuntimeError('Firefox project test exited before publication: ' + log_tail(logs / 'browser-project.log'))
     return python(firefox, f"import json;from pathlib import Path;p=Path({coordination!r});print(json.loads(p.read_text()).get('phase','') if p.exists() else '')")
   with (logs / 'browser-project.log').open('wb') as output:
     refresh_browser = subprocess.Popen(['docker', 'exec', '--user', 'tester', firefox,
@@ -582,7 +599,7 @@ print('project terminal tracking queue verified')
     python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'finished-runs'}}))")
     wait_for(lambda: refresh_browser.poll() is not None, 'Firefox project workflow did not finish', timeout=90)
     if refresh_browser.returncode:
-      raise RuntimeError('Firefox project workflow failed: ' + redact((logs / 'browser-project.log').read_text(errors='replace'))[-4096:])
+      raise RuntimeError('Firefox project workflow failed: ' + log_tail(logs / 'browser-project.log'))
     refresh_browser = None
 
 def project_artifact_checks(first, second):
@@ -850,24 +867,29 @@ with urlopen(Request(url,data=b'x'*1024,method='PUT'),timeout=10) as response:
   assert browser('/api/input?project_id=demo&input_id=dataset-v1', method='HEAD', cookie=cookie)['status'] == 200
   browser('/logout', method='POST', cookie=cookie)
 
+workflow_progress = Progress(log_path=logs / 'workflow-progress.log',
+  summary_path=os.environ.get('GITHUB_STEP_SUMMARY'))
+
 try:
-  if not options.no_build:
-    for target in ['worker', 'host', 'service', 'browser']:
-      logged(f'build-{target}.log', ['docker', 'build', '--target', target, '--tag', f'expri-ci-{target}',
-        '--file', 'tests/containers/Dockerfile', '.'], timeout=900)
-  s3_image = os.environ.get('EXPRI_TEST_S3_IMAGE', 'expri-ci-s3')
-  if 'EXPRI_TEST_S3_IMAGE' in os.environ:
-    logged('s3-pull.log', ['docker', 'pull', s3_image])
-  elif not options.no_build:
-    logged('build-s3.log', ['docker', 'build', '--tag', s3_image,
-      '--file', 'tests/containers/S3.Dockerfile', '.'], timeout=1200)
-  docker('network', 'create', '--internal', network)
-  created_network = True
-  subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(state / 'key')], check=True)
-  s3 = create('s3', s3_image, ['server', '/data'], env=['MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD'])
-  docker('start', s3)
-  server_config = state / 'server.toml'
-  server_config.write_text('''owner_token_env = "EXPRI_OWNER_TOKEN"
+  with workflow_progress.phase('Use existing container images' if options.no_build else 'Build container images'):
+    if not options.no_build:
+      for target in ['worker', 'host', 'service', 'browser']:
+        logged(f'build-{target}.log', ['docker', 'build', '--target', target, '--tag', f'expri-ci-{target}',
+          '--file', 'tests/containers/Dockerfile', '.'], timeout=900)
+    s3_image = os.environ.get('EXPRI_TEST_S3_IMAGE', 'expri-ci-s3')
+    if 'EXPRI_TEST_S3_IMAGE' in os.environ:
+      logged('s3-pull.log', ['docker', 'pull', s3_image])
+    elif not options.no_build:
+      logged('build-s3.log', ['docker', 'build', '--tag', s3_image,
+        '--file', 'tests/containers/S3.Dockerfile', '.'], timeout=1200)
+  with workflow_progress.phase('Start isolated fixtures'):
+    docker('network', 'create', '--internal', network)
+    created_network = True
+    subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(state / 'key')], check=True)
+    s3 = create('s3', s3_image, ['server', '/data'], env=['MINIO_ROOT_USER', 'MINIO_ROOT_PASSWORD'])
+    docker('start', s3)
+    server_config = state / 'server.toml'
+    server_config.write_text('''owner_token_env = "EXPRI_OWNER_TOKEN"
 [[workers]]
 project_id = "demo"
 origin = "worker"
@@ -890,84 +912,88 @@ region = "us-east-1"
 path_style = true
 prefix = "acceptance"
 ''')
-  (state / 'owner.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_OWNER_TOKEN"\n')
-  (state / 'worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_WORKER_TOKEN"\n')
-  (state / 'machine-worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_MACHINE_TOKEN"\n')
-  service = create('service', 'expri-ci-service', ['--config', '/tmp/server.toml', '--listen', '0.0.0.0:8787',
-    '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
-  copy(server_config, service, '/tmp/server.toml')
-  preview = state / 'preview'
-  revision = 'a' * 40
-  release = preview / 'releases' / revision
-  release.mkdir(parents=True)
-  for name in ['index.html', 'login.html', 'app.js', 'styles.css']:
-    shutil.copyfile(ROOT / 'dashboard_web' / name, release / name)
-  (release / 'deployment.json').write_text(json.dumps({'commit': revision, 'branch': 'fixture/ab'}))
-  (preview / 'current').symlink_to('releases/' + revision)
-  copy(preview, service, '/home/tester/preview')
-  host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'], entrypoint='sleep')
-  worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
-  proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
-  firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net', 's3.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
-  copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
-  copy(ROOT / 'tests/containers/service_proxy.py', proxy, '/tmp/proxy.py')
-  copy(state / 'owner.toml', host, '/tmp/owner.toml')
-  copy(state / 'machine-worker.toml', host, '/tmp/machine-worker.toml')
-  copy(state / 'worker.toml', worker, '/tmp/worker.toml')
-  copy(ROOT / 'tests/containers/s3_fixture.py', host, '/tmp/s3_fixture.py')
-  docker('start', host)
-  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://s3:9000/minio/health/ready',timeout=1).status)") == '200', 'S3 fixture not ready')
-  docker('start', service)
-  docker('start', proxy)
-  docker('start', worker)
-  wait_for(lambda: docker('exec', worker, 'test', '-f', '/tmp/expri-worker.ready', check=False).returncode == 0, 'worker not ready')
-  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service not ready')
-  execute(host, 'python3', '/tmp/s3_fixture.py', 'versioning')
-  wait_for(lambda: api_proxy('/test/state') is not None, 'fault proxy not ready')
-  docker('start', firefox)
-  wait_for(lambda: python(firefox, "import ssl;from urllib.request import urlopen;print(urlopen('https://expri.example.net/login',context=ssl._create_unverified_context(),timeout=2).status)") == '200', 'Firefox HTTPS proxy not ready')
-  logged('browser-forms.log', ['docker', 'exec', '--user', 'tester', firefox,
-    'python3', '/opt/expri-browser/browser_forms.py'], timeout=180)
-  initial_session = dashboard_public_checks()
-  python(host, "from pathlib import Path;Path('/home/tester/private.bin').write_bytes(b'private-input-fixture'*1024)")
-  client(host, 'input upload', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/queue')
-  client(worker, 'input download', '--project-id', 'demo', '--input-id', 'dataset-v1', '--destination', '/home/tester/private.bin')
-  python(host, "from pathlib import Path;Path('/home/tester/empty.bin').write_bytes(b'')")
-  client(host, 'input upload', '--project-id', 'demo', '--input-id', 'empty-file', '--file', '/home/tester/empty.bin', '--queue-dir', '/home/tester/queue')
-  client(worker, 'input download', '--project-id', 'demo', '--input-id', 'empty-file', '--destination', '/home/tester/empty.bin')
-  assert python(worker, "from pathlib import Path;print(Path('/home/tester/empty.bin').stat().st_size)") == '0', 'empty input did not round-trip'
-  assert python(worker, "from pathlib import Path;print(Path('/home/tester/private.bin').read_bytes() == b'private-input-fixture'*1024)") == 'True', 'private input bytes changed during worker download'
-  input_only = browser_json('/api/projects', initial_session)
-  project = next((source for source in input_only['sources'] if source['source_id'] == 'hosted-project:demo'), None)
-  assert project is not None and project['machines'] == [], 'input-only project is absent from hosted project discovery'
-  assert browser_json('/api/catalog', initial_session)['sources'] == [], 'private inputs unexpectedly became run sources'
-  project_storage_checks(initial_session)
-  logged('browser-storage-input-only.log', ['docker', 'exec', '--user', 'tester', firefox,
-    'python3', '/opt/expri-browser/browser_forms.py', '--storage-input-only'], timeout=90)
-  forbidden = client(worker, 'input upload', '--project-id', 'demo', '--input-id', 'forbidden', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/input-queue', check=False)
-  assert forbidden.returncode != 0, 'worker unexpectedly uploaded a private input'
-  python(host, "from pathlib import Path;Path('/home/tester/different.bin').write_bytes(b'different dataset')")
-  immutable = client(host, 'input upload', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/different.bin', '--queue-dir', '/home/tester/queue', check=False)
-  assert immutable.returncode != 0, 'input reference allowed replacement with different bytes'
-  execute(worker, 'mkdir', '-p', '/home/tester/experiment')
-  copy(ROOT / 'tests/containers/service_seed.py', worker, '/tmp/seed.py')
-  copy(ROOT / 'tests/containers/service_train.py', worker, '/home/tester/experiment/train.py')
-  copy(ROOT / 'python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
-  execute(worker, 'python3', '/tmp/seed.py')
-  receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
-  run_id, run_dir = receipt['run_id'], receipt['run_dir']
-  assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
-  push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
-  def publishing(directory):
-    return json.loads(python(worker, f"from pathlib import Path;print(Path({directory!r}+'/publishing-state.json').read_text())"))
-  wait_for(lambda: api_proxy('/test/state')['lost_stream_ack'], 'live metrics did not arrive or the lost stream acknowledgement was not injected')
-  assert json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'running', 'training finished before the service outage was injected'
-  docker('stop', '--time', '1', service)
-  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'training did not complete while service was offline')
-  assert publishing(run_dir)['status'] != 'published', 'publisher claimed published during the outage'
-  # Kill only the independent publisher after training exits, then resume its
-  # saved intent and queue while the service is still unavailable.
-  killed = python(worker, f'''import os, signal
+    (state / 'owner.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_OWNER_TOKEN"\n')
+    (state / 'worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_WORKER_TOKEN"\n')
+    (state / 'machine-worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_MACHINE_TOKEN"\n')
+    service = create('service', 'expri-ci-service', ['--config', '/tmp/server.toml', '--listen', '0.0.0.0:8787',
+      '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
+    copy(server_config, service, '/tmp/server.toml')
+    preview = state / 'preview'
+    revision = 'a' * 40
+    release = preview / 'releases' / revision
+    release.mkdir(parents=True)
+    for name in ['index.html', 'login.html', 'app.js', 'styles.css']:
+      shutil.copyfile(ROOT / 'dashboard_web' / name, release / name)
+    (release / 'deployment.json').write_text(json.dumps({'commit': revision, 'branch': 'fixture/ab'}))
+    (preview / 'current').symlink_to('releases/' + revision)
+    copy(preview, service, '/home/tester/preview')
+    host = create('host', 'expri-ci-host', ['infinity'], env=['EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'], entrypoint='sleep')
+    worker = create('worker', 'expri-ci-worker', env=['EXPRI_WORKER_TOKEN'])
+    proxy = create('proxy', 'expri-ci-host', ['/tmp/proxy.py'], entrypoint='python3')
+    firefox = create('browser', 'expri-ci-browser', alias=['expri.example.net', 'ab.expri.example.net', 's3.expri.example.net'], env=['EXPRI_DASHBOARD_PASSWORD'])
+    copy(state / 'key.pub', worker, '/run/expri-ssh/id_ed25519.pub')
+    copy(ROOT / 'tests/containers/service_proxy.py', proxy, '/tmp/proxy.py')
+    copy(state / 'owner.toml', host, '/tmp/owner.toml')
+    copy(state / 'machine-worker.toml', host, '/tmp/machine-worker.toml')
+    copy(state / 'worker.toml', worker, '/tmp/worker.toml')
+    copy(ROOT / 'tests/containers/s3_fixture.py', host, '/tmp/s3_fixture.py')
+    docker('start', host)
+    wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://s3:9000/minio/health/ready',timeout=1).status)") == '200', 'S3 fixture not ready')
+    docker('start', service)
+    docker('start', proxy)
+    docker('start', worker)
+    wait_for(lambda: docker('exec', worker, 'test', '-f', '/tmp/expri-worker.ready', check=False).returncode == 0, 'worker not ready')
+    wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service not ready')
+    execute(host, 'python3', '/tmp/s3_fixture.py', 'versioning')
+    wait_for(lambda: api_proxy('/test/state') is not None, 'fault proxy not ready')
+    docker('start', firefox)
+    wait_for(lambda: python(firefox, "import ssl;from urllib.request import urlopen;print(urlopen('https://expri.example.net/login',context=ssl._create_unverified_context(),timeout=2).status)") == '200', 'Firefox HTTPS proxy not ready')
+  with workflow_progress.phase('Dashboard login and authorization'):
+    logged('browser-forms.log', ['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py'], timeout=180)
+    initial_session = dashboard_public_checks()
+  with workflow_progress.phase('Private inputs, storage, and access rules'):
+    python(host, "from pathlib import Path;Path('/home/tester/private.bin').write_bytes(b'private-input-fixture'*1024)")
+    client(host, 'input upload', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/queue')
+    client(worker, 'input download', '--project-id', 'demo', '--input-id', 'dataset-v1', '--destination', '/home/tester/private.bin')
+    python(host, "from pathlib import Path;Path('/home/tester/empty.bin').write_bytes(b'')")
+    client(host, 'input upload', '--project-id', 'demo', '--input-id', 'empty-file', '--file', '/home/tester/empty.bin', '--queue-dir', '/home/tester/queue')
+    client(worker, 'input download', '--project-id', 'demo', '--input-id', 'empty-file', '--destination', '/home/tester/empty.bin')
+    assert python(worker, "from pathlib import Path;print(Path('/home/tester/empty.bin').stat().st_size)") == '0', 'empty input did not round-trip'
+    assert python(worker, "from pathlib import Path;print(Path('/home/tester/private.bin').read_bytes() == b'private-input-fixture'*1024)") == 'True', 'private input bytes changed during worker download'
+    input_only = browser_json('/api/projects', initial_session)
+    project = next((source for source in input_only['sources'] if source['source_id'] == 'hosted-project:demo'), None)
+    assert project is not None and project['machines'] == [], 'input-only project is absent from hosted project discovery'
+    assert browser_json('/api/catalog', initial_session)['sources'] == [], 'private inputs unexpectedly became run sources'
+    project_storage_checks(initial_session)
+    logged('browser-storage-input-only.log', ['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--storage-input-only'], timeout=90)
+    forbidden = client(worker, 'input upload', '--project-id', 'demo', '--input-id', 'forbidden', '--file', '/home/tester/private.bin', '--queue-dir', '/home/tester/input-queue', check=False)
+    assert forbidden.returncode != 0, 'worker unexpectedly uploaded a private input'
+    python(host, "from pathlib import Path;Path('/home/tester/different.bin').write_bytes(b'different dataset')")
+    immutable = client(host, 'input upload', '--project-id', 'demo', '--input-id', 'dataset-v1', '--file', '/home/tester/different.bin', '--queue-dir', '/home/tester/queue', check=False)
+    assert immutable.returncode != 0, 'input reference allowed replacement with different bytes'
+  with workflow_progress.phase('Prepare asset sidecars and uv experiment'):
+    execute(worker, 'mkdir', '-p', '/home/tester/experiment')
+    copy(ROOT / 'tests/containers/service_seed.py', worker, '/tmp/seed.py')
+    copy(ROOT / 'tests/containers/service_train.py', worker, '/home/tester/experiment/train.py')
+    copy(ROOT / 'python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
+    execute(worker, 'python3', '/tmp/seed.py')
+  with workflow_progress.phase('Training through a service outage and publisher resume'):
+    receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
+    run_id, run_dir = receipt['run_id'], receipt['run_dir']
+    assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
+    push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
+    def publishing(directory):
+      return json.loads(python(worker, f"from pathlib import Path;print(Path({directory!r}+'/publishing-state.json').read_text())"))
+    wait_for(lambda: api_proxy('/test/state')['lost_stream_ack'], 'live metrics did not arrive or the lost stream acknowledgement was not injected')
+    assert json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'running', 'training finished before the service outage was injected'
+    docker('stop', '--time', '1', service)
+    wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'training did not complete while service was offline')
+    assert publishing(run_dir)['status'] != 'published', 'publisher claimed published during the outage'
+    # Kill only the independent publisher after training exits, then resume its
+    # saved intent and queue while the service is still unavailable.
+    killed = python(worker, f'''import os, signal
 from pathlib import Path
 count = 0
 for process in Path('/proc').iterdir():
@@ -981,38 +1007,40 @@ for process in Path('/proc').iterdir():
   except (FileNotFoundError, ProcessLookupError, PermissionError):
     pass
 print(count)''')
-  assert killed == '1', 'did not find exactly one independent publisher'
-  wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['publishing']['worker_active'] is False, 'stopped publisher retained its lease')
-  resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--run-dir', run_dir).stdout)
-  assert resumed['run_id'] == run_id, 'resume started a different run'
-  docker('start', service)
-  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to restart')
-  def drained(directory):
-    report = json.loads(execute(worker, 'expri', 'runs', 'status', Path(directory).name, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)
-    return report['publishing']['status'] == 'published' and not report['publishing']['worker_active']
-  wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
-  queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
-  assert queue_state['protocol'] == 'tracking_v1' and set(queue_state['files']) <= {'outputs/checkpoint-1000.pt'}, 'fresh publishing queue used per-file multipart for tracking metadata or streams'
-  registered = next(file for file in service_record('list_files', run_id)['files']
-    if file['target']['path'] == 'outputs/checkpoint-1000.pt')
-  assert registered['storage'] == 'object' and registered['size'] == len(b'registered-live-checkpoint') * 4096, 'registered checkpoint did not recover from the service outage'
-  tracked = tracking_files(run_id)
-  assert all(path in tracked for path in ['run-state.json', 'snapshot.json', 'outputs/params.json', 'outputs/metrics.jsonl', 'logs/stdout.log', 'logs/stderr.log']), 'terminal tracking catalog omitted run records or raw streams'
-  assert tracked['outputs/metrics.jsonl']['storage']['tracking']['sealed'] is True, 'terminal metrics were not sealed at their acknowledged extent'
-  api_proxy('/test/arm')
-  first = client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt', check=False)
-  assert first.returncode != 0 and api_proxy('/test/state')['lost_ack'], 'lost part acknowledgement was not injected'
-  docker('restart', '--time', '1', service)
-  wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to recover multipart state')
-  client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt')
-  counts = api_proxy('/test/state')['part_urls']
-  assert counts.get('1') == 1 and counts.get('2') == 1 and counts.get('3') == 1, counts
-  sync_gate = '/tmp/expri-live-sync.release'
-  python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
-  second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /tmp/expri-live-sync.release').stdout)
-  assert second['run_id'] != run_id, 'second experiment reused the first run identity'
-  live_repo = '/home/tester/live-review'
-  watch_config = '''[project]
+    assert killed == '1', 'did not find exactly one independent publisher'
+    wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['publishing']['worker_active'] is False, 'stopped publisher retained its lease')
+    resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--run-dir', run_dir).stdout)
+    assert resumed['run_id'] == run_id, 'resume started a different run'
+    docker('start', service)
+    wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to restart')
+    def drained(directory):
+      report = json.loads(execute(worker, 'expri', 'runs', 'status', Path(directory).name, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)
+      return report['publishing']['status'] == 'published' and not report['publishing']['worker_active']
+    wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
+    queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
+    assert queue_state['protocol'] == 'tracking_v1' and set(queue_state['files']) <= {'outputs/checkpoint-1000.pt'}, 'fresh publishing queue used per-file multipart for tracking metadata or streams'
+    registered = next(file for file in service_record('list_files', run_id)['files']
+      if file['target']['path'] == 'outputs/checkpoint-1000.pt')
+    assert registered['storage'] == 'object' and registered['size'] == len(b'registered-live-checkpoint') * 4096, 'registered checkpoint did not recover from the service outage'
+    tracked = tracking_files(run_id)
+    assert all(path in tracked for path in ['run-state.json', 'snapshot.json', 'outputs/params.json', 'outputs/metrics.jsonl', 'logs/stdout.log', 'logs/stderr.log']), 'terminal tracking catalog omitted run records or raw streams'
+    assert tracked['outputs/metrics.jsonl']['storage']['tracking']['sealed'] is True, 'terminal metrics were not sealed at their acknowledged extent'
+  with workflow_progress.phase('Checkpoint upload recovery after lost acknowledgments'):
+    api_proxy('/test/arm')
+    first = client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt', check=False)
+    assert first.returncode != 0 and api_proxy('/test/state')['lost_ack'], 'lost part acknowledgement was not injected'
+    docker('restart', '--time', '1', service)
+    wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to recover multipart state')
+    client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt')
+    counts = api_proxy('/test/state')['part_urls']
+    assert counts.get('1') == 1 and counts.get('2') == 1 and counts.get('3') == 1, counts
+  with workflow_progress.phase('Live checkpoint downloads and result uploads'):
+    sync_gate = '/tmp/expri-live-sync.release'
+    python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
+    second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /tmp/expri-live-sync.release').stdout)
+    assert second['run_id'] != run_id, 'second experiment reused the first run identity'
+    live_repo = '/home/tester/live-review'
+    watch_config = '''[project]
 name = "Live result fetch"
 [download]
 results_dir = "results"
@@ -1022,16 +1050,16 @@ project_id = "demo"
 origins = ["worker"]
 labels = ["best"]
 '''
-  python(host, f"from pathlib import Path;p=Path({live_repo!r});p.mkdir();(p/'expri.toml').write_text({watch_config!r})")
-  watch_command = ['expri', 'fetch', '--watch', '--repo', live_repo, '--config', live_repo + '/expri.toml']
-  result_fetch_pid = int(python(host, f'''import subprocess
+    python(host, f"from pathlib import Path;p=Path({live_repo!r});p.mkdir();(p/'expri.toml').write_text({watch_config!r})")
+    watch_command = ['expri', 'fetch', '--watch', '--repo', live_repo, '--config', live_repo + '/expri.toml']
+    result_fetch_pid = int(python(host, f'''import subprocess
 with open('/tmp/result-fetch.stdout', 'wb') as output, open('/tmp/result-fetch.stderr', 'wb') as error:
   process = subprocess.Popen({watch_command!r}, stdout=output, stderr=error, start_new_session=True)
 print(process.pid)
 '''))
-  live_cache = f"{live_repo}/results/service-demo-worker/runs/{second['run_id']}"
-  def live_checkpoint_received():
-    return python(host, f'''import hashlib, json
+    live_cache = f"{live_repo}/results/service-demo-worker/runs/{second['run_id']}"
+    def live_checkpoint_received():
+      return python(host, f'''import hashlib, json
 from pathlib import Path
 root = Path({live_cache!r})
 checkpoint = root / 'outputs/checkpoint-1000.pt'
@@ -1047,9 +1075,9 @@ if ready:
   ready = completed and any(row['step'] >= 10 and 'loss' in row['metrics'] for row in rows)
 print(ready)
 ''') == 'True'
-  wait_for(live_checkpoint_received, 'laptop watcher did not receive the registered checkpoint and live metrics', timeout=90)
-  assert json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'checkpoint sync waited until training completed'
-  live_result = json.loads(python(host, f'''import json
+    wait_for(live_checkpoint_received, 'laptop watcher did not receive the registered checkpoint and live metrics', timeout=90)
+    assert json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'checkpoint sync waited until training completed'
+    live_result = json.loads(python(host, f'''import json
 from pathlib import Path
 root = Path({live_cache!r})
 receipt = json.loads((root / 'pull-state.json').read_text())
@@ -1058,106 +1086,116 @@ assert not (root / 'outputs/checkpoint.pt').exists(), 'label watch downloaded an
 print(json.dumps({{'status':json.loads((root / 'run-state.json').read_text())['status'],
   'downloaded':[file['path'] for file in receipt['downloaded_files']]}}))
 '''))
-  assert live_result['status'] == 'running' and 'outputs/checkpoint-1000.pt' in live_result['downloaded'], 'live watcher did not commit a verified running-run download receipt'
-  stop_result_fetch()
-  python(worker, f"from pathlib import Path;Path({sync_gate!r}).touch()")
-  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
-  wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)
-  for archived_run in [run_id, second['run_id']]:
-    archive = wait_archive(archived_run)
-    assert archive['incomplete'] is False and archive['file']['target']['path'] == 'result.zip', 'terminal archive did not finish independently as a complete result ZIP'
-  assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt', 'outputs/checkpoint-1000.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
-  intent = python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/publishing-request.json').read_text())")
-  assert fixture_env['EXPRI_WORKER_TOKEN'] not in intent, 'publishing intent exposed its token'
-  assert 'X-Amz-' not in intent, 'publishing intent exposed a signed URL'
-  python(host, "from pathlib import Path;p=Path('/home/tester/review');p.mkdir();(p/'expri.toml').write_text('[project]\\nname=\"Offline service review\"\\n[download]\\nresults_dir=\"results\"\\n')")
-  pull_args = ['--project-id', 'demo', '--origin', 'worker', '--run-id', run_id, '--repo', '/home/tester/review', '--source', 'service']
-  client(host, 'fetch', *pull_args)
-  local = f'/home/tester/review/results/service/runs/{run_id}'
-  assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False'
-  metrics = json.loads(execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json').stdout)
-  assert metrics['metrics']['loss']['summary']['last']['step'] == 79
-  steps = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([row['step'] for row in rows if 'loss' in row['metrics']]))"))
-  assert steps == list(range(80)), 'metrics were lost or duplicated during recovery'
-  duplicate_samples = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([[row['step'], row['metrics']['duplicate_probe']] for row in rows if 'duplicate_probe' in row['metrics']]))"))
-  assert duplicate_samples == [[0, 7.0], [0, 7.0], [1, 8.0]], 'recovery lost repeated-coordinate samples'
-  assert python(host, f"from pathlib import Path;print(('STDOUT_BURST:'+'x'*(256*1024)+'\\n').encode() in Path({local!r}+'/logs/stdout.log').read_bytes())") == 'True', 'large log stream was truncated'
-  # Interrupt an actual pull after one durable range, then restart the same CLI.
-  # Previous cached metadata and unselected files must remain intact throughout.
-  previous_state = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())")
-  api_proxy('/test/arm-download')
-  download_command = ['expri', 'service', 'fetch', '--config', '/tmp/owner.toml', *pull_args,
-    '--artifact', 'outputs/checkpoint.pt']
-  pull_pid = int(python(host, f'''import subprocess
+    assert live_result['status'] == 'running' and 'outputs/checkpoint-1000.pt' in live_result['downloaded'], 'live watcher did not commit a verified running-run download receipt'
+    stop_result_fetch()
+    python(worker, f"from pathlib import Path;Path({sync_gate!r}).touch()")
+    wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
+    wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)
+    for archived_run in [run_id, second['run_id']]:
+      archive = wait_archive(archived_run)
+      assert archive['incomplete'] is False and archive['file']['target']['path'] == 'result.zip', 'terminal archive did not finish independently as a complete result ZIP'
+    assert set(api_proxy('/test/state')['multipart_paths']) <= {'outputs/checkpoint.pt', 'outputs/checkpoint-1000.pt'}, 'worker finalized tracking documents or streams through per-file S3 multipart'
+    intent = python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/publishing-request.json').read_text())")
+    assert fixture_env['EXPRI_WORKER_TOKEN'] not in intent, 'publishing intent exposed its token'
+    assert 'X-Amz-' not in intent, 'publishing intent exposed a signed URL'
+  with workflow_progress.phase('Fetch metrics and raw logs'):
+    python(host, "from pathlib import Path;p=Path('/home/tester/review');p.mkdir();(p/'expri.toml').write_text('[project]\\nname=\"Offline service review\"\\n[download]\\nresults_dir=\"results\"\\n')")
+    pull_args = ['--project-id', 'demo', '--origin', 'worker', '--run-id', run_id, '--repo', '/home/tester/review', '--source', 'service']
+    client(host, 'fetch', *pull_args)
+    local = f'/home/tester/review/results/service/runs/{run_id}'
+    assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False'
+    metrics = json.loads(execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json').stdout)
+    assert metrics['metrics']['loss']['summary']['last']['step'] == 79
+    steps = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([row['step'] for row in rows if 'loss' in row['metrics']]))"))
+    assert steps == list(range(80)), 'metrics were lost or duplicated during recovery'
+    duplicate_samples = json.loads(python(host, f"import json;from pathlib import Path;rows=[json.loads(line) for line in Path({local!r}+'/outputs/metrics.jsonl').read_text().splitlines()];print(json.dumps([[row['step'], row['metrics']['duplicate_probe']] for row in rows if 'duplicate_probe' in row['metrics']]))"))
+    assert duplicate_samples == [[0, 7.0], [0, 7.0], [1, 8.0]], 'recovery lost repeated-coordinate samples'
+    assert python(host, f"from pathlib import Path;print(('STDOUT_BURST:'+'x'*(256*1024)+'\\n').encode() in Path({local!r}+'/logs/stdout.log').read_bytes())") == 'True', 'large log stream was truncated'
+  with workflow_progress.phase('Resume an interrupted checkpoint download'):
+    # Interrupt an actual pull after one durable range, then restart the same CLI.
+    # Previous cached metadata and unselected files must remain intact throughout.
+    previous_state = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())")
+    api_proxy('/test/arm-download')
+    download_command = ['expri', 'service', 'fetch', '--config', '/tmp/owner.toml', *pull_args,
+      '--artifact', 'outputs/checkpoint.pt']
+    pull_pid = int(python(host, f'''import subprocess
 from pathlib import Path
 with open('/tmp/checkpoint-pull.stdout', 'wb') as out, open('/tmp/checkpoint-pull.stderr', 'wb') as err:
   process = subprocess.Popen({download_command!r}, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
 print(process.pid)
 '''))
-  progress = f'/home/tester/review/results/service/.service-pull/{run_id}/state.json'
-  wait_for(lambda: api_proxy('/test/state')['download_blocked'], 'checkpoint pull did not reach its second range')
-  assert json.loads(python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())"))['files']['outputs/checkpoint.pt']['offset'] == 8 * 1024 * 1024, 'first range progress was not durable'
-  python(host, f'import os,signal;os.kill({pull_pid},signal.SIGKILL);print("interrupted")')
-  assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False', 'partial checkpoint was published into the review cache'
-  assert python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())") == previous_state, 'interrupted pull changed previous metadata'
-  saved_progress = python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())")
-  assert 'X-Amz-' not in saved_progress and fixture_env['EXPRI_OWNER_TOKEN'] not in saved_progress, 'download progress exposed a credential'
-  api_proxy('/test/release-download')
-  download_report = json.loads(client(host, 'fetch', *pull_args, '--artifact', 'outputs/checkpoint.pt').stdout)
-  assert download_report['resumed_bytes'] >= 8 * 1024 * 1024 and download_report['resumed_files'] >= 1, 'pull did not resume its saved checkpoint range'
-  assert api_proxy('/test/state')['download_ranges'].get('bytes=0-8388607') == 1, 'restart downloaded the acknowledged checkpoint prefix again'
-  digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
-  assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
-  dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
-  logged('browser-storage.log', ['docker', 'exec', '--user', 'tester', firefox,
-    'python3', '/opt/expri-browser/browser_forms.py', '--storage', run_id], timeout=90)
-  python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').touch()")
-  logged('browser-workspace.log', ['docker', 'exec', '--user', 'tester', firefox,
-    'python3', '/opt/expri-browser/browser_forms.py', '--workspace', run_id, second['run_id']], timeout=180)
-  logged('browser-previews.log', ['docker', 'exec', '--user', 'tester', firefox,
-    'python3', '/opt/expri-browser/browser_forms.py', '--previews', run_id, second['run_id']], timeout=180)
-  logged('browser-deep-link.log', ['docker', 'exec', '--user', 'tester', firefox,
-    'python3', '/opt/expri-browser/browser_forms.py', '--deep-link', run_id, second['run_id']], timeout=180)
-  refresh_run = running_refresh_fixture(second)
-  acknowledged_prefix_checks(refresh_run)
-  automatic_dashboard_checks(run_id, refresh_run)
-  python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').unlink()")
-  machine_run = project_machine_fixture(refresh_run)
-  project_api_checks(refresh_run, machine_run)
-  project_dashboard_checks(refresh_run, machine_run)
-  # Failed and cancelled runs must also finish publication, without a selected
-  # final checkpoint preventing their metadata/logs from draining.
-  failed = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach fail').stdout)
-  wait_for(lambda: drained(failed['run_dir']), 'failed run publisher did not drain', timeout=120)
-  failed_state = json.loads(python(worker, f"from pathlib import Path;print(Path({failed['run_dir']!r}+'/run-state.json').read_text())"))
-  assert failed_state['status'] == 'failed' and failed_state['exit_code'] == 7, 'publishing changed the failed task result'
-  cancelled = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach wait').stdout)
-  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({cancelled['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'cancellation fixture did not start')
-  execute(worker, 'expri', 'runs', 'cancel', cancelled['run_id'], '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json')
-  wait_for(lambda: drained(cancelled['run_dir']), 'cancelled run publisher did not drain', timeout=120)
-  cancelled_state = json.loads(python(worker, f"from pathlib import Path;print(Path({cancelled['run_dir']!r}+'/run-state.json').read_text())"))
-  assert cancelled_state['status'] == 'cancelled', 'publishing changed cancellation status'
-  terminal_session = dashboard_login()
-  terminal_catalog = browser_json('/api/catalog', terminal_session)
-  terminal_source = next(source['source_id'] for source in terminal_catalog['sources'] if source['project_id'] == 'demo' and source['origin'] == 'worker')
-  for result, expected in [(failed, 'failed'), (cancelled, 'cancelled')]:
-    detail = browser_json('/api/run?' + urlencode({'source': terminal_source, 'run_id': result['run_id']}), terminal_session)
-    assert detail['run']['status'] == expected, 'hosted result does not show the terminal training status'
-  browser('/logout', method='POST', cookie=terminal_session)
-  run_retention_checks()
-  storage_management_checks()
-  docker('stop', '--time', '1', service, s3)
-  offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
-  wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
-  offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
-  assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its pinned private asset'
-  assert publishing(offline_run['run_dir'])['status'] != 'published', 'offline checkpoint registration claimed completed cloud sync'
-  execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
-  python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
-  def review():
-    return python(host, "import json;from pathlib import Path;from urllib.request import urlopen;url=Path('/tmp/dashboard.log').read_text().strip().split('Dashboard: ')[1];catalog=json.load(urlopen(url+'/api/catalog',timeout=2));print(catalog['initial_source'])") == 'cached:service'
-  wait_for(review, 'offline dashboard did not recognize service cache')
-  offline_artifact = json.loads(python(host, f'''import hashlib, json
+    progress = f'/home/tester/review/results/service/.service-pull/{run_id}/state.json'
+    wait_for(lambda: api_proxy('/test/state')['download_blocked'], 'checkpoint pull did not reach its second range')
+    assert json.loads(python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())"))['files']['outputs/checkpoint.pt']['offset'] == 8 * 1024 * 1024, 'first range progress was not durable'
+    python(host, f'import os,signal;os.kill({pull_pid},signal.SIGKILL);print("interrupted")')
+    assert python(host, f"from pathlib import Path;print(Path({local!r}+'/outputs/checkpoint.pt').exists())") == 'False', 'partial checkpoint was published into the review cache'
+    assert python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/run-state.json').read_bytes()).hexdigest())") == previous_state, 'interrupted pull changed previous metadata'
+    saved_progress = python(host, f"from pathlib import Path;print(Path({progress!r}).read_text())")
+    assert 'X-Amz-' not in saved_progress and fixture_env['EXPRI_OWNER_TOKEN'] not in saved_progress, 'download progress exposed a credential'
+    api_proxy('/test/release-download')
+    download_report = json.loads(client(host, 'fetch', *pull_args, '--artifact', 'outputs/checkpoint.pt').stdout)
+    assert download_report['resumed_bytes'] >= 8 * 1024 * 1024 and download_report['resumed_files'] >= 1, 'pull did not resume its saved checkpoint range'
+    assert api_proxy('/test/state')['download_ranges'].get('bytes=0-8388607') == 1, 'restart downloaded the acknowledged checkpoint prefix again'
+    digest = python(host, f"import hashlib;from pathlib import Path;print(hashlib.sha256(Path({local!r}+'/outputs/checkpoint.pt').read_bytes()).hexdigest())")
+    assert digest == hashlib.sha256(bytes(range(256)) * (4096 * 17)).hexdigest()
+  with workflow_progress.phase('Hosted dashboard APIs and browser navigation'):
+    dashboard_uploaded_checks(run_id, second['run_id'], initial_session)
+    logged('browser-storage.log', ['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--storage', run_id], timeout=90)
+    python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').touch()")
+    logged('browser-workspace.log', ['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--workspace', run_id, second['run_id']], timeout=180)
+    logged('browser-previews.log', ['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--previews', run_id, second['run_id']], timeout=180)
+    logged('browser-deep-link.log', ['docker', 'exec', '--user', 'tester', firefox,
+      'python3', '/opt/expri-browser/browser_forms.py', '--deep-link', run_id, second['run_id']], timeout=180)
+  with workflow_progress.phase('Recover acknowledged tracking bytes'):
+    refresh_run = running_refresh_fixture(second)
+    acknowledged_prefix_checks(refresh_run)
+  with workflow_progress.phase('Dashboard refresh while new data arrives'):
+    automatic_dashboard_checks(run_id, refresh_run)
+  with workflow_progress.phase('Projects across multiple workers'):
+    python(firefox, "from pathlib import Path;Path('/tmp/expri-browser-legacy-catalog').unlink()")
+    machine_run = project_machine_fixture(refresh_run)
+    project_api_checks(refresh_run, machine_run)
+    project_dashboard_checks(refresh_run, machine_run)
+  with workflow_progress.phase('Failed and cancelled run publication'):
+    # Failed and cancelled runs must also finish publication, without a selected
+    # final checkpoint preventing their metadata/logs from draining.
+    failed = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach fail').stdout)
+    wait_for(lambda: drained(failed['run_dir']), 'failed run publisher did not drain', timeout=120)
+    failed_state = json.loads(python(worker, f"from pathlib import Path;print(Path({failed['run_dir']!r}+'/run-state.json').read_text())"))
+    assert failed_state['status'] == 'failed' and failed_state['exit_code'] == 7, 'publishing changed the failed task result'
+    cancelled = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach wait').stdout)
+    wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({cancelled['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'cancellation fixture did not start')
+    execute(worker, 'expri', 'runs', 'cancel', cancelled['run_id'], '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json')
+    wait_for(lambda: drained(cancelled['run_dir']), 'cancelled run publisher did not drain', timeout=120)
+    cancelled_state = json.loads(python(worker, f"from pathlib import Path;print(Path({cancelled['run_dir']!r}+'/run-state.json').read_text())"))
+    assert cancelled_state['status'] == 'cancelled', 'publishing changed cancellation status'
+    terminal_session = dashboard_login()
+    terminal_catalog = browser_json('/api/catalog', terminal_session)
+    terminal_source = next(source['source_id'] for source in terminal_catalog['sources'] if source['project_id'] == 'demo' and source['origin'] == 'worker')
+    for result, expected in [(failed, 'failed'), (cancelled, 'cancelled')]:
+      detail = browser_json('/api/run?' + urlencode({'source': terminal_source, 'run_id': result['run_id']}), terminal_session)
+      assert detail['run']['status'] == expected, 'hosted result does not show the terminal training status'
+    browser('/logout', method='POST', cookie=terminal_session)
+  with workflow_progress.phase('Run archival, restore, and retention'):
+    run_retention_checks()
+  with workflow_progress.phase('Storage statistics and durable project deletion'):
+    storage_management_checks()
+  with workflow_progress.phase('Offline asset training and local result review'):
+    docker('stop', '--time', '1', service, s3)
+    offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
+    wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
+    offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
+    assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its pinned private asset'
+    assert publishing(offline_run['run_dir'])['status'] != 'published', 'offline checkpoint registration claimed completed cloud sync'
+    execute(host, 'expri', '-T', 'service', 'runs', 'metrics', run_id, '--cached', '--config', '/home/tester/review/expri.toml', '--repo', '/home/tester/review', '--json')
+    python(host, "import subprocess;from pathlib import Path;f=Path('/tmp/dashboard.log').open('wb');subprocess.Popen(['expri','-T','service','dashboard','--config','/home/tester/review/expri.toml','--repo','/home/tester/review','--port','0'],stdout=f,stderr=f,start_new_session=True)")
+    def review():
+      return python(host, "import json;from pathlib import Path;from urllib.request import urlopen;url=Path('/tmp/dashboard.log').read_text().strip().split('Dashboard: ')[1];catalog=json.load(urlopen(url+'/api/catalog',timeout=2));print(catalog['initial_source'])") == 'cached:service'
+    wait_for(review, 'offline dashboard did not recognize service cache')
+    offline_artifact = json.loads(python(host, f'''import hashlib, json
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -1172,58 +1210,83 @@ with urlopen(url + checkpoint['download_url'], timeout=5) as response:
     digest.update(chunk)
 print(json.dumps({{'file': checkpoint, 'sha256': digest.hexdigest()}}))
 '''))
-  assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
-  assert offline_artifact['file']['downloaded'] is True, 'offline Files lost its verified checkpoint download receipt'
-  assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
-  print('Service workflow passed: tracking-v1 publishing, private asset sidecars/cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial result uploads, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
+    assert offline_artifact['file']['local'] is True and offline_artifact['file']['cloud'] is True, 'offline Files lost cached availability'
+    assert offline_artifact['file']['downloaded'] is True, 'offline Files lost its verified checkpoint download receipt'
+    assert offline_artifact['sha256'] == digest, 'offline dashboard download changed the cached checkpoint'
 finally:
-  if result_fetch_pid is not None:
-    try:
-      stop_result_fetch()
-    except (OSError, AssertionError):
-      print('Result-fetch watcher cleanup did not finish; container cleanup will stop it.', flush=True)
-  if refresh_browser is not None and refresh_browser.poll() is None:
-    refresh_browser.terminate()
-    try:
-      refresh_browser.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-      refresh_browser.kill()
-      refresh_browser.wait()
-  for container in containers:
-    try:
-      if container.endswith('-browser'):
-        docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
-        for name in [
-          'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
-          'workspace-storage-input-only', 'workspace-storage-inputs', 'workspace-storage', 'workspace-storage-narrow',
-          'workspace-storage-management',
-          'workspace-columns-desktop', 'workspace-columns-1024', 'workspace-columns-320', 'workspace-columns-360',
-          'workspace-project-default-desktop', 'workspace-project-default-1024',
-          'workspace-project-desktop', 'workspace-project-1024',
-          'workspace-project-320', 'workspace-project-360', 'workspace-project-failure',
-          'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
-          'workspace-elapsed', 'workspace-wall_clock',
-          'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
-        ]:
-          docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
-      if container.endswith('-host'):
-        for name in ['result-fetch.stdout', 'result-fetch.stderr']:
-          docker('cp', f'{container}:/tmp/{name}', str(logs / (name + '.log')), check=False, timeout=10)
-      with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
-        subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-      print('Could not collect a container log before cleanup.', flush=True)
-    finally:
+  try:
+    with workflow_progress.phase('Collect diagnostics and remove fixtures'):
+      if result_fetch_pid is not None:
+        try:
+          stop_result_fetch()
+        except (OSError, AssertionError):
+          workflow_progress.note('Result-fetch watcher cleanup did not finish; container cleanup will stop it.')
+      if refresh_browser is not None and refresh_browser.poll() is None:
+        try:
+          refresh_browser.terminate()
+          try:
+            refresh_browser.wait(timeout=5)
+          except subprocess.TimeoutExpired:
+            refresh_browser.kill()
+            refresh_browser.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+          workflow_progress.note('Browser cleanup did not finish; container cleanup will stop it.')
+      for container in containers:
+        role = container.rsplit('-', 1)[-1]
+        with workflow_progress.phase(f'Collect {role} diagnostics and remove container'):
+          try:
+            if container.endswith('-browser'):
+              docker('cp', f'{container}:/tmp/expri-browser-requests.jsonl', str(logs / 'browser-requests.log'), check=False, timeout=10)
+              for name in [
+                'workspace-desktop', 'workspace-narrow', 'workspace-ab', 'workspace-files', 'workspace-files-narrow',
+                'workspace-storage-input-only', 'workspace-storage-inputs', 'workspace-storage', 'workspace-storage-narrow',
+                'workspace-storage-management',
+                'workspace-columns-desktop', 'workspace-columns-1024', 'workspace-columns-320', 'workspace-columns-360',
+                'workspace-project-default-desktop', 'workspace-project-default-1024',
+                'workspace-project-desktop', 'workspace-project-1024',
+                'workspace-project-320', 'workspace-project-360', 'workspace-project-failure',
+                'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
+                'workspace-elapsed', 'workspace-wall_clock',
+                'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
+              ]:
+                docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
+            if container.endswith('-host'):
+              for name in ['result-fetch.stdout', 'result-fetch.stderr']:
+                docker('cp', f'{container}:/tmp/{name}', str(logs / (name + '.log')), check=False, timeout=10)
+            with (logs / (container.rsplit('-', 1)[-1] + '.log')).open('wb') as output:
+              subprocess.run(['docker', 'logs', container], stdout=output, stderr=subprocess.STDOUT, timeout=15)
+          except (OSError, AssertionError, subprocess.TimeoutExpired):
+            workflow_progress.note('Could not collect a container log before cleanup.')
+          finally:
+            try:
+              docker('rm', '--force', container, check=False, timeout=20)
+            except (OSError, AssertionError):
+              workflow_progress.note('Container cleanup did not finish; check the local container engine.')
+      if created_network:
+        try:
+          docker('network', 'rm', network, check=False, timeout=20)
+        except (OSError, AssertionError):
+          workflow_progress.note('Network cleanup did not finish; check the local container engine.')
+      for path in logs.glob('*.log'):
+        # Progress contains only authored labels and is still open for heartbeats.
+        if path.name == 'workflow-progress.log':
+          continue
+        try:
+          text = path.read_text(errors='replace')
+          path.write_text(redact(text))
+        except OSError:
+          # Exclude diagnostics that could not be redacted from uploaded artifacts.
+          try:
+            path.unlink(missing_ok=True)
+          except OSError:
+            workflow_progress.note('A diagnostic log could not be redacted or removed.')
+          else:
+            workflow_progress.note('A diagnostic log could not be redacted and was omitted.')
       try:
-        docker('rm', '--force', container, check=False, timeout=20)
-      except (OSError, AssertionError):
-        print('Container cleanup did not finish; check the local container engine.', flush=True)
-  if created_network:
-    try:
-      docker('network', 'rm', network, check=False, timeout=20)
-    except (OSError, AssertionError):
-      print('Network cleanup did not finish; check the local container engine.', flush=True)
-  for path in logs.glob('*.log'):
-    text = path.read_text(errors='replace')
-    path.write_text(redact(text))
-  shutil.rmtree(state)
+        shutil.rmtree(state)
+      except OSError:
+        workflow_progress.note('Temporary fixture cleanup did not finish.')
+  finally:
+    workflow_progress.close()
+
+print('Service workflow passed: tracking-v1 publishing, private asset sidecars/cache/offline reuse, registered live checkpoints/laptop label watch, acknowledged-prefix recovery, complete/partial result uploads, Firefox native downloads/SSE/chart review, versioned project storage cleanup/restart, checkpoint multipart/range recovery, terminal statuses and offline review.', flush=True)
