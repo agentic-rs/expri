@@ -6,6 +6,18 @@ or remotely.
 
 Building expri requires Rust 1.89 or newer.
 
+## Install
+
+Install or update the released CLI with Cargo:
+
+```sh
+cargo install expri --version 0.1.5 --locked --force
+expri --version
+```
+
+See the [release notes](CHANGELOG.md) for features and migration instructions.
+Install the same version on native workers when upgrading their capabilities.
+
 ## Push source and config
 
 Source and worker commands such as `push`, `setup`, and `-T ... run` operate

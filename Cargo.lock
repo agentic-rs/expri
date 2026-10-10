@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "expri"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "attohttpc",
  "base64 0.22.1",
