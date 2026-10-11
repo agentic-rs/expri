@@ -16,7 +16,7 @@ use preview::{bounded_warnings, preview};
 use crate::context::CommandContext;
 use crate::controller::run_pull;
 use crate::error::{ExpriError, Result};
-use crate::metric_charts::ChartXAxis;
+use crate::metric_charts::{ChartData, ChartXAxis};
 use crate::metrics::{self, MetricSummary, Reduction};
 use crate::protocol::RunQueryRequest;
 use crate::runs;
@@ -98,6 +98,15 @@ impl DashboardView for Dashboard {
     x_axis: ChartXAxis,
   ) -> Result<String> {
     Dashboard::chart(self, source, run_ids, filters, x_axis)
+  }
+  fn chart_data(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<ChartData> {
+    Dashboard::chart_data(self, source, run_ids, filters, x_axis)
   }
 }
 
@@ -635,7 +644,28 @@ impl Dashboard {
     filters: &[String],
     x_axis: ChartXAxis,
   ) -> Result<String> {
-    let runs = if filters.is_empty() {
+    let runs = self.load_chart_runs(source_id, run_ids, filters)?;
+    crate::metric_charts::render_dashboard_chart(&runs, filters, x_axis)
+  }
+
+  pub fn chart_data(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<ChartData> {
+    let runs = self.load_chart_runs(source_id, run_ids, filters)?;
+    crate::metric_charts::dashboard_chart_data(&runs, filters, x_axis)
+  }
+
+  fn load_chart_runs(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+  ) -> Result<Vec<metrics::RunMetrics>> {
+    Ok(if filters.is_empty() {
       let summaries = self.read_metrics(source_id, run_ids, &[], 1, false)?;
       let (selected, _) = selected_metrics(&summaries, &[])?;
       if selected.is_empty() {
@@ -654,8 +684,7 @@ impl Dashboard {
       }
     } else {
       self.read_metrics(source_id, run_ids, filters, 1, true)?
-    };
-    crate::metric_charts::render_dashboard_chart(&runs, filters, x_axis)
+    })
   }
 
   fn read_metrics(

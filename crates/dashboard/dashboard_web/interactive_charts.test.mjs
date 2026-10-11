@@ -1,7 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { attachChartInteractions, createChartController, parseChartPointLabel, parseChartRange, formatChartX, formatChartTick, chartXFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint } from "./.test/app.js";
+import { JSDOM } from "jsdom";
+import { act } from "react";
+
+execFileSync("./node_modules/.bin/esbuild", [
+  "interactive_charts.ts", "--bundle", "--format=esm", "--target=es2022", "--jsx=automatic", "--packages=external", "--outfile=.test/interactive_charts.js",
+], { cwd: new URL(".", import.meta.url), stdio: "pipe" });
+const { createChartController, parseChartPointLabel, parseChartRange, formatChartX, formatChartTick, chartXFraction, dragChartRange, zoomChartRange, restoreChartRange, nearestChartPoint, chartYFraction } = await import("./.test/interactive_charts.js");
 
 const MAX_STEP = 18446744073709551615n;
 function range(first, last, x_axis = "step") { return { x_axis, start_x: String(first), end_x: String(last) }; }
@@ -10,7 +16,7 @@ function point(step, x, y, value_text = "1") {
 }
 function localLabels(time_zone, values, domain) {
   const script = `
-    import { formatChartX, formatChartTick } from ${JSON.stringify(new URL("./.test/app.js", import.meta.url).href)};
+    import { formatChartX, formatChartTick } from ${JSON.stringify(new URL("./.test/interactive_charts.js", import.meta.url).href)};
     const values = ${JSON.stringify(values)}, domain = ${JSON.stringify(domain)};
     console.log(JSON.stringify(values.map(value => ({ full: formatChartX(value, "wall_clock", "local"), tick: formatChartTick(value, domain, "local") }))));
   `;
@@ -164,61 +170,240 @@ test("nearest sample uses displayed points without interpolating or collapsing r
   assert.deepEqual(logged, order, "logging order stays intact");
 });
 
-test("frame lifecycle is safe before a document exists and removes its load handler", () => {
-  const handlers = new Map();
-  const frame = { contentDocument: undefined, addEventListener: (name, callback) => handlers.set(name, callback), removeEventListener: (name, callback) => { if (handlers.get(name) === callback) handlers.delete(name); } };
-  const cleanup = attachChartInteractions(frame);
-  assert.equal(typeof handlers.get("load"), "function");
-  assert.doesNotThrow(() => handlers.get("load")());
-  cleanup();
-  assert.equal(handlers.size, 0);
-});
-
-test("chart refresh refuses unloaded frames and remains inert after disposal", () => {
-  const handlers = new Map();
-  const frame = { contentDocument: undefined, addEventListener: (name, callback) => handlers.set(name, callback), removeEventListener: (name, callback) => { if (handlers.get(name) === callback) handlers.delete(name); } };
-  const controller = createChartController(frame);
-  assert.equal(controller.isInteracting(), false);
-  assert.equal(controller.previewStatus(), "loading");
-  assert.equal(controller.replacePreview("<html></html>"), false);
-  assert.doesNotThrow(() => controller.setTimeZone("utc"), "display choices can change before the frame loads");
-  controller.dispose();
-  assert.equal(controller.replacePreview("<html></html>"), false);
-  assert.doesNotThrow(() => controller.setTimeZone("local"), "disposed controllers stay inert");
-  assert.equal(handlers.size, 0);
-  assert.doesNotThrow(() => controller.dispose());
-});
-
-test("preview status separates slow navigation, completed errors and stale loads", t => {
-  const previous_observer = globalThis.MutationObserver;
-  let changed;
-  globalThis.MutationObserver = class { constructor(callback) { changed = callback; } observe() {} disconnect() {} };
-  t.after(() => { globalThis.MutationObserver = previous_observer; });
-  const handlers = new Map();
-  const frame = {
-    ownerDocument: { baseURI: "https://expri.example.net/" }, src: "https://expri.example.net/api/chart?run_id=A", contentDocument: null,
-    addEventListener: (name, callback) => handlers.set(name, callback),
-    removeEventListener: (name, callback) => { if (handlers.get(name) === callback) handlers.delete(name); },
+function typedChart({ x_axis = "step", domain = ["0", "100"], runs = ["run-a", "run-b"], points } = {}) {
+  const samples = points ?? [
+    { step: "0", value: 1, x_value: domain[0], timestamp: null },
+    { step: "50", value: .5, x_value: String((BigInt(domain[0]) + BigInt(domain[1])) / 2n), timestamp: null },
+    { step: "100", value: 0, x_value: domain[1], timestamp: null },
+  ];
+  return {
+    schema_version: 1, x_axis, runs,
+    plots: [{ metric_name: "loss", domain: { x_min: domain[0], x_max: domain[1], value_min: 0, value_max: 1 }, series: runs.map((_, index) => ({
+      run_index: index + 1,
+      summary: { count: samples.length, missing_timestamp_count: samples.filter(point => point.timestamp === null).length, last: samples.at(-1), min: samples.at(-1), max: samples[0] },
+      points: samples.map(point => ({ ...point })),
+    })) }],
+    warnings: [], warnings_truncated: false,
+    parameter_rows: [{ name: "batch_size", values: runs.map(() => "8"), differs: false }], parameters_truncated: false,
   };
-  const controller = createChartController(frame); t.after(() => controller.dispose());
-  assert.equal(controller.previewStatus(), "loading", "inaccessible content before load can still be pending");
-  handlers.get("load")();
-  assert.equal(controller.previewStatus(), "invalid", "a completed native error page can be retried");
-  frame.src = "https://expri.example.net/api/chart?run_id=B";
-  assert.equal(controller.previewStatus(), "loading", "a new source is not the completed old request");
-  changed();
-  frame.contentDocument = { URL: "https://expri.example.net/api/chart?run_id=A", readyState: "complete", title: "", querySelectorAll: () => [], querySelector: () => null };
-  handlers.get("load")();
-  assert.equal(controller.previewStatus(), "loading", "a stale load never restarts the pending current source");
-  frame.contentDocument.URL = frame.src;
-  handlers.get("load")();
-  assert.equal(controller.previewStatus(), "invalid", "a completed current HTTP error is distinguishable from pending");
-  changed();
-  assert.equal(controller.previewStatus(), "loading", "same-source reload waits for its own completion");
-  frame.contentDocument.title = "Run comparison · expri";
-  frame.contentDocument.querySelector = () => ({});
-  handlers.get("load")();
-  assert.equal(controller.previewStatus(), "ready", "a valid no-metrics preview is ready too");
-  frame.src = "https://other.example.net/chart"; changed(); handlers.get("load")();
-  assert.equal(controller.previewStatus(), "loading", "foreign frames are never offered for automatic reload");
+}
+
+function chartHarness(t) {
+  const dom = new JSDOM('<!doctype html><body><div id="chart-preview"></div></body>', { url: "http://localhost/", pretendToBeVisual: true });
+  const globals = ["window", "document", "navigator", "HTMLElement", "Node", "Event", "KeyboardEvent", "IS_REACT_ACT_ENVIRONMENT"];
+  const previous = new Map(globals.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  for (const name of globals) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: name === "IS_REACT_ACT_ENVIRONMENT" ? true : dom.window[name] });
+  const container = dom.window.document.querySelector("#chart-preview");
+  const controller = createChartController(container);
+  t.after(() => {
+    act(() => controller.dispose());
+    dom.window.close();
+    for (const [name, descriptor] of previous) descriptor ? Object.defineProperty(globalThis, name, descriptor) : Reflect.deleteProperty(globalThis, name);
+  });
+  return {
+    dom, container, controller,
+    render(data) { let result; act(() => { result = controller.replacePreview(data); }); return result; },
+    click(selector) { act(() => container.querySelector(selector).click()); },
+    key(key) { const region = container.querySelector(".plot-scroll"); act(() => region.dispatchEvent(new dom.window.KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }))); },
+    axis() { const label = container.querySelector("[data-chart-range]"); return [label.dataset.startX, label.dataset.endX]; },
+  };
+}
+
+test("typed preview has constant-time readiness, explicit clearing, and an inert disposed lifecycle", t => {
+  const { container, controller, render } = chartHarness(t);
+  assert.equal(controller.previewStatus(), "loading");
+  assert.equal(controller.isInteracting(), false);
+  assert.doesNotThrow(() => controller.setTimeZone("utc"));
+  assert.equal(render({ ...typedChart(), plots: [] }), true);
+  assert.equal(controller.previewStatus(), "ready", "a no-metrics response is complete");
+  assert.match(container.textContent, /No scalar metrics/);
+  const original = container.querySelectorAll;
+  container.querySelectorAll = () => { throw new Error("Readiness must not walk the DOM"); };
+  assert.equal(controller.previewStatus(), "ready");
+  container.querySelectorAll = original;
+  act(() => controller.clear());
+  assert.equal(controller.previewStatus(), "loading");
+  assert.equal(container.childNodes.length, 0);
+  assert.equal(render(typedChart()), true);
+  act(() => controller.dispose());
+  assert.equal(controller.previewStatus(), "invalid");
+  assert.equal(render(typedChart()), false);
+  assert.equal(container.childNodes.length, 0);
+  assert.doesNotThrow(() => controller.clear());
+  assert.doesNotThrow(() => controller.setTimeZone("local"));
+});
+
+test("typed rendering treats names, warnings and bounded parameter prefixes as text", t => {
+  const { container, render } = chartHarness(t);
+  const data = typedChart({ runs: ['<img src="x">', "run-b"] });
+  data.plots[0].metric_name = "<script>metric</script>";
+  data.warnings = [{ run_index: 1, message: '<iframe src="bad"> note' }];
+  data.parameter_rows = [
+    { name: "same bounded prefix…", values: ['<a href="bad">', null], differs: true },
+    { name: "same bounded prefix…", values: ["second row", "different"], differs: true },
+  ];
+  render(data);
+  assert.equal(container.querySelector("img,script,iframe,a"), null);
+  assert.equal(container.querySelector("[style]"), null, "the parent dashboard needs no inline-style CSP exception");
+  assert.equal(container.querySelector(".metric-chart h2").textContent, data.plots[0].metric_name);
+  assert.match(container.textContent, /<iframe src="bad"> note/);
+  assert.equal(container.querySelectorAll(".params tbody tr").length, 2);
+  data.parameter_rows[0].values[0] = "changed first row";
+  render(data);
+  assert.deepEqual([...container.querySelectorAll(".params tbody tr")].map(row => row.querySelector("td").textContent), ["changed first row", "second row"]);
+  render(typedChart({ runs: ["run-a"] }));
+  assert.equal(container.querySelector(".parameter-comparison"), null, "single-run parameters stay in the Parameters tab");
+});
+
+test("refresh preserves stable plot nodes, absolute zoom, hidden runs, focus and parameter expansion", t => {
+  const h = chartHarness(t);
+  h.render(typedChart());
+  const svg = h.container.querySelector("svg"), details = h.container.querySelector("details");
+  details.open = true;
+  h.container.scrollTop = 50;
+  h.click('[data-chart-zoom="in"]');
+  assert.deepEqual(h.axis(), ["25", "75"]);
+  h.click('[data-chart-run="2"]');
+  const button = h.container.querySelector('[data-chart-run="2"]'); button.focus();
+  h.render(typedChart({ domain: ["0", "200"] }));
+  assert.equal(h.container.querySelector("svg"), svg);
+  assert.equal(h.container.querySelector("details"), details);
+  assert.equal(details.open, true);
+  assert.equal(h.container.scrollTop, 50);
+  assert.deepEqual(h.axis(), ["25", "75"]);
+  assert.equal(h.container.querySelector('[data-chart-run="2"]').getAttribute("aria-pressed"), "false");
+  assert.equal(h.dom.window.document.activeElement, h.container.querySelector('[data-chart-run="2"]'));
+  assert.equal(h.container.querySelectorAll("[data-chart-hit]").length, 1, "refresh never accumulates interaction layers");
+  h.click('[data-chart-zoom="reset"]');
+  h.render(typedChart({ domain: ["0", "300"] }));
+  assert.deepEqual(h.axis(), ["0", "300"], "reset resumes following new data");
+});
+
+test("refresh preserves logging order and keyboard identity through repeated and reset steps", t => {
+  const h = chartHarness(t);
+  const samples = [
+    { step: "10", value: .5, x_value: "10", timestamp: null },
+    { step: "0", value: -0, x_value: "0", timestamp: null },
+    { step: "10", value: .5, x_value: "10", timestamp: null },
+    { step: "10", value: .5, x_value: "10", timestamp: null },
+  ];
+  h.render(typedChart({ domain: ["0", "10"], points: samples }));
+  const region = h.container.querySelector(".plot-scroll"); region.focus();
+  const row = () => h.container.querySelector('[data-chart-readout-run="1"]');
+  h.key("ArrowRight"); assert.match(row().textContent, /sample 1 of 4 displayed/);
+  h.key("ArrowRight"); assert.equal(row().dataset.chartValue, "-0");
+  h.key("ArrowRight"); h.key("ArrowRight"); assert.match(row().textContent, /sample 4 of 4 displayed/);
+  h.render(typedChart({ domain: ["0", "20"], points: [...samples, { step: "20", value: 1, x_value: "20", timestamp: null }] }));
+  assert.equal(h.dom.window.document.activeElement, region);
+  assert.match(row().textContent, /sample 4 of 5 displayed/, "duplicate occurrence stays anchored after refresh");
+  h.key("ArrowRight"); assert.equal(row().dataset.chartStep, "20");
+});
+
+test("empty time plots retain visibility and zoom when timestamped data returns; axes reset exact range", t => {
+  const h = chartHarness(t);
+  const epoch = 1_780_000_000_000_000_000n;
+  const data = typedChart({ x_axis: "wall_clock", domain: [String(epoch), String(epoch + 100n)] });
+  for (const series of data.plots[0].series) for (const point of series.points) point.timestamp = "2026-05-28T00:00:00Z";
+  h.render(data); h.click('[data-chart-zoom="in"]'); h.click('[data-chart-run="2"]');
+  const zoom = h.axis();
+  h.render({ ...data, plots: [{ ...data.plots[0], domain: null, series: data.plots[0].series.map(series => ({ ...series, points: [] })) }] });
+  assert.equal(h.container.querySelector("svg"), null);
+  assert.match(h.container.textContent, /No timestamped samples/);
+  h.render(data);
+  assert.deepEqual(h.axis(), zoom);
+  assert.equal(h.container.querySelector('[data-chart-run="2"]').getAttribute("aria-pressed"), "false");
+  const svg = h.container.querySelector("svg");
+  act(() => h.controller.setTimeZone("utc"));
+  assert.equal(h.container.querySelector("svg"), svg);
+  assert.equal(h.container.querySelector("[data-chart-range]").dataset.timeZone, "utc");
+  const elapsed = typedChart({ x_axis: "elapsed" });
+  for (const series of elapsed.plots[0].series) for (const point of series.points) point.timestamp = "2026-05-28T00:00:00Z";
+  h.render(elapsed);
+  assert.match(h.container.querySelectorAll("circle")[2].getAttribute("aria-label"), / · elapsed 100 ns$/);
+  h.render(typedChart());
+  assert.deepEqual(h.axis(), ["0", "100"]);
+  assert.equal(h.container.querySelector('[data-chart-run="2"]').getAttribute("aria-pressed"), "false");
+});
+
+test("full finite domains position extreme values without overflow or sampled-extrema rescaling", t => {
+  const h = chartHarness(t);
+  const data = typedChart({ runs: ["run-a"] });
+  data.plots[0].domain.value_min = -Number.MAX_VALUE;
+  data.plots[0].domain.value_max = Number.MAX_VALUE;
+  data.plots[0].series[0].points = [
+    { step: "0", value: -Number.MAX_VALUE, x_value: "0", timestamp: null },
+    { step: "50", value: 0, x_value: "50", timestamp: null },
+    { step: "100", value: Number.MAX_VALUE, x_value: "100", timestamp: null },
+  ];
+  h.render(data);
+  assert.deepEqual([...h.container.querySelectorAll("circle")].map(circle => Number(circle.getAttribute("cy"))), [274, 151, 28]);
+  assert.ok([...h.container.querySelectorAll(".tick")].every(tick => !/Infinity|NaN/.test(tick.textContent)));
+  assert.equal(chartYFraction(0, -Number.MAX_VALUE, Number.MAX_VALUE), .5);
+  data.plots[0].series[0].points = [data.plots[0].series[0].points[1]];
+  h.render(data);
+  assert.equal(Number(h.container.querySelector("circle").getAttribute("cy")), 151, "the full retained domain remains authoritative");
+  data.plots[0].domain.value_min = data.plots[0].domain.value_max = Number.MIN_VALUE;
+  data.plots[0].series[0].points[0].value = Number.MIN_VALUE;
+  h.render(data);
+  assert.equal(h.container.querySelector("text.tick title").textContent, "5e-324", "a constant subnormal domain does not underflow during interpolation");
+  assert.equal(Number(h.container.querySelector("circle").getAttribute("cy")), 151);
+});
+
+test("a formerly empty plot does not steal focus after the user moves to another control", t => {
+  const h = chartHarness(t), data = typedChart();
+  h.render(data);
+  h.container.querySelector(".plot-scroll").focus();
+  h.click('[data-chart-run="2"]');
+  h.container.querySelector(".plot-scroll").focus();
+  h.render({ ...data, plots: [{ ...data.plots[0], domain: null, series: data.plots[0].series.map(series => ({ ...series, points: [] })) }] });
+  const outside = h.dom.window.document.createElement("button"); outside.textContent = "Other control";
+  h.dom.window.document.body.append(outside); outside.focus();
+  h.render(data);
+  assert.equal(h.dom.window.document.activeElement, outside);
+  assert.equal(h.container.querySelector('[data-chart-run="2"]').getAttribute("aria-pressed"), "false", "only stale focus is cleared; hidden runs are retained");
+});
+
+test("a refresh that clamps zoom to one coordinate does not draw hidden out-of-range values", t => {
+  const h = chartHarness(t);
+  h.render(typedChart({ runs: ["run-a"] })); h.click('[data-chart-zoom="in"]');
+  const points = [
+    { step: "100", value: 1, x_value: "100", timestamp: null },
+    { step: "200", value: 0, x_value: "200", timestamp: null },
+  ];
+  h.render(typedChart({ runs: ["run-a"], domain: ["100", "200"], points }));
+  assert.deepEqual(h.axis(), ["100", "100"]);
+  assert.equal(h.container.querySelector("polyline").getAttribute("points"), "518,28", "the out-of-range step must not become a visible vertical segment");
+  assert.equal(h.container.querySelectorAll('circle[display="none"]').length, 1);
+  h.click('[data-chart-zoom="reset"]');
+  assert.equal(h.container.querySelector("polyline").getAttribute("points"), "86,28 950,274");
+});
+
+test("controller uses typed point coordinates without DOM label parsing and defers refresh during drag", t => {
+  const h = chartHarness(t);
+  const first = MAX_STEP - 2n;
+  const samples = [0n, 1n, 2n].map((offset, index) => ({ step: String(first + offset), value: index / 2, x_value: String(first + offset), timestamp: null }));
+  const data = typedChart({ domain: [String(first), String(MAX_STEP)], points: samples });
+  h.render(data);
+  assert.deepEqual([...h.container.querySelectorAll('[data-chart-series="1"].point')].map(circle => Number(circle.getAttribute("cx"))), [86, 518, 950]);
+  for (const circle of h.container.querySelectorAll("circle")) {
+    const original = circle.getAttribute.bind(circle);
+    circle.getAttribute = name => { if (name === "aria-label") throw new Error("Typed charts must not reparse accessibility labels"); return original(name); };
+  }
+  const svg = h.container.querySelector("svg");
+  svg.getScreenCTM = () => ({ inverse: () => ({}) });
+  svg.createSVGPoint = () => ({ x: 0, y: 0, matrixTransform() { return { x: this.x, y: this.y }; } });
+  function pointer(name, x) {
+    const event = new h.dom.window.Event(name, { bubbles: true });
+    for (const [key, value] of Object.entries({ clientX: x, clientY: 151, pointerId: 1, button: 0, isPrimary: true })) Object.defineProperty(event, key, { value });
+    act(() => h.container.querySelector("[data-chart-hit]").dispatchEvent(event));
+  }
+  pointer("pointerdown", 86);
+  assert.equal(h.controller.isInteracting(), true);
+  assert.equal(h.render({ ...data, plots: [] }), false);
+  assert.equal(h.container.querySelector("svg"), svg);
+  pointer("pointerup", 950);
+  assert.equal(h.controller.isInteracting(), false);
+  assert.equal(h.render(data), true);
+  h.key("ArrowRight");
+  assert.equal(h.container.querySelector('[data-chart-readout-run="1"]').dataset.chartStep, String(first));
 });

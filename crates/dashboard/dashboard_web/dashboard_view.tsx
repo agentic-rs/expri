@@ -1293,12 +1293,7 @@ function ReviewWorkspace({
               </div>
             </div>
             <ErrorNotice id="chart-error" message={s.chart_error} />
-            <iframe
-              id="chart-frame"
-              title="Interactive experiment metric curves"
-              sandbox="allow-same-origin"
-              loading="lazy"
-            ></iframe>
+            <div id="chart-preview" role="region" aria-label="Interactive experiment metric curves"></div>
             <p className="chart-footnote muted">
               Hover to inspect values, drag across the x-axis to zoom, and use the legend to show or
               hide runs. Time views omit points without recorded timestamps.

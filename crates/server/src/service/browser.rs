@@ -877,7 +877,13 @@ mod tests {
       "/api/log?run_id=run-1",
       "/api/compare?run_id=run-1&run_id=run-2",
       "/api/chart?run_id=run-1",
+      "/api/chart-data?run_id=run-1",
     ] {
+      assert_eq!(
+        handle(&store, &auth, &request("GET", path, b"")).status(),
+        401,
+        "{path}"
+      );
       for (header, value) in [
         ("Origin", "null"),
         ("Origin", "https://hostile.example.net"),
@@ -1003,6 +1009,7 @@ mod tests {
         "/api/updates",
         "/api/runs",
         "/api/chart",
+        "/api/chart-data",
         "/unexpected",
       ] {
         let mut mutation = request(method, path, br#"{"operation":"write"}"#);

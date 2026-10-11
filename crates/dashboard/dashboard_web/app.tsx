@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { createChartController, type ChartAxis, type ChartTimeZone } from "./interactive_charts";
+import { parseChartData } from "./chart_data";
 import {
   AutoRefresh,
   type RefreshAvailability,
@@ -57,6 +58,7 @@ import {
 } from "./dashboard_view";
 export * from "./dashboard_model";
 export * from "./interactive_charts";
+export { parseChartData, type ChartData } from "./chart_data";
 export * from "./auto_refresh";
 export * from "./dashboard_files";
 export * from "./dashboard_storage";
@@ -135,7 +137,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let last_list_snapshot = -Infinity;
   let last_full_snapshot = -Infinity;
   let last_checked: number | null = null;
-  let cached_chart: { context: string; html: string } | null = null;
+  let cached_chart: { context: string; serialized: string; metric_names: string[] } | null = null;
+  let chart_context: string | null = null;
   let chart_error_context: string | null = null;
   let sources: Source[] = [];
   let source_id = "local";
@@ -536,7 +539,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const react_root = createRoot(required("dashboard-root"));
   flushSync(() => react_root.render(<DashboardView store={store} actions={actions} />));
   const chart_controller =
-    options.chart_controller ?? createChartController(required<HTMLIFrameElement>("chart-frame"));
+    options.chart_controller ?? createChartController(required("chart-preview"));
   chart_controller.setTimeZone(time_zone);
 
   function abortQuietRequests(): void {
@@ -744,8 +747,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     };
     reloadRunTable();
   }
-  function chartUrl(): string {
-    return apiUrl("/api/chart", {
+  function chartUrl(path = "/api/chart-data"): string {
+    return apiUrl(path, {
       source: source_id,
       run_id: review?.run_ids ?? [],
       metric: review?.metric_names ?? [],
@@ -882,7 +885,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     rendered_detail = null;
     rendered_comparison = null;
     clearChartError();
-    required<HTMLIFrameElement>("chart-frame").removeAttribute("src");
+    cached_chart = null;
+    chart_context = null;
+    chart_controller.clear();
     updateUi({ review_empty: true, chart_visible: false, log_content: "", log_note: "" });
   }
   function closeReview(): void {
@@ -911,6 +916,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     const open = () => {
       selection_timeout = undefined;
       if (review !== pending_review) return;
+      updateChart();
       if (ids.length === 1 && ids[0]) void loadRun(ids[0]);
       else void loadComparison();
     };
@@ -950,7 +956,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     rendered_detail = null;
     rendered_comparison = null;
     cached_chart = null;
-    required<HTMLIFrameElement>("chart-frame").removeAttribute("src");
+    chart_context = null;
+    chart_controller.clear();
     updateUi({
       review_empty: false,
       review_loading: true,
@@ -981,21 +988,65 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (log_view) log_view.pending = false;
     }
   }
+  function chartDataForRequest(value: unknown, url: string) {
+    const data = parseChartData(value), query = new URL(url, document.baseURI).searchParams;
+    if (data.x_axis !== query.get("x_axis") ||
+      JSON.stringify(data.runs) !== JSON.stringify(query.getAll("run_id")))
+      throw new Error("The chart data does not match the selected runs or axis.");
+    return data;
+  }
   function updateChart(): void {
     if (!review) return;
     const url = chartUrl();
-    const frame = required<HTMLIFrameElement>("chart-frame");
-    if ((cached_chart?.context ?? frame.getAttribute("src")) !== url) {
-      chart_lane.cancel();
-      frame.src = url;
-      chart_revisions.delete(url);
-      cached_chart = null;
-      clearChartError();
-      updateUi({ chart_busy: false });
-    }
-    chartControls(url);
+    chartControls();
+    if (chart_context === url && (chart_lane.pending || cached_chart?.context === url)) return;
+    chart_lane.cancel();
+    chart_context = url;
+    chart_revisions.delete(url);
+    clearChartError();
+    void loadChart(url, review, source_id);
   }
-  function chartControls(url: string): void {
+  async function loadChart(url: string, current_review: Review, source: string): Promise<void> {
+    const current = () => review === current_review && source_id === source && chart_context === url;
+    updateUi({ chart_busy: true });
+    try {
+      const value = await chart_lane.runJson<unknown>(url);
+      if (value === undefined || !current()) return;
+      const data = chartDataForRequest(value, url);
+      if (!chart_controller.replacePreview(data)) return;
+      cached_chart = { context: url, serialized: JSON.stringify(data), metric_names: data.plots.map(plot => plot.metric_name) };
+      clearChartError();
+    } catch (error) {
+      if (current()) {
+        chart_error_context = url;
+        updateUi({ chart_error: `${cached_chart ? "Could not load the selected chart. Showing the last loaded chart." : "Could not load the chart."} ${errorText(error)}` });
+      }
+    } finally {
+      if (current()) {
+        updateUi({ chart_busy: false });
+        alignChartContext();
+      }
+    }
+  }
+  // The first request chooses the default metrics on the server. Once metadata
+  // fills the checked tags, reuse that response if it chose the same series.
+  function alignChartContext(): void {
+    if (!cached_chart || !review?.metric_selection_set) return;
+    const requested = new URL(cached_chart.context, document.baseURI);
+    if (requested.searchParams.has("metric")) return;
+    const current_url = chartUrl(), current = new URL(current_url, document.baseURI);
+    current.searchParams.delete("metric");
+    if (current.toString() !== requested.toString()) return;
+    if (JSON.stringify(cached_chart.metric_names) === JSON.stringify(review.metric_names)) {
+      chart_context = current_url;
+      cached_chart.context = current_url;
+    } else if (!chart_lane.pending) {
+      // New metrics can arrive between the two parallel reads. Reconcile with
+      // the checked tags immediately, even when automatic updates are off.
+      updateChart();
+    }
+  }
+  function chartControls(): void {
     if (!review) return;
     const metrics = review.metric_names.length
       ? `${review.metric_names.length} selected metrics`
@@ -1007,7 +1058,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           ? `Recorded date & time in ${time_zone === "utc" ? "UTC" : "your local timezone"}`
           : "Global step";
     updateUi({
-      chart_url: url,
+      chart_url: chartUrl("/api/chart"),
       chart_visible: true,
       chart_note: `${metrics} · ${axis} · at most 600 chart points per series`,
     });
@@ -1020,55 +1071,21 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     time_zone = value;
     syncChartChoices();
     chart_controller.setTimeZone(value);
-    if (review && ui.chart_visible) chartControls(chartUrl());
+    if (review && ui.chart_visible) chartControls();
   }
   function clearChartError(context?: string): void {
     if (context !== undefined && chart_error_context !== context) return;
     chart_error_context = null;
     updateUi({ chart_error: null });
   }
-  async function changeChartAxis(value: ChartAxis): Promise<void> {
+  function changeChartAxis(value: ChartAxis): void {
     if (value === x_axis) return;
     cancelRefresh();
     chart_lane.cancel();
     clearChartError();
     x_axis = value;
     syncChartChoices();
-    if (!review || !ui.chart_visible) return;
-    const current_review = review,
-      source = source_id,
-      url = chartUrl();
-    chartControls(url);
-    if (chart_controller.previewStatus() !== "ready" || chart_controller.isInteracting()) {
-      updateChart();
-      return;
-    }
-    updateUi({ chart_busy: true });
-    try {
-      const html = await chart_lane.runText(url);
-      if (
-        html === undefined ||
-        review !== current_review ||
-        source_id !== source ||
-        chartUrl() !== url
-      )
-        return;
-      if (chart_controller.replacePreview(html)) {
-        cached_chart = { context: url, html };
-        chart_revisions.delete(url);
-        clearChartError(url);
-      } else updateChart();
-    } catch (error) {
-      if (review === current_review && source_id === source && chartUrl() === url) {
-        chart_error_context = url;
-        updateUi({
-          chart_error: `Could not load the selected axis. Showing the last loaded chart. ${errorText(error)}`,
-        });
-      }
-    } finally {
-      if (review === current_review && source_id === source && chartUrl() === url)
-        updateUi({ chart_busy: false });
-    }
+    if (review && ui.chart_visible) updateChart();
   }
   function changeMetric(name: string, checked: boolean): void {
     if (
@@ -1082,8 +1099,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       ? [...new Set([...review.metric_names, name])]
       : review.metric_names.filter((item) => item !== name);
     publish();
+    updateChart();
     if (review.kind === "compare") void loadComparison();
-    else updateChart();
   }
   function addMetric(name: string): void {
     if (!review || !name || review.metric_names.length >= 6) return;
@@ -1152,7 +1169,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     };
     ensureLog();
     ensureArtifacts();
-    if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
+    if (chart_context === null) updateChart();
+    else { alignChartContext(); chartControls(); }
     return true;
   }
   function resetArchivalAction(): void {
@@ -1231,6 +1249,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       review.log_stream = previous.log_stream;
       syncReviewTabs();
     }
+    if (review?.tab === "charts") updateChart();
     await loadRun(id);
   }
   function cacheDetail(detail: Detail): void {
@@ -1314,11 +1333,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({ review_warnings: result.comparison.warnings });
     return true;
   }
-  async function loadComparison(preserve = false): Promise<boolean> {
+  async function loadComparison(): Promise<boolean> {
     if (!review || review.kind !== "compare") return false;
     updateUi({ review_error: null });
     updateUi({ comparison_busy: true });
-    if (!rendered_comparison) updateUi({ chart_visible: false });
     try {
       const result = await compare_lane.run<Comparison>(comparisonUrl());
       if (!result || !review || review.kind !== "compare") return false;
@@ -1333,7 +1351,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (!renderComparison(result)) return false;
       updateUi({ comparison_busy: false });
       publish();
-      if (!preserve || !required<HTMLIFrameElement>("chart-frame").src) updateChart();
+      if (chart_context === null) updateChart();
+      else { alignChartContext(); chartControls(); }
       return true;
     } catch (error) {
       updateUi({ review_loading: false });
@@ -1349,6 +1368,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     metric_names = [
       ...new Set(ids.flatMap((id) => Object.keys(detail_cache.get(id)?.metrics ?? {}))),
     ].sort();
+    updateChart();
     void loadComparison();
   }
   function sourceNote(): void {
@@ -1458,35 +1478,20 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   }
   async function refreshCurrentChart(lane: RequestLane): Promise<ChartRefreshOutcome> {
     if (!review || review.tab !== "charts") return "applied";
-    if (chart_controller.isInteracting()) return "deferred";
-    const current_review = review,
-      source = source_id,
-      url = chartUrl(),
-      status = chart_controller.previewStatus();
-    if (status === "loading") return "deferred";
-    if (status === "invalid") {
-      required<HTMLIFrameElement>("chart-frame").src = url;
-      chart_revisions.delete(url);
-      cached_chart = null;
-      throw new Error(
-        "The chart preview could not load. Retrying when the connection is available.",
-      );
-    }
-    const html = await lane.runText(url);
-    if (
-      html === undefined ||
-      review !== current_review ||
-      source_id !== source ||
-      chartUrl() !== url
-    )
+    if (chart_controller.isInteracting() || chart_lane.pending) return "deferred";
+    const current_review = review, source = source_id, url = chartUrl();
+    const value = await lane.runJson<unknown>(url);
+    if (value === undefined || review !== current_review || source_id !== source || chartUrl() !== url)
       return "cancelled";
-    if (cached_chart?.context === url && cached_chart.html === html) {
-      clearChartError(url);
+    const data = chartDataForRequest(value, url), serialized = JSON.stringify(data);
+    if (chart_controller.previewStatus() === "ready" && cached_chart?.context === url && cached_chart.serialized === serialized) {
+      clearChartError();
       return "applied";
     }
-    if (!chart_controller.replacePreview(html)) return "deferred";
-    cached_chart = { context: url, html };
-    clearChartError(url);
+    if (!chart_controller.replacePreview(data)) return "deferred";
+    chart_context = url;
+    cached_chart = { context: url, serialized, metric_names: data.plots.map(plot => plot.metric_name) };
+    clearChartError();
     return "applied";
   }
   function applyLog(view: LogView, log: Log): void {
@@ -1623,7 +1628,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           if (current_review.kind === "run") {
             const id = current_review.run_ids[0];
             if (id && !(await loadRun(id, true))) return;
-          } else if (!(await loadComparison(true))) return;
+          } else if (!(await loadComparison())) return;
           if (generation !== refresh_generation || current_review !== review) return;
           if (
             !(await refreshCurrentLog(log_lane)) ||
@@ -1774,14 +1779,6 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           log_revisions.clear();
           comparison_revision = null;
         }
-        if (
-          current_review.tab === "charts" &&
-          required<HTMLIFrameElement>("chart-frame").src &&
-          chart_controller.previewStatus() !== "ready"
-        ) {
-          const outcome = await refreshCurrentChart(quiet_lanes.chart);
-          return outcome === "deferred" ? deferChart() : "cancelled";
-        }
         const view_revision = JSON.stringify(
           revisions.map((item) => [
             item?.run_id,
@@ -1843,7 +1840,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
             publish();
             updateUi({ review_error: null });
             publish();
-            if (!required<HTMLIFrameElement>("chart-frame").src) updateChart();
+            if (chart_context === null) updateChart();
+            else alignChartContext();
             acknowledgements.push(() => {
               comparison_revision = { context, revision: view_revision };
             });
@@ -1851,7 +1849,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         }
         if (current_review.tab === "charts") {
           const context = chartUrl();
-          if (force || chart_revisions.get(context) !== view_revision) {
+          if (force || chart_controller.previewStatus() !== "ready" || chart_revisions.get(context) !== view_revision) {
             const outcome = await refreshCurrentChart(quiet_lanes.chart);
             if (outcome === "deferred") return deferChart();
             if (outcome === "cancelled") return "cancelled";

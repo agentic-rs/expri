@@ -9,6 +9,282 @@ fn dashboard_chart(runs: &[RunMetrics], filters: &[String]) -> Result<String> {
   render_dashboard_chart(runs, filters, ChartXAxis::Step)
 }
 
+#[test]
+fn chart_data_keeps_integer_precision_and_exact_time_axis_coordinates() {
+  let mut selected = run(
+    "run-a",
+    vec![
+      timed_point(u64::MAX, 2.0, "2026-10-03T01:00:02.000000001Z"),
+      point(0, 1.0),
+      timed_point(u64::MAX - 1, 0.5, "2026-10-03T01:00:05.000000002Z"),
+    ],
+  );
+  selected.first_metric_timestamp = Some("2026-10-03T01:00:00Z".into());
+  let filters = ["loss".into()];
+  let step =
+    dashboard_chart_data(std::slice::from_ref(&selected), &filters, ChartXAxis::Step).unwrap();
+  let values = serde_json::to_value(&step).unwrap();
+  assert_eq!(values["schema_version"], 1);
+  assert_eq!(values["x_axis"], "step");
+  assert_eq!(values["runs"], json!(["run-a"]));
+  assert_eq!(values["plots"][0]["domain"]["x_max"], u64::MAX.to_string());
+  assert_eq!(
+    values["plots"][0]["series"][0]["points"][0]["step"],
+    u64::MAX.to_string()
+  );
+  assert_eq!(
+    values["plots"][0]["series"][0]["points"][0]["x_value"],
+    u64::MAX.to_string()
+  );
+  assert_eq!(
+    values["plots"][0]["series"][0]["points"][1]["timestamp"],
+    Value::Null
+  );
+  let elapsed = dashboard_chart_data(
+    std::slice::from_ref(&selected),
+    &filters,
+    ChartXAxis::Elapsed,
+  )
+  .unwrap();
+  let series = &elapsed.plots[0].series[0];
+  assert_eq!(series.points.len(), 2);
+  assert_eq!(series.points[0].x_value, "2000000001");
+  assert_eq!(series.points[1].x_value, "5000000002");
+  assert_eq!(series.summary.count, 3);
+  assert_eq!(series.summary.missing_timestamp_count, 1);
+  assert_eq!(series.summary.min.as_ref().unwrap().value, 0.5);
+  assert_eq!(series.run_index, 1);
+  let before_epoch = run(
+    "run-before",
+    vec![timed_point(1, 1.0, "1969-12-31T23:59:59.999999999Z")],
+  );
+  let wall_clock = dashboard_chart_data(&[before_epoch], &[], ChartXAxis::WallClock).unwrap();
+  assert_eq!(wall_clock.plots[0].series[0].points[0].x_value, "-1");
+  assert_eq!(wall_clock.plots[0].domain.as_ref().unwrap().x_min, "-1");
+}
+
+#[test]
+fn chart_data_shares_html_sampling_and_preserves_complete_summaries() {
+  let mut points: Vec<_> = (0..10_000)
+    .map(|step| point(step, (step % 13) as f64))
+    .collect();
+  points[5000].value = -99_999.0;
+  points[9998].value = 99_999.0;
+  let runs = [run("run-a", points)];
+  let data = dashboard_chart_data(&runs, &[], ChartXAxis::Step).unwrap();
+  let curve = &data.plots[0].series[0];
+  assert!(curve.points.len() <= DASHBOARD_POINT_BUDGET);
+  assert_eq!(curve.points.first().unwrap().point.step, "0");
+  assert_eq!(curve.points.last().unwrap().point.step, "9999");
+  assert!(curve.points.iter().any(|point| point.point.step == "5000"));
+  assert!(curve.points.iter().any(|point| point.point.step == "9998"));
+  assert_eq!(curve.summary.count, 10_000);
+  assert_eq!(curve.summary.min.as_ref().unwrap().value, -99_999.0);
+  assert_eq!(curve.summary.max.as_ref().unwrap().value, 99_999.0);
+  let html = dashboard_chart(&runs, &[]).unwrap();
+  assert_eq!(html.matches("<circle ").count(), curve.points.len());
+  let bytes = serde_json::to_vec(&data).unwrap();
+  assert!(bytes.len() * 2 < html.len());
+  let json = String::from_utf8(bytes).unwrap();
+  for markup in [
+    "<svg",
+    "<circle",
+    "<script",
+    "<style",
+    "aria-label",
+    "data-x-value",
+  ] {
+    assert!(!json.contains(markup), "{markup}");
+  }
+}
+
+#[test]
+fn chart_data_keeps_empty_time_series_and_null_zero_count_statistics() {
+  let mut absent = run("run-a", vec![point(4, 1.0), point(8, 2.0)]);
+  let data = dashboard_chart_data(std::slice::from_ref(&absent), &[], ChartXAxis::Elapsed).unwrap();
+  assert!(data.plots[0].domain.is_none());
+  assert_eq!(data.plots[0].series.len(), 1);
+  assert!(data.plots[0].series[0].points.is_empty());
+  assert_eq!(data.plots[0].series[0].summary.missing_timestamp_count, 2);
+  absent.metrics.get_mut("loss").unwrap().summary.count = 0;
+  absent
+    .metrics
+    .get_mut("loss")
+    .unwrap()
+    .summary
+    .missing_timestamp_count = 0;
+  absent.metrics.get_mut("loss").unwrap().points.clear();
+  let data = dashboard_chart_data(&[absent], &[], ChartXAxis::Step).unwrap();
+  let summary = &data.plots[0].series[0].summary;
+  assert!(summary.last.is_none() && summary.min.is_none() && summary.max.is_none());
+}
+
+#[test]
+fn chart_data_metadata_is_bounded_and_compares_complete_parameter_values() {
+  let common = "雪".repeat(1500);
+  let mut first = run("run-a", vec![]);
+  first.params = Some(json!({"nullable":null,"text":format!("{common}-a")}));
+  first.warnings = (0..110)
+    .map(|_| json!({"message":"a".repeat(2000)}))
+    .collect();
+  let mut second = run("run-b", vec![]);
+  second.params = Some(json!({"text":format!("{common}-b")}));
+  let data = dashboard_chart_data(&[first, second], &[], ChartXAxis::Step).unwrap();
+  assert!(data.warnings_truncated && data.parameters_truncated);
+  assert_eq!(data.warnings.len(), 100);
+  assert!(
+    data
+      .warnings
+      .iter()
+      .all(|warning| warning.message.chars().count() <= 512)
+  );
+  let text = data
+    .parameter_rows
+    .iter()
+    .find(|row| row.name == "text")
+    .unwrap();
+  assert!(text.differs);
+  assert_eq!(text.values[0], text.values[1]);
+  assert!(text.values[0].as_ref().unwrap().chars().count() <= 1000);
+  let nullable = data
+    .parameter_rows
+    .iter()
+    .find(|row| row.name == "nullable")
+    .unwrap();
+  assert_eq!(nullable.values, [Some("null".into()), None]);
+  assert!(nullable.differs);
+}
+
+#[test]
+fn chart_data_selection_checks_unknown_invalid_and_excessive_filters() {
+  let mut selected = run("run-a", vec![point(1, 1.0)]);
+  for index in 0..7 {
+    selected
+      .metrics
+      .insert(format!("metric-{index}"), selected.metrics["loss"].clone());
+  }
+  let data = dashboard_chart_data(std::slice::from_ref(&selected), &[], ChartXAxis::Step).unwrap();
+  assert_eq!(data.plots.len(), 4);
+  assert!(data.warnings[0].message.contains("first 4 of 8"));
+  for filters in [
+    vec!["missing".into()],
+    vec!["\n".into()],
+    (0..7).map(|index| format!("metric-{index}")).collect(),
+  ] {
+    assert!(
+      dashboard_chart_data(std::slice::from_ref(&selected), &filters, ChartXAxis::Step).is_err()
+    );
+  }
+  let mut invalid_run = selected.clone();
+  invalid_run.run_id = "雪".repeat(86);
+  assert!(dashboard_chart_data(&[invalid_run], &[], ChartXAxis::Step).is_err());
+  assert!(dashboard_chart_data(&[], &[], ChartXAxis::Step).is_err());
+  assert!(
+    dashboard_chart_data(&[selected.clone(), selected.clone()], &[], ChartXAxis::Step).is_err()
+  );
+  let mut invalid_metric = selected.clone();
+  invalid_metric
+    .metrics
+    .insert("a\n".into(), invalid_metric.metrics["loss"].clone());
+  assert!(dashboard_chart_data(&[invalid_metric], &[], ChartXAxis::Step).is_err());
+  assert!(dashboard_chart_data(&vec![selected; 9], &[], ChartXAxis::Step).is_err());
+}
+
+#[test]
+fn chart_data_large_comparisons_are_smaller_than_standalone_svg_payloads() {
+  let names: Vec<_> = (0..6).map(|index| format!("metric-{index}")).collect();
+  let mut runs = Vec::new();
+  for index in 0..8 {
+    let points = (0..2000)
+      .map(|step| {
+        timed_point(
+          step,
+          (step % 13) as f64,
+          &format!("2026-10-03T01:00:00.{step:09}Z"),
+        )
+      })
+      .collect();
+    let mut selected = run(&format!("run-{index}"), points);
+    let original = selected.metrics.remove("loss").unwrap();
+    for name in &names {
+      selected.metrics.insert(name.clone(), original.clone());
+    }
+    runs.push(selected);
+  }
+  let data = dashboard_chart_data(&runs, &names, ChartXAxis::Elapsed).unwrap();
+  let json = serde_json::to_vec(&data).unwrap();
+  let html = render_dashboard_chart(&runs, &names, ChartXAxis::Elapsed).unwrap();
+  let point_count: usize = data
+    .plots
+    .iter()
+    .flat_map(|plot| &plot.series)
+    .map(|series| series.points.len())
+    .sum();
+  assert_eq!(point_count, DASHBOARD_TOTAL_POINT_BUDGET);
+  assert_eq!(html.matches("<circle ").count(), point_count);
+  assert!(json.len() * 2 < html.len());
+  println!(
+    "8 runs × 6 metrics × 2000 source samples: {point_count} sampled points; JSON={} bytes, HTML={} bytes",
+    json.len(),
+    html.len()
+  );
+}
+
+#[test]
+fn chart_data_large_comparisons_preserve_the_sample_budget_under_the_response_cap() {
+  let timestamp = format!("2026-10-03T01:00:00.{}Z", "1".repeat(107));
+  let names: Vec<_> = (0..6).map(|index| format!("metric-{index}")).collect();
+  let mut runs = Vec::new();
+  for index in 0..8 {
+    let points = (0..1000)
+      .map(|step| {
+        timed_point(
+          u64::MAX - step,
+          if step % 2 == 0 { f64::MAX } else { -f64::MAX },
+          &timestamp,
+        )
+      })
+      .collect();
+    let mut selected = run(&format!("run-{index}"), points);
+    let original = selected.metrics.remove("loss").unwrap();
+    for name in &names {
+      selected.metrics.insert(name.clone(), original.clone());
+    }
+    selected.params = Some(
+      serde_json::to_value(
+        (0..30)
+          .map(|key| (format!("parameter-{key:02}"), "🧪".repeat(2000)))
+          .collect::<BTreeMap<_, _>>(),
+      )
+      .unwrap(),
+    );
+    selected.warnings = (0..100)
+      .map(|_| json!({"message":"🧪".repeat(512)}))
+      .collect();
+    runs.push(selected);
+  }
+  for axis in [ChartXAxis::Step, ChartXAxis::Elapsed, ChartXAxis::WallClock] {
+    let data = dashboard_chart_data(&runs, &names, axis).unwrap();
+    let points: usize = data
+      .plots
+      .iter()
+      .flat_map(|plot| &plot.series)
+      .map(|series| series.points.len())
+      .sum();
+    assert_eq!(points, DASHBOARD_TOTAL_POINT_BUDGET);
+    assert_eq!(data.parameter_rows.len(), 24);
+    assert!(data.parameters_truncated && data.warnings_truncated);
+    assert!(serde_json::to_vec(&data).unwrap().len() <= DASHBOARD_HTML_LIMIT);
+    assert!(
+      data
+        .plots
+        .iter()
+        .flat_map(|plot| &plot.series)
+        .all(|series| series.summary.count == 1000)
+    );
+  }
+}
+
 fn point(step: u64, value: f64) -> MetricPoint {
   MetricPoint {
     step,

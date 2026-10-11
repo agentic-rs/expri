@@ -349,6 +349,15 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert chart['status'] == 200 and chart['headers']['content-type'].startswith('text/html'), 'hosted metric chart is unavailable'
   assert '<svg' in chart['body'] and 'loss' in chart['body'] and run_id in chart['body'], 'hosted chart does not render uploaded metric data'
   assert 'X-Amz-Signature' not in chart['body'], 'hosted chart exposes an object-store credential'
+  assert "default-src 'none'" in chart['headers']['content-security-policy'] and 'script-src' not in chart['headers']['content-security-policy'], 'standalone chart weakened its script-blocking policy'
+  chart_data = browser('/api/chart-data?' + urlencode({'source': source_id, 'run_id': run_id, 'metric': 'loss'}), cookie=cookie, limit=2 * 1024 * 1024)
+  assert chart_data['status'] == 200 and chart_data['headers']['content-type'].startswith('application/json'), 'hosted chart data is unavailable'
+  chart_payload = json.loads(chart_data['body'])
+  assert chart_payload['schema_version'] == 1 and chart_payload['x_axis'] == 'step' and chart_payload['runs'] == [run_id], 'hosted chart data changed its comparison identity'
+  series = next(plot for plot in chart_payload['plots'] if plot['metric_name'] == 'loss')['series'][0]
+  assert series['run_index'] == 1 and series['summary']['count'] == 80 and series['summary']['last']['step'] == '79', 'hosted chart data differs from the complete metric summary'
+  assert len(series['points']) == 80 and all(isinstance(point['step'], str) and point['x_value'] == point['step'] for point in series['points']), 'hosted chart data lost exact decimal step coordinates'
+  assert 'X-Amz-Signature' not in chart_data['body'], 'hosted chart data exposes an object-store credential'
   all_runs = browser_json('/api/runs?' + urlencode({'source': source_id, 'limit': 20}), cookie)['runs']
   compared_ids = [run_id, second_run_id]
   assert set(compared_ids) <= {run['run_id'] for run in all_runs}, 'hosted catalog did not retain both uploaded experiments'
@@ -365,6 +374,67 @@ def dashboard_uploaded_checks(run_id, second_run_id, previous_cookie):
   assert logout['status'] == 303 and logout['headers'].get('location') == '/login', 'dashboard logout did not redirect to login'
   assert 'Max-Age=0' in logout['headers']['set-cookie'], 'dashboard logout did not clear its cookie'
   assert browser('/api/catalog', cookie=cookie)['status'] == 401, 'dashboard logout did not revoke its session'
+
+
+def long_chart_data_checks():
+  project_id = 'chart-data-fixture'
+  run_id = 'long-run'
+  root = '/home/tester/chart-data-fixture'
+  base_step = 9007199254740993
+  samples = 20_000
+  unsafe_metric = '<img src=x onerror="document.documentElement.dataset.metric_injected=\'ran\'">'
+  python(host, f'''import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+root = Path({root!r})
+(root / 'outputs').mkdir(parents=True)
+(root / 'logs').mkdir()
+start = datetime(2026, 10, 12, tzinfo=timezone.utc)
+(root / 'run-state.json').write_text(json.dumps({{'run_id': {run_id!r}, 'task': 'chart-data-fixture',
+  'status': 'completed', 'exit_code': 0, 'started_at': start.isoformat(), 'finished_at': (start + timedelta(seconds=20)).isoformat()}}))
+(root / 'snapshot.json').write_text(json.dumps({{'run_id': {run_id!r}, 'source': {{'kind': 'fixture'}}, 'files': []}}))
+(root / 'outputs/params.json').write_text(json.dumps({{'schema_version': 1, 'params': {{'label': '<script>document.documentElement.dataset.parameter_injected="ran"</script>'}}}}))
+(root / 'logs/stdout.log').write_text('long chart fixture complete' + chr(10))
+with (root / 'outputs/metrics.jsonl').open('w') as output:
+  for index in range({samples}):
+    output.write(json.dumps({{'schema_version': 1, 'step': {base_step} + index,
+      'timestamp': (start + timedelta(milliseconds=index)).isoformat().replace('+00:00', 'Z'),
+      'metrics': {{'loss': 1 / (index + 1), {unsafe_metric!r}: index % 37}}}}) + chr(10))
+''')
+  client(host, 'publish', '--run-dir', root, '--project-id', project_id, '--origin', 'fixture',
+    '--queue-dir', '/home/tester/chart-data-queue')
+  cookie = dashboard_login()
+  query = urlencode({'source': f'hosted:{project_id}:fixture', 'run_id': run_id})
+  start = time.monotonic()
+  data_response = browser('/api/chart-data?' + query, cookie=cookie, limit=2 * 1024 * 1024)
+  data_seconds = time.monotonic() - start
+  start = time.monotonic()
+  html_response = browser('/api/chart?' + query, cookie=cookie, limit=2 * 1024 * 1024)
+  html_seconds = time.monotonic() - start
+  assert data_response['status'] == 200 and data_response['headers']['content-type'].startswith('application/json'), 'long-run chart data is unavailable'
+  assert html_response['status'] == 200 and html_response['headers']['content-type'].startswith('text/html'), 'long-run standalone report is unavailable'
+  payload = json.loads(data_response['body'])
+  assert payload['schema_version'] == 1 and payload['runs'] == [run_id] and payload['x_axis'] == 'step'
+  assert len(payload['plots']) == 2 and {plot['metric_name'] for plot in payload['plots']} == {'loss', unsafe_metric}
+  retained = 0
+  for plot in payload['plots']:
+    assert plot['domain']['x_min'] == str(base_step) and plot['domain']['x_max'] == str(base_step + samples - 1), 'long-run chart domain rounded an exact step'
+    series = plot['series'][0]
+    assert series['run_index'] == 1 and series['summary']['count'] == samples, 'downsampling truncated the complete series summary'
+    assert series['summary']['last']['step'] == str(base_step + samples - 1), 'long-run summary rounded its last step'
+    assert 0 < len(series['points']) <= 600 and all(point['step'] == point['x_value'] and int(point['step']) >= base_step for point in series['points']), 'long-run chart data exceeds its budget or loses exact steps'
+    retained += len(series['points'])
+  assert retained <= 4800, 'long-run chart data exceeds the global point budget'
+  json_bytes = len(data_response['body'].encode())
+  html_bytes = len(html_response['body'].encode())
+  assert json_bytes < html_bytes, 'long-run JSON preview is no smaller than the static report'
+  print('Chart data fixture measurements: ' + json.dumps({'samples_per_metric': samples,
+    'retained_points': retained, 'json_bytes': json_bytes, 'html_bytes': html_bytes,
+    'json_seconds': round(data_seconds, 3), 'html_seconds': round(html_seconds, 3)}), flush=True)
+  browser('/logout', method='POST', cookie=cookie)
+  logged('browser-chart-data.log', ['docker', 'exec', '--user', 'tester', firefox,
+    'python3', '/opt/expri-browser/browser_forms.py', '--chart-data', project_id, run_id, unsafe_metric, str(base_step)], timeout=120)
+
 
 def publish_refresh_fixture(run_dir, step=None, log=False):
   code = f'''
@@ -1215,6 +1285,8 @@ print(process.pid)
     storage = browser_json('/api/storage?' + urlencode({'project_id': 'demo', 'kind': 'input', 'search': 'reusable-checkpoint'}), cookie)
     assert storage['items'][0]['producer']['run_id'] == run_id, 'dashboard omitted imported output provenance'
     browser('/logout', method='POST', cookie=cookie)
+  with workflow_progress.phase('Long-run chart data budgets and safe React rendering'):
+    long_chart_data_checks()
   with workflow_progress.phase('Offline asset training and local result review'):
     docker('stop', '--time', '1', service, s3)
     offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)

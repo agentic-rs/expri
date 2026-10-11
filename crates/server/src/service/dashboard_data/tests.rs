@@ -13,6 +13,83 @@ use crate::service::types::{Request, Response as ApiResponse};
 mod projects;
 
 #[test]
+fn hosted_chart_data_uses_tracking_projection_and_refreshes_appended_samples() {
+  use crate::service::store::tests::MockStorage;
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let scope = RunScope {
+    project_id: "example-project".into(),
+    origin: "worker-1".into(),
+    run_id: "run-example".into(),
+  };
+  let bytes = format!("{}\n{}\n", json!({"step":u64::MAX,"timestamp":"2026-10-03T01:00:00Z","metrics":{"loss":3,"accuracy":0.2}}), json!({"step":u64::MAX-1,"timestamp":"2026-10-03T01:00:00.000000001Z","metrics":{"loss":1,"accuracy":0.9}})).into_bytes();
+  store
+    .execute(Request::AppendTracking {
+      scope: scope.clone(),
+      path: "outputs/metrics.jsonl".into(),
+      offset: 0,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    })
+    .unwrap();
+  let dashboard = HostedDashboard::new(&store).unwrap();
+  let source = "hosted:example-project:worker-1";
+  let url =
+    format!("/api/chart-data?source={source}&run_id=run-example&metric=loss&x_axis=elapsed");
+  let reply = crate::dashboard::server::route_content(&dashboard, &url);
+  assert_eq!(reply.status, 200);
+  let data: Value = serde_json::from_slice(&reply.body).unwrap();
+  assert_eq!(data["plots"][0]["metric_name"], "loss");
+  assert_eq!(
+    data["plots"][0]["series"][0]["points"][0]["step"],
+    u64::MAX.to_string()
+  );
+  assert_eq!(data["plots"][0]["series"][0]["points"][1]["x_value"], "1");
+  assert_eq!(data["plots"][0]["series"][0]["summary"]["count"], 2);
+  let extra = format!(
+    "{}\n",
+    json!({"step":u64::MAX-2,"timestamp":"2026-10-03T01:00:00.000000002Z","metrics":{"loss":0.5}})
+  );
+  store
+    .execute(Request::AppendTracking {
+      scope,
+      path: "outputs/metrics.jsonl".into(),
+      offset: bytes.len() as u64,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(extra),
+    })
+    .unwrap();
+  let updated = dashboard
+    .chart_data(
+      source,
+      &["run-example".into()],
+      &["loss".into()],
+      ChartXAxis::Elapsed,
+    )
+    .unwrap();
+  assert_eq!(updated.plots[0].series[0].summary.count, 3);
+  assert_eq!(
+    updated.plots[0].series[0].points.last().unwrap().x_value,
+    "2"
+  );
+  let html = dashboard
+    .chart(
+      source,
+      &["run-example".into()],
+      &["loss".into()],
+      ChartXAxis::Elapsed,
+    )
+    .unwrap();
+  assert_eq!(
+    html.matches("<circle ").count(),
+    updated.plots[0].series[0].points.len()
+  );
+  let missing = crate::dashboard::server::route_content(
+    &dashboard,
+    "/api/chart-data?source=hosted:other:worker-1&run_id=run-example",
+  );
+  assert_eq!(missing.status, 404);
+}
+
+#[test]
 fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache() {
   let fixture = Fixture::new();
   for (id, rate, loss) in [("run-a", 10, 4), ("run-b", 2, 9)] {

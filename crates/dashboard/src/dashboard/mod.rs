@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{ExpriError, Result};
-use crate::metric_charts::ChartXAxis;
+use crate::metric_charts::{ChartData, ChartXAxis};
 use crate::metrics::Reduction;
 
 #[derive(Clone, Debug, Serialize)]
@@ -62,6 +62,13 @@ pub trait DashboardView {
     filters: &[String],
     x_axis: ChartXAxis,
   ) -> Result<String>;
+  fn chart_data(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<ChartData>;
 }
 
 fn message(message: impl Into<String>) -> ExpriError {

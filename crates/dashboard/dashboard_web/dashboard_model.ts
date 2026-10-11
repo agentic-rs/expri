@@ -320,8 +320,8 @@ export class RequestLane {
       body: JSON.stringify(body),
     });
   }
-  runText(url: string, maximum_bytes = 2 * 1024 * 1024): Promise<string | undefined> {
-    return this.request(url, (response) => boundedText(response, maximum_bytes));
+  runJson<T>(url: string, maximum_bytes = 2 * 1024 * 1024): Promise<T | undefined> {
+    return this.request(url, async (response) => JSON.parse(await boundedText(response, maximum_bytes)) as T);
   }
   private async request<T>(
     url: string,

@@ -354,7 +354,7 @@ impl Reply {
   }
 
   fn json(value: Value) -> Self {
-    let mut writer = LimitedWriter(Vec::new());
+    let mut writer = LimitedWriter(Vec::new(), JSON_LIMIT);
     if serde_json::to_writer(&mut writer, &value).is_err() {
       return Self::error(
         413,
@@ -364,6 +364,19 @@ impl Reply {
     Self::bytes("application/json; charset=utf-8", writer.0)
   }
 
+  fn chart_data(data: crate::metric_charts::ChartData) -> Self {
+    let mut writer = LimitedWriter(Vec::new(), HTML_LIMIT);
+    if serde_json::to_writer(&mut writer, &data).is_err() {
+      return Self::error(413, "dashboard chart data exceeds the 2 MiB preview limit");
+    }
+    Self {
+      status: 200,
+      content_type: "application/json; charset=utf-8",
+      body: writer.0,
+      chart: false,
+    }
+  }
+
   fn error(status: u16, message: impl Into<String>) -> Self {
     let mut reply = Self::json(json!({"error": message.into()}));
     reply.status = status;
@@ -371,11 +384,11 @@ impl Reply {
   }
 }
 
-struct LimitedWriter(Vec<u8>);
+struct LimitedWriter(Vec<u8>, usize);
 
 impl Write for LimitedWriter {
   fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-    if self.0.len().saturating_add(bytes.len()) > JSON_LIMIT {
+    if self.0.len().saturating_add(bytes.len()) > self.1 {
       return Err(std::io::Error::other("JSON response limit exceeded"));
     }
     self.0.extend_from_slice(bytes);
@@ -746,11 +759,18 @@ fn route_content_checked(
           .map_err(service_error)?,
       ))
     }
-    "/api/chart" => {
+    "/api/chart" | "/api/chart-data" => {
       query.allow(&["source", "run_id", "metric", "x_axis"])?;
       let ids = query.runs(1)?;
       let x_axis =
         ChartXAxis::parse(query.optional("x_axis").unwrap_or("step")).map_err(service_error)?;
+      if path == "/api/chart-data" {
+        return Ok(Reply::chart_data(
+          dashboard
+            .chart_data(source, &ids, &query.many("metric"), x_axis)
+            .map_err(service_error)?,
+        ));
+      }
       let html = dashboard
         .chart(source, &ids, &query.many("metric"), x_axis)
         .map_err(service_error)?;

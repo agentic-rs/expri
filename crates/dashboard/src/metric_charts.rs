@@ -10,6 +10,12 @@ use serde_json::Value;
 use crate::error::{ExpriError, Result};
 use crate::metrics::{MetricPoint, RunMetrics};
 
+mod chart_data;
+pub use chart_data::{
+  ChartData, ChartDataPoint, ChartDomain, ChartParameterRow, ChartPlot, ChartSeries,
+  ChartSeriesSummary, ChartSummaryPoint, ChartWarning, dashboard_chart_data,
+};
+
 const POINT_BUDGET: usize = 2000;
 const DASHBOARD_POINT_BUDGET: usize = 600;
 const DASHBOARD_TOTAL_POINT_BUDGET: usize = 4800;
@@ -138,40 +144,9 @@ pub fn render_dashboard_chart(
   filters: &[String],
   x_axis: ChartXAxis,
 ) -> Result<String> {
-  let mut options = ChartOptions {
-    x_axis,
-    presentation: ChartPresentation::Dashboard,
-    point_budget: DASHBOARD_POINT_BUDGET,
-    total_point_budget: Some(DASHBOARD_TOTAL_POINT_BUDGET),
-    default_metric_limit: Some(4),
-    selected_metric_limit: Some(6),
-    parameter_preview: Some(ParameterPreview {
-      keys: 24,
-      characters: 1000,
-    }),
-    text_preview: Some(512),
-  };
-  let names: BTreeSet<_> = if filters.is_empty() {
-    runs
-      .iter()
-      .flat_map(|run| run.metrics.keys().map(String::as_str))
-      .collect::<BTreeSet<_>>()
-      .into_iter()
-      .take(options.default_metric_limit.unwrap())
-      .collect()
-  } else {
-    filters.iter().map(String::as_str).collect()
-  };
-  let curves = names
-    .iter()
-    .map(|name| {
-      runs
-        .iter()
-        .filter(|run| run.metrics.contains_key(*name))
-        .count()
-    })
-    .sum::<usize>()
-    .max(1);
+  let mut options = dashboard_options(x_axis);
+  let (names, _) = selected_metric_names(runs, filters, options)?;
+  let curves = curve_count(runs, &names).max(1);
   let minimum_budget = 4 * curves;
   let mut total_budget = DASHBOARD_TOTAL_POINT_BUDGET.min(DASHBOARD_POINT_BUDGET * curves);
   loop {
@@ -191,11 +166,39 @@ pub fn render_dashboard_chart(
   }
 }
 
-fn render_with_options(
-  runs: &[RunMetrics],
-  filters: &[String],
+fn dashboard_options(x_axis: ChartXAxis) -> ChartOptions {
+  ChartOptions {
+    x_axis,
+    presentation: ChartPresentation::Dashboard,
+    point_budget: DASHBOARD_POINT_BUDGET,
+    total_point_budget: Some(DASHBOARD_TOTAL_POINT_BUDGET),
+    default_metric_limit: Some(4),
+    selected_metric_limit: Some(6),
+    parameter_preview: Some(ParameterPreview {
+      keys: 24,
+      characters: 1000,
+    }),
+    text_preview: Some(512),
+  }
+}
+
+fn curve_count(runs: &[RunMetrics], names: &[&str]) -> usize {
+  names
+    .iter()
+    .map(|name| {
+      runs
+        .iter()
+        .filter(|run| run.metrics.contains_key(*name))
+        .count()
+    })
+    .sum()
+}
+
+fn selected_metric_names<'a>(
+  runs: &'a [RunMetrics],
+  filters: &'a [String],
   options: ChartOptions,
-) -> Result<String> {
+) -> Result<(Vec<&'a str>, usize)> {
   let available: BTreeSet<&str> = runs
     .iter()
     .flat_map(|run| run.metrics.keys().map(String::as_str))
@@ -230,20 +233,25 @@ fn render_with_options(
       "dashboard charts support at most {limit} metrics; select fewer metrics"
     )));
   }
-  let curves = names
-    .iter()
-    .map(|name| {
-      runs
-        .iter()
-        .filter(|run| run.metrics.contains_key(*name))
-        .count()
-    })
-    .sum::<usize>();
-  let point_budget = options
+  Ok((names, available_count))
+}
+
+fn chart_point_budget(runs: &[RunMetrics], names: &[&str], options: ChartOptions) -> usize {
+  let curves = curve_count(runs, names);
+  options
     .total_point_budget
     .map_or(options.point_budget, |total| {
       options.point_budget.min((total / curves.max(1)).max(4))
-    });
+    })
+}
+
+fn render_with_options(
+  runs: &[RunMetrics],
+  filters: &[String],
+  options: ChartOptions,
+) -> Result<String> {
+  let (names, available_count) = selected_metric_names(runs, filters, options)?;
+  let point_budget = chart_point_budget(runs, &names, options);
   let mut html = if options.presentation == ChartPresentation::Dashboard {
     HTML_HEAD.replace("</style>", &format!("{DASHBOARD_STYLES}</style>"))
   } else {
@@ -419,19 +427,7 @@ fn render_metric(
       }
     }
   }
-  let all_points = runs.iter().flat_map(|run| {
-    let origin = run
-      .first_metric_timestamp
-      .as_deref()
-      .and_then(timestamp_nanos);
-    run.metrics.get(name).into_iter().flat_map(move |series| {
-      series.points.iter().filter_map(move |point| {
-        point.value.is_finite().then_some(())?;
-        Some((coordinate(point, options.x_axis, origin)?, point))
-      })
-    })
-  });
-  if let Some(domain) = Domain::new(all_points) {
+  if let Some(domain) = metric_domain(runs, name, options.x_axis) {
     render_plot(html, runs, name, index, &domain, options);
   } else {
     html.push_str(if options.x_axis == ChartXAxis::Step {
@@ -440,8 +436,28 @@ fn render_metric(
       "<p class=muted>No timestamped samples are available to plot.</p>"
     });
   }
+  render_statistics(html, runs, name, options);
+  html.push_str("</section>");
+}
+
+fn metric_domain(runs: &[RunMetrics], name: &str, x_axis: ChartXAxis) -> Option<Domain> {
+  let all_points = runs.iter().flat_map(|run| {
+    let origin = run
+      .first_metric_timestamp
+      .as_deref()
+      .and_then(timestamp_nanos);
+    run.metrics.get(name).into_iter().flat_map(move |series| {
+      series.points.iter().filter_map(move |point| {
+        point.value.is_finite().then_some(())?;
+        Some((coordinate(point, x_axis, origin)?, point))
+      })
+    })
+  });
+  Domain::new(all_points)
+}
+
+fn render_statistics(html: &mut String, runs: &[RunMetrics], name: &str, options: ChartOptions) {
   if options.presentation == ChartPresentation::Dashboard {
-    html.push_str("</section>");
     return;
   }
   html.push_str("<div class=table-scroll><table><thead><tr><th>Run</th><th>Samples</th><th>Last step</th><th>Last</th><th>Minimum</th><th>Maximum</th></tr></thead><tbody>");
@@ -469,7 +485,7 @@ fn render_metric(
     }
     html.push_str("</tr>");
   }
-  html.push_str("</tbody></table></div></section>");
+  html.push_str("</tbody></table></div>");
 }
 
 fn render_plot(

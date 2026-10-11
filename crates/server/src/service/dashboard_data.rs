@@ -21,7 +21,7 @@ use crate::dashboard::artifacts::Download;
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
 use crate::dashboard::table::{self, ListQuery};
 use crate::error::{ExpriError, Result};
-use crate::metric_charts::ChartXAxis;
+use crate::metric_charts::{ChartData, ChartXAxis};
 use crate::metrics::{self, Reduction, RunMetrics};
 
 const SOURCE_LIMIT: usize = 1000;
@@ -105,6 +105,15 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
     x_axis: ChartXAxis,
   ) -> Result<String> {
     HostedDashboard::chart(self, source, run_ids, filters, x_axis)
+  }
+  fn chart_data(
+    &self,
+    source: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<ChartData> {
+    HostedDashboard::chart_data(self, source, run_ids, filters, x_axis)
   }
 }
 
@@ -775,8 +784,29 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     filters: &[String],
     x_axis: ChartXAxis,
   ) -> Result<String> {
+    let (runs, selected) = self.load_chart_runs(source_id, run_ids, filters)?;
+    crate::metric_charts::render_dashboard_chart(&runs, &selected, x_axis)
+  }
+
+  pub fn chart_data(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+    x_axis: ChartXAxis,
+  ) -> Result<ChartData> {
+    let (runs, selected) = self.load_chart_runs(source_id, run_ids, filters)?;
+    crate::metric_charts::dashboard_chart_data(&runs, &selected, x_axis)
+  }
+
+  fn load_chart_runs(
+    &self,
+    source_id: &str,
+    run_ids: &[String],
+    filters: &[String],
+  ) -> Result<(Vec<RunMetrics>, Vec<String>)> {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
-    let selected = if filters.is_empty() {
+    let (selected, omitted) = if filters.is_empty() {
       let summaries = self.read_metrics(
         source_id,
         run_ids,
@@ -788,11 +818,11 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         },
         deadline,
       )?;
-      selected_metrics(&summaries, &[]).0
+      selected_metrics(&summaries, &[])
     } else {
-      filters.to_vec()
+      (filters.to_vec(), false)
     };
-    let runs = self.read_metrics(
+    let mut runs = self.read_metrics(
       source_id,
       run_ids,
       &selected,
@@ -803,7 +833,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       },
       deadline,
     )?;
-    crate::metric_charts::render_dashboard_chart(&runs, &selected, x_axis)
+    if omitted && let Some(first) = runs.first_mut() {
+      first.warnings.push(json!({"message":"Showing the first four metrics; select up to six exact metric names to change this preview."}));
+    }
+    Ok((runs, selected))
   }
 
   fn scope(&self, source_id: &str, run_id: &str) -> Result<(Source, RunScope)> {
