@@ -1352,6 +1352,7 @@ finally:
                 'workspace-hover', 'workspace-zoom', 'workspace-ab-hover', 'workspace-ab-zoom',
                 'workspace-elapsed', 'workspace-wall_clock',
                 'workspace-ab-elapsed', 'workspace-ab-wall_clock', 'workspace-auto-refresh',
+                'workspace-chart-data', 'workspace-chart-data-failure',
               ]:
                 docker('cp', f'{container}:/tmp/{name}.png', str(logs / (name + '.png')), check=False, timeout=10)
             if container.endswith('-host'):

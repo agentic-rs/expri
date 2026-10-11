@@ -1211,6 +1211,39 @@ test("chart JSON loads alongside metadata and reuses the default metric selectio
   assert.equal(model.chart.previews.length, 1, "an unchanged first poll acknowledges the preview without rendering it again");
 });
 
+test("chart refresh preserves signed-zero changes at the same sample identity", async t => {
+  let negative_zero = false;
+  const clock = new RefreshClock();
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, override: parsed => {
+    if (parsed.pathname !== "/api/chart-data") return null;
+    const data = chartData("zero-chart", parsed.searchParams);
+    for (const plot of data.plots) {
+      plot.domain.value_min = 0;
+      for (const series of plot.series) {
+        series.points[1].value = 0;
+        series.summary.last.value = 0;
+        series.summary.min.value = 0;
+      }
+    }
+    const wire = JSON.stringify(data);
+    // Deliver actual JSON numeric -0: stringify would erase it in the fixture too.
+    return { ...response(data), text: async () => negative_zero ? wire.replaceAll('"value":0', '"value":-0.0') : wire };
+  } });
+  await inspect(model);
+  const pointLabel = () => model.nodes.get("chart-preview")
+    .querySelector('circle.point[data-chart-sample-index="1"]')?.getAttribute("aria-label");
+  await settled(() => pointLabel()?.includes("value 0 · timestamp"));
+  await clock.advance(5_000);
+  negative_zero = true;
+  model.metrics_revision = "metrics-negative-zero";
+  await clock.advance(5_000);
+  assert.match(pointLabel(), /value -0 · timestamp/, "a changed sign must refresh the exact value despite unchanged counts, steps and timestamps");
+  negative_zero = false;
+  model.metrics_revision = "metrics-positive-zero";
+  await clock.advance(5_000);
+  assert.match(pointLabel(), /value 0 · timestamp/, "the refresh cache must distinguish a later change back to positive zero");
+});
+
 for (const chart_first of [true, false]) {
   test(`different server defaults reconcile when ${chart_first ? "chart" : "metadata"} arrives first with updates off`, async t => {
     const pending = deferred(); let query;

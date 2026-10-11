@@ -1,7 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { createChartController, type ChartAxis, type ChartTimeZone } from "./interactive_charts";
-import { parseChartData } from "./chart_data";
+import { parseChartData, type ChartData } from "./chart_data";
 import {
   AutoRefresh,
   type RefreshAvailability,
@@ -71,6 +71,10 @@ function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
   if (!node) throw new Error(`Missing dashboard element: ${id}`);
   return node as T;
+}
+function chartComparisonText(data: ChartData): string {
+  // JSON converts -0 to 0. A comparison-only marker preserves exact scalar labels.
+  return JSON.stringify(data, (_key, value: unknown) => Object.is(value, -0) ? "-0" : value);
 }
 export function startDashboard(options: DashboardOptions = {}): () => void {
   const page_document = document;
@@ -1014,7 +1018,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (value === undefined || !current()) return;
       const data = chartDataForRequest(value, url);
       if (!chart_controller.replacePreview(data)) return;
-      cached_chart = { context: url, serialized: JSON.stringify(data), metric_names: data.plots.map(plot => plot.metric_name) };
+      cached_chart = { context: url, serialized: chartComparisonText(data), metric_names: data.plots.map(plot => plot.metric_name) };
       clearChartError();
     } catch (error) {
       if (current()) {
@@ -1483,7 +1487,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     const value = await lane.runJson<unknown>(url);
     if (value === undefined || review !== current_review || source_id !== source || chartUrl() !== url)
       return "cancelled";
-    const data = chartDataForRequest(value, url), serialized = JSON.stringify(data);
+    const data = chartDataForRequest(value, url), serialized = chartComparisonText(data);
     if (chart_controller.previewStatus() === "ready" && cached_chart?.context === url && cached_chart.serialized === serialized) {
       clearChartError();
       return "applied";
