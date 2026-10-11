@@ -623,7 +623,7 @@ def artifact_files(browser, run_id):
     return evaluate('''const row = [...document.querySelectorAll('#file-rows tr')]
       .find(node => node.querySelector('th code')?.textContent === 'outputs/checkpoint.pt');
       if (!row) return null;
-      const link = row.querySelector('a');
+      const link = row.querySelector('a[download]');
       return {size: row.querySelector('.number').textContent,
         locations: row.querySelector('.file-locations').textContent,
         href: link?.getAttribute('href'), filename: link?.getAttribute('download')};''')
@@ -668,7 +668,7 @@ def artifact_files(browser, run_id):
   target.unlink(missing_ok=True)
   (DOWNLOADS / 'checkpoint.pt.part').unlink(missing_ok=True)
   original_window = browser.call('GET', '/window')
-  browser.click('#selected-file-downloads a')
+  browser.click('#selected-file-downloads a[download]')
   wait_for(lambda: target.exists() and target.stat().st_size == 17 * 1024 * 1024
     and not (DOWNLOADS / 'checkpoint.pt.part').exists(), 'native checkpoint download did not complete', timeout=60)
   expected = hashlib.sha256()
@@ -730,8 +730,8 @@ def project_storage(run_id=None):
     inputs = evaluate('''return [...document.querySelectorAll('#storage-rows tr')].map(row => ({
       id: row.querySelector('th code')?.textContent,
       size: row.querySelector('.number')?.textContent,
-      href: row.querySelector('a')?.getAttribute('href'),
-      filename: row.querySelector('a')?.getAttribute('download')
+      href: row.querySelector('a[download]')?.getAttribute('href'),
+      filename: row.querySelector('a[download]')?.getAttribute('download')
     }));''')
     by_id = {item['id']: item for item in inputs}
     assert set(by_id) == {'dataset-v1', 'empty-file'}, 'Storage input rows changed the published input IDs'
@@ -745,7 +745,7 @@ def project_storage(run_id=None):
     target.unlink(missing_ok=True)
     (DOWNLOADS / 'dataset-v1.part').unlink(missing_ok=True)
     original_window = browser.call('GET', '/window')
-    browser.click('//tbody[@id="storage-rows"]/tr[th/code="dataset-v1"]//a', using='xpath')
+    browser.click('//tbody[@id="storage-rows"]/tr[th/code="dataset-v1"]//a[@download="dataset-v1"]', using='xpath')
     wait_for(lambda: target.exists() and target.stat().st_size == len(b'private-input-fixture') * 1024
       and not (DOWNLOADS / 'dataset-v1.part').exists(), 'native private input download did not complete', timeout=60)
     assert hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(b'private-input-fixture' * 1024).digest(), 'native private input download changed its bytes'
@@ -767,7 +767,7 @@ def project_storage(run_id=None):
         return evaluate('''const row = [...document.querySelectorAll('#storage-rows tr')]
           .find(node => node.querySelector('th code')?.textContent === 'outputs/checkpoint.pt' && node.textContent.includes(arguments[0]));
           if (!row) return null;
-          return {text: row.textContent, href: row.querySelector('a')?.getAttribute('href')};''', run_id)
+          return {text: row.textContent, href: row.querySelector('a[download]')?.getAttribute('href')};''', run_id)
       row = wait_for(checkpoint_row, 'project Storage did not show the uploaded checkpoint')
       assert 'worker' in row['text'] and '17 MiB' in row['text'] and row['href'].startswith('/api/artifact?'), 'Storage checkpoint row lost machine, size, or scoped download'
       browser.keys('#storage-search', 'checkpoint.pt')
@@ -1296,7 +1296,7 @@ def project_workspace(run_id):
       assert args[args.index('--origin') + 1] == origin and args[args.index('--run-id') + 1] == run_id, 'project artifact CLI command contains the transport key or wrong origin'
       browser.click('#download-selected-files')
       wait_for(lambda: evaluate("return document.querySelectorAll('#selected-file-downloads a').length;") == 1, 'project selected artifact did not provide one attachment link')
-      browser.click('#selected-file-downloads a')
+      browser.click('#selected-file-downloads a[download]')
       expected = (origin + ' scope fixture\n').encode()
       wait_for(lambda: any(path.is_file() and path.stat().st_size == len(expected) and path.read_bytes() == expected for path in DOWNLOADS.iterdir()), 'project browser download resolved the artifact from the other machine', timeout=30)
     PROJECT_COORDINATION.write_text(json.dumps({'phase': 'complete'}))
