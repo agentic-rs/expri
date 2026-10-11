@@ -1,7 +1,7 @@
 //! Workspace-facing commands for small asset sidecars and cached data.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use crate::assets::{self, Asset, Descriptor, Source};
 use crate::error::{ExpriError, Result};
 
+mod context;
+use context::{client_config, parse_output, parse_source, project_context};
+
 #[derive(Debug, Args)]
 pub struct AssetsCommand {
   #[command(subcommand)]
@@ -19,10 +22,38 @@ pub struct AssetsCommand {
 
 #[derive(Debug, Subcommand)]
 enum AssetsSubcommand {
-  /// Download a source and create a Git-tracked .expri.toml sidecar.
+  /// Track a local file, or add a URL and its destination path.
+  Add {
+    source: String,
+    path: Option<PathBuf>,
+    /// Record a pinned source without downloading its file bytes.
+    #[arg(long)]
+    no_download: bool,
+    /// Known content digest for a source without trustworthy checksum metadata.
+    #[arg(long, requires = "size", requires = "no_download")]
+    sha256: Option<String>,
+    /// Exact byte size accompanying --sha256.
+    #[arg(long, requires = "sha256")]
+    size: Option<u64>,
+    #[command(flatten)]
+    options: Options,
+  },
+  /// Make a hosted run output a persistent asset without downloading it.
   Import {
     source: String,
     path: PathBuf,
+    /// Explicit private input ID; otherwise the server allocates one idempotently.
+    #[arg(long)]
+    input_id: Option<String>,
+    #[command(flatten)]
+    options: Options,
+  },
+  /// Upload exact tracked bytes and record their private availability.
+  Upload {
+    path: Option<PathBuf>,
+    /// Explicit private input ID; requires selecting one asset.
+    #[arg(long, requires = "path")]
+    input_id: Option<String>,
     #[command(flatten)]
     options: Options,
   },
@@ -68,18 +99,75 @@ pub fn run(command: AssetsCommand, target: Option<&str>, quiet: bool) -> Result<
     ));
   }
   let (report, json_output) = match command.command {
-    AssetsSubcommand::Import {
+    AssetsSubcommand::Add {
       source,
       path,
+      no_download,
+      sha256,
+      size,
       options,
     } => {
       let root = repo_root(options.repo.as_deref())?;
       let config = client_config(&root, options.client_config.as_deref())?;
-      let source = parse_source(&source, config.as_deref())?;
+      let report = if let Some(path) = path {
+        let source = parse_source(&source)?;
+        let identity = sha256
+          .zip(size)
+          .map(|(sha256, size)| assets::Identity { size, sha256 });
+        add_source(
+          &root,
+          &source,
+          &path,
+          config.as_deref(),
+          no_download,
+          identity.as_ref(),
+        )?
+      } else {
+        if no_download || sha256.is_some() || size.is_some() || source.contains("://") {
+          return Err(message(
+            "adding a URL requires a destination path; --no-download applies to URL sources",
+          ));
+        }
+        add_local(&root, Path::new(&source))?
+      };
+      (report, options.json)
+    }
+    AssetsSubcommand::Import {
+      source,
+      path,
+      input_id,
+      options,
+    } => {
+      let root = repo_root(options.repo.as_deref())?;
+      let config = client_config(&root, options.client_config.as_deref())?;
       (
-        import(&root, &source, &path, config.as_deref())?,
+        import_output(
+          &root,
+          &source,
+          &path,
+          input_id.as_deref(),
+          config.as_deref(),
+        )?,
         options.json,
       )
+    }
+    AssetsSubcommand::Upload {
+      path,
+      input_id,
+      options,
+    } => {
+      let root = repo_root(options.repo.as_deref())?;
+      let config = client_config(&root, options.client_config.as_deref())?;
+      let mut reports = Vec::new();
+      for asset in selection(&root, path.as_deref())? {
+        reports.push(upload(
+          &root,
+          &asset,
+          input_id.as_deref(),
+          config.as_deref(),
+        )?);
+      }
+      (json!({"assets": reports}), options.json)
     }
     AssetsSubcommand::Download {
       path,
@@ -113,40 +201,68 @@ pub fn run(command: AssetsCommand, target: Option<&str>, quiet: bool) -> Result<
       let root = repo_root(options.repo.as_deref())?;
       let config = client_config(&root, options.client_config.as_deref())?;
       let asset = selection(&root, Some(&path))?.remove(0);
-      let mut source = asset.descriptor.source.clone();
-      if let Source::HuggingFace {
-        revision,
-        requested_revision,
-        ..
-      } = &mut source
-      {
-        *revision = requested_revision
-          .clone()
-          .unwrap_or_else(|| revision.clone());
+      if matches!(asset.descriptor.source, Source::Local) {
+        let descriptor = assets::download::adopt(&root, &root.join(&path), &mut || Ok(false))?;
+        let _lease = checkout_lease(&root)?;
+        ensure_descriptor_current(&root, &asset)?;
+        if !matches_file(&root.join(&path), &descriptor)? {
+          return Err(message(
+            "local asset changed while updating; retry after writing finishes",
+          ));
+        }
+        let mut descriptor = descriptor;
+        if descriptor.sha256 == asset.descriptor.sha256 && descriptor.size == asset.descriptor.size
+        {
+          descriptor.availability = asset.descriptor.availability.clone();
+          descriptor.producer = asset.descriptor.producer.clone();
+        }
+        publish_descriptor(&root, &path, &descriptor, Some(&asset.descriptor))?;
+        let report = asset_report(&path, &descriptor);
+        (
+          json!({"path": report["path"], "sidecar": report["sidecar"], "changed": descriptor != asset.descriptor, "size": descriptor.size, "sha256": descriptor.sha256}),
+          options.json,
+        )
+      } else {
+        let mut source = asset.descriptor.source.clone();
+        if let Source::HuggingFace {
+          revision,
+          requested_revision,
+          ..
+        } = &mut source
+        {
+          *revision = requested_revision
+            .clone()
+            .unwrap_or_else(|| revision.clone());
+        }
+        let mut descriptor =
+          assets::download::resolve(&root, &source, config.as_deref(), &mut || Ok(false))?;
+        if descriptor.sha256 == asset.descriptor.sha256 && descriptor.size == asset.descriptor.size
+        {
+          descriptor.availability = asset.descriptor.availability.clone();
+          descriptor.producer = asset.descriptor.producer.clone();
+        }
+        let _lease = checkout_lease(&root)?;
+        ensure_descriptor_current(&root, &asset)?;
+        if assets::inspect(&root.join(&path))?.is_some()
+          && !matches_file(&root.join(&path), &asset.descriptor)?
+        {
+          return Err(message(
+            "local asset has changed; preserve your edits elsewhere before updating its source",
+          ));
+        }
+        publish_workspace_asset(
+          &root,
+          &path,
+          &assets::cache_file(&root, &descriptor.sha256),
+          &descriptor,
+          Some(&asset.descriptor),
+          &mut || Ok(()),
+        )?;
+        (
+          json!({"path": path, "sidecar": asset.sidecar, "changed": descriptor != asset.descriptor, "size": descriptor.size, "sha256": descriptor.sha256}),
+          options.json,
+        )
       }
-      let descriptor =
-        assets::download::resolve(&root, &source, config.as_deref(), &mut || Ok(false))?;
-      let _lease = checkout_lease(&root)?;
-      ensure_descriptor_current(&root, &asset)?;
-      if assets::inspect(&root.join(&path))?.is_some()
-        && !matches_file(&root.join(&path), &asset.descriptor)?
-      {
-        return Err(message(
-          "local asset has changed; preserve your edits elsewhere before updating its source",
-        ));
-      }
-      publish_workspace_asset(
-        &root,
-        &path,
-        &assets::cache_file(&root, &descriptor.sha256),
-        &descriptor,
-        Some(&asset.descriptor),
-        &mut || Ok(()),
-      )?;
-      (
-        json!({"path": path, "sidecar": asset.sidecar, "changed": descriptor != asset.descriptor, "size": descriptor.size, "sha256": descriptor.sha256}),
-        options.json,
-      )
     }
     AssetsSubcommand::Status { path, options } => {
       let root = repo_root(options.repo.as_deref())?;
@@ -158,7 +274,8 @@ pub fn run(command: AssetsCommand, target: Option<&str>, quiet: bool) -> Result<
         } else {
           "modified"
         };
-        Ok(json!({"path": asset.path, "sidecar": asset.sidecar, "status": status, "size": asset.descriptor.size, "sha256": asset.descriptor.sha256}))
+        let availability = if matches!(asset.descriptor.source, Source::Local) && asset.descriptor.availability.is_none() { "local_only" } else { "downloadable" };
+        Ok(json!({"path": asset.path, "sidecar": asset.sidecar, "status": status, "availability": availability, "size": asset.descriptor.size, "sha256": asset.descriptor.sha256, "producer": asset.descriptor.producer}))
       }).collect::<Result<Vec<_>>>()?;
       (json!({"assets": reports}), options.json)
     }
@@ -191,103 +308,6 @@ fn repo_root(explicit: Option<&Path>) -> Result<PathBuf> {
   Ok(root)
 }
 
-fn client_config(root: &Path, explicit: Option<&Path>) -> Result<Option<PathBuf>> {
-  if let Some(path) = explicit {
-    return Ok(Some(std::path::absolute(path)?));
-  }
-  let config = root.join("expri.toml");
-  if config.exists() {
-    return Ok(
-      crate::config::Config::load(&config)?
-        .local_service()?
-        .map(|service| service.client_config),
-    );
-  }
-  Ok(None)
-}
-
-fn parse_source(value: &str, client_config: Option<&Path>) -> Result<Source> {
-  let source = if let Some(value) = value.strip_prefix("hf://") {
-    let (repo_type, value) = if let Some(value) = value.strip_prefix("datasets/") {
-      ("dataset", value)
-    } else {
-      ("model", value.strip_prefix("models/").unwrap_or(value))
-    };
-    let mut parts = value.splitn(3, '/');
-    let namespace = parts.next().unwrap_or("");
-    let repository = parts.next().unwrap_or("");
-    let filename = parts.next().unwrap_or("");
-    let (repository, revision) = repository.split_once('@').unwrap_or((repository, "main"));
-    Source::HuggingFace {
-      repo_id: format!("{namespace}/{repository}"),
-      repo_type: repo_type.into(),
-      filename: filename.into(),
-      revision: revision.into(),
-      requested_revision: Some(revision.into()),
-    }
-  } else if value.starts_with("expri://") {
-    let parsed = url::Url::parse(value).map_err(|_| message("invalid private asset reference"))?;
-    if !parsed.username().is_empty()
-      || parsed.password().is_some()
-      || parsed.query().is_some()
-      || parsed.fragment().is_some()
-    {
-      return Err(message(
-        "private asset references must not contain credentials, query parameters, or fragments",
-      ));
-    }
-    let host = parsed
-      .host_str()
-      .ok_or_else(|| message("private asset reference requires a server"))?;
-    let authority = host.to_owned();
-    let authority = parsed
-      .port()
-      .map_or_else(|| authority.clone(), |port| format!("{authority}:{port}"));
-    let parts = parsed
-      .path()
-      .trim_start_matches('/')
-      .split('/')
-      .collect::<Vec<_>>();
-    if parts.len() != 3 || parts[1] != "inputs" {
-      return Err(message(
-        "private asset reference must be expri://server/project/inputs/input-id",
-      ));
-    }
-    let mut url = format!("https://{authority}/");
-    if let Some(config) = client_config {
-      let config = fs::canonicalize(config)?;
-      let mut bytes = Vec::new();
-      assets::open(&config)?
-        .take(32 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-      if bytes.len() > 32 * 1024 {
-        return Err(message("service client config exceeds its size limit"));
-      }
-      let text =
-        std::str::from_utf8(&bytes).map_err(|_| message("service client config must be UTF-8"))?;
-      let config: expri_core::service::ClientConfig =
-        toml::from_str(text).map_err(|_| message("service client configuration is invalid"))?;
-      let configured =
-        url::Url::parse(&config.url).map_err(|_| message("invalid client service URL"))?;
-      if configured.host_str() != Some(host) || configured.port() != parsed.port() {
-        return Err(message(
-          "client configuration points at a different asset server",
-        ));
-      }
-      url = configured.to_string();
-    }
-    Source::Expri {
-      url,
-      project_id: parts[0].into(),
-      input_id: parts[2].into(),
-    }
-  } else {
-    Source::Url { url: value.into() }
-  };
-  source.validate()?;
-  Ok(source)
-}
-
 fn selection(root: &Path, path: Option<&Path>) -> Result<Vec<Asset>> {
   let assets = assets::discover(root)?;
   if let Some(path) = path {
@@ -295,7 +315,7 @@ fn selection(root: &Path, path: Option<&Path>) -> Result<Vec<Asset>> {
     let asset = assets
       .into_iter()
       .find(|asset| asset.path == path)
-      .ok_or_else(|| message("asset sidecar is missing; import the asset first"))?;
+      .ok_or_else(|| message("asset sidecar is missing; add the asset first"))?;
     Ok(vec![asset])
   } else {
     Ok(assets)
@@ -307,12 +327,12 @@ fn checkout_lease(root: &Path) -> Result<crate::lock::FileLock> {
   crate::lock::worktree_lock(&root.join(".expri"))
 }
 
-fn import(root: &Path, source: &Source, path: &Path, config: Option<&Path>) -> Result<Value> {
+fn ensure_new_asset(root: &Path, path: &Path, local: bool) -> Result<()> {
   assets::validate_asset_path(path)?;
   assets::ensure_parent(root, path)?;
   let sidecar = assets::sidecar_path(path);
   assets::optional_regular(&root.join(&sidecar))?;
-  if assets::inspect(&root.join(path))?.is_some()
+  if (!local && assets::inspect(&root.join(path))?.is_some())
     || assets::inspect(&root.join(&sidecar))?.is_some()
   {
     return Err(message(
@@ -326,35 +346,311 @@ fn import(root: &Path, source: &Source, path: &Path, config: Option<&Path>) -> R
     .output()?;
   if tracked.status.success() {
     return Err(message(
-      "asset bytes are tracked by Git; remove the path from the Git index before importing it",
+      "asset bytes are tracked by Git; remove the path from the Git index before adding it",
     ));
   }
   check_import_assets(root, path)?;
-  let descriptor = assets::download::resolve(root, source, config, &mut || Ok(false))?;
+  Ok(())
+}
+
+fn add_source(
+  root: &Path,
+  source: &Source,
+  path: &Path,
+  config: Option<&Path>,
+  no_download: bool,
+  identity: Option<&assets::Identity>,
+) -> Result<Value> {
+  ensure_new_asset(root, path, false)?;
+  let descriptor = if no_download {
+    assets::download::resolve_metadata(root, source, identity, config, &mut || Ok(false))?
+  } else {
+    assets::download::resolve(root, source, config, &mut || Ok(false))?
+  };
   let _lease = checkout_lease(root)?;
-  assets::ensure_parent(root, path)?;
-  assets::optional_regular(&root.join(&sidecar))?;
-  if assets::inspect(&root.join(path))?.is_some()
-    || assets::inspect(&root.join(&sidecar))?.is_some()
-  {
-    return Err(message(
-      "asset path changed during import; existing files were preserved",
-    ));
-  }
-  check_import_assets(root, path)?;
+  ensure_new_asset(root, path, false)?;
   // Ignore the data before publishing a descriptor or workspace binding.
   ignore(root, path)?;
-  publish_workspace_asset(
-    root,
-    path,
-    &assets::cache_file(root, &descriptor.sha256),
-    &descriptor,
-    None,
-    &mut || Ok(()),
+  if no_download {
+    publish_descriptor(root, path, &descriptor, None)?;
+  } else {
+    publish_workspace_asset(
+      root,
+      path,
+      &assets::cache_file(root, &descriptor.sha256),
+      &descriptor,
+      None,
+      &mut || Ok(()),
+    )?;
+  }
+  Ok(asset_report(path, &descriptor))
+}
+
+fn add_local(root: &Path, path: &Path) -> Result<Value> {
+  ensure_new_asset(root, path, true)?;
+  let descriptor = assets::download::adopt(root, &root.join(path), &mut || Ok(false))?;
+  let _lease = checkout_lease(root)?;
+  ensure_new_asset(root, path, true)?;
+  if !matches_file(&root.join(path), &descriptor)? {
+    return Err(message(
+      "local asset changed while adding; retry after writing finishes",
+    ));
+  }
+  ignore(root, path)?;
+  publish_descriptor(root, path, &descriptor, None)?;
+  Ok(asset_report(path, &descriptor))
+}
+
+fn import_output(
+  root: &Path,
+  source: &str,
+  path: &Path,
+  input_id: Option<&str>,
+  config: Option<&Path>,
+) -> Result<Value> {
+  let producer = parse_output(source)?;
+  assets::validate_asset_path(path)?;
+  assets::ensure_parent(root, path)?;
+  let sidecar = root.join(assets::sidecar_path(path));
+  assets::optional_regular(&sidecar)?;
+  let previous = if assets::inspect(&sidecar)?.is_some() {
+    let previous = assets::load(&sidecar)?;
+    if previous.producer.as_ref() != Some(&producer) {
+      return Err(message("asset sidecar already exists for another source"));
+    }
+    Some(previous)
+  } else {
+    ensure_new_asset(root, path, false)?;
+    None
+  };
+  let (config, project_id) = project_context(config)?;
+  if let Some(previous) = &previous {
+    let existing_id = private_input_id(previous)
+      .ok_or_else(|| message("existing asset has no persistent private input"))?;
+    if input_id.is_some_and(|requested| requested != existing_id) {
+      return Err(message(
+        "existing asset has a different private input ID; use a new destination path",
+      ));
+    }
+    let target = expri_core::service::FileTarget::Input {
+      project_id,
+      input_id: existing_id.into(),
+    };
+    let record = expri_client::file_metadata(config, &target)?;
+    verify_remote_identity(&record, previous)?;
+    if record
+      .provenance
+      .as_ref()
+      .map(|provenance| &provenance.producer)
+      != previous.producer.as_ref()
+    {
+      return Err(message(
+        "persistent asset has different producing-run provenance",
+      ));
+    }
+    let _lease = checkout_lease(root)?;
+    if assets::load(&sidecar)? != *previous {
+      return Err(message(
+        "asset sidecar changed during import; retry using its current version",
+      ));
+    }
+    let mut report = asset_report(path, previous);
+    report["reused"] = json!(true);
+    return Ok(report);
+  }
+  let scope = expri_core::service::RunScope {
+    project_id,
+    origin: producer.origin.clone(),
+    run_id: producer.run_id.clone(),
+  };
+  let target = expri_core::service::FileTarget::Run {
+    scope: scope.clone(),
+    path: producer.path.clone(),
+  };
+  let source = expri_client::file_metadata(config, &target)?;
+  if !matches!(source.storage, expri_core::service::FileStorage::Object) {
+    return Err(message("import requires a finalized, uploaded run output"));
+  }
+  let sha256 = source
+    .sha256
+    .as_deref()
+    .ok_or_else(|| message("run output has no content digest"))?;
+  let record = expri_client::import_output(
+    config,
+    &scope,
+    &producer.path,
+    input_id,
+    source.size,
+    sha256,
   )?;
-  Ok(
-    json!({"path": path, "sidecar": sidecar, "source": descriptor.source, "size": descriptor.size, "sha256": descriptor.sha256}),
-  )
+  let expri_core::service::FileTarget::Input { input_id, .. } = record.target else {
+    return Err(message("server returned an invalid imported asset"));
+  };
+  let descriptor = Descriptor {
+    version: assets::DESCRIPTOR_VERSION,
+    source: Source::Expri { input_id },
+    size: record.size,
+    sha256: record
+      .sha256
+      .ok_or_else(|| message("imported asset has no content digest"))?,
+    availability: None,
+    producer: record.provenance.map(|provenance| provenance.producer),
+  };
+  descriptor.validate()?;
+  let _lease = checkout_lease(root)?;
+  ensure_new_asset(root, path, false)?;
+  ignore(root, path)?;
+  publish_descriptor(root, path, &descriptor, None)?;
+  let mut report = asset_report(path, &descriptor);
+  report["reused"] = json!(false);
+  Ok(report)
+}
+
+fn upload(
+  root: &Path,
+  asset: &Asset,
+  input_id: Option<&str>,
+  config: Option<&Path>,
+) -> Result<Value> {
+  let (config, project_id) = project_context(config)?;
+  if assets::inspect(&root.join(&asset.path))?.is_some()
+    && !matches_file(&root.join(&asset.path), &asset.descriptor)?
+  {
+    return Err(message(
+      "local asset differs from its descriptor; update it explicitly before uploading",
+    ));
+  }
+  let existing_id = private_input_id(&asset.descriptor);
+  let input_id = input_id
+    .or(existing_id)
+    .map(str::to_owned)
+    .unwrap_or_else(|| format!("file-{}", asset.descriptor.sha256));
+  expri_core::service::validate_component(&input_id)?;
+  let reused = if let Some(existing_id) = existing_id {
+    let source = expri_core::service::FileTarget::Input {
+      project_id: project_id.clone(),
+      input_id: existing_id.into(),
+    };
+    let record = expri_client::file_metadata(config, &source)?;
+    verify_remote_identity(&record, &asset.descriptor)?;
+    if existing_id != input_id {
+      let target = expri_core::service::FileTarget::Input {
+        project_id: project_id.clone(),
+        input_id: input_id.clone(),
+      };
+      expri_client::client::reference(expri_client::ReferenceOptions {
+        config: config.to_path_buf(),
+        source: serde_json::to_string(&source)?,
+        target: serde_json::to_string(&target)?,
+        size: asset.descriptor.size,
+        sha256: asset.descriptor.sha256.clone(),
+      })?;
+      let record = expri_client::file_metadata(config, &target)?;
+      verify_remote_identity(&record, &asset.descriptor)?;
+    }
+    true
+  } else {
+    let cached =
+      assets::download::ensure(root, &asset.descriptor, Some(config), &mut || Ok(false))?;
+    let report = expri_client::client::input_upload(expri_client::InputUploadOptions {
+      config: config.to_path_buf(),
+      project_id,
+      input_id: input_id.clone(),
+      file: cached,
+      queue_dir: root.join(".expri/publish"),
+    })?;
+    if report["size"].as_u64() != Some(asset.descriptor.size)
+      || report["sha256"].as_str() != Some(asset.descriptor.sha256.as_str())
+    {
+      return Err(message(
+        "uploaded bytes do not match the asset descriptor; local metadata was preserved",
+      ));
+    }
+    false
+  };
+  let mut descriptor = asset.descriptor.clone();
+  descriptor.availability = if matches!(&descriptor.source, Source::Expri { input_id: source_id } if source_id == &input_id)
+  {
+    None
+  } else {
+    Some(assets::ExpriAvailability {
+      input_id: input_id.clone(),
+    })
+  };
+  let _lease = checkout_lease(root)?;
+  ensure_descriptor_current(root, asset)?;
+  publish_descriptor(root, &asset.path, &descriptor, Some(&asset.descriptor))?;
+  let mut report = asset_report(&asset.path, &descriptor);
+  report["input_id"] = json!(input_id);
+  report["reused"] = json!(reused);
+  Ok(report)
+}
+
+fn private_input_id(descriptor: &Descriptor) -> Option<&str> {
+  descriptor
+    .availability
+    .as_ref()
+    .map(|availability| availability.input_id.as_str())
+    .or(match &descriptor.source {
+      Source::Expri { input_id } => Some(input_id.as_str()),
+      _ => None,
+    })
+}
+
+fn verify_remote_identity(
+  record: &expri_core::service::FileRecord,
+  descriptor: &Descriptor,
+) -> Result<()> {
+  if record.size != descriptor.size
+    || record.sha256.as_deref() != Some(descriptor.sha256.as_str())
+    || !matches!(record.storage, expri_core::service::FileStorage::Object)
+  {
+    return Err(message("persistent asset no longer matches its descriptor"));
+  }
+  if descriptor.producer.as_ref().is_some_and(|expected| {
+    record
+      .provenance
+      .as_ref()
+      .map(|provenance| &provenance.producer)
+      != Some(expected)
+  }) {
+    return Err(message(
+      "persistent asset has different producing-run provenance",
+    ));
+  }
+  Ok(())
+}
+
+fn asset_report(path: &Path, descriptor: &Descriptor) -> Value {
+  json!({"path": path, "sidecar": assets::sidecar_path(path), "source": descriptor.source, "size": descriptor.size, "sha256": descriptor.sha256, "availability": descriptor.availability, "producer": descriptor.producer})
+}
+
+fn publish_descriptor(
+  root: &Path,
+  path: &Path,
+  descriptor: &Descriptor,
+  previous: Option<&Descriptor>,
+) -> Result<()> {
+  assets::ensure_parent(root, path)?;
+  let sidecar = root.join(assets::sidecar_path(path));
+  assets::optional_regular(&sidecar)?;
+  let parent = sidecar.parent().expect("sidecar has a parent");
+  let temporary = tempfile::Builder::new()
+    .prefix(crate::filter::ASSET_STAGING_PREFIX)
+    .tempdir_in(parent)?;
+  let staged = temporary.path().join("descriptor");
+  assets::save(&staged, descriptor)?;
+  if let Some(previous) = previous {
+    if assets::load(&sidecar)? != *previous {
+      return Err(message(
+        "asset sidecar changed during publication; retry using its current version",
+      ));
+    }
+    fs::rename(&staged, &sidecar)?;
+  } else {
+    fs::hard_link(&staged, &sidecar)?;
+  }
+  assets::sync_directory(parent)
 }
 
 fn check_import_assets(root: &Path, path: &Path) -> Result<()> {

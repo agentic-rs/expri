@@ -190,6 +190,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       .map_err(api_error)?;
     let mut items = Vec::with_capacity(page.items.len());
     for record in page.items {
+      let relationships = self
+        .store
+        .dashboard_asset_relationships(&record)
+        .map_err(api_error)?;
       match record.target {
         FileTarget::Input { input_id, .. } => {
           let query = form_urlencoded::Serializer::new(String::new())
@@ -199,6 +203,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
             "input_id": input_id,
             "size": record.size,
             "download_url": format!("/api/input?{query}"),
+            "producer": relationships["producer"],
+            "used_by": relationships["used_by"],
+            "used_by_count": relationships["used_by_count"],
           }));
         }
         FileTarget::Run { scope, path } => {
@@ -211,6 +218,8 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
             "path": path,
             "size": record.size,
             "download_url": download_url,
+            "assets": relationships["assets"],
+            "assets_count": relationships["assets_count"],
           }));
         }
       }
@@ -611,7 +620,23 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       warnings.push(json!({"message": "Showing the first 50 metric summaries; enter an exact metric name to chart another series."}));
     }
     let mut metadata_truncated = false;
-    let metadata = run_metadata(&record, &mut metadata_truncated);
+    let mut metadata = run_metadata(&record, &mut metadata_truncated);
+    for asset in metadata["state"]["assets"]
+      .as_array_mut()
+      .into_iter()
+      .flatten()
+    {
+      if let Ok(producer) =
+        serde_json::from_value::<super::types::OutputProducer>(asset["producer"].clone())
+      {
+        asset["producer"]["run_available"] = json!(
+          self
+            .store
+            .producer_run_available(&scope.project_id, &producer)
+            .map_err(api_error)?
+        );
+      }
+    }
     let mut run = preview(&record["run"], &mut metadata_truncated);
     self
       .decorate_archival(&mut run, &scope)
@@ -794,6 +819,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     use crate::dashboard::artifacts::{ArtifactRow, bound_rows, download_url, parse_inventory};
     let (source, scope) = self.scope(source_id, run_id)?;
     let mut rows = BTreeMap::new();
+    let mut relationships = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut truncated = false;
     let mut recorded_at = None;
@@ -820,9 +846,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       .map_err(api_error)?;
     truncated |= objects_truncated;
     for object in objects {
+      let lineage = self
+        .store
+        .dashboard_asset_relationships(&object)
+        .map_err(api_error)?;
       let FileTarget::Run { path, .. } = object.target else {
         unreachable!("validated output target")
       };
+      relationships.insert(path.clone(), lineage);
       let row = rows.entry(path.clone()).or_insert_with(|| ArtifactRow {
         path: path.clone(),
         size: object.size,
@@ -848,11 +879,27 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       }
     }
     let files = bound_rows(rows, &mut truncated)?;
+    let mut bytes = 2;
+    let mut enriched = Vec::new();
+    for file in files {
+      let mut value = serde_json::to_value(&file)?;
+      let lineage = relationships.get(&file.path);
+      value["assets"] = lineage.map_or_else(|| json!([]), |value| value["assets"].clone());
+      value["assets_count"] =
+        lineage.map_or_else(|| json!(0), |value| value["assets_count"].clone());
+      let size = serde_json::to_vec(&value)?.len() + 1;
+      if bytes + size > crate::run_artifacts::INVENTORY_LIMIT {
+        truncated = true;
+        continue;
+      }
+      bytes += size;
+      enriched.push(value);
+    }
     if truncated {
       warnings.push(json!({"message": "Artifact listing is limited to 200 files and bounded metadata; some files are omitted."}));
     }
     source.decorate_warnings(&mut warnings, &scope);
-    let mut result = json!({"source": source, "run_id": scope.run_id, "files": files, "truncated": truncated,
+    let mut result = json!({"source": source, "run_id": scope.run_id, "files": enriched, "truncated": truncated,
       "warnings": bounded_warnings(&warnings), "pull_scope": scope, "inventory_recorded_at": recorded_at});
     if source.origin.is_none() {
       result["run_key"] = json!(run_id);

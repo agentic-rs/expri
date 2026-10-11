@@ -51,6 +51,8 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
       "source": asset.descriptor.source,
       "size": asset.descriptor.size,
       "sha256": asset.descriptor.sha256,
+      "availability": asset.descriptor.availability,
+      "producer": asset.descriptor.producer,
     })).collect::<Vec<_>>(),
   });
   write_state(&state_path, &state)?;
@@ -230,6 +232,16 @@ fn prepare_assets(
   client_config: Option<&Path>,
   cancel: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
+  if snapshot.assets.is_empty() {
+    return Ok(());
+  }
+  let ignored_config = repo_root.join(".expri/config.toml");
+  let client_config = if crate::assets::inspect(&ignored_config)?.is_some() {
+    crate::assets::optional_regular(&ignored_config)?;
+    Some(ignored_config.as_path())
+  } else {
+    client_config
+  };
   for asset in &snapshot.assets {
     if cancel()? {
       return Err(ExpriError::Message("run cancellation requested".into()));
@@ -483,12 +495,14 @@ mod tests {
     let (sha256, size) = crate::archive::sha256_file(&temporary).unwrap();
     fs::remove_file(temporary).unwrap();
     let descriptor = Descriptor {
-      version: 1,
+      version: 2,
       source: Source::Url {
         url: "https://unavailable.invalid/data.bin".into(),
       },
       size,
       sha256,
+      availability: None,
+      producer: None,
     };
     let cache = crate::assets::cache_file(root, &descriptor.sha256);
     fs::create_dir_all(cache.parent().unwrap()).unwrap();
@@ -549,6 +563,80 @@ mod tests {
     assert!(error.contains("cancellation"), "{error}");
     assert!(!snapshot.code_dir.join("data/train.bin").exists());
     assert!(!snapshot.run_dir.join(".venv").exists());
+  }
+
+  #[test]
+  fn private_assets_prefer_repository_defaults_over_publishing_configuration() {
+    let root = asset_repository();
+    let canonical = root.path().canonicalize().unwrap();
+    let mut descriptor = cached_asset(&canonical, b"private data");
+    descriptor.source = Source::Expri {
+      input_id: "input".into(),
+    };
+    crate::assets::save(&canonical.join("data/train.bin.expri.toml"), &descriptor).unwrap();
+    fs::remove_file(crate::assets::cache_file(&canonical, &descriptor.sha256)).unwrap();
+    let ignored_config = canonical.join(".expri/config.toml");
+    fs::write(
+      &ignored_config,
+      "url='https://example.net'\ntoken_env='MISSING_TOKEN'\n",
+    )
+    .unwrap();
+    let snapshot = environment::snapshot::create(&canonical, &[]).unwrap();
+    let error = prepare_assets(
+      &canonical,
+      &snapshot,
+      Some(&canonical.join("absent-publishing-config")),
+      &mut || Ok(false),
+    )
+    .unwrap_err()
+    .to_string();
+    // The selected local defaults are diagnosed before credentials or networking.
+    assert!(error.contains("project_id"), "{error}");
+    assert!(!snapshot.code_dir.join("data/train.bin").exists());
+    assert!(!snapshot.run_dir.join(".venv").exists());
+    fs::remove_file(ignored_config).unwrap();
+    let error = prepare_assets(&canonical, &snapshot, None, &mut || Ok(false))
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("client config"), "{error}");
+  }
+
+  #[test]
+  fn descriptor_version_mismatch_is_rejected_before_starting_training() {
+    let root = asset_repository();
+    let canonical = root.path().canonicalize().unwrap();
+    cached_asset(&canonical, b"data");
+    let sidecar = canonical.join("data/train.bin.expri.toml");
+    let text = fs::read_to_string(&sidecar)
+      .unwrap()
+      .replace("version = 2", "version = 1");
+    fs::write(&sidecar, text).unwrap();
+    let marker = canonical.join("training-started");
+    let request = RunRequest {
+      name: "test".into(),
+      command: vec!["touch".into(), marker.to_string_lossy().into_owned()],
+      environment: expri_core::config::EnvironmentConfig {
+        base_python: None,
+        reuse_packages: vec![],
+        require_cuda: false,
+        env: Default::default(),
+      },
+      service: None,
+      detach: false,
+      remote_managed: vec![],
+      extras: vec![],
+      sync_args: vec![],
+      expected_sync: None,
+    };
+    let error = apply_request_at(&request, &canonical)
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("assets-v2"), "{error}");
+    assert!(!marker.exists());
+    assert_eq!(
+      fs::read_dir(canonical.join(".expri/runs")).unwrap().count(),
+      0
+    );
   }
 
   #[test]

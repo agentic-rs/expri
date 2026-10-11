@@ -42,7 +42,7 @@ fn automatic_publishing_and_assets_never_fall_back_to_an_older_node_or_python() 
     "run-records-v1",
     "durable-runs-v1",
     "run-publishing-v1",
-    "assets-v1",
+    "assets-v2",
   ] {
     fs::write(
       &node,
@@ -57,13 +57,13 @@ fn automatic_publishing_and_assets_never_fall_back_to_an_older_node_or_python() 
         assert!(error.to_string().contains("run-publishing-v1"));
       }
       let result = super::require_run_assets(&remote, preference, "./expri");
-      assert_eq!(result.is_ok(), capability == "assets-v1");
+      assert_eq!(result.is_ok(), capability == "assets-v2");
       if let Err(error) = result {
-        assert!(error.to_string().contains("assets-v1"));
+        assert!(error.to_string().contains("assets-v2"));
       }
     }
   }
-  fs::write(&node, "#!/bin/sh\n[ \"$2\" = capabilities ] && { [ \"$4\" = run-publishing-v1 ] || [ \"$4\" = assets-v1 ]; }\n").unwrap();
+  fs::write(&node, "#!/bin/sh\n[ \"$2\" = capabilities ] && { [ \"$4\" = run-publishing-v1 ] || [ \"$4\" = assets-v2 ]; }\n").unwrap();
   let mut fresh = remote.clone();
   fresh.remote_dir = fixture
     .path()

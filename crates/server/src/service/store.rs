@@ -11,6 +11,7 @@ use super::storage::ObjectStorage;
 use super::types::*;
 
 mod archive;
+mod asset_imports;
 mod dashboard_storage;
 mod projects;
 mod references;
@@ -134,7 +135,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot read service metadata version".into())
       })?;
-    if version > 4 {
+    if version > 5 {
       return Err(crate::error::ExpriError::Message(
         "service metadata schema is newer than this binary".into(),
       ));
@@ -189,9 +190,10 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
     projects::initialize(&connection)?;
     run_retention::initialize(&connection)?;
-    // Older binaries must not ignore project/run tombstones and resurrect deleted data.
+    asset_imports::initialize(&directory, &connection)?;
+    // Older binaries must not drop captured asset provenance or ignore deletion fences.
     connection
-      .pragma_update(None, "user_version", 4)
+      .pragma_update(None, "user_version", 5)
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot upgrade service metadata version".into())
       })?;
@@ -896,6 +898,7 @@ impl<S: ObjectStorage> Store<S> {
         features: vec![
           "tracking-v1".into(),
           "file-references-v1".into(),
+          "output-assets-v1".into(),
           "project-storage-management-v1".into(),
           "run-retention-v1".into(),
         ],
@@ -959,6 +962,13 @@ impl<S: ObjectStorage> Store<S> {
         size,
         sha256,
       } => self.reference_file(source, target, size, sha256),
+      Request::ImportOutput {
+        scope,
+        path,
+        input_id,
+        size,
+        sha256,
+      } => self.import_output(scope, path, input_id, size, sha256),
       Request::GetFile { target } => Ok(Response::File {
         file: self.file(&target)?,
       }),
@@ -1142,10 +1152,11 @@ impl<S: ObjectStorage> Store<S> {
       ));
     }
     let target = target_json(&upload.target)?;
-    let record = FileRecord {
+    let mut record = FileRecord {
       target: upload.target.clone(),
       size: upload.size,
       sha256: Some(upload.sha256.clone()),
+      provenance: None,
       storage: FileStorage::Object,
     };
     let mut db = self.db()?;
@@ -1167,6 +1178,8 @@ impl<S: ObjectStorage> Store<S> {
         if existing.size != upload.size || existing.sha256 != record.sha256 {
           return Err(ApiError::new(409, "input ID is immutable"));
         }
+        // A redundant upload must preserve the durable producer captured by import.
+        record.provenance = existing.provenance;
       }
     }
     let stream_size: Option<u64> = transaction
@@ -1247,6 +1260,7 @@ impl<S: ObjectStorage> Store<S> {
       target: target.clone(),
       size: size.ok_or_else(|| ApiError::new(404, "artifact is missing"))?,
       sha256: None,
+      provenance: None,
       storage: FileStorage::Stream,
     })
   }
@@ -1292,6 +1306,7 @@ impl<S: ObjectStorage> Store<S> {
             .map_err(|_| ApiError::new(500, "invalid stored stream"))?,
           size,
           sha256: None,
+          provenance: None,
           storage: FileStorage::Stream,
         };
         entry.insert(record);
@@ -2221,6 +2236,7 @@ pub(super) mod tests {
       target: input.clone(),
       size: 999_000,
       sha256: Some("a".repeat(64)),
+      provenance: None,
       storage: FileStorage::Object,
     };
     db.execute(

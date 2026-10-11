@@ -30,6 +30,7 @@ fn record(path: &str, size: u64) -> FileRecord {
     },
     size,
     sha256: Some("a".repeat(64)),
+    provenance: None,
     storage: FileStorage::Object,
   }
 }
@@ -116,6 +117,7 @@ fn killed_private_input_download_reopens_only_its_acknowledged_range() {
     target,
     size: OBJECT_BATCH + 19,
     sha256: Some("a".repeat(64)),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let (file, offset) = staging.prepare("input", &record, true).unwrap();
@@ -270,6 +272,7 @@ fn object_record(path: &str, bytes: &[u8]) -> FileRecord {
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   }
 }
@@ -301,6 +304,7 @@ fn tracking_record(path: &str, size: u64, revision: u64, sealed: bool) -> FileRe
     },
     size,
     sha256: None,
+    provenance: None,
     storage: FileStorage::Tracking { revision, sealed },
   }
 }
@@ -1311,6 +1315,7 @@ fn private_input_resumes_durable_ranges_reuses_verified_files_and_works_offline(
     target,
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let expected = record.clone();
@@ -1491,6 +1496,7 @@ fn matching_existing_input_is_reused_without_changing_its_permissions_or_inode()
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let (url, task) = mock(1, move |request, _| {
@@ -1534,6 +1540,7 @@ fn prepared_input_binds_verified_destination_while_transfer_lease_is_held() {
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let (url, server) = mock(1, move |_, _| {
@@ -1617,6 +1624,7 @@ fn prepared_input_cancels_at_a_range_boundary_and_retains_resumable_progress() {
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let payload = bytes.clone();
@@ -1696,6 +1704,7 @@ fn prepared_input_cancels_during_cached_file_hash_verification() {
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let (url, task) = mock(1, move |_, _| {
@@ -1750,6 +1759,7 @@ fn prepared_input_cancels_inside_an_object_range_without_acknowledging_partial_b
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(&bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let payload = bytes.clone();
@@ -1824,6 +1834,7 @@ fn private_input_accepts_a_destination_at_the_filesystem_filename_limit() {
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let (url, server) = mock(1, move |_, _| {

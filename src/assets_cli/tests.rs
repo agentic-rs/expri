@@ -8,9 +8,9 @@ struct TestCli {
 }
 
 #[test]
-fn source_forms_are_explicit_and_named_files_are_required() {
+fn source_forms_are_relative_and_named_files_are_required() {
   assert_eq!(
-    parse_source("hf://datasets/example/corpus@v1/data/train.csv", None).unwrap(),
+    parse_source("hf://datasets/example/corpus@v1/data/train.csv").unwrap(),
     Source::HuggingFace {
       repo_id: "example/corpus".into(),
       repo_type: "dataset".into(),
@@ -19,57 +19,118 @@ fn source_forms_are_explicit_and_named_files_are_required() {
       requested_revision: Some("v1".into()),
     }
   );
-  assert!(parse_source("hf://example/model", None).is_err());
-  assert!(parse_source("https://example.net/data?token=secret", None).is_err());
-  assert!(parse_source("expri://user:secret@example.net/demo/inputs/data", None).is_err());
+  assert!(parse_source("hf://example/model").is_err());
+  assert!(parse_source("https://example.net/data?token=secret").is_err());
+  assert!(parse_source("expri://example.net/demo/inputs/data").is_err());
   assert_eq!(
-    parse_source("expri://example.net/demo/inputs/data", None).unwrap(),
+    parse_source("expri://./inputs/data").unwrap(),
     Source::Expri {
-      url: "https://example.net/".into(),
-      project_id: "demo".into(),
-      input_id: "data".into(),
+      input_id: "data".into()
     }
   );
+  assert!(parse_source("expri://./worker-1/run-1/outputs/data").is_err());
+}
+
+#[test]
+fn output_reference_keeps_exact_scoped_paths_and_rejects_normalized_escapes() {
   assert_eq!(
-    parse_source("expri://[::1]:8787/demo/inputs/data", None).unwrap(),
-    Source::Expri {
-      url: "https://[::1]:8787/".into(),
-      project_id: "demo".into(),
-      input_id: "data".into(),
+    parse_output("expri://./worker-1/run-1/outputs/model%20one.pt").unwrap(),
+    assets::Producer {
+      origin: "worker-1".into(),
+      run_id: "run-1".into(),
+      path: "outputs/model one.pt".into(),
     }
+  );
+  for source in [
+    "expri://service.example.net/demo/runs/worker-1/run-1/outputs/model.pt",
+    "worker-1/run-1/outputs/model.pt",
+    "expri://./worker-1/run-1/outputs/../secret",
+    "expri://./worker-1/run-1/outputs/%2e%2e/secret",
+    "expri://./worker-1/run-1/outputs/a%2fb.pt",
+    "expri://./worker-1/run-1/outputs/model.pt?token=secret",
+    "expri://./worker-1/run-1/outputs/model%ff.pt",
+    "expri://./worker-1/run-1/outputs/a%2.pt",
+  ] {
+    assert!(parse_output(source).is_err(), "{source}");
+  }
+  let filename = "字".repeat(330);
+  let encoded = "%E5%AD%97".repeat(330);
+  let reference = format!("expri://./worker-1/run-1/outputs/{encoded}");
+  assert_eq!(
+    parse_output(&reference).unwrap().path,
+    format!("outputs/{filename}")
   );
 }
 
 #[test]
-fn private_source_uses_only_the_matching_client_origin() {
+fn repository_config_is_ignored_and_canonical_aliases_cannot_bypass_tracking_guard() {
+  let temporary = tempfile::tempdir().unwrap();
+  let root = temporary.path().canonicalize().unwrap();
+  assert!(
+    Command::new("git")
+      .args(["init", "--quiet"])
+      .current_dir(&root)
+      .status()
+      .unwrap()
+      .success()
+  );
+  fs::create_dir(root.join(".expri")).unwrap();
+  fs::write(
+    root.join(".expri/config.toml"),
+    "url='https://service.example.net/'\nproject_id='example-project'\ntoken_env='TEST_TOKEN'\n",
+  )
+  .unwrap();
+  client_config(&root, None).unwrap();
+  assert!(git_ignored(&root, Path::new(".expri/config.toml")).unwrap());
+  assert!(
+    Command::new("git")
+      .args(["add", "--force", ".expri/config.toml"])
+      .current_dir(&root)
+      .status()
+      .unwrap()
+      .success()
+  );
+  for explicit in [None, Some(root.join(".expri/../.expri/config.toml"))] {
+    assert!(
+      client_config(&root, explicit.as_deref())
+        .unwrap_err()
+        .to_string()
+        .contains("Git-ignored")
+    );
+  }
+  #[cfg(unix)]
+  {
+    let alias = root.join("settings-alias.toml");
+    std::os::unix::fs::symlink(root.join(".expri/config.toml"), &alias).unwrap();
+    assert!(
+      client_config(&root, Some(&alias))
+        .unwrap_err()
+        .to_string()
+        .contains("Git-ignored")
+    );
+  }
+}
+
+#[test]
+fn local_config_context_errors_do_not_disclose_credentials() {
   let temporary = tempfile::tempdir().unwrap();
   let config = temporary.path().canonicalize().unwrap().join("client.toml");
   fs::write(
     &config,
-    "url='http://localhost:8787/'\ntoken_env='TEST_TOKEN'\n",
+    "url='http://localhost:8787/'\nproject_id='example-project'\ntoken_env='TEST_TOKEN'\n",
   )
   .unwrap();
-  assert_eq!(
-    parse_source("expri://localhost:8787/demo/inputs/data", Some(&config)).unwrap(),
-    Source::Expri {
-      url: "http://localhost:8787/".into(),
-      project_id: "demo".into(),
-      input_id: "data".into(),
-    }
-  );
-  assert!(parse_source("expri://other.example/demo/inputs/data", Some(&config)).is_err());
+  assert_eq!(project_context(Some(&config)).unwrap().1, "example-project");
   fs::write(
     &config,
     "url='http://localhost:8787/'\ntoken='SECRET_VALUE'\n",
   )
   .unwrap();
-  let error = parse_source("expri://localhost:8787/demo/inputs/data", Some(&config))
-    .unwrap_err()
-    .to_string();
+  let error = project_context(Some(&config)).unwrap_err().to_string();
   assert!(!error.contains("SECRET_VALUE"), "{error}");
   fs::write(&config, "x".repeat(32 * 1024 + 1)).unwrap();
   assert!(
-    parse_source("expri://localhost:8787/demo/inputs/data", Some(&config))
+    project_context(Some(&config))
       .unwrap_err()
       .to_string()
       .contains("size limit")
@@ -77,21 +138,63 @@ fn private_source_uses_only_the_matching_client_origin() {
 }
 
 #[test]
-fn download_requires_explicit_force_and_import_has_two_operands() {
-  assert!(
-    TestCli::try_parse_from(["assets", "download", "data/train.csv", "--force", "--json"]).is_ok()
-  );
-  assert!(
-    TestCli::try_parse_from([
+fn commands_use_six_verbs_and_pinning_flags_are_explicit() {
+  for args in [
+    vec!["assets", "add", "data/train.csv"],
+    vec![
+      "assets",
+      "add",
+      "https://example.net/data",
+      "data/train.csv",
+    ],
+    vec![
+      "assets",
+      "add",
+      "https://example.net/data",
+      "data/train.csv",
+      "--no-download",
+    ],
+    vec![
       "assets",
       "import",
+      "expri://./worker-1/run-1/outputs/best.pt",
+      "models/base.pt",
+    ],
+    vec!["assets", "upload"],
+    vec![
+      "assets",
+      "upload",
+      "data/train.csv",
+      "--input-id",
+      "data-v1",
+    ],
+    vec!["assets", "download", "data/train.csv", "--force", "--json"],
+    vec!["assets", "update", "data/train.csv"],
+    vec!["assets", "status"],
+  ] {
+    assert!(TestCli::try_parse_from(args.clone()).is_ok(), "{args:?}");
+  }
+  for args in [
+    vec![
+      "assets",
+      "import",
+      "expri://./worker-1/run-1/outputs/best.pt",
+    ],
+    vec!["assets", "upload", "--input-id", "data-v1"],
+    vec![
+      "assets",
+      "add",
       "https://example.net/data",
-      "data/train.csv"
-    ])
-    .is_ok()
-  );
-  assert!(TestCli::try_parse_from(["assets", "import", "https://example.net/data"]).is_err());
-  assert!(TestCli::try_parse_from(["assets", "sync"]).is_err());
+      "data/train.csv",
+      "--sha256",
+      "abc",
+    ],
+    vec!["assets", "bind"],
+    vec!["assets", "promote"],
+    vec!["assets", "sync"],
+  ] {
+    assert!(TestCli::try_parse_from(args.clone()).is_err(), "{args:?}");
+  }
 }
 
 fn cached_descriptor(root: &Path, bytes: &[u8]) -> (PathBuf, Descriptor) {
@@ -101,7 +204,9 @@ fn cached_descriptor(root: &Path, bytes: &[u8]) -> (PathBuf, Descriptor) {
   (
     source,
     Descriptor {
-      version: 1,
+      version: 2,
+      availability: None,
+      producer: None,
       source: Source::Url {
         url: "https://example.net/data.bin".into(),
       },
@@ -111,8 +216,97 @@ fn cached_descriptor(root: &Path, bytes: &[u8]) -> (PathBuf, Descriptor) {
   )
 }
 
+fn producer_identity_fixture() -> (Descriptor, expri_core::service::FileRecord) {
+  let producer = assets::Producer {
+    origin: "worker-1".into(),
+    run_id: "run-1".into(),
+    path: "outputs/best.pt".into(),
+  };
+  let descriptor = Descriptor {
+    version: assets::DESCRIPTOR_VERSION,
+    source: Source::Expri {
+      input_id: "checkpoint".into(),
+    },
+    size: 7,
+    sha256: "a".repeat(64),
+    availability: None,
+    producer: Some(producer.clone()),
+  };
+  let record = expri_core::service::FileRecord {
+    target: expri_core::service::FileTarget::Input {
+      project_id: "example-project".into(),
+      input_id: "checkpoint".into(),
+    },
+    size: descriptor.size,
+    sha256: Some(descriptor.sha256.clone()),
+    storage: expri_core::service::FileStorage::Object,
+    provenance: Some(expri_core::service::AssetProvenance {
+      producer,
+      captured_at: "2026-01-01T00:00:00Z".into(),
+      state: Value::Null,
+      snapshot: Value::Null,
+      environment: Value::Null,
+    }),
+  };
+  (descriptor, record)
+}
+
 #[test]
-fn import_publication_failure_removes_only_its_new_binding() {
+fn remote_identity_accepts_matching_producer_for_imported_assets() {
+  let (descriptor, record) = producer_identity_fixture();
+  verify_remote_identity(&record, &descriptor).unwrap();
+}
+
+#[test]
+fn remote_identity_rejects_missing_or_different_producer_for_identical_bytes() {
+  let (descriptor, record) = producer_identity_fixture();
+  let expected = descriptor.producer.clone().unwrap();
+  let variants = [
+    None,
+    Some(assets::Producer {
+      origin: "worker-2".into(),
+      ..expected.clone()
+    }),
+    Some(assets::Producer {
+      run_id: "run-2".into(),
+      ..expected.clone()
+    }),
+    Some(assets::Producer {
+      path: "outputs/other.pt".into(),
+      ..expected
+    }),
+  ];
+  for producer in variants {
+    let mut remote = record.clone();
+    remote.provenance = producer.map(|producer| expri_core::service::AssetProvenance {
+      producer,
+      ..record.provenance.clone().unwrap()
+    });
+    let error = verify_remote_identity(&remote, &descriptor).unwrap_err();
+    assert!(
+      error.to_string().contains("producing-run provenance"),
+      "{error}"
+    );
+  }
+}
+
+#[test]
+fn remote_identity_allows_local_and_public_dedup_without_declared_producer() {
+  let (mut descriptor, record) = producer_identity_fixture();
+  descriptor.producer = None;
+  for source in [
+    Source::Local,
+    Source::Url {
+      url: "https://example.net/data.bin".into(),
+    },
+  ] {
+    descriptor.source = source;
+    verify_remote_identity(&record, &descriptor).unwrap();
+  }
+}
+
+#[test]
+fn add_publication_failure_removes_only_its_new_binding() {
   let temporary = tempfile::tempdir().unwrap();
   let root = temporary.path().canonicalize().unwrap();
   let path = Path::new("data/train.bin");
@@ -239,7 +433,7 @@ fn failed_preparation_and_modified_workspace_never_change_existing_asset_metadat
 }
 
 #[test]
-fn import_rejects_the_sixty_fifth_descriptor_before_downloading() {
+fn add_rejects_the_sixty_fifth_descriptor_before_downloading() {
   let temporary = tempfile::tempdir().unwrap();
   let root = temporary.path().canonicalize().unwrap();
   let (_source, descriptor) = cached_descriptor(&root, b"dataset");
@@ -253,7 +447,7 @@ fn import_rejects_the_sixty_fifth_descriptor_before_downloading() {
   let source = Source::Url {
     url: "https://unavailable.invalid/new-data.bin".into(),
   };
-  let error = import(&root, &source, Path::new("new-data.bin"), None).unwrap_err();
+  let error = add_source(&root, &source, Path::new("new-data.bin"), None, false, None).unwrap_err();
   assert!(error.to_string().contains("at most 64"), "{error}");
   assert!(!root.join("new-data.bin").exists());
   assert!(!root.join("new-data.bin.expri.toml").exists());

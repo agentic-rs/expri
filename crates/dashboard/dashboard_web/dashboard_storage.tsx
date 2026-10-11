@@ -1,11 +1,15 @@
 import { apiUrl } from "./dashboard_model";
 import { artifactDownloadUrl, formatFileSize, safeArtifactPath } from "./dashboard_files";
+import { assetConsumerValid, assetProducerValid, assetRunUrl, CopyAssetReference, type AssetConsumer, type AssetProducer } from "./dashboard_assets";
 
 export type StorageKind = "input" | "output";
 export type StorageInput = {
   input_id: string;
   size: number;
   download_url: string | null;
+  producer?: (AssetProducer & { run_available: boolean }) | null;
+  used_by?: AssetConsumer[];
+  used_by_count?: number;
 };
 export type StorageOutput = {
   origin: string;
@@ -13,6 +17,8 @@ export type StorageOutput = {
   path: string;
   size: number;
   download_url: string | null;
+  assets?: { input_id: string }[];
+  assets_count?: number;
 };
 export type StorageCatalog = {
   project_id: string;
@@ -63,12 +69,48 @@ export function storageCatalogValid(
     item !== null && typeof item === "object" &&
     Number.isSafeInteger(item.size) && item.size >= 0 &&
     (kind === "input"
-      ? validComponent((item as StorageInput).input_id)
+      ? validComponent((item as StorageInput).input_id) && storageInputRelationshipsValid(item as StorageInput)
       : validComponent((item as StorageOutput).origin) &&
         validComponent((item as StorageOutput).run_id) &&
         typeof (item as StorageOutput).path === "string" &&
-        safeArtifactPath((item as StorageOutput).path)),
+        safeArtifactPath((item as StorageOutput).path) && storageOutputRelationshipsValid(item as StorageOutput)),
   );
+}
+
+function storageInputRelationshipsValid(item: StorageInput): boolean {
+  return (item.producer == null || (assetProducerValid(item.producer) && typeof item.producer.run_available === "boolean")) &&
+    (item.used_by === undefined || (Array.isArray(item.used_by) && item.used_by.length <= 16 && item.used_by.every(assetConsumerValid))) &&
+    (item.used_by_count === undefined || (Number.isSafeInteger(item.used_by_count) && item.used_by_count >= (item.used_by?.length ?? 0)));
+}
+
+function storageOutputRelationshipsValid(item: StorageOutput): boolean {
+  return (item.assets === undefined || (Array.isArray(item.assets) && item.assets.length <= 16 && item.assets.every((asset) => asset !== null && typeof asset === "object" && validComponent(asset.input_id)))) &&
+    (item.assets_count === undefined || (Number.isSafeInteger(item.assets_count) && item.assets_count >= (item.assets?.length ?? 0)));
+}
+
+function InputProducer({ item, project_id }: { item: StorageInput; project_id: string }) {
+  const producer = item.producer;
+  if (!producer) return <span className="muted">—</span>;
+  const url = producer.run_available ? assetRunUrl(project_id, producer) : null;
+  return <>
+    {url ? <a href={url}>{producer.origin} / {producer.run_id}</a> : <code>{producer.origin} / {producer.run_id}</code>}
+    <small className="asset-producer-path"><code>{producer.path}</code></small>
+    {!producer.run_available && <small className="muted asset-producer-path">Producing run is no longer available.</small>}
+  </>;
+}
+
+function InputConsumers({ item, project_id }: { item: StorageInput; project_id: string }) {
+  const consumers = item.used_by ?? [];
+  return consumers.length ? <>
+    <ul className="asset-relationships">{consumers.map((consumer) => {
+      const url = assetRunUrl(project_id, consumer);
+      return <li key={`${consumer.origin}:${consumer.run_id}:${consumer.path}`}>
+        {url ? <a href={url}>{consumer.origin} / {consumer.run_id}</a> : <code>{consumer.origin} / {consumer.run_id}</code>}
+        <small className="asset-producer-path"><code>{consumer.path}</code></small>
+      </li>;
+    })}</ul>
+    {(item.used_by_count ?? 0) > consumers.length && <small className="muted">Showing {consumers.length} of {item.used_by_count} uses.</small>}
+  </> : <span className="muted">—</span>;
 }
 
 export function storageInputDownloadUrl(item: StorageInput, project_id: string): string | null {
@@ -198,9 +240,9 @@ export function StoragePanel({
               <table className={`storage-table storage-table-${kind}`}>
                 <thead>
                   {kind === "input" ? (
-                    <tr><th scope="col">Input ID</th><th scope="col">Size</th><th scope="col">Download</th></tr>
+                    <tr><th scope="col">Input ID</th><th scope="col">Size</th><th scope="col">Produced by</th><th scope="col">Used by</th><th scope="col">Download</th></tr>
                   ) : (
-                    <tr><th scope="col">Machine</th><th scope="col">Run</th><th scope="col">File</th><th scope="col">Size</th><th scope="col">Download</th></tr>
+                    <tr><th scope="col">Machine</th><th scope="col">Run</th><th scope="col">File</th><th scope="col">Size</th><th scope="col">Reusable assets</th><th scope="col">Actions</th></tr>
                   )}
                 </thead>
                 <tbody id="storage-rows">
@@ -211,6 +253,8 @@ export function StoragePanel({
                           <tr key={item.input_id}>
                             <th scope="row"><code>{item.input_id}</code></th>
                             <td className="number">{formatFileSize(item.size)}</td>
+                            <td><InputProducer item={item} project_id={project_id} /></td>
+                            <td><InputConsumers item={item} project_id={project_id} /></td>
                             <td>{url ? <a className="text-button" href={url} download={item.input_id} target="_blank" rel="noopener noreferrer">Download</a> : <span className="muted">Unavailable</span>}</td>
                           </tr>
                         );
@@ -223,7 +267,13 @@ export function StoragePanel({
                             <td><code>{item.run_id}</code></td>
                             <th scope="row"><code>{item.path}</code></th>
                             <td className="number">{formatFileSize(item.size)}</td>
-                            <td>{url ? <a className="text-button" href={url} download={item.path.split("/").at(-1)} target="_blank" rel="noopener noreferrer">Download</a> : <span className="muted">Unavailable</span>}</td>
+                            <td>{item.assets?.length ? <>
+                              <ul className="asset-relationships">{item.assets.map((asset) => <li key={asset.input_id}><code>{asset.input_id}</code></li>)}</ul>
+                              {(item.assets_count ?? 0) > item.assets.length && <small className="muted">Showing {item.assets.length} of {item.assets_count} assets.</small>}
+                            </> : <span className="muted">—</span>}</td>
+                            <td>{url ? <a className="text-button" href={url} download={item.path.split("/").at(-1)} target="_blank" rel="noopener noreferrer">Download</a> : <span className="muted">Unavailable</span>}
+                              <CopyAssetReference producer={item} />
+                            </td>
                           </tr>
                         );
                       })}

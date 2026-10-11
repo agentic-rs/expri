@@ -312,6 +312,7 @@ impl<S: ObjectStorage> Store<S> {
         return Ok(Some(project_of(&self.upload_target(upload_id)?).into()));
       }
       Request::PutDocument { scope, .. }
+      | Request::ImportOutput { scope, .. }
       | Request::AppendTracking { scope, .. }
       | Request::SealRun { scope, .. }
       | Request::ArchiveStatus { scope }
@@ -416,6 +417,7 @@ impl<S: ObjectStorage> Store<S> {
       "tracking_metric_rows",
       "tracking_metric_summaries",
       "tracking_metric_state",
+      "tracking_asset_uses",
       "tracking_versions",
       "files",
       "uploads",

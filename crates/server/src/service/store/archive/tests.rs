@@ -196,6 +196,7 @@ fn archive_jobs_are_durable_and_repeated_seals_reuse_the_snapshot() {
       },
       size: 2,
       sha256: None,
+      provenance: None,
       storage: FileStorage::Tracking {
         revision: 1,
         sealed: false,

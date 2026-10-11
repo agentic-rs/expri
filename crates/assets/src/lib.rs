@@ -22,6 +22,8 @@ pub use bind::{
 };
 
 pub const SIDECAR_SUFFIX: &str = ".expri.toml";
+pub const DESCRIPTOR_VERSION: u32 = 2;
+pub use expri_core::service::OutputProducer as Producer;
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 pub const MAX_ASSETS: usize = 64;
 const MAX_DISCOVERY_ENTRIES: usize = 100_000;
@@ -34,11 +36,28 @@ pub struct Descriptor {
   pub source: Source,
   pub size: u64,
   pub sha256: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub availability: Option<ExpriAvailability>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub producer: Option<Producer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpriAvailability {
+  pub input_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+  pub size: u64,
+  pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Source {
+  Local,
   Url {
     url: String,
   },
@@ -51,8 +70,6 @@ pub enum Source {
     requested_revision: Option<String>,
   },
   Expri {
-    url: String,
-    project_id: String,
     input_id: String,
   },
 }
@@ -60,6 +77,7 @@ pub enum Source {
 impl Source {
   pub fn validate(&self) -> Result<()> {
     match self {
+      Self::Local => {}
       Self::Url { url } => {
         let parsed = parse_url(url)?;
         for (key, _) in parsed.query_pairs() {
@@ -112,16 +130,7 @@ impl Source {
           validate_hf_revision(requested)?;
         }
       }
-      Self::Expri {
-        url,
-        project_id,
-        input_id,
-      } => {
-        let parsed = parse_url(url)?;
-        if parsed.path() != "/" || parsed.query().is_some() {
-          return Err(message("private asset service URL must be a base origin"));
-        }
-        crate::service::validate_component(project_id)?;
+      Self::Expri { input_id } => {
         crate::service::validate_component(input_id)?;
       }
     }
@@ -131,10 +140,22 @@ impl Source {
 
 impl Descriptor {
   pub fn validate(&self) -> Result<()> {
-    if self.version != 1 {
+    if self.version != DESCRIPTOR_VERSION {
       return Err(message(
-        "unsupported asset descriptor version; expected version 1",
+        "unsupported asset descriptor version; expected version 2 (assets-v2 worker required)",
       ));
+    }
+    if let Some(availability) = &self.availability {
+      crate::service::validate_component(&availability.input_id)?;
+    }
+    if let Some(producer) = &self.producer {
+      crate::service::validate_component(&producer.origin)?;
+      crate::service::validate_component(&producer.run_id)?;
+      expri_core::service::validate_run_path(&producer.path)?;
+      validate_relative(&producer.path)?;
+      if !producer.path.starts_with("outputs/") {
+        return Err(message("asset producer must identify a run output"));
+      }
     }
     self.source.validate()?;
     if !valid_hex(&self.sha256, 64) {
@@ -147,6 +168,17 @@ impl Descriptor {
     {
       return Err(message(
         "asset Hugging Face revision must be a resolved 40-digit commit",
+      ));
+    }
+    Ok(())
+  }
+}
+
+impl Identity {
+  pub fn validate(&self) -> Result<()> {
+    if !valid_hex(&self.sha256, 64) {
+      return Err(message(
+        "asset SHA256 must contain 64 lowercase hexadecimal digits",
       ));
     }
     Ok(())

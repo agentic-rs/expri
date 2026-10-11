@@ -301,6 +301,18 @@ fn purge_preserves_shared_private_inputs_other_runs_and_all_their_local_tracking
     },
     run_file(&other, "outputs/shared.pt"),
   ] {
+    if let FileTarget::Input { input_id, .. } = &target {
+      store
+        .execute(Request::ImportOutput {
+          scope: selected.clone(),
+          path: "outputs/shared.pt".into(),
+          input_id: Some(input_id.clone()),
+          size: 7,
+          sha256: "a".repeat(64),
+        })
+        .unwrap();
+      continue;
+    }
     store
       .execute(Request::ReferenceFile {
         source: shared.clone(),
@@ -334,6 +346,16 @@ fn purge_preserves_shared_private_inputs_other_runs_and_all_their_local_tracking
       })
       .is_ok()
   );
+  let imported = store
+    .file(&FileTarget::Input {
+      project_id: "project".into(),
+      input_id: "dataset".into(),
+    })
+    .unwrap();
+  let producer = imported.provenance.unwrap();
+  assert_eq!(producer.producer.run_id, selected.run_id);
+  assert_eq!(producer.producer.path, "outputs/shared.pt");
+  assert_eq!(producer.state["status"], "completed");
   assert!(!dir.path().join("tracking/project/worker/run-1").exists());
   for scope in [&other, &other_origin] {
     assert!(
@@ -624,7 +646,7 @@ fn schema_three_upgrade_adds_retention_without_changing_existing_runs() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    4
+    5
   );
   assert_eq!(
     serde_json::to_value(store.file(&original.target).unwrap()).unwrap(),

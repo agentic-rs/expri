@@ -562,12 +562,14 @@ mod tests {
     crate::assets::save(
       &sidecar,
       &crate::assets::Descriptor {
-        version: 1,
+        version: 2,
         source: crate::assets::Source::Url {
           url: "https://example.net/data.bin".into(),
         },
         size: 3,
         sha256: digest(b"abc"),
+        availability: None,
+        producer: None,
       },
     )
     .unwrap();
@@ -714,7 +716,7 @@ mod tests {
       };
       asset_descriptor(root.path(), "data.bin");
       let error = python_snapshot(root.path(), &[]).unwrap_err();
-      assert!(error.contains("assets-v1"), "{error}");
+      assert!(error.contains("assets-v2"), "{error}");
       assert!(error.contains("native expri worker"), "{error}");
       assert!(!root.path().join(".expri/runs").exists());
     }

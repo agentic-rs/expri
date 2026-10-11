@@ -112,13 +112,13 @@ fn git(root: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn import_update_frozen_download_offline_cache_and_git_sidecars() {
+fn add_update_frozen_download_offline_cache_and_git_sidecars() {
   let root = tempfile::tempdir().unwrap();
   assert!(git(root.path(), &["init", "--quiet"]).status.success());
   let mut origin = Origin::new(b"first dataset");
   let imported = succeeds(
     root.path(),
-    &["assets", "import", &origin.url, "data/train.bin", "--json"],
+    &["assets", "add", &origin.url, "data/train.bin", "--json"],
   );
   assert_eq!(imported["sidecar"], "data/train.bin.expri.toml");
   let original_sidecar = fs::read(root.path().join("data/train.bin.expri.toml")).unwrap();
@@ -198,7 +198,7 @@ fn edited_files_existing_code_and_unsafe_paths_are_preserved() {
   let origin = Origin::new(b"immutable asset");
   fs::write(root.path().join("train.py"), "print('source')").unwrap();
   assert!(
-    !expri(root.path(), &["assets", "import", &origin.url, "train.py"])
+    !expri(root.path(), &["assets", "add", &origin.url, "train.py"])
       .status
       .success()
   );
@@ -213,7 +213,7 @@ fn edited_files_existing_code_and_unsafe_paths_are_preserved() {
     "data/../train.bin",
   ] {
     assert!(
-      !expri(root.path(), &["assets", "import", &origin.url, path])
+      !expri(root.path(), &["assets", "add", &origin.url, path])
         .status
         .success()
     );
@@ -221,7 +221,7 @@ fn edited_files_existing_code_and_unsafe_paths_are_preserved() {
   assert_eq!(origin.requests.load(Ordering::Relaxed), 0);
   let imported = succeeds(
     root.path(),
-    &["assets", "import", &origin.url, "data/train.bin", "--json"],
+    &["assets", "add", &origin.url, "data/train.bin", "--json"],
   );
   // Replace the workspace path rather than changing the shared read-only cache inode.
   fs::remove_file(root.path().join("data/train.bin")).unwrap();
@@ -264,10 +264,7 @@ fn tracked_data_is_rejected_before_download_even_when_missing_on_disk() {
   fs::write(root.path().join("dataset.bin"), b"old").unwrap();
   assert!(git(root.path(), &["add", "dataset.bin"]).status.success());
   fs::remove_file(root.path().join("dataset.bin")).unwrap();
-  let result = expri(
-    root.path(),
-    &["assets", "import", &origin.url, "dataset.bin"],
-  );
+  let result = expri(root.path(), &["assets", "add", &origin.url, "dataset.bin"]);
   assert!(!result.status.success());
   assert!(String::from_utf8_lossy(&result.stderr).contains("tracked by Git"));
   assert_eq!(origin.requests.load(Ordering::Relaxed), 0);
@@ -283,7 +280,7 @@ fn ignored_data_directories_keep_bytes_ignored_and_descriptors_trackable() {
     root.path(),
     &[
       "assets",
-      "import",
+      "add",
       &origin.url,
       "data/nested/train.bin",
       "--json",
@@ -330,4 +327,87 @@ fn ignored_data_directories_keep_bytes_ignored_and_descriptors_trackable() {
       .any(|path| path == "data/nested/train.bin.expri.toml")
   );
   assert!(!tracked.lines().any(|path| path.ends_with(".bin")));
+}
+
+#[test]
+fn deferred_public_add_downloads_only_on_the_consuming_checkout() {
+  let laptop = tempfile::tempdir().unwrap();
+  let worker = tempfile::tempdir().unwrap();
+  let origin = Origin::new(b"hello");
+  let digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+  let declared = succeeds(
+    laptop.path(),
+    &[
+      "assets",
+      "add",
+      &origin.url,
+      "data/train.bin",
+      "--no-download",
+      "--sha256",
+      digest,
+      "--size",
+      "5",
+      "--json",
+    ],
+  );
+  assert_eq!(declared["sha256"], digest);
+  assert_eq!(origin.requests.load(Ordering::Relaxed), 0);
+  assert!(!laptop.path().join("data/train.bin").exists());
+  assert!(
+    !laptop
+      .path()
+      .join(format!(".expri/assets/{digest}"))
+      .exists()
+  );
+  fs::create_dir(worker.path().join("data")).unwrap();
+  fs::copy(
+    laptop.path().join("data/train.bin.expri.toml"),
+    worker.path().join("data/train.bin.expri.toml"),
+  )
+  .unwrap();
+  succeeds(
+    worker.path(),
+    &["assets", "download", "data/train.bin", "--json"],
+  );
+  assert_eq!(
+    fs::read(worker.path().join("data/train.bin")).unwrap(),
+    b"hello"
+  );
+  assert_eq!(origin.requests.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn local_add_and_explicit_update_preserve_original_files_and_never_use_network() {
+  let root = tempfile::tempdir().unwrap();
+  fs::write(root.path().join("dataset.bin"), b"version one").unwrap();
+  let added = succeeds(root.path(), &["assets", "add", "dataset.bin", "--json"]);
+  assert_eq!(added["source"]["kind"], "local");
+  let status = succeeds(root.path(), &["assets", "status", "--json"]);
+  assert_eq!(status["assets"][0]["availability"], "local_only");
+  fs::write(root.path().join("dataset.bin"), b"version two").unwrap();
+  let updated = succeeds(root.path(), &["assets", "update", "dataset.bin", "--json"]);
+  assert_ne!(updated["sha256"], added["sha256"]);
+  assert_eq!(updated["changed"], true);
+  assert_eq!(
+    fs::read(root.path().join("dataset.bin")).unwrap(),
+    b"version two"
+  );
+  fs::remove_file(root.path().join("dataset.bin")).unwrap();
+  succeeds(
+    root.path(),
+    &["assets", "download", "dataset.bin", "--json"],
+  );
+  assert_eq!(
+    fs::read(root.path().join("dataset.bin")).unwrap(),
+    b"version two"
+  );
+  let other = tempfile::tempdir().unwrap();
+  fs::copy(
+    root.path().join("dataset.bin.expri.toml"),
+    other.path().join("dataset.bin.expri.toml"),
+  )
+  .unwrap();
+  let missing = expri(other.path(), &["assets", "download", "dataset.bin"]);
+  assert!(!missing.status.success());
+  assert!(String::from_utf8_lossy(&missing.stderr).contains("upload"));
 }

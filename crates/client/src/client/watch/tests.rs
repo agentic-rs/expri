@@ -33,6 +33,7 @@ fn record(path: &str, bytes: &[u8]) -> FileRecord {
     },
     size: bytes.len() as u64,
     sha256: Some(fs::hex(&Sha256::digest(bytes))),
+    provenance: None,
     storage: FileStorage::Object,
   }
 }

@@ -301,6 +301,7 @@ fn explicit_upload_captures_exact_tracking_revisions_and_partial_intent() {
               target: run_target(&scope, "run-state.json"),
               size: 40,
               sha256: None,
+              provenance: None,
               storage: FileStorage::Tracking {
                 revision: 3,
                 sealed: true,
@@ -310,6 +311,7 @@ fn explicit_upload_captures_exact_tracking_revisions_and_partial_intent() {
               target: run_target(&scope, "logs/stdout.log"),
               size: 71,
               sha256: None,
+              provenance: None,
               storage: FileStorage::Tracking {
                 revision: 1,
                 sealed: false,
@@ -319,6 +321,7 @@ fn explicit_upload_captures_exact_tracking_revisions_and_partial_intent() {
               target: run_target(&scope, "outputs/checkpoint.pt"),
               size: 100,
               sha256: Some("a".repeat(64)),
+              provenance: None,
               storage: FileStorage::Object,
             },
           ],
@@ -367,6 +370,7 @@ fn explicit_upload_rejects_another_run_before_sealing() {
             target: run_target(&scope, "run-state.json"),
             size: 40,
             sha256: None,
+            provenance: None,
             storage: FileStorage::Tracking {
               revision: 1,
               sealed: true,

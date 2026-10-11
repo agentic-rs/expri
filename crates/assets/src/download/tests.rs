@@ -105,10 +105,12 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
 
 fn descriptor(source: Source, bytes: &[u8]) -> Descriptor {
   Descriptor {
-    version: 1,
+    version: 2,
     source,
     size: bytes.len() as u64,
     sha256: hex(&Sha256::digest(bytes)),
+    availability: None,
+    producer: None,
   }
 }
 
@@ -137,7 +139,7 @@ fn private_steps(bytes: &'static [u8]) -> Vec<Step> {
       assert!(request.contains("authorization: Bearer "));
       assert!(request.contains("\"action\":\"get_file\""));
       json_response(serde_json::json!({"kind":"file","file":{
-        "target":{"kind":"input","project_id":"project","input_id":"input"},
+        "target":{"kind":"input","project_id":"example-project","input_id":"input"},
         "size":bytes.len(),"sha256":digest,"storage":"object"}}))
     }),
     Box::new(|request| {
@@ -404,7 +406,7 @@ fn unsafe_redirect_schemes_and_embedded_credentials_are_rejected() {
 }
 
 #[test]
-fn private_endpoint_mismatch_fails_before_credentials_or_network_are_used() {
+fn missing_private_project_fails_before_credentials_or_network_are_used() {
   let (_temporary, repo) = fixture();
   let path = repo.join("client.toml");
   std::fs::write(
@@ -413,14 +415,12 @@ fn private_endpoint_mismatch_fails_before_credentials_or_network_are_used() {
   )
   .unwrap();
   let source = Source::Expri {
-    url: "https://expected.example".into(),
-    project_id: "project".into(),
     input_id: "input".into(),
   };
   let error = resolve(&repo, &source, Some(&path), &mut || Ok(false))
     .unwrap_err()
     .to_string();
-  assert!(error.contains("does not match"));
+  assert!(error.contains("project_id"));
   assert!(!error.contains("MISSING_TOKEN"));
   let expected = descriptor(source, b"private bytes");
   let cache = cache_file(&repo, &expected.sha256);
@@ -441,19 +441,18 @@ fn explicitly_selected_client_configuration_accepts_read_only_symlink_parents() 
   let config = actual.join("client.toml");
   std::fs::write(
     &config,
-    "url='https://private.example'\ntoken_env='MISSING_TOKEN'\n",
+    "url='https://private.example.net'\nproject_id='example-project'\ntoken_env='MISSING_TOKEN'\n",
   )
   .unwrap();
   let alias = repo.join("config-alias");
   std::os::unix::fs::symlink(&actual, &alias).unwrap();
-  let source = Source::Expri {
-    url: "https://private.example".into(),
-    project_id: "project".into(),
-    input_id: "input".into(),
-  };
   assert_eq!(
-    matching_client(&source, Some(&alias.join("client.toml"))).unwrap(),
-    config
+    matching_client(Some(&alias.join("client.toml"))).unwrap(),
+    (
+      config,
+      "example-project".into(),
+      "https://private.example.net".into()
+    )
   );
 }
 
@@ -463,16 +462,22 @@ fn registered_private_input_uses_existing_service_transfer_and_only_keeps_one_fu
   let mut mock = Mock::start(private_steps(b"private v1"));
   let config = repo.join("client.toml");
   // Use the same harmless, already-present test token convention as service tests.
-  std::fs::write(&config, format!("url={:?}\ntoken_env='PATH'\n", mock.url)).unwrap();
+  std::fs::write(
+    &config,
+    format!(
+      "url={:?}\ntoken_env='PATH'\nproject_id='example-project'\n",
+      mock.url
+    ),
+  )
+  .unwrap();
   let source = Source::Expri {
-    url: mock.url.clone(),
-    project_id: "project".into(),
     input_id: "input".into(),
   };
   let actual = resolve(&repo, &source, Some(&config), &mut || Ok(false)).unwrap();
   assert_eq!(actual, descriptor(source.clone(), b"private v1"));
   mock.finish();
-  let staging = transfer_directory(&repo, &source, None).unwrap();
+  let staging =
+    transfer_directory_scoped(&repo, &source, None, Some((&mock.url, "example-project"))).unwrap();
   assert!(!staging.join("file").exists());
   let record = staging.join(".expri-input-downloads/file/input-record.json");
   assert!(
@@ -491,10 +496,15 @@ fn frozen_private_input_rejects_changed_server_record_before_asset_cache_publica
   let (_temporary, repo) = fixture();
   let mut mock = Mock::start(private_steps(b"private v2"));
   let config = repo.join("client.toml");
-  std::fs::write(&config, format!("url={:?}\ntoken_env='PATH'\n", mock.url)).unwrap();
+  std::fs::write(
+    &config,
+    format!(
+      "url={:?}\ntoken_env='PATH'\nproject_id='example-project'\n",
+      mock.url
+    ),
+  )
+  .unwrap();
   let source = Source::Expri {
-    url: mock.url.clone(),
-    project_id: "project".into(),
     input_id: "input".into(),
   };
   let old = descriptor(source.clone(), b"private v1");
@@ -520,10 +530,15 @@ fn private_response_details_are_redacted_at_the_asset_boundary() {
     )
   })]);
   let config = repo.join("client.toml");
-  std::fs::write(&config, format!("url={:?}\ntoken_env='PATH'\n", mock.url)).unwrap();
+  std::fs::write(
+    &config,
+    format!(
+      "url={:?}\ntoken_env='PATH'\nproject_id='example-project'\n",
+      mock.url
+    ),
+  )
+  .unwrap();
   let source = Source::Expri {
-    url: mock.url.clone(),
-    project_id: "project".into(),
     input_id: "input".into(),
   };
   let error = resolve(&repo, &source, Some(&config), &mut || Ok(false))
@@ -580,4 +595,269 @@ fn cancelled_transfers_release_the_lease_and_keep_only_safe_progress() {
   drop(held);
   let lease = lease(&staging.join(".asset.lock"), &mut || Ok(false)).unwrap();
   drop(lease);
+}
+
+fn private_config(repo: &Path, url: &str) -> PathBuf {
+  let config = repo.join("client.toml");
+  std::fs::write(
+    &config,
+    format!("url={url:?}\nproject_id='example-project'\ntoken_env='PATH'\n",),
+  )
+  .unwrap();
+  config
+}
+
+#[test]
+fn local_adoption_copies_into_immutable_cache_without_changing_the_original() {
+  let (_temporary, repo) = fixture();
+  let source = repo.join("local.bin");
+  std::fs::write(&source, b"original bytes").unwrap();
+  let before = std::fs::metadata(&source).unwrap();
+  let actual = adopt(&repo, &source, &mut || Ok(false)).unwrap();
+  assert_eq!(actual, descriptor(Source::Local, b"original bytes"));
+  let cache = ensure(&repo, &actual, None, &mut || Ok(false)).unwrap();
+  assert_eq!(std::fs::read(&cache).unwrap(), b"original bytes");
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    let after = std::fs::metadata(&source).unwrap();
+    let cached = std::fs::metadata(cache).unwrap();
+    assert_eq!((before.ino(), before.mode()), (after.ino(), after.mode()));
+    assert_ne!(after.ino(), cached.ino());
+    assert_eq!(cached.mode() & 0o777, 0o400);
+  }
+  std::fs::write(&source, b"edited workspace").unwrap();
+  assert_eq!(
+    std::fs::read(cache_file(&repo, &actual.sha256)).unwrap(),
+    b"original bytes"
+  );
+}
+
+#[test]
+fn local_asset_on_a_new_worker_requires_upload_and_then_uses_private_availability() {
+  let (_temporary, repo) = fixture();
+  let mut expected = descriptor(Source::Local, b"private v1");
+  let error = ensure(&repo, &expected, None, &mut || Ok(false))
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("upload"));
+  assert!(!repo.join(".expri").exists());
+  expected.availability = Some(crate::ExpriAvailability {
+    input_id: "input".into(),
+  });
+  let mut mock = Mock::start(private_steps(b"private v1"));
+  let config = private_config(&repo, &mock.url);
+  let cache = ensure(&repo, &expected, Some(&config), &mut || Ok(false)).unwrap();
+  assert_eq!(std::fs::read(cache).unwrap(), b"private v1");
+  assert_eq!(mock.finish().len(), 3);
+  assert_eq!(expected.source, Source::Local);
+}
+
+#[test]
+fn supplied_public_identity_is_locked_offline_without_creating_transfer_state() {
+  let (_temporary, repo) = fixture();
+  let expected = descriptor(
+    Source::Url {
+      url: "https://example.net/model.bin".into(),
+    },
+    b"model data",
+  );
+  let identity = Identity {
+    size: expected.size,
+    sha256: expected.sha256.clone(),
+  };
+  assert_eq!(
+    resolve_metadata(&repo, &expected.source, Some(&identity), None, &mut || Ok(
+      false
+    ))
+    .unwrap(),
+    expected
+  );
+  assert!(!repo.join(".expri").exists());
+}
+
+#[test]
+fn public_metadata_only_add_uses_head_and_never_downloads_or_creates_a_cache() {
+  let (_temporary, repo) = fixture();
+  let digest = hex(&Sha256::digest(b"model data"));
+  let mut mock = Mock::start(vec![Box::new(move |request| {
+    assert!(request.starts_with("HEAD /file HTTP/1.1"));
+    response(
+      "200 OK",
+      &format!("Content-Length: 10\r\nX-Checksum-Sha256: {digest}\r\n"),
+      b"",
+    )
+  })]);
+  let source = url_source(&mock);
+  assert_eq!(
+    resolve_metadata(&repo, &source, None, None, &mut || Ok(false)).unwrap(),
+    descriptor(source, b"model data")
+  );
+  assert_eq!(mock.finish().len(), 1);
+  assert!(!repo.join(".expri").exists());
+}
+
+#[test]
+fn metadata_only_add_rejects_unknown_sha256_instead_of_fetching_payload() {
+  let (_temporary, repo) = fixture();
+  let mut mock = Mock::start(vec![Box::new(|request| {
+    assert!(request.starts_with("HEAD "));
+    response("200 OK", "Content-Length: 10\r\nETag: \"version\"\r\n", b"")
+  })]);
+  let error = resolve_metadata(&repo, &url_source(&mock), None, None, &mut || Ok(false))
+    .unwrap_err()
+    .to_string();
+  assert!(error.contains("known SHA256"));
+  assert_eq!(mock.finish().len(), 1);
+  assert!(!repo.join(".expri").exists());
+}
+
+#[test]
+fn private_metadata_only_add_retains_short_producer_without_fetching_payload() {
+  let (_temporary, repo) = fixture();
+  let digest = hex(&Sha256::digest(b"private v1"));
+  let mut mock = Mock::start(vec![Box::new(move |request| {
+    assert!(request.contains("\"action\":\"get_file\""));
+    assert!(request.contains("\"project_id\":\"example-project\""));
+    json_response(serde_json::json!({"kind":"file","file":{
+      "target":{"kind":"input","project_id":"example-project","input_id":"input"},
+      "size":10,"sha256":digest,"storage":"object",
+      "provenance": {"producer":{"origin":"worker-1","run_id":"run-abc123","path":"outputs/best.pt"},
+        "captured_at":"2026-10-11T00:00:00Z", "state":{"private":"captured-state"},"snapshot":{},"environment":{}}
+    }}))
+  })]);
+  let config = private_config(&repo, &mock.url);
+  let source = Source::Expri {
+    input_id: "input".into(),
+  };
+  let actual = resolve_metadata(&repo, &source, None, Some(&config), &mut || Ok(false)).unwrap();
+  assert_eq!(actual.producer.as_ref().unwrap().origin, "worker-1");
+  let serialized = toml::to_string(&actual).unwrap();
+  assert!(!serialized.contains("example-project"));
+  assert!(!serialized.contains(&mock.url));
+  assert!(!serialized.contains("captured-state"));
+  assert_eq!(mock.finish().len(), 1);
+  assert!(!repo.join(".expri").exists());
+}
+
+#[test]
+fn uploaded_public_asset_prefers_private_mirror_and_falls_back_to_its_source() {
+  let (_temporary, repo) = fixture();
+  let mut private = Mock::start(private_steps(b"private v1"));
+  let config = private_config(&repo, &private.url);
+  let mut expected = descriptor(
+    Source::Url {
+      url: "https://example.net/unavailable.bin".into(),
+    },
+    b"private v1",
+  );
+  expected.availability = Some(crate::ExpriAvailability {
+    input_id: "input".into(),
+  });
+  assert!(
+    ensure(&repo, &expected, Some(&config), &mut || Ok(false))
+      .unwrap()
+      .exists()
+  );
+  assert_eq!(private.finish().len(), 3);
+
+  let (_temporary, repo) = fixture();
+  let mut public = Mock::start(vec![Box::new(|request| {
+    assert!(request.starts_with("GET /file "));
+    response("200 OK", "Content-Length: 10\r\n", b"model data")
+  })]);
+  let mut expected = descriptor(url_source(&public), b"model data");
+  expected.availability = Some(crate::ExpriAvailability {
+    input_id: "input".into(),
+  });
+  let config = private_config(&repo, "http://127.0.0.1:1");
+  assert!(
+    ensure(&repo, &expected, Some(&config), &mut || Ok(false))
+      .unwrap()
+      .exists()
+  );
+  assert_eq!(public.finish().len(), 1);
+
+  let (_temporary, repo) = fixture();
+  let mut public = Mock::start(vec![Box::new(|request| {
+    assert!(request.starts_with("GET /file "));
+    response("200 OK", "Content-Length: 10\r\n", b"model data")
+  })]);
+  let mut expected = descriptor(url_source(&public), b"model data");
+  expected.availability = Some(crate::ExpriAvailability {
+    input_id: "input".into(),
+  });
+  assert!(
+    ensure(&repo, &expected, None, &mut || Ok(false))
+      .unwrap()
+      .exists()
+  );
+  assert_eq!(public.finish().len(), 1);
+}
+
+#[test]
+fn uploaded_private_asset_uses_the_new_availability_without_losing_original_source() {
+  let (_temporary, repo) = fixture();
+  let mut mock = Mock::start(private_steps(b"private v1"));
+  let config = private_config(&repo, &mock.url);
+  let mut expected = descriptor(
+    Source::Expri {
+      input_id: "original-input".into(),
+    },
+    b"private v1",
+  );
+  expected.availability = Some(crate::ExpriAvailability {
+    input_id: "input".into(),
+  });
+  assert!(
+    ensure(&repo, &expected, Some(&config), &mut || Ok(false))
+      .unwrap()
+      .exists()
+  );
+  assert_eq!(mock.finish().len(), 3);
+  assert_eq!(
+    expected.source,
+    Source::Expri {
+      input_id: "original-input".into()
+    }
+  );
+}
+
+#[test]
+fn private_transfer_staging_is_scoped_by_configuration_without_affecting_content_identity() {
+  let (_temporary, repo) = fixture();
+  let source = Source::Expri {
+    input_id: "input".into(),
+  };
+  let expected = descriptor(source.clone(), b"bytes");
+  let first = transfer_directory_scoped(
+    &repo,
+    &source,
+    Some(&expected),
+    Some(("https://first.example.net", "example-project")),
+  )
+  .unwrap();
+  let second = transfer_directory_scoped(
+    &repo,
+    &source,
+    Some(&expected),
+    Some(("https://second.example.net", "example-project")),
+  )
+  .unwrap();
+  let third = transfer_directory_scoped(
+    &repo,
+    &source,
+    Some(&expected),
+    Some(("https://first.example.net", "other-project")),
+  )
+  .unwrap();
+  assert_ne!(first, second);
+  assert_ne!(first, third);
+  assert_eq!(
+    cache_file(&repo, &expected.sha256),
+    repo
+      .join(".expri/assets")
+      .join(&expected.sha256)
+      .join("file")
+  );
 }

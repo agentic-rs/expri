@@ -634,7 +634,7 @@ fn input_download_bound(
     Ok(Response::File { file }) => file,
     Ok(_) => return Err(message("service did not return an input record")),
     Err(error) if offline_input_error(&error) && fs::inspect(&cached_record)?.is_some() => {
-      let file: FileRecord = serde_json::from_slice(&fs::read_bounded(&cached_record, 16 * 1024)?)?;
+      let file: FileRecord = serde_json::from_slice(&fs::read_bounded(&cached_record, 64 * 1024)?)?;
       validate_input_record(&file, &target)?;
       if staging::verified_source_with_cancel(&file, &destination, cancelled)?.is_none() {
         return Err(error);
@@ -642,7 +642,7 @@ fn input_download_bound(
       return bound_input_report(
         &destination,
         json!({"target": target, "destination": destination, "size": file.size,
-        "sha256": file.sha256, "reused": true, "offline": true,
+        "sha256": file.sha256, "producer": file.provenance.as_ref().map(|value| &value.producer), "reused": true, "offline": true,
         "resumed_bytes": 0, "downloaded_bytes": 0}),
         cancelled,
         bind,
@@ -658,7 +658,7 @@ fn input_download_bound(
     return bound_input_report(
       &destination,
       json!({"target":target,"destination":destination,"size":file.size,"sha256":file.sha256,
-      "reused":true,"offline":false,"resumed_bytes":0,"downloaded_bytes":0}),
+      "producer":file.provenance.as_ref().map(|value| &value.producer),"reused":true,"offline":false,"resumed_bytes":0,"downloaded_bytes":0}),
       cancelled,
       bind,
     );
@@ -673,7 +673,7 @@ fn input_download_bound(
   bound_input_report(
     &destination,
     json!({"target": target, "destination": destination, "size": file.size, "sha256": file.sha256,
-      "reused": false, "offline": false, "resumed_bytes": resumed, "downloaded_bytes": downloaded}),
+      "producer": file.provenance.as_ref().map(|value| &value.producer), "reused": false, "offline": false, "resumed_bytes": resumed, "downloaded_bytes": downloaded}),
     cancelled,
     bind,
   )

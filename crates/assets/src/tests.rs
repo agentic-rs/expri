@@ -2,12 +2,14 @@ use super::*;
 
 fn descriptor() -> Descriptor {
   Descriptor {
-    version: 1,
+    version: 2,
     source: Source::Url {
-      url: "https://example.com/train.parquet?download=1".into(),
+      url: "https://example.net/train.parquet?download=1".into(),
     },
     size: 7,
     sha256: "1".repeat(64),
+    availability: None,
+    producer: None,
   }
 }
 
@@ -38,7 +40,7 @@ fn descriptor_roundtrip_is_strict_versioned_and_atomic() {
   )
   .unwrap();
   assert!(load(&path).is_err());
-  second.version = 2;
+  second.version = 3;
   assert!(save(&path, &second).is_err());
   assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
 }
@@ -60,15 +62,15 @@ fn fingerprints_and_descriptors_have_bounded_formats() {
 fn public_source_rejects_credentials_signed_queries_and_ambiguous_urls() {
   for url in [
     "file:///etc/passwd",
-    "https://user:password@example.com/file",
-    "https://example.com/file#fragment",
-    "https://example.com/file?token=secret",
-    "https://example.com/file?X-Amz-Signature=secret",
-    "https://example.com/file?x-goog-credential=secret",
-    "https://example.com/file?AWSAccessKeyId=secret",
-    "https://example.com/file?access%5Ftoken=secret",
-    " https://example.com/file",
-    "https:\\example.com\\file",
+    "https://user:password@example.net/file",
+    "https://example.net/file#fragment",
+    "https://example.net/file?token=secret",
+    "https://example.net/file?X-Amz-Signature=secret",
+    "https://example.net/file?x-goog-credential=secret",
+    "https://example.net/file?AWSAccessKeyId=secret",
+    "https://example.net/file?access%5Ftoken=secret",
+    " https://example.net/file",
+    "https:\\example.net\\file",
   ] {
     assert!(
       Source::Url { url: url.into() }.validate().is_err(),
@@ -76,7 +78,7 @@ fn public_source_rejects_credentials_signed_queries_and_ambiguous_urls() {
     );
   }
   for url in [
-    "https://example.com/data?download=1&version=2",
+    "https://example.net/data?download=1&version=2",
     "http://127.0.0.1:8080/test",
   ] {
     Source::Url { url: url.into() }.validate().unwrap();
@@ -125,37 +127,61 @@ fn hugging_face_resolution_pins_a_commit_without_losing_the_requested_reference(
 }
 
 #[test]
-fn private_source_stores_only_an_origin_and_stable_identifiers() {
-  for url in [
-    "https://expri.example",
-    "https://expri.example/",
-    "http://127.0.0.1:8000",
-  ] {
-    Source::Expri {
-      url: url.into(),
-      project_id: "vision".into(),
-      input_id: "dataset-v1".into(),
-    }
-    .validate()
-    .unwrap();
-  }
-  for (url, project_id, input_id) in [
-    ("https://expri.example/api", "vision", "dataset"),
-    ("https://expri.example/?token=value", "vision", "dataset"),
-    ("https://secret@expri.example/", "vision", "dataset"),
-    ("https://expri.example/", "../vision", "dataset"),
-    ("https://expri.example/", "vision", "dataset/nested"),
-  ] {
+fn private_sources_are_portable_references_without_deployment_identity() {
+  let mut value = descriptor();
+  value.source = Source::Expri {
+    input_id: "dataset-v1".into(),
+  };
+  value.availability = Some(ExpriAvailability {
+    input_id: "persistent-copy".into(),
+  });
+  value.producer = Some(Producer {
+    origin: "worker-1".into(),
+    run_id: "run-abc123".into(),
+    path: "outputs/best.pt".into(),
+  });
+  value.validate().unwrap();
+  let serialized = toml::to_string(&value).unwrap();
+  assert!(!serialized.contains("url") && !serialized.contains("project_id"));
+  assert_eq!(toml::from_str::<Descriptor>(&serialized).unwrap(), value);
+  for input_id in ["", "../dataset", "dataset/nested"] {
     assert!(
       Source::Expri {
-        url: url.into(),
-        project_id: project_id.into(),
         input_id: input_id.into()
       }
       .validate()
       .is_err()
     );
   }
+  assert!(
+    toml::from_str::<Source>("kind='expri'\ninput_id='dataset'\nurl='https://example.net'\n")
+      .is_err()
+  );
+  value.version = 1;
+  assert!(
+    value
+      .validate()
+      .unwrap_err()
+      .to_string()
+      .contains("assets-v2")
+  );
+}
+
+#[test]
+fn uploading_preserves_public_source_and_short_producer_is_validated() {
+  let mut value = descriptor();
+  let original = value.source.clone();
+  value.availability = Some(ExpriAvailability {
+    input_id: "uploaded-copy".into(),
+  });
+  value.validate().unwrap();
+  assert_eq!(value.source, original);
+  value.producer = Some(Producer {
+    origin: "worker-1".into(),
+    run_id: "run-abc123".into(),
+    path: "../outside.pt".into(),
+  });
+  assert!(value.validate().is_err());
 }
 
 #[test]

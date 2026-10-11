@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 /// Keep the metadata shape identical for filesystem and hosted dashboards.
 pub fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
-  let state = projection(
+  let mut state = projection(
     &record["state"],
     &[
       "schema_version",
@@ -19,6 +19,41 @@ pub fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
     ],
     truncated,
   );
+  if state.is_object()
+    && let Some(assets) = record["state"]["assets"].as_array()
+  {
+    state["asset_count"] = json!(assets.len());
+    if assets.len() > 16 {
+      *truncated = true;
+    }
+    let assets: Vec<_> = assets
+      .iter()
+      .take(16)
+      .map(|asset| {
+        let mut output = projection(asset, &["path", "size", "sha256"], truncated);
+        if output.is_object() {
+          output["source"] = projection(
+            &asset["source"],
+            &[
+              "kind",
+              "input_id",
+              "url",
+              "repo_id",
+              "repo_type",
+              "filename",
+              "revision",
+            ],
+            truncated,
+          );
+          output["availability"] = projection(&asset["availability"], &["input_id"], truncated);
+          output["producer"] =
+            projection(&asset["producer"], &["origin", "run_id", "path"], truncated);
+        }
+        output
+      })
+      .collect();
+    state["assets"] = preview(&json!(assets), truncated);
+  }
   let mut snapshot = projection(
     &record["snapshot"],
     &["schema_version", "run_id", "created_at"],
@@ -182,5 +217,49 @@ fn preview_inner(
       *budget -= size;
       Some(value)
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn asset_preview_preserves_short_lineage_and_omits_private_connection_settings() {
+    let record = json!({"state": {"assets": [{
+      "path": "models/base.pt", "size": 10, "sha256": "a".repeat(64),
+      "source": {"kind": "expri", "input_id": "base-v1", "endpoint": "https://service.example.net", "project_id": "example-project", "token": "secret"},
+      "availability": {"input_id": "base-v1", "token": "secret"},
+      "producer": {"origin": "worker-1", "run_id": "run-1", "path": "outputs/best.pt", "project_id": "example-project"},
+      "extra": "omitted"
+    }]}});
+    let mut truncated = false;
+    let preview = run_metadata(&record, &mut truncated);
+    assert_eq!(preview["state"]["asset_count"], 1);
+    assert_eq!(
+      preview["state"]["assets"][0]["source"],
+      json!({"kind": "expri", "input_id": "base-v1"})
+    );
+    assert_eq!(
+      preview["state"]["assets"][0]["producer"],
+      json!({"origin": "worker-1", "run_id": "run-1", "path": "outputs/best.pt"})
+    );
+    assert_eq!(
+      preview["state"]["assets"][0]["availability"],
+      json!({"input_id": "base-v1"})
+    );
+    assert!(!preview.to_string().contains("secret"));
+    assert!(!truncated);
+  }
+
+  #[test]
+  fn asset_preview_is_bounded_even_when_run_metadata_has_many_assets() {
+    let asset = json!({"path": "data/audio.tar.zst", "size": 10, "source": {"kind": "local"}});
+    let record = json!({"state": {"assets": vec![asset; 100]}});
+    let mut truncated = false;
+    let preview = run_metadata(&record, &mut truncated);
+    assert_eq!(preview["state"]["asset_count"], 100);
+    assert_eq!(preview["state"]["assets"].as_array().unwrap().len(), 16);
+    assert!(truncated);
   }
 }

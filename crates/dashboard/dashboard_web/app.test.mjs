@@ -1854,6 +1854,66 @@ test("Storage searches and pages on the server, including a project with no runs
   await settled(() => nodes.document.getElementById("storage-empty")?.textContent.includes("No files match") && !nodes.get("storage-empty").hidden);
 });
 
+test("Storage shows reusable output lineage and copies a deployment-free reference", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  model.model.storage_inputs = [{ input_id: "base-v1", size: 1024,
+    producer: { origin: "worker-1", run_id: "same-run", path: "outputs/best.pt", run_available: true },
+    used_by: [{ origin: "worker-2", run_id: "same-run", path: "models/base.pt" }], used_by_count: 2 }];
+  model.model.storage_outputs = [{ origin: "worker-1", run_id: "same-run", path: "outputs/best.pt", size: 1024,
+    assets: [{ input_id: "base-v1" }], assets_count: 1 }];
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("storage-rows")?.textContent.includes("base-v1"));
+  let row = nodes.get("storage-rows").children[0];
+  const links = [...row.querySelectorAll("a")].filter(link => !link.hasAttribute("download"));
+  assert.deepEqual(links.map(link => Object.fromEntries(new URL(link.href).searchParams)), [
+    { project_id: "vision", origin: "worker-1", run_id: "same-run" },
+    { project_id: "vision", origin: "worker-2", run_id: "same-run" },
+  ], "the producing and consuming run have exact independent machine identities");
+  assert.match(row.textContent, /Showing 1 of 2 uses/);
+  model.model.storage_inputs[0].producer.run_available = false;
+  await click(nodes.get("refresh-storage"));
+  await settled(() => nodes.get("storage-rows").textContent.includes("Producing run is no longer available"));
+  assert.equal(nodes.get("storage-rows").querySelectorAll('a[href*="origin=worker-1"]').length, 0);
+  await click(nodes.get("storage-kind-output"));
+  await settled(() => nodes.get("storage-rows").textContent.includes("outputs/best.pt"));
+  row = nodes.get("storage-rows").children[0];
+  assert.match(row.textContent, /base-v1/);
+  const copied = [];
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => copied.push(text) } });
+  await click(row.querySelector('button[aria-label="Copy reference for outputs/best.pt"]'));
+  assert.deepEqual(copied, ["expri://./worker-1/same-run/outputs/best.pt"]);
+  assert.match(row.textContent, /Reference copied/);
+});
+
+test("run Overview connects consumed assets to their producing run", async t => {
+  const project_runs = projectRuns();
+  const model = await autoFixture(t, { projects: true, project_runs,
+    override: parsed => parsed.pathname === "/api/run" ? response({
+      ...detailRecord({ source_id: "hosted-project:vision", kind: "hosted_project", project_id: "vision" }, project_runs[0], 0.5),
+      state: { assets: [{ path: "models/base.pt", size: 1024, source: { kind: "expri", input_id: "base-v1" },
+        producer: { origin: "worker-1", run_id: "producer-run", path: "outputs/best.pt" } }], asset_count: 20 },
+    }) : null });
+  await inspect(model, 0);
+  await click(model.nodes.get("review-tab-overview"));
+  const panel = model.nodes.get("run-assets-heading").closest("section");
+  assert.match(panel.textContent, /models\/base.pt.*base-v1.*worker-1 \/ producer-run.*outputs\/best.pt/);
+  assert.match(panel.textContent, /Showing 1 input assets/);
+  assert.deepEqual(Object.fromEntries(new URL(panel.querySelector("a").href).searchParams),
+    { project_id: "vision", origin: "worker-1", run_id: "producer-run" });
+  model.model.artifact_files = [{ path: "outputs/new-best.pt", size: 1024, local: null, worker: true, cloud: true,
+    assets: [{ input_id: "new-base-v1" }], assets_count: 1 }];
+  await click(model.nodes.get("review-tab-files"));
+  await settled(() => model.nodes.get("file-rows").textContent.includes("new-base-v1"));
+  const row = model.nodes.get("file-rows").children[0];
+  assert.match(row.textContent, /Reusable as.*new-base-v1/);
+  await click(row.querySelector('button[aria-label="Copy reference for outputs/new-best.pt"]'));
+  const reference = row.querySelector('input[aria-label="Asset reference for outputs/new-best.pt"]');
+  assert.equal(reference.value, "expri://./gpu-a/same-run/outputs/new-best.pt");
+  assert.equal(model.nodes.document.activeElement, reference, "unavailable clipboard falls back to a selected text field");
+  assert.equal(reference.selectionStart, 0);
+  assert.equal(reference.selectionEnd, reference.value.length);
+});
+
 test("Storage revision checks reload a changed visible page but skip unchanged pages", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
   model.model.storage_inputs = [{ input_id: "dataset-v1", size: 8 }];

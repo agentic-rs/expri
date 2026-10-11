@@ -11,6 +11,7 @@ use super::{
   Descriptor, Result, Source, cache_file, check_cancelled, digest, directories, inspect, lease,
   message, open, optional_regular, publish, sync_directory, transfer_directory, verified,
 };
+use crate::{DESCRIPTOR_VERSION, Identity};
 
 const CHECKPOINT_BYTES: u64 = 1024 * 1024;
 const MAX_REDIRECTS: usize = 8;
@@ -57,7 +58,9 @@ pub(super) fn resolve(
       resolve_hugging_face(&client, "https://huggingface.co", source, cancelled)?
     }
     Source::Url { .. } => source.clone(),
-    Source::Expri { .. } => return Err(message("private asset needs the service downloader")),
+    Source::Expri { .. } | Source::Local => {
+      return Err(message("private or local asset needs its source adapter"));
+    }
   };
   let url = source_url(&pinned)?;
   download(repo, &pinned, &url, None, &client, cancelled)
@@ -126,7 +129,9 @@ fn source_url(source: &Source) -> Result<Url> {
   match source {
     Source::Url { url } => Url::parse(url).map_err(|_| message("invalid asset URL")),
     Source::HuggingFace { .. } => hugging_face_url("https://huggingface.co", source),
-    Source::Expri { .. } => Err(message("private asset needs the service downloader")),
+    Source::Expri { .. } | Source::Local => {
+      Err(message("private or local asset needs its source adapter"))
+    }
   }
 }
 
@@ -165,6 +170,8 @@ fn hugging_face_url(endpoint: &str, source: &Source) -> Result<Url> {
 struct Received {
   response: Response,
   commit: Option<String>,
+  sha256: Option<String>,
+  size: Option<u64>,
 }
 
 fn request(
@@ -177,6 +184,8 @@ fn request(
 ) -> Result<Received> {
   let mut url = initial.clone();
   let mut commit = None;
+  let mut sha256 = None;
+  let mut size = None;
   for hop in 0..=MAX_REDIRECTS {
     check_cancelled(cancelled)?;
     validate_url(&url)?;
@@ -209,6 +218,40 @@ fn request(
       }
       commit = Some(value.to_string());
     }
+    if url.origin() == initial.origin() {
+      if let Some(value) = response
+        .headers()
+        .get("x-linked-etag")
+        .and_then(|value| value.to_str().ok())
+      {
+        let value = value.trim_matches('"');
+        if crate::valid_hex(value, 64) {
+          sha256 = Some(value.to_string());
+        }
+      }
+      if let Some(value) = response
+        .headers()
+        .get("x-linked-size")
+        .and_then(|value| value.to_str().ok())
+      {
+        size = Some(
+          value
+            .parse()
+            .map_err(|_| message("asset metadata contains an invalid size"))?,
+        );
+      }
+    }
+    if let Some(value) = response
+      .headers()
+      .get("x-checksum-sha256")
+      .and_then(|value| value.to_str().ok())
+    {
+      let value = value.trim_matches('"');
+      if !crate::valid_hex(value, 64) {
+        return Err(message("asset metadata contains an invalid SHA256"));
+      }
+      sha256 = Some(value.to_string());
+    }
     if matches!(
       response.status(),
       StatusCode::MOVED_PERMANENTLY
@@ -236,9 +279,138 @@ fn request(
       url = next;
       continue;
     }
-    return Ok(Received { response, commit });
+    if size.is_none() {
+      // reqwest describes a HEAD response body's length as zero. The header
+      // describes the selected object's length, which metadata pinning needs.
+      size = if method == Method::HEAD {
+        response
+          .headers()
+          .get(header::CONTENT_LENGTH)
+          .map(|value| {
+            value
+              .to_str()
+              .ok()
+              .and_then(|value| value.parse().ok())
+              .ok_or_else(|| message("asset metadata contains an invalid size"))
+          })
+          .transpose()?
+      } else {
+        response.content_length()
+      };
+    }
+    return Ok(Received {
+      response,
+      commit,
+      sha256,
+      size,
+    });
   }
   Err(message("asset redirect limit exceeded"))
+}
+
+pub(super) fn resolve_metadata(
+  source: &Source,
+  supplied: Option<&Identity>,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Descriptor> {
+  if matches!(source, Source::Url { .. })
+    && let Some(identity) = supplied
+  {
+    return metadata_descriptor(source.clone(), identity.clone());
+  }
+  let client = client()?;
+  resolve_metadata_at(
+    &client,
+    "https://huggingface.co",
+    source,
+    supplied,
+    cancelled,
+  )
+}
+
+fn resolve_metadata_at(
+  client: &Client,
+  endpoint: &str,
+  source: &Source,
+  supplied: Option<&Identity>,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Descriptor> {
+  let mut pinned = source.clone();
+  if let Source::HuggingFace {
+    revision,
+    requested_revision,
+    ..
+  } = &mut pinned
+  {
+    *revision = requested_revision
+      .clone()
+      .unwrap_or_else(|| revision.clone());
+  }
+  let url = match &pinned {
+    Source::HuggingFace { .. } => hugging_face_url(endpoint, &pinned)?,
+    Source::Url { .. } => source_url(&pinned)?,
+    _ => {
+      return Err(message(
+        "asset metadata requires a public URL or Hugging Face source",
+      ));
+    }
+  };
+  let received = request(client, Method::HEAD, &url, None, None, cancelled)?;
+  if !received.response.status().is_success() {
+    return Err(message(format!(
+      "asset metadata lookup returned HTTP {}",
+      received.response.status().as_u16()
+    )));
+  }
+  if let Source::HuggingFace {
+    revision,
+    requested_revision,
+    ..
+  } = &mut pinned
+  {
+    let requested = revision.clone();
+    *revision = received
+      .commit
+      .ok_or_else(|| message("Hugging Face did not identify the file's resolved commit"))?;
+    *requested_revision = Some(requested);
+  }
+  let identity = if let Some(identity) = supplied {
+    if received.size.is_some_and(|size| size != identity.size)
+      || received
+        .sha256
+        .as_ref()
+        .is_some_and(|sha256| sha256 != &identity.sha256)
+    {
+      return Err(message(
+        "asset metadata does not match the supplied SHA256 and size",
+      ));
+    }
+    identity.clone()
+  } else {
+    Identity {
+      size: received.size.ok_or_else(|| {
+        message("metadata-only add requires a known size; supply --size and --sha256")
+      })?,
+      sha256: received.sha256.ok_or_else(|| {
+        message("metadata-only add requires a known SHA256; supply --sha256 and --size")
+      })?,
+    }
+  };
+  metadata_descriptor(pinned, identity)
+}
+
+fn metadata_descriptor(source: Source, identity: Identity) -> Result<Descriptor> {
+  identity.validate()?;
+  let descriptor = Descriptor {
+    version: DESCRIPTOR_VERSION,
+    source,
+    size: identity.size,
+    sha256: identity.sha256,
+    availability: None,
+    producer: None,
+  };
+  descriptor.validate()?;
+  Ok(descriptor)
 }
 
 fn validate_url(url: &Url) -> Result<()> {
@@ -435,10 +607,12 @@ fn download(
   }
   let (size, sha256) = digest(&path, cancelled)?;
   let descriptor = Descriptor {
-    version: 1,
+    version: DESCRIPTOR_VERSION,
     source: source.clone(),
     size,
     sha256,
+    availability: None,
+    producer: None,
   };
   descriptor.validate()?;
   if let Some(expected) = expected
@@ -702,6 +876,82 @@ mod tests {
         .as_str(),
       "https://huggingface.co/datasets/owner/data/resolve/refs%2Fpr%2F12/folder/my%20data.parquet"
     );
+  }
+
+  #[test]
+  fn hugging_face_metadata_only_add_pins_commit_and_lfs_identity_through_head() {
+    let digest = "b".repeat(64);
+    let checksum = digest.clone();
+    let commit = "a".repeat(40);
+    let resolved = commit.clone();
+    let mut mock = Mock::start(vec![
+      Box::new(move |request| {
+        assert!(request.starts_with("HEAD /owner/model/resolve/main/weights/model.bin "));
+        response(
+          "302 Found",
+          &format!(
+            "Content-Length: 0\r\nX-Repo-Commit: {resolved}\r\nX-Linked-ETag: \"{checksum}\"\r\nX-Linked-Size: 12345\r\nLocation: /object?signature=temporary-secret\r\n"
+          ),
+          b"",
+        )
+      }),
+      Box::new(|request| {
+        assert!(request.starts_with("HEAD /object?signature=temporary-secret "));
+        response("200 OK", "Content-Length: 12345\r\n", b"")
+      }),
+    ]);
+    let actual = resolve_metadata_at(
+      &client().unwrap(),
+      &mock.url,
+      &hf_source("main", None),
+      None,
+      &mut || Ok(false),
+    )
+    .unwrap();
+    assert_eq!(actual.source, hf_source(&commit, Some("main")));
+    assert_eq!(actual.sha256, digest);
+    assert_eq!(actual.size, 12345);
+    assert!(
+      !toml::to_string(&actual)
+        .unwrap()
+        .contains("temporary-secret")
+    );
+    assert_eq!(mock.finish().len(), 2);
+  }
+
+  #[test]
+  fn hugging_face_git_etag_requires_supplied_sha256_and_rejects_wrong_size() {
+    for (supplied, valid) in [(None, false), (Some(10), true), (Some(11), false)] {
+      let mut mock = Mock::start(vec![Box::new(|request| {
+        assert!(request.starts_with("HEAD "));
+        response(
+          "200 OK",
+          &format!(
+            "Content-Length: 10\r\nX-Repo-Commit: {}\r\nETag: \"{}\"\r\n",
+            "a".repeat(40),
+            "b".repeat(40),
+          ),
+          b"",
+        )
+      })]);
+      let identity = supplied.map(|size| Identity {
+        size,
+        sha256: "c".repeat(64),
+      });
+      let result = resolve_metadata_at(
+        &client().unwrap(),
+        &mock.url,
+        &hf_source("main", None),
+        identity.as_ref(),
+        &mut || Ok(false),
+      );
+      assert_eq!(result.is_ok(), valid);
+      if let Ok(descriptor) = result {
+        assert_eq!(descriptor.sha256, "c".repeat(64));
+        assert_eq!(descriptor.source, hf_source(&"a".repeat(40), Some("main")));
+      }
+      assert_eq!(mock.finish().len(), 1);
+    }
   }
 
   #[test]

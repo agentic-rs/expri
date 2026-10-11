@@ -137,6 +137,8 @@ export type ArtifactFile = {
   downloaded?: boolean | null;
   labels?: string[];
   labels_pending?: boolean;
+  assets?: { input_id: string }[];
+  assets_count?: number;
 };
 export type ArtifactCatalog = {
   source: Source;

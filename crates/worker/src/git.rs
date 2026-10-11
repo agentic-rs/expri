@@ -83,6 +83,7 @@ pub fn nearest_remote_url(repo_root: &Path, head: &str) -> Result<Option<RemoteC
 }
 
 pub fn build_source_bundle(repo_root: &Path, base_commit: Option<&str>) -> Result<SourceBundle> {
+  reject_tracked_assets(repo_root)?;
   let temp_dir = tempfile::Builder::new().prefix("expri-source-").tempdir()?;
   let path = temp_dir.path().join("source.bundle");
   let refspec = match base_commit {
@@ -222,6 +223,11 @@ pub fn reject_tracked_assets(repo_root: &Path) -> Result<()> {
     .filter(|value| !value.is_empty())
   {
     let path = path_from_git(value)?;
+    if path == Path::new(".expri/config.toml") {
+      return Err(ExpriError::Message(
+        "private expri configuration is tracked by Git: .expri/config.toml; remove it from Git tracking before pushing source".into(),
+      ));
+    }
     if path.components().any(|component| {
       matches!(component, std::path::Component::Normal(name) if name.to_string_lossy().starts_with(crate::filter::ASSET_STAGING_PREFIX))
     }) {
@@ -431,6 +437,36 @@ mod asset_tests {
         .contains("data.bin")
     );
     git_capture(root.path(), ["rm", "--cached", "data.bin"]).unwrap();
+    assert!(reject_tracked_assets(root.path()).is_ok());
+  }
+
+  #[test]
+  fn tracked_private_config_is_rejected_without_assets_before_git_bundle_creation() {
+    let root = repository();
+    fs::create_dir(root.path().join(".expri")).unwrap();
+    let config = root.path().join(".expri/config.toml");
+    fs::write(
+      &config,
+      "url='https://example.net'\nproject_id='example-project'\ntoken_env='EXPRI_TOKEN'\n",
+    )
+    .unwrap();
+    commit(root.path());
+    let rules = SyncRules::new(vec![], vec![], vec![".expri/config.toml".into()], vec![]).unwrap();
+    assert!(
+      !source_paths(root.path(), &rules)
+        .unwrap()
+        .contains(&PathBuf::from(".expri/config.toml"))
+    );
+    fs::write(&config, "changed private configuration").unwrap();
+    assert!(dirty_paths(root.path(), &rules).unwrap().files.is_empty());
+    let error = reject_tracked_assets(root.path()).unwrap_err().to_string();
+    assert!(error.contains("private expri configuration"));
+    assert!(error.contains(".expri/config.toml"));
+    assert!(build_source_bundle(root.path(), None).is_err());
+    // A deleted workspace file remains tracked and must still block bundling.
+    fs::remove_file(&config).unwrap();
+    assert!(reject_tracked_assets(root.path()).is_err());
+    git_capture(root.path(), ["rm", "--cached", ".expri/config.toml"]).unwrap();
     assert!(reject_tracked_assets(root.path()).is_ok());
   }
 

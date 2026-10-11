@@ -88,6 +88,16 @@ It checks immutable private inputs, automatic worker input provisioning and
 offline cache reuse, upload recovery, continuous selected checkpoint downloads,
 and offline review without shared project directories or published ports.
 
+The reusable-assets phase exercises `assets add --no-download` against private
+input metadata, confirms the workspace file stays absent, adopts and uploads a
+local file, and imports a finalized checkpoint with producing-run provenance.
+Repeating import/upload reuses the registered asset; the imported checkpoint
+creates no second S3 object. Only the portable sidecars cross to a fresh worker
+checkout, whose ignored `.expri/config.toml` supplies its private service context.
+The worker downloads all three assets, and the hosted Storage API exposes the
+imported output's producer. Public URL/Hugging Face metadata resolution, local
+file updates, status checks, and failure guards have separate Rust tests.
+
 The self-hosted workflow reports named phases for image builds, fixture startup,
 transfer recovery, and browser checks. A heartbeat every 20 seconds names the
 active phase and its elapsed time while commands or waits are still running.
