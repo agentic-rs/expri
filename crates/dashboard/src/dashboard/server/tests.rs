@@ -203,7 +203,7 @@ fn http_response_headers_are_bounded_and_head_omits_the_body() {
     Reply::bytes("text/html; charset=utf-8", vec![b'x'; HTML_LIMIT + 1]),
     413,
   );
-  let mut writer = LimitedWriter(Vec::new());
+  let mut writer = LimitedWriter(Vec::new(), JSON_LIMIT);
   writer.write_all(&vec![b'x'; JSON_LIMIT]).unwrap();
   assert!(writer.write_all(b"x").is_err());
   assert_eq!(writer.0.len(), JSON_LIMIT);
@@ -215,4 +215,28 @@ fn service_failures_return_json_error_statuses() {
     service_error(std::io::Error::other("read failure").into()),
     500,
   );
+}
+
+#[test]
+fn chart_data_has_its_own_bounded_json_budget_without_frame_markup() {
+  let mut data = crate::metric_charts::ChartData {
+    schema_version: 1,
+    x_axis: ChartXAxis::Step,
+    runs: Vec::new(),
+    plots: Vec::new(),
+    warnings: Vec::new(),
+    warnings_truncated: false,
+    parameter_rows: Vec::new(),
+    parameters_truncated: false,
+  };
+  data.runs.push("x".repeat(JSON_LIMIT));
+  let reply = Reply::chart_data(data.clone());
+  assert_eq!(reply.status, 200);
+  assert_eq!(reply.content_type, "application/json; charset=utf-8");
+  assert!(!reply.chart);
+  assert!(reply.body.len() > JSON_LIMIT && reply.body.len() < HTML_LIMIT);
+  assert!(serde_json::from_slice::<Value>(&reply.body).is_ok());
+  data.runs[0] = "x".repeat(HTML_LIMIT);
+  assert_error(Reply::chart_data(data), 413);
+  assert_error(Reply::json(json!({"large":"x".repeat(JSON_LIMIT)})), 413);
 }

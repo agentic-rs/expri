@@ -2,6 +2,59 @@ use super::*;
 use crate::config::Config;
 
 #[test]
+fn local_chart_data_endpoint_matches_standalone_selection_and_preserves_steps() {
+  let fixture = Fixture::new();
+  let run = fixture.run("run-a");
+  fs::write(
+    run.join("outputs/metrics.jsonl"),
+    format!(
+      "{}\n{}\n",
+      json!({"step":u64::MAX,"timestamp":"2026-10-03T01:00:00Z","metrics":{"loss":3}}),
+      json!({"step":u64::MAX-1,"timestamp":"2026-10-03T01:00:00.000000001Z","metrics":{"loss":1}})
+    ),
+  )
+  .unwrap();
+  let reply = server::route_content(
+    &fixture.dashboard,
+    "/api/chart-data?source=local&run_id=run-a&metric=loss&x_axis=elapsed",
+  );
+  assert_eq!(reply.status, 200);
+  assert_eq!(reply.content_type, "application/json; charset=utf-8");
+  assert!(!reply.chart);
+  let data: Value = serde_json::from_slice(&reply.body).unwrap();
+  assert_eq!(
+    data["plots"][0]["series"][0]["points"][0]["step"],
+    u64::MAX.to_string()
+  );
+  assert_eq!(data["plots"][0]["series"][0]["points"][1]["x_value"], "1");
+  assert_eq!(data["plots"][0]["series"][0]["summary"]["count"], 2);
+  let html = server::route_content(
+    &fixture.dashboard,
+    "/api/chart?source=local&run_id=run-a&metric=loss&x_axis=elapsed",
+  );
+  assert_eq!(html.status, 200);
+  assert!(html.chart);
+  assert!(String::from_utf8(html.body).unwrap().contains("<svg "));
+  for query in [
+    "run_id=run-a&x_axis=unknown",
+    "run_id=run-a&metric=missing",
+    "run_id=run-a&unexpected=1",
+    "run_id=run-a&run_id=run-a",
+    "",
+  ] {
+    assert_eq!(
+      server::route_content(
+        &fixture.dashboard,
+        &format!("/api/chart-data?source=local&{query}")
+      )
+      .status,
+      400,
+      "{query}"
+    );
+  }
+}
+
+#[test]
 fn local_scalar_cache_refreshes_appended_metrics_and_replaced_parameter_files() {
   use std::io::Write;
   let fixture = Fixture::new();

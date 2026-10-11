@@ -522,11 +522,13 @@ Browser responses stay bounded: details preview large parameters and metadata,
 show up to 50 metric summaries, and omit package/source-file inventories. Log
 tails read at most 64 KiB and 1,000 lines. Charts initially show four metrics;
 enter up to six exact metric names to choose others. Curves retain extrema with
-at most 600 points per run/metric and 4,800 points across the chart. JSON responses
-are capped at 512 KiB and charts at 2 MiB; an oversized response reports an error
-so you can narrow the selection. Original artifacts stay intact. Summary tables
-do not retain point arrays; chart reads retain the existing 128 MiB file and
-1,000,000 selected-point limits.
+at most 600 points per run/metric and 4,800 points across the chart. Chart previews
+use bounded JSON rendered in the dashboard, with exact step/time coordinates
+carried as decimal strings. Chart JSON and standalone HTML reports are capped
+at 2 MiB; other JSON responses are capped at 512 KiB. An oversized response
+reports an error so you can narrow the selection. Original artifacts stay
+intact. Summary tables do not retain point arrays; chart reads retain the
+existing 128 MiB file and 1,000,000 selected-point limits.
 
 The dashboard uses React and TypeScript with TSX components. Esbuild bundles the
 UI into one JavaScript asset embedded in the Rust binary, so viewing runs requires
@@ -542,7 +544,9 @@ pnpm --dir crates/dashboard/dashboard_web build
 Commit the generated `crates/dashboard/dashboard_web/app.js` with its
 TypeScript and TSX source.
 The controller owns requests and refresh scheduling; React owns the workspace
-UI, while the chart controller keeps its stable iframe and interactive state.
+and chart markup, while the chart controller keeps interactive state in a stable
+preview container. **Open chart** retains the standalone HTML report for sharing
+and offline review.
 Frontend tests use jsdom, and container acceptance tests exercise the production
 bundle in Firefox. CI checks that rebuilding produces the checked-in asset.
 

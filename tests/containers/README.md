@@ -143,7 +143,7 @@ pixels; extra columns scroll inside it. Below 860 CSS pixels, the panels stack
 and the table scrolls without extending the page.
 The isolated Firefox driver removes its desktop window's 500px minimum before
 the mobile checks and asserts the resulting page viewport. It changes no page
-markup, authentication rules, iframe sandbox, or content security policy.
+markup, authentication rules, or content security policy.
 
 The project workflow publishes an active run from a second recorded origin using
 a distinct worker token, preserving the first origin's actual run ID. It checks
@@ -184,8 +184,20 @@ Native pointer and keyboard input also checks exact hover readouts, drag zoom,
 zoom/reset controls, and per-run legend toggles on both dashboard hosts. Repeated
 samples stay individually reachable. Changed previews remove the old chart
 handlers; unchanged Refresh retains their controls. Interaction does not fetch
-more metric data. Chart scripts remain blocked.
+more metric data. The preview renders JSON in the dashboard's stable container;
+its CSP blocks injected inline scripts and event handlers. The separate **Open
+chart** HTML report retains its script-blocking CSP.
 Hover and zoom screenshots are included in the CI diagnostics.
+
+A separate long-run fixture records 20,000 samples for each of two metrics,
+starting above JavaScript's largest exact integer. It checks full-series
+summaries, exact decimal coordinates, at most 600 points per run/metric and
+4,800 total, and a smaller JSON payload than the standalone HTML report. Logs
+record payload bytes, retained points, and request durations without a timing
+threshold. Firefox confirms bounded rendered points, literal metric/parameter
+text, exact keyboard readouts and native zoom, and no static-report request or
+additional data fetch during exploration. `workspace-chart-data.png` and
+`browser-chart-data.log` retain the browser evidence.
 
 Time-axis checks on both dashboard hosts cover elapsed and date & time hover,
 native drag zoom, single-click axis tags, native radio keyboard navigation, and

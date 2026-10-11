@@ -26,18 +26,18 @@ function deferred() {
   return { promise, resolve, reject };
 }
 function response(value, status = 200) {
-  return { ok: status >= 200 && status < 300, status, json: async () => value };
+  return { ok: status >= 200 && status < 300, status, json: async () => value, text: async () => JSON.stringify(value) };
 }
 
 test("URL encoding preserves source labels and exact metric names", () => {
-  const url = new URL(apiUrl("/api/chart", {
+  const url = new URL(apiUrl("/api/chart-data", {
     source: "cached:gpu rental & #1",
     run_id: ["run-a", "run-b"],
     metric: ["loss&run_id=outside", "validation/loss + λ"],
     ignored: null,
     empty: "",
   }), "http://127.0.0.1:8765");
-  assert.equal(url.pathname, "/api/chart");
+  assert.equal(url.pathname, "/api/chart-data");
   assert.equal(url.searchParams.get("source"), "cached:gpu rental & #1");
   assert.deepEqual(url.searchParams.getAll("run_id"), ["run-a", "run-b"]);
   assert.deepEqual(url.searchParams.getAll("metric"), ["loss&run_id=outside", "validation/loss + λ"]);
@@ -89,7 +89,7 @@ test("current server errors remain actionable", async t => {
   const original_fetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = original_fetch; });
   globalThis.fetch = async () => response({ error: "Chart exceeds the 2 MiB size limit; select fewer metrics." }, 413);
-  await assert.rejects(new RequestLane().run("/api/chart"), /select fewer metrics/);
+  await assert.rejects(new RequestLane().run("/api/chart-data"), /select fewer metrics/);
 });
 
 test("expired sessions navigate to login before parsing the response body", async t => {
@@ -124,14 +124,14 @@ function dashboard(t, url = "http://localhost/") {
   const dom = new JSDOM(html, { url, pretendToBeVisual: true });
   const restore = installWindow(dom.window);
   let navigation_count = 0;
-  const record = records => { navigation_count += records.filter(item => item.type === "attributes" && item.target.id === "chart-frame").length; };
+  const record = records => { navigation_count += records.filter(item => item.type === "childList" && [...item.addedNodes].some(node => node.id === "chart-preview")).length; };
   const observer = new dom.window.MutationObserver(record);
-  observer.observe(dom.window.document.body, { subtree: true, attributes: true, attributeFilter: ["src"] });
+  observer.observe(dom.window.document.body, { subtree: true, childList: true });
   const nodes = {
     document: dom.window.document,
     cleanup: null,
     get(id) { const node = dom.window.document.getElementById(id); assert.ok(node, `Missing rendered element: ${id}`); return node; },
-    navigationCount() { record(observer.takeRecords()); return navigation_count; },
+    previewMountCount() { record(observer.takeRecords()); return navigation_count; },
   };
   t.after(async () => {
     if (nodes.cleanup) await act(async () => { nodes.cleanup(); await microtasks(); });
@@ -158,7 +158,7 @@ function setValue(node, value) {
   const prototype = node.ownerDocument.defaultView[node.tagName === "SELECT" ? "HTMLSelectElement" : "HTMLInputElement"].prototype;
   Object.getOwnPropertyDescriptor(prototype, "value").set.call(node, value);
 }
-function frameNavigations(nodes) { return nodes.navigationCount(); }
+function previewMounts(nodes) { return nodes.previewMountCount(); }
 
 async function settled(predicate) {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -176,6 +176,22 @@ function detailRecord(source, run, value = 0.5) {
   return { source, run, state: { command: "python train.py" }, snapshot: null, environment: null, cache: null, params: { learning_rate: 0.1 }, params_truncated: false, metadata_truncated: false, metrics: { accuracy: metric, loss: metric }, metric_count: 2, metrics_truncated: false, metrics_error: null, warnings: [] };
 }
 
+function chartData(label, query) {
+  const x_axis = query.get("x_axis") ?? "step", runs = query.getAll("run_id");
+  const start = BigInt(Date.parse("2026-10-03T01:00:00Z")) * 1_000_000n;
+  const point = (step, value) => ({ step: String(step), value,
+    timestamp: step === 0 ? "2026-10-03T01:00:00Z" : "2026-10-03T01:00:01Z",
+    x_value: String(x_axis === "step" ? BigInt(step) : x_axis === "elapsed" ? BigInt(step) * 1_000_000_000n : start + BigInt(step) * 1_000_000_000n),
+  });
+  const points = [point(0, 1), point(1, 0.5)];
+  const names = query.getAll("metric").length ? query.getAll("metric") : ["accuracy", "loss"];
+  return { schema_version: 1, x_axis, runs, plots: names.map(metric_name => ({ metric_name,
+    domain: { x_min: points[0].x_value, x_max: points[1].x_value, value_min: 0.5, value_max: 1 },
+    series: runs.map((_, index) => ({ run_index: index + 1,
+      summary: { count: 2, missing_timestamp_count: 0, last: points[1], min: points[1], max: points[0] }, points })),
+  })), warnings: [{ run_index: 1, message: label }], warnings_truncated: false, parameter_rows: [], parameters_truncated: false };
+}
+
 async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null } = {}) {
   const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
@@ -184,7 +200,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
   const project_sources = [{ source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] }];
-  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_html: "<html>chart-1</html>", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
+  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_label: "chart-1", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -265,7 +281,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       return response({ source, run_id: selected_run?.run_id ?? query.get("run_id"), ...(selected_run?.run_key ? {run_key: selected_run.run_key} : {}), files: model.artifact_files.map(file => ({ ...file, download_url: file.download_url === undefined ? (file.local === true || file.cloud === true ? apiUrl("/api/artifact", { source: source.source_id, run_id: query.get("run_id"), path: file.path }) : null) : file.download_url })), truncated: model.artifact_truncated, warnings: model.artifact_warnings, pull_scope: hosted ? { project_id: source.project_id ?? "test-project", origin: selected_run?.origin ?? source.origin ?? "test-worker", run_id: selected_run?.run_id ?? query.get("run_id") } : null, inventory_recorded_at: "2026-10-07T01:02:03Z" });
     }
     if (parsed.pathname === "/api/log") return response({ content: model.logs[query.get("stream")] ?? `${query.get("stream")} training complete${source.kind === "hosted_project" ? ` ${query.get("run_id")}` : ""}`, stream: query.get("stream"), missing: false, truncated: false });
-    if (parsed.pathname === "/api/chart") return { ok: true, status: 200, text: async () => model.chart_html };
+    if (parsed.pathname === "/api/chart-data") return response(chartData(model.chart_label, query));
     if (parsed.pathname === "/api/compare") {
       const metric_names = query.getAll("metric").length ? query.getAll("metric") : ["accuracy", "loss"];
       return response({ source, comparison: { reduction: query.get("reduction"), metric_names, runs: query.getAll("run_id").map(run_id => ({ run_id, run: runs.find(item => runIdentity(item) === run_id), values: Object.fromEntries(metric_names.map(name => [name, metric.last])) })), warnings: [] } });
@@ -313,8 +329,11 @@ function metricCheckbox(nodes, name) {
   const label = [...nodes.get("run-metric-options").querySelectorAll("label.metric-choice")].find(item => item.textContent === name);
   assert.ok(label, `Missing metric control: ${name}`); return label.querySelector("input");
 }
+function chartSource(nodes) {
+  return nodes.get("chart-card").hidden ? "" : nodes.get("open-chart").getAttribute("href") ?? "";
+}
 function chartQuery(nodes) {
-  return new URL(nodes.get("chart-frame").src || "/", "http://localhost").searchParams;
+  return new URL(chartSource(nodes) || "/", "http://localhost").searchParams;
 }
 function comparisonRows(nodes) {
   return nodes.get("comparison-values").querySelectorAll("tbody tr");
@@ -405,8 +424,8 @@ test("columns and server sorting preserve the selected run, chart settings and i
   await chooseAxis(nodes, "elapsed");
   await click(nodes.get("review-tab-logs"));
   await settled(() => text(nodes.get("run-logs")).includes("stdout training complete"));
-  const chart_url = nodes.get("chart-frame").src;
-  const chart_count = requestCounts(model.requests)["/api/chart"];
+  const chart_url = chartSource(nodes);
+  const chart_count = requestCounts(model.requests)["/api/chart-data"];
   await openColumns(nodes);
   await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
   await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
@@ -431,8 +450,8 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(latestRunQuery(model).get("reduction"), "min");
   assert.equal(runCheckbox(nodes, 0).checked, true);
   assert.equal(nodes.get("review-tab-logs").getAttribute("aria-selected"), "true");
-  assert.equal(nodes.get("chart-frame").src, chart_url);
-  assert.equal(requestCounts(model.requests)["/api/chart"], chart_count, "table changes do not refetch the chart");
+  assert.equal(chartSource(nodes), chart_url);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], chart_count, "table changes do not refetch the chart");
   await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
   assert.equal(latestRunQuery(model).has("sort"), false, "removing the active column restores newest first");
   assert.equal(latestRunQuery(model).has("metric"), false);
@@ -777,7 +796,7 @@ class RefreshClock {
 }
 async function autoFixture(t, fields = {}) {
   const clock = new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [], time_zones: [], disposals: 0 };
-  const controller = { dispose() { chart.disposals++; }, setTimeZone: value => chart.time_zones.push(value), isInteracting: () => chart.interacting, previewStatus: () => chart.status, replacePreview: html => { if (!chart.ready) return false; chart.previews.push(html); return true; } };
+  const controller = { dispose() { chart.disposals++; }, setTimeZone: value => chart.time_zones.push(value), isInteracting: () => chart.interacting, previewStatus: () => chart.status, clear() { chart.status = "invalid"; }, replacePreview: data => { if (!chart.ready) return false; chart.status = "ready"; chart.previews.push(data.warnings[0]?.message ?? "chart"); return true; } };
   const model = await reviewFixture(t, { hosted: true, updates: true, ...fields, refresh_clock: clock, chart_controller: controller });
   return { ...model, model, clock, chart, page_document: globalThis.document };
 }
@@ -790,20 +809,21 @@ function requestCounts(requests) {
   return requests.reduce((counts, url) => { const path = new URL(url, "http://localhost").pathname; counts[path] = (counts[path] ?? 0) + 1; return counts; }, {});
 }
 
-test("React retains the actual chart iframe across reviews, tags, tabs and refresh", async t => {
+test("React retains the actual chart container across reviews, tags, tabs and refresh", async t => {
   const model = await autoFixture(t), { nodes } = model;
-  const frame = nodes.get("chart-frame");
+  const frame = nodes.get("chart-preview");
   const assert_stable = () => {
-    assert.equal(nodes.get("chart-frame"), frame, "state updates must not remount the chart iframe");
+    assert.equal(nodes.get("chart-preview"), frame, "state updates must not remount the chart container");
     assert.equal(frame.isConnected, true);
-    assert.equal(frame.getAttribute("sandbox"), "allow-same-origin");
+    assert.equal(frame.tagName, "DIV");
+    assert.equal(nodes.document.querySelector("iframe"), null);
   };
   await inspect(model); assert_stable(); await model.clock.advance(5_000);
-  const document = frame.contentDocument, writes = frameNavigations(nodes);
+  const document = frame.ownerDocument, writes = previewMounts(nodes);
   await chooseAxis(nodes, "wall_clock"); assert_stable();
   await chooseTimeZone(nodes, "utc"); assert_stable();
-  assert.equal(frame.contentDocument, document, "axis and timezone controls retain the existing chart security context");
-  assert.equal(frameNavigations(nodes), writes);
+  assert.equal(frame.ownerDocument, document, "axis and timezone controls retain the chart document");
+  assert.equal(previewMounts(nodes), writes);
   await click(nodes.get("review-tab-overview")); assert_stable();
   await click(nodes.get("refresh-button")); assert_stable();
   await click(nodes.get("review-tab-charts"));
@@ -833,7 +853,7 @@ test("unmount aborts foreground requests, removes React content and disposes the
   pending.resolve(response(detailRecord(model.sources[0], model.runs[0])));
   await flush(); await model.clock.advance(60_000); await click(button);
   assert.equal(model.requests.length, count, "late responses and detached controls must not restart work after unmount");
-  assert.equal(model.nodes.document.getElementById("chart-frame"), null);
+  assert.equal(model.nodes.document.getElementById("chart-preview"), null);
 });
 
 test("unmount cancels an outstanding automatic probe and every scheduled refresh", async t => {
@@ -859,14 +879,14 @@ test("unmount cancels an outstanding automatic probe and every scheduled refresh
 test("auto checks settle into probe-only traffic without rebuilding controls or navigating the chart", async t => {
   const model = await autoFixture(t); await inspect(model);
   const { nodes, clock, chart, requests } = model;
-  await clock.advance(5_000); // Establish a safe baseline after the initial iframe navigation.
-  const counts = requestCounts(requests), frame_writes = frameNavigations(nodes);
+  await clock.advance(5_000); // Establish the initial update revision baseline.
+  const counts = requestCounts(requests), frame_writes = previewMounts(nodes);
   const choices = nodes.get("run-metric-options").children[0], overview = nodes.get("run-detail").children[0];
   const checkbox = choices.children[0].children[0]; checkbox.focus();
   await clock.advance(15_000);
   assert.equal(requestCounts(requests)["/api/updates"], counts["/api/updates"] + 3);
-  for (const path of ["/api/catalog", "/api/runs", "/api/run", "/api/chart"]) assert.equal(requestCounts(requests)[path], counts[path], path);
-  assert.equal(frameNavigations(nodes), frame_writes);
+  for (const path of ["/api/catalog", "/api/runs", "/api/run", "/api/chart-data"]) assert.equal(requestCounts(requests)[path], counts[path], path);
+  assert.equal(previewMounts(nodes), frame_writes);
   assert.equal(nodes.get("run-metric-options").children[0], choices);
   assert.equal(nodes.get("run-detail").children[0], overview);
   assert.equal(globalThis.document.activeElement, checkbox);
@@ -916,34 +936,34 @@ test("changed metrics update only the active run and chart while preserving the 
   await click(accuracy);
   await model.clock.advance(5_000);
   const counts = requestCounts(model.requests), choices = model.nodes.get("run-metric-options").children[0];
-  const writes = frameNavigations(model.nodes);
-  model.model.metrics_revision = "metrics-2"; model.model.metric_value = 0.125; model.model.chart_html = "<html>chart-2</html>";
+  const writes = previewMounts(model.nodes);
+  model.model.metrics_revision = "metrics-2"; model.model.metric_value = 0.125; model.model.chart_label = "chart-2";
   await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"] + 1);
-  assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"] + 1);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"] + 1);
   for (const path of ["/api/catalog", "/api/runs", "/api/log"]) assert.equal(requestCounts(model.requests)[path], counts[path]);
   assert.equal(model.nodes.get("run-metric-options").children[0], choices);
   assert.deepEqual(chartQuery(model.nodes).getAll("metric"), ["loss"]);
-  assert.equal(frameNavigations(model.nodes), writes);
-  assert.equal(model.chart.previews.at(-1), "<html>chart-2</html>");
+  assert.equal(previewMounts(model.nodes), writes);
+  assert.equal(model.chart.previews.at(-1), "chart-2");
   assert.match(text(model.nodes.get("run-detail")), /0\.125/);
 });
 
 test("time-axis changes replace the preview in place and remain selected for incremental updates", async t => {
   const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  const writes = frameNavigations(model.nodes);
-  model.model.chart_html = "<html>elapsed-chart</html>";
+  const writes = previewMounts(model.nodes);
+  model.model.chart_label = "elapsed-chart";
   await chooseAxis(model.nodes, "elapsed");
-  await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
-  assert.equal(frameNavigations(model.nodes), writes, "axis switching preserves the iframe and its visibility state");
+  await settled(() => model.chart.previews.at(-1) === "elapsed-chart");
+  assert.equal(previewMounts(model.nodes), writes, "axis switching preserves the chart container and its visibility state");
   assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
   assert.equal(new URL(model.nodes.get("open-chart").href, "http://localhost").searchParams.get("x_axis"), "elapsed");
-  model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>elapsed-chart-updated</html>";
+  model.model.metrics_revision = "metrics-2"; model.model.chart_label = "elapsed-chart-updated";
   await model.clock.advance(5_000);
-  assert.equal(model.chart.previews.at(-1), "<html>elapsed-chart-updated</html>");
-  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/chart")).at(-1), "http://localhost").searchParams.get("x_axis"), "elapsed");
+  assert.equal(model.chart.previews.at(-1), "elapsed-chart-updated");
+  assert.equal(new URL(model.requests.filter(url => url.startsWith("/api/chart-data")).at(-1), "http://localhost").searchParams.get("x_axis"), "elapsed");
   assert.equal(selectedAxis(model.nodes), "elapsed");
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
 });
 
 test("timezone tags redraw locally without requests and persist across axes and refresh", async t => {
@@ -951,7 +971,7 @@ test("timezone tags redraw locally without requests and persist across axes and 
   assert.deepEqual(model.chart.time_zones, ["local"], "date & time defaults to the viewer’s timezone");
   await chooseAxis(model.nodes, "wall_clock");
   await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
-  const requests = model.requests.length, writes = frameNavigations(model.nodes), previews = [...model.chart.previews];
+  const requests = model.requests.length, writes = previewMounts(model.nodes), previews = [...model.chart.previews];
   model.nodes.get("time-zone-utc").focus(); await chooseTimeZone(model.nodes, "utc");
   assert.deepEqual(model.chart.time_zones, ["local", "utc"]);
   assert.equal(model.nodes.get("time-zone-utc").checked, true);
@@ -959,7 +979,7 @@ test("timezone tags redraw locally without requests and persist across axes and 
   assert.equal(model.nodes.get("time-zone-label").textContent, "UTC");
   assert.match(model.nodes.get("chart-note").textContent, /Recorded date & time in UTC/);
   assert.equal(model.requests.length, requests, "timezone is a display choice and does not refetch the chart");
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
   assert.deepEqual(model.chart.previews, previews);
   assert.equal(globalThis.document.activeElement, model.nodes.get("time-zone-utc"));
   await chooseTimeZone(model.nodes, "utc");
@@ -971,9 +991,9 @@ test("timezone tags redraw locally without requests and persist across axes and 
   await chooseAxis(model.nodes, "wall_clock");
   await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
   assert.equal(model.nodes.get("time-zone-utc").checked, true);
-  model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>utc-updated-chart</html>";
+  model.model.metrics_revision = "metrics-2"; model.model.chart_label = "utc-updated-chart";
   await model.clock.advance(5_000);
-  assert.equal(model.chart.previews.at(-1), "<html>utc-updated-chart</html>");
+  assert.equal(model.chart.previews.at(-1), "utc-updated-chart");
   assert.equal(model.nodes.get("time-zone-utc").checked, true);
   assert.equal(selectedAxis(model.nodes), "wall_clock");
   await chooseTimeZone(model.nodes, "local");
@@ -985,43 +1005,43 @@ test("late axis responses cannot replace a newer choice or review", async t => {
   const model = await autoFixture(t); await inspect(model);
   const pending = deferred(), signals = [];
   model.model.override = (parsed, options) => {
-    if (parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed") {
+    if (parsed.pathname === "/api/chart-data" && parsed.searchParams.get("x_axis") === "elapsed") {
       signals.push(options.signal); return pending.promise;
     }
   };
   await chooseAxis(model.nodes, "elapsed");
   assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "true");
-  model.model.chart_html = "<html>wall-clock-chart</html>";
+  model.model.chart_label = "wall-clock-chart";
   await chooseAxis(model.nodes, "wall_clock");
-  await settled(() => model.chart.previews.at(-1) === "<html>wall-clock-chart</html>");
+  await settled(() => model.chart.previews.at(-1) === "wall-clock-chart");
   assert.equal(signals[0].aborted, true);
-  pending.resolve({ ok: true, status: 200, text: async () => "<html>stale-elapsed-chart</html>" });
+  pending.resolve({ ok: true, status: 200, text: async () => "stale-elapsed-chart" });
   await flush();
-  assert.equal(model.chart.previews.at(-1), "<html>wall-clock-chart</html>");
+  assert.equal(model.chart.previews.at(-1), "wall-clock-chart");
   assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
   const next = deferred();
-  model.model.override = parsed => parsed.pathname === "/api/chart" && parsed.searchParams.get("x_axis") === "elapsed" ? next.promise : null;
+  model.model.override = parsed => parsed.pathname === "/api/chart-data" && parsed.searchParams.get("x_axis") === "elapsed" ? next.promise : null;
   await chooseAxis(model.nodes, "elapsed");
   await click(runButton(model.nodes, 1));
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-1");
-  next.resolve({ ok: true, status: 200, text: async () => "<html>old-review-chart</html>" });
+  next.resolve({ ok: true, status: 200, text: async () => "old-review-chart" });
   await flush();
-  assert.equal(model.chart.previews.includes("<html>old-review-chart</html>"), false);
+  assert.equal(model.chart.previews.includes("old-review-chart"), false);
   assert.equal(chartQuery(model.nodes).get("x_axis"), "elapsed");
 });
 
 test("an axis load failure retains the last chart and automatic recovery clears its scoped error", async t => {
   const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  const previews = [...model.chart.previews], writes = frameNavigations(model.nodes);
-  model.model.override = parsed => parsed.pathname === "/api/chart" ? response({ error: "Connection temporarily unavailable" }, 503) : null;
+  const previews = [...model.chart.previews], writes = previewMounts(model.nodes);
+  model.model.override = parsed => parsed.pathname === "/api/chart-data" ? response({ error: "Connection temporarily unavailable" }, 503) : null;
   await chooseAxis(model.nodes, "elapsed");
   await settled(() => model.nodes.get("chart-error").hidden === false);
   assert.deepEqual(model.chart.previews, previews);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
   assert.match(model.nodes.get("chart-error").textContent, /Showing the last loaded chart/);
-  model.model.override = null; model.model.chart_html = "<html>recovered-elapsed-chart</html>";
+  model.model.override = null; model.model.chart_label = "recovered-elapsed-chart";
   await model.clock.advance(5_000);
-  assert.equal(model.chart.previews.at(-1), "<html>recovered-elapsed-chart</html>");
+  assert.equal(model.chart.previews.at(-1), "recovered-elapsed-chart");
   assert.equal(model.nodes.get("chart-error").hidden, true);
   assert.equal(selectedAxis(model.nodes), "elapsed");
 });
@@ -1032,9 +1052,9 @@ test("changing only the chart axis does not dismiss an unrelated metadata failur
   await click(model.nodes.get("refresh-button"));
   await settled(() => model.nodes.get("review-error").hidden === false);
   const error = model.nodes.get("review-error");
-  model.model.chart_html = "<html>elapsed-chart</html>";
+  model.model.chart_label = "elapsed-chart";
   await chooseAxis(model.nodes, "elapsed");
-  await settled(() => model.chart.previews.at(-1) === "<html>elapsed-chart</html>");
+  await settled(() => model.chart.previews.at(-1) === "elapsed-chart");
   assert.equal(error.hidden, false);
   assert.equal(error.textContent, "Run metadata temporarily unavailable");
 });
@@ -1054,11 +1074,11 @@ test("auto and manual refresh preserve pagination and explicit selections outsid
   assert.match(text(model.nodes.get("selected-runs")), /run-0/);
   assert.deepEqual(chartQuery(model.nodes).getAll("run_id"), ["run-0"]);
   assert.equal(globalThis.document.activeElement, runCheckbox(model.nodes, 0));
-  const writes = frameNavigations(model.nodes);
+  const writes = previewMounts(model.nodes);
   await click(model.nodes.get("refresh-button"));
   await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(model.nodes.get("page-label").textContent, "Page 2");
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
 });
 
 test("only the visible log stream refreshes and a reader's scroll position is retained", async t => {
@@ -1080,14 +1100,14 @@ test("only the visible log stream refreshes and a reader's scroll position is re
   assert.equal(output.scrollTop, 200);
   assert.equal(findElement(model.nodes.get("run-logs"), "log-tab-stderr"), stderr);
   assert.equal(stderr.getAttribute("aria-selected"), "true");
-  assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"]);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"]);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"]);
 });
 
 test("a failed cycle keeps its successful timestamp and retries unacknowledged revisions", async t => {
   const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
   const checked = model.nodes.get("updated-at").textContent.split(" · ")[0], previews = model.chart.previews.length;
-  model.model.metrics_revision = "metrics-2"; model.model.metric_value = 7; model.model.chart_html = "<html>chart-2</html>";
+  model.model.metrics_revision = "metrics-2"; model.model.metric_value = 7; model.model.chart_label = "chart-2";
   model.model.override = parsed => parsed.pathname === "/api/run" ? response({ error: "temporarily unavailable" }, 503) : undefined;
   await model.clock.advance(5_000);
   assert.equal(model.nodes.get("updated-at").textContent.split(" · ")[0], checked);
@@ -1095,22 +1115,22 @@ test("a failed cycle keeps its successful timestamp and retries unacknowledged r
   assert.equal(model.chart.previews.length, previews);
   model.model.override = null;
   await model.clock.advance(10_000);
-  assert.equal(model.chart.previews.at(-1), "<html>chart-2</html>");
+  assert.equal(model.chart.previews.at(-1), "chart-2");
   assert.match(text(model.nodes.get("run-detail")), /7/);
   assert.match(model.nodes.get("updated-at").textContent, /Auto updates every 5s/);
 });
 
 test("an active chart drag defers adoption and the next check still applies the new revision", async t => {
   const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  model.chart.interacting = true; model.model.metrics_revision = "metrics-2"; model.model.chart_html = "<html>chart-2</html>";
+  model.chart.interacting = true; model.model.metrics_revision = "metrics-2"; model.model.chart_label = "chart-2";
   await model.clock.advance(5_000); assert.equal(model.chart.previews.length, 1);
   const counts = requestCounts(model.requests);
   await model.clock.advance(10_000);
-  for (const path of ["/api/catalog", "/api/runs", "/api/run", "/api/chart"]) assert.equal(requestCounts(model.requests)[path], counts[path], "a held drag does not reread completed views");
+  for (const path of ["/api/catalog", "/api/runs", "/api/run", "/api/chart-data"]) assert.equal(requestCounts(model.requests)[path], counts[path], "a held drag does not reread completed views");
   model.chart.interacting = false;
   await model.clock.advance(5_000);
   assert.equal(model.chart.previews.length, 2);
-  assert.equal(model.chart.previews.at(-1), "<html>chart-2</html>");
+  assert.equal(model.chart.previews.at(-1), "chart-2");
 });
 
 test("automatic recovery completes an initially failed comparison and reopening a review gets a fresh baseline", async t => {
@@ -1119,7 +1139,7 @@ test("automatic recovery completes an initially failed comparison and reopening 
   model.model.override = parsed => parsed.pathname === "/api/compare" ? response({ error: "temporarily unavailable" }, 503) : undefined;
   await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
   await settled(() => model.nodes.get("review-error").hidden === false);
-  assert.equal(model.nodes.get("chart-frame").src, "");
+  assert.deepEqual(chartQuery(model.nodes).getAll("run_id"), ["run-0", "run-1"], "chart data can load while comparison metadata recovers");
   model.model.override = null;
   await model.clock.advance(5_000);
   assert.equal(model.nodes.get("review-loading").hidden, true);
@@ -1127,10 +1147,10 @@ test("automatic recovery completes an initially failed comparison and reopening 
   assert.deepEqual(chartQuery(model.nodes).getAll("run_id"), ["run-0", "run-1"]);
   assert.equal(model.nodes.get("compare-metric-options").children.length > 0, true);
   assert.equal(model.chart.previews.length, 1);
-  const writes = frameNavigations(model.nodes);
+  const writes = previewMounts(model.nodes);
   await chooseReduction(model.nodes, "max");
   await settled(() => model.nodes.get("comparison-values").getAttribute("aria-busy") === "false");
-  assert.equal(frameNavigations(model.nodes), writes, "scalar reduction does not navigate identical chart metrics");
+  assert.equal(previewMounts(model.nodes), writes, "scalar reduction does not navigate identical chart metrics");
   await click(model.nodes.get("clear-selection"));
   await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
   await settled(() => chartQuery(model.nodes).getAll("run_id").length === 2);
@@ -1138,24 +1158,151 @@ test("automatic recovery completes an initially failed comparison and reopening 
   assert.equal(model.chart.previews.length, 2, "a new review validates its initial preview again");
 });
 
-test("a completed invalid initial chart retries navigation once and slow pending navigation is left alone", async t => {
-  const model = await autoFixture(t); await inspect(model);
-  model.chart.status = "invalid";
-  const writes = frameNavigations(model.nodes), counts = requestCounts(model.requests);
-  await model.clock.advance(5_000);
-  assert.equal(frameNavigations(model.nodes), writes + 1);
+test("a failed initial JSON chart recovers without remounting its container", async t => {
+  let failed = true;
+  const model = await autoFixture(t, { override: parsed => parsed.pathname === "/api/chart-data" && failed ? response({ error: "temporarily unavailable" }, 503) : null });
+  await inspect(model);
+  assert.match(model.nodes.get("chart-error").textContent, /temporarily unavailable/);
+  const mounts = previewMounts(model.nodes), counts = requestCounts(model.requests);
   assert.equal(model.chart.previews.length, 0);
-  assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"]);
-  model.chart.status = "loading";
-  await model.clock.advance(15_000);
-  assert.equal(frameNavigations(model.nodes), writes + 1, "polls must not restart an outstanding iframe navigation");
-  assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"]);
-  model.chart.status = "ready";
+  failed = false;
   await model.clock.advance(5_000);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"] + 1);
   assert.equal(model.chart.previews.length, 1);
-  assert.equal(frameNavigations(model.nodes), writes + 1);
+  assert.equal(model.nodes.get("chart-error").hidden, true);
+  assert.equal(previewMounts(model.nodes), mounts);
   await model.clock.advance(5_000);
   assert.equal(model.chart.previews.length, 1, "successful recovery establishes its normal revision baseline");
+});
+
+test("a slow initial JSON request remains in flight while polls wait", async t => {
+  const pending = deferred(); let query;
+  const model = await autoFixture(t, { override: parsed => {
+    if (parsed.pathname === "/api/chart-data") { query = parsed.searchParams; return pending.promise; }
+  } });
+  t.after(() => pending.resolve(response(chartData("slow-chart", query))));
+  await inspect(model);
+  const mounts = previewMounts(model.nodes), counts = requestCounts(model.requests);
+  await model.clock.advance(20_000);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"]);
+  assert.equal(model.chart.previews.length, 0);
+  model.model.override = null;
+  pending.resolve(response(chartData("slow-chart", query))); await flush();
+  assert.equal(model.chart.previews.at(-1), "slow-chart");
+  assert.equal(model.nodes.get("chart-card").getAttribute("aria-busy"), "false");
+  assert.equal(previewMounts(model.nodes), mounts);
+});
+
+test("chart JSON loads alongside metadata and reuses the default metric selection", async t => {
+  const pending = deferred();
+  const model = await autoFixture(t, { override: parsed => parsed.pathname === "/api/run" ? pending.promise : null });
+  t.after(() => pending.resolve(response(detailRecord(model.sources[0], model.runs[0]))));
+  await inspect(model);
+  await settled(() => model.chart.previews.length === 1);
+  assert.equal(model.nodes.get("review-loading").hidden, false, "the chart is usable before metadata finishes");
+  assert.equal(requestCounts(model.requests)["/api/run"], 1);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], 1);
+  assert.equal(new URL(model.nodes.get("open-chart").href).pathname, "/api/chart", "standalone reports remain HTML");
+  model.model.override = null;
+  pending.resolve(response(detailRecord(model.sources[0], model.runs[0]))); await flush();
+  assert.deepEqual(chartQuery(model.nodes).getAll("metric"), ["accuracy", "loss"]);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], 1, "populating default tags must not start a second chart request");
+  await model.clock.advance(5_000);
+  assert.equal(model.chart.previews.length, 1, "an unchanged first poll acknowledges the preview without rendering it again");
+});
+
+test("chart refresh preserves signed-zero changes at the same sample identity", async t => {
+  let negative_zero = false;
+  const clock = new RefreshClock();
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, override: parsed => {
+    if (parsed.pathname !== "/api/chart-data") return null;
+    const data = chartData("zero-chart", parsed.searchParams);
+    for (const plot of data.plots) {
+      plot.domain.value_min = 0;
+      for (const series of plot.series) {
+        series.points[1].value = 0;
+        series.summary.last.value = 0;
+        series.summary.min.value = 0;
+      }
+    }
+    const wire = JSON.stringify(data);
+    // Deliver actual JSON numeric -0: stringify would erase it in the fixture too.
+    return { ...response(data), text: async () => negative_zero ? wire.replaceAll('"value":0', '"value":-0.0') : wire };
+  } });
+  await inspect(model);
+  const pointLabel = () => model.nodes.get("chart-preview")
+    .querySelector('circle.point[data-chart-sample-index="1"]')?.getAttribute("aria-label");
+  await settled(() => pointLabel()?.includes("value 0 · timestamp"));
+  await clock.advance(5_000);
+  negative_zero = true;
+  model.metrics_revision = "metrics-negative-zero";
+  await clock.advance(5_000);
+  assert.match(pointLabel(), /value -0 · timestamp/, "a changed sign must refresh the exact value despite unchanged counts, steps and timestamps");
+  negative_zero = false;
+  model.metrics_revision = "metrics-positive-zero";
+  await clock.advance(5_000);
+  assert.match(pointLabel(), /value 0 · timestamp/, "the refresh cache must distinguish a later change back to positive zero");
+});
+
+for (const chart_first of [true, false]) {
+  test(`different server defaults reconcile when ${chart_first ? "chart" : "metadata"} arrives first with updates off`, async t => {
+    const pending = deferred(); let query;
+    const model = await autoFixture(t, { override: parsed => {
+      if (parsed.pathname === "/api/chart-data" && !parsed.searchParams.has("metric")) {
+        query = parsed.searchParams;
+        if (!chart_first) return pending.promise;
+        const with_new_metric = new URLSearchParams(query);
+        for (const name of ["accuracy", "loss", "new-metric"]) with_new_metric.append("metric", name);
+        return response(chartData("different-defaults", with_new_metric));
+      }
+      if (chart_first && parsed.pathname === "/api/run") return pending.promise;
+    } });
+    await click(model.nodes.get("auto-refresh-toggle"));
+    await inspect(model);
+    model.model.override = null;
+    if (chart_first) pending.resolve(response(detailRecord(model.sources[0], model.runs[0])));
+    else {
+      const with_new_metric = new URLSearchParams(query);
+      for (const name of ["accuracy", "loss", "new-metric"]) with_new_metric.append("metric", name);
+      pending.resolve(response(chartData("different-defaults", with_new_metric)));
+    }
+    await flush();
+    await settled(() => model.nodes.get("chart-card").getAttribute("aria-busy") === "false");
+    const requests = model.requests.filter(url => url.startsWith("/api/chart-data"));
+    assert.equal(requests.length, 2, "different defaults must request the checked selection immediately");
+    assert.deepEqual(new URL(requests[1], "http://localhost").searchParams.getAll("metric"), ["accuracy", "loss"]);
+    assert.equal(model.chart.previews.at(-1), "chart-1");
+    assert.equal(model.nodes.get("chart-error").hidden, true);
+  });
+}
+
+test("invalid chart JSON retains the loaded chart and recovers on a later update", async t => {
+  const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
+  const previews = [...model.chart.previews];
+  model.model.override = parsed => parsed.pathname === "/api/chart-data" ? response({ schema_version: 1, plots: [] }) : null;
+  await chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.nodes.get("chart-error").hidden === false);
+  assert.match(model.nodes.get("chart-error").textContent, /Invalid chart data/);
+  assert.deepEqual(model.chart.previews, previews);
+  model.model.override = null; await model.clock.advance(5_000);
+  assert.equal(model.nodes.get("chart-error").hidden, true);
+});
+
+test("well-formed JSON for a different run cannot replace the selected chart", async t => {
+  const model = await autoFixture(t); await inspect(model);
+  const previews = [...model.chart.previews];
+  model.model.override = parsed => {
+    if (parsed.pathname !== "/api/chart-data") return null;
+    const data = chartData("outside-run", parsed.searchParams);
+    data.runs = ["run-outside"];
+    return response(data);
+  };
+  await chooseAxis(model.nodes, "elapsed");
+  await settled(() => model.nodes.get("chart-error").hidden === false);
+  assert.match(model.nodes.get("chart-error").textContent, /does not match the selected runs or axis/);
+  assert.deepEqual(model.chart.previews, previews);
+  model.model.override = null; await model.clock.advance(5_000);
+  assert.equal(model.nodes.get("chart-error").hidden, true);
 });
 
 test("a failed initial hosted catalog recovers through a catalog-only probe", async t => {
@@ -1192,7 +1339,7 @@ test("an initially failed run can recover directly into Logs without overlapping
   assert.equal(model.nodes.get("review-error").hidden, true);
   assert.equal(model.nodes.get("review-loading").hidden, true);
   assert.equal(requestCounts(model.requests)["/api/log"], 1, "detail recovery starts one initial foreground log load");
-  assert.equal(requestCounts(model.requests)["/api/chart"], undefined);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], 1, "the initial chart request is independent; Logs recovery must not fetch it again");
 });
 
 test("failed page loads recover even with unchanged revisions and identical retries restore controls", async t => {
@@ -1227,14 +1374,14 @@ test("missing selected runs retain their preview without artifact retries and re
   await selectRow(model.nodes, 0);
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-0");
   await model.clock.advance(5_000);
-  const counts = requestCounts(model.requests), writes = frameNavigations(model.nodes);
+  const counts = requestCounts(model.requests), writes = previewMounts(model.nodes);
   const removed = model.runs.shift(); model.model.missing_run_ids.add(removed.run_id);
   await model.clock.advance(20_000);
   assert.match(model.nodes.get("review-error").textContent, /selected runs are no longer available.*last successful preview/);
   assert.equal(model.nodes.get("review-error").hidden, false);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
   assert.equal(model.chart.previews.length, 1);
-  for (const path of ["/api/run", "/api/chart", "/api/log"]) assert.equal(requestCounts(model.requests)[path], counts[path]);
+  for (const path of ["/api/run", "/api/chart-data", "/api/log"]) assert.equal(requestCounts(model.requests)[path], counts[path]);
   await click(model.nodes.get("review-tab-logs")); await flush();
   await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/log"], counts["/api/log"], "known missing logs are not requested when changing tabs");
@@ -1245,22 +1392,23 @@ test("missing selected runs retain their preview without artifact retries and re
   assert.match(text(model.nodes.get("run-logs")), /stdout training complete/);
   await click(model.nodes.get("review-tab-charts")); await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/run"], counts["/api/run"] + 1);
-  assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"] + 1);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"] + 1);
+  assert.equal(previewMounts(model.nodes), writes);
   assert.equal(model.nodes.get("review-error").hidden, true);
 });
 
-test("completed chart load failures use exponential backoff while a valid recovery restores five-second checks", async t => {
+test("completed JSON chart failures use exponential backoff and recovery restores five-second checks", async t => {
   const model = await autoFixture(t); await inspect(model);
-  model.chart.status = "invalid";
-  const writes = frameNavigations(model.nodes);
+  model.model.override = parsed => parsed.pathname === "/api/chart-data" ? response({ error: "Connection unavailable" }, 503) : null;
+  const mounts = previewMounts(model.nodes), counts = requestCounts(model.requests);
   let retries = 0;
   for (const [delay, retry] of [[5_000, 10], [10_000, 20], [20_000, 40], [40_000, 60]]) {
     await model.clock.advance(delay); retries++;
-    assert.equal(frameNavigations(model.nodes), writes + retries);
+    assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"] + retries);
+    assert.equal(previewMounts(model.nodes), mounts);
     assert.match(model.nodes.get("updated-at").textContent, new RegExp(`retrying in ${retry}s`));
   }
-  model.chart.status = "ready";
+  model.model.override = null;
   await model.clock.advance(60_000);
   assert.equal(model.chart.previews.length, 1);
   assert.match(model.nodes.get("updated-at").textContent, /Auto updates every 5s/);
@@ -1281,7 +1429,7 @@ test("source changes cancel only obsolete background work and late probes cannot
   pending.resolve(response({ catalog_revision: "late", source_revision: "late", runs: [] })); await flush();
   assert.equal(model.nodes.get("source-select").value, "hosted:b");
   assert.equal(model.nodes.get("review-section").hidden, true);
-  assert.equal(model.nodes.get("chart-frame").src, "");
+  assert.equal(chartSource(model.nodes), "");
   await model.clock.advance(5_000);
   const probes = model.requests.filter(url => url.startsWith("/api/updates"));
   assert.equal(new URL(probes.at(-1), "http://localhost").searchParams.get("source"), "hosted:b");
@@ -1289,27 +1437,27 @@ test("source changes cancel only obsolete background work and late probes cannot
 
 test("hidden pages stop probes and resume once without disturbing the current review", async t => {
   const model = await autoFixture(t); await inspect(model); await model.clock.advance(5_000);
-  const probes = requestCounts(model.requests)["/api/updates"], writes = frameNavigations(model.nodes);
+  const probes = requestCounts(model.requests)["/api/updates"], writes = previewMounts(model.nodes);
   Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "hidden" }); await emit(model.page_document, "visibilitychange");
   await model.clock.advance(90_000);
   assert.equal(requestCounts(model.requests)["/api/updates"], probes);
   Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "visible" }); await emit(model.page_document, "visibilitychange");
   await model.clock.advance(0);
   assert.equal(requestCounts(model.requests)["/api/updates"], probes + 1);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
 });
 
 test("older backends fall back once to bounded 30-second snapshots without replacing unchanged charts", async t => {
   const model = await autoFixture(t, { updates: false }); await inspect(model);
   await model.clock.advance(5_000);
-  const counts = requestCounts(model.requests), writes = frameNavigations(model.nodes);
+  const counts = requestCounts(model.requests), writes = previewMounts(model.nodes);
   assert.equal(counts["/api/updates"], 1);
   assert.match(model.nodes.get("updated-at").textContent, /Auto updates every 30s/);
   await model.clock.advance(30_000);
   assert.equal(requestCounts(model.requests)["/api/updates"], 1);
-  assert.equal(requestCounts(model.requests)["/api/chart"], counts["/api/chart"] + 1);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"] + 1);
   assert.equal(model.chart.previews.length, 1);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(previewMounts(model.nodes), writes);
 });
 
 test("local catalog and list snapshots stay modest while selected update probes remain frequent", async t => {
@@ -1325,16 +1473,16 @@ test("local catalog and list snapshots stay modest while selected update probes 
   assert.equal(requestCounts(model.requests)["/api/runs"], counts["/api/runs"] + 1);
 });
 
-test("chart text requests enforce their byte limit and release pending request state", async t => {
+test("chart JSON requests enforce their byte limit before parsing and release pending request state", async t => {
   const original_fetch = globalThis.fetch; t.after(() => { globalThis.fetch = original_fetch; });
-  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => "λ λ" });
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify("λ λ") });
   const lane = new RequestLane();
-  await assert.rejects(lane.runText("/api/chart", 4), /preview limit/);
+  await assert.rejects(lane.runJson("/api/chart-data", 6), /preview limit/);
   assert.equal(lane.pending, false);
-  assert.equal(await lane.runText("/api/chart", 5), "λ λ");
+  assert.equal(await lane.runJson("/api/chart-data", 7), "λ λ");
   let cancelled = false;
-  globalThis.fetch = async () => ({ ok: true, status: 200, body: new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(6)); }, cancel() { cancelled = true; } }) });
-  await assert.rejects(lane.runText("/api/chart", 5), /preview limit/);
+  globalThis.fetch = async () => ({ ok: true, status: 200, body: new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(8)); }, cancel() { cancelled = true; } }) });
+  await assert.rejects(lane.runJson("/api/chart-data", 7), /preview limit/);
   assert.equal(cancelled, true);
   assert.equal(lane.pending, false);
 });
@@ -1421,18 +1569,18 @@ test("explicit run inspection ignores a late linked detail and keeps the user's 
   assert.equal(signal.aborted, false);
   await inspect(model, 0);
   assert.equal(signal.aborted, true);
-  const frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  const frame = model.nodes.get("chart-preview"), writes = previewMounts(model.nodes);
   pending.resolve(response(detailRecord(linked_source, model.runs[1]))); await flush();
   model.model.override = null; await model.clock.advance(5_000);
   assert.equal(chartQuery(model.nodes).get("run_id"), "run-0");
-  assert.equal(model.nodes.get("chart-frame"), frame);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(model.nodes.get("chart-preview"), frame);
+  assert.equal(previewMounts(model.nodes), writes);
 });
 
-test("resolved links preserve the review tab, expanded records, and iframe through refresh", async t => {
+test("resolved links preserve the review tab, expanded records, and chart container through refresh", async t => {
   const model = await autoFixture(t, { sources: [linked_source], url: runLink() });
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-1");
-  const frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  const frame = model.nodes.get("chart-preview"), writes = previewMounts(model.nodes);
   await click(model.nodes.get("review-tab-overview"));
   const record = model.nodes.get("run-detail").querySelector("details");
   await click(record.querySelector("summary")); assert.equal(record.open, true);
@@ -1442,8 +1590,8 @@ test("resolved links preserve the review tab, expanded records, and iframe throu
   await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(model.nodes.get("review-tab-overview").getAttribute("aria-selected"), "true");
   assert.equal(model.nodes.get("run-detail").querySelector("details"), record);
-  assert.equal(record.open, true); assert.equal(model.nodes.get("chart-frame"), frame);
-  assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(record.open, true); assert.equal(model.nodes.get("chart-preview"), frame);
+  assert.equal(previewMounts(model.nodes), writes);
   assert.equal(chartQuery(model.nodes).get("run_id"), "run-1");
 });
 
@@ -1487,7 +1635,7 @@ function fileCheckbox(nodes, path) { return fileRow(nodes, path).querySelector('
 test("Files loads only on demand and displays reported availability and scoped native downloads", async t => {
   const model = await autoFixture(t); await inspect(model);
   model.model.artifact_files = [checkpointFile("outputs/model 'two' $HOME.pt"), checkpointFile("outputs/pending.pt", { cloud: false, worker: true }), checkpointFile("outputs/local.pt", { local: true, cloud: false, worker: null })];
-  const frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  const frame = model.nodes.get("chart-preview"), writes = previewMounts(model.nodes);
   assert.equal(requestCounts(model.requests)["/api/artifacts"], undefined);
   await emit(model.nodes.get("review-tab-logs"), "keydown", { key: "End" });
   await settled(() => model.nodes.document.getElementById("file-rows") !== null);
@@ -1504,7 +1652,7 @@ test("Files loads only on demand and displays reported availability and scoped n
   assert.equal(fileCheckbox(model.nodes, "outputs/pending.pt").disabled, true);
   assert.match(fileRow(model.nodes, "outputs/pending.pt").textContent, /Upload to download/);
   assert.equal(fileCheckbox(model.nodes, "outputs/local.pt").disabled, false);
-  assert.equal(model.nodes.get("chart-frame"), frame); assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(model.nodes.get("chart-preview"), frame); assert.equal(previewMounts(model.nodes), writes);
   await click(model.nodes.get("review-tab-charts")); await click(model.nodes.get("review-tab-files"));
   assert.equal(requestCounts(model.requests)["/api/artifacts"], 1, "returning to Files reuses its current inventory");
 });
@@ -1593,7 +1741,7 @@ test("automatic and manual file refresh retain selection, drafts and focus and o
   const checkbox = fileCheckbox(model.nodes, "outputs/keep.pt"); await click(checkbox);
   const config = model.nodes.get("artifact-config-path"); setValue(config, "/private/owner.toml"); await emit(config, "input");
   await model.clock.advance(5_000);
-  const counts = requestCounts(model.requests), frame = model.nodes.get("chart-frame"), writes = frameNavigations(model.nodes);
+  const counts = requestCounts(model.requests), frame = model.nodes.get("chart-preview"), writes = previewMounts(model.nodes);
   checkbox.focus(); await model.clock.advance(10_000);
   assert.equal(requestCounts(model.requests)["/api/artifacts"], counts["/api/artifacts"], "unchanged probes skip inventory downloads");
   model.model.artifact_files.push(checkpointFile("outputs/new.pt")); model.model.list_revision = "new-output";
@@ -1603,7 +1751,7 @@ test("automatic and manual file refresh retain selection, drafts and focus and o
   assert.equal(model.nodes.document.activeElement, checkbox); assert.equal(config.value, "/private/owner.toml");
   await click(model.nodes.get("refresh-button")); await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(fileCheckbox(model.nodes, "outputs/keep.pt").checked, true); assert.equal(model.nodes.get("artifact-config-path"), config);
-  assert.equal(model.nodes.get("chart-frame"), frame); assert.equal(frameNavigations(model.nodes), writes);
+  assert.equal(model.nodes.get("chart-preview"), frame); assert.equal(previewMounts(model.nodes), writes);
   model.model.artifact_files = [checkpointFile("outputs/new.pt")]; model.model.metadata_revision = "removed-output";
   await model.clock.advance(5_000);
   assert.equal(model.nodes.get("files-selection-count").textContent, "Select files to download");
@@ -1661,15 +1809,15 @@ test("hosted live hints coalesce into incremental probes and preserve the curren
   assert.equal(live.streams[0].closed, 1, "inspection closes the unscoped previous stream");
   stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
   assert.match(model.nodes.get("updated-at").textContent, /Live updates.*recovery check every 5s/);
-  const counts = requestCounts(model.requests), frame = model.nodes.get("chart-frame"), previews = model.chart.previews.length;
-  model.model.metrics_revision = "metrics-push"; model.model.metric_value = 0.25; model.model.chart_html = "<html>chart-push</html>";
+  const counts = requestCounts(model.requests), frame = model.nodes.get("chart-preview"), previews = model.chart.previews.length;
+  model.model.metrics_revision = "metrics-push"; model.model.metric_value = 0.25; model.model.chart_label = "chart-push";
   await stream.emit("updates", '{"catalog_revision":"11"}'); await stream.emit("updates", '{"catalog_revision":"12"}');
   await model.clock.advance(0);
   const next = requestCounts(model.requests);
   assert.equal(next["/api/updates"], counts["/api/updates"] + 1);
-  assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"] + 1);
+  assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart-data"], counts["/api/chart-data"] + 1);
   for (const path of ["/api/catalog", "/api/runs", "/api/log"]) assert.equal(next[path], counts[path], path);
-  assert.equal(model.nodes.get("chart-frame"), frame); assert.equal(model.chart.previews.length, previews + 1);
+  assert.equal(model.nodes.get("chart-preview"), frame); assert.equal(model.chart.previews.length, previews + 1);
   assert.equal(model.nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
   await stream.emit("updates", '{"catalog_revision":"12"}'); await stream.emit("updates", '{"catalog_revision":12}'); await model.clock.advance(0);
   assert.equal(requestCounts(model.requests)["/api/updates"], next["/api/updates"]);
@@ -1691,7 +1839,7 @@ test("local dashboards avoid streams and unsupported hosted streams retain recov
 test("live connections close while hidden offline disabled and disposed and reopen on resume", async t => {
   const live = dashboardStreams(), model = await autoFixture(t, { event_source: live.create }); await inspect(model);
   let stream = live.latest(); stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
-  const frame = model.nodes.get("chart-frame"); await click(model.nodes.get("review-tab-overview"));
+  const frame = model.nodes.get("chart-preview"); await click(model.nodes.get("review-tab-overview"));
   Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "hidden" }); await emit(model.page_document, "visibilitychange");
   assert.equal(stream.closed, 1); const requests = model.requests.length; await stream.emit("updates", '{"catalog_revision":"77"}'); await model.clock.advance(30_000); assert.equal(model.requests.length, requests);
   Object.defineProperty(model.page_document, "visibilityState", { configurable: true, value: "visible" }); await emit(model.page_document, "visibilitychange");
@@ -1703,7 +1851,7 @@ test("live connections close while hidden offline disabled and disposed and reop
   await click(model.nodes.get("auto-refresh-toggle")); assert.equal(live.streams.length, closed_count + 1); stream = live.latest();
   stream.readyState = 0; await stream.emit("error"); assert.equal(stream.closed, 0, "transient loss leaves native reconnection intact");
   stream.readyState = 1; await stream.emit("open"); await model.clock.advance(0);
-  assert.equal(model.nodes.get("review-tab-overview").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("chart-frame"), frame);
+  assert.equal(model.nodes.get("review-tab-overview").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("chart-preview"), frame);
   await act(async () => { model.nodes.cleanup(); model.nodes.cleanup(); await microtasks(); }); assert.equal(stream.closed, 1);
 });
 
@@ -1751,7 +1899,7 @@ test("result upload metadata hints update the badge during Logs without fetching
   model.model.result_upload = { status: "uploaded", incomplete: true }; model.model.metadata_revision = "result-upload-finished";
   await stream.emit("updates", '{"catalog_revision":"21"}'); await model.clock.advance(0);
   const next = requestCounts(model.requests);
-  assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart"], counts["/api/chart"]); assert.equal(next["/api/log"], counts["/api/log"]);
+  assert.equal(next["/api/run"], counts["/api/run"] + 1); assert.equal(next["/api/chart-data"], counts["/api/chart-data"]); assert.equal(next["/api/log"], counts["/api/log"]);
   assert.match(model.nodes.get("result-upload-summary").textContent, /Result uploaded.*Partial result.*Download result.zip/);
   assert.equal(model.nodes.get("review-tab-logs").getAttribute("aria-selected"), "true"); assert.equal(model.nodes.get("log-output"), log); assert.equal(log.scrollTop, 24);
 });
@@ -1765,21 +1913,21 @@ function projectRuns() {
 test("project tables retain separate run and review panes before and after optional columns", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
   await settledTable(nodes);
-  const panes = workspacePanes(nodes), frame = nodes.get("chart-frame");
+  const panes = workspacePanes(nodes), frame = nodes.get("chart-preview");
   const table = nodes.document.querySelector(".runs-table");
   assert.equal(panes.grid.classList.contains("has-wide-table"), true, "the built-in Machine column widens the browser pane");
   assert.equal(table.classList.contains("has-custom-columns"), true, "project columns scroll within the table container");
   assert.equal(table.dataset.columnCount, "0");
   await inspect(model, 0);
-  const chart_url = frame.src;
+  const chart_url = chartSource(nodes);
   await openColumns(nodes);
   for (const name of ["Parameter learning_rate", "Metric loss"]) {
     await click(columnCheckbox(nodes, name)); await settledTable(nodes);
   }
   assert.equal(table.dataset.columnCount, "2");
   assert.deepEqual(workspacePanes(nodes), panes);
-  assert.equal(nodes.get("chart-frame"), frame);
-  assert.equal(frame.src, chart_url);
+  assert.equal(nodes.get("chart-preview"), frame);
+  assert.equal(chartSource(nodes), chart_url);
   assert.equal(nodes.get("review-title").textContent, "same-run · gpu-a");
   for (const name of ["Parameter learning_rate", "Metric loss"]) {
     await click(columnCheckbox(nodes, name)); await settledTable(nodes);
@@ -1787,16 +1935,16 @@ test("project tables retain separate run and review panes before and after optio
   assert.equal(table.dataset.columnCount, "0");
   assert.equal(panes.grid.classList.contains("has-wide-table"), true, "removing optional columns retains the Machine column's width");
   assert.deepEqual(workspacePanes(nodes), panes);
-  assert.equal(nodes.get("chart-frame"), frame);
-  assert.equal(frame.src, chart_url);
+  assert.equal(nodes.get("chart-preview"), frame);
+  assert.equal(chartSource(nodes), chart_url);
 });
 
-test("project Storage loads lazily, shows inputs and uploaded outputs, and preserves the chart iframe", async t => {
+test("project Storage loads lazily, shows inputs and uploaded outputs, and preserves the chart container", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
   model.model.storage_inputs = [{ input_id: "dataset-v1", size: 1024 }];
   model.model.storage_outputs = [{ origin: "gpu-a", run_id: "same-run", path: "outputs/checkpoint.pt", size: 2048 }];
   await inspect(model);
-  const frame = nodes.get("chart-frame"), chart_url = frame.src, writes = frameNavigations(nodes);
+  const frame = nodes.get("chart-preview"), chart_url = chartSource(nodes), writes = previewMounts(nodes);
   assert.equal(model.requests.some(url => url.startsWith("/api/storage")), false, "Storage is lazy");
   assert.equal(nodes.get("workspace-view-workspace").checked, true);
   await click(nodes.get("workspace-view-storage"));
@@ -1817,11 +1965,11 @@ test("project Storage loads lazily, shows inputs and uploaded outputs, and prese
   assert.equal(link.searchParams.get("run_id"), "gpu-a:same-run");
   await click(nodes.get("workspace-view-workspace"));
   assert.equal(nodes.get("workspace-page").hidden, false);
-  assert.equal(nodes.get("chart-frame"), frame);
-  assert.equal(frame.src, chart_url);
-  assert.equal(frameNavigations(nodes), writes, "page switching must not reload chart contents");
+  assert.equal(nodes.get("chart-preview"), frame);
+  assert.equal(chartSource(nodes), chart_url);
+  assert.equal(previewMounts(nodes), writes, "page switching must not reload chart contents");
   await click(nodes.get("workspace-view-storage"));
-  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(nodes.get("chart-preview"), frame);
   const count = requestCounts(model.requests)["/api/storage"], projects = requestCounts(model.requests)["/api/projects"];
   await click(nodes.get("refresh-button"));
   await settled(() => requestCounts(model.requests)["/api/storage"] === count + 1);
@@ -2053,28 +2201,28 @@ test("machine filters operate within projects, clear run selection and use one-c
   await click(nodes.document.querySelector('button[aria-label="Sort by Machine ascending"]')); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("sort"), "origin");
   assert.equal(latestRunQuery(model).get("direction"), "asc");
-  const frame = nodes.get("chart-frame");
+  const frame = nodes.get("chart-preview");
   model.model.project_sources.push({ ...project_source, project_id: "other", source_id: "hosted-project:other", label: "other" });
   model.model.catalog_revision = "another-project"; await model.clock.advance(5_000);
   await click(nodes.get("project-other")); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("source"), "hosted-project:other");
   assert.equal(nodes.get("project-name").textContent, "other");
   assert.equal(nodes.document.title, "expri · other");
-  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(nodes.get("chart-preview"), frame);
 });
 
 test("legacy deep links open the exact project run and live probes retain its machine key", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns(), url: "http://localhost/?project_id=vision&origin=gpu-b&run_id=same-run" }), { nodes } = model;
   await settled(() => chartQuery(nodes).get("run_id") === "gpu-b:same-run");
   assert.equal(nodes.get("review-title").textContent, "same-run · gpu-b");
-  const frame = nodes.get("chart-frame");
+  const frame = nodes.get("chart-preview");
   await click(nodes.get("review-tab-logs"));
   model.model.metrics_revision = "metric-2"; model.model.metadata_revision = "metadata-2"; model.model.stdout_revision = "log-2";
   await model.clock.advance(5_000);
   const probe = new URL(model.requests.filter(url => url.startsWith("/api/updates")).at(-1), "http://localhost");
   assert.deepEqual(probe.searchParams.getAll("run_id"), ["gpu-b:same-run"]);
   assert.equal(nodes.get("review-tab-logs").getAttribute("aria-selected"), "true");
-  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(nodes.get("chart-preview"), frame);
   assert.equal(nodes.get("review-error").hidden, true);
 });
 
@@ -2088,13 +2236,13 @@ test("project capability fallback retries manually and transient project failure
   model.model.projects_status = 200;
   await click(nodes.get("refresh-button")); await settled(() => nodes.document.getElementById("project-vision")?.checked);
   assert.equal(nodes.get("project-catalog-note").hidden, true);
-  const frame = nodes.get("chart-frame");
+  const frame = nodes.get("chart-preview");
   model.model.projects_status = 503;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
   assert.match(nodes.get("global-error").textContent, /Project browsing unavailable/);
   assert.equal(nodes.get("project-vision").checked, true);
   assert.equal(nodes.get("run-rows").children.length, 3);
-  assert.equal(nodes.get("chart-frame"), frame);
+  assert.equal(nodes.get("chart-preview"), frame);
   model.model.projects_status = 200;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
   assert.equal(nodes.get("global-error").hidden, true);
@@ -2348,7 +2496,7 @@ test("archiving confirms the exact worker run, clears its selection, and preserv
     project_runs: [archivalRun("same"), archivalRun("same", { origin: "gpu-b" })] }), { nodes } = model;
   await settledTable(nodes); await selectRow(nodes, 0);
   await settled(() => nodes.document.getElementById("archive-run-button"));
-  const frame = nodes.get("chart-frame"), navigations = frameNavigations(nodes);
+  const frame = nodes.get("chart-preview"), navigations = previewMounts(nodes);
   await click(nodes.get("archive-run-button"));
   assert.match(nodes.get("archive-run-confirmation").textContent, /automatically deleted after 15 days.*restore.*Local copies and project private inputs are kept/s);
   assert.equal(model.requests.some(url => url === "/api/runs/archive"), false);
@@ -2362,8 +2510,8 @@ test("archiving confirms the exact worker run, clears its selection, and preserv
   assert.equal(nodes.get("review-section").hidden, false);
   assert.match(nodes.get("review-title").textContent, /gpu-a:same|same · gpu-a/);
   assert.match(nodes.get("run-archival-summary").textContent, /Archived run.*Scheduled deletion/s);
-  assert.equal(nodes.get("chart-frame"), frame);
-  assert.equal(frameNavigations(nodes), navigations);
+  assert.equal(nodes.get("chart-preview"), frame);
+  assert.equal(previewMounts(nodes), navigations);
   assert.equal(model.requests.filter(url => url === "/api/runs/archive").length, 1);
   await click(nodes.get("review-tab-overview"));
   assert.match(nodes.get("run-detail").textContent, /completed/);
@@ -2471,7 +2619,7 @@ test("an external archive refreshes the detail and removes hidden selections wit
   await settledTable(nodes); await selectRow(nodes, 0);
   await settled(() => nodes.document.getElementById("archive-run-button"));
   await model.clock.advance(5_000);
-  const frame = nodes.get("chart-frame"), navigations = frameNavigations(nodes);
+  const frame = nodes.get("chart-preview"), navigations = previewMounts(nodes);
   model.runs[0].archival = { ...archivalRun("run", { archived: true }).archival };
   model.model.list_revision = "archived-elsewhere"; model.model.metadata_revision = "archived-elsewhere";
   await model.clock.advance(5_000);
@@ -2480,8 +2628,8 @@ test("an external archive refreshes the detail and removes hidden selections wit
   assert.equal(nodes.document.getElementById("archive-run-button"), null);
   assert.ok(nodes.document.getElementById("restore-run-button"));
   assert.equal(nodes.get("review-section").hidden, false);
-  assert.equal(nodes.get("chart-frame"), frame);
-  assert.equal(frameNavigations(nodes), navigations);
+  assert.equal(nodes.get("chart-preview"), frame);
+  assert.equal(previewMounts(nodes), navigations);
 });
 
 test("external archival removes only that run from a comparison and retains the remaining selection", async t => {
