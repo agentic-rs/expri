@@ -209,8 +209,11 @@ impl<S: ObjectStorage> Store<S> {
     let complete = end == total_size;
     if complete {
       file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-      serde_json::from_reader::<_, Value>((&mut file).take(total_size))
+      let value = serde_json::from_reader::<_, Value>((&mut file).take(total_size))
         .map_err(|_| ApiError::new(422, "tracking document contains invalid JSON"))?;
+      if !previous.is_some_and(|(_, _, complete)| complete) {
+        super::asset_imports::index_uses(&tx, &target, &value)?;
+      }
     }
     tx.execute("INSERT INTO tracking_versions(target,revision,size,total_size,document,complete,sealed) VALUES(?1,?2,?3,?4,1,?5,?5)
       ON CONFLICT(target,revision) DO UPDATE SET size=excluded.size,complete=excluded.complete,sealed=excluded.sealed", params![key,revision,end,total_size,complete]).map_err(database)?;
@@ -221,6 +224,7 @@ impl<S: ObjectStorage> Store<S> {
           target,
           size: total_size,
           sha256: None,
+          provenance: None,
           storage: FileStorage::Tracking {
             revision,
             sealed: true,
@@ -287,6 +291,7 @@ impl<S: ObjectStorage> Store<S> {
           target,
           size: end,
           sha256: None,
+          provenance: None,
           storage: FileStorage::Tracking {
             revision: 1,
             sealed: previous.is_some_and(|(_, sealed)| sealed),
@@ -363,6 +368,7 @@ impl<S: ObjectStorage> Store<S> {
           target: file_target,
           size,
           sha256: None,
+          provenance: None,
           storage: FileStorage::Tracking {
             revision: *revision,
             sealed: true,
@@ -381,6 +387,7 @@ impl<S: ObjectStorage> Store<S> {
           target: file_target,
           size: *size,
           sha256: None,
+          provenance: None,
           storage: FileStorage::Tracking {
             revision: 1,
             sealed: sealed && *size == current,
@@ -471,6 +478,28 @@ impl<S: ObjectStorage> Store<S> {
       incomplete,
     })
   }
+}
+
+/// Read a completed local metadata document while its publication transaction is held.
+pub(super) fn captured_document(
+  directory: &Path,
+  db: &Connection,
+  scope: &RunScope,
+  path: &str,
+) -> ApiResult<Value> {
+  let target = FileTarget::Run {
+    scope: scope.clone(),
+    path: path.into(),
+  };
+  let Some(record) = current(db, &target)? else {
+    return Ok(Value::Null);
+  };
+  let FileStorage::Tracking { revision, .. } = record.storage else {
+    return Ok(Value::Null);
+  };
+  let file = open_raw(directory, &target, revision, false)?;
+  serde_json::from_reader(file.take(record.size))
+    .map_err(|_| ApiError::new(500, "stored provenance metadata is invalid"))
 }
 
 #[cfg(test)]

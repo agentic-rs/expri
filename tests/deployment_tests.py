@@ -115,7 +115,7 @@ class InstallerTests(unittest.TestCase):
     self.root = Path(self.temporary.name).resolve()
     self.config = self.root / 'etc/expri/server.toml'
     self.config.parent.mkdir(parents=True)
-    self.configuration = '[dashboard]\npublic_url = "https://expri.clouds56.top"\n'
+    self.configuration = '[dashboard]\npublic_url = "https://expri.example.net"\n'
     self.config.write_text(self.configuration)
     self.database = self.root / 'var/lib/expri/metadata.sqlite3'
     self.database.parent.mkdir(parents=True)
@@ -290,7 +290,7 @@ class InstallerTests(unittest.TestCase):
     link, old = self.existing('main')
     preview, preview_release = self.existing('ab')
     self.config.write_text(self.configuration + '''[[dashboard.previews]]
-public_url = "https://ab.expri.clouds56.top"
+public_url = "https://ab.expri.example.net"
 assets_dir = "/opt/expri/dashboard/ab"
 ''')
     class Reply:
@@ -302,7 +302,7 @@ assets_dir = "/opt/expri/dashboard/ab"
         pass
     observed = []
     def request(value, **_):
-      self.assertEqual(value.get_header('Host'), 'ab.expri.clouds56.top')
+      self.assertEqual(value.get_header('Host'), 'ab.expri.example.net')
       current = link.resolve().parent.name
       observed.append(current)
       if current == NEW:

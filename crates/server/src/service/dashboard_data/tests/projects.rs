@@ -291,6 +291,7 @@ fn storage_lists_completed_project_inputs_and_outputs_without_reading_object_byt
       "input_id": "weights-v1",
       "size": 7,
       "download_url": "/api/input?project_id=project&input_id=weights-v1",
+      "producer":null,"used_by":[],"used_by_count":0,
     })
   );
   let next = dashboard.storage("project", "input", "", 1, 1).unwrap();
@@ -374,6 +375,7 @@ fn storage_lists_completed_project_inputs_and_outputs_without_reading_object_byt
       "path": "outputs/model.pt",
       "size": 10,
       "download_url": "/api/artifact?source=hosted-project%3Aproject&run_id=worker-b%3Ashared&path=outputs%2Fmodel.pt",
+      "assets":[],"assets_count":0,
     })
   );
   let searched = dashboard

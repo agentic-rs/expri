@@ -20,7 +20,7 @@ Each transfer has a direction and a named action:
 | Source and config | Laptop → worker checkout | `expri -T gpu-1 push` |
 | Live tracking and registered checkpoints | Worker → server/S3 | Automatic publisher, or `expri service publish --watch` |
 | Completed private input files | Owner → S3 | `expri service input upload` |
-| Required private input files | S3 → worker asset cache | `expri assets import`/`download` and automatic run preparation |
+| Required private input files | S3 → worker asset cache | `expri assets add`/`download` and automatic run preparation |
 | Tracking bundle (`result.zip`) | Server → S3 | Automatic server upload, or `expri service upload` |
 | Run metadata and selected outputs | Server/S3 → laptop | `expri fetch --watch` |
 
@@ -77,10 +77,11 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 4. Older binaries
-refuse that directory because they cannot enforce run retention and project deletion records. Back up the
-entire service directory before upgrading; restoring that backup is required
-for a backend downgrade. Existing S3 runs remain readable after the upgrade.
+Opening this version upgrades the SQLite schema to version 5. Older binaries
+refuse that directory because they cannot preserve asset provenance and usage
+relationships alongside run retention and project deletion. Back up the entire
+service directory before upgrading; restoring that backup is required for a
+backend downgrade. Existing S3 runs remain readable after the upgrade.
 
 The optional object prefix is limited to 512 bytes to leave room for scoped IDs
 within S3's object-key limit.
@@ -240,6 +241,7 @@ Create a client configuration on the worker, outside the pushed source repo:
 
 ```toml
 url = "https://expri.example.net"
+project_id = "vision" # Required by repository-relative private asset references.
 token_env = "EXPRI_SERVICE_GPU_1_TOKEN"
 ```
 
@@ -508,10 +510,10 @@ Pass the downloaded path to the experiment as needed. Keep input files outside
 Git and code snapshots. This version handles datasets/files; credentials and
 secret injection are outside its scope.
 
-For automatic preparation, import a registered input as a managed asset:
+For automatic preparation, add a registered input as a managed asset:
 
 ```sh
-expri assets import expri://expri.clouds56.top/vision/inputs/dataset-v1 \
+expri assets add expri://./inputs/dataset-v1 \
   data/train.bin --client-config /etc/expri/worker.toml
 ```
 
@@ -520,10 +522,13 @@ Commit `data/train.bin.expri.toml` and the generated ignore rule. Training reads
 descriptor before environment setup and task launch, reusing verified bytes
 under `.expri/assets/<sha256>/file`. Cached assets work offline and running
 experiments keep their original bytes across later workspace updates. Private
-cache misses use the executing worker's `service.client_config`.
+cache misses prefer the executing worker's ignored `.expri/config.toml`, then
+`service.client_config`. The selected client configuration must include the
+project ID; neither it nor the server URL is stored in the committed descriptor.
 
-See [managed assets](assets.md) for public URL and Hugging Face imports,
-explicit updates, safe ordinary file paths, and migration from `service.inputs`.
+See [managed assets](assets.md) for local/public/Hugging Face additions, deferred
+downloads, output imports, explicit uploads and updates, and migration from
+earlier descriptors.
 
 Private input downloads retain range receipts beside the destination under
 `.expri-input-downloads/`. Repeating a download verifies and reuses matching
@@ -531,7 +536,7 @@ bytes. An unavailable service can use the last acknowledged input record only
 when the cached file still passes its size and full-file SHA256 check; rejected
 credentials or a deleted project never permit that fallback. A failed download
 preserves the previous destination. Keep the cache private and outside Git.
-Asset preparation requires a native worker advertising `assets-v1`.
+Asset preparation requires a native worker advertising `assets-v2`.
 `--no-publish` disables uploads while retaining private download credentials.
 
 ### Reuse an uploaded file

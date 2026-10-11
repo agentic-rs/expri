@@ -3,15 +3,17 @@ use crate::Source;
 
 fn descriptor(bytes: &[u8]) -> Descriptor {
   Descriptor {
-    version: 1,
+    version: 2,
     source: Source::Url {
-      url: "https://example.com/asset.bin".into(),
+      url: "https://example.net/asset.bin".into(),
     },
     size: bytes.len() as u64,
     sha256: Sha256::digest(bytes)
       .iter()
       .map(|byte| format!("{byte:02x}"))
       .collect(),
+    availability: None,
+    producer: None,
   }
 }
 
@@ -52,8 +54,6 @@ fn immutable_run_binding_survives_cache_replacement_by_another_source() {
   fs::rename(root.join("replacement"), &cache).unwrap();
   let mut other_descriptor = descriptor(b"replacement");
   other_descriptor.source = Source::Expri {
-    url: "https://expri.example".into(),
-    project_id: "vision".into(),
     input_id: "new-data".into(),
   };
   let other_binding = root.join("run-2/code/data/train.bin");

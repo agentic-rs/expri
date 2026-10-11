@@ -276,6 +276,7 @@ fn authorize<S: ObjectStorage>(
       ..
     } => worker.project_id == scope.project_id && worker.origin == scope.origin,
     Request::ReferenceFile { .. }
+    | Request::ImportOutput { .. }
     | Request::ProjectStorage { .. }
     | Request::PreviewProjectDelete { .. }
     | Request::DeleteProject { .. }
@@ -1147,6 +1148,20 @@ mod tests {
     assert!(authorize(&store, None, &operation).is_ok());
     assert_eq!(
       authorize(&store, Some(&auth.workers[0].1), &operation)
+        .unwrap_err()
+        .status,
+      403
+    );
+    let import = Request::ImportOutput {
+      scope: scope(),
+      path: "outputs/best.pt".into(),
+      input_id: None,
+      size: 7,
+      sha256: "a".repeat(64),
+    };
+    assert!(authorize(&store, None, &import).is_ok());
+    assert_eq!(
+      authorize(&store, Some(&auth.workers[0].1), &import)
         .unwrap_err()
         .status,
       403

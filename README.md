@@ -110,6 +110,33 @@ See [managed assets](docs/assets.md) for public URL, Hugging Face, and private
 input sidecars, and [result fetching](docs/self-hosted-service.md#local-download-and-dashboard)
 for laptop selection, offline reuse, and resumable transfers.
 
+## Managed assets
+
+Track large files with small `<path>.expri.toml` sidecars and keep the file bytes
+out of Git. `assets add` accepts an existing local file or a public URL/Hugging
+Face named file. `assets import` makes a hosted run output reusable without
+downloading or copying its S3 object. `assets upload` makes a local asset
+available to other workers; `download`, `update`, and `status` reproduce, refresh,
+and inspect the tracked version.
+
+```sh
+expri assets add data/train.bin
+expri assets upload data/train.bin
+expri assets add https://example.net/model.bin models/base.bin
+expri assets add expri://./inputs/dataset-v1 data/remote.bin --no-download
+expri assets import expri://./worker-1/run-abc123/outputs/best.pt models/best.pt
+expri assets download
+expri assets status
+expri assets update data/train.bin
+```
+
+`--no-download` requires a known SHA256 and size from metadata or explicit
+arguments. Private references use repository-relative IDs; configure the service
+URL, project ID, and token environment variable in ignored `.expri/config.toml`.
+Sidecars retain content identity and optional producing-run provenance. Native
+workers require `assets-v2`; verified cached assets remain usable offline.
+See the [managed assets guide](docs/assets.md) for configuration and examples.
+
 ## Transport
 
 Targets use SSH by default. Set `transport = "ctl"` on an individual target to
@@ -762,7 +789,9 @@ GPU computation or PyTorch/CUDA binary compatibility.
 The [self-hosted S3 suite](docs/self-hosted-service.md#acceptance-tests) additionally
 tests private inputs, service outages during training, lost multipart
 acknowledgments, restart recovery, selective checkpoint downloads and offline
-review through separate service, S3, host and worker containers:
+review through separate service, S3, host and worker containers. Its reusable
+asset phase also checks deferred addition, local upload, output import without
+an extra S3 object, portable sidecars, worker downloads, and hosted provenance:
 
 ```sh
 python3 -B tests/containers/service_workflow.py

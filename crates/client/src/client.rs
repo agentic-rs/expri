@@ -628,6 +628,72 @@ fn run_target(scope: &RunScope, path: &str) -> FileTarget {
   }
 }
 
+/// Inspect a file's pinned identity without requesting a download URL or payload.
+pub fn file_metadata(config: &Path, target: &FileTarget) -> Result<FileRecord> {
+  validate_target(target)?;
+  let Response::File { file } = Api::new(config)?.request(&Request::GetFile {
+    target: target.clone(),
+  })?
+  else {
+    return Err(message("service did not return file metadata"));
+  };
+  if file.target != *target {
+    return Err(message("service returned metadata for another file"));
+  }
+  if let Some(sha256) = &file.sha256 {
+    validate_digest(sha256)?;
+  }
+  Ok(file)
+}
+
+/// Publish a durable reusable input reference to completed output bytes.
+pub fn import_output(
+  config: &Path,
+  scope: &RunScope,
+  path: &str,
+  input_id: Option<&str>,
+  size: u64,
+  sha256: &str,
+) -> Result<FileRecord> {
+  validate_scope(scope)?;
+  crate::run_artifacts::validate_path(path)?;
+  if let Some(input_id) = input_id {
+    validate_component(input_id)?;
+  }
+  validate_digest(sha256)?;
+  let Response::File { file } = Api::new(config)?.request(&Request::ImportOutput {
+    scope: scope.clone(),
+    path: path.into(),
+    input_id: input_id.map(str::to_string),
+    size,
+    sha256: sha256.into(),
+  })?
+  else {
+    return Err(message("service did not return an imported output"));
+  };
+  let target_matches = matches!(&file.target, FileTarget::Input {
+    project_id, input_id: returned,
+  } if project_id == &scope.project_id && input_id.is_none_or(|expected| returned == expected));
+  let producer = OutputProducer {
+    origin: scope.origin.clone(),
+    run_id: scope.run_id.clone(),
+    path: path.into(),
+  };
+  if !target_matches
+    || file.size != size
+    || file.sha256.as_deref() != Some(sha256)
+    || !matches!(file.storage, FileStorage::Object)
+    || file
+      .provenance
+      .as_ref()
+      .is_none_or(|value| value.producer != producer)
+  {
+    return Err(message("service returned an inconsistent imported output"));
+  }
+  validate_target(&file.target)?;
+  Ok(file)
+}
+
 /// Create an identity-pinned reference; the service performs no object transfer.
 pub fn reference(options: super::ReferenceOptions) -> Result<Value> {
   let source: FileTarget = serde_json::from_str(&options.source)?;

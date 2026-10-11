@@ -144,6 +144,7 @@ pub(in crate::client) fn fetch_objects(
         },
         size,
         sha256: Some(digest.into()),
+        provenance: None,
         storage: FileStorage::Object,
       },
     );

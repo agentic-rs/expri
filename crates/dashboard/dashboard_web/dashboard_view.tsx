@@ -4,6 +4,7 @@ import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
 import { ProjectStorageManagement } from "./storage_management_view";
 import { RunArchivalPanel } from "./run_archival_view";
+import { RunAssets } from "./dashboard_assets";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
   MAX_RUN_COLUMNS,
@@ -905,6 +906,7 @@ function Overview({ detail }: { detail: Detail | null }) {
               )}
             </section>
           </div>
+          <RunAssets detail={detail} />
           <section className="card">
             <h3>Metric summaries</h3>
             {detail.metrics_error && <p className="notice error">{detail.metrics_error}</p>}

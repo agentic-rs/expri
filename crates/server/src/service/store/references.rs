@@ -76,6 +76,8 @@ impl<S: ObjectStorage> Store<S> {
           "reference destination already exists with another object",
         ));
       }
+      // Return the canonical destination, including its original provenance.
+      record = previous;
     } else {
       let live: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM streams WHERE target=?1) OR EXISTS(SELECT 1 FROM uploads WHERE target=?1 AND complete=0)",

@@ -10,7 +10,7 @@ pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
 pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 pub const RUN_PUBLISHING_CAPABILITY: &str = "run-publishing-v1";
-pub const ASSETS_CAPABILITY: &str = "assets-v1";
+pub const ASSETS_CAPABILITY: &str = "assets-v2";
 
 #[derive(Debug, Subcommand)]
 pub enum NodeCommand {

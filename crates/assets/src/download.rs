@@ -11,8 +11,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-  Descriptor, Source, cache_file, check_cancelled, directories, inspect, message, open,
-  optional_regular, sync_directory, unchanged,
+  DESCRIPTOR_VERSION, Descriptor, Identity, Source, cache_file, check_cancelled, directories,
+  inspect, message, open, optional_regular, sync_directory, unchanged,
 };
 use crate::error::{ExpriError, Result};
 use crate::lock::{FileLock, LockAttempt};
@@ -32,6 +32,9 @@ pub fn resolve(
   check_cancelled(cancelled)?;
   match source {
     Source::Expri { .. } => private_download(repo, source, None, client_config, cancelled),
+    Source::Local => Err(message(
+      "local assets must be added from an existing local file",
+    )),
     _ => http::resolve(repo, source, cancelled),
   }
 }
@@ -49,6 +52,24 @@ pub fn ensure(
   if verified(&destination, descriptor.size, &descriptor.sha256, cancelled)? {
     return Ok(destination);
   }
+  if !matches!(descriptor.source, Source::Local)
+    && let Some(availability) = &descriptor.availability
+    && client_config.is_some()
+  {
+    match private_download(
+      repo,
+      &Source::Expri {
+        input_id: availability.input_id.clone(),
+      },
+      Some(descriptor),
+      client_config,
+      cancelled,
+    ) {
+      Ok(_) => return Ok(destination),
+      Err(ExpriError::DownloadCancelled) => return Err(ExpriError::DownloadCancelled),
+      Err(_) => check_cancelled(cancelled)?,
+    }
+  }
   match &descriptor.source {
     Source::Expri { .. } => {
       private_download(
@@ -59,9 +80,21 @@ pub fn ensure(
         cancelled,
       )?;
     }
-    _ => {
-      http::ensure(repo, descriptor, cancelled)?;
+    Source::Local => {
+      let availability = descriptor.availability.as_ref().ok_or_else(|| message(
+        "local asset is not cached on this machine; upload it to expri before using it on another worker",
+      ))?;
+      private_download(
+        repo,
+        &Source::Expri {
+          input_id: availability.input_id.clone(),
+        },
+        Some(descriptor),
+        client_config,
+        cancelled,
+      )?;
     }
+    _ => http::ensure(repo, descriptor, cancelled)?,
   }
   Ok(destination)
 }
@@ -69,12 +102,10 @@ pub fn ensure(
 #[derive(Deserialize)]
 struct ClientEndpoint {
   url: String,
+  project_id: Option<String>,
 }
 
-fn matching_client(source: &Source, client_config: Option<&Path>) -> Result<PathBuf> {
-  let Source::Expri { url, .. } = source else {
-    return Err(message("asset source is not an expri input"));
-  };
+fn matching_client(client_config: Option<&Path>) -> Result<(PathBuf, String, String)> {
   let path = client_config.ok_or_else(|| {
     message("private assets require --client-config or the worker's service client config")
   })?;
@@ -93,18 +124,25 @@ fn matching_client(source: &Source, client_config: Option<&Path>) -> Result<Path
     toml::from_str(text).map_err(|_| message("cannot read service client endpoint"))?;
   let actual =
     reqwest::Url::parse(&config.url).map_err(|_| message("invalid service client endpoint"))?;
-  let expected = reqwest::Url::parse(url).map_err(|_| message("invalid expri asset endpoint"))?;
-  if actual != expected
+  if !matches!(actual.scheme(), "http" | "https")
+    || actual.host_str().is_none()
+    || actual.path() != "/"
     || !actual.username().is_empty()
     || actual.password().is_some()
     || actual.query().is_some()
     || actual.fragment().is_some()
   {
     return Err(message(
-      "service client endpoint does not match the private asset server",
+      "private asset client endpoint must be an HTTP(S) origin without credentials",
     ));
   }
-  Ok(path)
+  let project_id = config.project_id.ok_or_else(|| {
+    message(
+      "private assets require project_id in the ignored .expri/config.toml client configuration",
+    )
+  })?;
+  crate::service::validate_component(&project_id)?;
+  Ok((path, project_id, actual.origin().ascii_serialization()))
 }
 
 fn private_download(
@@ -114,16 +152,11 @@ fn private_download(
   client_config: Option<&Path>,
   cancelled: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<Descriptor> {
-  let config = matching_client(source, client_config)?;
-  let Source::Expri {
-    project_id,
-    input_id,
-    ..
-  } = source
-  else {
+  let (config, project_id, endpoint) = matching_client(client_config)?;
+  let Source::Expri { input_id } = source else {
     return Err(message("asset source is not an expri input"));
   };
-  let staging = transfer_directory(repo, source, expected)?;
+  let staging = transfer_directory_scoped(repo, source, expected, Some((&endpoint, &project_id)))?;
   directories(&staging)?;
   let _lease = lease(&staging.join(".asset.lock"), cancelled)?;
   if let Some(expected) = expected {
@@ -143,7 +176,7 @@ fn private_download(
     cancelled,
     &mut |path, report, cancelled| {
       let descriptor = Descriptor {
-        version: 1,
+        version: DESCRIPTOR_VERSION,
         source: source.clone(),
         size: report["size"]
           .as_u64()
@@ -152,6 +185,13 @@ fn private_download(
           .as_str()
           .ok_or_else(|| message("private asset record has no SHA256 digest"))?
           .to_string(),
+        availability: None,
+        producer: report
+          .get("producer")
+          .filter(|value| !value.is_null())
+          .map(|value| serde_json::from_value(value.clone()))
+          .transpose()
+          .map_err(|_| message("private asset producer is invalid"))?,
       };
       descriptor.validate()?;
       if let Some(expected) = expected
@@ -166,17 +206,7 @@ fn private_download(
       Ok(())
     },
   )
-  .map_err(|error| match error {
-    ExpriError::ServiceRejected { status, .. } => {
-      message(format!("private asset server returned HTTP {status}"))
-    }
-    ExpriError::ServiceUnavailable { .. } => {
-      message("private asset service is unavailable; retry to resume saved progress")
-    }
-    ExpriError::Json(_) => message("private asset response or transfer receipt is invalid"),
-    ExpriError::Toml(_) => message("private asset service client configuration is invalid"),
-    error => error,
-  })?;
+  .map_err(private_error)?;
   // The verified content cache owns the bytes after preparation; retain only
   // small transfer receipts, rather than a second full private-input copy.
   let temporary = staging.join("file");
@@ -188,13 +218,118 @@ fn private_download(
   result.ok_or_else(|| message("private asset download did not prepare a file"))
 }
 
+/// Adopt existing bytes offline without changing their inode or permissions.
+pub fn adopt(
+  repo: &Path,
+  path: &Path,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Descriptor> {
+  let (size, sha256) = digest(path, cancelled)?;
+  let descriptor = Descriptor {
+    version: DESCRIPTOR_VERSION,
+    source: Source::Local,
+    size,
+    sha256,
+    availability: None,
+    producer: None,
+  };
+  publish(repo, path, &descriptor, cancelled)?;
+  Ok(descriptor)
+}
+
+/// Pin identity through metadata only. No payload bytes are downloaded or cached.
+pub fn resolve_metadata(
+  _repo: &Path,
+  source: &Source,
+  supplied: Option<&Identity>,
+  client_config: Option<&Path>,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Descriptor> {
+  source.validate()?;
+  if let Some(identity) = supplied {
+    identity.validate()?;
+  }
+  check_cancelled(cancelled)?;
+  match source {
+    Source::Local => Err(message(
+      "local assets already have payload bytes; add the local file",
+    )),
+    Source::Expri { input_id } => {
+      let (config, project_id, _) = matching_client(client_config)?;
+      let target = expri_core::service::FileTarget::Input {
+        project_id,
+        input_id: input_id.clone(),
+      };
+      let record = crate::service::file_metadata(&config, &target).map_err(private_error)?;
+      if record.target != target
+        || !matches!(record.storage, expri_core::service::FileStorage::Object)
+      {
+        return Err(message(
+          "private asset metadata does not identify the requested immutable input",
+        ));
+      }
+      let identity = Identity {
+        size: record.size,
+        sha256: record
+          .sha256
+          .ok_or_else(|| message("private asset metadata has no SHA256"))?,
+      };
+      identity.validate()?;
+      if supplied.is_some_and(|supplied| *supplied != identity) {
+        return Err(message(
+          "private asset metadata does not match the supplied SHA256 and size",
+        ));
+      }
+      let descriptor = Descriptor {
+        version: DESCRIPTOR_VERSION,
+        source: source.clone(),
+        size: identity.size,
+        sha256: identity.sha256,
+        availability: None,
+        producer: record.provenance.map(|value| value.producer),
+      };
+      descriptor.validate()?;
+      check_cancelled(cancelled)?;
+      Ok(descriptor)
+    }
+    _ => http::resolve_metadata(source, supplied, cancelled),
+  }
+}
+
+fn private_error(error: ExpriError) -> ExpriError {
+  match error {
+    ExpriError::ServiceRejected { status, .. } => {
+      message(format!("private asset server returned HTTP {status}"))
+    }
+    ExpriError::ServiceUnavailable { .. } => {
+      message("private asset service is unavailable; retry to resume saved progress")
+    }
+    ExpriError::Json(_) => message("private asset response or transfer receipt is invalid"),
+    ExpriError::Toml(_) => message("private asset service client configuration is invalid"),
+    error => error,
+  }
+}
+
 /// Internal staging identity only; the descriptor has a single content SHA256.
 fn transfer_directory(
   repo: &Path,
   source: &Source,
   expected: Option<&Descriptor>,
 ) -> Result<PathBuf> {
-  let identity = serde_json::to_vec(&(source, expected.map(|value| (&value.sha256, value.size))))?;
+  transfer_directory_scoped(repo, source, expected, None)
+}
+
+fn transfer_directory_scoped(
+  repo: &Path,
+  source: &Source,
+  expected: Option<&Descriptor>,
+  private_scope: Option<(&str, &str)>,
+) -> Result<PathBuf> {
+  let identity = serde_json::to_vec(&(
+    source,
+    expected.map(|value| (&value.sha256, value.size)),
+    private_scope,
+  ))?;
   let key = hex(&Sha256::digest(identity));
   Ok(repo.join(".expri/assets/.transfers").join(key))
 }

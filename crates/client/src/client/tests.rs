@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use super::super::InputDownloadOptions;
 use super::*;
 
+mod asset_imports;
 mod checkpoints;
 
 struct HttpRequest {
@@ -152,6 +153,7 @@ fn upload_projects_completed_status_from_the_server_receipt() {
             target: run_target(&scope, "run-state.json"),
             size: 10,
             sha256: None,
+            provenance: None,
             storage: FileStorage::Tracking {
               revision: 7,
               sealed: true,
@@ -180,6 +182,7 @@ fn upload_projects_completed_status_from_the_server_receipt() {
               target: run_target(&scope, "result.zip"),
               size: 22,
               sha256: Some("a".repeat(64)),
+              provenance: None,
               storage: FileStorage::Object,
             }),
             last_error: None,
@@ -552,6 +555,7 @@ fn assert_core_sync_without_inventory(linked_outputs: bool) {
             target: run_target(&expected_scope, "run-state.json"),
             size: state.len() as u64,
             sha256: Some(fs::hex(&Sha256::digest(state))),
+            provenance: None,
             storage: FileStorage::Object,
           },
         }
@@ -1061,6 +1065,7 @@ fn source_mutation_discards_acknowledged_parts_before_retrying_original_bytes() 
               target: expected.clone(),
               size: original.len() as u64,
               sha256: Some(fs::hex(&Sha256::digest(original))),
+              provenance: None,
               storage: FileStorage::Object,
             },
           }
@@ -1120,6 +1125,7 @@ fn private_input_digest_failure_preserves_old_file_and_signed_requests_have_no_b
     target: target.clone(),
     size: body.len() as u64,
     sha256: Some("a".repeat(64)),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let (url, task) = mock(3, move |request, origin| {
@@ -1195,6 +1201,7 @@ fn truncated_object_body_does_not_leak_signed_url_or_replace_previous_input() {
     },
     size: 15,
     sha256: Some("a".repeat(64)),
+    provenance: None,
     storage: FileStorage::Object,
   };
   // One catalog request, then three fresh signed URLs and failed Range requests.
@@ -1556,6 +1563,7 @@ fn publisher_reopens_offline_queue_and_observes_only_acknowledged_terminal_progr
             target: target.clone(),
             size: *size,
             sha256: Some(sha256.clone()),
+            provenance: None,
             storage: FileStorage::Object,
           },
         }
@@ -1664,6 +1672,7 @@ fn explicit_file_upload_reuses_completed_objects_even_without_a_local_queue() {
           target: expected.clone(),
           size: 8,
           sha256: Some(hash.clone()),
+          provenance: None,
           storage: FileStorage::Object,
         },
       })
@@ -1725,6 +1734,7 @@ fn explicit_file_upload_rejects_changes_while_checking_for_reuse() {
             target: expected.clone(),
             size: 8,
             sha256: Some(digest.clone()),
+            provenance: None,
             storage: FileStorage::Object,
           },
         })

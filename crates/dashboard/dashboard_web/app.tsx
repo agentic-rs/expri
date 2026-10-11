@@ -60,6 +60,7 @@ export * from "./interactive_charts";
 export * from "./auto_refresh";
 export * from "./dashboard_files";
 export * from "./dashboard_storage";
+export * from "./dashboard_assets";
 export * from "./storage_management";
 export * from "./live_updates";
 export * from "./run_archival";

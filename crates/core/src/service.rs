@@ -12,6 +12,8 @@ pub const MAX_REQUEST: usize = 1024 * 1024;
 pub struct ClientConfig {
   pub url: String,
   pub token_env: String,
+  #[serde(default)]
+  pub project_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -62,6 +64,27 @@ pub struct FileRecord {
   pub size: u64,
   pub sha256: Option<String>,
   pub storage: FileStorage,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub provenance: Option<AssetProvenance>,
+}
+
+/// Portable producer identity; deployment and project configuration stay local.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputProducer {
+  pub origin: String,
+  pub run_id: String,
+  pub path: String,
+}
+
+/// Captured metadata remains available after the producing run expires.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AssetProvenance {
+  pub producer: OutputProducer,
+  pub captured_at: String,
+  pub state: serde_json::Value,
+  pub snapshot: serde_json::Value,
+  pub environment: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -145,6 +168,15 @@ pub enum Request {
   ReferenceFile {
     source: FileTarget,
     target: FileTarget,
+    size: u64,
+    sha256: String,
+  },
+  /// Import a finalized run output as a reusable private input without copying bytes.
+  /// The server assigns an opaque input ID when one is not supplied. Owner-only.
+  ImportOutput {
+    scope: RunScope,
+    path: String,
+    input_id: Option<String>,
     size: u64,
     sha256: String,
   },

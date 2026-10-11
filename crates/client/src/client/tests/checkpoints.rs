@@ -170,6 +170,7 @@ impl Server {
                     target: target.clone(),
                     size: *size,
                     sha256: Some(sha256.clone()),
+                    provenance: None,
                     storage: FileStorage::Object,
                   },
                 }

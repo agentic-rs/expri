@@ -342,6 +342,7 @@ fn project_delete_rejects_stale_preview_and_preserves_foreign_references() {
     target: foreign.clone(),
     size: 7,
     sha256: Some("a".repeat(64)),
+    provenance: None,
     storage: FileStorage::Object,
   };
   let key = object_key(&input("project", "source"), "source-upload");
@@ -780,7 +781,7 @@ fn cleanup_failure_columns_migrate_existing_schema_three_without_losing_pending_
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
       .unwrap(),
-    4
+    5
   );
   backend.state.0.lock().unwrap().fail_delete = false;
   reopened

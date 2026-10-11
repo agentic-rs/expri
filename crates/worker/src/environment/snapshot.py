@@ -65,7 +65,7 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
       for name in source["paths"]
     ):
       raise RuntimeError(
-        "asset preparation requires assets-v1 on a native expri worker; "
+        "asset preparation requires assets-v2 on a native expri worker; "
         "upgrade expri on the target and use protocol = \"auto\" or \"expri-node\""
       )
     runs_dir = state_dir / "runs"

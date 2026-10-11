@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from "react";
+import { CopyAssetReference } from "./dashboard_assets";
+import { safeArtifactPath } from "./artifact_paths";
+export { safeArtifactPath } from "./artifact_paths";
 import {
   apiUrl,
   artifactScopeMatchesRun,
@@ -9,23 +12,6 @@ import {
   type ArtifactScope,
 } from "./dashboard_model";
 
-export function safeArtifactPath(path: string): boolean {
-  return (
-    path.startsWith("outputs/") &&
-    new TextEncoder().encode(path).length <= 1024 &&
-    !/[\\\u0000-\u001f\u007f-\u009f]/.test(path) &&
-    !path
-      .split("/")
-      .some(
-        (part) =>
-          part === "" ||
-          part.startsWith(".") ||
-          part === "cache" ||
-          part === "__pycache__" ||
-          part === "node_modules",
-      )
-  );
-}
 export function artifactCanSelect(
   file: ArtifactFile,
   scope: ArtifactScope | null,
@@ -173,6 +159,13 @@ export function artifactLabels(file: ArtifactFile): string[] {
     ? [...new Set(file.labels.filter((label) => label === "best" || label === "latest"))]
     : [];
 }
+export function artifactAssetIds(file: ArtifactFile): string[] {
+  if (!Array.isArray(file.assets) || file.assets.length > 16) return [];
+  return [...new Set(file.assets.flatMap((asset) =>
+    asset && typeof asset.input_id === "string" && /^[A-Za-z0-9._-]{1,96}$/.test(asset.input_id) &&
+      asset.input_id !== "." && asset.input_id !== ".." ? [asset.input_id] : [],
+  ))];
+}
 export function FilesPanel({
   catalog,
   source_id,
@@ -294,7 +287,8 @@ export function FilesPanel({
                 {visible.map((file) => {
                   const url = artifactDownloadUrl(file, source_id, run_id, pull_scope),
                     selectable = artifactCanSelect(file, pull_scope, source_id, run_id),
-                    checked = selected.includes(file.path);
+                    checked = selected.includes(file.path),
+                    asset_ids = artifactAssetIds(file);
                   return (
                     <tr key={file.path}>
                       <td className="selection-column">
@@ -317,6 +311,11 @@ export function FilesPanel({
                             ))}
                           </span>
                         )}
+                        {asset_ids.length > 0 && <div className="asset-producer-path">
+                          <small className="muted">Reusable as</small>
+                          <ul className="asset-relationships">{asset_ids.map((input_id) => <li key={input_id}><code>{input_id}</code></li>)}</ul>
+                          {Number.isSafeInteger(file.assets_count) && (file.assets_count ?? 0) > asset_ids.length && <small className="muted">Showing {asset_ids.length} of {file.assets_count} assets.</small>}
+                        </div>}
                       </th>
                       <td
                         className="number"
@@ -363,6 +362,7 @@ export function FilesPanel({
                                 : "Unavailable"}
                           </span>
                         )}
+                        {file.cloud === true && pull_scope && <CopyAssetReference producer={{ origin: pull_scope.origin, run_id: pull_scope.run_id, path: file.path }} />}
                       </td>
                     </tr>
                   );

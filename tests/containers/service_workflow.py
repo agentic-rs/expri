@@ -912,9 +912,9 @@ region = "us-east-1"
 path_style = true
 prefix = "acceptance"
 ''')
-    (state / 'owner.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_OWNER_TOKEN"\n')
-    (state / 'worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_WORKER_TOKEN"\n')
-    (state / 'machine-worker.toml').write_text('url = "http://proxy:8001"\ntoken_env = "EXPRI_MACHINE_TOKEN"\n')
+    (state / 'owner.toml').write_text('url = "http://proxy:8001"\nproject_id = "demo"\ntoken_env = "EXPRI_OWNER_TOKEN"\n')
+    (state / 'worker.toml').write_text('url = "http://proxy:8001"\nproject_id = "demo"\ntoken_env = "EXPRI_WORKER_TOKEN"\n')
+    (state / 'machine-worker.toml').write_text('url = "http://proxy:8001"\nproject_id = "demo"\ntoken_env = "EXPRI_MACHINE_TOKEN"\n')
     service = create('service', 'expri-ci-service', ['--config', '/tmp/server.toml', '--listen', '0.0.0.0:8787',
       '--data-dir', '/home/tester/state', '--create-bucket'], env=['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'EXPRI_OWNER_TOKEN', 'EXPRI_WORKER_TOKEN', 'EXPRI_MACHINE_TOKEN', 'EXPRI_DASHBOARD_PASSWORD'])
     copy(server_config, service, '/tmp/server.toml')
@@ -1183,6 +1183,38 @@ print(process.pid)
     run_retention_checks()
   with workflow_progress.phase('Storage statistics and durable project deletion'):
     storage_management_checks()
+  with workflow_progress.phase('Reusable assets: deferred add, local upload, and output import'):
+    asset_repo = '/home/tester/reusable-assets'
+    consumer_repo = '/home/tester/asset-consumer'
+    python(host, f"from pathlib import Path;p=Path({asset_repo!r});p.mkdir();(p/'.expri').mkdir();(p/'.expri/config.toml').write_text(Path('/tmp/owner.toml').read_text());(p/'local.bin').write_bytes(b'locally tracked asset')")
+    python(worker, f"from pathlib import Path;p=Path({consumer_repo!r});p.mkdir();(p/'.expri').mkdir();(p/'.expri/config.toml').write_text(Path('/tmp/worker.toml').read_text())")
+    def asset_command(container, repo, *args):
+      return json.loads(execute(container, 'expri', 'assets', *args, '--repo', repo, '--json').stdout)
+    declared = asset_command(host, asset_repo, 'add', 'expri://./inputs/dataset-v1', 'data/deferred.bin', '--no-download')
+    assert declared['size'] == len(b'private-input-fixture') * 1024
+    assert python(host, f"from pathlib import Path;print(Path({asset_repo!r}+'/data/deferred.bin').exists())") == 'False', 'deferred add downloaded the input'
+    local = asset_command(host, asset_repo, 'add', 'local.bin')
+    uploaded = asset_command(host, asset_repo, 'upload', 'local.bin', '--input-id', 'local-asset')['assets'][0]
+    assert uploaded['sha256'] == local['sha256'] and uploaded['input_id'] == 'local-asset'
+    reference = f'expri://./worker/{run_id}/outputs/checkpoint-1000.pt'
+    imported = asset_command(host, asset_repo, 'import', reference, 'models/base.pt', '--input-id', 'reusable-checkpoint')
+    assert imported['producer'] == {'origin': 'worker', 'run_id': run_id, 'path': 'outputs/checkpoint-1000.pt'}
+    assert asset_command(host, asset_repo, 'import', reference, 'models/base.pt')['reused'] is True
+    assert python(host, f"from pathlib import Path;print(Path({asset_repo!r}+'/models/base.pt').exists())") == 'False', 'output import downloaded the checkpoint'
+    versions = json.loads(execute(host, 'python3', '/tmp/s3_fixture.py', 'versions', '--prefix', 'acceptance/projects/demo/inputs/reusable-checkpoint/').stdout)
+    assert not versions['versions'], 'output import copied payload into a second S3 object'
+    assert all(item['reused'] for item in asset_command(host, asset_repo, 'upload')['assets']), 'already hosted assets were uploaded again'
+    for relative in ['local.bin', 'data/deferred.bin', 'models/base.pt']:
+      descriptor = python(host, f"from pathlib import Path;print(Path({asset_repo!r}+'/'+{relative!r}+'.expri.toml').read_text())")
+      assert 'project_id' not in descriptor and 'http://proxy' not in descriptor and 'token_env' not in descriptor, 'private context entered an asset descriptor'
+      python(worker, f"from pathlib import Path;p=Path({consumer_repo!r}+'/'+{relative!r}+'.expri.toml');p.parent.mkdir(parents=True,exist_ok=True);p.write_text({descriptor!r})")
+    downloaded = asset_command(worker, consumer_repo, 'download')['assets']
+    assert len(downloaded) == 3 and all(item['sha256'] for item in downloaded)
+    assert python(worker, f"from pathlib import Path;print(Path({consumer_repo!r}+'/local.bin').read_bytes()==b'locally tracked asset')") == 'True'
+    cookie = dashboard_login()
+    storage = browser_json('/api/storage?' + urlencode({'project_id': 'demo', 'kind': 'input', 'search': 'reusable-checkpoint'}), cookie)
+    assert storage['items'][0]['producer']['run_id'] == run_id, 'dashboard omitted imported output provenance'
+    browser('/logout', method='POST', cookie=cookie)
   with workflow_progress.phase('Offline asset training and local result review'):
     docker('stop', '--time', '1', service, s3)
     offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
