@@ -420,6 +420,83 @@ fn run_management_client_rejects_invalid_scope_and_mismatched_receipts() {
   task.join().unwrap();
 }
 
+#[test]
+fn run_annotations_client_uses_shared_service_values_and_validates_scope() {
+  let (_temporary, root) = root();
+  let scope = RunScope {
+    project_id: "vision".into(),
+    origin: "gpu-1".into(),
+    run_id: "run-1".into(),
+  };
+  let expected = scope.clone();
+  let mut index = 0;
+  let (url, task) = mock(2, move |request, _| {
+    let operation: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(operation["scope"], json!(expected));
+    assert_eq!(
+      operation["action"],
+      if index == 0 {
+        "set_run_annotations"
+      } else {
+        "run_annotations"
+      }
+    );
+    if index == 0 {
+      assert_eq!(operation["nickname"], "Baseline");
+      assert_eq!(operation["tags"], json!(["model-a", "baseline"]));
+    }
+    index += 1;
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::RunAnnotations {
+        annotations: expri_core::service::RunAnnotations {
+          scope: expected.clone(),
+          nickname: Some("Baseline".into()),
+          tags: vec!["model-a".into(), "baseline".into()],
+        },
+      })
+      .unwrap(),
+    )
+  });
+  let config_path = config(&root, &url);
+  let saved = set_run_annotations(
+    &config_path,
+    &scope,
+    Some("Baseline".into()),
+    vec!["model-a".into(), "baseline".into()],
+  )
+  .unwrap();
+  assert_eq!(saved, run_annotations(&config_path, &scope).unwrap());
+  task.join().unwrap();
+
+  let expected = scope.clone();
+  let (url, task) = mock(1, move |_, _| {
+    let mut foreign = expected.clone();
+    foreign.origin = "gpu-2".into();
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::RunAnnotations {
+        annotations: expri_core::service::RunAnnotations {
+          scope: foreign,
+          nickname: None,
+          tags: vec![],
+        },
+      })
+      .unwrap(),
+    )
+  });
+  let config_path = config(&root, &url);
+  assert!(
+    run_annotations(&config_path, &scope)
+      .unwrap_err()
+      .to_string()
+      .contains("another run")
+  );
+  task.join().unwrap();
+}
+
 fn mark_synced_metadata(queue: &mut Queue, scope: &RunScope, run_dir: &Path, paths: &[&str]) {
   for (index, path) in paths.iter().enumerate() {
     let mut file = fs::open(&run_dir.join(path)).unwrap();

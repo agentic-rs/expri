@@ -4,6 +4,7 @@ import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
 import { ProjectStorageManagement } from "./storage_management_view";
 import { RunArchivalPanel } from "./run_archival_view";
+import { RunAnnotationsPanel, RunTags } from "./run_annotations_view";
 import { RunAssets } from "./dashboard_assets";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
@@ -27,6 +28,7 @@ import {
   runIdentity,
   runKeyLabel,
   runLabel,
+  runNickname,
   localTimeZoneLabel,
   type ArtifactCatalog,
   type Comparison,
@@ -55,6 +57,8 @@ export type DashboardUi = {
   archival_confirming: boolean;
   archival_busy: boolean;
   archival_error: string | null;
+  annotations_busy: boolean;
+  annotations_error: string | null;
   project_catalog_note: string | null;
   refreshing: boolean;
   controls_disabled: boolean;
@@ -125,6 +129,7 @@ export type DashboardActions = {
   archival_confirm: () => void;
   archival_cancel: () => void;
   archival_mutate: (action: ArchivalAction) => void;
+  annotations_save: (nickname: string | null, tags: string[]) => void;
   filter: (field: "search" | "task" | "status" | "origin", value: string) => void;
   clear_filters: () => void;
   run_column: (column: RunColumn, checked: boolean) => void;
@@ -691,12 +696,14 @@ function RunBrowser({
                   <td className="run-cell">
                     <button
                       type="button"
-                      className="run-link"
+                      className={`run-link${runNickname(run) ? " has-nickname" : ""}`}
                       disabled={s.list_busy}
                       onClick={() => a.inspect_run(identity)}
                     >
-                      {run.run_id}
+                      {runNickname(run) ?? run.run_id}
                     </button>
+                    {runNickname(run) && <div className="run-meta run-identifier">{run.run_id}</div>}
+                    <RunTags run={run} />
                     <div className="run-task">{run.task ?? "No task recorded"}</div>
                     <div className="run-meta">{metadata.join(" · ")}</div>
                     {run.archival && run.archival.status !== "active" && <div className="run-meta">
@@ -789,17 +796,23 @@ function RunBrowser({
               : "Select runs to compare"}
           </p>
           <div id="selected-runs" className="selected-runs">
-            {s.selected.map((id) => (
+            {s.selected.map((id) => {
+              const run = s.runs.find((item) => runIdentity(item) === id) ??
+                s.comparison?.comparison.runs.find((item) => runIdentity(item.run) === id)?.run ??
+                (s.detail && runIdentity(s.detail.run) === id ? s.detail.run : null);
+              const label = run ? runLabel(run) : runKeyLabel(id);
+              return (
               <button
                 type="button"
                 className="selection-chip"
                 key={id}
-                aria-label={`Remove ${runKeyLabel(id)} from comparison`}
+                aria-label={`Remove ${label} from comparison`}
                 onClick={() => a.select_run(id, false)}
               >
-                {runKeyLabel(id)} ×
+                {label} ×
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>
         <div className="selection-actions">
@@ -1009,7 +1022,11 @@ function ComparisonValues({ result, busy }: { result: Comparison | null; busy: b
             <tbody>
               {comparison.runs.map((run) => (
                 <tr key={run.run_id}>
-                  <th scope="row">{runLabel(run.run)}</th>
+                  <th scope="row">
+                    <span className={runNickname(run.run) ? "run-nickname" : undefined}>{runNickname(run.run) ?? runKeyLabel(runIdentity(run.run))}</span>
+                    {runNickname(run.run) && <div className="run-meta run-identifier">{runKeyLabel(runIdentity(run.run))}</div>}
+                    <RunTags run={run.run} />
+                  </th>
                   {comparison.metric_names.map((name) => {
                     const point = run.values[name];
                     return (
@@ -1110,6 +1127,10 @@ function ReviewWorkspace({
 }) {
   const tabs: ReviewTab[] = ["charts", "overview", "logs", "files"];
   const available: ReviewTab[] = s.review?.kind === "compare" ? ["charts"] : tabs;
+  const review_run = s.review?.kind === "run" ? (
+    s.detail && runIdentity(s.detail.run) === s.review.run_ids[0] ? s.detail.run :
+      s.runs.find((run) => runIdentity(run) === s.review?.run_ids[0])
+  ) : null;
   return (
     <div className="review-workspace">
       <section id="review-empty" className="review-empty" hidden={!s.review_empty}>
@@ -1126,11 +1147,13 @@ function ReviewWorkspace({
             <p id="review-eyebrow" className="eyebrow">
               {s.review?.kind === "compare" ? "Experiment comparison" : "Run details"}
             </p>
-            <h2 id="review-title">
+            <h2 id="review-title" className={review_run && runNickname(review_run) ? "has-nickname" : undefined}>
               {s.review?.kind === "compare"
                 ? `${s.review.run_ids.length} runs`
-                : runKeyLabel(s.review?.run_ids[0] ?? "")}
+                : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
+            {review_run && runNickname(review_run) && <p className="run-meta run-identifier">{runKeyLabel(runIdentity(review_run))}</p>}
+            {review_run && <RunTags run={review_run} />}
           </div>
           <button
             id="close-review"
@@ -1144,6 +1167,7 @@ function ReviewWorkspace({
         </div>
         {s.access_mode === "hosted" && s.review?.kind === "run" && (
           <>
+            <RunAnnotationsPanel snapshot={s} actions={a} />
             <RunArchivalPanel snapshot={s} actions={a} />
             <ResultUploadSummary detail={s.detail} />
           </>

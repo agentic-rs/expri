@@ -533,6 +533,44 @@ pub fn run_archival(config: &Path, scope: &RunScope) -> Result<Value> {
   )
 }
 
+pub fn run_annotations(config: &Path, scope: &RunScope) -> Result<Value> {
+  annotations_request(
+    config,
+    scope,
+    Request::RunAnnotations {
+      scope: scope.clone(),
+    },
+  )
+}
+
+pub fn set_run_annotations(
+  config: &Path,
+  scope: &RunScope,
+  nickname: Option<String>,
+  tags: Vec<String>,
+) -> Result<Value> {
+  annotations_request(
+    config,
+    scope,
+    Request::SetRunAnnotations {
+      scope: scope.clone(),
+      nickname,
+      tags,
+    },
+  )
+}
+
+fn annotations_request(config: &Path, scope: &RunScope, request: Request) -> Result<Value> {
+  validate_scope(scope)?;
+  let Response::RunAnnotations { annotations } = Api::new(config)?.request(&request)? else {
+    return Err(message("service did not return run annotations"));
+  };
+  if annotations.scope != *scope {
+    return Err(message("service returned annotations for another run"));
+  }
+  serde_json::to_value(annotations).map_err(Into::into)
+}
+
 fn run_management(config: &Path, scope: &RunScope, request: Request) -> Result<Value> {
   validate_scope(scope)?;
   let Response::RunArchival { archival } = Api::new(config)?.request(&request)? else {

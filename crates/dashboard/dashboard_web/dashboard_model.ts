@@ -40,12 +40,20 @@ export type Run = {
   started_at: string | null;
   finished_at: string | null;
   exit_code: number | null;
+  nickname?: string | null;
+  tags?: string[];
+  annotations?: RunAnnotations | null;
   archival?: RunArchival | null;
   table_values?: {
     params: Record<string, RunTableValue>;
     metrics: Record<string, number | null>;
   };
   table_values_truncated?: boolean;
+};
+export type RunAnnotations = {
+  scope: RunDeepLink;
+  nickname: string | null;
+  tags: string[];
 };
 export type RunArchival = {
   scope: RunDeepLink;
@@ -154,8 +162,18 @@ export type ArtifactCatalog = {
 export function runIdentity(run: Pick<Run, "run_id" | "run_key">): string {
   return run.run_key ?? run.run_id;
 }
-export function runLabel(run: Pick<Run, "run_id" | "origin">): string {
-  return run.origin ? `${run.run_id} · ${run.origin}` : run.run_id;
+export function runNickname(run: Pick<Run, "nickname" | "annotations">): string | null {
+  const nickname = run.annotations ? run.annotations.nickname : run.nickname;
+  return typeof nickname === "string" && nickname.length > 0 ? nickname : null;
+}
+export function runTags(run: Pick<Run, "tags" | "annotations">): string[] {
+  const tags = run.annotations ? run.annotations.tags : run.tags;
+  return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === "string") : [];
+}
+export function runLabel(run: Pick<Run, "run_id" | "origin" | "nickname" | "annotations">): string {
+  const identity = run.origin ? `${run.run_id} · ${run.origin}` : run.run_id;
+  const nickname = runNickname(run);
+  return nickname ? `${nickname} (${identity})` : identity;
 }
 export function runKeyLabel(run_key: string): string {
   const run = parseProjectRunKey(run_key);

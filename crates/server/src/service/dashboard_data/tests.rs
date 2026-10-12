@@ -13,6 +13,21 @@ use crate::service::types::{Request, Response as ApiResponse};
 mod projects;
 
 #[test]
+fn run_previews_keep_complete_bounded_editor_values_when_metadata_is_truncated() {
+  let tags: Vec<_> = (b'a'..=b'p')
+    .map(|suffix| format!("{}{}", "😀".repeat(47), suffix as char))
+    .collect();
+  let annotations = json!({"scope":{"project_id":"project","origin":"worker","run_id":"run"},"nickname":"😀".repeat(128),"tags":tags});
+  let run = json!({"annotations":annotations,"nickname":annotations["nickname"],"tags":tags,"table_values": vec!["😀".repeat(512);16], "task":"x".repeat(512)});
+  let mut truncated = false;
+  let result = run_preview(&run, &mut truncated);
+  assert!(truncated);
+  assert_eq!(result["annotations"], annotations);
+  assert_eq!(result["nickname"], annotations["nickname"]);
+  assert_eq!(result["tags"], json!(tags));
+}
+
+#[test]
 fn hosted_chart_data_uses_tracking_projection_and_refreshes_appended_samples() {
   use crate::service::store::tests::MockStorage;
   let directory = tempfile::tempdir().unwrap();
@@ -327,7 +342,7 @@ fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_sto
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    5
+    6
   );
 }
 

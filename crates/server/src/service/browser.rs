@@ -205,7 +205,7 @@ fn route<S: ObjectStorage>(
     ("POST", "/api/projects/delete") => {
       return project_management::delete(dashboard, auth, allow_project_deletion, request);
     }
-    ("POST", "/api/runs/archive" | "/api/runs/restore") => {
+    ("POST", "/api/runs/archive" | "/api/runs/restore" | "/api/runs/annotations") => {
       return run_management::mutate(dashboard, auth, allow_run_management, request);
     }
     _ if !matches!(method, "GET" | "HEAD") => {

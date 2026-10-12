@@ -114,7 +114,11 @@ impl<S: ObjectStorage> Store<S> {
   pub(super) fn ensure_request_runs(&self, request: &Request) -> ApiResult<()> {
     let mut targets = Vec::new();
     let scope = match request {
-      Request::ArchiveRun { .. } | Request::RestoreRun { .. } | Request::RunArchival { .. } => {
+      Request::ArchiveRun { .. }
+      | Request::RestoreRun { .. }
+      | Request::RunArchival { .. }
+      | Request::RunAnnotations { .. }
+      | Request::SetRunAnnotations { .. } => {
         return Ok(());
       }
       Request::BeginUpload { target, .. }
@@ -376,6 +380,11 @@ impl<S: ObjectStorage> Store<S> {
       tx.execute(&format!("DELETE FROM {table} WHERE scope=?1"), [&encoded])
         .map_err(database)?;
     }
+    tx.execute(
+      "DELETE FROM run_annotations WHERE project_id=?1 AND origin=?2 AND run_id=?3",
+      scope_params(scope),
+    )
+    .map_err(database)?;
     // Other runs and private inputs may reference the same object; keep those objects intact.
     tx.execute("UPDATE run_cleanup_tasks SET done=1,kind='preserved' WHERE project_id=?1 AND origin=?2 AND run_id=?3 AND kind='object' AND (EXISTS(SELECT 1 FROM files WHERE object_key=run_cleanup_tasks.value) OR EXISTS(SELECT 1 FROM uploads WHERE object_key=run_cleanup_tasks.value))",scope_params(scope)).map_err(database)?;
     refresh(&tx, scope)?;
