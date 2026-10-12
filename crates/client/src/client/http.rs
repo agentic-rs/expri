@@ -62,7 +62,7 @@ impl Api {
         .map_err(|_| message("cannot initialize service HTTP client"))
     };
     Ok(Self {
-      endpoint: format!("{}/v1/request", config.url.trim_end_matches('/')),
+      endpoint: format!("{}/v1/request", url.as_str().trim_end_matches('/')),
       token,
       control: build(Duration::from_secs(30))?,
       objects: build(Duration::from_secs(900))?,
@@ -126,7 +126,12 @@ impl Api {
         detail: self.redact(&detail),
       });
     }
-    serde_json::from_slice(&bytes).map_err(Into::into)
+    serde_json::from_slice(&bytes).map_err(|error| {
+      message(format!(
+        "invalid service response: {}",
+        self.redact(&error.to_string())
+      ))
+    })
   }
 
   pub(super) fn signed_url(&self, request: Request) -> Result<String> {
@@ -146,4 +151,4 @@ impl Api {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::client) mod tests;

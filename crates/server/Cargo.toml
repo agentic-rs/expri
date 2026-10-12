@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 expri-core.workspace = true
+expri-system.workspace = true
 expri-runs.workspace = true
 expri-dashboard.workspace = true
 attohttpc.workspace = true

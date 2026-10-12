@@ -4,6 +4,7 @@ pub(super) mod fs;
 mod http;
 mod inventory;
 mod queue;
+mod system_profile;
 #[cfg(test)]
 pub(super) mod tests;
 mod tracking;
@@ -26,6 +27,7 @@ use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
 pub use download::{fetch, input_download, input_download_prepared};
+pub use system_profile::SystemProfileClient;
 pub use watch::fetch as fetch_files;
 
 pub(super) fn validate_config(path: &Path) -> Result<()> {

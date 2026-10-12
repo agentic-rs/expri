@@ -22,6 +22,7 @@ prints an embedded Markdown guide and works without project configuration.
 | `expri skill assets` | Pin datasets/models or reuse a producing run's output |
 | `expri skill environment` | Prepare uv, check base-package reuse, or prune |
 | `expri skill service` | Publish runs or fetch results from an existing service |
+| `expri skill system` | Collect machine inventory/utilization and inspect system history |
 
 ## Essential behavior
 

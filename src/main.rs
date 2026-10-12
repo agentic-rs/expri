@@ -13,6 +13,7 @@ mod runs;
 mod runs_cli;
 mod service;
 mod skill_cli;
+mod system_cli;
 
 use expri_assets as assets;
 use expri_core::{error, filter, lock, protocol};
@@ -57,6 +58,8 @@ struct Cli {
 enum Command {
   /// Print progressive agent guidance, with deeper instructions by topic.
   Skill(skill_cli::SkillCommand),
+  /// Collect and inspect machine system profiles in global expri storage.
+  System(system_cli::SystemCommand),
   /// Import, download, update, and inspect Git-tracked asset descriptors.
   Assets(assets_cli::AssetsCommand),
   /// Push source and configuration changes to a worker checkout.
@@ -255,6 +258,7 @@ fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
     Command::Skill(command) => skill_cli::run(command),
+    Command::System(command) => system_cli::run(command, cli.target.as_deref()),
     Command::Assets(command) => assets_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Push(command) => push_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Fetch(command) => fetch_cli::run(command, cli.target.as_deref(), cli.quiet),

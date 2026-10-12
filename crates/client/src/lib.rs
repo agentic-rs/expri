@@ -9,6 +9,7 @@ pub mod options;
 pub mod publishing;
 pub mod registrations;
 
+pub use client::SystemProfileClient;
 pub use client::{fetch_files, file_metadata, import_output, input_download_prepared};
 pub use options::*;
 pub use types::validate_component;
