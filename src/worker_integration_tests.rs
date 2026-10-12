@@ -195,6 +195,7 @@ impl Fixture {
     let request = RunRequest {
       service: None,
       detach: false,
+      smoke: false,
       name: "train".to_string(),
       command: vec![
         "python".to_string(),

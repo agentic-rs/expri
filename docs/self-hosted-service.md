@@ -733,6 +733,19 @@ archived; a running or incompletely received run must finish publishing its
 authoritative run state first. Archiving does not stop training or create a ZIP.
 `expri service upload` remains the server's result ZIP upload command.
 
+Launch smoke tests with `expri run --smoke TASK`, or add `--detach` before the
+task name for background execution. A configured environment is required. The
+run records `smoke: true` and receives a generated `smoke-run-…` ID; the name
+alone never enables archival. On an updated server, a complete terminal
+run-state publication from the managed publisher automatically archives a smoke
+run, including `failed`, `cancelled`, or `lost` runs. The 15-day period starts
+when the server receives that state. Publishing can finish during retention,
+and worker/laptop run files remain in place. Automatic archival happens once
+per run: restoring it keeps it active through later metadata updates and
+publisher retries. You can still archive it manually afterward. Raw legacy
+object uploads do not trigger this policy. `--no-publish` keeps the smoke mark locally without
+automatic server archival.
+
 On the primary hosted dashboard, use **Archive** on a finished run. Select the
 **Archived** view to review its deadline or **Restore** it before that deadline.
 Restoring returns the run to the normal list and cancels retention. Archiving an

@@ -54,6 +54,44 @@ fn request_list() -> RunQueryRequest {
 }
 
 #[test]
+fn catalog_preserves_boolean_smoke_marks_without_inferring_them_from_ids() {
+  let (_directory, root) = fixture();
+  let runs = root.join(".expri/runs");
+  for (run_id, smoke) in [
+    ("marked", Some(json!(true))),
+    ("explicit-false", Some(json!(false))),
+    ("typed", Some(json!("true"))),
+    ("number", Some(json!(1))),
+    ("null", Some(Value::Null)),
+    ("smoke-run-unmarked", None),
+  ] {
+    let mut saved = state(run_id, "running", "2026-10-12T00:00:00Z");
+    if let Some(smoke) = smoke {
+      saved["smoke"] = smoke;
+    }
+    run(&runs, run_id, Some(&saved));
+  }
+  let report = parity(&root, &request_list(), false);
+  for record in report["runs"].as_array().unwrap() {
+    match record["run_id"].as_str().unwrap() {
+      "marked" => assert_eq!(record["smoke"], true),
+      "explicit-false" => assert_eq!(record["smoke"], false),
+      _ => assert!(record.get("smoke").is_none()),
+    }
+  }
+  let warnings = report["warnings"].as_array().unwrap();
+  for invalid in ["typed", "number", "null"] {
+    assert!(warnings.iter().any(|warning| warning["run_id"] == invalid
+      && warning["message"].as_str().unwrap().contains("smoke")));
+  }
+  assert!(
+    !warnings
+      .iter()
+      .any(|warning| warning["run_id"] == "smoke-run-unmarked")
+  );
+}
+
+#[test]
 fn catalog_preserves_explicit_machine_identity_without_inferring_legacy_records() {
   let (_directory, root) = fixture();
   let runs = root.join(".expri/runs");

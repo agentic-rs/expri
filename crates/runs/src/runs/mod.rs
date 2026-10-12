@@ -314,6 +314,13 @@ fn record_from_state(run_id: &str, state: Option<Value>) -> Record {
         );
         return;
       }
+      if let Some(smoke) = object.get("smoke") {
+        if let Some(smoke) = smoke.as_bool() {
+          summary["smoke"] = json!(smoke);
+        } else {
+          field_warning(&mut warnings, run_id, "smoke");
+        }
+      }
       if let Some(machine_id) = object.get("machine_id").filter(|value| !value.is_null()) {
         if let Some(machine_id) = machine_id
           .as_str()

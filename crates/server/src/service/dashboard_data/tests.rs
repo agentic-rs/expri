@@ -925,6 +925,7 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
   let scope = Fixture::scope("run-machine");
   let state = json!({
     "schema_version": 1, "run_id": scope.run_id, "machine_id": "machine-physical",
+    "smoke": true,
     "task": "train", "status": "running", "started_at": "2026-10-03T01:00:00Z",
   });
   fixture.run_file(
@@ -939,7 +940,7 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
     .unwrap();
   let version = record.sha256.clone().unwrap();
   fixture.store.dashboard_cache_overview(&scope, &version, &json!({
-    "overview_schema": 1,
+    "overview_schema": OVERVIEW_SCHEMA_VERSION - 1,
     "run": {"run_id": scope.run_id, "task": "train", "status": "running", "started_at": state["started_at"]},
     "task_filter": "train", "metadata_truncated": false, "warnings": [],
   })).unwrap();
@@ -949,6 +950,7 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
     .list("hosted:project:worker", None, None, None, 20, 0)
     .unwrap();
   assert_eq!(rows["runs"][0]["machine_id"], "machine-physical");
+  assert_eq!(rows["runs"][0]["smoke"], true);
   assert_eq!(
     fixture.backend.objects.lock().unwrap().requests.len(),
     1,
@@ -961,6 +963,7 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
     .unwrap();
   assert_eq!(cached["overview_schema"], OVERVIEW_SCHEMA_VERSION);
   assert_eq!(cached["run"]["machine_id"], "machine-physical");
+  assert_eq!(cached["run"]["smoke"], true);
   assert_eq!(
     fixture
       .store

@@ -3005,6 +3005,22 @@ function annotatedRun(run_id, options = {}) {
   return { ...run, nickname: null, tags: [], annotations: { scope: run.archival.scope, nickname: null, tags: [] } };
 }
 
+test("smoke badges follow explicit metadata rather than run ID prefixes", async t => {
+  const runs = [
+    { ...annotatedRun("run-marked"), smoke: true },
+    annotatedRun("smoke-run-unmarked"),
+    { ...annotatedRun("smoke-run-false"), smoke: false },
+    { ...annotatedRun("run-invalid"), smoke: "true" },
+  ];
+  const { nodes } = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs });
+  const rows = [...nodes.get("run-rows").children];
+  assert.equal(rows[0].querySelector(".run-smoke")?.textContent, "Smoke");
+  for (const row of rows.slice(1)) assert.equal(row.querySelector(".run-smoke"), null);
+  await click(runButton(nodes, 0));
+  await settled(() => nodes.get("review-section").hidden === false);
+  assert.equal(nodes.get("review-section").querySelector(".inspector-meta .run-smoke")?.textContent, "Smoke");
+});
+
 test("history limits tag badges while keeping every tag accessible in inspection", async t => {
   const run = annotatedRun("tagged-run");
   run.tags = ["baseline", "vision", "resnet-50", "validated", "published"];

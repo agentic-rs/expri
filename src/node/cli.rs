@@ -10,6 +10,7 @@ pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
 pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 pub const RUN_PUBLISHING_CAPABILITY: &str = "run-publishing-v1";
+pub const SMOKE_RUNS_CAPABILITY: &str = "smoke-runs-v1";
 pub const ASSETS_CAPABILITY: &str = "assets-v2";
 
 #[derive(Debug, Subcommand)]
@@ -105,6 +106,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     DURABLE_RUNS_CAPABILITY,
     RUN_METRICS_CAPABILITY,
     RUN_PUBLISHING_CAPABILITY,
+    SMOKE_RUNS_CAPABILITY,
     ASSETS_CAPABILITY,
     expri_core::run_system::RUN_SYSTEM_CAPABILITY,
   ];

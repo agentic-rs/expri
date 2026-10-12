@@ -453,6 +453,12 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(database)?;
     transaction
       .execute(
+        "DELETE FROM smoke_run_archivals WHERE project_id=?1",
+        [project_id],
+      )
+      .map_err(database)?;
+    transaction
+      .execute(
         "DELETE FROM dashboard_run_activity WHERE project_id=?1",
         [project_id],
       )

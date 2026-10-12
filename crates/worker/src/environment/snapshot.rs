@@ -50,6 +50,8 @@ struct SourceFile {
 #[derive(Serialize)]
 struct SnapshotManifest<'a> {
   run_id: &'a str,
+  #[serde(skip_serializing_if = "is_false")]
+  smoke: bool,
   created_at: String,
   source: &'a SourceSelection,
   files: &'a [SourceFile],
@@ -69,6 +71,15 @@ pub fn create_expected(
   remote_managed: &[String],
   expected_sync: Option<&SyncIdentity>,
 ) -> Result<RunSnapshot> {
+  create_expected_with_smoke(repo_root, remote_managed, expected_sync, false)
+}
+
+pub fn create_expected_with_smoke(
+  repo_root: &Path,
+  remote_managed: &[String],
+  expected_sync: Option<&SyncIdentity>,
+  smoke: bool,
+) -> Result<RunSnapshot> {
   let repo_root =
     fs::canonicalize(repo_root).map_err(|source| io_context("resolve", repo_root, source))?;
   let state_dir = repo_root.join(".expri");
@@ -81,7 +92,7 @@ pub fn create_expected(
   let runs_dir = state_dir.join("runs");
   create_private_directory(&runs_dir)?;
   let temporary = tempfile::Builder::new()
-    .prefix("run-")
+    .prefix(if smoke { "smoke-run-" } else { "run-" })
     .tempdir_in(&runs_dir)?;
   let run_dir = temporary.path().to_path_buf();
   let run_id = run_dir
@@ -131,6 +142,7 @@ pub fn create_expected(
 
   let manifest = SnapshotManifest {
     run_id: &run_id,
+    smoke,
     created_at: Utc::now().to_rfc3339(),
     source: &source,
     files: &files,
@@ -147,6 +159,10 @@ pub fn create_expected(
     code_dir,
     assets,
   })
+}
+
+fn is_false(value: &bool) -> bool {
+  !*value
 }
 
 fn verify_sync_identity(state_dir: &Path, expected: &SyncIdentity) -> Result<()> {
@@ -984,10 +1000,20 @@ mod tests {
     remote_managed: &[String],
     expected_sync: Option<&SyncIdentity>,
   ) -> std::result::Result<serde_json::Value, String> {
+    python_snapshot_options(root, remote_managed, expected_sync, false)
+  }
+
+  #[cfg(unix)]
+  fn python_snapshot_options(
+    root: &Path,
+    remote_managed: &[String],
+    expected_sync: Option<&SyncIdentity>,
+    smoke: bool,
+  ) -> std::result::Result<serde_json::Value, String> {
     use std::io::Write;
     use std::process::Stdio;
     let script = format!(
-      "{}\nimport sys\nrequest = _snapshot_json.load(sys.stdin)\n_snapshot_json.dump(create_snapshot(request['repo_root'], request['remote_managed'], request.get('expected_sync')), sys.stdout)\n",
+      "{}\nimport sys\nrequest = _snapshot_json.load(sys.stdin)\n_snapshot_json.dump(create_snapshot(request['repo_root'], request['remote_managed'], request.get('expected_sync'), smoke=request['smoke']), sys.stdout)\n",
       include_str!("snapshot.py")
     );
     let mut child = Command::new("python3")
@@ -997,7 +1023,7 @@ mod tests {
       .stderr(Stdio::piped())
       .spawn()
       .expect("spawn Python snapshot");
-    let request = serde_json::json!({"repo_root": root, "remote_managed": remote_managed, "expected_sync": expected_sync});
+    let request = serde_json::json!({"repo_root": root, "remote_managed": remote_managed, "expected_sync": expected_sync, "smoke": smoke});
     child
       .stdin
       .take()
@@ -1009,6 +1035,33 @@ mod tests {
       return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
     Ok(serde_json::from_slice(&output.stdout).expect("Python snapshot JSON"))
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn smoke_snapshots_use_distinct_ids_and_explicit_marks_in_both_backends() {
+    let root = synced_repository("train.py\n");
+    fs::write(root.path().join("train.py"), "print('hello')").unwrap();
+    for smoke in [false, true] {
+      let native = create_expected_with_smoke(root.path(), &[], None, smoke).unwrap();
+      let python = python_snapshot_options(root.path(), &[], None, smoke).unwrap();
+      for run_dir in [
+        native.run_dir,
+        PathBuf::from(python["run_dir"].as_str().unwrap()),
+      ] {
+        let id = run_dir.file_name().unwrap().to_str().unwrap();
+        assert!(id.starts_with(if smoke { "smoke-run-" } else { "run-" }));
+        assert!(!id.ends_with('-'));
+        let manifest: serde_json::Value =
+          serde_json::from_slice(&fs::read(run_dir.join("snapshot.json")).unwrap()).unwrap();
+        assert_eq!(manifest["run_id"], id);
+        if smoke {
+          assert_eq!(manifest["smoke"], true);
+        } else {
+          assert!(manifest.get("smoke").is_none());
+        }
+      }
+    }
   }
 
   #[cfg(unix)]

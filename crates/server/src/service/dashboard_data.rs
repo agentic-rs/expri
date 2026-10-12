@@ -35,7 +35,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Version normalized run metadata independently of the unchanged artifact digest.
 // Schema 3 also preserves validated capture identity and completion metadata.
-const OVERVIEW_SCHEMA_VERSION: u64 = 3;
+const OVERVIEW_SCHEMA_VERSION: u64 = 4;
 
 struct MetricReadMode {
   minimum: usize,

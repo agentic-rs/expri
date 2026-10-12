@@ -53,6 +53,11 @@ import {
 } from "./dashboard_model";
 
 export type EmptyRuns = { title: string; message: string; setup: boolean };
+
+function RunSmokeMark({ run }: { run: Run }) {
+  return run.smoke === true ? <span className="run-tag run-smoke" title="Smoke run">Smoke</span> : null;
+}
+
 export type DashboardUi = {
   project_name: string;
   search: string;
@@ -740,6 +745,7 @@ function RunBrowser({
                     </button>
                     <div className="run-summary-meta">
                       {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
+                      <RunSmokeMark run={run} />
                       <RunTags run={run} limit={2} />
                     </div>
                     {run.archival && run.archival.status !== "active" && <div className="run-meta">
@@ -1078,6 +1084,7 @@ function ComparisonValues({ result, busy }: { result: Comparison | null; busy: b
                   <th scope="row">
                     <span className={runNickname(run.run) ? "run-nickname" : undefined}>{runNickname(run.run) ?? runKeyLabel(runIdentity(run.run))}</span>
                     {runNickname(run.run) && <div className="run-meta run-identifier">{runKeyLabel(runIdentity(run.run))}</div>}
+                    <RunSmokeMark run={run.run} />
                     <RunTags run={run.run} />
                   </th>
                   {comparison.metric_names.map((name) => {
@@ -1215,6 +1222,7 @@ function ReviewWorkspace({
               {review_run.origin && runNickname(review_run) && <span title="Machine"><span className="sr-only">Machine: </span>{review_run.origin}</span>}
               {review_run.started_at && <time dateTime={review_run.started_at} title="Started"><span className="sr-only">Started: </span>{dateText(review_run.started_at)}</time>}
               {review_run.finished_at && <span title="Duration"><span className="sr-only">Duration: </span>{formatDuration(review_run)}</span>}
+              <RunSmokeMark run={review_run} />
               <RunTags run={review_run} />
             </div>}
           </div>

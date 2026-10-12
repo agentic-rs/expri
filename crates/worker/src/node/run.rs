@@ -43,10 +43,11 @@ pub fn execute_request_at(
     service.validate()?;
   }
   environment::task_argv(&request.command)?;
-  let snapshot = environment::snapshot::create_expected(
+  let snapshot = environment::snapshot::create_expected_with_smoke(
     &repo_root,
     &request.remote_managed,
     request.expected_sync.as_ref(),
+    request.smoke,
   )?;
   let state_path = snapshot.run_dir.join("run-state.json");
   let mut state = json!({
@@ -69,6 +70,9 @@ pub fn execute_request_at(
       "producer": asset.descriptor.producer,
     })).collect::<Vec<_>>(),
   });
+  if request.smoke {
+    state["smoke"] = json!(true);
+  }
   if let Some(machine_id) = existing_machine_id() {
     state["machine_id"] = json!(machine_id);
   }
@@ -358,6 +362,9 @@ fn start_detached(
       {
         let current = read_record(&snapshot.run_dir.join("run-state.json"), 256 * 1024)?;
         let mut receipt = json!({"run_id": snapshot.run_id, "run_dir": snapshot.run_dir, "status": current["status"], "detached": true});
+        if request.smoke {
+          receipt["smoke"] = json!(true);
+        }
         if let Some(url) = request
           .service
           .as_ref()
@@ -457,6 +464,8 @@ pub fn worker(run_dir: &Path) -> Result<()> {
   if state["run_id"].as_str() != Some(run_id)
     || state["status"] != "preparing"
     || state["detached"] != true
+    || state.get("smoke").is_some_and(|value| !value.is_boolean())
+    || state["smoke"].as_bool().unwrap_or(false) != request.smoke
   {
     return Err(ExpriError::Message(
       "run is not awaiting a detached supervisor".to_string(),
@@ -709,6 +718,7 @@ mod tests {
       },
       service: None,
       detach: false,
+      smoke: false,
       remote_managed: vec![],
       extras: vec![],
       sync_args: vec![],

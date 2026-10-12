@@ -271,6 +271,13 @@ both task and publishing status; `--no-publish` disables it for one run.
 See [automatic publishing and worker credentials](docs/self-hosted-service.md#worker-uploads)
 for configuration, dashboard links, and resuming a stopped publisher.
 
+Use `expri run --smoke train --epochs 1` for a smoke test. This requires a
+configured environment and records an explicit smoke mark with a generated
+`smoke-run-…` ID. It also works with `--detach`. Once the finished run state
+reaches an updated server, the server automatically archives the run, including
+failed or cancelled runs, using the existing 15-day retention period. Local and
+worker run files remain available. The dashboard shows a **Smoke** badge.
+
 Each configured-environment run receives these variables:
 
 | Variable | Meaning |

@@ -2,7 +2,7 @@ use super::*;
 use crate::service::storage::CleanupResult;
 use crate::service::storage::ObjectMetadata;
 use crate::service::store::tests::{MockStorage, scope};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[derive(Default)]
 struct CleanupState {
@@ -65,17 +65,28 @@ impl ObjectStorage for Backend {
 }
 
 fn document(store: &Store<Backend>, scope: &RunScope, status: &str) {
-  let bytes = serde_json::to_vec(&json!({"run_id":scope.run_id,"status":status})).unwrap();
-  store
-    .execute(Request::PutDocument {
-      scope: scope.clone(),
-      path: "run-state.json".into(),
-      revision: 1,
-      offset: 0,
-      total_size: bytes.len() as u64,
-      data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-    })
-    .unwrap();
+  state_document(
+    store,
+    scope,
+    1,
+    json!({"run_id":scope.run_id,"status":status}),
+  );
+}
+
+fn state_document(store: &Store<Backend>, scope: &RunScope, revision: u64, value: Value) {
+  let bytes = serde_json::to_vec(&value).unwrap();
+  for (index, chunk) in bytes.chunks(STREAM_BATCH).enumerate() {
+    store
+      .execute(Request::PutDocument {
+        scope: scope.clone(),
+        path: "run-state.json".into(),
+        revision,
+        offset: (index * STREAM_BATCH) as u64,
+        total_size: bytes.len() as u64,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
+      })
+      .unwrap();
+  }
 }
 
 fn run_file(scope: &RunScope, path: &str) -> FileTarget {
@@ -122,6 +133,410 @@ fn drain(store: &Store<Backend>, at: i64) {
     }
   }
   panic!("run cleanup did not drain");
+}
+
+#[test]
+fn explicit_smoke_runs_archive_only_when_terminal() {
+  for status in [
+    "preparing",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+    "lost",
+  ] {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Backend::default()).unwrap();
+    state_document(
+      &store,
+      &scope(),
+      1,
+      json!({
+        "schema_version": 1, "run_id": scope().run_id, "status": status, "smoke": true,
+      }),
+    );
+    let terminal = matches!(status, "completed" | "failed" | "cancelled" | "lost");
+    let archival = store.run_archival(&scope()).unwrap();
+    assert_eq!(
+      archival.status,
+      if terminal { "archived" } else { "active" },
+      "{status}"
+    );
+    if terminal {
+      let archived_at =
+        DateTime::parse_from_rfc3339(archival.archived_at.as_deref().unwrap()).unwrap();
+      let delete_after =
+        DateTime::parse_from_rfc3339(archival.delete_after.as_deref().unwrap()).unwrap();
+      assert_eq!(
+        (delete_after - archived_at).num_seconds(),
+        RETENTION_SECONDS
+      );
+      assert_eq!(
+        store
+          .dashboard_project_runs_with_archival("project", None, 10, 0, false)
+          .unwrap()
+          .total_count,
+        0
+      );
+      assert_eq!(
+        store
+          .dashboard_project_runs_with_archival("project", None, 10, 0, true)
+          .unwrap()
+          .total_count,
+        1
+      );
+    }
+  }
+}
+
+#[test]
+fn smoke_archival_requires_an_explicit_valid_matching_state() {
+  let selected = RunScope {
+    run_id: "smoke-run-example".into(),
+    ..scope()
+  };
+  let valid =
+    json!({"schema_version":1,"run_id":selected.run_id,"status":"completed","smoke":true});
+  let mut invalid = Vec::new();
+  for marker in [json!(false), json!("true"), Value::Null] {
+    let mut value = valid.clone();
+    value["smoke"] = marker;
+    invalid.push(value);
+  }
+  let mut missing = valid.clone();
+  missing.as_object_mut().unwrap().remove("smoke");
+  invalid.push(missing);
+  let mut wrong_id = valid.clone();
+  wrong_id["run_id"] = json!("another-run");
+  invalid.push(wrong_id);
+  for schema in [json!(2), json!(-1), json!("1"), Value::Null] {
+    let mut value = valid.clone();
+    value["schema_version"] = schema;
+    invalid.push(value);
+  }
+  for value in invalid {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Backend::default()).unwrap();
+    state_document(&store, &selected, 1, value);
+    assert_eq!(store.run_archival(&selected).unwrap().status, "active");
+  }
+}
+
+#[test]
+fn large_complete_tracking_state_can_automatically_archive_a_smoke_run() {
+  let dir = tempfile::tempdir().unwrap();
+  let store = Store::open(dir.path(), Backend::default()).unwrap();
+  state_document(
+    &store,
+    &scope(),
+    1,
+    json!({
+      "schema_version": 1, "run_id": scope().run_id, "status": "failed", "smoke": true,
+      "error": "x".repeat(128 * 1024),
+    }),
+  );
+  let state = store.file(&run_file(&scope(), "run-state.json")).unwrap();
+  assert!(state.size > STATE_LIMIT);
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "archived");
+}
+
+#[test]
+fn smoke_archival_waits_for_complete_state_and_persists_with_publication() {
+  let dir = tempfile::tempdir().unwrap();
+  let backend = Backend::default();
+  let store = Store::open(dir.path(), backend.clone()).unwrap();
+  document(&store, &scope(), "running");
+  let bytes = serde_json::to_vec(
+    &json!({"schema_version":1,"run_id":scope().run_id,"status":"failed","smoke":true}),
+  )
+  .unwrap();
+  let split = bytes.len() / 2;
+  let total_size = bytes.len() as u64;
+  let batch = |offset: usize, payload: &[u8]| Request::PutDocument {
+    scope: scope(),
+    path: "run-state.json".into(),
+    revision: 2,
+    offset: offset as u64,
+    total_size,
+    data_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+  };
+  assert!(matches!(
+    store.execute(batch(0, &bytes[..split])).unwrap(),
+    Response::DocumentAcknowledged {
+      complete: false,
+      ..
+    }
+  ));
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+  let before = store
+    .dashboard_project_updates("project", &[(scope().run_id, scope())])
+    .unwrap();
+  assert!(matches!(
+    store.execute(batch(split, &bytes[split..])).unwrap(),
+    Response::DocumentAcknowledged { complete: true, .. }
+  ));
+  let archival = store.run_archival(&scope()).unwrap();
+  assert_eq!(archival.status, "archived");
+  let after = store
+    .dashboard_project_updates("project", &[(scope().run_id, scope())])
+    .unwrap();
+  assert_ne!(before["source_revision"], after["source_revision"]);
+  assert_ne!(
+    before["runs"][0]["metadata_revision"],
+    after["runs"][0]["metadata_revision"]
+  );
+  drop(store);
+  let store = Store::open(dir.path(), backend).unwrap();
+  assert_eq!(
+    store.run_archival(&scope()).unwrap().delete_after,
+    archival.delete_after
+  );
+  assert!(matches!(
+    store
+      .file(&run_file(&scope(), "run-state.json"))
+      .unwrap()
+      .storage,
+    FileStorage::Tracking { revision: 2, .. }
+  ));
+}
+
+#[test]
+fn smoke_retries_keep_the_deadline_and_do_not_undo_restoration() {
+  let dir = tempfile::tempdir().unwrap();
+  let backend = Backend::default();
+  let store = Store::open(dir.path(), backend.clone()).unwrap();
+  let mut value = json!({"schema_version":1,"run_id":scope().run_id,"status":"cancelled","smoke":true,"system_capture_status":"capturing"});
+  state_document(&store, &scope(), 1, value.clone());
+  let archival = store.run_archival(&scope()).unwrap();
+  state_document(&store, &scope(), 1, value.clone());
+  assert_eq!(
+    store.run_archival(&scope()).unwrap().delete_after,
+    archival.delete_after
+  );
+  value["system_capture_status"] = json!("complete");
+  state_document(&store, &scope(), 2, value.clone());
+  assert_eq!(
+    store.run_archival(&scope()).unwrap().delete_after,
+    archival.delete_after
+  );
+  assert_eq!(store.restore_run(&scope()).unwrap().status, "active");
+  state_document(&store, &scope(), 2, value.clone());
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+  value["system_capture_status"] = json!("incomplete");
+  value["system_capture_error"] = json!("collector stopped");
+  state_document(&store, &scope(), 3, value.clone());
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+  drop(store);
+  let store = Store::open(dir.path(), backend).unwrap();
+  state_document(&store, &scope(), 3, value.clone());
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+  value["status"] = json!("running");
+  state_document(&store, &scope(), 4, value.clone());
+  value["status"] = json!("completed");
+  state_document(&store, &scope(), 5, value);
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+  assert_eq!(store.archive_run(&scope()).unwrap().status, "archived");
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "archived");
+}
+
+#[test]
+fn additive_smoke_markers_preserve_schema_seven_run_data() {
+  let dir = tempfile::tempdir().unwrap();
+  let backend = Backend::default();
+  let store = Store::open(dir.path(), backend.clone()).unwrap();
+  document(&store, &scope(), "completed");
+  let original = store.file(&run_file(&scope(), "run-state.json")).unwrap();
+  store
+    .db()
+    .unwrap()
+    .execute_batch("DROP TABLE smoke_run_archivals; PRAGMA user_version=7;")
+    .unwrap();
+  drop(store);
+  let store = Store::open(dir.path(), backend).unwrap();
+  assert_eq!(
+    serde_json::to_value(store.file(&original.target).unwrap()).unwrap(),
+    serde_json::to_value(original).unwrap()
+  );
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+  assert_eq!(
+    store
+      .db()
+      .unwrap()
+      .query_row("SELECT COUNT(*) FROM smoke_run_archivals", [], |row| row
+        .get::<_, u64>(0))
+      .unwrap(),
+    0
+  );
+  state_document(
+    &store,
+    &scope(),
+    2,
+    json!({"schema_version":1,"run_id":scope().run_id,"status":"completed","smoke":true}),
+  );
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "archived");
+}
+
+#[test]
+fn project_deletion_removes_only_its_smoke_once_markers() {
+  let dir = tempfile::tempdir().unwrap();
+  let store = Store::open(dir.path(), Backend::default()).unwrap();
+  let other = RunScope {
+    project_id: "other-project".into(),
+    ..scope()
+  };
+  for selected in [&scope(), &other] {
+    state_document(
+      &store,
+      selected,
+      1,
+      json!({"schema_version":1,"run_id":selected.run_id,"status":"completed","smoke":true}),
+    );
+  }
+  let preview = store.preview_project_delete("project").unwrap();
+  store
+    .delete_project("project", &preview.revision, "project")
+    .unwrap();
+  let db = store.db().unwrap();
+  assert_eq!(
+    db.query_row(
+      "SELECT COUNT(*) FROM smoke_run_archivals WHERE project_id='project'",
+      [],
+      |row| row.get::<_, u64>(0)
+    )
+    .unwrap(),
+    0
+  );
+  assert_eq!(
+    db.query_row(
+      "SELECT COUNT(*) FROM smoke_run_archivals WHERE project_id='other-project'",
+      [],
+      |row| row.get::<_, u64>(0)
+    )
+    .unwrap(),
+    1
+  );
+}
+
+#[test]
+fn smoke_publication_failure_rolls_back_archival() {
+  let dir = tempfile::tempdir().unwrap();
+  let store = Store::open(dir.path(), Backend::default()).unwrap();
+  store.db().unwrap().execute_batch("CREATE TRIGGER fail_publication BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;").unwrap();
+  let bytes = serde_json::to_vec(
+    &json!({"schema_version":1,"run_id":scope().run_id,"status":"completed","smoke":true}),
+  )
+  .unwrap();
+  let request = Request::PutDocument {
+    scope: scope(),
+    path: "run-state.json".into(),
+    revision: 1,
+    offset: 0,
+    total_size: bytes.len() as u64,
+    data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+  };
+  assert_eq!(store.execute(request).unwrap_err().status, 500);
+  let db = store.db().unwrap();
+  assert_eq!(
+    db.query_row("SELECT COUNT(*) FROM run_retention", [], |row| row
+      .get::<_, u64>(0))
+      .unwrap(),
+    0
+  );
+  assert_eq!(
+    db.query_row("SELECT COUNT(*) FROM tracking_versions", [], |row| row
+      .get::<_, u64>(0))
+      .unwrap(),
+    0
+  );
+  assert_eq!(
+    db.query_row("SELECT COUNT(*) FROM smoke_run_archivals", [], |row| row
+      .get::<_, u64>(0))
+      .unwrap(),
+    0
+  );
+}
+
+#[test]
+fn automatically_archived_smoke_runs_keep_publishing_and_sealing() {
+  let dir = tempfile::tempdir().unwrap();
+  let backend = Backend::default();
+  let store = Store::open(dir.path(), backend.clone()).unwrap();
+  state_document(
+    &store,
+    &scope(),
+    1,
+    json!({"schema_version":1,"run_id":scope().run_id,"status":"completed","smoke":true}),
+  );
+  let bytes = b"last log line\n";
+  store
+    .execute(Request::AppendTracking {
+      scope: scope(),
+      path: "logs/stdout.log".into(),
+      offset: 0,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+    .unwrap();
+  publish(
+    &store,
+    &backend,
+    run_file(&scope(), "outputs/model.pt"),
+    "smoke-model",
+  );
+  assert!(matches!(
+    store
+      .execute(Request::SealRun {
+        scope: scope(),
+        documents: BTreeMap::from([("run-state.json".into(), 1)]),
+        streams: BTreeMap::from([("logs/stdout.log".into(), bytes.len() as u64)]),
+        incomplete: false,
+      })
+      .unwrap(),
+    Response::Archive { .. }
+  ));
+  assert_eq!(store.run_archival(&scope()).unwrap().status, "archived");
+}
+
+#[test]
+fn smoke_archival_is_scoped_and_ignores_other_documents() {
+  let dir = tempfile::tempdir().unwrap();
+  let store = Store::open(dir.path(), Backend::default()).unwrap();
+  let selected = scope();
+  let other_origin = RunScope {
+    origin: "another-worker".into(),
+    ..selected.clone()
+  };
+  let other_project = RunScope {
+    project_id: "another-project".into(),
+    ..selected.clone()
+  };
+  for other in [&other_origin, &other_project] {
+    document(&store, other, "completed");
+  }
+  let bytes = serde_json::to_vec(
+    &json!({"schema_version":1,"run_id":selected.run_id,"status":"completed","smoke":true}),
+  )
+  .unwrap();
+  store
+    .execute(Request::PutDocument {
+      scope: selected.clone(),
+      path: "snapshot.json".into(),
+      revision: 1,
+      offset: 0,
+      total_size: bytes.len() as u64,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+    .unwrap();
+  assert_eq!(store.run_archival(&selected).unwrap().status, "active");
+  state_document(
+    &store,
+    &selected,
+    1,
+    json!({"schema_version":1,"run_id":selected.run_id,"status":"completed","smoke":true}),
+  );
+  assert_eq!(store.run_archival(&selected).unwrap().status, "archived");
+  for other in [&other_origin, &other_project] {
+    assert_eq!(store.run_archival(other).unwrap().status, "active");
+  }
 }
 
 #[test]

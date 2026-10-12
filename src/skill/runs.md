@@ -26,6 +26,12 @@ reports publishing status when available. A detached run with an active record
 but no live supervisor is `lost`. Missing or incomplete records can yield
 warnings rather than a complete report.
 
+Smoke runs launched with `run --smoke` carry a `smoke` mark in local metadata
+and a generated `smoke-run-…` ID. The dashboard shows a Smoke badge. Finished
+published smoke runs are archived automatically on an updated server; use
+`expri query runs --archival archived --json` to include them. Local and worker
+inspection remains available during and after the server's 15-day retention.
+
 Logs default to stdout and its last 100 lines. Following ends when the run
 finishes or its supervisor is lost. Interrupting the log reader leaves training
 running. For bounded agent inspection, start with a tail rather than a follow.

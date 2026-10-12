@@ -133,8 +133,16 @@ impl Fixture {
   }
 
   fn start(&self, mode: &str, preparing: bool) -> Value {
+    self.start_with_smoke(mode, preparing, false)
+  }
+
+  fn start_with_smoke(&self, mode: &str, preparing: bool, smoke: bool) -> Value {
     let mut command = self.command();
-    command.args(["run", "--detach", "--json", "train", mode]);
+    command.args(["run", "--detach", "--json"]);
+    if smoke {
+      command.arg("--smoke");
+    }
+    command.args(["train", mode]);
     if preparing {
       command.env("EXPRI_TEST_PREPARE_BLOCK", "1");
     }
@@ -201,6 +209,154 @@ fn publishing_error(fixture: &Fixture, id: &str) -> Value {
     );
     thread::sleep(Duration::from_millis(25));
   }
+}
+
+fn only_run(fixture: &Fixture) -> PathBuf {
+  let mut runs = fs::read_dir(fixture.repo.join(".expri/runs")).unwrap();
+  let run = runs.next().unwrap().unwrap().path();
+  assert!(runs.next().is_none(), "fixture created more than one run");
+  run
+}
+
+fn record(run: &Path, name: &str) -> Value {
+  serde_json::from_slice(&fs::read(run.join(name)).unwrap()).unwrap()
+}
+
+fn assert_smoke_snapshot(run: &Path) -> String {
+  let id = run.file_name().unwrap().to_str().unwrap();
+  assert!(id.starts_with("smoke-run-"), "unexpected smoke ID: {id}");
+  assert!(id.len() > "smoke-run-".len());
+  for name in ["snapshot.json", "run-state.json"] {
+    let value = record(run, name);
+    assert_eq!(value["run_id"], id, "{name} identifies another run");
+    assert_eq!(value["smoke"], true, "{name} lost the smoke marker");
+  }
+  id.to_owned()
+}
+
+#[test]
+fn foreground_smoke_runs_keep_the_marker_and_local_results_after_finishing() {
+  for (mode, preparation_fails, exit_code, status) in [
+    ("success", false, 0, "completed"),
+    ("finish", false, 7, "failed"),
+    ("success", true, 43, "failed"),
+  ] {
+    let fixture = Fixture::new();
+    fixture.enable_service_with_missing_client();
+    let mut command = fixture.command();
+    command.args(["run", "--smoke", "train", mode]);
+    if preparation_fails {
+      command.env("EXPRI_TEST_PREPARE_FAIL", "1");
+    }
+    let output = command.output().unwrap();
+    assert_eq!(output.status.code(), Some(exit_code));
+    let run = only_run(&fixture);
+    let id = assert_smoke_snapshot(&run);
+    let report = publishing_error(&fixture, &id);
+    assert_eq!(report["status"], status);
+    assert_eq!(report["state"]["smoke"], true);
+    assert_eq!(report["state"]["exit_code"], exit_code);
+    assert!(run.join("publishing-request.json").is_file());
+    assert!(run.join("logs/stdout.log").is_file());
+    assert!(run.join("logs/stderr.log").is_file());
+    assert_eq!(run.join("outputs/model.pt").exists(), !preparation_fails);
+    let shown: Value =
+      serde_json::from_slice(&fixture.run(&["runs", "show", &id, "--json"]).stdout).unwrap();
+    assert_eq!(shown["state"]["smoke"], true);
+    assert_eq!(shown["run"]["status"], status);
+    assert!(
+      run.is_dir(),
+      "finishing a smoke run removed its local files"
+    );
+  }
+}
+
+#[test]
+fn detached_smoke_receipts_and_worker_requests_preserve_the_marker() {
+  for (mode, status, exit_code) in [("success", "completed", 0), ("finish", "failed", 7)] {
+    let fixture = Fixture::new();
+    let receipt = fixture.start_with_smoke(mode, false, true);
+    assert_eq!(receipt["smoke"], true);
+    let run = Path::new(receipt["run_dir"].as_str().unwrap());
+    let id = assert_smoke_snapshot(run);
+    assert_eq!(receipt["run_id"], id);
+    assert_eq!(record(run, "run-request.json")["smoke"], true);
+    let report = terminal(&fixture, &id);
+    assert_eq!(report["status"], status);
+    assert_eq!(report["state"]["smoke"], true);
+    assert_eq!(report["state"]["exit_code"], exit_code);
+    assert_eq!(
+      fs::read(run.join("outputs/model.pt")).unwrap(),
+      b"checkpoint"
+    );
+    assert!(
+      run.is_dir(),
+      "finishing a smoke run removed its local files"
+    );
+  }
+}
+
+#[test]
+fn cancelled_smoke_runs_remain_available_on_the_worker() {
+  let fixture = Fixture::new();
+  let receipt = fixture.start_with_smoke("graceful", false, true);
+  let run = Path::new(receipt["run_dir"].as_str().unwrap());
+  let id = assert_smoke_snapshot(run);
+  await_file(&run.join("outputs/started"));
+  fixture.run(&["runs", "cancel", &id]);
+  let report = terminal(&fixture, &id);
+  assert_eq!(report["status"], "cancelled");
+  assert_eq!(report["state"]["smoke"], true);
+  assert_eq!(report["state"]["exit_code"], 130);
+  assert!(run.join("code/train.py").is_file());
+  assert!(run.join("outputs/started").is_file());
+  assert_eq!(
+    fixture.run(&["runs", "logs", &id]).stdout,
+    b"first\x00\xff\n"
+  );
+}
+
+#[test]
+fn smoke_requires_an_environment_before_starting_a_run() {
+  let fixture = Fixture::new();
+  fs::write(
+    fixture.repo.join("expri.toml"),
+    "[tasks]\ntrain=['python3', 'train.py']\n",
+  )
+  .unwrap();
+  let output = fixture
+    .command()
+    .args(["run", "--smoke", "train", "success"])
+    .output()
+    .unwrap();
+  assert!(!output.status.success());
+  assert!(
+    String::from_utf8_lossy(&output.stderr).contains("--smoke requires a configured environment"),
+    "{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert!(!fixture.repo.join(".expri/runs").exists());
+}
+
+#[test]
+fn ordinary_runs_keep_their_existing_id_and_metadata_shape() {
+  let fixture = Fixture::new();
+  let receipt = fixture.start("success", false);
+  let run = Path::new(receipt["run_dir"].as_str().unwrap());
+  let id = receipt["run_id"].as_str().unwrap();
+  assert!(id.starts_with("run-"));
+  assert!(receipt.get("smoke").is_none());
+  assert_eq!(terminal(&fixture, id)["status"], "completed");
+  for name in ["snapshot.json", "run-state.json", "run-request.json"] {
+    assert!(
+      record(run, name).get("smoke").is_none(),
+      "{name} changed its existing shape"
+    );
+  }
+  assert_eq!(
+    fs::read(run.join("outputs/model.pt")).unwrap(),
+    b"checkpoint"
+  );
 }
 
 #[test]
