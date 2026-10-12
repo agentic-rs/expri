@@ -15,7 +15,7 @@ token = "your-server-token"
 ```
 
 Run `expri config server set --url URL --token-stdin` with the token supplied
-through stdin. It writes private configuration atomically and preserves existing
+through a pipe or redirected file. It writes private configuration atomically and preserves existing
 system-profile settings. `expri config server show` hides the token;
 `expri config server unset` removes only the connection. `EXPRI_STORAGE_DIR`
 overrides the global root; config commands also accept `--storage-dir`.

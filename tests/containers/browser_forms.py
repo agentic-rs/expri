@@ -268,7 +268,7 @@ def interactive_charts(browser, run_ids, prefix='workspace', check_security=Fals
   def chart_script(metric, script):
     return evaluate("const card = [...document.querySelector('#chart-preview').querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === arguments[0]); " + script, metric)
   def selector(metric, suffix):
-    return f'//*[@id="chart-preview"]//section[@data-interactive-chart][h2="{metric}"]{suffix}'
+    return f'//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="{metric}"]{suffix}'
   def pointer(metric, fraction, drag_to=None):
     browser.pointer(selector(metric, '//*[@data-chart-hit]'), fraction, drag_to, using='xpath')
   def keys(metric, text):
@@ -430,10 +430,10 @@ def time_axes(browser, run_ids, prefix='workspace'):
       else:
         assert 'UTC+08:00' not in row['text'] and 'UTC+8' not in row['text'], 'UTC tag retained the local display offset'
     assert not any(record['path'] in {'/api/chart-data', '/api/chart', '/api/run', '/api/compare'} for record in trace_records()[start:]), 'timezone tags refetched experiment data'
-  loss = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]'
+  loss = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
   chart_context(browser)
   for metric in ['loss', 'duplicate_probe']:
-    browser.click(f'//*[@id="chart-preview"]//section[@data-interactive-chart][h2="{metric}"]//button[code="' + run_ids[1] + '"]', using='xpath')
+    browser.click(f'//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="{metric}"]//button[code="' + run_ids[1] + '"]', using='xpath')
   for axis in ['elapsed', 'wall_clock']:
     choose(axis)
     full = state()
@@ -445,7 +445,7 @@ def time_axes(browser, run_ids, prefix='workspace'):
     assert full['range'] == full['domain'], 'axis switch reused an incompatible zoom range'
     assert full['hidden'] == [run_ids[1]], 'axis switch lost the hidden actual run ID'
     chart_context(browser)
-    duplicate = evaluate('''const card = [...document.querySelector('#chart-preview').querySelectorAll('section.card')].find(node => node.querySelector('h2')?.textContent === 'duplicate_probe');
+    duplicate = evaluate('''const card = document.querySelector('#chart-preview section[data-chart-metric="duplicate_probe"]');
       return {text: card.textContent, circles: card.querySelectorAll('circle.point').length, svgs: card.querySelectorAll('svg').length};''')
     assert duplicate['text'].count('3 of 3 samples omitted') == 2 and duplicate['circles'] == 0 and duplicate['svgs'] == 0, 'time chart invented a timestamp or plotted an entirely legacy series'
     assert 'No timestamped samples are available to plot' in duplicate['text'], 'empty time chart did not explain its missing samples'
@@ -480,7 +480,7 @@ def time_axes(browser, run_ids, prefix='workspace'):
   choose('step')
   chart_context(browser)
   for metric in ['loss', 'duplicate_probe']:
-    browser.click(f'//*[@id="chart-preview"]//section[@data-interactive-chart][h2="{metric}"]//button[code="' + run_ids[1] + '"]', using='xpath')
+    browser.click(f'//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="{metric}"]//button[code="' + run_ids[1] + '"]', using='xpath')
   assert state()['hidden'] == [] and state()['duplicate_hidden'] == [], 'returning to Step did not restore the visible comparison runs'
 
 
@@ -490,6 +490,29 @@ def remember_chart_preview(browser):
 
 def assert_chart_preview_cleaned(browser):
   wait_for(lambda: browser.call('POST', '/execute/sync', {'script': "return window.__acceptance_chart_preview.querySelectorAll('[data-interactive-chart], [data-chart-hit], [data-chart-run]').length;", 'args': []}) == 0, 'navigation left interactive controls in the previous chart preview')
+
+
+def login_layout(browser, width):
+  geometry = browser.call('POST', '/execute/sync', {'script': '''const bounds = node => {
+      const rect = node.getBoundingClientRect();
+      return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width};
+    };
+    const main = document.querySelector('.login-main');
+    const card = document.querySelector('.login-card');
+    const footer = main.querySelector('.deployment-revision');
+    return {viewport_width: innerWidth, page_width: document.documentElement.scrollWidth,
+      client_width: document.documentElement.clientWidth, main: bounds(main), card: bounds(card),
+      controls: [...card.querySelectorAll('input, button')].map(bounds), footer: footer ? bounds(footer) : null};''', 'args': []})
+  assert geometry['viewport_width'] == width, f'login viewport is not {width} CSS pixels wide'
+  assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px login overflows horizontally'
+  if width < 500:
+    assert geometry['card']['width'] >= geometry['main']['width'] * 0.75, f'{width}px login form is squeezed by deployment metadata'
+  for control in geometry['controls']:
+    assert control['left'] >= 0 and control['right'] <= geometry['client_width'] + 1, f'{width}px native login control is clipped'
+    assert control['width'] >= geometry['card']['width'] * 0.65, f'{width}px native login control is too narrow'
+  if footer := geometry['footer']:
+    assert footer['top'] >= geometry['card']['bottom'] - 1, 'preview deployment metadata displaces the login form'
+    assert footer['left'] >= 0 and footer['right'] <= geometry['client_width'] + 1, f'{width}px preview login metadata overflows'
 
 
 def forms():
@@ -512,6 +535,10 @@ def forms():
     POLICY_OVERRIDE.unlink()
     browser.navigate('/login')
     assert trace_records()[-1]['referrer_policy'] == 'same-origin', 'login policy does not preserve same-origin forms'
+    for width in [1440, 360, 320]:
+      browser.set_viewport(width, 1000 if width >= 500 else 800)
+      login_layout(browser, width)
+    browser.set_viewport(1440, 1000)
     start = len(trace_records())
     browser.login()
     posted_since(start, '/login', ORIGIN, 303)
@@ -703,10 +730,13 @@ def project_storage(run_id=None):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelector('#workspace-view-storage') !== null;"), 'hosted project did not offer its Storage page')
+    assert evaluate("return !!document.querySelector('#project-options')?.closest('.topbar');"), 'project switching is not in the header'
+    evaluate("window.__storage_history = document.querySelector('#run-rows'); window.__storage_chart = document.querySelector('#chart-preview');")
     start = len(trace_records())
     browser.click('#workspace-view-storage + span')
     wait_for(lambda: evaluate("return document.querySelector('#storage-kind-input')?.checked && document.querySelectorAll('#storage-rows tr').length === 2;"), 'project Storage did not show both completed private inputs')
     assert evaluate("return document.querySelector('#workspace-view-storage').checked;"), 'Storage tag did not select the project page in one click'
+    assert evaluate("return document.querySelector('#workspace-page').hidden === false && document.querySelector('.run-history').getClientRects().length > 0 && document.querySelector('#run-rows') === window.__storage_history;"), 'Storage hid or replaced the full run history'
     inputs = evaluate('''return [...document.querySelectorAll('#storage-rows tr')].map(row => ({
       id: row.querySelector('th code')?.textContent,
       size: row.querySelector('.number')?.textContent,
@@ -760,55 +790,121 @@ def project_storage(run_id=None):
         return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
       });'''), 'narrow Storage controls are clipped'
       capture('workspace-storage-narrow')
-    browser.click('#workspace-view-workspace + span')
-    assert evaluate("return document.querySelector('#workspace-view-workspace').checked;"), 'Storage could not return to the project workspace'
+    if run_id:
+      browser.click(f'#run-rows tr[data-run-key="worker:{run_id}"] .run-link')
+      wait_for(lambda: evaluate("return document.querySelector('#workspace-view-workspace').checked && !document.querySelector('#run-workspace').hidden;"), 'opening history from Storage did not return to inspection')
+      assert evaluate("return document.querySelector('#run-rows') === window.__storage_history && document.querySelector('#chart-preview') === window.__storage_chart;"), 'opening history from Storage replaced the run list or chart node'
+    else:
+      browser.click('#workspace-view-workspace + span')
+      assert evaluate("return document.querySelector('#workspace-view-workspace').checked;"), 'Storage could not return to the project workspace'
     print('Firefox Storage passed: project inputs before runs, authenticated input bytes, completed output inventory, native tags, search, and narrow layout.' if run_id else 'Firefox input-only Storage passed: project discovery before runs, private input bytes, and empty run outputs.', flush=True)
   finally:
     browser.close()
 
 
+def status_bar_layout(browser, width):
+  geometry = browser.call('POST', '/execute/sync', {'script': '''const bounds = node => {
+      const rect = node.getBoundingClientRect();
+      return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom};
+    };
+    const bar = document.querySelector('footer.workspace-status-bar');
+    return {viewport_width: innerWidth, viewport_height: innerHeight,
+      client_width: document.documentElement.clientWidth, bar: bounds(bar),
+      controls: ['#refresh-button', '.auto-refresh', '#updated-at', '.deployment-revision']
+        .map(selector => ({selector, node: bar.querySelector(selector)}))
+        .filter(item => item.node?.getClientRects().length)
+        .map(item => ({selector: item.selector, ...bounds(item.node)}))};''', 'args': []})
+  assert geometry['viewport_width'] == width, f'status bar viewport is not {width} CSS pixels wide'
+  bar = geometry['bar']
+  assert bar['left'] >= 0 and bar['right'] <= geometry['client_width'] + 1, f'{width}px status bar overflows horizontally'
+  assert bar['top'] >= 0 and bar['bottom'] <= geometry['viewport_height'] + 1, f'{width}px status bar is outside the viewport'
+  for control in geometry['controls']:
+    assert control['left'] >= bar['left'] - 1 and control['right'] <= bar['right'] + 1, f'{width}px status bar clips {control["selector"]} horizontally'
+    assert control['top'] >= bar['top'] - 1 and control['bottom'] <= bar['bottom'] + 1, f'{width}px status bar clips {control["selector"]} vertically'
+  return geometry
+
+
 def workspace_layout(browser, width, wide=False):
+  status_bar_layout(browser, width)
   geometry = browser.call('POST', '/execute/sync', {'script': '''window.scrollTo(0, 0);
     const bounds = selector => {
       const rect = document.querySelector(selector).getBoundingClientRect();
       return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
         width: rect.width, height: rect.height};
     };
+    const grid = document.querySelector('.workspace-grid');
     const table = document.querySelector('#runs-region');
-    return {viewport_width: innerWidth, page_width: document.documentElement.scrollWidth,
+    const headers = [...table.querySelectorAll('thead th')];
+    const column_classes = ['selection-column', 'run-column', 'status-column',
+      ...(table.querySelector('.machine-column') ? ['machine-column'] : []),
+      'task-column', 'started-column'];
+    return {viewport_width: innerWidth, viewport_height: innerHeight, page_width: document.documentElement.scrollWidth,
       client_width: document.documentElement.clientWidth, grid: bounds('.workspace-grid'),
       runs: bounds('.runs-card'), review: bounds('.review-workspace'),
+      has_review: grid.classList.contains('has-review'), has_wide_table: grid.classList.contains('has-wide-table'),
+      gap: parseFloat(getComputedStyle(grid).columnGap),
+      columns: {builtins_match: column_classes.every((name, index) => headers[index]?.classList.contains(name)),
+        header_count: headers.length, builtin_count: column_classes.length,
+        custom_count: Number(table.querySelector('table').dataset.columnCount),
+        run: bounds('#run-rows .run-cell'), selection: bounds('#run-rows .selection-column'),
+        status: bounds('#run-rows .status-column'), region: bounds('#runs-region'),
+        row_counts: [...table.querySelectorAll('tbody tr')].map(row => row.children.length)},
       table: {client_width: table.clientWidth, scroll_width: table.scrollWidth, scroll_left: table.scrollLeft}};''', 'args': []})
   assert geometry['viewport_width'] == width, f'layout viewport is not {width} CSS pixels wide'
   assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px workspace overflows horizontally'
   runs, review = geometry['runs'], geometry['review']
-  if width >= 860:
+  if wide:
+    assert geometry['has_wide_table'], f'{width}px project or selected columns lost their table layout'
+  if width > 1000:
+    assert geometry['grid']['bottom'] <= geometry['viewport_height'] + 1, f'{width}px workspace extends below the viewport and clips pane scrolling'
     assert runs['right'] <= review['left'] + 1, f'{width}px Runs and Review are not side by side'
     assert abs(runs['top'] - review['top']) <= 1, f'{width}px Review is displaced below Runs'
-    if wide:
-      expected = min(geometry['grid']['width'] * 0.44, 520)
-      assert abs(runs['width'] - expected) <= 1, f'{width}px expanded Runs sidebar has unexpected width'
-      minimum_review_width = 500 if width >= 1024 else 400
-      assert review['width'] >= minimum_review_width, f'{width}px expanded Runs sidebar leaves Review too narrow'
+    available = geometry['grid']['width'] - geometry['gap']
+    assert abs(runs['width'] + review['width'] - available) <= 1, f'{width}px split panels leave unused workspace'
+    assert 280 <= runs['width'] <= 420, f'{width}px history pane is not a readable, compact run browser'
+    assert review['width'] > runs['width'], f'{width}px Review does not have room for inspecting charts'
   else:
     assert runs['bottom'] <= review['top'] + 1, f'{width}px Runs and Review are not stacked'
+    assert abs(runs['width'] - geometry['grid']['width']) <= 1, f'{width}px Runs does not use the full workspace'
+    assert abs(review['width'] - geometry['grid']['width']) <= 1, f'{width}px stacked Review does not use the full workspace'
+  columns = geometry['columns']
+  assert columns['builtins_match'], 'run table lost Run, adjacent Status, Machine, Task, or Started columns'
+  expected_columns = columns['builtin_count'] + columns['custom_count']
+  assert columns['header_count'] == expected_columns, 'run table omitted built-in or selected column headings'
+  assert all(count == expected_columns for count in columns['row_counts']), 'run rows do not align with their column headings'
+  if width > 1000 and geometry['table']['scroll_left'] == 0:
+    assert columns['status']['right'] <= columns['region']['left'] + geometry['table']['client_width'] + 1, 'desktop Run status is outside the visible table'
   assert geometry['table']['client_width'] <= runs['width'] + 1, f'{width}px table escapes its Runs panel'
   return geometry
 
 
 def table_scroll_contained(browser, width):
-  before = workspace_layout(browser, width, wide=width >= 860)
+  before = workspace_layout(browser, width, wide=True)
   assert before['table']['scroll_width'] > before['table']['client_width'], f'{width}px selected columns do not scroll within Runs'
   browser.call('POST', '/execute/sync', {'script': '''const table = document.querySelector('#runs-region');
     table.scrollLeft = table.scrollWidth;''', 'args': []})
   try:
-    after = workspace_layout(browser, width, wide=width >= 860)
+    after = workspace_layout(browser, width, wide=True)
     assert after['table']['scroll_left'] > 0, f'{width}px table could not scroll to its later columns'
+    run, selection, region = after['columns']['run'], after['columns']['selection'], after['columns']['region']
+    assert run['left'] >= selection['right'] - 1, f'{width}px pinned run identity overlaps row selection'
+    assert run['right'] <= region['right'] + 1, f'{width}px pinned run identity escapes its table'
+    assert abs(run['left'] - before['columns']['run']['left']) <= 1, f'{width}px horizontal scrolling hides the pinned run identity'
     assert after['page_width'] == before['page_width'], f'{width}px table scrolling widened the page'
+    assert all(abs(after['runs'][key] - before['runs'][key]) <= 1 for key in before['runs']), f'{width}px table scrolling moved or resized Runs'
     assert all(abs(after['review'][key] - before['review'][key]) <= 1 for key in before['review']), f'{width}px table scrolling moved or resized Review'
   finally:
     browser.call('POST', '/execute/sync', {'script': "document.querySelector('#runs-region').scrollLeft = 0;", 'args': []})
   return before
+
+
+def compact_focus_visible(browser, target, width):
+  def focused_near_top():
+    return browser.call('POST', '/execute/sync', {'script': '''const node = document.getElementById(arguments[0]);
+      const rect = node?.getBoundingClientRect();
+      return !!rect && node.getClientRects().length > 0 && document.activeElement === node
+        && rect.top >= -1 && rect.top <= 80 && rect.bottom <= innerHeight;''', 'args': [target]})
+  wait_for(focused_near_top, f'{width}px explicit navigation did not reveal and focus {target} near the viewport top')
 
 
 def choose_run_table_columns(browser):
@@ -842,7 +938,7 @@ def run_table_columns(browser, run_ids):
     assert evaluate("return document.querySelector('#chart-preview') === window.__table_chart_preview;"), 'table column or sort change replaced the chart preview'
     assert loss_state() == explored, 'table column or sort change lost zoom or hidden curves'
   chart_context(browser)
-  loss_prefix = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]'
+  loss_prefix = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
   browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
   browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '+', using='xpath')
   selected = selection()
@@ -870,15 +966,18 @@ def run_table_columns(browser, run_ids):
   preserved()
   for width in [1440, 1024]:
     browser.set_viewport(width, 1000)
-    table_scroll_contained(browser, width)
-    preserved()
-    capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
-  for width in [860, 859]:
-    browser.set_viewport(width, 1000)
-    if width == 860:
+    if width > 1000:
       table_scroll_contained(browser, width)
     else:
-      workspace_layout(browser, width)
+      workspace_layout(browser, width, wide=True)
+    preserved()
+    capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
+  for width in [1001, 1000]:
+    browser.set_viewport(width, 1000)
+    if width == 1001:
+      table_scroll_contained(browser, width)
+    else:
+      workspace_layout(browser, width, wide=True)
     preserved()
   for width in [320, 360]:
     browser.set_viewport(width, 800)
@@ -902,7 +1001,7 @@ def run_table_columns(browser, run_ids):
   chart_context(browser)
   browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
   browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '\ue00c', using='xpath')
-  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, review/selection/zoom/visibility preserved, 1440/1024/860px split panels, an 859px stacked boundary, and 320/360px stacked panels with contained table scroll.', flush=True)
+  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, Run/Status/Task/Started columns, review/selection/zoom/visibility preserved, 1440/1024/1001px persistent history beside inspection, 1000/320/360px stacked panels, and contained table scroll with pinned run identity.', flush=True)
 
 
 def workspace(run_id, second_run_id):
@@ -922,6 +1021,7 @@ def workspace(run_id, second_run_id):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
+    assert not workspace_layout(browser, 1440)['has_review'], 'initial run browser opened an implicit review'
     browser.click('#auto-refresh-toggle')
     start = len(trace_records())
     browser.click(f'input[aria-label="Select {run_id} for comparison"]')
@@ -976,8 +1076,8 @@ def workspace(run_id, second_run_id):
     assert evaluate('''return [...document.querySelector('#chart-preview').querySelectorAll('.chart-explorer-controls button, [data-chart-range], [data-chart-run]')].every(node => {
       const box = node.getBoundingClientRect(); return box.left >= 0 && box.right <= document.documentElement.clientWidth + 1;
     });'''), 'narrow chart controls overflow the preview'
-    loss_region = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]//*[@class="plot-scroll"]'
-    loss_hit = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]//*[@data-chart-hit]'
+    loss_region = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]//*[@class="plot-scroll"]'
+    loss_hit = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]//*[@data-chart-hit]'
     browser.pointer(loss_hit, .001, using='xpath')
     hover_rows = evaluate("const card = [...document.querySelector('#chart-preview').querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss'); return [...card.querySelectorAll('[data-chart-readout-run]')].map(row => ({step: row.getAttribute('data-chart-step'), value: row.getAttribute('data-chart-value')}));")
     chart_context(browser)
@@ -1016,6 +1116,13 @@ def workspace(run_id, second_run_id):
     assert evaluate("return document.querySelectorAll('#run-rows tr').length;") == 0, 'Failed status filter retained completed runs'
     browser.click('#clear-filters')
     wait_for(lambda: evaluate("return document.querySelector('#status-any').checked && document.querySelectorAll('#run-rows tr').length === 2;"), 'Clear filters did not restore the Any status tag')
+    for width in [1000, 390, 320]:
+      browser.set_viewport(width, 800)
+      browser.click('#run-rows tr:first-child .run-link')
+      wait_for(lambda: evaluate("return !document.querySelector('#chart-card').hidden && document.querySelector('#chart-preview svg') !== null && document.querySelector('#chart-card').getAttribute('aria-busy') === 'false';"), 'compact inspection did not finish loading its charts')
+      compact_focus_visible(browser, 'review-title', width)
+      browser.click('#close-review')
+      compact_focus_visible(browser, 'runs-heading', width)
     print('Firefox workspace passed: parent-rendered comparison, exact hover, native legend/zoom/keyboard, duplicate coordinates, dashboard/standalone CSP, lazy logs, refresh/selection cleanup, desktop/narrow layout.', flush=True)
   finally:
     browser.close()
@@ -1073,6 +1180,10 @@ def previews(run_id, second_run_id):
       if record['host'] == urlsplit(preview_origin).netloc]
     assert preview_requests and all(record['session_cookie_count'] == 0 for record in preview_requests), 'main cookie escaped its host on the wire'
     assert not browser.cookies(), 'preview unexpectedly stored its own session before login'
+    for width in [1440, 360, 320]:
+      browser.set_viewport(width, 1000 if width >= 500 else 800)
+      login_layout(browser, width)
+    browser.set_viewport(1440, 1000)
     browser.login()
     wait_for(lambda: browser.catalog()['status'] == 200, 'preview native login did not complete')
     browser.click('#auto-refresh-toggle')
@@ -1155,7 +1266,8 @@ def project_workspace(run_id):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: settled() and project_selected(), 'hosted dashboard did not default to its project')
-    assert evaluate("return document.querySelector('#project-options legend').textContent;") == 'Project', 'hosted aggregate selector is not labeled Project'
+    assert evaluate("return document.querySelector('#project-options legend').textContent;") == 'Projects', 'hosted aggregate selector is not labeled Projects'
+    assert evaluate("return !!document.querySelector('#project-options')?.closest('.topbar');"), 'project switching consumes the full history pane'
     assert evaluate("return document.querySelector('#machine-all').checked;"), 'project did not begin with All machines'
     assert evaluate("return document.querySelectorAll('#machine-options input[type=\"radio\"]').length;") == 3, 'project machine tags do not match its two recorded origins'
     assert evaluate('''return [...document.querySelectorAll('#run-rows .run-link')].filter(node=>node.textContent===arguments[0]).length;''', run_id) == 2, 'project default collapsed duplicate actual run IDs'
@@ -1176,7 +1288,7 @@ def project_workspace(run_id):
       const labels=[...card.querySelectorAll('[data-chart-run]')].map(node=>node.textContent);
       return labels.length===2 && labels.some(label=>label.includes('worker-b') && label.includes(arguments[0])) && labels.some(label=>label.includes('worker:') && label.includes(arguments[0]));''', run_id), 'chart legend does not distinguish machines with equal run IDs'
     chart_context(browser)
-    loss = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]'
+    loss = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
     browser.keys(loss + '//*[@class="plot-scroll"]', '\ue011\ue014', using='xpath')
     values = evaluate("const card=[...document.querySelector('#chart-preview').querySelectorAll('[data-interactive-chart]')].find(node=>node.querySelector('h2').textContent==='loss'); return [...card.querySelectorAll('[data-chart-readout-run]')].map(node=>Number(node.dataset.chartValue)).sort((a,b)=>a-b);")
     assert values == [0.7, 1.0], 'exact comparison samples came from the same machine stream'
@@ -1203,7 +1315,9 @@ def project_workspace(run_id):
       geometry = table_scroll_contained(browser, width) if scroll else workspace_layout(browser, width, wide=True)
       reference = project_layouts[width]
       assert geometry['page_width'] == reference['page_width'], f'{width}px choosing project columns widened the page'
-      assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in reference['review']), f'{width}px choosing project columns moved or resized Review'
+      assert all(abs(geometry['runs'][key] - reference['runs'][key]) <= 1 for key in ['left', 'right', 'width']), f'{width}px choosing project columns resized Runs'
+      review_keys = reference['review'] if width > 1000 else ['left', 'right', 'width', 'height']
+      assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in review_keys), f'{width}px choosing project columns moved or resized Review'
     for width in [1440, 1024]:
       browser.set_viewport(width, 1000)
       stable_project_layout(width, scroll=True)
@@ -1333,7 +1447,7 @@ def automatic_refresh(run_id, updated_run_id):
     assert data_counts() == counts, 'unchanged auto poll refetched chart or scalar summaries'
 
     chart_context(browser)
-    loss_prefix = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]'
+    loss_prefix = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
     browser.click(loss_prefix + '//button[code="' + run_id + '"]', using='xpath')
     browser.pointer(loss_prefix + '//*[@data-chart-hit]', .2, .65, using='xpath')
     before = loss_state()
@@ -1482,7 +1596,7 @@ def chart_data_fixture(project_id, run_id, unsafe_metric, base_step):
       name: card.querySelector('h2').textContent, point_count: card.querySelectorAll('circle.point').length,
       x_min: card.querySelector('svg').dataset.xMin, x_max: card.querySelector('svg').dataset.xMax}));''')
     assert len(points) == 2 and all(0 < item['point_count'] <= 600 and item['x_min'] == base_step for item in points), 'long-run browser rendered an unbounded or rounded plot'
-    loss = '//*[@id="chart-preview"]//section[@data-interactive-chart][h2="loss"]'
+    loss = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
     browser.keys(loss + '//*[@class="plot-scroll"]', '\ue011\ue014', using='xpath')
     first = evaluate('''const card = [...document.querySelectorAll('#chart-preview [data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss');
       const row = card.querySelector('[data-chart-readout-run]'); return row ? {step: row.dataset.chartStep, value: row.dataset.chartValue} : null;''')

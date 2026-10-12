@@ -13,7 +13,7 @@ token = "your-server-token"
 ```
 
 Use `expri config server set --url URL --token-stdin` to store a token supplied
-through stdin. `expri config server show` hides the token; `unset` removes only
+through a pipe or redirected file. `expri config server show` hides the token; `unset` removes only
 the connection. Writes are private and atomic, preserving system-profile settings.
 `EXPRI_STORAGE_DIR` overrides the global storage root. Inspection creates no files.
 
