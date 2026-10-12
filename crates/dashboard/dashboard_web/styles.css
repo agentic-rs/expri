@@ -571,7 +571,8 @@ tbody tr:last-child > * { border-bottom: 0; }
 .login-benefits .ui-icon { color: var(--accent); }
 .login-benefits li > span { color: var(--accent); font: 11px var(--font-mono); letter-spacing: .5px; padding-right: 3px; }
 .login-story-footer { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap; color: var(--subtle); font-size: 12px; }
-.login-main { display: flex; align-items: center; justify-content: center; width: 100%; max-width: none; margin: 0; padding: 48px; }
+.login-main { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; width: 100%; max-width: none; margin: 0; padding: 48px; }
+.login-main > .deployment-revision { max-width: 420px; color: var(--muted); font-size: 12px; text-align: center; overflow-wrap: anywhere; }
 .login-card { width: 100%; max-width: 420px; margin: 0; padding: 34px; }
 .login-card h2 { font-size: 29px; letter-spacing: -.8px; }
 .login-card .subheading { margin: 12px 0 26px; font-size: 14px; line-height: 1.65; }

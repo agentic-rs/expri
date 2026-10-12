@@ -492,6 +492,29 @@ def assert_chart_preview_cleaned(browser):
   wait_for(lambda: browser.call('POST', '/execute/sync', {'script': "return window.__acceptance_chart_preview.querySelectorAll('[data-interactive-chart], [data-chart-hit], [data-chart-run]').length;", 'args': []}) == 0, 'navigation left interactive controls in the previous chart preview')
 
 
+def login_layout(browser, width):
+  geometry = browser.call('POST', '/execute/sync', {'script': '''const bounds = node => {
+      const rect = node.getBoundingClientRect();
+      return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width};
+    };
+    const main = document.querySelector('.login-main');
+    const card = document.querySelector('.login-card');
+    const footer = main.querySelector('.deployment-revision');
+    return {viewport_width: innerWidth, page_width: document.documentElement.scrollWidth,
+      client_width: document.documentElement.clientWidth, main: bounds(main), card: bounds(card),
+      controls: [...card.querySelectorAll('input, button')].map(bounds), footer: footer ? bounds(footer) : null};''', 'args': []})
+  assert geometry['viewport_width'] == width, f'login viewport is not {width} CSS pixels wide'
+  assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px login overflows horizontally'
+  if width < 500:
+    assert geometry['card']['width'] >= geometry['main']['width'] * 0.75, f'{width}px login form is squeezed by deployment metadata'
+  for control in geometry['controls']:
+    assert control['left'] >= 0 and control['right'] <= geometry['client_width'] + 1, f'{width}px native login control is clipped'
+    assert control['width'] >= geometry['card']['width'] * 0.65, f'{width}px native login control is too narrow'
+  if footer := geometry['footer']:
+    assert footer['top'] >= geometry['card']['bottom'] - 1, 'preview deployment metadata displaces the login form'
+    assert footer['left'] >= 0 and footer['right'] <= geometry['client_width'] + 1, f'{width}px preview login metadata overflows'
+
+
 def forms():
   browser = None
   try:
@@ -512,6 +535,10 @@ def forms():
     POLICY_OVERRIDE.unlink()
     browser.navigate('/login')
     assert trace_records()[-1]['referrer_policy'] == 'same-origin', 'login policy does not preserve same-origin forms'
+    for width in [1440, 360, 320]:
+      browser.set_viewport(width, 1000 if width >= 500 else 800)
+      login_layout(browser, width)
+    browser.set_viewport(1440, 1000)
     start = len(trace_records())
     browser.login()
     posted_since(start, '/login', ORIGIN, 303)
@@ -774,37 +801,60 @@ def workspace_layout(browser, width, wide=False):
       return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom,
         width: rect.width, height: rect.height};
     };
+    const grid = document.querySelector('.workspace-grid');
     const table = document.querySelector('#runs-region');
+    const headers = [...table.querySelectorAll('thead th')];
+    const column_classes = ['selection-column', 'run-column', 'status-column',
+      ...(table.querySelector('.machine-column') ? ['machine-column'] : []),
+      'task-column', 'started-column'];
     return {viewport_width: innerWidth, page_width: document.documentElement.scrollWidth,
       client_width: document.documentElement.clientWidth, grid: bounds('.workspace-grid'),
       runs: bounds('.runs-card'), review: bounds('.review-workspace'),
+      has_review: grid.classList.contains('has-review'), has_wide_table: grid.classList.contains('has-wide-table'),
+      gap: parseFloat(getComputedStyle(grid).columnGap),
+      columns: {builtins_match: column_classes.every((name, index) => headers[index]?.classList.contains(name)),
+        header_count: headers.length, builtin_count: column_classes.length,
+        custom_count: Number(table.querySelector('table').dataset.columnCount),
+        status: bounds('#run-rows .status-column'), region: bounds('#runs-region'),
+        row_counts: [...table.querySelectorAll('tbody tr')].map(row => row.children.length)},
       table: {client_width: table.clientWidth, scroll_width: table.scrollWidth, scroll_left: table.scrollLeft}};''', 'args': []})
   assert geometry['viewport_width'] == width, f'layout viewport is not {width} CSS pixels wide'
   assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px workspace overflows horizontally'
   runs, review = geometry['runs'], geometry['review']
-  if width >= 860:
+  if wide:
+    assert geometry['has_wide_table'], f'{width}px project or selected columns lost their table layout'
+  if geometry['has_review'] and width > 1180:
     assert runs['right'] <= review['left'] + 1, f'{width}px Runs and Review are not side by side'
     assert abs(runs['top'] - review['top']) <= 1, f'{width}px Review is displaced below Runs'
-    if wide:
-      expected = min(geometry['grid']['width'] * 0.44, 520)
-      assert abs(runs['width'] - expected) <= 1, f'{width}px expanded Runs sidebar has unexpected width'
-      minimum_review_width = 500 if width >= 1024 else 400
-      assert review['width'] >= minimum_review_width, f'{width}px expanded Runs sidebar leaves Review too narrow'
+    available = geometry['grid']['width'] - geometry['gap']
+    assert abs(runs['width'] + review['width'] - available) <= 1, f'{width}px split panels leave unused workspace'
+    assert 0.40 <= runs['width'] / available <= 0.49, f'{width}px Runs panel has an unreadable share of the workspace'
+    assert review['width'] > runs['width'], f'{width}px Review does not have room for inspecting charts'
   else:
     assert runs['bottom'] <= review['top'] + 1, f'{width}px Runs and Review are not stacked'
+    assert abs(runs['width'] - geometry['grid']['width']) <= 1, f'{width}px Runs does not use the full workspace'
+    assert abs(review['width'] - geometry['grid']['width']) <= 1, f'{width}px stacked Review does not use the full workspace'
+  columns = geometry['columns']
+  assert columns['builtins_match'], 'run table lost Run, adjacent Status, Machine, Task, or Started columns'
+  expected_columns = columns['builtin_count'] + columns['custom_count']
+  assert columns['header_count'] == expected_columns, 'run table omitted built-in or selected column headings'
+  assert all(count == expected_columns for count in columns['row_counts']), 'run rows do not align with their column headings'
+  if width > 1180 and geometry['table']['scroll_left'] == 0:
+    assert columns['status']['right'] <= columns['region']['left'] + geometry['table']['client_width'] + 1, 'desktop Run status is outside the visible table'
   assert geometry['table']['client_width'] <= runs['width'] + 1, f'{width}px table escapes its Runs panel'
   return geometry
 
 
 def table_scroll_contained(browser, width):
-  before = workspace_layout(browser, width, wide=width >= 860)
+  before = workspace_layout(browser, width, wide=True)
   assert before['table']['scroll_width'] > before['table']['client_width'], f'{width}px selected columns do not scroll within Runs'
   browser.call('POST', '/execute/sync', {'script': '''const table = document.querySelector('#runs-region');
     table.scrollLeft = table.scrollWidth;''', 'args': []})
   try:
-    after = workspace_layout(browser, width, wide=width >= 860)
+    after = workspace_layout(browser, width, wide=True)
     assert after['table']['scroll_left'] > 0, f'{width}px table could not scroll to its later columns'
     assert after['page_width'] == before['page_width'], f'{width}px table scrolling widened the page'
+    assert all(abs(after['runs'][key] - before['runs'][key]) <= 1 for key in before['runs']), f'{width}px table scrolling moved or resized Runs'
     assert all(abs(after['review'][key] - before['review'][key]) <= 1 for key in before['review']), f'{width}px table scrolling moved or resized Review'
   finally:
     browser.call('POST', '/execute/sync', {'script': "document.querySelector('#runs-region').scrollLeft = 0;", 'args': []})
@@ -870,15 +920,18 @@ def run_table_columns(browser, run_ids):
   preserved()
   for width in [1440, 1024]:
     browser.set_viewport(width, 1000)
-    table_scroll_contained(browser, width)
-    preserved()
-    capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
-  for width in [860, 859]:
-    browser.set_viewport(width, 1000)
-    if width == 860:
+    if width > 1180:
       table_scroll_contained(browser, width)
     else:
-      workspace_layout(browser, width)
+      workspace_layout(browser, width, wide=True)
+    preserved()
+    capture('workspace-columns-desktop' if width == 1440 else 'workspace-columns-1024')
+  for width in [1181, 1180]:
+    browser.set_viewport(width, 1000)
+    if width == 1181:
+      table_scroll_contained(browser, width)
+    else:
+      workspace_layout(browser, width, wide=True)
     preserved()
   for width in [320, 360]:
     browser.set_viewport(width, 800)
@@ -902,7 +955,7 @@ def run_table_columns(browser, run_ids):
   chart_context(browser)
   browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
   browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '\ue00c', using='xpath')
-  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, review/selection/zoom/visibility preserved, 1440/1024/860px split panels, an 859px stacked boundary, and 320/360px stacked panels with contained table scroll.', flush=True)
+  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, Run/Status/Task/Started columns, review/selection/zoom/visibility preserved, 1440/1181px split panels, 1180/1024px stacked panels, and 320/360px stacked panels with contained table scroll.', flush=True)
 
 
 def workspace(run_id, second_run_id):
@@ -922,6 +975,7 @@ def workspace(run_id, second_run_id):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
+    assert not workspace_layout(browser, 1440)['has_review'], 'initial run browser opened an implicit review'
     browser.click('#auto-refresh-toggle')
     start = len(trace_records())
     browser.click(f'input[aria-label="Select {run_id} for comparison"]')
@@ -1073,6 +1127,10 @@ def previews(run_id, second_run_id):
       if record['host'] == urlsplit(preview_origin).netloc]
     assert preview_requests and all(record['session_cookie_count'] == 0 for record in preview_requests), 'main cookie escaped its host on the wire'
     assert not browser.cookies(), 'preview unexpectedly stored its own session before login'
+    for width in [1440, 360, 320]:
+      browser.set_viewport(width, 1000 if width >= 500 else 800)
+      login_layout(browser, width)
+    browser.set_viewport(1440, 1000)
     browser.login()
     wait_for(lambda: browser.catalog()['status'] == 200, 'preview native login did not complete')
     browser.click('#auto-refresh-toggle')
@@ -1203,7 +1261,9 @@ def project_workspace(run_id):
       geometry = table_scroll_contained(browser, width) if scroll else workspace_layout(browser, width, wide=True)
       reference = project_layouts[width]
       assert geometry['page_width'] == reference['page_width'], f'{width}px choosing project columns widened the page'
-      assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in reference['review']), f'{width}px choosing project columns moved or resized Review'
+      assert all(abs(geometry['runs'][key] - reference['runs'][key]) <= 1 for key in ['left', 'right', 'width']), f'{width}px choosing project columns resized Runs'
+      review_keys = reference['review'] if width > 1180 else ['left', 'right', 'width', 'height']
+      assert all(abs(geometry['review'][key] - reference['review'][key]) <= 1 for key in review_keys), f'{width}px choosing project columns moved or resized Review'
     for width in [1440, 1024]:
       browser.set_viewport(width, 1000)
       stable_project_layout(width, scroll=True)
