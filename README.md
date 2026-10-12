@@ -714,12 +714,18 @@ Browse published records without a project checkout:
 ```sh
 expri query runs
 expri query runs --project-id vision --origin gpu-1
-expri query files --project-id vision --origin gpu-1 --run-id run-abc123
+expri query files --run-id run-abc123
 ```
 
+File queries resolve a run ID across accessible active runs and archived runs
+within their restore window. Add `--project-id` and/or `--origin` only when the
+ID is ambiguous, or supply both to select the scope directly.
+
 These commands show tables by default. Add `--json` for complete bounded pages
-with `next_cursor`; table output shows the next cursor when more rows are available. File rows distinguish
-received data from reported outputs still awaiting upload. Execution status is
+with `next_cursor`; table output shows the next cursor when more rows are available.
+To pin later file pages to the same scope, optionally pass the resolved project
+and origin with the cursor.
+File rows distinguish received data from reported outputs still awaiting upload. Execution status is
 the last published state. See [server browsing](docs/self-hosted-service.md#browse-published-runs-and-files).
 
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and

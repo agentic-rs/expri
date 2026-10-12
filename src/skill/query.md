@@ -35,12 +35,18 @@ for live supervision; `service run status` describes archival and cleanup.
 ## Inspect file availability
 
 ```sh
-expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --json
-expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --prefix outputs/ --limit 50
+expri query files --run-id run-abc123 --json
+expri query files --run-id run-abc123 --prefix outputs/ --limit 50
 ```
 
-Files require the complete project/origin/run ID scope and default to up to
-100 rows. `--prefix` matches literal path text; `%` and `_` are ordinary characters.
+Files require only the run ID when exactly one accessible scope matches. Lookup
+includes active runs and archived runs within their restore window. If the ID is
+ambiguous, add `--project-id` and/or `--origin`; the error identifies conflicting
+scopes. Providing both scope fields selects the run directly and avoids paging
+through the existing catalog for resolution.
+
+File pages retain the resolved full `scope` and default to up to 100 rows.
+`--prefix` matches literal path text; `%` and `_` are ordinary characters.
 Rows combine authoritative `received` metadata with the worker's last `reported`
 inventory. `availability` distinguishes `received`, `reported_only`, and
 `received_different_version` when known sizes or checksums disagree. Received
@@ -54,7 +60,9 @@ mismatch. The reported inventory is bounded to 200 files and 64 KiB, with
 Received records still appear when the inventory is unavailable.
 
 Both queries accept `--limit` from 1 to 100. Tables print a next-cursor hint. In `--json` output, copy the response's `next_cursor`
-exactly into `--cursor` and keep the same scope and filters. Continue until
+exactly into `--cursor` and keep the same scope and filters. To pin later file
+pages, optionally pass the resolved `scope.project_id` and `scope.origin` as
+`--project-id` and `--origin`. Continue until
 `next_cursor` is null; byte bounds can make a page shorter than its requested
 limit. Run cursors identify full scopes; file cursors are raw paths.
 

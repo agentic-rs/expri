@@ -1,15 +1,16 @@
 //! Read-only published run and file catalogs over the bounded service transport.
 
+use std::cmp::Ordering;
 use std::path::Path;
 
 use expri_core::service_catalog::{
-  RunFilesPage, RunFilesQuery, RunListPage, RunListQuery, SERVICE_CATALOG_CAPABILITY,
-  validate_run_files_page, validate_run_list_page,
+  MAX_CATALOG_ROWS, RunArchiveFilter, RunFilesPage, RunFilesQuery, RunListPage, RunListQuery,
+  RunSelector, SERVICE_CATALOG_CAPABILITY, validate_run_files_page, validate_run_list_page,
 };
 
 use super::{Api, fs};
 use crate::error::Result;
-use crate::types::{Request, Response};
+use crate::types::{Request, Response, RunScope};
 
 pub struct ServiceCatalogClient {
   api: Api,
@@ -47,6 +48,40 @@ impl ServiceCatalogClient {
     validate_run_list_page(query, &page)
       .map_err(|_| fs::message("service returned an inconsistent run catalog page"))?;
     Ok(page)
+  }
+
+  /// Find at most two accessible scopes for an exact run ID, including archived runs.
+  /// One match is returned only after later pages cannot contain another match;
+  /// two matches prove ambiguity. This uses the existing catalog-v1 wire contract.
+  pub fn run_scopes(&self, selector: &RunSelector) -> Result<Vec<RunScope>> {
+    selector.validate()?;
+    let mut query = RunListQuery {
+      project_id: selector.project_id.clone(),
+      origin: selector.origin.clone(),
+      archival: RunArchiveFilter::All,
+      limit: MAX_CATALOG_ROWS,
+      cursor: None,
+    };
+    let mut matches = Vec::new();
+    loop {
+      let page = self.runs(&query)?;
+      for run in page.runs {
+        match run.scope.run_id.cmp(&selector.run_id) {
+          Ordering::Greater => {}
+          Ordering::Equal => {
+            matches.push(run.scope);
+            if matches.len() == 2 {
+              return Ok(matches);
+            }
+          }
+          Ordering::Less => return Ok(matches),
+        }
+      }
+      let Some(cursor) = page.next_cursor else {
+        return Ok(matches);
+      };
+      query.cursor = Some(cursor);
+    }
   }
 
   /// Received records are authoritative; reported outputs may still await upload.

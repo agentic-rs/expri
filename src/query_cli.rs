@@ -4,7 +4,8 @@ use clap::{Args, Subcommand};
 use expri_client::{ServiceCatalogClient, resolve_client_config};
 use expri_core::service::RunScope;
 use expri_core::service_catalog::{
-  RunArchiveFilter, RunFilesPage, RunFilesQuery, RunListPage, RunListQuery,
+  RunArchiveFilter, RunFilesPage, RunFilesQuery, RunListPage, RunListQuery, RunSelector,
+  validate_run_files_options,
 };
 
 use crate::error::{ExpriError, Result};
@@ -79,10 +80,12 @@ struct FilesOptions {
   /// Override the global [server] connection with another client configuration.
   #[arg(long)]
   config: Option<PathBuf>,
+  /// Narrow the run ID to this project; needed only when the ID is ambiguous.
   #[arg(long)]
-  project_id: String,
+  project_id: Option<String>,
+  /// Narrow the run ID to this worker; needed only when the ID is ambiguous.
   #[arg(long)]
-  origin: String,
+  origin: Option<String>,
   #[arg(long)]
   run_id: String,
   /// Literal path prefix, such as outputs/; % and _ are ordinary characters.
@@ -114,18 +117,58 @@ fn runs(options: RunsOptions) -> Result<RunListPage> {
 }
 
 fn files(options: FilesOptions) -> Result<RunFilesPage> {
+  let selector = RunSelector {
+    project_id: options.project_id,
+    origin: options.origin,
+    run_id: options.run_id,
+  };
+  selector.validate()?;
+  validate_run_files_options(
+    options.prefix.as_deref(),
+    options.limit as usize,
+    options.cursor.as_deref(),
+  )?;
+  let client = ServiceCatalogClient::new(&resolve_client_config(options.config.as_deref())?)?;
+  let scope = match selector.explicit_scope() {
+    Some(scope) => scope,
+    None => resolved_scope(&client, &selector)?,
+  };
   let query = RunFilesQuery {
-    scope: RunScope {
-      project_id: options.project_id,
-      origin: options.origin,
-      run_id: options.run_id,
-    },
+    scope,
     prefix: options.prefix,
     limit: options.limit as usize,
     cursor: options.cursor,
   };
   query.validate()?;
-  ServiceCatalogClient::new(&resolve_client_config(options.config.as_deref())?)?.files(&query)
+  client.files(&query)
+}
+
+fn resolved_scope(client: &ServiceCatalogClient, selector: &RunSelector) -> Result<RunScope> {
+  let matches = client.run_scopes(selector)?;
+  match matches.as_slice() {
+    [scope] => Ok(scope.clone()),
+    [] => Err(ExpriError::Message(format!(
+      "no accessible run matches run ID {} and the supplied filters",
+      selector.run_id,
+    ))),
+    _ => {
+      let rows = matches
+        .iter()
+        .map(|scope| {
+          vec![
+            scope.project_id.clone(),
+            scope.origin.clone(),
+            scope.run_id.clone(),
+          ]
+        })
+        .collect::<Vec<_>>();
+      let table = crate::output::table(&["PROJECT", "ORIGIN", "RUN"], &rows, &[32, 32, 40]);
+      Err(ExpriError::Message(format!(
+        "run ID {} is ambiguous; at least two accessible runs match:\n{table}Use --project-id and/or --origin to choose one.",
+        selector.run_id,
+      )))
+    }
+  }
 }
 
 fn optional(value: Option<&str>) -> String {
@@ -352,7 +395,8 @@ mod tests {
     for limit in ["0", "101"] {
       assert!(Cli::try_parse_from(["expri", "query", "runs", "--limit", limit]).is_err());
     }
-    assert!(Cli::try_parse_from(["expri", "query", "files", "--run-id", "run-one"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "query", "files", "--run-id", "run-one"]).is_ok());
+    assert!(Cli::try_parse_from(["expri", "query", "files"]).is_err());
   }
 
   #[test]
@@ -376,6 +420,36 @@ mod tests {
         .to_string()
         .contains("current machine")
     );
+  }
+
+  #[test]
+  fn file_selector_and_page_options_fail_before_configuration_or_network() {
+    for (option, value) in [
+      ("--run-id", "../run"),
+      ("--project-id", "../project"),
+      ("--origin", "../worker"),
+      ("--prefix", "/absolute"),
+      ("--cursor", "../file"),
+    ] {
+      let mut args = vec![
+        "expri",
+        "query",
+        "files",
+        "--config",
+        "/missing/client.toml",
+      ];
+      if option != "--run-id" {
+        args.extend(["--run-id", "run-one"]);
+      }
+      args.extend([option, value]);
+      let cli = Cli::try_parse_from(args).unwrap();
+      let Command::Query(command) = cli.command else {
+        unreachable!()
+      };
+      let error = run(command, None, false).unwrap_err();
+      assert!(!error.to_string().contains("client.toml"));
+      assert!(error.to_string().contains("invalid"), "{error}");
+    }
   }
 
   #[test]

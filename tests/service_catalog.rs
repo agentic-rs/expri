@@ -95,6 +95,48 @@ fn mock_catalog(
   (endpoint, server)
 }
 
+fn mock_request_sequence(
+  responses: Vec<Response>,
+  inspect: impl Fn(Request, usize) + Send + 'static,
+) -> (String, thread::JoinHandle<()>) {
+  let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+  listener.set_nonblocking(true).unwrap();
+  let endpoint = format!("http://{}", listener.local_addr().unwrap());
+  let server = thread::spawn(move || {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut responses = responses.into_iter().enumerate().peekable();
+    while responses.peek().is_some() {
+      let mut stream = loop {
+        match listener.accept() {
+          Ok((stream, _)) => break stream,
+          Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            assert!(
+              Instant::now() < deadline,
+              "CLI did not finish catalog requests"
+            );
+            thread::sleep(Duration::from_millis(10));
+          }
+          Err(error) => panic!("{error}"),
+        }
+      };
+      let request = request(&mut stream);
+      let response = if matches!(request, Request::Capabilities) {
+        Response::Capabilities {
+          features: vec![SERVICE_CATALOG_CAPABILITY.into()],
+        }
+      } else {
+        let (index, response) = responses.next().unwrap();
+        inspect(request, index);
+        response
+      };
+      let body = serde_json::to_vec(&response).unwrap();
+      write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+      stream.write_all(&body).unwrap();
+    }
+  });
+  (endpoint, server)
+}
+
 fn fixture(endpoint: &str) -> (tempfile::TempDir, PathBuf) {
   let directory = tempfile::tempdir().unwrap();
   let root = directory.path().canonicalize().unwrap();
@@ -108,7 +150,7 @@ fn fixture(endpoint: &str) -> (tempfile::TempDir, PathBuf) {
   (directory, config)
 }
 
-fn query_output(config: &Path, args: &[&str]) -> Output {
+fn raw_query_output(config: &Path, args: &[&str]) -> Output {
   let output = Command::new(env!("CARGO_BIN_EXE_expri"))
     .args(["query"])
     .args(args)
@@ -119,13 +161,18 @@ fn query_output(config: &Path, args: &[&str]) -> Output {
     .current_dir(config.parent().unwrap())
     .output()
     .unwrap();
+  assert!(!String::from_utf8_lossy(&output.stdout).contains("catalog-fixture-token"));
+  assert!(!String::from_utf8_lossy(&output.stderr).contains("catalog-fixture-token"));
+  output
+}
+
+fn query_output(config: &Path, args: &[&str]) -> Output {
+  let output = raw_query_output(config, args);
   assert!(
     output.status.success(),
     "{}",
     String::from_utf8_lossy(&output.stderr)
   );
-  assert!(!String::from_utf8_lossy(&output.stdout).contains("catalog-fixture-token"));
-  assert!(!String::from_utf8_lossy(&output.stderr).contains("catalog-fixture-token"));
   output
 }
 
@@ -142,6 +189,30 @@ fn scope() -> RunScope {
     project_id: "project".into(),
     origin: "worker".into(),
     run_id: "run-one".into(),
+  }
+}
+
+fn run_entry(scope: RunScope, archived: bool) -> RunListEntry {
+  RunListEntry {
+    scope,
+    task: Some("train".into()),
+    status: "completed".into(),
+    started_at: None,
+    finished_at: None,
+    exit_code: Some(0),
+    archived,
+    warnings: Vec::new(),
+  }
+}
+
+fn empty_file_page(scope: RunScope) -> RunFilesPage {
+  RunFilesPage {
+    scope,
+    files: Vec::new(),
+    next_cursor: None,
+    inventory_recorded_at: None,
+    reported_inventory_truncated: false,
+    warnings: Vec::new(),
   }
 }
 
@@ -280,6 +351,372 @@ fn run_files_expose_pending_uploads_and_versions_with_literal_prefix_and_continu
   assert_eq!(page["files"][1]["labels_pending"], true);
   assert_eq!(page["next_cursor"], paths[1]);
   server.join().unwrap();
+}
+
+#[test]
+fn run_id_only_resolves_an_archived_run_and_preserves_file_filters() {
+  let page = empty_file_page(scope());
+  let expected = serde_json::to_value(&page).unwrap();
+  let (endpoint, server) = mock_request_sequence(
+    vec![
+      Response::RunPage {
+        page: RunListPage {
+          runs: vec![run_entry(scope(), true)],
+          next_cursor: None,
+        },
+      },
+      Response::RunFilesPage { page },
+    ],
+    |request, index| match (index, request) {
+      (0, Request::BrowseRuns { query }) => {
+        assert_eq!(query.project_id, None);
+        assert_eq!(query.origin, None);
+        assert_eq!(query.archival, RunArchiveFilter::All);
+        assert_eq!(query.limit, 100);
+        assert_eq!(query.cursor, None);
+      }
+      (1, Request::BrowseRunFiles { query }) => {
+        assert_eq!(query.scope, scope());
+        assert_eq!(query.prefix.as_deref(), Some("outputs/"));
+        assert_eq!(query.limit, 2);
+        assert_eq!(query.cursor.as_deref(), Some("outputs/older.pt"));
+      }
+      _ => panic!("unexpected run-id lookup request"),
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let actual = cli(
+    &config,
+    &[
+      "files",
+      "--run-id",
+      "run-one",
+      "--prefix",
+      "outputs/",
+      "--limit",
+      "2",
+      "--cursor",
+      "outputs/older.pt",
+    ],
+  );
+  assert_eq!(actual, expected);
+  server.join().unwrap();
+}
+
+#[test]
+fn run_id_only_table_identifies_the_resolved_project_and_origin() {
+  let (endpoint, server) = mock_request_sequence(
+    vec![
+      Response::RunPage {
+        page: RunListPage {
+          runs: vec![run_entry(scope(), false)],
+          next_cursor: None,
+        },
+      },
+      Response::RunFilesPage {
+        page: empty_file_page(scope()),
+      },
+    ],
+    |request, index| match (index, request) {
+      (0, Request::BrowseRuns { .. }) => {}
+      (1, Request::BrowseRunFiles { query }) => assert_eq!(query.scope, scope()),
+      _ => panic!("unexpected run-id lookup request"),
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let output = query_output(&config, &["files", "--run-id", "run-one"]);
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  assert!(stdout.contains("Project: project"));
+  assert!(stdout.contains("Origin: worker"));
+  assert!(stdout.contains("Run: run-one"));
+  assert!(stdout.contains("No files."));
+  server.join().unwrap();
+}
+
+#[test]
+fn run_id_collisions_report_candidate_scopes_instead_of_fetching_files() {
+  let other = RunScope {
+    project_id: "second-project".into(),
+    origin: "second-worker".into(),
+    run_id: scope().run_id,
+  };
+  let (endpoint, server) = mock_request_sequence(
+    vec![Response::RunPage {
+      page: RunListPage {
+        runs: vec![run_entry(scope(), false), run_entry(other, true)],
+        next_cursor: None,
+      },
+    }],
+    |request, _| {
+      let Request::BrowseRuns { query } = request else {
+        panic!("ambiguous run IDs must not fetch files");
+      };
+      assert_eq!(query.project_id, None);
+      assert_eq!(query.origin, None);
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let output = raw_query_output(&config, &["files", "--run-id", "run-one", "--json"]);
+  assert!(!output.status.success());
+  assert!(output.stdout.is_empty());
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(
+    stderr.contains("run-one") && stderr.contains("ambiguous"),
+    "{stderr}"
+  );
+  for candidate in ["project", "worker", "second-project", "second-worker"] {
+    assert!(
+      stderr.contains(candidate),
+      "missing candidate {candidate}: {stderr}"
+    );
+  }
+  assert!(stderr.contains("--project-id"), "{stderr}");
+  assert!(stderr.contains("--origin"), "{stderr}");
+  server.join().unwrap();
+}
+
+#[test]
+fn one_optional_scope_filter_can_disambiguate_a_run_id() {
+  for (flag, value, selected) in [
+    ("--project-id", "project", scope()),
+    (
+      "--origin",
+      "second-worker",
+      RunScope {
+        project_id: "second-project".into(),
+        origin: "second-worker".into(),
+        run_id: "run-one".into(),
+      },
+    ),
+  ] {
+    let expected = selected.clone();
+    let (endpoint, server) = mock_request_sequence(
+      vec![
+        Response::RunPage {
+          page: RunListPage {
+            runs: vec![run_entry(selected.clone(), false)],
+            next_cursor: None,
+          },
+        },
+        Response::RunFilesPage {
+          page: empty_file_page(selected),
+        },
+      ],
+      move |request, index| match (index, request) {
+        (0, Request::BrowseRuns { query }) => {
+          assert_eq!(
+            query.project_id.as_deref(),
+            (flag == "--project-id").then_some(value)
+          );
+          assert_eq!(
+            query.origin.as_deref(),
+            (flag == "--origin").then_some(value)
+          );
+          assert_eq!(query.archival, RunArchiveFilter::All);
+        }
+        (1, Request::BrowseRunFiles { query }) => assert_eq!(query.scope, expected),
+        _ => panic!("unexpected filtered run-id lookup request"),
+      },
+    );
+    let (_directory, config) = fixture(&endpoint);
+    let actual = cli(&config, &["files", "--run-id", "run-one", flag, value]);
+    assert_eq!(actual["scope"]["run_id"], "run-one");
+    assert_eq!(
+      actual["scope"][if flag == "--origin" {
+        "origin"
+      } else {
+        "project_id"
+      }],
+      value
+    );
+    server.join().unwrap();
+  }
+}
+
+#[test]
+fn a_project_filter_still_requires_a_choice_between_matching_origins() {
+  let other = RunScope {
+    project_id: "project".into(),
+    origin: "worker-two".into(),
+    run_id: "run-one".into(),
+  };
+  let (endpoint, server) = mock_request_sequence(
+    vec![Response::RunPage {
+      page: RunListPage {
+        runs: vec![run_entry(scope(), false), run_entry(other, false)],
+        next_cursor: None,
+      },
+    }],
+    |request, _| {
+      let Request::BrowseRuns { query } = request else {
+        panic!("an ambiguous origin must prevent a file catalog lookup");
+      };
+      assert_eq!(query.project_id.as_deref(), Some("project"));
+      assert_eq!(query.origin, None);
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let output = raw_query_output(
+    &config,
+    &["files", "--run-id", "run-one", "--project-id", "project"],
+  );
+  assert!(!output.status.success());
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("ambiguous"), "{stderr}");
+  assert!(stderr.contains("worker-two"), "{stderr}");
+  assert!(stderr.contains("--origin"), "{stderr}");
+  server.join().unwrap();
+}
+
+#[test]
+fn absent_run_id_fails_without_fetching_a_file_catalog() {
+  let (endpoint, server) = mock_request_sequence(
+    vec![Response::RunPage {
+      page: RunListPage {
+        runs: vec![run_entry(scope(), false)],
+        next_cursor: None,
+      },
+    }],
+    |request, _| assert!(matches!(request, Request::BrowseRuns { .. })),
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let output = raw_query_output(&config, &["files", "--run-id", "missing-run"]);
+  assert!(!output.status.success());
+  assert!(output.stdout.is_empty());
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("missing-run"), "{stderr}");
+  assert!(stderr.contains("no accessible run matches"), "{stderr}");
+  server.join().unwrap();
+}
+
+#[test]
+fn run_id_resolution_continues_past_an_unrelated_first_page() {
+  let earlier = RunScope {
+    project_id: "earlier-project".into(),
+    origin: "worker".into(),
+    run_id: "unrelated-run".into(),
+  };
+  let cursor = encode_run_cursor(&earlier).unwrap();
+  let (endpoint, server) = mock_request_sequence(
+    vec![
+      Response::RunPage {
+        page: RunListPage {
+          runs: vec![run_entry(earlier, false)],
+          next_cursor: Some(cursor.clone()),
+        },
+      },
+      Response::RunPage {
+        page: RunListPage {
+          runs: vec![run_entry(scope(), false)],
+          next_cursor: None,
+        },
+      },
+      Response::RunFilesPage {
+        page: empty_file_page(scope()),
+      },
+    ],
+    move |request, index| match (index, request) {
+      (0 | 1, Request::BrowseRuns { query }) => {
+        assert_eq!(query.cursor, (index == 1).then(|| cursor.clone()));
+        assert_eq!(query.archival, RunArchiveFilter::All);
+      }
+      (2, Request::BrowseRunFiles { query }) => assert_eq!(query.scope, scope()),
+      _ => panic!("unexpected paginated run-id lookup request"),
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  assert_eq!(
+    cli(&config, &["files", "--run-id", "run-one"])["scope"]["project_id"],
+    "project"
+  );
+  server.join().unwrap();
+}
+
+#[test]
+fn a_matching_first_page_does_not_hide_a_collision_on_a_later_page() {
+  let cursor = encode_run_cursor(&scope()).unwrap();
+  let other = RunScope {
+    project_id: "second-project".into(),
+    origin: "worker".into(),
+    run_id: "run-one".into(),
+  };
+  let (endpoint, server) = mock_request_sequence(
+    vec![
+      Response::RunPage {
+        page: RunListPage {
+          runs: vec![run_entry(scope(), false)],
+          next_cursor: Some(cursor.clone()),
+        },
+      },
+      Response::RunPage {
+        page: RunListPage {
+          runs: vec![run_entry(other, true)],
+          next_cursor: None,
+        },
+      },
+    ],
+    move |request, index| {
+      let Request::BrowseRuns { query } = request else {
+        panic!("a later-page collision must prevent a file catalog lookup");
+      };
+      assert_eq!(query.cursor, (index == 1).then(|| cursor.clone()));
+      assert_eq!(query.archival, RunArchiveFilter::All);
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let output = raw_query_output(&config, &["files", "--run-id", "run-one"]);
+  assert!(!output.status.success());
+  assert!(output.stdout.is_empty());
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("project"), "{stderr}");
+  assert!(stderr.contains("second-project"), "{stderr}");
+  assert!(stderr.contains("--project-id"), "{stderr}");
+  server.join().unwrap();
+}
+
+#[test]
+fn run_resolution_stops_before_older_catalog_pages_after_the_target_id() {
+  for found in [false, true] {
+    let older = RunScope {
+      run_id: "run-aaa".into(),
+      ..scope()
+    };
+    let mut runs = Vec::new();
+    if found {
+      runs.push(run_entry(scope(), false));
+    }
+    runs.push(run_entry(older.clone(), false));
+    let mut responses = vec![Response::RunPage {
+      page: RunListPage {
+        runs,
+        next_cursor: Some(encode_run_cursor(&older).unwrap()),
+      },
+    }];
+    if found {
+      responses.push(Response::RunFilesPage {
+        page: empty_file_page(scope()),
+      });
+    }
+    let (endpoint, server) =
+      mock_request_sequence(responses, move |request, index| match (index, request) {
+        (0, Request::BrowseRuns { query }) => {
+          assert_eq!(query.cursor, None);
+          assert_eq!(query.archival, RunArchiveFilter::All);
+        }
+        (1, Request::BrowseRunFiles { query }) if found => assert_eq!(query.scope, scope()),
+        _ => panic!("resolution must not fetch older catalog pages"),
+      });
+    let (_directory, config) = fixture(&endpoint);
+    let output = raw_query_output(&config, &["files", "--run-id", "run-one", "--json"]);
+    assert_eq!(output.status.success(), found);
+    if found {
+      let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+      assert_eq!(page["scope"], serde_json::to_value(scope()).unwrap());
+    } else {
+      assert!(String::from_utf8_lossy(&output.stderr).contains("no accessible run matches"));
+    }
+    server.join().unwrap();
+  }
 }
 
 #[test]

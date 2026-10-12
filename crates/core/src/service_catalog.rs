@@ -77,27 +77,62 @@ pub struct RunFilesQuery {
   pub cursor: Option<String>,
 }
 
-impl RunFilesQuery {
+/// A CLI selection whose omitted scope components can be resolved from the catalog.
+#[derive(Clone, Debug)]
+pub struct RunSelector {
+  pub run_id: String,
+  pub project_id: Option<String>,
+  pub origin: Option<String>,
+}
+
+impl RunSelector {
   pub fn validate(&self) -> Result<()> {
-    validate_scope(&self.scope)?;
-    validate_limit(self.limit)?;
-    if let Some(prefix) = &self.prefix
-      && (prefix.is_empty()
-        || prefix.len() > 1024
-        || prefix.starts_with('/')
-        || prefix.contains('\\')
-        || prefix.chars().any(char::is_control)
-        || prefix
-          .split('/')
-          .any(|component| matches!(component, "." | "..")))
-    {
-      return Err(invalid("invalid literal file prefix"));
-    }
-    if let Some(cursor) = &self.cursor {
-      validate_run_path(cursor)?;
+    validate_component(&self.run_id)?;
+    for component in [&self.project_id, &self.origin].into_iter().flatten() {
+      validate_component(component)?;
     }
     Ok(())
   }
+
+  pub fn explicit_scope(&self) -> Option<RunScope> {
+    Some(RunScope {
+      run_id: self.run_id.clone(),
+      project_id: self.project_id.clone()?,
+      origin: self.origin.clone()?,
+    })
+  }
+}
+
+impl RunFilesQuery {
+  pub fn validate(&self) -> Result<()> {
+    validate_scope(&self.scope)?;
+    validate_run_files_options(self.prefix.as_deref(), self.limit, self.cursor.as_deref())
+  }
+}
+
+/// Validate file-page options before resolving a partially specified run scope.
+pub fn validate_run_files_options(
+  prefix: Option<&str>,
+  limit: usize,
+  cursor: Option<&str>,
+) -> Result<()> {
+  validate_limit(limit)?;
+  if let Some(prefix) = prefix
+    && (prefix.is_empty()
+      || prefix.len() > 1024
+      || prefix.starts_with('/')
+      || prefix.contains('\\')
+      || prefix.chars().any(char::is_control)
+      || prefix
+        .split('/')
+        .any(|component| matches!(component, "." | "..")))
+  {
+    return Err(invalid("invalid literal file prefix"));
+  }
+  if let Some(cursor) = cursor {
+    validate_run_path(cursor)?;
+  }
+  Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -434,6 +469,32 @@ pub fn compare_run_scopes(left: &RunScope, right: &RunScope) -> Ordering {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn partial_run_selectors_validate_each_supplied_component() {
+    let mut selector = RunSelector {
+      run_id: "run-one".into(),
+      project_id: None,
+      origin: None,
+    };
+    selector.validate().unwrap();
+    assert!(selector.explicit_scope().is_none());
+    selector.project_id = Some("vision".into());
+    selector.validate().unwrap();
+    assert!(selector.explicit_scope().is_none());
+    selector.origin = Some("gpu-1".into());
+    selector.validate().unwrap();
+    assert_eq!(selector.explicit_scope().unwrap().project_id, "vision");
+    for field in ["run_id", "project_id", "origin"] {
+      let mut invalid = selector.clone();
+      match field {
+        "run_id" => invalid.run_id = "../must-not-echo".into(),
+        "project_id" => invalid.project_id = Some("../must-not-echo".into()),
+        _ => invalid.origin = Some("../must-not-echo".into()),
+      }
+      assert!(invalid.validate().is_err());
+    }
+  }
 
   #[test]
   fn received_storage_rejects_impossible_streams_and_tracking_revisions() {
