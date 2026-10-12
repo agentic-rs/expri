@@ -120,7 +120,7 @@ export function createChartController(container: HTMLElement): ChartController {
 }
 
 function enhancePlot(document: Document, svg: SVGSVGElement, time_zone: ChartTimeZone, model: ChartPlot, data: ChartData, initial_state?: PlotState): PlotController | null {
-  const section = svg.closest<HTMLElement>("section.card");
+  const section = svg.closest<HTMLElement>("section[data-chart-metric]");
   const region = svg.parentElement;
   const legend = section?.querySelector<HTMLUListElement>("ul.legend");
   if (!section || !region || !legend || section.hasAttribute("data-interactive-chart")) return null;

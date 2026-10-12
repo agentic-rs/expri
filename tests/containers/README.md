@@ -131,16 +131,18 @@ without passwords, cookies or request bodies.
 After the worker uploads two runs, Firefox checks the workspace against those
 results: selecting runs updates charts, tabs support the keyboard, logs load on
 demand, Refresh preserves the comparison, and filters clear it. The suite checks
-desktop columns at verified 1440, 1024, and 860 CSS pixel viewports, stacking
-at 859 CSS pixels, and overflow at 320, 360, and 500 CSS pixels, saving `workspace-desktop.png`,
+desktop columns at verified 1440, 1024, and 1001 CSS pixel viewports, stacking
+at 1000 CSS pixels, and overflow at 320, 360, and 500 CSS pixels, saving `workspace-desktop.png`,
 `workspace-narrow.png`, and
 `workspace-columns-<width>.png` with the CI diagnostics. Native checkbox tags
 choose parameter and metric columns, summary tags switch Last/Min/Max,
 and header clicks sort while retaining selection, the active tab, and chart
-zoom. At desktop widths, project and added-column tables keep **Runs** beside
-**Review**. The widened run browser uses 44% of the workspace, capped at 520 CSS
-pixels; extra columns scroll inside it. Below 860 CSS pixels, the panels stack
-and the table scrolls without extending the page.
+zoom. Project switching stays in the header. Above 1000 CSS pixels, full run
+history remains in a compact left pane beside the main workspace, including
+before inspection and while Storage is open. Selecting a run from Storage
+opens its inspection without replacing the history or chart nodes. At 1000 CSS
+pixels and below, the panels stack. Extra columns scroll inside the table while
+the run identity stays pinned, without extending the page or moving the panes.
 The isolated Firefox driver removes its desktop window's 500px minimum before
 the mobile checks and asserts the resulting page viewport. It changes no page
 markup, authentication rules, or content security policy.

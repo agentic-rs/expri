@@ -321,6 +321,8 @@ function workspacePanes(nodes) {
   const browser = grid.querySelector(":scope > .runs-card");
   const review = grid.querySelector(":scope > .review-workspace");
   assert.deepEqual([...grid.children], [browser, review], "run browsing and review stay in sibling panes");
+  assert.ok(browser.classList.contains("run-history"), "the left pane retains the full run history");
+  assert.ok(review.classList.contains("main-workspace"), "inspection and Storage share the main workspace");
   assert.equal(nodes.get("runs-region").closest(".runs-card"), browser, "wide tables keep their own scrolling region");
   assert.equal(grid.classList.contains("has-custom-columns"), false, "table sizing does not select the workspace layout");
   return { grid, browser, review };
@@ -359,6 +361,54 @@ test("React renders small fixed choices as native radio tags with accessible gro
   assert.equal(nodes.get("time-zone-options").hidden, true);
   assert.equal(nodes.get("x-axis-wall-clock").closest("label").textContent, "Date & time");
   assert.equal(document.querySelector("#x-axis-select, #reduction-select"), null);
+});
+
+test("project switching stays in the header while history and inspection retain their panes", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true });
+  const { nodes } = model;
+  assert.ok(nodes.get("project-options").closest(".topbar"));
+  assert.equal(nodes.document.querySelector(".app-sidebar"), null, "project controls do not reserve a sidebar");
+  assert.ok(nodes.get("workspace-view-storage").closest("#navigation-root"));
+  assert.ok(nodes.get("refresh-button").closest("#utility-controls-root"));
+  assert.ok(nodes.get("utility-controls-root").closest("footer.workspace-status-bar"), "refresh and live status belong to the bottom bar");
+  assert.equal(nodes.document.querySelector(".workspace-grid").classList.contains("has-review"), false);
+  const panes = workspacePanes(nodes);
+  assert.equal(latestRunQuery(model).has("status"), false, "history starts with every training status");
+  await click(runButton(nodes, 0));
+  await settled(() => nodes.get("review-section").hidden === false);
+  const preview = nodes.get("chart-preview");
+  const chart_url = chartSource(nodes);
+  const request_counts = requestCounts(model.requests);
+  assert.equal(nodes.document.querySelector(".workspace-grid").classList.contains("has-review"), true);
+  assert.deepEqual(workspacePanes(nodes), panes, "opening a run retains the history and main pane nodes");
+  await click(nodes.document.querySelector('.theme-control input[value="dark"]'));
+  assert.equal(nodes.document.documentElement.dataset.theme, "dark");
+  assert.equal(nodes.document.defaultView.localStorage.getItem("expri.dashboard.theme"), "dark");
+  await click(nodes.document.querySelector('.theme-control input[value="system"]'));
+  assert.equal(nodes.document.documentElement.dataset.theme, "system");
+  assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(chartSource(nodes), chart_url);
+  assert.deepEqual(requestCounts(model.requests), request_counts, "changing appearance never reloads results");
+});
+
+test("compact explicit inspection moves to review while refresh preserves position and reduced motion", async t => {
+  const { nodes } = await reviewFixture(t);
+  nodes.document.defaultView.matchMedia = query => ({
+    matches: query === "(max-width: 1000px)" || query === "(prefers-reduced-motion: reduce)",
+  });
+  const scrolls = [];
+  for (const id of ["review-title", "runs-heading"]) {
+    nodes.get(id).scrollIntoView = options => scrolls.push({ id, ...options });
+  }
+  await click(runButton(nodes, 0));
+  assert.equal(nodes.document.activeElement, nodes.get("review-title"));
+  assert.deepEqual(scrolls, [{ id: "review-title", block: "start", behavior: "auto" }]);
+  await click(nodes.get("refresh-button"));
+  assert.equal(scrolls.length, 1, "refresh must not move the viewport");
+  assert.equal(nodes.document.activeElement, nodes.get("refresh-button"));
+  await click(nodes.get("close-review"));
+  assert.equal(nodes.document.activeElement, nodes.get("runs-heading"));
+  assert.deepEqual(scrolls[1], { id: "runs-heading", block: "start", behavior: "auto" });
 });
 
 test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
@@ -434,7 +484,7 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 7);
   assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
   await click(nodes.get("next-page")); await settledTable(nodes);
   assert.equal(nodes.get("page-label").textContent, "Page 2");
@@ -507,8 +557,9 @@ test("automatic list updates keep table choices and sorting while refreshing onl
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = await reviewFixture(t);
   await settled(() => nodes.get("run-rows").children.length === 3);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 3);
-  assert.match(text(nodes.get("run-rows").children[0].children[1]), /train.*3s/);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
+  assert.equal(nodes.get("run-rows").children[0].querySelector(".task-column").textContent, "train");
+  assert.match(text(nodes.get("run-rows").children[0].querySelector(".status-column")), /3s/);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
@@ -723,7 +774,7 @@ test("empty hosted catalog refreshes into published runs with opaque source IDs 
   assert.equal(nodes.get("search-input").disabled, false);
   assert.equal(nodes.get("source-select").children[0].textContent, "Vision / gpu-1 · Published");
   assert.match(nodes.get("source-note").textContent, /^Published results.*workers publish their recorded files/);
-  assert.equal(nodes.get("dashboard-kind").textContent, "expri · Hosted experiment review");
+  assert.equal(nodes.get("dashboard-kind").textContent, "Hosted workspace");
   assert.match(text(nodes.get("catalog-warnings")), /limited to 500 runs/);
   await emit(nodes.get("next-page"), "click");
   await settled(() => nodes.get("page-label").textContent === "Page 2");
@@ -757,7 +808,7 @@ test("local catalogs retain cached labels, 100-row pages, and no logout control"
   assert.match(nodes.get("source-note").textContent, /^Cached remote results/);
   assert.match(text(nodes.get("list-empty")), /expri runs fetch/);
   assert.equal(text(nodes.get("list-empty")).includes("Publish results"), false);
-  assert.equal(nodes.get("dashboard-kind").textContent, "expri · Local experiment review");
+  assert.equal(nodes.get("dashboard-kind").textContent, "Local workspace");
 });
 
 test("login and logout use browser POST forms without application credentials", async t => {
@@ -1310,6 +1361,9 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
   const model = await autoFixture(t, { sources: [source], catalog_failure: true });
   await settled(() => model.nodes.get("global-error").hidden === false);
   assert.match(model.nodes.get("global-error").textContent, /Catalog temporarily unavailable/);
+  assert.equal(model.nodes.get("runs-region").getAttribute("aria-busy"), "false");
+  assert.match(model.nodes.get("list-empty").textContent, /Runs are unavailable.*Refresh/);
+  assert.doesNotMatch(model.nodes.get("list-empty").textContent, /Loading runs/);
   model.model.failed_catalog = false;
   model.model.override = parsed => {
     if (parsed.pathname !== "/api/updates") return;
@@ -1322,6 +1376,25 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
   assert.equal(model.nodes.get("global-error").hidden, true);
   const probe = new URL(model.requests.find(url => url.startsWith("/api/updates")), "http://localhost");
   assert.equal(probe.searchParams.has("source"), false);
+});
+
+test("failed initial run loading ends the loading state and retains successful rows on a later failure", async t => {
+  let unavailable = true;
+  const { nodes } = await reviewFixture(t, { override: url =>
+    url.pathname === "/api/runs" && unavailable ? response({ error: "Results unavailable" }, 503) : null,
+  });
+  assert.equal(nodes.get("runs-region").getAttribute("aria-busy"), "false");
+  assert.match(nodes.get("list-empty").textContent, /Runs are unavailable.*Refresh/);
+  assert.equal(nodes.get("refresh-button").disabled, false);
+  unavailable = false;
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(nodes.get("list-empty").hidden, true);
+  unavailable = true;
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("run-rows").children.length, 3, "an error must keep the last successful run history");
+  assert.equal(nodes.get("list-empty").hidden, true);
+  assert.match(nodes.get("global-error").textContent, /Results unavailable/);
 });
 
 test("an initially failed run can recover directly into Logs without overlapping log requests", async t => {
@@ -1949,7 +2022,12 @@ test("project Storage loads lazily, shows inputs and uploaded outputs, and prese
   assert.equal(nodes.get("workspace-view-workspace").checked, true);
   await click(nodes.get("workspace-view-storage"));
   await settled(() => nodes.document.getElementById("storage-rows")?.children.length === 1);
-  assert.equal(nodes.get("workspace-page").hidden, true);
+  assert.equal(nodes.get("workspace-page").hidden, false, "Storage retains the run history workspace");
+  assert.equal(nodes.get("run-workspace").hidden, true);
+  assert.equal(nodes.get("storage-workspace").hidden, false);
+  const history = nodes.get("run-rows");
+  assert.ok(history.closest(".run-history"));
+  assert.equal(history.closest("[hidden]"), null, "run history stays visible beside Storage");
   assert.equal(nodes.get("project-storage").querySelector(".storage-card").getAttribute("aria-busy"), "false");
   assert.equal(nodes.get("storage-kind-input").checked, true);
   assert.match(nodes.get("storage-rows").textContent, /dataset-v1.*1 KiB/);
@@ -1965,6 +2043,9 @@ test("project Storage loads lazily, shows inputs and uploaded outputs, and prese
   assert.equal(link.searchParams.get("run_id"), "gpu-a:same-run");
   await click(nodes.get("workspace-view-workspace"));
   assert.equal(nodes.get("workspace-page").hidden, false);
+  assert.equal(nodes.get("run-workspace").hidden, false);
+  assert.equal(nodes.get("storage-workspace").hidden, true);
+  assert.equal(nodes.get("run-rows"), history, "page switching keeps the same history table");
   assert.equal(nodes.get("chart-preview"), frame);
   assert.equal(chartSource(nodes), chart_url);
   assert.equal(previewMounts(nodes), writes, "page switching must not reload chart contents");
@@ -1974,6 +2055,35 @@ test("project Storage loads lazily, shows inputs and uploaded outputs, and prese
   await click(nodes.get("refresh-button"));
   await settled(() => requestCounts(model.requests)["/api/storage"] === count + 1);
   assert.equal(requestCounts(model.requests)["/api/projects"], projects + 1, "global Refresh also discovers projects");
+});
+
+test("full run history remains interactive beside Storage and opening a run returns to inspection", async t => {
+  const runs = projectRuns();
+  runs[0].status = "completed";
+  runs[1].status = "running";
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs }), { nodes } = model;
+  await settledTable(nodes);
+  const history = nodes.get("run-rows"), panes = workspacePanes(nodes), preview = nodes.get("chart-preview");
+  assert.deepEqual([...history.querySelectorAll(".status-column")].map(node => node.textContent), ["completed", "running"]);
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.document.getElementById("storage-rows") !== null);
+  assert.equal(nodes.get("workspace-page").hidden, false);
+  assert.equal(history.closest("[hidden]"), null);
+  assert.deepEqual(workspacePanes(nodes), panes);
+  await click(runButton(nodes, 1));
+  await settled(() => nodes.get("review-section").hidden === false);
+  assert.equal(nodes.get("workspace-view-workspace").checked, true);
+  assert.equal(nodes.get("storage-workspace").hidden, true);
+  assert.equal(nodes.get("run-workspace").hidden, false);
+  assert.equal(nodes.get("run-rows"), history);
+  assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(chartQuery(nodes).get("run_id"), runIdentity(runs[1]), "inspection uses the selected machine's run");
+  await click(nodes.get("workspace-view-storage"));
+  await selectRow(nodes, 0);
+  await settled(() => chartQuery(nodes).get("run_id") === runIdentity(runs[0]));
+  assert.equal(nodes.get("workspace-view-workspace").checked, true, "selecting history from Storage opens inspection");
+  assert.equal(nodes.get("chart-preview"), preview);
+  assert.deepEqual(workspacePanes(nodes), panes);
 });
 
 test("Storage searches and pages on the server, including a project with no runs", async t => {
@@ -2062,17 +2172,36 @@ test("run Overview connects consumed assets to their producing run", async t => 
   assert.equal(reference.selectionEnd, reference.value.length);
 });
 
-test("Storage revision checks reload a changed visible page but skip unchanged pages", async t => {
-  const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
+test("Storage revision checks update visible history and files independently without reloading hidden inspection", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
   model.model.storage_inputs = [{ input_id: "dataset-v1", size: 8 }];
+  await inspect(model, 0);
+  const preview = nodes.get("chart-preview");
   await click(nodes.get("workspace-view-storage"));
   await settled(() => nodes.get("storage-rows").children.length === 1);
   await model.clock.advance(5_000);
   const initial = requestCounts(model.requests)["/api/storage"];
+  const list_count = requestCounts(model.requests)["/api/runs"];
+  const inspection_counts = requestCounts(model.requests);
   const probes = requestCounts(model.requests)["/api/updates"];
   await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/updates"], probes + 1, "visible Storage checks the small project revision");
   assert.equal(requestCounts(model.requests)["/api/storage"], initial, "unchanged revision must not relist storage");
+  assert.equal(requestCounts(model.requests)["/api/runs"], list_count, "unchanged history revision must not relist runs");
+  model.runs[1].status = "failed";
+  model.model.list_revision = "list-2";
+  nodes.get("storage-search").focus();
+  await model.clock.advance(5_000);
+  await settled(() => nodes.get("run-rows").textContent.includes("failed"));
+  assert.equal(requestCounts(model.requests)["/api/runs"], list_count + 1, "changed history refreshes while Storage is visible");
+  assert.equal(requestCounts(model.requests)["/api/storage"], initial, "history changes do not reload unchanged files");
+  assert.equal(nodes.document.activeElement, nodes.get("storage-search"), "quiet history refresh retains Storage focus");
+  for (const path of ["/api/run", "/api/chart-data", "/api/log"]) {
+    assert.equal(requestCounts(model.requests)[path], inspection_counts[path], `visible history must not refresh hidden ${path}`);
+  }
+  assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(nodes.get("workspace-view-storage").checked, true);
+  assert.equal(nodes.get("storage-kind-input").checked, true);
   model.model.storage_inputs.push({ input_id: "dataset-v2", size: 16 });
   model.model.storage_revision = "storage-2";
   await model.clock.advance(5_000);
@@ -2080,6 +2209,38 @@ test("Storage revision checks reload a changed visible page but skip unchanged p
   assert.equal(requestCounts(model.requests)["/api/storage"], initial + 1);
   await model.clock.advance(5_000);
   assert.equal(requestCounts(model.requests)["/api/storage"], initial + 1);
+  assert.equal(requestCounts(model.requests)["/api/runs"], list_count + 1, "acknowledged history revision stays quiet");
+});
+
+test("a failed history refresh retains its revision without blocking healthy Storage updates", async t => {
+  const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
+  model.model.storage_inputs = [{ input_id: "dataset-v1", size: 8 }];
+  await inspect(model, 0);
+  const preview = nodes.get("chart-preview");
+  await click(nodes.get("workspace-view-storage"));
+  await settled(() => nodes.get("storage-rows").children.length === 1);
+  await model.clock.advance(5_000);
+  const before = requestCounts(model.requests), old_history = nodes.get("run-rows").textContent;
+  model.runs[1].status = "failed";
+  model.model.list_revision = "list-2";
+  model.model.storage_inputs.push({ input_id: "dataset-v2", size: 16 });
+  model.model.storage_revision = "storage-2";
+  model.model.failed_list = true;
+  await model.clock.advance(5_000);
+  await settled(() => nodes.get("storage-rows").children.length === 2);
+  assert.equal(nodes.get("run-rows").textContent, old_history, "failed history retains its last loaded rows");
+  assert.equal(requestCounts(model.requests)["/api/storage"], before["/api/storage"] + 1, "healthy files refresh even when history is unavailable");
+  assert.equal(requestCounts(model.requests)["/api/runs"], before["/api/runs"] + 1);
+  model.model.failed_list = false;
+  await model.clock.advance(30_000);
+  await settled(() => nodes.get("run-rows").textContent.includes("failed"));
+  assert.equal(requestCounts(model.requests)["/api/runs"], before["/api/runs"] + 2, "the failed history revision is retried and acknowledged only after success");
+  assert.equal(requestCounts(model.requests)["/api/storage"], before["/api/storage"] + 1, "acknowledged healthy Storage stays quiet during the retry");
+  assert.equal(nodes.get("workspace-view-storage").checked, true);
+  assert.equal(nodes.get("chart-preview"), preview);
+  for (const path of ["/api/run", "/api/chart-data", "/api/log"]) {
+    assert.equal(requestCounts(model.requests)[path], before[path], `history retry does not reload hidden ${path}`);
+  }
 });
 
 test("Storage ignores late searches and explains older backends without losing the selected page", async t => {
@@ -2463,6 +2624,23 @@ function annotatedRun(run_id, options = {}) {
   return { ...run, nickname: null, tags: [], annotations: { scope: run.archival.scope, nickname: null, tags: [] } };
 }
 
+test("history limits tag badges while keeping every tag accessible in inspection", async t => {
+  const run = annotatedRun("tagged-run");
+  run.tags = ["baseline", "vision", "resnet-50", "validated", "published"];
+  run.annotations = { ...run.annotations, tags: run.tags };
+  const { nodes } = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run] });
+  const row = nodes.get("run-rows").children[0];
+  assert.deepEqual([...row.querySelectorAll(".run-tag")].map(node => node.textContent), run.tags.slice(0, 2));
+  const remaining = row.querySelector(".run-tag-count");
+  assert.equal(remaining.textContent, "+3");
+  assert.equal(remaining.title, run.tags.slice(2).join(", "));
+  assert.match(remaining.getAttribute("aria-label"), /resnet-50.*validated.*published/);
+  await click(runButton(nodes, 0));
+  await settled(() => nodes.get("review-section").hidden === false);
+  const review = nodes.get("review-section");
+  assert.deepEqual([...review.querySelectorAll(".inspector-meta .run-tags > .run-tag")].map(node => node.textContent), run.tags);
+});
+
 test("nickname and multiple tags save to the exact machine run without changing identity or chart", async t => {
   const runs = [annotatedRun("run-shared"), annotatedRun("run-shared", { origin: "gpu-b" })];
   const posts = [];
@@ -2482,6 +2660,10 @@ test("nickname and multiple tags save to the exact machine run without changing 
   const { nodes } = model;
   await click(nodes.document.querySelector('[data-run-key="gpu-b:run-shared"] .run-link'));
   const preview = nodes.get("chart-preview");
+  assert.equal(nodes.get("run-annotations-panel").tagName, "DETAILS");
+  assert.equal(nodes.get("run-annotations-panel").open, false);
+  await click(nodes.get("run-annotations-panel").querySelector("summary"));
+  assert.equal(nodes.get("run-annotations-panel").open, true);
   setValue(nodes.get("run-nickname"), " Baseline λ "); await emit(nodes.get("run-nickname"), "input");
   setValue(nodes.get("run-tag-input"), " baseline "); await emit(nodes.get("run-tag-input"), "input");
   await click(nodes.get("add-run-tag"));
@@ -2512,11 +2694,13 @@ test("annotation drafts survive refresh and failed saves, with explicit cancel t
   } });
   const { nodes } = model;
   await click(nodes.document.querySelector(".run-link"));
+  await click(nodes.get("run-annotations-panel").querySelector("summary"));
   setValue(nodes.get("run-nickname"), "Unsaved"); await emit(nodes.get("run-nickname"), "input");
   run.nickname = "Changed by CLI";
   run.annotations = { ...run.annotations, nickname: run.nickname };
   await click(nodes.get("refresh-button"));
   assert.equal(nodes.get("run-nickname").value, "Unsaved");
+  assert.equal(nodes.get("run-annotations-panel").open, true);
   await emit(nodes.get("save-run-annotations").form, "submit");
   assert.match(nodes.get("run-annotations-error").textContent, /Connection unavailable/);
   assert.equal(nodes.get("run-nickname").value, "Unsaved");
@@ -2665,6 +2849,7 @@ test("annotations show a disabled preview on older servers and hide explicitly u
   delete run.annotations;
   await click(nodes.get("refresh-button"));
   assert.ok(nodes.get("run-annotations-panel"));
+  assert.match(nodes.get("run-annotations-panel").querySelector("summary").textContent, /Unavailable/);
   assert.equal(nodes.get("run-nickname").matches(":disabled"), true);
   assert.match(nodes.get("run-annotations-unavailable").textContent, /unavailable on this server/);
   run.annotations = null;

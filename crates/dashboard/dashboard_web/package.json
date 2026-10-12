@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "pnpm@10.30.3",
   "scripts": {
-    "build": "tsc --noEmit && esbuild app.tsx --bundle --format=esm --target=es2022 --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --minify --legal-comments=eof --outfile=app.js",
+    "build": "tsc --noEmit && esbuild app.tsx --bundle --format=iife --target=es2022 --jsx=automatic --define:process.env.NODE_ENV='\"production\"' --minify --legal-comments=eof --outfile=app.js",
     "build:test": "esbuild app.tsx --bundle --format=esm --target=es2022 --jsx=automatic --packages=external --legal-comments=none --outfile=.test/app.js",
     "check": "tsc --noEmit",
     "test": "pnpm build:test && node --test *.test.mjs"
