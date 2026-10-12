@@ -2653,7 +2653,7 @@ test("late annotation replies cannot replace a newly inspected run", async t => 
   assert.equal(nodes.document.getElementById("run-annotations-error"), null);
 });
 
-test("annotations remain read-only in preview dashboards and unavailable on older servers", async t => {
+test("annotations show a disabled preview on older servers and hide explicitly unavailable capabilities", async t => {
   const run = annotatedRun("run-1");
   const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run] });
   const { nodes } = model;
@@ -2664,7 +2664,31 @@ test("annotations remain read-only in preview dashboards and unavailable on olde
   assert.equal(nodes.get("save-run-annotations").matches(":disabled"), true);
   delete run.annotations;
   await click(nodes.get("refresh-button"));
+  assert.ok(nodes.get("run-annotations-panel"));
+  assert.equal(nodes.get("run-nickname").matches(":disabled"), true);
+  assert.match(nodes.get("run-annotations-unavailable").textContent, /unavailable on this server/);
+  run.annotations = null;
+  await click(nodes.get("refresh-button"));
   assert.equal(nodes.document.getElementById("run-annotations-panel"), null);
+});
+
+test("a missing annotation capability cannot submit even if other run management is enabled", async t => {
+  const run = annotatedRun("run-1");
+  const scope = run.annotations.scope;
+  delete run.annotations;
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run] });
+  const { nodes } = model;
+  await click(nodes.document.querySelector(".run-link"));
+  assert.equal(nodes.get("run-nickname").matches(":disabled"), true);
+  assert.equal(nodes.get("run-tag-input").matches(":disabled"), true);
+  setValue(nodes.get("run-nickname"), "Scripted draft"); await emit(nodes.get("run-nickname"), "input");
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  assert.equal(requestCounts(model.requests)["/api/runs/annotations"] ?? 0, 0);
+  for (const annotations of [{}, { scope: { ...scope, origin: "other-machine" }, nickname: null, tags: [] }]) {
+    run.annotations = annotations;
+    await click(nodes.get("refresh-button"));
+    assert.equal(nodes.document.getElementById("run-annotations-panel"), null);
+  }
 });
 
 test("hosted archive tags filter in one click without replacing training statuses", async t => {

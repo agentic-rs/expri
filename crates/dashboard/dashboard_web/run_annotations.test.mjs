@@ -71,6 +71,8 @@ test("nicknames improve labels without changing run identities or hiding origina
   assert.deepEqual(runTags(run), ["baseline", "gpu"]);
   assert.equal(runNickname({ ...run, annotations: { ...annotations, nickname: null } }), null);
   assert.deepEqual(runTags({ ...run, annotations: { ...annotations, tags: [] } }), []);
+  assert.deepEqual(runTags({ ...run, annotations: {} }), []);
+  assert.deepEqual(runTags({ ...run, annotations: { tags: [null, 42, "safe"] } }), ["safe"]);
   assert.equal(runLabel({ run_id: "run", nickname: "Simple" }), "Simple (run)");
   assert.equal(runLabel({ run_id: "run", origin: "gpu-a" }), "run · gpu-a");
 });

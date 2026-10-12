@@ -167,7 +167,8 @@ export function runNickname(run: Pick<Run, "nickname" | "annotations">): string 
   return typeof nickname === "string" && nickname.length > 0 ? nickname : null;
 }
 export function runTags(run: Pick<Run, "tags" | "annotations">): string[] {
-  return run.annotations ? run.annotations.tags : run.tags ?? [];
+  const tags = run.annotations ? run.annotations.tags : run.tags;
+  return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === "string") : [];
 }
 export function runLabel(run: Pick<Run, "run_id" | "origin" | "nickname" | "annotations">): string {
   const identity = run.origin ? `${run.run_id} · ${run.origin}` : run.run_id;

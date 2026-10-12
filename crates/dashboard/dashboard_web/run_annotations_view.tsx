@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { errorText, runIdentity, runNickname, runTags, type Run } from "./dashboard_model";
+import { apiUrl, errorText, parseProjectRunKey, parseRunDeepLink, runIdentity, runNickname, runTags, type Run, type Source } from "./dashboard_model";
 import { MAX_RUN_NICKNAME_CHARS, MAX_RUN_TAGS, normalizeRunAnnotations, runAnnotationsScope, type RunAnnotationValues } from "./run_annotations";
 import type { DashboardActions, DashboardSnapshot } from "./dashboard_view";
 
@@ -30,10 +30,11 @@ function draftChanged(draft: AnnotationDraft): boolean {
     JSON.stringify(draft.tags) !== JSON.stringify(draft.baseline.tags);
 }
 
-function RunAnnotationsEditor({ run, snapshot: s, actions: a }: {
+function RunAnnotationsEditor({ run, snapshot: s, actions: a, unavailable = false }: {
   run: Run;
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
+  unavailable?: boolean;
 }) {
   const committed = { nickname: runNickname(run), tags: runTags(run) };
   const committed_key = JSON.stringify(committed);
@@ -45,9 +46,11 @@ function RunAnnotationsEditor({ run, snapshot: s, actions: a }: {
         JSON.stringify(current.tags) === JSON.stringify(current.submitted.tags) &&
         valuesEqual(current.submitted, committed))) ? newDraft(committed) : current);
   }, [committed_key]);
-  const disabled = !s.run_management_enabled || s.review_loading || s.annotations_busy || s.archival_busy;
+  const disabled = unavailable || !s.run_management_enabled || s.review_loading || s.annotations_busy || s.archival_busy;
+  const description_id = unavailable ? "run-annotations-hint run-annotations-unavailable" : "run-annotations-hint";
   const dirty = draftChanged(draft);
   const addTag = () => {
+    if (disabled) return;
     try {
       const tag = normalizeRunAnnotations(null, [draft.tag_input]).tags[0]!;
       const values = normalizeRunAnnotations(null, draft.tags.includes(tag) ? draft.tags : [...draft.tags, tag]);
@@ -84,7 +87,7 @@ function RunAnnotationsEditor({ run, snapshot: s, actions: a }: {
         <label className="field" htmlFor="run-nickname">
           <span>Nickname</span>
           <input id="run-nickname" type="text" value={draft.nickname} autoComplete="off"
-            aria-describedby="run-annotations-hint"
+            aria-describedby={description_id}
             onChange={(event) => setDraft({ ...draft, nickname: event.currentTarget.value, error: null })}
             placeholder="Give this run a name" />
         </label>
@@ -103,7 +106,7 @@ function RunAnnotationsEditor({ run, snapshot: s, actions: a }: {
             <label className="field" htmlFor="run-tag-input">
               <span className="sr-only">New tag</span>
               <input id="run-tag-input" type="text" value={draft.tag_input} autoComplete="off" placeholder="Add a tag"
-                aria-describedby="run-annotations-hint" onChange={(event) => setDraft({ ...draft, tag_input: event.currentTarget.value, error: null })}
+                aria-describedby={description_id} onChange={(event) => setDraft({ ...draft, tag_input: event.currentTarget.value, error: null })}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.nativeEvent.isComposing) {
                     event.preventDefault();
@@ -122,8 +125,17 @@ function RunAnnotationsEditor({ run, snapshot: s, actions: a }: {
       </fieldset>
     </form>
     {(draft.error || s.annotations_error) && <p id="run-annotations-error" className="notice error" role="alert">{draft.error || s.annotations_error}</p>}
-    {!s.run_management_enabled && <p className="muted">Run management is disabled on this dashboard.</p>}
+    {unavailable && <p id="run-annotations-unavailable" className="muted">Nickname and tags are unavailable on this server. The server needs an upgrade.</p>}
+    {!unavailable && !s.run_management_enabled && <p className="muted">Run management is disabled on this dashboard.</p>}
   </section>;
+}
+
+function annotationsUnavailable(run: Run, source: Source | undefined): boolean {
+  if (run.annotations !== undefined || !source || !source.project_id) return false;
+  const identity = source.kind === "hosted_project" ? parseProjectRunKey(run.run_key ?? "") :
+    source.kind === "service" && source.origin ? { origin: source.origin, run_id: run.run_id } : null;
+  if (!identity || identity.run_id !== run.run_id || (run.origin !== undefined && run.origin !== identity.origin)) return false;
+  return parseRunDeepLink(apiUrl("", { project_id: source.project_id, ...identity })) !== null;
 }
 
 export function RunAnnotationsPanel({ snapshot: s, actions: a }: {
@@ -133,6 +145,8 @@ export function RunAnnotationsPanel({ snapshot: s, actions: a }: {
   const run = s.detail?.run;
   const source = s.sources.find((item) => item.source_id === s.source_id);
   if (s.access_mode !== "hosted" || s.review?.kind !== "run" || !run ||
-    s.review.run_ids[0] !== runIdentity(run) || !runAnnotationsScope(run, source)) return null;
-  return <RunAnnotationsEditor key={`${s.source_id}:${runIdentity(run)}`} run={run} snapshot={s} actions={a} />;
+    s.review.run_ids[0] !== runIdentity(run) || s.detail?.source.source_id !== s.source_id) return null;
+  const unavailable = annotationsUnavailable(run, source);
+  if (!runAnnotationsScope(run, source) && !unavailable) return null;
+  return <RunAnnotationsEditor key={`${s.source_id}:${runIdentity(run)}`} run={run} snapshot={s} actions={a} unavailable={unavailable} />;
 }

@@ -480,6 +480,8 @@ Hosted runs have an optional nickname and multiple tags. Open a run and use
 run browser and comparisons; Search also matches them. The run ID remains visible
 and continues to identify files and links. Edits are stored in the service and
 survive worker publishing. Local and cached dashboards remain read-only.
+Older hosted servers show the nickname and tag fields disabled until the server
+is upgraded, so branch previews can still show the new layout.
 
 The owner CLI reads or replaces the same values:
 
