@@ -344,7 +344,7 @@ fn schema_five_migrates_without_changing_worker_records() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, u64>(0))
       .unwrap(),
-    6
+    METADATA_SCHEMA_VERSION as u64
   );
   assert_eq!(
     serde_json::to_value(

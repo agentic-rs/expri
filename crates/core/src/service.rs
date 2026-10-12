@@ -3,10 +3,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::system_profile::{
+  MachineProfile, ProfileAcknowledgement, ProfileBatch, ProfileHistory, ProfileHistoryQuery,
+};
+
 pub use crate::identifiers::validate_component;
 
 pub const STREAM_BATCH: usize = 64 * 1024;
 pub const MAX_REQUEST: usize = 1024 * 1024;
+pub const MAX_SYSTEM_MACHINES: usize = 100;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ClientConfig {
@@ -90,6 +95,22 @@ pub struct AssetProvenance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  /// Publish machine inventory, recent details, and authoritative hourly snapshots.
+  PutSystemProfile {
+    batch: ProfileBatch,
+  },
+  /// Browse system profiles independently of project and run history. Owner-only.
+  ListSystemMachines {
+    limit: usize,
+    cursor: Option<String>,
+  },
+  GetSystemMachine {
+    machine_id: String,
+    inventory_revision: Option<u64>,
+  },
+  SystemHistory {
+    query: ProfileHistoryQuery,
+  },
   ProjectStorage {
     project_id: String,
   },
@@ -213,6 +234,19 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  SystemProfileAcknowledged {
+    acknowledgement: ProfileAcknowledgement,
+  },
+  SystemMachines {
+    machines: Vec<MachineProfile>,
+    next_cursor: Option<String>,
+  },
+  SystemMachine {
+    machine: MachineProfile,
+  },
+  SystemHistory {
+    history: ProfileHistory,
+  },
   ProjectStorage {
     stats: ProjectStorageStats,
   },

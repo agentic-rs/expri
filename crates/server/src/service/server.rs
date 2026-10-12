@@ -13,7 +13,9 @@ use super::browser_auth::BrowserAuth;
 use super::dashboard_data::HostedDashboard;
 use super::storage::{ObjectStorage, S3Storage};
 use super::store::{ApiError, ApiResult, Store};
-use super::types::{self, DashboardConfig, FileTarget, Request, ServerConfig, WorkerAuth};
+use super::types::{
+  self, DashboardConfig, FileTarget, MachineAuth, Request, ServerConfig, WorkerAuth,
+};
 use crate::error::{ExpriError, Result};
 
 const HEADER_LIMIT: usize = 16 * 1024;
@@ -32,7 +34,14 @@ struct DashboardSite {
 struct Auth {
   owner: Vec<u8>,
   workers: Vec<(Vec<u8>, WorkerAuth)>,
+  machines: Vec<(Vec<u8>, MachineAuth)>,
   sites: Vec<DashboardSite>,
+}
+
+enum Role<'a> {
+  Owner,
+  Worker(&'a WorkerAuth),
+  Machine(&'a MachineAuth),
 }
 
 impl Auth {
@@ -54,6 +63,26 @@ impl Auth {
       }
       workers.push((value, worker.clone()));
     }
+    let mut machines = Vec::new();
+    for machine in &config.machines {
+      types::validate_component(&machine.machine_id)?;
+      let value = token(&machine.token_env)?;
+      if constant_eq(&value, &owner)
+        || workers
+          .iter()
+          .any(|(previous, _)| constant_eq(&value, previous))
+        || machines
+          .iter()
+          .any(|(previous, registered): &(Vec<u8>, MachineAuth)| {
+            constant_eq(&value, previous) || registered.machine_id == machine.machine_id
+          })
+      {
+        return Err(ExpriError::Message(
+          "service machine identities and bearer tokens must be distinct".into(),
+        ));
+      }
+      machines.push((value, machine.clone()));
+    }
     let sites = config
       .dashboard
       .as_ref()
@@ -71,8 +100,13 @@ impl Auth {
             "dashboard password must contain 16 to 256 printable ASCII bytes".into(),
           ));
         }
+        // Reject credential reuse: bearer tokens must never also be browser passwords.
+        // This does not authenticate or create a browser session for any bearer token.
         if constant_eq(password.as_bytes(), &owner)
           || workers
+            .iter()
+            .any(|(token, _)| constant_eq(password.as_bytes(), token))
+          || machines
             .iter()
             .any(|(token, _)| constant_eq(password.as_bytes(), token))
         {
@@ -87,6 +121,7 @@ impl Auth {
     Ok(Self {
       owner,
       workers,
+      machines,
       sites,
     })
   }
@@ -134,7 +169,7 @@ impl Auth {
     Ok(())
   }
 
-  fn role(&self, request: &HttpRequest<Vec<u8>>) -> ApiResult<Option<&WorkerAuth>> {
+  fn role(&self, request: &HttpRequest<Vec<u8>>) -> ApiResult<Role<'_>> {
     let mut headers = request.headers().get_all("authorization").iter();
     let header = headers
       .next()
@@ -147,13 +182,20 @@ impl Auth {
       .ok_or_else(|| ApiError::new(401, "bearer authentication required"))?
       .as_bytes();
     if constant_eq(supplied, &self.owner) {
-      return Ok(None);
+      return Ok(Role::Owner);
     }
-    self
+    if let Some((_, worker)) = self
       .workers
       .iter()
       .find(|(token, _)| constant_eq(supplied, token))
-      .map(|(_, worker)| Some(worker))
+    {
+      return Ok(Role::Worker(worker));
+    }
+    self
+      .machines
+      .iter()
+      .find(|(token, _)| constant_eq(supplied, token))
+      .map(|(_, machine)| Role::Machine(machine))
       .ok_or_else(|| ApiError::new(401, "bearer authentication required"))
   }
 }
@@ -228,6 +270,33 @@ fn constant_eq(left: &[u8], right: &[u8]) -> bool {
   bool::from(left.ct_eq(right))
 }
 
+fn authorize_role<S: ObjectStorage>(
+  store: &Store<S>,
+  role: Role<'_>,
+  request: &Request,
+) -> ApiResult<()> {
+  let machine = match role {
+    Role::Owner => return authorize(store, None, request),
+    Role::Worker(worker) => return authorize(store, Some(worker), request),
+    Role::Machine(machine) => machine,
+  };
+  let allowed = match request {
+    Request::Capabilities => true,
+    Request::PutSystemProfile { batch } => machine.machine_id == batch.machine_id,
+    Request::GetSystemMachine { machine_id, .. } => machine.machine_id == *machine_id,
+    Request::SystemHistory { query } => machine.machine_id == query.machine_id,
+    _ => false,
+  };
+  if allowed {
+    Ok(())
+  } else {
+    Err(ApiError::new(
+      403,
+      "machine token is outside its system profile",
+    ))
+  }
+}
+
 fn authorize<S: ObjectStorage>(
   store: &Store<S>,
   worker: Option<&WorkerAuth>,
@@ -285,7 +354,11 @@ fn authorize<S: ObjectStorage>(
     | Request::RestoreRun { .. }
     | Request::RunArchival { .. }
     | Request::RunAnnotations { .. }
-    | Request::SetRunAnnotations { .. } => false,
+    | Request::SetRunAnnotations { .. }
+    | Request::PutSystemProfile { .. }
+    | Request::ListSystemMachines { .. }
+    | Request::GetSystemMachine { .. }
+    | Request::SystemHistory { .. } => false,
     Request::Capabilities => true,
     Request::SealRun {
       incomplete: true, ..
@@ -402,6 +475,20 @@ pub fn serve(
         let _ = retention_store.run_retention_cycle();
         for _ in 0..10 {
           if retention_stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+          }
+          std::thread::sleep(Duration::from_millis(500));
+        }
+      }
+    });
+    let profile_store = &store;
+    let profile_stop = &stop;
+    scope.spawn(move || {
+      while !profile_stop.load(std::sync::atomic::Ordering::Acquire) {
+        // Each transaction removes a bounded batch while preserving hourly history.
+        let _ = profile_store.system_profile_retention_cycle();
+        for _ in 0..10 {
+          if profile_stop.load(std::sync::atomic::Ordering::Acquire) {
             break;
           }
           std::thread::sleep(Duration::from_millis(500));
@@ -571,7 +658,7 @@ fn route<S: ObjectStorage>(
   if request.method() != "POST" {
     return Err(ApiError::new(405, "service requests require POST"));
   }
-  let worker = auth.role(&request)?;
+  let role = auth.role(&request)?;
   let mut content_types = request.headers().get_all("content-type").iter();
   if !content_types
     .next()
@@ -591,7 +678,7 @@ fn route<S: ObjectStorage>(
   }
   let operation: Request = serde_json::from_slice(request.body())
     .map_err(|_| ApiError::new(400, "invalid service request"))?;
-  authorize(store, worker, &operation)?;
+  authorize_role(store, role, &operation)?;
   let response = store.execute(operation)?;
   let mut body = LimitedBytes(Vec::new());
   serde_json::to_writer(&mut body, &response).map_err(|_| {
@@ -841,6 +928,7 @@ mod tests {
     Auth {
       owner: b"owner-token-with-at-least-24-characters".to_vec(),
       sites: Vec::new(),
+      machines: Vec::new(),
       workers: vec![(
         b"worker-token-with-at-least-24-characters".to_vec(),
         WorkerAuth {
@@ -863,6 +951,162 @@ mod tests {
     request
       .body(serde_json::to_vec(operation).unwrap())
       .unwrap()
+  }
+
+  #[test]
+  fn machine_tokens_publish_and_read_only_their_profile_without_worker_or_browser_access() {
+    use expri_core::system_profile::{
+      CpuInventory, InventoryRevision, PROFILE_SCHEMA_VERSION, ProfileBatch, ProfileHistoryQuery,
+      ProfileResolution, SYSTEM_PROFILE_CAPABILITY, SystemInventory,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let mut auth = auth();
+    let machine_token = "machine-token-with-at-least-24-characters";
+    auth.machines.push((
+      machine_token.as_bytes().to_vec(),
+      MachineAuth {
+        machine_id: "machine-test".into(),
+        token_env: "unused".into(),
+      },
+    ));
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let batch = ProfileBatch {
+      schema_version: PROFILE_SCHEMA_VERSION,
+      machine_id: "machine-test".into(),
+      samples: Vec::new(),
+      hours: Vec::new(),
+      inventories: vec![InventoryRevision {
+        revision: 1,
+        inventory: SystemInventory {
+          observed_at_ms: at_ms,
+          hostname: "host".into(),
+          os_name: None,
+          os_version: None,
+          kernel_version: None,
+          architecture: "test".into(),
+          memory_total_bytes: 1024,
+          cpu: CpuInventory {
+            brand: "cpu".into(),
+            vendor: "vendor".into(),
+            logical_cpu_count: 1,
+            physical_core_count: None,
+          },
+          measurement_scope: "host".into(),
+          devices: Vec::new(),
+          warnings: Vec::new(),
+        },
+      }],
+    };
+    let put = Request::PutSystemProfile {
+      batch: batch.clone(),
+    };
+    assert!(route(&store, &auth, request(Some(machine_token), &put)).is_ok());
+    let capabilities = route(
+      &store,
+      &auth,
+      request(Some(machine_token), &Request::Capabilities),
+    )
+    .unwrap();
+    let Response::Capabilities { features } = serde_json::from_slice(&capabilities).unwrap() else {
+      panic!("expected capabilities")
+    };
+    assert!(
+      features
+        .iter()
+        .any(|feature| feature == SYSTEM_PROFILE_CAPABILITY)
+    );
+    let get = Request::GetSystemMachine {
+      machine_id: "machine-test".into(),
+      inventory_revision: None,
+    };
+    assert!(route(&store, &auth, request(Some(machine_token), &get)).is_ok());
+    let history = Request::SystemHistory {
+      query: ProfileHistoryQuery {
+        machine_id: "machine-test".into(),
+        start_ms: 0,
+        end_ms: at_ms + 1,
+        resolution: ProfileResolution::Hourly,
+        cursor: None,
+        limit: 1,
+      },
+    };
+    assert!(route(&store, &auth, request(Some(machine_token), &history)).is_ok());
+    let list = Request::ListSystemMachines {
+      limit: 1,
+      cursor: None,
+    };
+    assert_eq!(
+      route(&store, &auth, request(Some(machine_token), &list))
+        .unwrap_err()
+        .status,
+      403
+    );
+    assert!(
+      route(
+        &store,
+        &auth,
+        request(Some("owner-token-with-at-least-24-characters"), &list)
+      )
+      .is_ok()
+    );
+
+    for operation in [&put, &get, &history, &list] {
+      assert_eq!(
+        route(
+          &store,
+          &auth,
+          request(Some("worker-token-with-at-least-24-characters"), operation)
+        )
+        .unwrap_err()
+        .status,
+        403
+      );
+    }
+    let mut foreign = batch;
+    foreign.machine_id = "another-machine".into();
+    for operation in [
+      Request::PutSystemProfile { batch: foreign },
+      Request::GetSystemMachine {
+        machine_id: "another-machine".into(),
+        inventory_revision: None,
+      },
+      Request::SystemHistory {
+        query: ProfileHistoryQuery {
+          machine_id: "another-machine".into(),
+          start_ms: 0,
+          end_ms: at_ms + 1,
+          resolution: ProfileResolution::Detail,
+          cursor: None,
+          limit: 1,
+        },
+      },
+      Request::ListFiles { scope: scope() },
+      Request::ListRuns {
+        project_id: "project".into(),
+        origin: "worker".into(),
+      },
+    ] {
+      assert_eq!(
+        route(&store, &auth, request(Some(machine_token), &operation))
+          .unwrap_err()
+          .status,
+        403
+      );
+    }
+    let dashboard = HostedDashboard::new(&store).unwrap();
+    let mut browser_auth = dashboard_auth();
+    browser_auth.machines = auth.machines;
+    let mut browser = browser_request(Some(MAIN_AUTHORITY), "/api/catalog");
+    browser.headers_mut().insert(
+      "authorization",
+      format!("Bearer {machine_token}").parse().unwrap(),
+    );
+    assert_eq!(
+      dispatch(&store, &browser_auth, Some(&dashboard), browser).status(),
+      401
+    );
   }
 
   #[test]

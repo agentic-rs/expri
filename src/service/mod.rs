@@ -19,6 +19,8 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSubcommand {
+  /// Inspect machine inventories and system-profile history.
+  System(crate::system_cli::ServiceSystemCommand),
   /// Edit hosted run names and tags, or manage archival and retention.
   Run {
     #[command(subcommand)]
@@ -280,6 +282,7 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
     ));
   }
   let report = match command.command {
+    ServiceSubcommand::System(command) => return crate::system_cli::run_service(command),
     ServiceSubcommand::Run { command } => match command {
       RunCommand::Archive(options) => client::archive_run(&options.config, &options.scope())?,
       RunCommand::Restore(options) => client::restore_run(&options.config, &options.scope())?,

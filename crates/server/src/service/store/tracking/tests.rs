@@ -143,7 +143,7 @@ fn version_one_migration_preserves_legacy_objects_and_live_streams() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    6
+    METADATA_SCHEMA_VERSION
   );
   assert_eq!(
     serde_json::to_value(store.file(&checkpoint).unwrap()).unwrap(),
@@ -199,10 +199,11 @@ fn future_schema_is_rejected_without_creating_tables_or_changing_data() {
   let db = Connection::open(&path).unwrap();
   db.execute_batch(
     "CREATE TABLE future_data (value TEXT NOT NULL);
-     INSERT INTO future_data VALUES('untouched');
-     PRAGMA user_version=7;",
+     INSERT INTO future_data VALUES('untouched');",
   )
   .unwrap();
+  db.pragma_update(None, "user_version", METADATA_SCHEMA_VERSION + 1)
+    .unwrap();
   drop(db);
   let error = Store::open(dir.path(), MockStorage::default())
     .err()
@@ -212,7 +213,7 @@ fn future_schema_is_rejected_without_creating_tables_or_changing_data() {
   assert_eq!(
     db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    7
+    METADATA_SCHEMA_VERSION + 1
   );
   assert_eq!(
     db.query_row("SELECT value FROM future_data", [], |row| row

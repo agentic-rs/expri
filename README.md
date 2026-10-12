@@ -31,9 +31,30 @@ expri skill --help
 ```
 
 Topics cover configuration, source pushing, task launch, run inspection,
-metrics, artifacts, assets, environments, and service publishing/fetching.
+metrics, artifacts, assets, environments, service publishing/fetching, and
+machine system profiles.
 The Markdown is embedded in the CLI, works offline without project
 configuration, and does not install files.
+
+## Machine system profiles
+
+Record CPU/GPU, memory, disk, and network observations independently of
+experiment runs:
+
+```sh
+expri system sample
+expri system daemon --no-publish
+expri system status
+expri system history --resolution hourly
+```
+
+New machine configuration and profile history live in `~/.tokn/expri`.
+The foreground daemon samples every ten seconds. Optional machine-scoped
+publishing runs independently, so server outages do not delay collection.
+Both local and server stores keep 72 hours of raw samples and retain historical
+hourly summaries indefinitely. Existing project configuration, caches, and run
+storage keep their current paths. See [system profiles](docs/system-profiles.md)
+for GPU support, service authentication, publishing, and history queries.
 
 ## Push source and config
 

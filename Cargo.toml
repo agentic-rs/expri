@@ -7,6 +7,7 @@ members = [
   "crates/worker",
   "crates/dashboard",
   "crates/server",
+  "crates/system",
 ]
 resolver = "3"
 
@@ -25,6 +26,7 @@ expri-assets = { version = "=0.1.5", path = "crates/assets" }
 expri-worker = { version = "=0.1.5", path = "crates/worker" }
 expri-dashboard = { version = "=0.1.5", path = "crates/dashboard" }
 expri-server = { version = "=0.1.5", path = "crates/server" }
+expri-system = { version = "=0.1.5", path = "crates/system", default-features = false }
 attohttpc = { version = "0.30.1", default-features = false }
 base64 = "0.22.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -39,12 +41,15 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 rust-s3 = { version = "=0.37.2", default-features = false, features = ["sync-rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
+sysinfo = { version = "=0.37.2", default-features = false, features = ["system", "disk", "network"] }
+nvml-wrapper = "=0.11.0"
 tempfile = "3.27.0"
 toml = "1.1.2"
 url = "2.5.8"
+uuid = { version = "=1.18.1", features = ["v4"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [package]
@@ -66,6 +71,7 @@ expri-assets.workspace = true
 expri-worker.workspace = true
 expri-dashboard.workspace = true
 expri-server.workspace = true
+expri-system = { workspace = true, features = ["collector"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

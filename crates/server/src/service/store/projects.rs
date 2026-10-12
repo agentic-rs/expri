@@ -303,7 +303,11 @@ impl<S: ObjectStorage> Store<S> {
       | Request::RestoreRun { .. }
       | Request::RunArchival { .. }
       | Request::RunAnnotations { .. }
-      | Request::SetRunAnnotations { .. } => return Ok(None),
+      | Request::SetRunAnnotations { .. }
+      | Request::PutSystemProfile { .. }
+      | Request::ListSystemMachines { .. }
+      | Request::GetSystemMachine { .. }
+      | Request::SystemHistory { .. } => return Ok(None),
       Request::BeginUpload { target, .. }
       | Request::GetFile { target }
       | Request::DownloadUrl { target } => project_of(target),

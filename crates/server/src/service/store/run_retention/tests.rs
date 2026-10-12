@@ -646,7 +646,7 @@ fn schema_three_upgrade_adds_retention_without_changing_existing_runs() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    6
+    METADATA_SCHEMA_VERSION
   );
   assert_eq!(
     serde_json::to_value(store.file(&original.target).unwrap()).unwrap(),

@@ -9,6 +9,8 @@ pub struct ServerConfig {
   #[serde(default)]
   pub workers: Vec<WorkerAuth>,
   #[serde(default)]
+  pub machines: Vec<MachineAuth>,
+  #[serde(default)]
   pub dashboard: Option<DashboardConfig>,
   pub storage: super::storage::S3Config,
 }
@@ -37,6 +39,13 @@ pub struct WorkerAuth {
   pub token_env: String,
 }
 
+/// A telemetry token authorizes exactly one physical machine, independently of runs.
+#[derive(Clone, Debug, Deserialize)]
+pub struct MachineAuth {
+  pub machine_id: String,
+  pub token_env: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ArchiveSnapshot {
   pub scope: RunScope,
@@ -62,6 +71,7 @@ password_env = "EXPRI_DASHBOARD_PASSWORD"
 "#,
     )
     .unwrap();
+    assert!(config.machines.is_empty());
     assert!(config.dashboard.unwrap().previews.is_empty());
     let config: ServerConfig = toml::from_str(
       r#"
@@ -84,5 +94,25 @@ assets_dir = "/opt/expri/preview"
       dashboard.previews[0].assets_dir,
       PathBuf::from("/opt/expri/preview")
     );
+  }
+
+  #[test]
+  fn machine_token_configuration_is_independent_of_projects() {
+    let config: ServerConfig = toml::from_str(
+      r#"
+owner_token_env = "EXPRI_OWNER_TOKEN"
+[[machines]]
+machine_id = "machine-123"
+token_env = "EXPRI_MACHINE_TOKEN"
+[storage]
+bucket = "experiments"
+region = "us-east-1"
+"#,
+    )
+    .unwrap();
+    assert!(config.workers.is_empty());
+    assert_eq!(config.machines.len(), 1);
+    assert_eq!(config.machines[0].machine_id, "machine-123");
+    assert_eq!(config.machines[0].token_env, "EXPRI_MACHINE_TOKEN");
   }
 }

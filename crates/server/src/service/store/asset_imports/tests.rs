@@ -376,7 +376,7 @@ fn schema_four_migration_backfills_declared_uses_from_acknowledged_documents() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, u64>(0))
       .unwrap(),
-    6
+    METADATA_SCHEMA_VERSION as u64
   );
 }
 

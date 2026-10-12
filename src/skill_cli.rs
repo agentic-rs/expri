@@ -34,6 +34,8 @@ enum SkillTopic {
   Environment,
   /// Publish runs and fetch results through an existing self-hosted service.
   Service,
+  /// Collect and publish machine system profiles with global detail/hourly history.
+  System,
 }
 
 impl SkillTopic {
@@ -48,6 +50,7 @@ impl SkillTopic {
       Self::Assets => include_str!("skill/assets.md"),
       Self::Environment => include_str!("skill/environment.md"),
       Self::Service => include_str!("skill/service.md"),
+      Self::System => include_str!("skill/system.md"),
     }
   }
 }

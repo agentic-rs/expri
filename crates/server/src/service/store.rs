@@ -17,12 +17,14 @@ mod projects;
 mod references;
 mod run_annotations;
 mod run_retention;
+mod system_profiles;
 mod tracking;
 
 const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 7;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -136,7 +138,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot read service metadata version".into())
       })?;
-    if version > 6 {
+    if version > METADATA_SCHEMA_VERSION {
       return Err(crate::error::ExpriError::Message(
         "service metadata schema is newer than this binary".into(),
       ));
@@ -192,10 +194,11 @@ impl<S: ObjectStorage> Store<S> {
     projects::initialize(&connection)?;
     run_annotations::initialize(&connection)?;
     run_retention::initialize(&connection)?;
+    expri_system::store::initialize(&connection)?;
     asset_imports::initialize(&directory, &connection)?;
     // Older binaries must not drop captured provenance, annotations, or deletion fences.
     connection
-      .pragma_update(None, "user_version", 6)
+      .pragma_update(None, "user_version", METADATA_SCHEMA_VERSION)
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot upgrade service metadata version".into())
       })?;
@@ -872,6 +875,25 @@ impl<S: ObjectStorage> Store<S> {
     }
     self.ensure_request_runs(&request)?;
     match request {
+      Request::PutSystemProfile { batch } => Ok(Response::SystemProfileAcknowledged {
+        acknowledgement: self.put_system_profile(&batch)?,
+      }),
+      Request::ListSystemMachines { limit, cursor } => {
+        let (machines, next_cursor) = self.list_system_machines(limit, cursor.as_deref())?;
+        Ok(Response::SystemMachines {
+          machines,
+          next_cursor,
+        })
+      }
+      Request::GetSystemMachine {
+        machine_id,
+        inventory_revision,
+      } => Ok(Response::SystemMachine {
+        machine: self.system_machine(&machine_id, inventory_revision)?,
+      }),
+      Request::SystemHistory { query } => Ok(Response::SystemHistory {
+        history: self.system_history(&query)?,
+      }),
       Request::ArchiveRun { scope } => Ok(Response::RunArchival {
         archival: self.archive_run(&scope)?,
       }),
@@ -914,6 +936,7 @@ impl<S: ObjectStorage> Store<S> {
           "output-assets-v1".into(),
           "project-storage-management-v1".into(),
           "run-retention-v1".into(),
+          expri_core::system_profile::SYSTEM_PROFILE_CAPABILITY.into(),
           "run-annotations-v1".into(),
         ],
       }),

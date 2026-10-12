@@ -23,8 +23,8 @@ pub enum LockAttempt {
 
 /// Hold this lease from run preparation until its terminal state is published.
 pub fn run_lock(run_dir: &Path) -> Result<FileLock> {
-  let file =
-    open_lock_file(&run_dir.join(".run.lock"), true)?.expect("creating a lock file returns a file");
+  let file = open_lock_file(&run_dir.join(".run.lock"), true, true)?
+    .expect("creating a lock file returns a file");
   file
     .lock()
     .map_err(|source| io_context("lock run", run_dir, source))?;
@@ -33,7 +33,7 @@ pub fn run_lock(run_dir: &Path) -> Result<FileLock> {
 
 /// Preview callers pass `create = false` so inspecting a run never creates files.
 pub fn try_lock_file(path: &Path, create: bool) -> Result<LockAttempt> {
-  let Some(file) = open_lock_file(path, create)? else {
+  let Some(file) = open_lock_file(path, create, true)? else {
     return Ok(LockAttempt::Missing);
   };
   match file.try_lock() {
@@ -43,7 +43,20 @@ pub fn try_lock_file(path: &Path, create: bool) -> Result<LockAttempt> {
   }
 }
 
-fn open_lock_file(path: &Path, create: bool) -> Result<Option<File>> {
+/// Inspect an existing exclusive lease with a shared read-only handle.
+/// A readable snapshot can be inspected without write access or creating files.
+pub fn try_lock_file_readonly(path: &Path) -> Result<LockAttempt> {
+  let Some(file) = open_lock_file(path, false, false)? else {
+    return Ok(LockAttempt::Missing);
+  };
+  match file.try_lock_shared() {
+    Ok(()) => Ok(LockAttempt::Acquired(FileLock { file })),
+    Err(std::fs::TryLockError::WouldBlock) => Ok(LockAttempt::Busy),
+    Err(std::fs::TryLockError::Error(source)) => Err(io_context("inspect lock", path, source)),
+  }
+}
+
+fn open_lock_file(path: &Path, create: bool, writable: bool) -> Result<Option<File>> {
   if let Some(parent) = path.parent() {
     validate_directory(parent)?;
   }
@@ -59,7 +72,7 @@ fn open_lock_file(path: &Path, create: bool) -> Result<Option<File>> {
     Err(source) => return Err(io_context("inspect", path, source)),
   };
   let file = if initial.is_some() {
-    OpenOptions::new().read(true).write(true).open(path)
+    OpenOptions::new().read(true).write(writable).open(path)
   } else if create {
     match OpenOptions::new()
       .read(true)
@@ -69,7 +82,7 @@ fn open_lock_file(path: &Path, create: bool) -> Result<Option<File>> {
     {
       Ok(file) => Ok(file),
       Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-        return open_lock_file(path, create);
+        return open_lock_file(path, create, writable);
       }
       Err(error) => Err(error),
     }
@@ -182,9 +195,35 @@ fn io_context(action: &'static str, path: &Path, source: std::io::Error) -> Expr
 
 #[cfg(all(test, unix))]
 mod tests {
+  use std::os::unix::fs::PermissionsExt;
   use std::os::unix::fs::symlink;
 
   use super::*;
+
+  #[test]
+  fn readonly_probe_detects_exclusive_leases_without_write_permission() {
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let path = root.join("collector.lock");
+    assert!(matches!(
+      try_lock_file_readonly(&path).unwrap(),
+      LockAttempt::Missing
+    ));
+    assert!(!path.exists());
+    let LockAttempt::Acquired(lease) = try_lock_file(&path, true).unwrap() else {
+      panic!("new lease");
+    };
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+    assert!(matches!(
+      try_lock_file_readonly(&path).unwrap(),
+      LockAttempt::Busy
+    ));
+    drop(lease);
+    assert!(matches!(
+      try_lock_file_readonly(&path).unwrap(),
+      LockAttempt::Acquired(_)
+    ));
+  }
 
   #[test]
   fn leases_release_while_an_inherited_file_description_remains_open() {
@@ -245,5 +284,6 @@ mod tests {
     let outside = tempfile::NamedTempFile::new().expect("outside file");
     symlink(outside.path(), root.join("worktree.lock")).expect("lock symlink");
     assert!(worktree_lock(&root).is_err());
+    assert!(try_lock_file_readonly(&root.join("worktree.lock")).is_err());
   }
 }

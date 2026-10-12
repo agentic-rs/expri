@@ -6,5 +6,7 @@ pub mod identifiers;
 pub mod lock;
 pub mod protocol;
 pub mod service;
+pub mod storage;
+pub mod system_profile;
 
 pub mod filter;

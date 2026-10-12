@@ -1,10 +1,11 @@
 use super::*;
 use crate::client::download::mock::mock;
 
-fn api(url: &str) -> Api {
+pub(in crate::client) fn api(url: &str) -> Api {
   init_tls();
   let client = Client::builder()
     .no_proxy()
+    .redirect(reqwest::redirect::Policy::none())
     .timeout(Duration::from_secs(3))
     .build()
     .unwrap();
@@ -62,5 +63,19 @@ fn unreadable_successful_body_is_a_typed_transport_failure() {
       reading_response: true
     }
   ));
+  server.join().unwrap();
+}
+
+#[test]
+fn malformed_successful_json_never_echoes_the_service_bearer_token() {
+  let (url, server) = mock(1, |_, _| {
+    (200, Vec::new(), br#"{"kind":"must-not-leak"}"#.to_vec())
+  });
+  let error = api(&url).request(&Request::Capabilities).unwrap_err();
+  let detail = error.to_string();
+  assert!(detail.contains("invalid service response"));
+  assert!(detail.contains("[redacted]"));
+  assert!(!detail.contains("must-not-leak"));
+  assert!(detail.len() <= 512 + "invalid service response: ".len());
   server.join().unwrap();
 }
