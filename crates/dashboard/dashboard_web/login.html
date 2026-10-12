@@ -3,27 +3,47 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="light dark">
     <title>expri · Sign in</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
-  <body>
-    <header class="topbar">
-      <div class="topbar-inner">
-        <a class="brand" href="/login" aria-label="expri sign in"><span class="brand-mark" aria-hidden="true">e</span>expri</a>
-      </div>
-    </header>
-    <main class="login-main">
-      <section class="card login-card" aria-labelledby="login-heading">
-        <p class="eyebrow">Private workspace</p>
-        <h1 id="login-heading">Sign in</h1>
-        <p class="subheading">Enter the dashboard password to review published experiments.</p>
-        <!-- LOGIN_ERROR -->
-        <form class="login-form" method="post" action="/login">
-          <label class="field" for="password">Dashboard password<input id="password" name="password" type="password" autocomplete="current-password" required autofocus></label>
-          <button class="button primary" type="submit">Sign in</button>
-        </form>
+  <body class="login-page">
+    <div class="login-layout">
+      <section class="login-story" aria-labelledby="login-story-heading">
+        <a class="brand" href="/login" aria-label="expri sign in">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 32 32" fill="none">
+              <path d="M9 7h14M9 16h10M9 25h14" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+              <circle cx="22" cy="16" r="3" fill="currentColor" />
+            </svg>
+          </span>
+          <span>expri</span>
+        </a>
+        <div class="login-story-content">
+          <p class="eyebrow">Experiment workspace</p>
+          <h1 id="login-story-heading">A clearer view<br>of every run.</h1>
+          <p>Compare results, inspect metrics, and keep your experiments organized.</p>
+          <ul class="login-benefits">
+            <li><span aria-hidden="true">01</span>Compare experiment metrics</li>
+            <li><span aria-hidden="true">02</span>Inspect run details and logs</li>
+            <li><span aria-hidden="true">03</span>Explore recorded files and outputs</li>
+          </ul>
+        </div>
+        <p class="login-story-footer">Your experiments, in focus.</p>
       </section>
-    </main>
+      <main class="login-main">
+        <section class="card login-card" aria-labelledby="login-heading">
+          <p class="eyebrow">Private workspace</p>
+          <h2 id="login-heading">Welcome back</h2>
+          <p class="subheading">Enter your dashboard password to continue.</p>
+          <!-- LOGIN_ERROR -->
+          <form class="login-form" method="post" action="/login">
+            <label class="field" for="password">Dashboard password<input id="password" name="password" type="password" autocomplete="current-password" required autofocus placeholder="Enter your password"></label>
+            <button class="button primary" type="submit">Sign in to workspace</button>
+          </form>
+          <p class="login-hint">Use the password configured for this dashboard.</p>
+        </section>
+      </main>
+    </div>
   </body>
 </html>

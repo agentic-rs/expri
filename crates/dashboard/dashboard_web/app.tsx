@@ -42,6 +42,7 @@ import {
 import { canArchiveRun, canRestoreRun, runArchivalMatchesScope, runArchivalScope, runIsArchived, type ArchivalAction } from "./run_archival";
 import { normalizeRunAnnotations, runAnnotationsMatchesScope, runAnnotationsScope } from "./run_annotations";
 import { artifactCanSelect } from "./dashboard_files";
+import { applyThemePreference, readThemePreference } from "./dashboard_theme";
 import {
   boundedStorageSearch,
   storageCatalogValid,
@@ -69,6 +70,7 @@ export * from "./storage_management";
 export * from "./live_updates";
 export * from "./run_archival";
 export * from "./run_annotations";
+export * from "./dashboard_theme";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -875,13 +877,21 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       applyRunList(result, url);
       return true;
     } catch (error) {
-      updateUi({
-        global_error: errorText(error),
-        list_busy: false,
-        run_count: "Could not read run history",
-      });
+      showRunListError(error);
       return false;
     }
+  }
+  function showRunListError(error: unknown): void {
+    updateUi({
+      global_error: errorText(error),
+      list_busy: false,
+      run_count: "Could not read run history",
+      list_empty: runs.length ? null : {
+        title: "Runs are unavailable",
+        message: "Check your connection, then choose Refresh to try again.",
+        setup: false,
+      },
+    });
   }
   function cancelRefresh(): void {
     cancelQuietRefresh();
@@ -1714,7 +1724,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       }
     } catch (error) {
       if (generation === refresh_generation) {
-        updateUi({ global_error: errorText(error) });
+        if (!catalog_initialized) showRunListError(error);
+        else updateUi({ global_error: errorText(error) });
         updateUi({ review_loading: false });
       }
     } finally {
@@ -2090,4 +2101,17 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   };
 }
 
-if (typeof document !== "undefined" && document.getElementById("dashboard-root")) startDashboard();
+if (typeof document !== "undefined") {
+  const initial_document = document;
+  applyThemePreference(readThemePreference(), initial_document.documentElement);
+  const mountDashboard = () => {
+    if (typeof document !== "undefined" && document === initial_document && initial_document.getElementById("dashboard-root")) {
+      startDashboard();
+    }
+  };
+  if (initial_document.readyState === "loading") {
+    initial_document.addEventListener("DOMContentLoaded", mountDashboard, { once: true });
+  } else {
+    mountDashboard();
+  }
+}

@@ -79,8 +79,19 @@ function RunAnnotationsEditor({ run, snapshot: s, actions: a, unavailable = fals
       setDraft({ ...draft, error: errorText(error) });
     }
   };
-  return <section id="run-annotations-panel" className="card run-annotations-panel" aria-label="Nickname and tags" aria-busy={s.annotations_busy}>
-    <h3>Nickname and tags</h3>
+  const summary_status = unavailable ? "Unavailable" : !s.run_management_enabled ? "Read only" :
+    s.annotations_busy ? "Saving…" : (draft.error || s.annotations_error) ? "Save failed" : dirty ? "Unsaved changes" : null;
+  return <details id="run-annotations-panel" className="card run-annotations-panel" aria-label="Nickname and tags" aria-busy={s.annotations_busy}>
+    <summary className="annotation-summary">
+      <span className="annotation-summary-label">
+        <span className="annotation-summary-title">Nickname and tags</span>
+        <span className="annotation-summary-description">Give this run a name and add labels.</span>
+      </span>
+      {summary_status && <span className={`annotation-summary-status${(draft.error || s.annotations_error) ? " error" : ""}`}>{summary_status}</span>}
+      <svg className="annotation-summary-chevron" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+        <path d="m6 8 4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </summary>
     <form onSubmit={save}>
       <fieldset disabled={disabled} className="run-annotations-fields">
         <legend className="sr-only">Edit run nickname and tags</legend>
@@ -127,7 +138,7 @@ function RunAnnotationsEditor({ run, snapshot: s, actions: a, unavailable = fals
     {(draft.error || s.annotations_error) && <p id="run-annotations-error" className="notice error" role="alert">{draft.error || s.annotations_error}</p>}
     {unavailable && <p id="run-annotations-unavailable" className="muted">Nickname and tags are unavailable on this server. The server needs an upgrade.</p>}
     {!unavailable && !s.run_management_enabled && <p className="muted">Run management is disabled on this dashboard.</p>}
-  </section>;
+  </details>;
 }
 
 function annotationsUnavailable(run: Run, source: Source | undefined): boolean {

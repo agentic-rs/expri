@@ -6,6 +6,8 @@ import { ProjectStorageManagement } from "./storage_management_view";
 import { RunArchivalPanel } from "./run_archival_view";
 import { RunAnnotationsPanel, RunTags } from "./run_annotations_view";
 import { RunAssets } from "./dashboard_assets";
+import { Icon } from "./dashboard_icons";
+import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
   MAX_RUN_COLUMNS,
@@ -170,6 +172,16 @@ export type DashboardStore = {
 };
 
 type RadioOption<T extends string> = { id: string; value: T; label: string };
+function revealOnCompactLayout(id: string): void {
+  if (!window.matchMedia?.("(max-width: 1180px)").matches) return;
+  const target = document.getElementById(id);
+  if (!target) return;
+  target.focus({ preventScroll: true });
+  target.scrollIntoView?.({
+    block: "start",
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+  });
+}
 function RadioTags<T extends string>({
   id,
   name,
@@ -341,7 +353,7 @@ function RunColumnPicker({
         Columns <span className="muted">{s.run_columns.length} / {MAX_RUN_COLUMNS}</span>
       </summary>
       <p id="run-columns-hint" className="muted">
-        Run and Status stay visible. Choose up to eight parameter or metric columns.
+        Run, task, status, and start time stay visible. Add up to eight parameter or metric columns.
       </p>
       {s.run_columns_loading && <p role="status">Finding recorded columns…</p>}
       <Warnings id="run-columns-warnings" items={s.run_columns_warnings} />
@@ -495,39 +507,27 @@ function RunBrowser({
     <section className="card runs-card" aria-labelledby="runs-heading">
       <div className="section-heading">
         <div>
-          <h2 id="runs-heading" tabIndex={-1}>
-            Runs
-          </h2>
+          <h2 id="runs-heading" tabIndex={-1}>All runs</h2>
           <p id="run-count" className="muted">
             {s.run_count}
           </p>
         </div>
       </div>
       <div className="filters">
-        {s.access_mode === "hosted" && <RadioTags
-          id="archival-options"
-          name="archival"
-          legend="Run history"
-          value={s.archival}
-          disabled={s.controls_disabled}
-          options={[
-            { id: "archival-active", value: "active", label: "Active" },
-            { id: "archival-archived", value: "archived", label: "Archived" },
-          ]}
-          on_change={a.archival}
-        />}
-        {project && <MachineFilter key={project.source_id} source={project} snapshot={s} actions={a} />}
         <label className="field search-field">
           Search
-          <input
-            id="search-input"
-            type="search"
-            placeholder="Run ID or task"
-            autoComplete="off"
-            disabled={s.controls_disabled}
-            value={s.search}
-            onChange={(event) => a.filter("search", event.currentTarget.value)}
-          />
+          <span className="search-control">
+            <Icon name="search" />
+            <input
+              id="search-input"
+              type="search"
+              placeholder="Name, tag, run ID, or task"
+              autoComplete="off"
+              disabled={s.controls_disabled}
+              value={s.search}
+              onChange={(event) => a.filter("search", event.currentTarget.value)}
+            />
+          </span>
         </label>
         <label className="field">
           Task
@@ -547,6 +547,18 @@ function RunBrowser({
             ))}
           </datalist>
         </label>
+        {s.access_mode === "hosted" && <RadioTags
+          id="archival-options"
+          name="archival"
+          legend="Run history"
+          value={s.archival}
+          disabled={s.controls_disabled}
+          options={[
+            { id: "archival-active", value: "active", label: "Active" },
+            { id: "archival-archived", value: "archived", label: "Archived" },
+          ]}
+          on_change={a.archival}
+        />}
         <RadioTags
           id="status-options"
           name="status"
@@ -565,6 +577,7 @@ function RunBrowser({
           ]}
           on_change={(value) => a.filter("status", value)}
         />
+        {project && <MachineFilter key={project.source_id} source={project} snapshot={s} actions={a} />}
         <button
           id="clear-filters"
           className="text-button"
@@ -643,7 +656,6 @@ function RunBrowser({
                 snapshot={s}
                 actions={a}
               />
-              {project && <RunSortHeader label="Machine" sort_key="origin" class_name="machine-column" snapshot={s} actions={a} />}
               <RunSortHeader
                 label="Status"
                 sort_key="status"
@@ -651,6 +663,9 @@ function RunBrowser({
                 snapshot={s}
                 actions={a}
               />
+              {project && <RunSortHeader label="Machine" sort_key="origin" class_name="machine-column" snapshot={s} actions={a} />}
+              <th scope="col" className="task-column">Task</th>
+              <RunSortHeader label="Started" sort_key="started_at" class_name="started-column" snapshot={s} actions={a} />
               {s.run_columns.map((column) => (
                 <RunSortHeader
                   key={runColumnIdentity(column)}
@@ -666,7 +681,7 @@ function RunBrowser({
           </thead>
           <tbody id="run-rows">
             {s.runs.map((run) => {
-              const metadata = [dateText(run.started_at), formatDuration(run)].filter(
+              const metadata = [formatDuration(run)].filter(
                 (value) => value !== "—",
               );
               if (run.exit_code !== null && run.exit_code !== 0)
@@ -698,14 +713,15 @@ function RunBrowser({
                       type="button"
                       className={`run-link${runNickname(run) ? " has-nickname" : ""}`}
                       disabled={s.list_busy}
-                      onClick={() => a.inspect_run(identity)}
+                      onClick={() => {
+                        a.inspect_run(identity);
+                        revealOnCompactLayout("review-title");
+                      }}
                     >
                       {runNickname(run) ?? run.run_id}
                     </button>
                     {runNickname(run) && <div className="run-meta run-identifier">{run.run_id}</div>}
                     <RunTags run={run} />
-                    <div className="run-task">{run.task ?? "No task recorded"}</div>
-                    <div className="run-meta">{metadata.join(" · ")}</div>
                     {run.archival && run.archival.status !== "active" && <div className="run-meta">
                       {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` :
                         run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
@@ -719,14 +735,17 @@ function RunBrowser({
                       </div>
                     )}
                   </td>
-                  {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
                   <td className="status-column">
                     <span
                       className={`status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(run.status) ? run.status : ""}`}
                     >
                       {run.status}
                     </span>
+                    {metadata.length > 0 && <div className="run-meta">{metadata.join(" · ")}</div>}
                   </td>
+                  {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
+                  <td className="task-column"><span className="run-task">{run.task ?? "—"}</span></td>
+                  <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
                   {s.run_columns.map((column) => {
                     const value = formatRunTableValue(runColumnValue(run, column));
                     return (
@@ -830,9 +849,12 @@ function RunBrowser({
             className="button primary"
             type="button"
             disabled={s.selected.length < 2}
-            onClick={a.compare}
+            onClick={() => {
+              a.compare();
+              revealOnCompactLayout("review-title");
+            }}
           >
-            Compare runs
+            <Icon name="compare" />Compare runs
           </button>
         </div>
       </div>
@@ -980,7 +1002,13 @@ function ResultUploadSummary({ detail }: { detail: Detail | null }) {
     failed: "Result upload failed",
   };
   return (
-    <div id="result-upload-summary" className="notice" role="status">
+    <div
+      id="result-upload-summary"
+      className={`notice${result_upload.status === "failed" ? " error" : ""}`}
+      data-upload-status={result_upload.status}
+      data-incomplete={result_upload.incomplete ? "true" : "false"}
+      role="status"
+    >
       <strong id="result-upload-status">{labels[result_upload.status] ?? "Result upload status unknown"}</strong>
       {result_upload.incomplete && <span> · Partial result</span>}
       {result_upload.status === "uploaded" && (
@@ -1134,12 +1162,11 @@ function ReviewWorkspace({
   return (
     <div className="review-workspace">
       <section id="review-empty" className="review-empty" hidden={!s.review_empty}>
-        <p className="eyebrow">Experiment review</p>
-        <h2>Select a run</h2>
-        <p>
-          Open a run to inspect its curves, parameters, and logs. Select runs to compare their
-          recorded results.
-        </p>
+        <span className="review-empty-icon"><Icon name="charts" /></span>
+        <div>
+          <h2>Inspect or compare runs</h2>
+          <p>Open a run to explore metrics, parameters, logs, and files. Select two to eight runs to compare results.</p>
+        </div>
       </section>
       <section id="review-section" aria-live="polite" hidden={!s.review}>
         <div className="review-heading">
@@ -1147,7 +1174,7 @@ function ReviewWorkspace({
             <p id="review-eyebrow" className="eyebrow">
               {s.review?.kind === "compare" ? "Experiment comparison" : "Run details"}
             </p>
-            <h2 id="review-title" className={review_run && runNickname(review_run) ? "has-nickname" : undefined}>
+            <h2 id="review-title" tabIndex={-1} className={review_run && runNickname(review_run) ? "has-nickname" : undefined}>
               {s.review?.kind === "compare"
                 ? `${s.review.run_ids.length} runs`
                 : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
@@ -1160,17 +1187,20 @@ function ReviewWorkspace({
             className="text-button"
             type="button"
             hidden={s.review?.origin === "selection"}
-            onClick={a.close}
+            onClick={() => {
+              a.close();
+              revealOnCompactLayout("runs-heading");
+            }}
           >
-            {s.selected.length ? "Back to selection" : "Close review"}
+            <Icon name="close" />{s.selected.length ? "Back to selection" : "Close review"}
           </button>
         </div>
         {s.access_mode === "hosted" && s.review?.kind === "run" && (
-          <>
+          <div className="review-management">
             <RunAnnotationsPanel snapshot={s} actions={a} />
             <RunArchivalPanel snapshot={s} actions={a} />
             <ResultUploadSummary detail={s.detail} />
-          </>
+          </div>
         )}
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {tabs.map((tab) => (
@@ -1187,7 +1217,7 @@ function ReviewWorkspace({
               onClick={() => a.tab(tab)}
               onKeyDown={(event) => moveTab(event, tab, available, a.tab, "review-tab-")}
             >
-              {tab[0]?.toUpperCase()}
+              <Icon name={tab} />{tab[0]?.toUpperCase()}
               {tab.slice(1)}
             </button>
           ))}
@@ -1363,123 +1393,145 @@ function ReviewWorkspace({
     </div>
   );
 }
-export function DashboardView({
-  store,
-  actions,
-}: {
+function SourceControls({ snapshot: s, actions }: {
+  snapshot: DashboardSnapshot;
+  actions: DashboardActions;
+}) {
+  const empty_label = s.refreshing
+    ? s.project_catalog_enabled ? "Loading projects…" : "Loading sources…"
+    : s.project_catalog_enabled ? "No published projects" : s.access_mode === "hosted" ? "No published sources" : "No sources";
+  return s.project_catalog_enabled && s.sources.length > 0 && s.sources.length <= 6 ? (
+    <RadioTags
+      id="project-options"
+      name="project"
+      legend="Projects"
+      value={s.source_id}
+      options={s.sources.map((source) => ({
+        id: `project-${source.project_id}`,
+        value: source.source_id,
+        label: source.label,
+      }))}
+      on_change={actions.source}
+    />
+  ) : (
+    <label className="field">
+      {s.project_catalog_enabled ? "Project" : "Source"}
+      <select
+        id="source-select"
+        aria-label={s.project_catalog_enabled ? "Project" : "Run source"}
+        disabled={!s.sources.length}
+        value={s.source_id}
+        onChange={(event) => actions.source(event.currentTarget.value)}
+      >
+        {s.sources.length ? s.sources.map((source) => (
+          <option key={source.source_id} value={source.source_id}>
+            {source.kind === "service" ? `${source.label} · Published` : source.label}
+          </option>
+        )) : (
+          <option value="">{empty_label}</option>
+        )}
+      </select>
+    </label>
+  );
+}
+function WorkspaceNavigation({ snapshot: s, actions, storage_enabled }: {
+  snapshot: DashboardSnapshot;
+  actions: DashboardActions;
+  storage_enabled: boolean;
+}) {
+  const views: ("workspace" | "storage")[] = storage_enabled ? ["workspace", "storage"] : ["workspace"];
+  return (
+    <nav aria-label="Workspace navigation">
+      <fieldset id="workspace-view-options" className="workspace-navigation">
+        <legend className="sr-only">Project page</legend>
+        {views.map((view) => (
+          <label className="navigation-item" key={view}>
+            <input
+              className="sr-only"
+              type="radio"
+              name="workspace_view"
+              id={`workspace-view-${view}`}
+              value={view}
+              checked={s.workspace_view === view}
+              onChange={() => actions.workspace_view(view)}
+            />
+            <span><Icon name={view === "workspace" ? "runs" : "storage"} />{view === "workspace" ? "Runs" : "Storage"}</span>
+          </label>
+        ))}
+      </fieldset>
+    </nav>
+  );
+}
+function RefreshControls({ snapshot: s, actions }: {
+  snapshot: DashboardSnapshot;
+  actions: DashboardActions;
+}) {
+  return (
+    <div className="refresh-status">
+      <div className="refresh-context">
+        <label className="auto-refresh">
+          <input
+            id="auto-refresh-toggle"
+            type="checkbox"
+            checked={s.auto_enabled}
+            onChange={(event) => actions.auto_refresh(event.currentTarget.checked)}
+          />
+          Auto refresh
+        </label>
+        <span id="updated-at" className="freshness">{s.freshness}</span>
+      </div>
+      <button
+        id="refresh-button"
+        className="button secondary"
+        type="button"
+        disabled={s.refreshing}
+        onClick={actions.refresh}
+      >
+        <Icon name="refresh" />
+        {s.refreshing ? "Refreshing…" : "Refresh"}
+      </button>
+    </div>
+  );
+}
+export function DashboardView({ store, actions }: {
   store: DashboardStore;
   actions: DashboardActions;
 }) {
   const s = useSyncExternalStore(store.subscribe, store.get_snapshot);
   const source_controls = document.getElementById("source-controls-root");
+  const utility_controls = document.getElementById("utility-controls-root");
+  const navigation = document.getElementById("navigation-root");
+  const theme_controls = document.getElementById("theme-controls-root");
   const project = document.getElementById("project-name");
   const kind = document.getElementById("dashboard-kind");
   const active_source = s.sources.find((source) => source.source_id === s.source_id);
   const project_id = active_source?.kind === "hosted_project" ? active_source.project_id : null;
+  const storage_visible = s.workspace_view === "storage";
+  const page_description = storage_visible
+    ? "Manage the inputs and outputs behind your experiments."
+    : "Explore experiments, inspect results, and compare what changed.";
   return (
     <>
       {project && createPortal(s.project_name, project)}
-      {kind &&
-        createPortal(
-          s.access_mode === "hosted"
-            ? "expri · Hosted experiment review"
-            : "expri · Local experiment review",
-          kind,
-        )}
-      {source_controls &&
-        createPortal(
-          <>
-            {s.project_catalog_enabled && s.sources.length > 0 && s.sources.length <= 6 ? (
-              <RadioTags
-                id="project-options"
-                name="project"
-                legend="Project"
-                value={s.source_id}
-                options={s.sources.map((source) => ({
-                  id: `project-${source.project_id}`,
-                  value: source.source_id,
-                  label: source.label,
-                }))}
-                on_change={actions.source}
-              />
-            ) : (
-              <label className="field">
-                {s.project_catalog_enabled ? "Project" : "Source"}
-                <select
-                  id="source-select"
-                  aria-label={s.project_catalog_enabled ? "Project" : "Run source"}
-                  disabled={!s.sources.length}
-                  value={s.source_id}
-                  onChange={(event) => actions.source(event.currentTarget.value)}
-                >
-                  {s.sources.length ? (
-                    s.sources.map((source) => (
-                      <option key={source.source_id} value={source.source_id}>
-                        {source.kind === "service" ? `${source.label} · Published` : source.label}
-                      </option>
-                    ))
-                  ) : (
-                    <option value="">
-                      {s.refreshing
-                      ? s.project_catalog_enabled ? "Loading projects…" : "Loading sources…"
-                      : s.project_catalog_enabled ? "No published projects" : s.access_mode === "hosted" ? "No published sources" : "No sources"}
-                    </option>
-                  )}
-                </select>
-              </label>
-            )}
-            <button
-              id="refresh-button"
-              className="button secondary"
-              type="button"
-              disabled={s.refreshing}
-              onClick={actions.refresh}
-            >
-              <span aria-hidden="true">↻</span> Refresh
-            </button>
-          </>,
-          source_controls,
-        )}
+      {kind && createPortal(s.access_mode === "hosted" ? "Hosted workspace" : "Local workspace", kind)}
+      {source_controls && createPortal(<SourceControls snapshot={s} actions={actions} />, source_controls)}
+      {utility_controls && createPortal(<RefreshControls snapshot={s} actions={actions} />, utility_controls)}
+      {navigation && createPortal(<WorkspaceNavigation snapshot={s} actions={actions} storage_enabled={!!project_id} />, navigation)}
+      {theme_controls && createPortal(<ThemeControl compact />, theme_controls)}
       <div className="workspace-heading">
         <div>
-          <p className="eyebrow">{s.workspace_view === "storage" ? "Project storage" : "Experiments"}</p>
-          <h1 id={s.workspace_view === "storage" ? "storage-heading" : undefined}>
-            {s.workspace_view === "storage" ? "Storage" : "Workspace"}
+          <p className="eyebrow">{active_source?.label ?? "Experiment workspace"}</p>
+          <h1 id={storage_visible ? "storage-heading" : undefined}>
+            {storage_visible ? "Storage" : "Runs"}
           </h1>
+          <p className="workspace-description">{page_description}</p>
         </div>
-        <div className="refresh-status">
-          <label className="auto-refresh">
-            <input
-              id="auto-refresh-toggle"
-              type="checkbox"
-              checked={s.auto_enabled}
-              onChange={(event) => actions.auto_refresh(event.currentTarget.checked)}
-            />
-            Auto refresh
-          </label>
-          <span id="updated-at" className="freshness">
-            {s.freshness}
-          </span>
-        </div>
+        {!utility_controls && <RefreshControls snapshot={s} actions={actions} />}
       </div>
-      <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>
-        {s.project_catalog_note}
-      </div>
+      {!navigation && <WorkspaceNavigation snapshot={s} actions={actions} storage_enabled={!!project_id} />}
+      <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>{s.project_catalog_note}</div>
       <ErrorNotice id="global-error" message={s.global_error} />
       <Warnings id="catalog-warnings" items={s.catalog_warnings} />
-      {project_id && (
-        <RadioTags
-          id="workspace-view-options"
-          name="workspace_view"
-          legend="Project page"
-          value={s.workspace_view}
-          options={[
-            { id: "workspace-view-workspace", value: "workspace", label: "Workspace" },
-            { id: "workspace-view-storage", value: "storage", label: "Storage" },
-          ]}
-          on_change={actions.workspace_view}
-        />
-      )}
       <ProjectStorageManagement
         project_id={project_id ?? null}
         active={s.workspace_view === "storage" && !!project_id}
@@ -1490,32 +1542,28 @@ export function DashboardView({
         <div id="source-note" className="source-note" hidden={s.source_note === null}>
           {s.source_note}
         </div>
-        <div className={`workspace-grid${(s.run_columns.length || project_id) ? " has-wide-table" : ""}`}>
+        <div className={`workspace-grid${(s.run_columns.length || project_id) ? " has-wide-table" : ""}${s.review ? " has-review" : ""}`}>
           <RunBrowser snapshot={s} actions={actions} />
           <ReviewWorkspace snapshot={s} actions={actions} />
         </div>
       </div>
-      {project_id && (
-        <div hidden={s.workspace_view !== "storage"}>
-          <StoragePanel
-            project_id={project_id}
-            kind={s.storage_kind}
-            search={s.storage_search}
-            offset={s.storage_offset}
-            catalog={s.storage_catalog}
-            loading={s.storage_loading}
-            error={s.storage_error}
-            on_kind={actions.storage_kind}
-            on_search={actions.storage_search}
-            on_previous={actions.storage_previous}
-            on_next={actions.storage_next}
-            on_refresh={actions.storage_refresh}
-          />
-        </div>
-      )}
-      <div id="live-status" className="sr-only" role="status" aria-live="polite">
-        {s.live_status}
-      </div>
+      {project_id && <div hidden={s.workspace_view !== "storage"}>
+        <StoragePanel
+          project_id={project_id}
+          kind={s.storage_kind}
+          search={s.storage_search}
+          offset={s.storage_offset}
+          catalog={s.storage_catalog}
+          loading={s.storage_loading}
+          error={s.storage_error}
+          on_kind={actions.storage_kind}
+          on_search={actions.storage_search}
+          on_previous={actions.storage_previous}
+          on_next={actions.storage_next}
+          on_refresh={actions.storage_refresh}
+        />
+      </div>}
+      <div id="live-status" className="sr-only" role="status" aria-live="polite">{s.live_status}</div>
     </>
   );
 }

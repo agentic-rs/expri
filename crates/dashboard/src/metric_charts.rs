@@ -21,8 +21,8 @@ const DASHBOARD_POINT_BUDGET: usize = 600;
 const DASHBOARD_TOTAL_POINT_BUDGET: usize = 4800;
 const DASHBOARD_HTML_LIMIT: usize = 2 * 1024 * 1024;
 const COLORS: [&str; 10] = [
-  "#4056b4", "#087f8c", "#c05a25", "#894caa", "#bd416c", "#577c30", "#9a6717", "#306a94",
-  "#78594e", "#59616e",
+  "#008573", "#4b6fd8", "#cf7b23", "#9960bd", "#cf526c", "#5c8837", "#a46b16", "#277f9c",
+  "#b0806e", "#8190a1",
 ];
 const LEFT: f64 = 86.0;
 const TOP: f64 = 28.0;
@@ -951,13 +951,85 @@ fn message(value: impl Into<String>) -> ExpriError {
 const HTML_HEAD: &str = r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Run comparison · expri</title>
 <style>
-:root{color-scheme:light;--ink:#20283a;--muted:#647086;--line:#e2e6ed;--paper:#fff;--bg:#f4f5f8}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1160px;margin:0 auto;padding:48px 28px}header{margin-bottom:30px}h1{font-size:36px;letter-spacing:-1px;margin:4px 0 10px;line-height:1.2}h2{font-size:19px;margin:0 0 16px;overflow-wrap:anywhere}.eyebrow{color:#4056b4;font-size:12px;font-weight:700;letter-spacing:1.4px;text-transform:uppercase;margin:0}.muted{color:var(--muted)}.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:24px;margin:18px 0;box-shadow:0 2px 4px #18284404}.card>p{margin:0 0 18px}.table-scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}thead th{font-weight:600;color:var(--muted);font-size:11px;letter-spacing:.5px;text-transform:uppercase}tbody tr:last-child>*{border-bottom:0}tbody th{font-weight:500}code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}code{overflow-wrap:anywhere}pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;min-width:130px;max-width:380px}.params .diff>*{background:#fff8e8}.diff-label{display:block;color:#8b681e;font:10px/1.4 system-ui;letter-spacing:.3px;margin-top:4px}.swatch{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:8px;flex:none}svg{display:block;width:100%;height:auto;min-width:520px;margin:8px 0 10px;overflow:visible}.grid{stroke:#e6eaf0;stroke-width:1}.tick{fill:#647086;font:11px ui-monospace,SFMono-Regular,Consolas,monospace}.axis-label{fill:#647086;font:12px system-ui}.point{transition:r .1s}.point:hover{r:4}.legend{padding:0;margin:8px 0 18px;display:flex;flex-wrap:wrap;gap:12px 24px;list-style:none;font-size:12px}.legend li{display:flex;align-items:center;gap:5px}.legend .swatch{margin-right:2px}.warning{border-color:#e9d79e;background:#fffdf7}.warning ul{padding-left:20px}.warning li{margin:6px 0}footer{color:var(--muted);font-size:12px;margin-top:28px}@media(max-width:650px){main{padding:24px 14px}h1{font-size:28px}.card{padding:16px;overflow-x:auto}.legend li{flex-wrap:wrap}}
+:root {
+  color-scheme: light;
+  --ink: #182724;
+  --muted: #697b75;
+  --line: #e1e8e4;
+  --paper: #fff;
+  --bg: #f6f8f7;
+  --accent: #008573;
+  --diff: #fff8e8;
+  --warning: #fffdf7;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main { max-width: 1240px; margin: 0 auto; padding: 48px 28px; }
+header { margin-bottom: 30px; }
+h1 { font-size: 36px; letter-spacing: -1px; margin: 4px 0 10px; line-height: 1.2; }
+h2 { font-size: 19px; margin: 0 0 16px; overflow-wrap: anywhere; }
+.eyebrow { color: var(--accent); font-size: 12px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase; margin: 0; }
+.muted { color: var(--muted); }
+.card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 24px; margin: 18px 0; }
+.card > p { margin: 0 0 18px; }
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th { font-weight: 600; color: var(--muted); font-size: 12px; }
+tbody tr:last-child > * { border-bottom: 0; }
+tbody th { font-weight: 500; }
+code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+code { overflow-wrap: anywhere; }
+pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; min-width: 130px; max-width: 380px; }
+.params .diff > * { background: var(--diff); }
+.diff-label { display: block; color: var(--muted); font: 11px/1.4 system-ui; margin-top: 4px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; flex: none; }
+svg { display: block; width: 100%; height: auto; min-width: 520px; margin: 8px 0 10px; overflow: visible; }
+.grid { stroke: var(--line); stroke-width: 1; }
+.tick { fill: var(--muted); font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.axis-label { fill: var(--muted); font: 12px system-ui; }
+.point { transition: r .1s; }
+.point:hover { r: 4; }
+.legend { padding: 0; margin: 8px 0 18px; display: flex; flex-wrap: wrap; gap: 12px 24px; list-style: none; font-size: 12px; }
+.legend li { display: flex; align-items: center; gap: 5px; }
+.legend .swatch { margin-right: 2px; }
+.warning { border-color: var(--line); background: var(--warning); }
+.warning ul { padding-left: 20px; }
+.warning li { margin: 6px 0; }
+footer { color: var(--muted); font-size: 12px; margin-top: 28px; }
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ink: #e7efec;
+    --muted: #a0b1a9;
+    --line: #2c3b35;
+    --paper: #17231e;
+    --bg: #101a15;
+    --accent: #64cdb6;
+    --diff: #332b19;
+    --warning: #29291b;
+  }
+}
+@media (max-width: 650px) {
+  main { padding: 24px 14px; }
+  h1 { font-size: 28px; }
+  .card { padding: 16px; overflow-x: auto; }
+  .legend li { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .point { transition: none; }
+}
 </style></head><body><main>
 "#;
 
 /// Dashboard panels already present metadata and value tables around this frame.
 const DASHBOARD_STYLES: &str = r#"
-body{background:transparent;font-size:13px;line-height:1.45}main{max-width:none;padding:0 0 4px}.chart-summary{color:var(--muted);font-size:12px;margin:0 0 10px}.card{padding:14px;margin:0 0 12px;border-radius:10px;box-shadow:none}.card>p{margin:8px 0}h2{font-size:16px;margin:0 0 8px}.plot-scroll{overflow-x:auto;margin:4px 0 6px;border-radius:4px}.plot-scroll:focus-visible{outline:2px solid #4056b4;outline-offset:2px}svg{margin:0;min-width:680px}.tick{font-size:18px}.axis-label{font-size:18px}.legend{margin:8px 0 0;gap:6px 14px}.legend li{flex-wrap:wrap;min-width:0}.legend code{max-width:100%}.parameter-comparison{margin:8px 0 12px;border:1px solid var(--line);border-radius:10px;background:var(--paper)}.parameter-comparison>summary{cursor:pointer;padding:12px 14px;font-weight:600}.parameter-comparison .card{margin:0;border:0;padding:0 14px 14px;box-shadow:none}.parameter-comparison table{font-size:12px}.warning ul{margin:4px 0;max-height:148px;overflow-y:auto}.warning li{margin:4px 0}@media(max-width:650px){main{padding:0 0 4px}.card{padding:12px;overflow:visible}h2{font-size:15px}}
+body{background:transparent;font-size:13px;line-height:1.45}main{max-width:none;padding:0 0 4px}.chart-summary{color:var(--muted);font-size:12px;margin:0 0 10px}.card{padding:14px;margin:0 0 12px;border-radius:10px;box-shadow:none}.card>p{margin:8px 0}h2{font-size:16px;margin:0 0 8px}.plot-scroll{overflow-x:auto;margin:4px 0 6px;border-radius:4px}.plot-scroll:focus-visible{outline:2px solid var(--accent);outline-offset:2px}svg{margin:0;min-width:680px}.tick{font-size:18px}.axis-label{font-size:18px}.legend{margin:8px 0 0;gap:6px 14px}.legend li{flex-wrap:wrap;min-width:0}.legend code{max-width:100%}.parameter-comparison{margin:8px 0 12px;border:1px solid var(--line);border-radius:10px;background:var(--paper)}.parameter-comparison>summary{cursor:pointer;padding:12px 14px;font-weight:600}.parameter-comparison .card{margin:0;border:0;padding:0 14px 14px;box-shadow:none}.parameter-comparison table{font-size:12px}.warning ul{margin:4px 0;max-height:148px;overflow-y:auto}.warning li{margin:4px 0}@media(max-width:650px){main{padding:0 0 4px}.card{padding:12px;overflow:visible}h2{font-size:15px}}
 "#;
 
 #[cfg(test)]

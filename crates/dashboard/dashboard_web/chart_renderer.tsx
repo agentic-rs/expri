@@ -2,7 +2,7 @@ import { Fragment } from "react";
 import type { ChartData, ChartPlot, ChartSeries } from "./chart_data";
 import { BOTTOM, LEFT, RIGHT, TOP, chartValueAtFraction, chartValueText, chartXFraction, chartYFraction, formatChartX, type ChartRange } from "./chart_math";
 
-const COLORS = ["#4056b4", "#087f8c", "#c05a25", "#894caa", "#bd416c", "#577c30", "#9a6717", "#306a94"];
+const COLORS = ["#008573", "#4b6fd8", "#cf7b23", "#9960bd", "#cf526c", "#5c8837", "#a46b16", "#277f9c"];
 
 function runColor(run_index: number): string { return COLORS[run_index - 1]!; }
 function valueTick(value: number): string {

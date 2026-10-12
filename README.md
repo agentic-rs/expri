@@ -465,11 +465,16 @@ expri -T runpod runs fetch run-abc123 --metrics
 expri -T runpod runs fetch run-abc123             # Refresh metadata and logs
 ```
 
-The run browser stays beside the review workspace at widths of at least 860 CSS
-pixels and stacks above it on narrower screens. Choose up to eight parameter or
-metric columns with the **Columns** checkbox tags. On desktop, the project view
-and added columns widen the run browser while keeping the review beside it.
-Wider tables scroll horizontally inside **Runs**. Nested parameters remain
+The workspace sidebar contains source/project selection and **Runs / Storage**
+navigation. **Appearance** offers Light, Dark, and System themes and remembers
+your choice in this browser. The run browser uses the full width until you open
+an inspection or comparison. It then stays beside the review above 1180 CSS
+pixels and stacks above it on narrower screens. Opening a run or choosing
+**Compare runs** moves to the review on compact screens; closing it returns to
+the run browser. Run names and status stay at the start of the table, followed
+by machine, task, and start time. Choose up to eight parameter or metric columns
+with the **Columns** checkbox tags. Wider tables scroll horizontally inside
+**Runs**. Nested parameters remain
 distinct, including keys containing dots or slashes. Missing values show
 an em dash. The table's **Last / Min / Max** tags choose the metric
 summary, independently of the chart comparison summary. Click a column header

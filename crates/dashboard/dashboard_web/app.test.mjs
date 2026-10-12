@@ -361,6 +361,49 @@ test("React renders small fixed choices as native radio tags with accessible gro
   assert.equal(document.querySelector("#x-axis-select, #reduction-select"), null);
 });
 
+test("workspace shell keeps navigation and appearance separate from persistent run inspection", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true });
+  const { nodes } = model;
+  assert.ok(nodes.get("project-options").closest(".app-sidebar"));
+  assert.ok(nodes.get("workspace-view-storage").closest("#navigation-root"));
+  assert.ok(nodes.get("refresh-button").closest("#utility-controls-root"));
+  assert.equal(nodes.document.querySelector(".workspace-grid").classList.contains("has-review"), false);
+  await click(runButton(nodes, 0));
+  await settled(() => nodes.get("review-section").hidden === false);
+  const preview = nodes.get("chart-preview");
+  const chart_url = chartSource(nodes);
+  const request_counts = requestCounts(model.requests);
+  assert.equal(nodes.document.querySelector(".workspace-grid").classList.contains("has-review"), true);
+  await click(nodes.document.querySelector('.theme-control input[value="dark"]'));
+  assert.equal(nodes.document.documentElement.dataset.theme, "dark");
+  assert.equal(nodes.document.defaultView.localStorage.getItem("expri.dashboard.theme"), "dark");
+  await click(nodes.document.querySelector('.theme-control input[value="system"]'));
+  assert.equal(nodes.document.documentElement.dataset.theme, "system");
+  assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(chartSource(nodes), chart_url);
+  assert.deepEqual(requestCounts(model.requests), request_counts, "changing appearance never reloads results");
+});
+
+test("compact explicit inspection moves to review while refresh preserves position and reduced motion", async t => {
+  const { nodes } = await reviewFixture(t);
+  nodes.document.defaultView.matchMedia = query => ({
+    matches: query === "(max-width: 1180px)" || query === "(prefers-reduced-motion: reduce)",
+  });
+  const scrolls = [];
+  for (const id of ["review-title", "runs-heading"]) {
+    nodes.get(id).scrollIntoView = options => scrolls.push({ id, ...options });
+  }
+  await click(runButton(nodes, 0));
+  assert.equal(nodes.document.activeElement, nodes.get("review-title"));
+  assert.deepEqual(scrolls, [{ id: "review-title", block: "start", behavior: "auto" }]);
+  await click(nodes.get("refresh-button"));
+  assert.equal(scrolls.length, 1, "refresh must not move the viewport");
+  assert.equal(nodes.document.activeElement, nodes.get("refresh-button"));
+  await click(nodes.get("close-review"));
+  assert.equal(nodes.document.activeElement, nodes.get("runs-heading"));
+  assert.deepEqual(scrolls[1], { id: "runs-heading", block: "start", behavior: "auto" });
+});
+
 test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
   const model = await reviewFixture(t), { nodes } = model;
   await settled(() => nodes.get("run-rows").children.length === 3);
@@ -434,7 +477,7 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 7);
   assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
   await click(nodes.get("next-page")); await settledTable(nodes);
   assert.equal(nodes.get("page-label").textContent, "Page 2");
@@ -507,8 +550,9 @@ test("automatic list updates keep table choices and sorting while refreshing onl
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = await reviewFixture(t);
   await settled(() => nodes.get("run-rows").children.length === 3);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 3);
-  assert.match(text(nodes.get("run-rows").children[0].children[1]), /train.*3s/);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
+  assert.equal(nodes.get("run-rows").children[0].querySelector(".task-column").textContent, "train");
+  assert.match(text(nodes.get("run-rows").children[0].querySelector(".status-column")), /3s/);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
@@ -723,7 +767,7 @@ test("empty hosted catalog refreshes into published runs with opaque source IDs 
   assert.equal(nodes.get("search-input").disabled, false);
   assert.equal(nodes.get("source-select").children[0].textContent, "Vision / gpu-1 · Published");
   assert.match(nodes.get("source-note").textContent, /^Published results.*workers publish their recorded files/);
-  assert.equal(nodes.get("dashboard-kind").textContent, "expri · Hosted experiment review");
+  assert.equal(nodes.get("dashboard-kind").textContent, "Hosted workspace");
   assert.match(text(nodes.get("catalog-warnings")), /limited to 500 runs/);
   await emit(nodes.get("next-page"), "click");
   await settled(() => nodes.get("page-label").textContent === "Page 2");
@@ -757,7 +801,7 @@ test("local catalogs retain cached labels, 100-row pages, and no logout control"
   assert.match(nodes.get("source-note").textContent, /^Cached remote results/);
   assert.match(text(nodes.get("list-empty")), /expri runs fetch/);
   assert.equal(text(nodes.get("list-empty")).includes("Publish results"), false);
-  assert.equal(nodes.get("dashboard-kind").textContent, "expri · Local experiment review");
+  assert.equal(nodes.get("dashboard-kind").textContent, "Local workspace");
 });
 
 test("login and logout use browser POST forms without application credentials", async t => {
@@ -1310,6 +1354,9 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
   const model = await autoFixture(t, { sources: [source], catalog_failure: true });
   await settled(() => model.nodes.get("global-error").hidden === false);
   assert.match(model.nodes.get("global-error").textContent, /Catalog temporarily unavailable/);
+  assert.equal(model.nodes.get("runs-region").getAttribute("aria-busy"), "false");
+  assert.match(model.nodes.get("list-empty").textContent, /Runs are unavailable.*Refresh/);
+  assert.doesNotMatch(model.nodes.get("list-empty").textContent, /Loading runs/);
   model.model.failed_catalog = false;
   model.model.override = parsed => {
     if (parsed.pathname !== "/api/updates") return;
@@ -1322,6 +1369,25 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
   assert.equal(model.nodes.get("global-error").hidden, true);
   const probe = new URL(model.requests.find(url => url.startsWith("/api/updates")), "http://localhost");
   assert.equal(probe.searchParams.has("source"), false);
+});
+
+test("failed initial run loading ends the loading state and retains successful rows on a later failure", async t => {
+  let unavailable = true;
+  const { nodes } = await reviewFixture(t, { override: url =>
+    url.pathname === "/api/runs" && unavailable ? response({ error: "Results unavailable" }, 503) : null,
+  });
+  assert.equal(nodes.get("runs-region").getAttribute("aria-busy"), "false");
+  assert.match(nodes.get("list-empty").textContent, /Runs are unavailable.*Refresh/);
+  assert.equal(nodes.get("refresh-button").disabled, false);
+  unavailable = false;
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(nodes.get("list-empty").hidden, true);
+  unavailable = true;
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("run-rows").children.length, 3, "an error must keep the last successful run history");
+  assert.equal(nodes.get("list-empty").hidden, true);
+  assert.match(nodes.get("global-error").textContent, /Results unavailable/);
 });
 
 test("an initially failed run can recover directly into Logs without overlapping log requests", async t => {
@@ -2482,6 +2548,10 @@ test("nickname and multiple tags save to the exact machine run without changing 
   const { nodes } = model;
   await click(nodes.document.querySelector('[data-run-key="gpu-b:run-shared"] .run-link'));
   const preview = nodes.get("chart-preview");
+  assert.equal(nodes.get("run-annotations-panel").tagName, "DETAILS");
+  assert.equal(nodes.get("run-annotations-panel").open, false);
+  await click(nodes.get("run-annotations-panel").querySelector("summary"));
+  assert.equal(nodes.get("run-annotations-panel").open, true);
   setValue(nodes.get("run-nickname"), " Baseline λ "); await emit(nodes.get("run-nickname"), "input");
   setValue(nodes.get("run-tag-input"), " baseline "); await emit(nodes.get("run-tag-input"), "input");
   await click(nodes.get("add-run-tag"));
@@ -2512,11 +2582,13 @@ test("annotation drafts survive refresh and failed saves, with explicit cancel t
   } });
   const { nodes } = model;
   await click(nodes.document.querySelector(".run-link"));
+  await click(nodes.get("run-annotations-panel").querySelector("summary"));
   setValue(nodes.get("run-nickname"), "Unsaved"); await emit(nodes.get("run-nickname"), "input");
   run.nickname = "Changed by CLI";
   run.annotations = { ...run.annotations, nickname: run.nickname };
   await click(nodes.get("refresh-button"));
   assert.equal(nodes.get("run-nickname").value, "Unsaved");
+  assert.equal(nodes.get("run-annotations-panel").open, true);
   await emit(nodes.get("save-run-annotations").form, "submit");
   assert.match(nodes.get("run-annotations-error").textContent, /Connection unavailable/);
   assert.equal(nodes.get("run-nickname").value, "Unsaved");
@@ -2665,6 +2737,7 @@ test("annotations show a disabled preview on older servers and hide explicitly u
   delete run.annotations;
   await click(nodes.get("refresh-button"));
   assert.ok(nodes.get("run-annotations-panel"));
+  assert.match(nodes.get("run-annotations-panel").querySelector("summary").textContent, /Unavailable/);
   assert.equal(nodes.get("run-nickname").matches(":disabled"), true);
   assert.match(nodes.get("run-annotations-unavailable").textContent, /unavailable on this server/);
   run.annotations = null;
