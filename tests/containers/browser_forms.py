@@ -1213,7 +1213,7 @@ def project_workspace(run_id):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: settled() and project_selected(), 'hosted dashboard did not default to its project')
-    assert evaluate("return document.querySelector('#project-options legend').textContent;") == 'Project', 'hosted aggregate selector is not labeled Project'
+    assert evaluate("return document.querySelector('#project-options legend').textContent;") == 'Projects', 'hosted aggregate selector is not labeled Projects'
     assert evaluate("return document.querySelector('#machine-all').checked;"), 'project did not begin with All machines'
     assert evaluate("return document.querySelectorAll('#machine-options input[type=\"radio\"]').length;") == 3, 'project machine tags do not match its two recorded origins'
     assert evaluate('''return [...document.querySelectorAll('#run-rows .run-link')].filter(node=>node.textContent===arguments[0]).length;''', run_id) == 2, 'project default collapsed duplicate actual run IDs'

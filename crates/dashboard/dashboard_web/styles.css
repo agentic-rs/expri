@@ -185,7 +185,9 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .project-name { color: var(--ink); font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #utility-controls-root, .utility-controls { display: flex; align-items: center; justify-content: flex-end; gap: 16px; min-width: 0; }
 .utility-controls { flex-wrap: wrap; }
-.read-only { font-size: 12px; color: var(--muted); background: var(--surface-soft); border: 1px solid var(--line); padding: 5px 9px; border-radius: 6px; white-space: nowrap; }
+/* Versioned AB bundles inject their provenance outside the React root. */
+.read-only { display: none; align-self: flex-start; font-size: 11px; color: var(--warning-ink); background: var(--warning-bg); border: 1px solid var(--warning-line); padding: 2px 6px; border-radius: 5px; white-space: nowrap; }
+.dashboard-page:has(footer .deployment-revision) .read-only { display: inline-flex; }
 .session-actions { margin: 0; flex-shrink: 0; }
 main { max-width: 1920px; margin: 0 auto; padding: 32px; }
 .workspace-main { min-width: 0; padding: 30px 32px 22px; }
