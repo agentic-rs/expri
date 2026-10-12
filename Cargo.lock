@@ -666,6 +666,7 @@ dependencies = [
  "expri-client",
  "expri-core",
  "expri-runs",
+ "expri-system",
  "libc",
  "serde",
  "serde_json",

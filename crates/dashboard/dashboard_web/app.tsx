@@ -38,6 +38,7 @@ import {
   type RunSort,
   type Source,
   type Updates,
+  type WorkspaceView,
 } from "./dashboard_model";
 import { canArchiveRun, canRestoreRun, runArchivalMatchesScope, runArchivalScope, runIsArchived, type ArchivalAction } from "./run_archival";
 import { normalizeRunAnnotations, runAnnotationsMatchesScope, runAnnotationsScope } from "./run_annotations";
@@ -51,6 +52,7 @@ import {
   type StorageKind,
 } from "./dashboard_storage";
 import { LiveUpdates, type LiveUpdatesState } from "./live_updates";
+import { SystemMonitor } from "./system_monitor";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import {
   DashboardView,
@@ -71,6 +73,7 @@ export * from "./live_updates";
 export * from "./run_archival";
 export * from "./run_annotations";
 export * from "./dashboard_theme";
+export * from "./system_monitor";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -96,6 +99,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const archival_lane = new RequestLane(() => pending_deep_link);
   const annotations_lane = new RequestLane(() => pending_deep_link);
   const storage_lane = new RequestLane(() => pending_deep_link);
+  const system_lane = new RequestLane(() => pending_deep_link);
   const quiet_lanes = {
     updates: new RequestLane(() => pending_deep_link),
     catalog: new RequestLane(() => pending_deep_link),
@@ -106,6 +110,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     chart: new RequestLane(() => pending_deep_link),
     artifacts: new RequestLane(() => pending_deep_link),
     storage: new RequestLane(() => pending_deep_link),
+    system: new RequestLane(() => pending_deep_link),
   };
   const foreground_lanes = [
     catalog_lane,
@@ -120,6 +125,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     archival_lane,
     annotations_lane,
     storage_lane,
+    system_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
   let auto_refresh: AutoRefresh | null = null;
@@ -179,7 +185,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let rendered_comparison: Comparison | null = null;
   let artifacts: ArtifactCatalog | null = null;
   let artifacts_loaded = false;
-  let workspace_view: "workspace" | "storage" = "workspace";
+  let workspace_view: WorkspaceView = "workspace";
   let storage_kind: StorageKind = "input";
   let storage_offset = 0;
   let storage_catalog: StorageCatalog | null = null;
@@ -251,6 +257,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     run_columns_supported: true,
     run_columns_warnings: [],
   };
+  const system_monitor = new SystemMonitor(system_lane, quiet_lanes.system, now, publish);
   function snapshot(): DashboardSnapshot {
     const source = currentSource();
     return {
@@ -271,6 +278,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       artifacts,
       selected_files: [...selected_files],
       workspace_view,
+      system_monitor: system_monitor.snapshot(),
       storage_kind,
       storage_offset,
       storage_catalog,
@@ -489,13 +497,24 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (value === workspace_view ||
         (value === "storage" && currentSource()?.kind !== "hosted_project")) return;
       workspace_view = value;
-      if (value === "workspace") {
+      cancelQuietRefresh();
+      system_monitor.setActive(value === "system");
+      if (value !== "storage") {
         storage_lane.cancel();
         clearStorageSearchTimeout();
         ui.storage_loading = false;
       }
       publish();
       if (value === "storage") void loadStorage();
+    },
+    system_monitor: {
+      machine: (value) => { cancelQuietRefresh(); system_monitor.chooseMachine(value); },
+      period: (value) => { cancelQuietRefresh(); system_monitor.choosePeriod(value); },
+      resolution: (value) => { cancelQuietRefresh(); system_monitor.chooseResolution(value); },
+      metric: (name, checked) => system_monitor.chooseMetric(name, checked),
+      more_machines: () => { cancelQuietRefresh(); void system_monitor.moreMachines(); },
+      refresh: () => { cancelQuietRefresh(); void system_monitor.refresh(); },
+      time_zone: changeChartTimeZone,
     },
     storage_kind: (value) => {
       if (storage_kind === value) return;
@@ -610,7 +629,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       active
         ? apiUrl("/api/events", {
             source: source_id,
-            run_id: workspace_view === "storage" ? [] : review?.run_ids ?? [],
+            run_id: workspace_view !== "workspace" ? [] : review?.run_ids ?? [],
           })
         : null,
     );
@@ -632,7 +651,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     ui.storage_search = "";
     ui.storage_loading = false;
     ui.storage_error = null;
-    if (currentSource()?.kind !== "hosted_project") workspace_view = "workspace";
+    if (workspace_view === "storage" && currentSource()?.kind !== "hosted_project") workspace_view = "workspace";
   }
   async function loadStorage(): Promise<void> {
     const source = currentSource();
@@ -1688,6 +1707,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     cancelQuietRefresh();
     const generation = ++refresh_generation;
     updateUi({ refreshing: true, global_error: null });
+    let monitor_refresh = workspace_view === "system" ? system_monitor.refresh() : null;
     let successful = false;
     try {
       const catalog = await loadCatalog(catalog_lane, true);
@@ -1718,10 +1738,6 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         }
         successful = generation === refresh_generation;
       }
-      if (successful) {
-        last_checked = now();
-        last_full_snapshot = now();
-      }
     } catch (error) {
       if (generation === refresh_generation) {
         if (!catalog_initialized) showRunListError(error);
@@ -1729,7 +1745,16 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         updateUi({ review_loading: false });
       }
     } finally {
+      // Machine history does not depend on project catalog or run-list health.
+      // Await it even after those reads fail, while keeping combined freshness honest.
+      if (!monitor_refresh && workspace_view === "system" && generation === refresh_generation)
+        monitor_refresh = system_monitor.refresh();
+      if (monitor_refresh && (await monitor_refresh) !== "success") successful = false;
       if (generation === refresh_generation) {
+        if (successful) {
+          last_checked = now();
+          last_full_snapshot = now();
+        }
         updateUi({ refreshing: false });
         auto_refresh?.refreshCompleted(successful);
       }
@@ -1738,6 +1763,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   async function quietRefresh(): Promise<RefreshOutcome> {
     if (availability() !== "ready") return "cancelled";
     if (workspace_view === "storage") return quietStorageRefresh();
+    if (workspace_view === "system") return quietSystemRefresh();
     const generation = quiet_generation;
     const current = () => generation === quiet_generation && availability() === "ready";
     const acknowledgements: (() => void)[] = [];
@@ -1981,6 +2007,28 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       return "failure";
     }
   }
+  async function quietSystemRefresh(): Promise<RefreshOutcome> {
+    const generation = quiet_generation, source = source_id;
+    const current = () => !disposed && generation === quiet_generation && workspace_view === "system" && source_id === source;
+    let history_outcome: RefreshOutcome = "success";
+    try {
+      if (source_id && now() - last_list_snapshot >= 30_000) {
+        const url = listUrl(), result = await quiet_lanes.list.run<RunList>(url);
+        if (!result || !current() || url !== listUrl()) return "cancelled";
+        applyRunList(result, url, true);
+      }
+    } catch {
+      if (!current()) return "cancelled";
+      history_outcome = "failure";
+    }
+    try {
+      if (!current()) return "cancelled";
+      const outcome = await system_monitor.refresh(true);
+      if (!current()) return "cancelled";
+      if (outcome === "success" && history_outcome === "success") last_checked = now();
+      return outcome === "success" ? history_outcome : outcome;
+    } catch { return current() ? "failure" : "cancelled"; }
+  }
   async function quietStorageRefresh(): Promise<RefreshOutcome> {
     const source = currentSource();
     if (source?.kind !== "hosted_project" || !source.project_id) return "cancelled";
@@ -2110,6 +2158,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     live_updates.dispose();
     auto_refresh?.dispose();
     chart_controller.dispose();
+    system_monitor.cancel();
     for (const lane of foreground_lanes) lane.cancel();
     clearSearchTimeout();
     clearStorageSearchTimeout();

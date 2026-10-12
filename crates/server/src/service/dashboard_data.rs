@@ -5,6 +5,7 @@ mod table_data;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use expri_core::system_profile::{MachineProfile, ProfileHistory, ProfileHistoryQuery};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -32,6 +33,9 @@ const JSON_LIMIT: u64 = 1024 * 1024;
 const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Version normalized run metadata independently of the unchanged artifact digest.
+// Schema 2 preserves the validated physical machine identity for monitor alignment.
+const OVERVIEW_SCHEMA_VERSION: u64 = 2;
 
 struct MetricReadMode {
   minimum: usize,
@@ -49,6 +53,38 @@ pub(super) struct HostedDashboard<'a, S> {
 impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S> {
   fn catalog(&self) -> Result<Value> {
     HostedDashboard::catalog(self)
+  }
+  fn system_machines(
+    &self,
+    limit: usize,
+    cursor: Option<&str>,
+  ) -> Result<Option<crate::dashboard::SystemMachines>> {
+    let (machines, next_cursor) = self
+      .store
+      .list_system_machines(limit, cursor)
+      .map_err(system_profile_error)?;
+    Ok(Some(crate::dashboard::SystemMachines {
+      machines,
+      next_cursor,
+    }))
+  }
+  fn system_profile(
+    &self,
+    machine_id: &str,
+    inventory_revision: Option<u64>,
+  ) -> Result<Option<MachineProfile>> {
+    self
+      .store
+      .system_machine(machine_id, inventory_revision)
+      .map(Some)
+      .map_err(system_profile_error)
+  }
+  fn system_history(&self, query: &ProfileHistoryQuery) -> Result<Option<ProfileHistory>> {
+    self
+      .store
+      .system_history(query)
+      .map(Some)
+      .map_err(system_profile_error)
   }
   fn projects(&self) -> Result<Option<Value>> {
     HostedDashboard::projects(self).map(Some)
@@ -1035,7 +1071,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       },
     );
     if let Some(mut value) = self.store.dashboard_cached_overview(scope, &version)?
-      && value["overview_schema"] == 1
+      && value["overview_schema"] == OVERVIEW_SCHEMA_VERSION
     {
       self.decorate_run_metadata(&mut value["run"], scope)?;
       return Ok(value);
@@ -1069,7 +1105,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut metadata_truncated = false;
     let run = preview(&normalized["run"], &mut metadata_truncated);
-    let mut result = json!({"overview_schema": 1, "run": run, "task_filter": task_filter, "metadata_truncated": metadata_truncated, "warnings": bounded_warnings(&warnings)});
+    let mut result = json!({"overview_schema": OVERVIEW_SCHEMA_VERSION, "run": run, "task_filter": task_filter, "metadata_truncated": metadata_truncated, "warnings": bounded_warnings(&warnings)});
     // A failed network read must remain retryable; a missing or malformed
     // immutable state can safely share its versioned normalized preview.
     if record.is_none() || normalized["state"].is_object() {
@@ -1306,6 +1342,12 @@ fn valid_storage_download_url(url: &str) -> bool {
 
 fn api_error(error: ApiError) -> ExpriError {
   message(error.message)
+}
+fn system_profile_error(error: ApiError) -> ExpriError {
+  ExpriError::ServiceRejected {
+    status: error.status,
+    detail: error.message,
+  }
 }
 fn message(text: impl Into<String>) -> ExpriError {
   ExpriError::Message(text.into())

@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use expri_core::storage::StoragePaths;
+use expri_system::store::LocalStore;
+
 use crate::environment::snapshot::RunSnapshot;
 use crate::environment::{self, EnvironmentRequest};
 use crate::error::{ExpriError, Result, command_exit_code};
@@ -55,6 +58,9 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
       "producer": asset.descriptor.producer,
     })).collect::<Vec<_>>(),
   });
+  if let Some(machine_id) = existing_machine_id() {
+    state["machine_id"] = json!(machine_id);
+  }
   write_state(&state_path, &state)?;
   let _ = writeln!(std::io::stderr(), "run: {}", snapshot.run_id);
   let _ = writeln!(
@@ -77,6 +83,18 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
   }
   let _run_lock = crate::lock::run_lock(&snapshot.run_dir)?;
   execute_snapshot(request, &repo_root, &snapshot, state, false)
+}
+
+/// A profile belongs to this machine only when an existing local store says so.
+/// Monitoring is optional: lookup failures must not create storage or stop a run.
+fn existing_machine_id() -> Option<String> {
+  existing_machine_id_at(&StoragePaths::resolve(None).ok()?)
+}
+
+fn existing_machine_id_at(paths: &StoragePaths) -> Option<String> {
+  paths.validate_existing().ok()?;
+  let store = LocalStore::open_readonly(&paths.profile_database()).ok()??;
+  Some(store.machine_id().to_owned())
 }
 
 fn execute_snapshot(
@@ -509,6 +527,60 @@ mod tests {
     fs::write(cache, bytes).unwrap();
     crate::assets::save(&root.join("data/train.bin.expri.toml"), &descriptor).unwrap();
     descriptor
+  }
+
+  #[test]
+  fn machine_identity_only_reads_existing_profile_storage() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::from_root(directory.path().join("profiles")).unwrap();
+    assert_eq!(existing_machine_id_at(&paths), None);
+    assert!(!paths.root().exists());
+
+    let store = LocalStore::open(&paths.profile_database()).unwrap();
+    let machine_id = store.machine_id().to_owned();
+    drop(store);
+    let before = fs::read(paths.profile_database()).unwrap();
+    assert_eq!(existing_machine_id_at(&paths), Some(machine_id));
+    assert_eq!(fs::read(paths.profile_database()).unwrap(), before);
+    assert_eq!(fs::read_dir(paths.root()).unwrap().count(), 1);
+  }
+
+  #[test]
+  fn malformed_profile_storage_does_not_supply_an_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::from_root(directory.path().join("profiles")).unwrap();
+    fs::create_dir(paths.root()).unwrap();
+    fs::write(paths.profile_database(), b"not a SQLite database").unwrap();
+    assert_eq!(existing_machine_id_at(&paths), None);
+    assert_eq!(
+      fs::read(paths.profile_database()).unwrap(),
+      b"not a SQLite database"
+    );
+    assert_eq!(fs::read_dir(paths.root()).unwrap().count(), 1);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn profile_identity_rejects_owned_directory_database_and_sidecar_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let actual = StoragePaths::from_root(directory.path().join("actual")).unwrap();
+    drop(LocalStore::open(&actual.profile_database()).unwrap());
+    let alias = StoragePaths::from_root(directory.path().join("alias")).unwrap();
+    symlink(actual.root(), alias.root()).unwrap();
+    assert_eq!(existing_machine_id_at(&alias), None);
+
+    let paths = StoragePaths::from_root(directory.path().join("profiles")).unwrap();
+    fs::create_dir(paths.root()).unwrap();
+    symlink(actual.profile_database(), paths.profile_database()).unwrap();
+    assert_eq!(existing_machine_id_at(&paths), None);
+
+    fs::remove_file(paths.profile_database()).unwrap();
+    drop(LocalStore::open(&paths.profile_database()).unwrap());
+    let sidecar = paths.root().join("profiles.sqlite3-wal");
+    symlink(actual.profile_database(), sidecar).unwrap();
+    assert_eq!(existing_machine_id_at(&paths), None);
   }
 
   #[test]

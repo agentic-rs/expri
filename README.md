@@ -486,7 +486,7 @@ expri -T runpod runs fetch run-abc123 --metrics
 expri -T runpod runs fetch run-abc123             # Refresh metadata and logs
 ```
 
-The header contains source/project selection, **Runs / Storage** navigation,
+The header contains source/project selection, **Runs / System / Storage** navigation,
 and appearance controls. The bottom status bar contains Refresh, Auto refresh,
 and freshness information. **Appearance** offers Light, Dark, and System
 themes and remembers your choice in this browser. Full run history stays in the
@@ -507,6 +507,15 @@ and missing values stay at the end in either direction. Column and sort changes
 preserve selected runs, the active review tab, and chart exploration. Status
 filters use single-click tags. These choices last for the current page;
 saved workspace views are a separate roadmap step.
+
+The **System** page browses machine inventory and CPU, memory, GPU, disk, and
+network history independently of the selected project. Choose a machine,
+period, and Detail or Hourly resolution with native controls. Detail retains
+72 hours of readings; hourly charts show means over measured coverage.
+Counter readings become rates over their measured intervals, and missing
+observations remain gaps. The bottom status bar refreshes the visible monitor
+without loading hidden run logs or charts. See [system profiles](docs/system-profiles.md)
+to start and publish collection.
 
 Opening a run starts with its curves in a compact metric grid. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads

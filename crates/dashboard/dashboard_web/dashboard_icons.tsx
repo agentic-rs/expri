@@ -1,8 +1,9 @@
-export type IconName = "runs" | "storage" | "charts" | "overview" | "logs" | "files" | "refresh" | "compare" | "close" | "search";
+export type IconName = "runs" | "storage" | "system" | "charts" | "overview" | "logs" | "files" | "refresh" | "compare" | "close" | "search";
 
 const PATHS: Record<IconName, string> = {
   runs: "M4 5h16M4 12h16M4 19h16M7 3v4M7 10v4M7 17v4",
   storage: "M4 6c0-2 16-2 16 0s-16 2-16 0Zm0 0v6c0 2 16 2 16 0V6M4 12v6c0 2 16 2 16 0v-6",
+  system: "M3 4h18v13H3V4Zm5 17h8M12 17v4M5 11h3l2-4 4 7 2-3h3",
   charts: "M4 4v16h16M7 15l4-5 4 3 5-7",
   overview: "M9 4h11M9 12h11M9 20h11M4 4h.01M4 12h.01M4 20h.01",
   logs: "m5 6 5 6-5 6M13 18h6",

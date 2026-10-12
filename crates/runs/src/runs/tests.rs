@@ -53,6 +53,39 @@ fn request_list() -> RunQueryRequest {
   }
 }
 
+#[test]
+fn catalog_preserves_explicit_machine_identity_without_inferring_legacy_records() {
+  let (_directory, root) = fixture();
+  let runs = root.join(".expri/runs");
+  for (run_id, machine_id) in [
+    ("mapped", json!("machine-actual-id")),
+    ("legacy", Value::Null),
+    ("path", json!("../machine")),
+    ("oversize", json!("m".repeat(97))),
+    ("typed", json!(true)),
+  ] {
+    let mut saved = state(run_id, "running", "2026-10-12T00:00:00Z");
+    saved["machine_id"] = machine_id;
+    run(&runs, run_id, Some(&saved));
+  }
+  let report = parity(&root, &request_list(), false);
+  let records = report["runs"].as_array().unwrap();
+  for record in records {
+    if record["run_id"] == "mapped" {
+      assert_eq!(record["machine_id"], "machine-actual-id");
+    } else {
+      assert!(record.get("machine_id").is_none());
+    }
+  }
+  let warnings = report["warnings"].as_array().unwrap();
+  assert_eq!(warnings.len(), 3);
+  assert!(
+    warnings
+      .iter()
+      .all(|warning| warning["message"].as_str().unwrap().contains("machine_id"))
+  );
+}
+
 fn python_query(
   root: &Path,
   request: &RunQueryRequest,

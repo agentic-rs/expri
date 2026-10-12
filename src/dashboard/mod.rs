@@ -2,6 +2,8 @@ pub(crate) use expri_dashboard::dashboard::{
   DashboardView, Source, artifacts, preview, server, table, table_cache, updates,
 };
 
+mod system_profiles;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -49,11 +51,32 @@ pub struct Dashboard {
   targets: BTreeSet<String>,
   initial_source: String,
   table_cache: table_cache::Cache,
+  system_profiles_path: Option<PathBuf>,
 }
 
 impl DashboardView for Dashboard {
   fn catalog(&self) -> Result<Value> {
     Dashboard::catalog(self)
+  }
+  fn system_machines(
+    &self,
+    limit: usize,
+    cursor: Option<&str>,
+  ) -> Result<Option<expri_dashboard::dashboard::SystemMachines>> {
+    self.system_machines_page(limit, cursor)
+  }
+  fn system_profile(
+    &self,
+    machine_id: &str,
+    inventory_revision: Option<u64>,
+  ) -> Result<Option<expri_core::system_profile::MachineProfile>> {
+    self.system_machine_profile(machine_id, inventory_revision)
+  }
+  fn system_history(
+    &self,
+    query: &expri_core::system_profile::ProfileHistoryQuery,
+  ) -> Result<Option<expri_core::system_profile::ProfileHistory>> {
+    self.system_machine_history(query)
   }
   fn updates(&self, source: &str, run_ids: &[String]) -> Result<Value> {
     Dashboard::updates(self, source, run_ids)
@@ -137,6 +160,9 @@ impl Dashboard {
       targets,
       initial_source,
       table_cache: table_cache::Cache::default(),
+      system_profiles_path: expri_core::storage::StoragePaths::resolve(None)
+        .ok()
+        .map(|paths| paths.profile_database()),
     };
     dashboard.local_runs_dir()?;
     dashboard.sources()?;

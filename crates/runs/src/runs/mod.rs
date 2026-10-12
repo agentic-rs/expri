@@ -314,6 +314,16 @@ fn record_from_state(run_id: &str, state: Option<Value>) -> Record {
         );
         return;
       }
+      if let Some(machine_id) = object.get("machine_id").filter(|value| !value.is_null()) {
+        if let Some(machine_id) = machine_id
+          .as_str()
+          .filter(|value| expri_core::identifiers::validate_component(value).is_ok())
+        {
+          summary["machine_id"] = json!(machine_id);
+        } else {
+          field_warning(&mut warnings, run_id, "machine_id");
+        }
+      }
       if let Some(task) = object
         .get("task")
         .and_then(Value::as_str)

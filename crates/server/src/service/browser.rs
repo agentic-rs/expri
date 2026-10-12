@@ -420,6 +420,171 @@ mod tests {
   }
 
   #[test]
+  fn system_monitor_reads_require_a_session_and_keep_pagination_and_request_boundaries() {
+    use crate::service::types::Request;
+    use expri_core::system_profile::*;
+    use std::collections::BTreeMap;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let store = Store::open(temporary.path(), MockStorage::default()).unwrap();
+    let at = chrono::Utc::now().timestamp_millis();
+    let inventory = SystemInventory {
+      observed_at_ms: at,
+      hostname: "worker-monitor".into(),
+      os_name: Some("Linux".into()),
+      os_version: None,
+      kernel_version: None,
+      architecture: "x86_64".into(),
+      cpu: CpuInventory {
+        brand: "CPU".into(),
+        vendor: "vendor".into(),
+        logical_cpu_count: 4,
+        physical_core_count: Some(2),
+      },
+      memory_total_bytes: 1024,
+      measurement_scope: "host".into(),
+      devices: Vec::new(),
+      warnings: Vec::new(),
+    };
+    let samples = (1..=3)
+      .map(|sequence| SystemSample {
+        sequence,
+        session_id: "session-test".into(),
+        observed_at_ms: at + sequence as i64 - 1,
+        interval_ms: 0,
+        collection_duration_ms: 0,
+        inventory_revision: 1,
+        metrics: BTreeMap::from([(
+          "memory/used_bytes".into(),
+          MetricReading {
+            kind: MetricKind::Gauge,
+            value: sequence as f64,
+          },
+        )]),
+        counters: BTreeMap::new(),
+        warnings: Vec::new(),
+      })
+      .collect();
+    store
+      .execute(Request::PutSystemProfile {
+        batch: ProfileBatch {
+          schema_version: PROFILE_SCHEMA_VERSION,
+          machine_id: "machine-test".into(),
+          inventories: vec![InventoryRevision {
+            revision: 1,
+            inventory,
+          }],
+          samples,
+          hours: Vec::new(),
+        },
+      })
+      .unwrap();
+    let auth = BrowserAuth::new("https://expri.example.com", b"dashboard-password").unwrap();
+    let history_path = format!(
+      "/api/system-history?machine_id=machine-test&start_ms={at}&end_ms={}&limit=1",
+      at + 2
+    );
+    for path in [
+      "/api/system-machines",
+      "/api/system-profile?machine_id=machine-test",
+      &history_path,
+    ] {
+      assert_eq!(
+        handle(&store, &auth, &request("GET", path, b"")).status(),
+        401
+      );
+    }
+    let mut login = request("POST", "/login", b"");
+    login
+      .headers_mut()
+      .insert("Origin", "https://expri.example.com".parse().unwrap());
+    let cookie = auth.login(&login, b"dashboard-password").unwrap();
+    let listing = handle(
+      &store,
+      &auth,
+      &request_with_cookie("/api/system-machines?limit=1", &cookie),
+    );
+    assert_eq!(listing.status(), 200);
+    let page: serde_json::Value = serde_json::from_slice(listing.body()).unwrap();
+    assert_eq!(page["machines"][0]["machine_id"], "machine-test");
+    assert_eq!(
+      page["machines"][0]["inventory"]["hostname"],
+      "worker-monitor"
+    );
+    let profile = handle(
+      &store,
+      &auth,
+      &request_with_cookie(
+        "/api/system-profile?machine_id=machine-test&inventory_revision=1",
+        &cookie,
+      ),
+    );
+    assert_eq!(profile.status(), 200);
+    assert_eq!(
+      serde_json::from_slice::<serde_json::Value>(profile.body()).unwrap()["inventory_revision"],
+      1
+    );
+    let history = handle(&store, &auth, &request_with_cookie(&history_path, &cookie));
+    assert_eq!(history.status(), 200);
+    let first: ProfileHistory = serde_json::from_slice(history.body()).unwrap();
+    assert_eq!(first.samples.len(), 1);
+    assert_eq!(first.samples[0].sequence, 1);
+    assert_eq!(first.next_cursor, Some(1));
+    let next = handle(
+      &store,
+      &auth,
+      &request_with_cookie(&format!("{history_path}&cursor=1"), &cookie),
+    );
+    let second: ProfileHistory = serde_json::from_slice(next.body()).unwrap();
+    assert_eq!(second.samples[0].sequence, 2);
+    assert_eq!(
+      second.next_cursor, None,
+      "end_ms excludes the sample at the boundary"
+    );
+    for path in [
+      "/api/system-profile?machine_id=machine-missing",
+      "/api/system-profile?machine_id=machine-test&inventory_revision=99",
+    ] {
+      assert_eq!(
+        handle(&store, &auth, &request_with_cookie(path, &cookie)).status(),
+        404
+      );
+    }
+    for path in [
+      "/api/system-machines?limit=101",
+      "/api/system-profile?machine_id=..",
+      "/api/system-history?machine_id=machine-test&start_ms=0&end_ms=0",
+    ] {
+      assert_eq!(
+        handle(&store, &auth, &request_with_cookie(path, &cookie)).status(),
+        400
+      );
+    }
+    for path in [
+      "/api/system-machines",
+      "/api/system-profile?machine_id=machine-test",
+      &history_path,
+    ] {
+      let mut request = request_with_cookie(path, &cookie);
+      request
+        .headers_mut()
+        .insert("Origin", "https://attacker.invalid".parse().unwrap());
+      assert_eq!(handle(&store, &auth, &request).status(), 403);
+      request.headers_mut().remove("Origin");
+      request
+        .headers_mut()
+        .insert("Host", "attacker.invalid".parse().unwrap());
+      assert_eq!(handle(&store, &auth, &request).status(), 403);
+    }
+    let mut read = request_with_cookie("/api/system-machines", &cookie);
+    *read.method_mut() = http::Method::POST;
+    assert_eq!(handle(&store, &auth, &read).status(), 405);
+    *read.method_mut() = http::Method::GET;
+    *read.body_mut() = b"unexpected".to_vec();
+    assert_eq!(handle(&store, &auth, &read).status(), 400);
+  }
+
+  #[test]
   fn artifact_download_requires_session_and_scoped_output_before_signed_redirect() {
     use crate::service::types::{CompletedPart, FileTarget, Request, RunScope};
     let temporary = tempfile::tempdir().unwrap();

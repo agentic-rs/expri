@@ -172,6 +172,14 @@ def _catalog_summary(run_id, state, warnings):
   if state.get("run_id") != run_id:
     _catalog_warning(warnings, run_id, "run-state.json run_id does not match its directory")
     return summary, None
+  machine_id = state.get("machine_id")
+  if machine_id is not None:
+    if (isinstance(machine_id, str) and len(machine_id) <= 96 and
+        machine_id not in {".", ".."} and
+        _catalog_re.fullmatch(r"[A-Za-z0-9._-]+", machine_id) is not None):
+      summary["machine_id"] = machine_id
+    else:
+      _catalog_warning(warnings, run_id, "run-state.json has invalid or missing machine_id")
   task = state.get("task")
   if isinstance(task, str) and task.strip():
     summary["task"] = task

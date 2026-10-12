@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,9 @@ class RunLifecycleTests(unittest.TestCase):
   def setUp(self):
     self.temporary = tempfile.TemporaryDirectory(prefix="expri-run-lifecycle-tests-")
     self.repo = Path(self.temporary.name).resolve()
+    self.storage_env = patch.dict(os.environ, {"EXPRI_STORAGE_DIR": str(self.repo / "profiles")})
+    self.storage_env.start()
+    self.addCleanup(self.storage_env.stop)
     (self.repo / ".expri").mkdir()
     (self.repo / ".expri/checkout.manifest").write_text("task.py\n")
     self.bin = self.repo / "bin"
@@ -100,6 +104,109 @@ class RunLifecycleTests(unittest.TestCase):
     self.start()
     state = self.wait_terminal()
     self.assertEqual(state["status"], "completed", state)
+
+  def profile_identity(self, machine_id="machine-fixture"):
+    profiles = self.repo / "profiles"
+    profiles.mkdir()
+    database = profiles / "profiles.sqlite3"
+    connection = sqlite3.connect(database)
+    try:
+      connection.execute("CREATE TABLE system_local(singleton INTEGER PRIMARY KEY, machine_id TEXT)")
+      connection.execute("INSERT INTO system_local VALUES(1, ?)", (machine_id,))
+      connection.commit()
+    finally:
+      connection.close()
+    return database
+
+  def test_foreground_and_detached_runs_preserve_existing_machine_identity(self):
+    database = self.profile_identity()
+    before = database.read_bytes()
+    for detached in (False, True):
+      with self.subTest(detached=detached):
+        self.request["detach"] = detached
+        (self.repo / "task.py").write_text("print('task output')")
+        receipt = run_lifecycle.start_run(str(self.repo), self.request, fixture_context(), worker_source())
+        if detached:
+          self.run = Path(receipt["run_dir"])
+          state = self.wait_terminal()
+        else:
+          self.assertEqual(receipt, 0)
+          self.run = next((self.repo / ".expri/runs").iterdir())
+          state = self.state()
+        self.assertEqual(state["machine_id"], "machine-fixture")
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(database.read_bytes(), before)
+        self.assertEqual(list(database.parent.iterdir()), [database])
+
+  def test_missing_profile_storage_is_not_created_and_does_not_stop_runs(self):
+    self.start()
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "completed")
+    self.assertNotIn("machine_id", state)
+    self.assertFalse((self.repo / "profiles").exists())
+
+  def test_invalid_profile_storage_and_missing_sqlite_support_do_not_stop_runs(self):
+    profiles = self.repo / "profiles"
+    profiles.mkdir()
+    database = profiles / "profiles.sqlite3"
+    database.write_bytes(b"not a database")
+    self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
+    self.assertEqual(database.read_bytes(), b"not a database")
+    self.start()
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "completed")
+    self.assertNotIn("machine_id", state)
+    with patch.dict(sys.modules, {"sqlite3": None}):
+      self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
+
+  def test_profile_identity_validation_rejects_non_component_names(self):
+    database = self.profile_identity()
+    for machine_id in ("", ".", "..", "x" * 97, "host/name", "é", "host\nname", None):
+      with self.subTest(machine_id=machine_id):
+        connection = sqlite3.connect(database)
+        try:
+          connection.execute("UPDATE system_local SET machine_id=?", (machine_id,))
+          connection.commit()
+        finally:
+          connection.close()
+        self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
+
+  def test_profile_lookup_rejects_database_owned_directory_and_sidecar_symlinks(self):
+    database = self.profile_identity()
+    original = self.repo / "original.sqlite3"
+    database.replace(original)
+    database.symlink_to(original)
+    self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
+    database.unlink()
+    original.replace(database)
+    sidecar = database.with_name(database.name + "-wal")
+    sidecar.symlink_to(database)
+    self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
+    sidecar.unlink()
+    actual = self.repo / "actual"
+    database.parent.rename(actual)
+    (self.repo / "profiles").symlink_to(actual, target_is_directory=True)
+    self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
+
+  def test_profile_lookup_uses_home_default_and_allows_aliases_above_owned_boundary(self):
+    database = self.profile_identity()
+    home = self.repo / "home"
+    (home / ".tokn").mkdir(parents=True)
+    database.parent.rename(home / ".tokn/expri")
+    alias = self.repo / "home-alias"
+    alias.symlink_to(home, target_is_directory=True)
+    with patch.dict(os.environ, {"HOME": str(alias)}):
+      with patch.dict(os.environ):
+        os.environ.pop("EXPRI_STORAGE_DIR", None)
+        self.assertEqual(run_lifecycle._lifecycle_existing_machine_id(), "machine-fixture")
+    actual = home / ".tokn/expri"
+    outside = self.repo / "outside"
+    actual.rename(outside)
+    actual.symlink_to(outside, target_is_directory=True)
+    with patch.dict(os.environ, {"HOME": str(home)}):
+      with patch.dict(os.environ):
+        os.environ.pop("EXPRI_STORAGE_DIR", None)
+        self.assertIsNone(run_lifecycle._lifecycle_existing_machine_id())
 
   def state(self):
     return json.loads((self.run / "run-state.json").read_text())

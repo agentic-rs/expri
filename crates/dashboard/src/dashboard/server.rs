@@ -12,6 +12,8 @@ use crate::error::{ExpriError, Result};
 use crate::metric_charts::ChartXAxis;
 use crate::metrics::Reduction;
 
+mod system_profiles;
+
 const QUERY_LIMIT: usize = 8 * 1024;
 const HEADER_LIMIT: usize = 16 * 1024;
 const JSON_LIMIT: usize = 512 * 1024;
@@ -354,8 +356,12 @@ impl Reply {
   }
 
   fn json(value: Value) -> Self {
+    Self::serialized(&value)
+  }
+
+  fn serialized(value: &impl serde::Serialize) -> Self {
     let mut writer = LimitedWriter(Vec::new(), JSON_LIMIT);
-    if serde_json::to_writer(&mut writer, &value).is_err() {
+    if serde_json::to_writer(&mut writer, value).is_err() {
       return Self::error(
         413,
         "dashboard JSON response exceeds the 512 KiB size limit; reduce the row/log limits or select fewer runs and metrics",
@@ -619,6 +625,9 @@ fn route_content_checked(
         .ok_or_else(|| Reply::error(404, "project browsing is unavailable"))?;
       Ok(Reply::json(projects))
     }
+    "/api/system-machines" => system_profiles::machines(dashboard, &query),
+    "/api/system-profile" => system_profiles::profile(dashboard, &query),
+    "/api/system-history" => system_profiles::history(dashboard, &query),
     "/api/storage" => {
       query.allow(&["project_id", "kind", "limit", "offset", "search"])?;
       let project_id = query.required("project_id")?;
@@ -784,6 +793,7 @@ fn route_content_checked(
 
 fn service_error(error: ExpriError) -> Reply {
   let status = match &error {
+    ExpriError::ServiceRejected { status, .. } => *status,
     ExpriError::Message(message) if message == "object storage unavailable" => 502,
     ExpriError::Message(message)
       if message.starts_with("run is missing: ")

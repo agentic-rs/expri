@@ -327,6 +327,132 @@ function workspacePanes(nodes) {
   assert.equal(grid.classList.contains("has-custom-columns"), false, "table sizing does not select the workspace layout");
   return { grid, browser, review };
 }
+
+function monitorReply(request, value = 20) {
+  const machine = { machine_id: "machine-explicit", inventory_revision: 1, last_sample_at_ms: 0, last_received_at_ms: 0,
+    inventory: { observed_at_ms: 0, hostname: "Recorded host", os_name: "Linux", os_version: null, kernel_version: null, architecture: "x86_64", cpu: { brand: "Recorded CPU", vendor: "Vendor", logical_cpu_count: 8, physical_core_count: 4 }, memory_total_bytes: 16 * 1024 ** 3, measurement_scope: "host", devices: [], warnings: [] } };
+  if (request.pathname === "/api/system-machines") return response({ machines: [machine], next_cursor: null });
+  if (request.pathname === "/api/system-profile") return response(machine);
+  if (request.pathname === "/api/system-history") {
+    const end_ms = Number(request.searchParams.get("end_ms")), start_ms = Number(request.searchParams.get("start_ms"));
+    const observed_at_ms = Math.max(start_ms, end_ms - 1000), resolution = request.searchParams.get("resolution");
+    const metrics = { "cpu/usage_percent": { kind: "gauge", value }, "memory/used_bytes": { kind: "gauge", value: 4 * 1024 ** 3 } };
+    return response({ machine_id: machine.machine_id, resolution, samples: resolution === "detail" ? [{ sequence: 1, session_id: "session-a", observed_at_ms, interval_ms: 1000, collection_duration_ms: 1, inventory_revision: 1, metrics, counters: {}, warnings: [] }] : [], hours: [], next_cursor: null });
+  }
+  return null;
+}
+
+test("System loads only on demand, preserves full history and inspector nodes, and supports semantic chart inspection", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true, override: request => monitorReply(request) }), { nodes } = model;
+  await inspect(model);
+  assert.equal(model.requests.some(url => url.startsWith("/api/system-")), false);
+  const history = nodes.get("run-rows"), preview = nodes.get("chart-preview"), charts = previewMounts(nodes), run_url = chartSource(nodes), panes = workspacePanes(nodes);
+  await click(nodes.get("workspace-view-system"));
+  await settled(() => nodes.document.querySelectorAll(".system-chart").length === 2);
+  assert.equal(nodes.get("run-workspace").hidden, true); assert.equal(nodes.get("storage-workspace").hidden, true); assert.equal(nodes.get("system-workspace").hidden, false);
+  assert.equal(history.closest("[hidden]"), null); assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), charts); assert.deepEqual(workspacePanes(nodes), panes);
+  assert.match(nodes.get("system-workspace").textContent, /Recorded CPU/);
+  assert.match(nodes.get("system-workspace").textContent, /Whole-machine readings/);
+  const plot = nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] svg');
+  await act(async () => plot.focus()); await emit(plot, "keydown", { key: "Home" });
+  assert.match(plot.parentElement.querySelector(".system-point-inspection").textContent, /20%/);
+  assert.doesNotMatch(plot.getAttribute("aria-label"), /Run 1/);
+  await click(nodes.get("workspace-view-workspace"));
+  assert.equal(nodes.get("system-workspace").hidden, true); assert.equal(nodes.get("chart-preview"), preview); assert.equal(chartSource(nodes), run_url); assert.equal(previewMounts(nodes), charts);
+  await click(nodes.get("workspace-view-system")); await settled(() => nodes.document.querySelector(".system-monitor").getAttribute("aria-busy") === "false");
+  await click(runButton(nodes, 1));
+  await settled(() => chartQuery(nodes).get("run_id") === runIdentity(model.runs[1]));
+  assert.equal(nodes.get("workspace-view-workspace").checked, true); assert.equal(nodes.get("run-rows"), history); assert.equal(nodes.get("system-workspace").hidden, true);
+});
+
+test("System automatic and status-bar refresh retain controls and exclude hidden inspector traffic", async t => {
+  let value = 20;
+  const model = await autoFixture(t, { projects: true, override: request => monitorReply(request, value) }); await inspect(model);
+  const { nodes, clock } = model;
+  await click(nodes.get("workspace-view-system")); await settled(() => nodes.document.querySelectorAll(".system-chart").length === 2);
+  await click(nodes.document.querySelector(".system-metric-picker summary"));
+  const checkbox = nodes.document.querySelector('.system-metric-picker input[type="checkbox"]'), preview = nodes.get("chart-preview"); checkbox.focus();
+  const counts = requestCounts(model.requests);
+  value = 25; await clock.advance(30_000);
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /25%/);
+  assert.equal(nodes.document.querySelector('.system-metric-picker input[type="checkbox"]'), checkbox); assert.equal(nodes.document.activeElement, checkbox);
+  assert.ok(requestCounts(model.requests)["/api/runs"] > counts["/api/runs"], "visible full history receives periodic snapshots");
+  for (const path of ["/api/run", "/api/chart-data", "/api/log", "/api/artifacts"]) assert.equal(requestCounts(model.requests)[path], counts[path], path);
+  assert.equal(nodes.get("chart-preview"), preview);
+  const history_requests = requestCounts(model.requests)["/api/system-history"];
+  value = 30; await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.ok(requestCounts(model.requests)["/api/system-history"] > history_requests);
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /30%/);
+});
+
+test("System is available without projects and explains unsupported backends while retaining runs", async t => {
+  const model = await reviewFixture(t, { override: request => request.pathname.startsWith("/api/system-") ? response({ error: "Unavailable" }, 404) : null });
+  await settledTable(model.nodes); const history = model.nodes.get("run-rows");
+  await click(model.nodes.get("workspace-view-system")); await settled(() => model.nodes.get("system-workspace").querySelector('[role="alert"]') !== null);
+  assert.match(model.nodes.get("system-workspace").textContent, /Upgrade the backend/);
+  assert.equal(model.nodes.get("run-rows"), history); assert.equal(model.nodes.document.querySelectorAll(".system-chart").length, 0);
+  await click(model.nodes.get("workspace-view-workspace")); assert.equal(model.nodes.get("run-workspace").hidden, false);
+});
+
+test("healthy System readings continue through run-list and catalog failures and recover history without hidden inspector reads", async t => {
+  let value = 20;
+  const model = await autoFixture(t, { override: request => monitorReply(request, value) }); await inspect(model);
+  const { nodes, clock } = model;
+  await click(nodes.get("workspace-view-system")); await settled(() => nodes.document.querySelectorAll(".system-chart").length === 2);
+  const counts = requestCounts(model.requests), history = nodes.get("run-rows");
+  model.model.failed_list = true; value = 35;
+  await clock.advance(30_000);
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /35%/);
+  assert.equal(nodes.get("run-rows"), history);
+  for (const path of ["/api/run", "/api/chart-data", "/api/log", "/api/artifacts"]) assert.equal(requestCounts(model.requests)[path], counts[path], path);
+  const failed_history_requests = requestCounts(model.requests)["/api/runs"];
+  model.model.failed_list = false; value = 40; await clock.advance(10_000);
+  assert.ok(requestCounts(model.requests)["/api/runs"] > failed_history_requests, "failed history remains unacknowledged and retries");
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /40%/);
+  model.model.failed_catalog = true; value = 45;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.match(nodes.get("global-error").textContent, /Catalog temporarily unavailable/);
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /45%/);
+  assert.equal(nodes.get("run-rows"), history);
+});
+
+test("System polling and manual Refresh work with no project catalog or experiment runs", async t => {
+  let value = 20;
+  const model = await autoFixture(t, { sources: [], count: 0, override: request => monitorReply(request, value) });
+  const { nodes, clock } = model;
+  await click(nodes.get("workspace-view-system")); await settled(() => nodes.document.querySelectorAll(".system-chart").length === 2);
+  value = 55; await clock.advance(5_000);
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /55%/);
+  value = 60; await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /60%/);
+  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(model.requests.some(url => url.startsWith("/api/run?")), false);
+});
+
+test("compact page navigation reveals System and Storage once, honors reduced motion and keeps refresh focus", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true, override: request => monitorReply(request) }), { nodes } = model;
+  nodes.document.defaultView.matchMedia = query => ({ matches: query === "(max-width: 1000px)" || query === "(prefers-reduced-motion: reduce)" });
+  const calls = [];
+  for (const id of ["system-heading", "storage-heading", "runs-heading", "review-title"]) nodes.get(id).scrollIntoView = options => calls.push({ id, options });
+  const pointerPage = async view => {
+    const radio = nodes.get(`workspace-view-${view}`);
+    await act(async () => { radio.focus(); radio.dispatchEvent(new nodes.document.defaultView.MouseEvent("click", { bubbles: true, cancelable: true, detail: 1 })); await microtasks(); });
+  };
+  await pointerPage("system"); await settled(() => nodes.document.querySelectorAll(".system-chart").length === 2);
+  assert.equal(nodes.document.activeElement, nodes.get("system-heading"));
+  assert.deepEqual(calls, [{ id: "system-heading", options: { block: "start", behavior: "auto" } }]);
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.equal(nodes.document.activeElement, nodes.get("refresh-button")); assert.equal(calls.length, 1);
+  await pointerPage("storage");
+  assert.equal(nodes.document.activeElement, nodes.get("storage-heading")); assert.equal(calls.at(-1).id, "storage-heading");
+  await pointerPage("workspace");
+  assert.equal(nodes.document.activeElement, nodes.get("runs-heading")); assert.equal(calls.at(-1).id, "runs-heading");
+  await inspect(model); await pointerPage("system"); await pointerPage("workspace");
+  assert.equal(nodes.document.activeElement, nodes.get("review-title")); assert.equal(calls.at(-1).id, "review-title");
+  const revealed = calls.length;
+  await click(nodes.get("workspace-view-system"));
+  assert.equal(nodes.document.activeElement, nodes.get("workspace-view-system")); assert.equal(calls.length, revealed, "keyboard activation retains radio focus");
+});
 function metricCheckbox(nodes, name) {
   const label = [...nodes.get("run-metric-options").querySelectorAll("label.metric-choice")].find(item => item.textContent === name);
   assert.ok(label, `Missing metric control: ${name}`); return label.querySelector("input");

@@ -272,6 +272,7 @@ impl Fixture {
       .env_remove("UV_CACHE_DIR")
       .env_remove("PYTHONUNBUFFERED")
       .env_remove("EXPRI_TEST_CLI_CONFIG")
+      .env("EXPRI_STORAGE_DIR", self._directory.path().join("profiles"))
       .env("EXPRI_TEST_SOURCE_ROOT", &self.repo_root)
       .env("UV_PROJECT", "/ambient/wrong-project")
       .env("UV_PYTHON", "/ambient/wrong-python")
@@ -560,6 +561,65 @@ fn native_and_python_setup_steps_share_prepared_environment_after_bootstrap() {
       read_json(&fixture.repo_root.join(".expri/setup-state.json")),
       serde_json::to_value(request).unwrap()
     );
+  }
+}
+
+#[test]
+fn native_and_python_runs_capture_the_existing_machine_identity() {
+  for backend in [Backend::Native, Backend::Python] {
+    let fixture = Fixture::new();
+    let database = fixture._directory.path().join("profiles/profiles.sqlite3");
+    let store = expri_system::store::LocalStore::open(&database).unwrap();
+    let machine_id = store.machine_id().to_owned();
+    drop(store);
+    let before = fs::read(&database).unwrap();
+    let output = fixture.execute(backend, 0, false);
+    assert!(
+      output.status.success(),
+      "{backend:?}: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let state = read_json(&fixture.run_dir().join("run-state.json"));
+    assert_eq!(state["status"], "completed", "{state}");
+    assert_eq!(state["machine_id"], machine_id);
+    assert_eq!(fs::read(&database).unwrap(), before);
+    assert_eq!(fs::read_dir(database.parent().unwrap()).unwrap().count(), 1);
+  }
+}
+
+#[test]
+fn native_and_python_runs_continue_without_missing_or_malformed_profiles() {
+  for backend in [Backend::Native, Backend::Python] {
+    for malformed in [false, true] {
+      let fixture = Fixture::new();
+      let profiles = fixture._directory.path().join("profiles");
+      if malformed {
+        fs::create_dir(&profiles).unwrap();
+        fs::write(
+          profiles.join("profiles.sqlite3"),
+          b"invalid profile database",
+        )
+        .unwrap();
+      }
+      let output = fixture.execute(backend, 0, false);
+      assert!(
+        output.status.success(),
+        "{backend:?}, malformed={malformed}: {}",
+        String::from_utf8_lossy(&output.stderr)
+      );
+      let state = read_json(&fixture.run_dir().join("run-state.json"));
+      assert_eq!(state["status"], "completed", "{state}");
+      assert!(state.get("machine_id").is_none(), "{state}");
+      if malformed {
+        assert_eq!(
+          fs::read(profiles.join("profiles.sqlite3")).unwrap(),
+          b"invalid profile database"
+        );
+        assert_eq!(fs::read_dir(profiles).unwrap().count(), 1);
+      } else {
+        assert!(!profiles.exists());
+      }
+    }
   }
 }
 

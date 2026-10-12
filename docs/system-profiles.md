@@ -145,6 +145,28 @@ jump; the wall clock at process startup is still the initial time reference.
 
 ## Inspect local and hosted history
 
+Open the dashboard's **System** page to browse machine inventory and utilization.
+Machine choices are independent of project selection. Period presets, Detail or
+Hourly resolution, and Local or UTC time controls share the chart workspace.
+Detailed charts show counter rates over their measured intervals; hourly charts
+show means or throughput over measured coverage. Missing readings remain gaps.
+The displayed measurements describe the whole system visible to the collector.
+
+Hosted dashboards read profiles through the authenticated browser session and
+do not require machine credentials in the browser. Local dashboards read an
+existing profile store using `EXPRI_STORAGE_DIR` or the normal home-directory
+location. Opening the page does not start collection or create a profile store.
+
+New native and Python fallback runs record the existing store's stable
+`machine_id` in `run-state.json` when it is available at launch. Start collection
+or run `expri system sample` before launching a run to establish that identity,
+and use the same `EXPRI_STORAGE_DIR` on both commands if overriding storage.
+Missing or unreadable profiles leave the run without a mapping and do not stop
+the experiment. Existing runs do not acquire an inferred machine identity from
+their hostname or worker label.
+
+The CLI can also inspect the same local or hosted history:
+
 ```sh
 expri system history
 expri system history --resolution hourly

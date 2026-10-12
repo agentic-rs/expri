@@ -140,7 +140,7 @@ code, pre { font: 11px/1.6 var(--font-mono); }
 code { overflow-wrap: anywhere; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .number { text-align: right; font-variant-numeric: tabular-nums; }
-#review-title, #runs-heading { scroll-margin-top: 12px; }
+#review-title, #runs-heading, #system-heading, #storage-heading { scroll-margin-top: 12px; }
 
 /* Project and page navigation belong to the header; run history owns the rail. */
 .app-shell { display: flex; flex-direction: column; height: 100dvh; min-height: 420px; overflow: hidden; }
@@ -493,6 +493,45 @@ details.inspector-controls { display: block; }
 #chart-preview .metric-chart-title { min-width: 0; margin: 0; font-size: 13px; }
 .metric-chart-summary { display: flex; align-items: baseline; gap: 6px; font-size: 10px; color: var(--muted); white-space: nowrap; }
 .metric-chart-summary strong { font-size: 15px; line-height: 1.3; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.system-monitor { min-width: 0; }
+.system-monitor .workspace-heading { align-items: flex-start; }
+.system-monitor .workspace-heading p { margin-top: 3px; font-size: 11px; }
+.system-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 9px 16px; margin-bottom: 10px; }
+.system-controls #system-machine-options { flex-basis: 100%; }
+.system-controls #system-machine-options .choice-tags { max-height: 104px; overflow: auto; padding: 2px; }
+.system-monitor .choice-tag span { white-space: normal; overflow-wrap: anywhere; }
+.system-inventory { padding: 9px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+.system-profile-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 10px; }
+.system-profile-heading h2 { font-size: 14px; }
+.system-inventory-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 6px 12px; margin: 8px 0; }
+.system-inventory-summary > div { min-width: 0; }
+.system-inventory-summary dt { color: var(--muted); font-size: 10px; }
+.system-inventory-summary dd { margin: 1px 0 0; overflow-wrap: anywhere; font-size: 11px; }
+@media (min-width: 1400px) {
+  .system-inventory-summary { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
+.system-inventory summary, .system-warnings summary, .system-metric-picker summary { color: var(--muted); font-size: 11px; }
+.system-inventory .table-scroll { overflow: auto; margin-top: 8px; }
+.system-inventory table { width: 100%; border-collapse: collapse; }
+.system-inventory th, .system-inventory td { padding: 6px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; max-width: 240px; }
+.system-data-note { font-size: 11px; margin: 8px 0 3px; }
+.system-range { font-size: 10px; margin-bottom: 8px; overflow-wrap: anywhere; }
+.system-metric-picker { margin: 10px 0; padding: 8px 0; border-block: 1px solid var(--line); }
+.system-metric-picker .field { max-width: 280px; margin: 8px 0; }
+.system-metric-picker .choice-tags { max-height: 104px; overflow: auto; padding: 2px; }
+.system-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(400px, 100%), 1fr)); gap: 10px; }
+.system-chart { min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+.system-chart .metric-chart-header { align-items: flex-start; flex-wrap: wrap; }
+.system-chart h2 { min-width: 0; font-size: 13px; overflow-wrap: anywhere; }
+.system-chart svg { display: block; width: 100%; height: auto; margin-top: 5px; color: var(--accent); }
+.system-chart .grid { stroke: var(--chart-grid); stroke-width: 1; }
+.system-chart .tick { fill: var(--muted); font: 20px var(--font-mono); }
+.system-chart-inspection line { stroke: var(--muted); stroke-dasharray: 4 4; }
+.system-chart-inspection circle { fill: var(--paper); stroke: var(--accent); stroke-width: 2; }
+.system-point-inspection { min-height: 32px; font-size: 10px; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .system-chart .tick { font-size: 32px; }
+}
 .chart-context { font-size: 11px; margin-top: 5px; }
 #chart-preview .card > p { margin: 5px 0; font-size: 11px; }
 #chart-preview h2 { font-size: 13px; margin-bottom: 6px; }
@@ -679,6 +718,7 @@ details.inspector-controls { display: block; }
   .runs-scroll { min-height: 120px; }
   .main-workspace { overflow: visible; padding: 12px; }
   .workspace-grid.has-review #run-workspace:not([hidden]) { min-height: 100dvh; }
+  #system-workspace:not([hidden]), #storage-workspace:not([hidden]) { min-height: 100dvh; }
   .review-empty { min-height: 210px; }
   .filters { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
   .filters > #archival-options, .filters > #status-options, .filters > .machine-filter { grid-column: auto; }
