@@ -173,7 +173,7 @@ export type DashboardStore = {
 
 type RadioOption<T extends string> = { id: string; value: T; label: string };
 function revealOnCompactLayout(id: string): void {
-  if (!window.matchMedia?.("(max-width: 1180px)").matches) return;
+  if (!window.matchMedia?.("(max-width: 1000px)").matches) return;
   const target = document.getElementById(id);
   if (!target) return;
   target.focus({ preventScroll: true });
@@ -504,10 +504,10 @@ function RunBrowser({
     ...new Set(s.runs.map((run) => run.task).filter((task): task is string => task !== null)),
   ].sort();
   return (
-    <section className="card runs-card" aria-labelledby="runs-heading">
-      <div className="section-heading">
+    <aside className="runs-card run-history" aria-labelledby="runs-heading">
+      <div className="section-heading run-history-header">
         <div>
-          <h2 id="runs-heading" tabIndex={-1}>All runs</h2>
+          <h2 id="runs-heading" tabIndex={-1}>Run history</h2>
           <p id="run-count" className="muted">
             {s.run_count}
           </p>
@@ -587,7 +587,7 @@ function RunBrowser({
         >
           Clear filters
         </button>
-        <p className="filter-hint">Changing filters clears the selection.</p>
+        <p className="filter-hint sr-only">Changing filters clears the selection.</p>
       </div>
       <div className="run-table-toolbar">
         <RunColumnPicker key={s.source_id} snapshot={s} actions={a} />
@@ -705,7 +705,11 @@ function RunBrowser({
                       checked={selected}
                       disabled={s.list_busy || (s.selected.length >= 8 && !selected)}
                       aria-label={`Select ${runLabel(run)} for comparison`}
-                      onChange={(event) => a.select_run(identity, event.currentTarget.checked)}
+                      onChange={(event) => {
+                        const checked = event.currentTarget.checked;
+                        if (s.workspace_view !== "workspace") a.workspace_view("workspace");
+                        a.select_run(identity, checked);
+                      }}
                     />
                   </td>
                   <td className="run-cell">
@@ -713,15 +717,19 @@ function RunBrowser({
                       type="button"
                       className={`run-link${runNickname(run) ? " has-nickname" : ""}`}
                       disabled={s.list_busy}
+                      title={runLabel(run)}
                       onClick={() => {
+                        if (s.workspace_view !== "workspace") a.workspace_view("workspace");
                         a.inspect_run(identity);
                         revealOnCompactLayout("review-title");
                       }}
                     >
                       {runNickname(run) ?? run.run_id}
                     </button>
-                    {runNickname(run) && <div className="run-meta run-identifier">{run.run_id}</div>}
-                    <RunTags run={run} />
+                    <div className="run-summary-meta">
+                      {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
+                      <RunTags run={run} limit={2} />
+                    </div>
                     {run.archival && run.archival.status !== "active" && <div className="run-meta">
                       {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` :
                         run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
@@ -850,6 +858,7 @@ function RunBrowser({
             type="button"
             disabled={s.selected.length < 2}
             onClick={() => {
+              if (s.workspace_view !== "workspace") a.workspace_view("workspace");
               a.compare();
               revealOnCompactLayout("review-title");
             }}
@@ -858,7 +867,11 @@ function RunBrowser({
           </button>
         </div>
       </div>
-    </section>
+      <details className="source-context" hidden={s.source_note === null}>
+        <summary>Source details</summary>
+        <p id="source-note">{s.source_note}</p>
+      </details>
+    </aside>
   );
 }
 function Facts({ values }: { values: [string, string][] }) {
@@ -1160,31 +1173,40 @@ function ReviewWorkspace({
       s.runs.find((run) => runIdentity(run) === s.review?.run_ids[0])
   ) : null;
   return (
-    <div className="review-workspace">
+    <div className="review-content">
       <section id="review-empty" className="review-empty" hidden={!s.review_empty}>
         <span className="review-empty-icon"><Icon name="charts" /></span>
         <div>
-          <h2>Inspect or compare runs</h2>
-          <p>Open a run to explore metrics, parameters, logs, and files. Select two to eight runs to compare results.</p>
+          <h2>Select a run</h2>
+          <p>Open a run from the history to inspect its metrics, parameters, logs, and files. Select two to eight runs to compare.</p>
         </div>
       </section>
       <section id="review-section" aria-live="polite" hidden={!s.review}>
-        <div className="review-heading">
-          <div>
+        <header className="inspector-header review-heading">
+          <div className="inspector-identity">
             <p id="review-eyebrow" className="eyebrow">
-              {s.review?.kind === "compare" ? "Experiment comparison" : "Run details"}
+              {s.review?.kind === "compare" ? "Comparison" : "Run"}
             </p>
-            <h2 id="review-title" tabIndex={-1} className={review_run && runNickname(review_run) ? "has-nickname" : undefined}>
+            <h2 id="review-title" tabIndex={-1} className={`inspector-title${review_run && runNickname(review_run) ? " has-nickname" : ""}`}>
               {s.review?.kind === "compare"
                 ? `${s.review.run_ids.length} runs`
                 : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
-            {review_run && runNickname(review_run) && <p className="run-meta run-identifier">{runKeyLabel(runIdentity(review_run))}</p>}
-            {review_run && <RunTags run={review_run} />}
+            {review_run && <div className="inspector-meta">
+              <span className={`status inspector-status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(review_run.status) ? review_run.status : ""}`}>
+                {review_run.status}
+              </span>
+              {runNickname(review_run) && <code className="run-identifier">{review_run.run_id}</code>}
+              {review_run.task && <span title="Task"><span className="sr-only">Task: </span>{review_run.task}</span>}
+              {review_run.origin && runNickname(review_run) && <span title="Machine"><span className="sr-only">Machine: </span>{review_run.origin}</span>}
+              {review_run.started_at && <time dateTime={review_run.started_at} title="Started"><span className="sr-only">Started: </span>{dateText(review_run.started_at)}</time>}
+              {review_run.finished_at && <span title="Duration"><span className="sr-only">Duration: </span>{formatDuration(review_run)}</span>}
+              <RunTags run={review_run} />
+            </div>}
           </div>
           <button
             id="close-review"
-            className="text-button"
+            className="text-button inspector-close"
             type="button"
             hidden={s.review?.origin === "selection"}
             onClick={() => {
@@ -1192,16 +1214,9 @@ function ReviewWorkspace({
               revealOnCompactLayout("runs-heading");
             }}
           >
-            <Icon name="close" />{s.selected.length ? "Back to selection" : "Close review"}
+            <Icon name="close" />{s.selected.length ? "Back to selection" : "Close"}
           </button>
-        </div>
-        {s.access_mode === "hosted" && s.review?.kind === "run" && (
-          <div className="review-management">
-            <RunAnnotationsPanel snapshot={s} actions={a} />
-            <RunArchivalPanel snapshot={s} actions={a} />
-            <ResultUploadSummary detail={s.detail} />
-          </div>
-        )}
+        </header>
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {tabs.map((tab) => (
             <button
@@ -1222,8 +1237,15 @@ function ReviewWorkspace({
             </button>
           ))}
         </div>
-        <div id="review-loading" className="card loading-state" hidden={!s.review_loading}>
-          Loading experiment details…
+        {s.access_mode === "hosted" && s.review?.kind === "run" && (
+          <div className="inspector-toolbar review-management">
+            <RunAnnotationsPanel snapshot={s} actions={a} />
+            <RunArchivalPanel snapshot={s} actions={a} />
+            <ResultUploadSummary detail={s.detail} />
+          </div>
+        )}
+        <div id="review-loading" className="loading-state inspector-loading" hidden={!s.review_loading}>
+          Loading run details…
         </div>
         <ErrorNotice id="review-error" message={s.review_error} />
         <Warnings id="review-warnings" items={s.review_warnings} />
@@ -1235,11 +1257,11 @@ function ReviewWorkspace({
         >
           <details
             id="run-metric-controls"
-            className="card metric-settings"
+            className="metric-settings metric-menu inspector-controls"
             hidden={!s.detail || s.review?.kind !== "run"}
           >
             <summary>
-              Chart metrics <span className="muted">Choose up to six</span>
+              Metrics <span className="muted">{s.review?.metric_names.length ? `${s.review.metric_names.length} / 6 selected` : "Default selection"}</span>
             </summary>
             <fieldset className="metric-picker">
               <legend>Metrics</legend>
@@ -1252,12 +1274,23 @@ function ReviewWorkspace({
             </fieldset>
           </details>
           <div id="compare-detail" hidden={!s.comparison || s.review?.kind !== "compare"}>
-            <section className="card comparison-controls">
-              <div className="section-heading">
-                <div>
-                  <h3>Compare selected runs</h3>
-                  <p className="muted">Recorded scalar values from this source.</p>
-                </div>
+            <section className="inspector-controls comparison-controls">
+              <div className="metric-control-group">
+                <details className="metric-settings metric-menu">
+                  <summary>
+                    Metrics <span className="muted">{s.review?.metric_names.length ? `${s.review.metric_names.length} / 6 selected` : "Default selection"}</span>
+                  </summary>
+                  <fieldset className="metric-picker">
+                    <legend>Comparison metrics</legend>
+                    <MetricPicker
+                      key={`${s.source_id}:${s.review_version}`}
+                      id="compare-metric-options"
+                      snapshot={s}
+                      actions={a}
+                    />
+                    <p id="compare-metric-hint" className="muted"></p>
+                  </fieldset>
+                </details>
                 <RadioTags
                   name="reduction"
                   legend="Summary"
@@ -1270,40 +1303,19 @@ function ReviewWorkspace({
                   on_change={a.reduction}
                 />
               </div>
-              <details className="metric-settings">
-                <summary>
-                  Metrics <span className="muted">Choose up to six</span>
-                </summary>
-                <fieldset className="metric-picker">
-                  <legend>Comparison metrics</legend>
-                  <MetricPicker
-                    key={`${s.source_id}:${s.review_version}`}
-                    id="compare-metric-options"
-                    snapshot={s}
-                    actions={a}
-                  />
-                  <p id="compare-metric-hint" className="muted"></p>
-                </fieldset>
-              </details>
             </section>
-            <section className="card comparison-summary">
+            <section className="evidence-panel comparison-summary">
               <h3>Metric values</h3>
               <ComparisonValues result={s.comparison} busy={s.comparison_busy} />
             </section>
           </div>
           <section
             id="chart-card"
-            className="card chart-card"
+            className="evidence-panel chart-card"
             hidden={!s.chart_visible}
             aria-busy={s.chart_busy}
           >
-            <div className="section-heading">
-              <div>
-                <h3>Metric curves</h3>
-                <p id="chart-note" className="muted">
-                  {s.chart_note}
-                </p>
-              </div>
+            <div className="chart-toolbar">
               <div className="chart-actions">
                 <div className="chart-axis-controls">
                   <RadioTags
@@ -1346,11 +1358,11 @@ function ReviewWorkspace({
                 </a>
               </div>
             </div>
+            <p id="chart-note" className="muted chart-context">{s.chart_note}</p>
             <ErrorNotice id="chart-error" message={s.chart_error} />
             <div id="chart-preview" role="region" aria-label="Interactive experiment metric curves"></div>
             <p className="chart-footnote muted">
-              Hover to inspect values, drag across the x-axis to zoom, and use the legend to show or
-              hide runs. Time views omit points without recorded timestamps.
+              Hover to inspect · Drag to zoom · Click a legend entry to show or hide a run. Time views omit samples without timestamps.
             </p>
           </section>
         </div>
@@ -1478,7 +1490,7 @@ function RefreshControls({ snapshot: s, actions }: {
           />
           Auto refresh
         </label>
-        <span id="updated-at" className="freshness">{s.freshness}</span>
+        <span id="updated-at" className="freshness" title={s.freshness}>{s.freshness}</span>
       </div>
       <button
         id="refresh-button"
@@ -1507,9 +1519,6 @@ export function DashboardView({ store, actions }: {
   const active_source = s.sources.find((source) => source.source_id === s.source_id);
   const project_id = active_source?.kind === "hosted_project" ? active_source.project_id : null;
   const storage_visible = s.workspace_view === "storage";
-  const page_description = storage_visible
-    ? "Manage the inputs and outputs behind your experiments."
-    : "Explore experiments, inspect results, and compare what changed.";
   return (
     <>
       {project && createPortal(s.project_name, project)}
@@ -1518,51 +1527,49 @@ export function DashboardView({ store, actions }: {
       {utility_controls && createPortal(<RefreshControls snapshot={s} actions={actions} />, utility_controls)}
       {navigation && createPortal(<WorkspaceNavigation snapshot={s} actions={actions} storage_enabled={!!project_id} />, navigation)}
       {theme_controls && createPortal(<ThemeControl compact />, theme_controls)}
-      <div className="workspace-heading">
-        <div>
-          <p className="eyebrow">{active_source?.label ?? "Experiment workspace"}</p>
-          <h1 id={storage_visible ? "storage-heading" : undefined}>
-            {storage_visible ? "Storage" : "Runs"}
-          </h1>
-          <p className="workspace-description">{page_description}</p>
-        </div>
-        {!utility_controls && <RefreshControls snapshot={s} actions={actions} />}
-      </div>
       {!navigation && <WorkspaceNavigation snapshot={s} actions={actions} storage_enabled={!!project_id} />}
-      <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>{s.project_catalog_note}</div>
+      <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>
+        {s.project_catalog_note}
+      </div>
       <ErrorNotice id="global-error" message={s.global_error} />
       <Warnings id="catalog-warnings" items={s.catalog_warnings} />
-      <ProjectStorageManagement
-        project_id={project_id ?? null}
-        active={s.workspace_view === "storage" && !!project_id}
-        auto_enabled={s.auto_enabled}
-        on_project_removed={actions.refresh}
-      />
-      <div id="workspace-page" hidden={s.workspace_view !== "workspace"}>
-        <div id="source-note" className="source-note" hidden={s.source_note === null}>
-          {s.source_note}
-        </div>
-        <div className={`workspace-grid${(s.run_columns.length || project_id) ? " has-wide-table" : ""}${s.review ? " has-review" : ""}`}>
+      <div id="workspace-page">
+        <div className={`workspace-grid history-grid${(s.run_columns.length || project_id) ? " has-wide-table" : ""}${s.review ? " has-review" : ""}`}>
           <RunBrowser snapshot={s} actions={actions} />
-          <ReviewWorkspace snapshot={s} actions={actions} />
+          <div className="main-workspace review-workspace">
+            <ProjectStorageManagement
+              project_id={project_id ?? null}
+              active={storage_visible && !!project_id}
+              auto_enabled={s.auto_enabled}
+              on_project_removed={actions.refresh}
+            />
+            <div id="run-workspace" hidden={storage_visible}>
+              <ReviewWorkspace snapshot={s} actions={actions} />
+            </div>
+            <div id="storage-workspace" hidden={!storage_visible}>
+              <div className="workspace-heading storage-heading">
+                <h1 id="storage-heading">Storage</h1>
+              </div>
+              {project_id && (
+                <StoragePanel
+                  project_id={project_id}
+                  kind={s.storage_kind}
+                  search={s.storage_search}
+                  offset={s.storage_offset}
+                  catalog={s.storage_catalog}
+                  loading={s.storage_loading}
+                  error={s.storage_error}
+                  on_kind={actions.storage_kind}
+                  on_search={actions.storage_search}
+                  on_previous={actions.storage_previous}
+                  on_next={actions.storage_next}
+                  on_refresh={actions.storage_refresh}
+                />
+              )}
+            </div>
+          </div>
         </div>
       </div>
-      {project_id && <div hidden={s.workspace_view !== "storage"}>
-        <StoragePanel
-          project_id={project_id}
-          kind={s.storage_kind}
-          search={s.storage_search}
-          offset={s.storage_offset}
-          catalog={s.storage_catalog}
-          loading={s.storage_loading}
-          error={s.storage_error}
-          on_kind={actions.storage_kind}
-          on_search={actions.storage_search}
-          on_previous={actions.storage_previous}
-          on_next={actions.storage_next}
-          on_refresh={actions.storage_refresh}
-        />
-      </div>}
       <div id="live-status" className="sr-only" role="status" aria-live="polite">{s.live_status}</div>
     </>
   );

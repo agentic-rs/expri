@@ -9,45 +9,37 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body class="dashboard-page">
-    <a class="skip-link" href="#runs-heading">Skip to runs</a>
+    <a class="skip-link" href="#runs-heading">Skip to run history</a>
     <div class="app-shell">
-      <aside class="app-sidebar" aria-label="Workspace navigation">
-        <a class="brand" href="/" aria-label="expri dashboard">
-          <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 32 32" fill="none">
-              <path d="M9 7h14M9 16h10M9 25h14" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
-              <circle cx="22" cy="16" r="3" fill="currentColor" />
-            </svg>
-          </span>
-          <span>expri</span>
-        </a>
-        <p class="sidebar-caption">Navigate</p>
-        <div id="navigation-root"></div>
-        <div id="source-controls-root" class="source-controls"></div>
-        <div class="sidebar-footer">
-          <div id="theme-controls-root"></div>
-        </div>
-      </aside>
-      <div class="app-body">
-        <header class="topbar">
-          <div class="topbar-inner">
-            <div class="project-context">
-              <span class="eyebrow">Workspace</span>
-              <span class="project-name" id="project-name"></span>
-              <span class="read-only">Read only</span>
-            </div>
-            <div id="utility-controls-root"></div>
-            <form id="logout-form" class="session-actions" method="post" action="/logout" hidden>
-              <button class="text-button" type="submit">Sign out</button>
-            </form>
+      <header class="topbar">
+        <div class="topbar-inner">
+          <a class="brand" href="/" aria-label="expri dashboard">
+            <span class="brand-mark" aria-hidden="true">
+              <svg viewBox="0 0 32 32" fill="none">
+                <path d="M9 7h14M9 16h10M9 25h14" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+                <circle cx="22" cy="16" r="3" fill="currentColor" />
+              </svg>
+            </span>
+            <span>expri</span>
+          </a>
+          <div class="header-scope">
+            <span id="project-name" class="sr-only"></span>
+            <div id="source-controls-root" class="source-controls"></div>
+            <span class="read-only">Read only</span>
           </div>
-        </header>
-        <main class="workspace-main">
-          <div id="dashboard-root"></div>
-          <noscript><p class="notice">Enable JavaScript to review recorded experiment results.</p></noscript>
-          <footer><span id="dashboard-kind"></span><span>Experiment workspace</span></footer>
-        </main>
-      </div>
+          <div id="navigation-root"></div>
+          <div id="utility-controls-root"></div>
+          <div id="theme-controls-root" class="header-theme"></div>
+          <form id="logout-form" class="session-actions" method="post" action="/logout" hidden>
+            <button class="text-button" type="submit">Sign out</button>
+          </form>
+        </div>
+      </header>
+      <main class="workspace-main">
+        <div id="dashboard-root"></div>
+        <noscript><p class="notice">Enable JavaScript to review recorded experiment results.</p></noscript>
+        <footer><span id="dashboard-kind"></span><span>Experiment workspace</span></footer>
+      </main>
     </div>
   </body>
 </html>

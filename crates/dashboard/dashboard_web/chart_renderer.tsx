@@ -41,8 +41,15 @@ function MetricPlot({ data, plot }: { data: ChartData; plot: ChartPlot }) {
   const range = metricRange(data, plot);
   const summary_by_run = new Map(plot.series.map(series => [series.run_index, series]));
   const sampled = plot.series.some(series => series.points.length < series.summary.count - (data.x_axis === "step" ? 0 : series.summary.missing_timestamp_count));
-  return <section className="card metric-chart" data-chart-metric={plot.metric_name}>
-    <h2>{plot.metric_name}</h2>
+  const last = data.runs.length === 1 ? plot.series[0]?.summary.last : null;
+  return <section className="metric-chart evidence-panel" data-chart-metric={plot.metric_name}>
+    <header className="metric-chart-header">
+      <h2 className="metric-chart-title">{plot.metric_name}</h2>
+      {last && <div className="metric-chart-summary" title="Last recorded value across all samples">
+        <span className="muted">Last</span>
+        <strong title={chartValueText(last.value)}>{valueTick(last.value)}</strong>
+      </div>}
+    </header>
     {data.x_axis !== "step" && plot.series.filter(series => series.summary.missing_timestamp_count > 0).map(series => <p className="muted" key={series.run_index}>
       Run {series.run_index} · <code>{data.runs[series.run_index - 1]}</code>: {series.summary.missing_timestamp_count} of {series.summary.count} samples omitted from this time view because they have no timestamp.
     </p>)}
@@ -85,16 +92,16 @@ function MetricPlot({ data, plot }: { data: ChartData; plot: ChartPlot }) {
 
 export function ChartPreview({ data }: { data: ChartData }) {
   return <Fragment>
-    <p className="chart-summary">{data.plots.length} metric chart{data.plots.length === 1 ? "" : "s"} · {data.runs.length} run{data.runs.length === 1 ? "" : "s"}. Curves follow logging order.</p>
-    {(data.warnings.length > 0 || data.warnings_truncated) && <section className="card warning">
+    <p className="chart-summary">{data.plots.length} metric{data.plots.length === 1 ? "" : "s"} · {data.runs.length} run{data.runs.length === 1 ? "" : "s"} · Logging order</p>
+    {(data.warnings.length > 0 || data.warnings_truncated) && <section className="evidence-panel warning">
       <h2>Data notes</h2>
       <ul tabIndex={0} aria-label="Metric data notes">{data.warnings.map((warning, index) => <li key={index}><code>{data.runs[warning.run_index - 1]}</code>: {warning.message}</li>)}</ul>
       {data.warnings_truncated && <p className="muted">Some data notes are shortened or omitted. Review the original run records for complete notes.</p>}
     </section>}
-    {data.plots.length === 0 && <section className="card"><h2>No scalar metrics</h2><p className="muted">No metric series are available in these run records.</p></section>}
+    {data.plots.length === 0 && <section className="evidence-panel"><h2>No scalar metrics</h2><p className="muted">No metric series are available in these run records.</p></section>}
     {data.plots.map(plot => <MetricPlot key={plot.metric_name} data={data} plot={plot} />)}
     {data.runs.length > 1 && <details className="parameter-comparison"><summary>Compare parameters</summary>
-      <section className="card"><h2>Effective parameters</h2>
+      <section className="evidence-panel"><h2>Effective parameters</h2>
         {data.parameter_rows.length === 0 ? <p className="muted">No effective parameters were saved for these runs.</p> : <Fragment>
           <p className="muted">Highlighted rows differ between runs. A dash means the parameter was not recorded.</p>
           <div className="table-scroll"><table className="params"><thead><tr><th>Parameter</th>{data.runs.map(run_id => <th key={run_id}><code>{run_id}</code></th>)}</tr></thead>

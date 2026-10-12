@@ -3,10 +3,14 @@ import { apiUrl, errorText, parseProjectRunKey, parseRunDeepLink, runIdentity, r
 import { MAX_RUN_NICKNAME_CHARS, MAX_RUN_TAGS, normalizeRunAnnotations, runAnnotationsScope, type RunAnnotationValues } from "./run_annotations";
 import type { DashboardActions, DashboardSnapshot } from "./dashboard_view";
 
-export function RunTags({ run }: { run: Run }) {
+export function RunTags({ run, limit }: { run: Run; limit?: number }) {
   const tags = runTags(run);
+  const visible_tags = limit === undefined ? tags : tags.slice(0, limit);
+  const remaining = tags.slice(visible_tags.length);
   return tags.length ? <ul className="run-tags" aria-label="Run tags">
-    {tags.map((tag) => <li className="run-tag" key={tag}>{tag}</li>)}
+    {visible_tags.map((tag) => <li className="run-tag" key={tag} title={tag}>{tag}</li>)}
+    {remaining.length > 0 && <li className="run-tag-count" title={remaining.join(", ")}
+      aria-label={`${remaining.length} more tags: ${remaining.join(", ")}`}>+{remaining.length}</li>}
   </ul> : null;
 }
 

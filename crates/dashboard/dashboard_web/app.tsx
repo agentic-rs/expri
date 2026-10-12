@@ -1993,8 +1993,29 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     const current = () => !disposed && generation === quiet_generation &&
       workspace_view === "storage" && source_id === source.source_id &&
       storage_kind === kind && storage_offset === offset && ui.storage_search === search;
+    const refreshHistory = async (revision?: string | null): Promise<RefreshOutcome> => {
+      const changed = revision !== null && revision !== undefined &&
+        source_revisions.get(source_id) !== revision;
+      if (list_ready && last_run_list_context === listUrl() && !changed &&
+        !((revision === null || revision === undefined || !updates_supported) && now() - last_list_snapshot >= 30_000)) {
+        return "success";
+      }
+      try {
+        const history_url = listUrl();
+        const result = await quiet_lanes.list.run<RunList>(history_url);
+        if (!result || !current() || listUrl() !== history_url) return "cancelled";
+        applyRunList(result, history_url, true);
+        if (revision !== null && revision !== undefined) {
+          boundedSet(source_revisions, source_id, revision);
+        }
+        return "success";
+      } catch {
+        return current() ? "failure" : "cancelled";
+      }
+    };
+    let history_outcome: RefreshOutcome = "success";
     try {
-      if (!updates_supported) return "success";
+      if (!updates_supported) return refreshHistory();
       let updates: Updates | undefined;
       try {
         updates = await quiet_lanes.updates.run<Updates>(
@@ -2004,14 +2025,16 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         if (!(error instanceof RequestError) || error.status !== 404) throw error;
         updates_supported = false;
         auto_refresh?.setInterval(30_000);
-        return "success";
+        return refreshHistory();
       }
       if (!updates || !current()) return "cancelled";
+      history_outcome = await refreshHistory(updates.source_revision);
+      if (history_outcome === "cancelled") return history_outcome;
       const revision = updates.storage_revision;
       if (revision === undefined || (storage_revision === revision && storage_catalog) ||
         now() < storage_retry_at) {
         last_checked = now();
-        return "success";
+        return history_outcome;
       }
       const result = await quiet_lanes.storage.run<StorageCatalog>(url);
       if (!result || !current()) return "cancelled";
@@ -2023,14 +2046,14 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       }
       if (ui.storage_error) updateUi({ storage_error: null });
       last_checked = now();
-      return "success";
+      return history_outcome;
     } catch (error) {
       if (!current()) return "cancelled";
       if (error instanceof RequestError && error.status === 404) {
         storage_retry_at = now() + 5 * 60_000;
         storage_catalog = null;
         updateUi({ storage_error: "Project storage browsing is unavailable on this server. Upgrade expri, then Refresh storage; the service CLI remains available." });
-        return "success";
+        return history_outcome;
       }
       return "failure";
     }
