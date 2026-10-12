@@ -18,6 +18,23 @@ expri --version
 See the [release notes](CHANGELOG.md) for features and migration instructions.
 Install the same version on native workers when upgrading their capabilities.
 
+## Agent guidance
+
+`expri skill` prints a short agent skill with essential behavior and a topic
+index. Load deeper instructions only for the workflow at hand:
+
+```sh
+expri skill
+expri skill run
+expri skill assets
+expri skill --help
+```
+
+Topics cover configuration, source pushing, task launch, run inspection,
+metrics, artifacts, assets, environments, and service publishing/fetching.
+The Markdown is embedded in the CLI, works offline without project
+configuration, and does not install files.
+
 ## Push source and config
 
 Source and worker commands such as `push`, `setup`, and `-T ... run` operate
