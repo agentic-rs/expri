@@ -18,6 +18,8 @@ use super::types::{
 };
 use crate::error::{ExpriError, Result};
 
+mod cli_auth;
+
 const HEADER_LIMIT: usize = 16 * 1024;
 const WORKERS: usize = 4;
 const QUEUE: usize = 16;
@@ -36,10 +38,12 @@ struct Auth {
   workers: Vec<(Vec<u8>, WorkerAuth)>,
   machines: Vec<(Vec<u8>, MachineAuth)>,
   sites: Vec<DashboardSite>,
+  login_limiter: cli_auth::LoginLimiter,
 }
 
 enum Role<'a> {
   Owner,
+  IssuedOwner { digest: [u8; 32] },
   Worker(&'a WorkerAuth),
   Machine(&'a MachineAuth),
 }
@@ -123,6 +127,7 @@ impl Auth {
       workers,
       machines,
       sites,
+      login_limiter: cli_auth::LoginLimiter::default(),
     })
   }
 
@@ -169,7 +174,11 @@ impl Auth {
     Ok(())
   }
 
-  fn role(&self, request: &HttpRequest<Vec<u8>>) -> ApiResult<Role<'_>> {
+  fn role<S: ObjectStorage>(
+    &self,
+    store: &Store<S>,
+    request: &HttpRequest<Vec<u8>>,
+  ) -> ApiResult<Role<'_>> {
     let mut headers = request.headers().get_all("authorization").iter();
     let header = headers
       .next()
@@ -191,12 +200,26 @@ impl Auth {
     {
       return Ok(Role::Worker(worker));
     }
-    self
+    if let Some(machine) = self
       .machines
       .iter()
       .find(|(token, _)| constant_eq(supplied, token))
       .map(|(_, machine)| Role::Machine(machine))
-      .ok_or_else(|| ApiError::new(401, "bearer authentication required"))
+    {
+      return Ok(machine);
+    }
+    if let Ok(token) = std::str::from_utf8(supplied)
+      && expri_core::service_auth::validate_cli_token(token).is_ok()
+      && self.sites.iter().any(|site| !site.preview)
+    {
+      let site = cli_auth::primary_site(self, request)?;
+      let epoch = site.auth.cli_credential_epoch(&self.owner);
+      let digest = cli_auth::token_digest(token);
+      if store.accepts_cli_credential(&digest, &epoch, cli_auth::now_ms())? {
+        return Ok(Role::IssuedOwner { digest });
+      }
+    }
+    Err(ApiError::new(401, "bearer authentication required"))
   }
 }
 
@@ -276,7 +299,7 @@ fn authorize_role<S: ObjectStorage>(
   request: &Request,
 ) -> ApiResult<()> {
   let machine = match role {
-    Role::Owner => return authorize(store, None, request),
+    Role::Owner | Role::IssuedOwner { .. } => return authorize(store, None, request),
     Role::Worker(worker) => return authorize(store, Some(worker), request),
     Role::Machine(machine) => machine,
   };
@@ -430,6 +453,14 @@ pub fn serve(
     storage.create_bucket()?;
   }
   let store = Store::open(&data_dir, storage)?;
+  let epoch = auth
+    .sites
+    .iter()
+    .find(|site| !site.preview)
+    .map(|site| site.auth.cli_credential_epoch(&auth.owner));
+  store
+    .set_cli_credential_epoch(epoch.as_ref())
+    .map_err(|_| ExpriError::Message("cannot activate CLI credential binding".into()))?;
   let dashboard = if auth.sites.is_empty() {
     None
   } else {
@@ -640,6 +671,9 @@ fn dispatch<S: ObjectStorage>(
   dashboard: Option<&HostedDashboard<'_, S>>,
   request: HttpRequest<Vec<u8>>,
 ) -> HttpResponse<Vec<u8>> {
+  if matches!(request.uri().path(), "/v1/login" | "/v1/logout") {
+    return cli_auth::handle(store, auth, &request);
+  }
   if !auth.sites.is_empty() && !matches!(request.uri().path(), "/health" | "/v1/request") {
     return match auth.site(&request) {
       Ok(Some(site)) => super::browser::handle(
@@ -687,7 +721,7 @@ fn route<S: ObjectStorage>(
   if request.method() != "POST" {
     return Err(ApiError::new(405, "service requests require POST"));
   }
-  let role = auth.role(&request)?;
+  let role = auth.role(store, &request)?;
   let mut content_types = request.headers().get_all("content-type").iter();
   if !content_types
     .next()
@@ -776,6 +810,14 @@ fn read_request(stream: &mut TcpStream) -> ApiResult<HttpRequest<Vec<u8>>> {
   };
   if body_length > types::MAX_REQUEST {
     return Err(ApiError::new(413, "request body exceeds 1 MiB"));
+  }
+  if matches!(request.uri().path(), "/v1/login" | "/v1/logout")
+    && body_length > expri_core::service_auth::MAX_AUTH_REQUEST_BYTES
+  {
+    return Err(ApiError::new(
+      413,
+      "CLI authentication request exceeds its size limit",
+    ));
   }
   let mut body = bytes.split_off(header_length);
   if body.len() > body_length {
@@ -959,6 +1001,7 @@ mod tests {
       owner: b"owner-token-with-at-least-24-characters".to_vec(),
       sites: Vec::new(),
       machines: Vec::new(),
+      login_limiter: cli_auth::LoginLimiter::default(),
       workers: vec![(
         b"worker-token-with-at-least-24-characters".to_vec(),
         WorkerAuth {

@@ -390,7 +390,7 @@ fn missing_global_settings_give_setup_guidance_and_explicit_config_bypasses_bad_
     .output()
     .unwrap();
   assert!(!missing.status.success());
-  assert!(String::from_utf8_lossy(&missing.stderr).contains("config server set"));
+  assert!(String::from_utf8_lossy(&missing.stderr).contains("expri login --url"));
   assert!(!root.exists());
   std::fs::create_dir(&root).unwrap();
   std::fs::write(root.join("config.toml"), "[server]\ntoken='must-not-leak\n").unwrap();

@@ -93,6 +93,14 @@ location = /v1/request {
   return 404;
 }
 
+location = /v1/login {
+  return 404;
+}
+
+location = /v1/logout {
+  return 404;
+}
+
 location = /login {
   limit_req zone=expri_login burst=5 nodelay;
   limit_req_status 429;
@@ -105,7 +113,10 @@ location / {
 ```
 
 The application also denies CLI requests addressed to a configured preview host.
-Workers and uploaders continue using the main service URL.
+Workers and uploaders continue using the main service URL. CLI login and logout
+also use the main URL. Forward `/v1/login` and `/v1/logout` on the main vhost,
+preserving `Host`, `Content-Type`, and `Authorization`; include `/v1/login` in
+its password-attempt rate limit.
 
 ## Release and recovery
 

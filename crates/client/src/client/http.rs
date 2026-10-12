@@ -14,7 +14,7 @@ fn init_tls() {
   let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn resolve_token(
+pub(super) fn resolve_token(
   config: ClientConfig,
   read_env: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
 ) -> Result<String> {

@@ -8,7 +8,8 @@ use expri_core::storage::StoragePaths;
 
 use crate::error::{ExpriError, Result};
 
-const NO_SERVER: &str = "no server configured; run expri config server set --url URL --token-stdin, or pass --config PATH";
+const NO_SERVER: &str = "no server configured; run expri login --url URL, or pass --config PATH";
+const NO_CREDENTIAL: &str = "no API credential configured; run expri login";
 
 /// Load either a global `[server]` table or a legacy flat client file.
 /// Environment credentials are validated by name but are not resolved here.
@@ -22,7 +23,11 @@ pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
       let global: GlobalConfig =
         toml::from_str(&text).map_err(|_| message("global expri configuration is invalid"))?;
       global.validate()?;
-      global.server.ok_or_else(|| message(NO_SERVER))?
+      let server = global.server.ok_or_else(|| message(NO_SERVER))?;
+      if server.token.is_none() && server.token_env.is_none() {
+        return Err(message(NO_CREDENTIAL));
+      }
+      server
     } else {
       toml::from_str(&text).map_err(|_| message("service client configuration is invalid"))?
     };
@@ -48,8 +53,9 @@ fn resolve_default_client_config(paths: &StoragePaths) -> Result<PathBuf> {
   };
   let config = GlobalConfig::load(&path)?;
   paths.validate_existing()?;
-  if config.server.is_none() {
-    return Err(message(NO_SERVER));
+  let server = config.server.ok_or_else(|| message(NO_SERVER))?;
+  if server.token.is_none() && server.token_env.is_none() {
+    return Err(message(NO_CREDENTIAL));
   }
   Ok(path)
 }
@@ -118,6 +124,35 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("file is missing")
+    );
+  }
+
+  #[test]
+  fn global_url_only_configuration_requires_login_without_changing_the_file() {
+    let directory = directory();
+    let root = directory.path().canonicalize().unwrap();
+    let config = root.join("config.toml");
+    let contents = "[server]\nurl='https://example.net'\n[system_profile]\ninterval_seconds=20\n";
+    fs::write(&config, contents).unwrap();
+    assert_eq!(
+      load_client_config(&config).unwrap_err().to_string(),
+      NO_CREDENTIAL
+    );
+    let paths = StoragePaths::from_root(root.clone()).unwrap();
+    assert_eq!(
+      resolve_default_client_config(&paths)
+        .unwrap_err()
+        .to_string(),
+      NO_CREDENTIAL
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), contents);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    fs::write(&config, "url='https://example.net'\n").unwrap();
+    assert!(
+      load_client_config(&config)
+        .unwrap_err()
+        .to_string()
+        .contains("exactly one")
     );
   }
 

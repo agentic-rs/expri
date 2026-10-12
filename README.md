@@ -28,10 +28,11 @@ expri skill
 expri skill run
 expri skill assets
 expri skill query
+expri skill login
 expri skill --help
 ```
 
-Topics cover configuration, source pushing, task launch, run inspection,
+Topics cover configuration, server login, source pushing, task launch, run inspection,
 metrics, artifacts, assets, environments, server queries, service publishing/fetching,
 and machine system profiles.
 The Markdown is embedded in the CLI, works offline without project
@@ -657,19 +658,31 @@ for configuration and server management commands.
 The local dashboard remains available for offline review after downloading
 results.
 
-Configure this machine's default server in `~/.tokn/expri/config.toml`:
+Sign in with the primary dashboard password to save this machine's server connection:
 
-```toml
-[server]
-url = "https://expri.example.net"
-token = "your-server-token"
+```sh
+expri login --url https://expri.example.net
+expri config server show
 ```
 
-Use `expri config server set --url URL --token-stdin` to store a token supplied
-through a pipe or redirected file, and `expri config server show` to inspect the connection with the
-token hidden. The setup command writes private files and preserves existing
-system-profile settings. Query and service client commands use this global connection;
-`--config PATH` selects an explicit override.
+The interactive password prompt is hidden. Login exchanges the password for a
+separate API token with unrestricted server access and saves it privately in `[server]` in
+`~/.tokn/expri/config.toml`; it never stores the password or prints the token.
+Use `--password-stdin` for a pipe or redirected password file. Later `expri login`
+uses the saved URL. Query and service client commands use this connection by
+default; `--config PATH` selects an explicit override.
+
+Issued tokens have no expiry and survive service restarts. `expri logout`
+revokes the current issued token and clears its local credential while keeping
+the URL and project selection. Changing the dashboard password, unrestricted
+server API token, or primary dashboard authority invalidates issued tokens after
+restarting the service. Upgrade the server to enable CLI login and logout.
+
+Existing manual tokens and `token_env` client files remain supported. Use
+`expri config server set --url URL --token-stdin` to store a supplied token;
+`expri config server show` hides it. Connection updates preserve system-profile
+settings. Read [login and configuration](docs/self-hosted-service.md#configure-the-clis-server-connection)
+or `expri skill login` for details.
 
 Browse published records without a project checkout:
 

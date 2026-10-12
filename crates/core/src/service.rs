@@ -42,8 +42,8 @@ impl std::fmt::Debug for ClientConfig {
 }
 
 impl ClientConfig {
-  /// Validate syntax without resolving credentials or contacting the server.
-  pub fn validate(&self) -> crate::error::Result<()> {
+  /// Validate the connection URL independently of any saved credential.
+  pub fn validate_url(&self) -> crate::error::Result<()> {
     use crate::error::ExpriError;
 
     let invalid = |message: &str| ExpriError::Message(message.into());
@@ -59,6 +59,15 @@ impl ClientConfig {
         "service URL must be HTTP(S) without embedded credentials, query or fragment",
       ));
     }
+    Ok(())
+  }
+
+  /// Validate syntax without resolving credentials or contacting the server.
+  pub fn validate(&self) -> crate::error::Result<()> {
+    use crate::error::ExpriError;
+
+    self.validate_url()?;
+    let invalid = |message: &str| ExpriError::Message(message.into());
     match (&self.token, &self.token_env) {
       (Some(token), None) => {
         validate_client_token(token)?;
@@ -581,6 +590,22 @@ mod tests {
       client_config(Some("!#$%&()*+,-./:;<=>?@[\\]^_`{|}~"), None)
         .validate()
         .is_ok()
+    );
+  }
+
+  #[test]
+  fn connection_url_validation_does_not_imply_authenticated_client_configuration() {
+    let mut config = client_config(None, None);
+    config.validate_url().unwrap();
+    assert!(config.validate().is_err());
+    config.url = "https://must-not-leak@host".into();
+    assert!(config.validate_url().is_err());
+    assert!(
+      !config
+        .validate_url()
+        .unwrap_err()
+        .to_string()
+        .contains("must-not-leak")
     );
   }
 

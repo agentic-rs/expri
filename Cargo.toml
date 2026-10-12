@@ -33,6 +33,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 form_urlencoded = "1.2.2"
 globset = "0.4.18"
 http = "1.5.0"
+hmac = "0.13.0"
 httparse = "1.10.1"
 libc = "0.2.186"
 quick-xml = { version = "0.38.3", features = ["serialize", "overlapped-lists"] }
@@ -40,6 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rusqlite = { version = "0.37", features = ["bundled"] }
 rust-s3 = { version = "=0.37.2", default-features = false, features = ["sync-rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rpassword = "7.5.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 sha2 = "0.11.0"
@@ -72,6 +74,7 @@ expri-worker.workspace = true
 expri-dashboard.workspace = true
 expri-server.workspace = true
 expri-system = { workspace = true, features = ["collector"] }
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

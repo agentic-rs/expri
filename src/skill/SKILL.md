@@ -13,6 +13,7 @@ prints an embedded Markdown guide and works without project configuration.
 
 | Command | Read when you need to |
 | --- | --- |
+| `expri skill login` | Authenticate to the server and revoke an issued CLI token |
 | `expri skill config` | Configure the global server, define tasks, or select a target |
 | `expri skill push` | Transfer source and config to a worker |
 | `expri skill run` | Launch a task, including a detached experiment |

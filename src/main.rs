@@ -7,6 +7,8 @@ mod controller;
 mod dashboard;
 mod environment;
 mod fetch_cli;
+mod global_config;
+mod login_cli;
 mod metrics_cli;
 mod node;
 mod push_cli;
@@ -58,6 +60,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+  /// Log in using the dashboard password and save an issued API token globally.
+  Login(login_cli::LoginCommand),
+  /// Revoke the saved CLI credential, keeping the server URL for the next login.
+  Logout(login_cli::LogoutCommand),
   /// Configure machine-wide expri settings and the default server connection.
   Config(config_cli::ConfigCommand),
   /// Query published runs and files using the configured server connection.
@@ -263,6 +269,8 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
+    Command::Login(command) => login_cli::run_login(command, cli.target.as_deref()),
+    Command::Logout(command) => login_cli::run_logout(command, cli.target.as_deref()),
     Command::Config(command) => config_cli::run(command, cli.target.as_deref()),
     Command::Query(command) => query_cli::run(command, cli.target.as_deref()),
     Command::Skill(command) => skill_cli::run(command),

@@ -52,7 +52,8 @@ prefix = "expri"
 Provide distinct random bearer tokens of at least 24 printable characters using
 the named environment variables. Each worker token is restricted to its project
 and origin; workers can download that project's inputs but cannot publish inputs.
-Only the owner token has unrestricted access.
+The configured owner token and separately issued CLI login credentials have
+unrestricted API access. Worker and machine credentials retain their bound scopes.
 
 Provide S3 credentials to the service through `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`. Workers and laptops
@@ -179,11 +180,13 @@ A recovery export is visibly marked as a partial result.
 
 The primary dashboard allows archiving and restoring finished runs. Project
 deletion requires explicit configuration. Preview dashboards remain read-only.
+CLI login credentials have unrestricted API authority, including project deletion;
+`dashboard.allow_project_deletion` governs the browser controls.
 Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
 Logout revokes the session. Restart the service after changing its password;
 restarts invalidate existing sessions. The CLI continues to use its existing
-bearer authentication.
+bearer authentication, including separately issued CLI login tokens.
 
 Keep the backend on loopback behind HTTPS. The reverse proxy must preserve the
 browser's `Host`, `Origin`, `Cookie`, and `Sec-Fetch-Site` headers. Keep the
@@ -192,7 +195,7 @@ native login/logout forms send `Origin: null`, which the service rejects.
 If forwarding an explicit header list, also retain `Authorization` and
 `Content-Type` for CLI requests. Buffer request bodies, use HTTP/1.0 upstream,
 and strip `Expect` so the service receives fixed-length requests. Configure per-client rate limiting
-for `/login`; a limit of ten requests per minute with a small burst is suitable
+for `/login` and `/v1/login`; a limit of ten requests per minute with a small burst is suitable
 for this single-user setup. Do not cache authenticated responses or log request
 bodies, credentials, or signed S3 URL queries.
 
@@ -446,7 +449,56 @@ Reports are bounded and watch summaries stay compact.
 
 ## Configure the CLI's server connection
 
-Store this machine's default connection in `~/.tokn/expri/config.toml`:
+Authenticate using the password for the primary hosted dashboard:
+
+```sh
+expri login --url https://expri.example.net
+expri config server show
+```
+
+The interactive prompt hides the password. For automation, supply one password
+line through a pipe or redirected file with `--password-stdin`:
+
+```sh
+printf '%s' "$EXPRI_DASHBOARD_PASSWORD" | expri login --url https://expri.example.net --password-stdin
+```
+
+Login exchanges that password for an independently issued API token with
+unrestricted server access. The password is never saved. The token is stored in
+`[server]` in `~/.tokn/expri/config.toml`, with a private directory and a
+`0600` configuration file on Unix; command output and `config server show` hide it. Updates
+are atomic and preserve system-profile settings. A concurrent connection change
+during authentication prevents login from overwriting the newer selection. If
+login reports that the token was saved but durability could not be confirmed,
+inspect `expri config server show` before retrying; the saved token is not revoked.
+
+Once a URL is saved, `expri login` defaults to it. Login and logout run on the
+current machine and accept `--storage-dir`; `EXPRI_STORAGE_DIR` also selects the
+global root. `expri logout` revokes the current issued credential and clears its
+saved token while retaining the URL and project selection for the next login.
+Other clients' issued tokens and browser sessions remain active.
+
+Issued API tokens have no expiry and survive server restarts. Restart the service
+after rotating the dashboard password, unrestricted API token, or primary
+dashboard authority; this invalidates previously issued credentials. Disabling
+the primary dashboard at startup also revokes them. Restoring an older password
+or API secret does not resurrect invalidated tokens. An already
+rejected or revoked credential can be cleared by logout with a warning. If
+revocation cannot be confirmed because of another server or transport error,
+logout keeps the saved credential for retry. Static server/worker tokens cannot
+be revoked through logout; use `expri config server unset` to remove a manually
+configured connection locally.
+
+Upgrade the server to enable `POST /v1/login` and `POST /v1/logout`. The primary
+configured dashboard host accepts these endpoints; preview and unknown hosts do
+not. The reverse proxy must forward these paths and preserve `Host`,
+`Content-Type`, and `Authorization` for logout. Login does not use browser
+cookies. The server allows ten login attempts per minute and at most 256 active
+issued credentials; reaching the limit rejects a new login without evicting
+other clients. Revoke unused credentials before creating more.
+
+Manual API tokens and existing environment-based client files remain supported.
+A manually configured global connection looks like:
 
 ```toml
 [server]
@@ -454,26 +506,21 @@ url = "https://expri.example.net"
 token = "your-server-token"
 ```
 
-Configure it with the token supplied through a pipe or redirected file. For
-example, use a shell variable containing the token for this setup command:
-
-```sh
-printf '%s' "$EXPRI_TOKEN" | expri config server set --url https://expri.example.net --token-stdin
-expri config server show
-```
-
-The setup command writes private directories and a `0600` configuration file,
-updates it atomically, and preserves system-profile settings. Its output and
-`show` hide the token. `expri config server unset` removes only this connection.
-`EXPRI_STORAGE_DIR` selects another global storage directory; config commands
-also accept `--storage-dir`. Inspection of missing configuration creates no files.
+Use `expri config server set --url URL --token-stdin` with a supplied token
+through a pipe or redirected file. `expri config server unset` removes only the
+connection and preserves system settings; it does not revoke a remote token.
+`config server show` reports a retained URL without credentials using
+`token_configured: false` and `token_source: null`. Inspection of missing
+configuration creates no files.
 
 Query and service client commands use this connection by default. `--config PATH`
 overrides it with another global config or a standalone client file containing
-`url` and exactly one of `token` or `token_env`. Existing environment-based client
-files continue to work. The server determines permissions from the token.
-`service serve --config` still selects the server daemon's configuration.
-Remote run publishing keeps its explicit worker-local client path.
+`url` and exactly one of `token` or `token_env`. A global `[server]` may retain
+only a URL after logout; authenticate again before issuing client requests.
+The server determines permissions from the token. `service serve --config`
+still selects the server daemon's configuration. Remote run publishing keeps
+its explicit worker-local client path. Read `expri skill login` for the agent
+workflow.
 
 ## Browse published runs and files
 

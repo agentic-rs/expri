@@ -4,7 +4,13 @@ Use an existing expri service to publish run metadata, metrics, logs, and select
 finalized checkpoints, then fetch them onto the reviewing machine. Worker
 publishing credentials and laptop fetching credentials are separate.
 
-Query and service client commands default to `[server]` in `~/.tokn/expri/config.toml`:
+Use `expri login --url URL` with the primary dashboard password to configure
+this machine's server connection. Its prompt is hidden; it saves a separately
+issued API token, without saving the password. Read `expri skill login` for
+stdin input, logout, and token lifecycle.
+
+Query and service client commands default to `[server]` in
+`~/.tokn/expri/config.toml`. Existing manually supplied tokens remain supported:
 
 ```toml
 [server]
@@ -12,16 +18,17 @@ url = "https://expri.example.net"
 token = "your-server-token"
 ```
 
-Use `expri config server set --url URL --token-stdin` to store a token supplied
-through a pipe or redirected file. `expri config server show` hides the token; `unset` removes only
-the connection. Writes are private and atomic, preserving system-profile settings.
-`EXPRI_STORAGE_DIR` overrides the global storage root. Inspection creates no files.
+`expri config server set --url URL --token-stdin` stores a supplied token;
+`config server show` hides it. `unset` removes the local connection without
+revoking the token. Writes are private and atomic, preserving system-profile
+settings. `EXPRI_STORAGE_DIR` overrides the global storage root. Inspection
+creates no files.
 
-For query and service client commands, `--config` overrides the default with another global config
-or a standalone `url` plus `token`/`token_env` file. It selects a service connection
-rather than the project's `expri.toml`. `service serve --config` is server configuration.
-`service fetch --repo` selects the review checkout
-and defaults to the current directory; provide it when fetching from elsewhere.
+For query and service client commands, `--config` selects another global config
+or a standalone `url` plus `token`/`token_env` file. It selects a server connection
+rather than the project's `expri.toml`. `service serve --config` is server
+configuration. `service fetch --repo` selects the review checkout and defaults
+to the current directory; provide it when fetching from elsewhere.
 
 ## Configure the executing worker
 

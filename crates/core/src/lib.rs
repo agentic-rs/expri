@@ -7,6 +7,7 @@ pub mod identifiers;
 pub mod lock;
 pub mod protocol;
 pub mod service;
+pub mod service_auth;
 pub mod service_catalog;
 pub mod storage;
 pub mod system_profile;

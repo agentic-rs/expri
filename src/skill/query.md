@@ -6,8 +6,9 @@ checkout or SSH target and print bounded JSON pages. They read metadata, without
 downloading run files or filling the local review cache.
 
 The connection defaults to `[server]` in `~/.tokn/expri/config.toml`;
-`EXPRI_STORAGE_DIR` selects another global root. Read `expri skill config` for
-setup. `--config PATH` selects another global or standalone client file.
+`EXPRI_STORAGE_DIR` selects another global root. Use `expri login --url URL`
+with the primary dashboard password to configure it; read `expri skill login`
+for authentication and `expri skill config` for path rules. `--config PATH` selects another global or standalone client file.
 Credentials determine access: unrestricted credentials can query all scopes,
 worker tokens are bound to one project/origin, and machine-profile tokens cannot
 query runs. The server must advertise `service-catalog-v1`.

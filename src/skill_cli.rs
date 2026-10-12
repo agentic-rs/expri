@@ -16,6 +16,8 @@ pub struct SkillCommand {
 
 #[derive(Debug, Subcommand)]
 enum SkillTopic {
+  /// Authenticate to the server with its dashboard password and revoke CLI tokens.
+  Login,
   /// Select a repository, configure tasks, and choose local or remote execution.
   Config,
   /// Push source and configuration to a worker checkout.
@@ -43,6 +45,7 @@ enum SkillTopic {
 impl SkillTopic {
   fn content(&self) -> &'static str {
     match self {
+      Self::Login => include_str!("skill/login.md"),
       Self::Config => include_str!("skill/config.md"),
       Self::Push => include_str!("skill/push.md"),
       Self::Run => include_str!("skill/run.md"),

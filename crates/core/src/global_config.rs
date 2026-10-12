@@ -63,7 +63,11 @@ impl GlobalConfig {
   pub fn validate(&self) -> Result<()> {
     self.interval(None)?;
     if let Some(server) = &self.server {
-      server.validate()?;
+      if server.token.is_none() && server.token_env.is_none() {
+        server.validate_url()?;
+      } else {
+        server.validate()?;
+      }
     }
     if let Some(publish) = &self.system_profile.publish
       && !publish.client_config.is_absolute()
@@ -228,6 +232,30 @@ mod tests {
     roundtrip.validate().unwrap();
     assert_eq!(roundtrip.system_profile.interval_seconds, 30);
     assert!(!format!("{config:?}").contains("must-not-leak"));
+  }
+
+  #[test]
+  fn url_only_server_survives_logout_without_becoming_an_authenticated_client() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    fs::write(
+      &path,
+      "[server]\nurl='https://example.net'\n[system_profile]\ninterval_seconds=30\n",
+    )
+    .unwrap();
+    let config = GlobalConfig::load(&path).unwrap();
+    let server = config.server.as_ref().unwrap();
+    assert_eq!(server.url, "https://example.net");
+    assert!(server.token.is_none());
+    assert!(server.token_env.is_none());
+    assert!(server.validate().is_err());
+    config.validate().unwrap();
+    let restored: GlobalConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(restored.system_profile.interval_seconds, 30);
+    fs::write(&path, "[server]\nurl='https://must-not-leak@host'\n").unwrap();
+    let error = GlobalConfig::load(&path).unwrap_err();
+    assert!(!error.to_string().contains("must-not-leak"));
   }
 
   #[test]

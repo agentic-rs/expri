@@ -1,15 +1,14 @@
-use std::fs::File;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
-use expri_core::global_config::{GlobalConfig, MAX_CONFIG_BYTES};
-use expri_core::lock::{self, LockAttempt};
+use expri_core::global_config::GlobalConfig;
 use expri_core::service::ClientConfig;
-use expri_core::storage::{StoragePaths, ensure_private_file};
+use expri_core::storage::StoragePaths;
 use serde_json::{Value, json};
 
 use crate::error::{ExpriError, Result};
+use crate::global_config::{load, save_server};
 
 const TOKEN_LIMIT: usize = 4096;
 
@@ -58,7 +57,7 @@ pub fn run(command: ConfigCommand, target: Option<&str>) -> Result<()> {
   let ConfigSubcommand::Server { command } = command.command;
   let report = match command {
     ServerCommand::Show => {
-      let config = GlobalConfig::load(&config_path(&paths)?)?;
+      let config = load(&paths)?;
       report(&paths, &config)
     }
     ServerCommand::Set { url, token_stdin } => {
@@ -112,59 +111,6 @@ fn read_token(reader: impl Read) -> Result<String> {
   String::from_utf8(bytes).map_err(|_| message("server token must be UTF-8"))
 }
 
-fn config_path(paths: &StoragePaths) -> Result<PathBuf> {
-  // Resolve trusted aliases above the owned boundary without following a
-  // config-file symlink. Reads never initialize the directory or change modes.
-  if paths.root().exists() {
-    Ok(std::fs::canonicalize(paths.root())?.join("config.toml"))
-  } else {
-    Ok(paths.config_file())
-  }
-}
-
-fn save_server(paths: &StoragePaths, server: Option<ClientConfig>) -> Result<GlobalConfig> {
-  let existing = GlobalConfig::load(&config_path(paths)?)?;
-  if server.is_none() && existing.server.is_none() {
-    return Ok(existing);
-  }
-  paths.ensure_private()?;
-  let root = std::fs::canonicalize(paths.root())?;
-  let path = root.join("config.toml");
-  let lock_path = root.join("config.lock");
-  ensure_private_file(&lock_path)?;
-  let _lease = match lock::try_lock_file(&lock_path, false)? {
-    LockAttempt::Acquired(lease) => lease,
-    LockAttempt::Busy => return Err(message("global configuration is being updated; retry")),
-    LockAttempt::Missing => return Err(message("global configuration lock disappeared; retry")),
-  };
-  let mut config = GlobalConfig::load(&path)?;
-  config.server = server;
-  config.validate()?;
-  let encoded =
-    toml::to_string_pretty(&config).map_err(|_| message("cannot encode global configuration"))?;
-  if encoded.len() as u64 > MAX_CONFIG_BYTES {
-    return Err(message("global configuration exceeds 32 KiB"));
-  }
-  let mut temporary = tempfile::Builder::new()
-    .prefix(".config-")
-    .tempfile_in(&root)?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    temporary
-      .as_file()
-      .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-  }
-  temporary.write_all(encoded.as_bytes())?;
-  temporary.as_file().sync_all()?;
-  // Refuse a symlink or a non-regular destination introduced during the write.
-  GlobalConfig::load(&path)?;
-  temporary.persist(&path).map_err(|error| error.error)?;
-  #[cfg(unix)]
-  File::open(&root)?.sync_all()?;
-  Ok(config)
-}
-
 fn report(paths: &StoragePaths, config: &GlobalConfig) -> Value {
   json!({
     "config_file": paths.config_file(),
@@ -172,7 +118,13 @@ fn report(paths: &StoragePaths, config: &GlobalConfig) -> Value {
     "server": config.server.as_ref().map(|server| json!({
       "url": server.url,
       "token_configured": server.token.is_some() || server.token_env.is_some(),
-      "token_source": if server.token.is_some() { "config" } else { "environment" },
+      "token_source": if server.token.is_some() {
+        Some("config")
+      } else if server.token_env.is_some() {
+        Some("environment")
+      } else {
+        None
+      },
       "token_env": server.token_env,
     })),
   })
@@ -267,5 +219,25 @@ mod tests {
       StoragePaths::from_root(directory.path().canonicalize().unwrap().join("absent")).unwrap();
     assert!(save_server(&paths, None).unwrap().server.is_none());
     assert!(!paths.root().exists());
+  }
+
+  #[test]
+  fn url_only_connection_reports_no_credential_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::from_root(directory.path().canonicalize().unwrap()).unwrap();
+    let config = GlobalConfig {
+      server: Some(ClientConfig {
+        url: "https://expri.example.net".into(),
+        token: None,
+        token_env: None,
+        project_id: Some("vision".into()),
+      }),
+      ..GlobalConfig::default()
+    };
+    let output = report(&paths, &config);
+    assert_eq!(output["configured"], true);
+    assert_eq!(output["server"]["token_configured"], false);
+    assert!(output["server"]["token_source"].is_null());
+    assert!(output["server"]["token_env"].is_null());
   }
 }

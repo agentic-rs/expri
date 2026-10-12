@@ -14,6 +14,7 @@ mod archive;
 mod asset_imports;
 mod catalog_files;
 mod catalog_runs;
+mod cli_credentials;
 mod dashboard_storage;
 mod projects;
 mod references;
@@ -201,6 +202,7 @@ impl<S: ObjectStorage> Store<S> {
     run_retention::initialize(&connection)?;
     expri_system::store::initialize(&connection)?;
     asset_imports::initialize(&directory, &connection)?;
+    cli_credentials::initialize(&connection)?;
     // Older binaries must not drop captured provenance, annotations, or deletion fences.
     connection
       .pragma_update(None, "user_version", METADATA_SCHEMA_VERSION)

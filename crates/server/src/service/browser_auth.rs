@@ -3,8 +3,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use hmac::{Hmac, KeyInit, Mac};
 use http::Request as HttpRequest;
 use reqwest::Url;
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use super::store::{ApiError, ApiResult};
@@ -69,6 +71,24 @@ impl BrowserAuth {
     &self.host
   }
 
+  /// Check a CLI exchange without creating or inspecting browser sessions.
+  pub(super) fn verifies_credential(&self, supplied: &[u8]) -> bool {
+    bool::from(supplied.ct_eq(self.credential.as_slice()))
+  }
+
+  /// Bind issued credentials to the current password, API secret, and authority.
+  /// The stored binding cannot serve as an unpeppered human-password hash.
+  pub(super) fn cli_credential_epoch(&self, api_secret: &[u8]) -> [u8; 32] {
+    let mut binding = <Hmac<Sha256> as KeyInit>::new_from_slice(api_secret)
+      .expect("HMAC accepts arbitrary key lengths");
+    binding.update(b"expri-cli-credential-epoch-v1\0");
+    for field in [self.host.as_bytes(), self.credential.as_slice()] {
+      binding.update(&(field.len() as u64).to_be_bytes());
+      binding.update(field);
+    }
+    binding.finalize().into_bytes().into()
+  }
+
   /// Use the configured public authority rather than trusting forwarded headers.
   /// The reverse proxy must preserve the browser's Host and Origin headers.
   pub fn check_boundary<T>(&self, request: &HttpRequest<T>, require_origin: bool) -> ApiResult<()> {
@@ -111,7 +131,7 @@ impl BrowserAuth {
   pub fn reauthenticate<T>(&self, request: &HttpRequest<T>, supplied: &[u8]) -> ApiResult<()> {
     self.check_boundary(request, true)?;
     self.authorized_session(request)?;
-    if !bool::from(supplied.ct_eq(self.credential.as_slice())) {
+    if !self.verifies_credential(supplied) {
       return Err(ApiError::new(403, "dashboard password is incorrect"));
     }
     Ok(())
@@ -139,7 +159,7 @@ impl BrowserAuth {
   pub fn login<T>(&self, request: &HttpRequest<T>, supplied: &[u8]) -> ApiResult<String> {
     self.check_boundary(request, true)?;
     let previous = session_cookie(request)?;
-    if !bool::from(supplied.ct_eq(self.credential.as_slice())) {
+    if !self.verifies_credential(supplied) {
       return Err(ApiError::new(401, "dashboard credential is incorrect"));
     }
     let id = new_session_id()?;
