@@ -314,6 +314,34 @@ fn record_from_state(run_id: &str, state: Option<Value>) -> Record {
         );
         return;
       }
+      if let Some(machine_id) = object.get("machine_id").filter(|value| !value.is_null()) {
+        if let Some(machine_id) = machine_id
+          .as_str()
+          .filter(|value| expri_core::identifiers::validate_component(value).is_ok())
+        {
+          summary["machine_id"] = json!(machine_id);
+        } else {
+          field_warning(&mut warnings, run_id, "machine_id");
+        }
+      }
+      for field in [
+        "system_capture_id",
+        "system_capture_status",
+        "system_capture_error",
+      ] {
+        if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
+          let valid = value.as_str().is_some_and(|value| match field {
+            "system_capture_id" => expri_core::identifiers::validate_component(value).is_ok(),
+            "system_capture_status" => matches!(value, "capturing" | "complete" | "incomplete"),
+            _ => value.len() <= 1024 && !value.chars().any(char::is_control),
+          });
+          if valid {
+            summary[field] = value.clone();
+          } else {
+            field_warning(&mut warnings, run_id, field);
+          }
+        }
+      }
       if let Some(task) = object
         .get("task")
         .and_then(Value::as_str)

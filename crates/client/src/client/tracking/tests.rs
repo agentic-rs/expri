@@ -2,6 +2,367 @@ use super::*;
 
 use super::super::download::mock;
 
+#[test]
+fn system_stream_capability_is_negotiated_and_saved_separately() {
+  for supported in [false, true] {
+    let (url, task) = mock::mock(1, move |request, _| {
+      assert!(matches!(
+        serde_json::from_slice::<Request>(&request.body).unwrap(),
+        Request::Capabilities
+      ));
+      let mut features = vec!["tracking-v1".into()];
+      if supported {
+        features.push(expri_core::run_system::RUN_SYSTEM_CAPABILITY.into());
+      }
+      (
+        200,
+        Vec::new(),
+        serde_json::to_vec(&Response::Capabilities { features }).unwrap(),
+      )
+    });
+    let (root, api, scope) = fixture(&url);
+    let directory = root.path().join("queue");
+    let owner = json!({"endpoint": api.endpoint, "scope": scope});
+    let mut queue = Queue::new(directory.clone(), owner.clone()).unwrap();
+    assert_eq!(negotiate(&api, &mut queue).unwrap(), Protocol::TrackingV1);
+    assert_eq!(system_supported(&api, &mut queue).unwrap(), supported);
+    drop(queue);
+    let mut queue = Queue::new(directory, owner).unwrap();
+    assert_eq!(system_supported(&api, &mut queue).unwrap(), supported);
+    task.join().unwrap();
+  }
+}
+
+#[test]
+fn capture_upload_excludes_uncheckpointed_tail_across_recovery() {
+  let committed = b"{\"kind\":\"sample\"}\n";
+  let expected = committed.to_vec();
+  let (url, task) = mock::mock(1, move |request, _| {
+    let Request::AppendTracking {
+      path,
+      offset,
+      data_base64,
+      ..
+    } = serde_json::from_slice(&request.body).unwrap()
+    else {
+      panic!("tracking capture expected")
+    };
+    assert_eq!(path, RUN_SYSTEM_PATH);
+    assert_eq!(offset, 0);
+    assert_eq!(STANDARD.decode(data_base64).unwrap(), expected);
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::Acknowledged {
+        offset: committed.len() as u64,
+      })
+      .unwrap(),
+    )
+  });
+  let (root, api, scope) = fixture(&url);
+  let source = root.path().join("capture.jsonl");
+  std::fs::write(
+    &source,
+    [committed.as_slice(), b"uncommitted complete line\n"].concat(),
+  )
+  .unwrap();
+  let directory = root.path().join("queue");
+  let owner = json!({"endpoint": api.endpoint, "scope": scope});
+  let mut queue = Queue::new(directory.clone(), owner.clone()).unwrap();
+  queue.state.protocol = Some(Protocol::TrackingV1);
+  upload::sync_stream_up_to(
+    &api,
+    &mut queue,
+    &scope,
+    RUN_SYSTEM_PATH,
+    &source,
+    false,
+    Some(committed.len() as u64),
+  )
+  .unwrap();
+  drop(queue);
+  // Recovery discards the tail that was never durably checkpointed.
+  std::fs::write(&source, committed).unwrap();
+  let mut queue = Queue::new(directory, owner).unwrap();
+  upload::sync_stream_up_to(
+    &api,
+    &mut queue,
+    &scope,
+    RUN_SYSTEM_PATH,
+    &source,
+    false,
+    Some(committed.len() as u64),
+  )
+  .unwrap();
+  assert_eq!(queue.state.streams[RUN_SYSTEM_PATH], committed.len() as u64);
+  assert!(
+    upload::sync_stream_up_to(
+      &api,
+      &mut queue,
+      &scope,
+      RUN_SYSTEM_PATH,
+      &source,
+      false,
+      Some(committed.len() as u64 + 1)
+    )
+    .is_err()
+  );
+  task.join().unwrap();
+}
+
+#[test]
+fn a_terminal_task_with_a_draining_capture_publishes_state_without_sealing() {
+  let (url, task) = mock::mock(4, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => Response::Capabilities {
+        features: vec!["tracking-v1".into()],
+      },
+      Request::PutDocument {
+        revision,
+        offset,
+        total_size,
+        ..
+      } => {
+        assert_eq!(offset, 0);
+        Response::DocumentAcknowledged {
+          revision,
+          offset: total_size,
+          complete: true,
+        }
+      }
+      other => panic!("draining capture must not seal or use an unsupported stream: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let (root, api, scope) = fixture(&url);
+  let run = root.path().join("run");
+  fs::directories(&run.join("outputs")).unwrap();
+  std::fs::write(run.join("snapshot.json"), b"{}").unwrap();
+  std::fs::write(run.join("run-state.json"), serde_json::to_vec(&json!({
+    "run_id": "run", "status": "completed", "started_at": "1970-01-01T00:00:00Z",
+    "machine_id": "machine-1", "system_capture_id": "capture-1", "system_capture_status": "capturing"
+  })).unwrap()).unwrap();
+  std::fs::write(run.join(RUN_SYSTEM_PATH), b"{\"kind\":\"capture\",\"schema_version\":1,\"capture_id\":\"capture-1\",\"machine_id\":\"machine-1\",\"start_ms\":0}\n").unwrap();
+  let mut queue = Queue::new(
+    root.path().join("queue"),
+    json!({"endpoint": api.endpoint, "scope": scope}),
+  )
+  .unwrap();
+  assert!(
+    !publish_cycle(
+      &api,
+      &mut queue,
+      &scope,
+      &run,
+      &BTreeSet::new(),
+      true,
+      &mut |_| Ok(())
+    )
+    .unwrap()
+  );
+  assert_eq!(system_upload_report(&queue)["status"], "unsupported");
+  assert!(queue.state.archive.is_none());
+  task.join().unwrap();
+}
+
+#[test]
+fn capture_identity_failure_keeps_logs_and_terminal_state_publication_alive() {
+  let (url, task) = mock::mock(5, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => Response::Capabilities {
+        features: vec![
+          "tracking-v1".into(),
+          expri_core::run_system::RUN_SYSTEM_CAPABILITY.into(),
+        ],
+      },
+      Request::PutDocument {
+        revision,
+        total_size,
+        ..
+      } => Response::DocumentAcknowledged {
+        revision,
+        offset: total_size,
+        complete: true,
+      },
+      Request::AppendTracking {
+        path,
+        offset,
+        data_base64,
+        ..
+      } => {
+        assert_eq!(path, "logs/stdout.log");
+        assert_eq!(offset, 0);
+        assert_eq!(STANDARD.decode(data_base64).unwrap(), b"task finished\n");
+        Response::Acknowledged { offset: 14 }
+      }
+      other => panic!("invalid capture cannot upload or seal: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let (root, api, scope) = fixture(&url);
+  let run = root.path().join("run");
+  fs::directories(&run.join("outputs")).unwrap();
+  fs::directories(&run.join("logs")).unwrap();
+  std::fs::write(run.join("snapshot.json"), b"{}").unwrap();
+  std::fs::write(run.join("logs/stdout.log"), b"task finished\n").unwrap();
+  std::fs::write(run.join("run-state.json"), serde_json::to_vec(&json!({
+    "run_id": "run", "status": "completed", "started_at": "1970-01-01T00:00:00Z",
+    "machine_id": "machine-1", "system_capture_id": "capture-1", "system_capture_status": "complete"
+  })).unwrap()).unwrap();
+  let unrelated = b"{\"kind\":\"capture\",\"schema_version\":1,\"capture_id\":\"capture-1\",\"machine_id\":\"machine-other\",\"start_ms\":0}\n";
+  std::fs::write(run.join(RUN_SYSTEM_PATH), unrelated).unwrap();
+  let mut queue = Queue::new(
+    root.path().join("queue"),
+    json!({"endpoint": api.endpoint, "scope": scope}),
+  )
+  .unwrap();
+  assert!(
+    publish_cycle(
+      &api,
+      &mut queue,
+      &scope,
+      &run,
+      &BTreeSet::new(),
+      true,
+      &mut |_| Ok(())
+    )
+    .is_err()
+  );
+  assert!(queue.state.documents["run-state.json"].complete);
+  assert_eq!(queue.state.streams["logs/stdout.log"], 14);
+  assert!(!queue.state.streams.contains_key(RUN_SYSTEM_PATH));
+  assert!(queue.state.archive.is_none());
+  assert_eq!(std::fs::read(run.join(RUN_SYSTEM_PATH)).unwrap(), unrelated);
+  task.join().unwrap();
+}
+
+#[test]
+fn unrelated_output_named_like_a_capture_is_not_automatically_uploaded() {
+  let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+  fs::directories(&root.path().join("outputs")).unwrap();
+  std::fs::write(root.path().join(RUN_SYSTEM_PATH), b"user data").unwrap();
+  assert!(!system_capture_owned(root.path(), &json!({"run_id": "run"})).unwrap());
+}
+
+#[test]
+fn a_legacy_queue_reports_retained_local_even_after_the_service_upgrades() {
+  let (root, api, scope) = fixture("http://127.0.0.1:1");
+  let mut queue = Queue::new(
+    root.path().join("queue"),
+    json!({"endpoint": api.endpoint, "scope": scope}),
+  )
+  .unwrap();
+  queue.state.protocol = Some(Protocol::Legacy);
+  queue.state.run_system_supported = Some(true);
+  queue.state.run_system_capture = true;
+  let report = system_upload_report(&queue);
+  assert_eq!(report["status"], "unsupported");
+  assert_eq!(report["retained_local"], true);
+  assert!(
+    report["message"]
+      .as_str()
+      .unwrap()
+      .contains("legacy publishing queue")
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn supported_capture_is_published_at_its_checkpoint_and_included_in_final_seal() {
+  use std::os::unix::fs::MetadataExt;
+  let bytes = b"{\"kind\":\"capture\",\"schema_version\":1,\"capture_id\":\"capture-1\",\"machine_id\":\"machine-1\",\"start_ms\":0}\n{\"kind\":\"end\",\"end_ms\":1000,\"complete\":true,\"warnings\":[]}\n";
+  let (url, task) = mock::mock(6, move |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => Response::Capabilities {
+        features: vec![
+          "tracking-v1".into(),
+          expri_core::run_system::RUN_SYSTEM_CAPABILITY.into(),
+        ],
+      },
+      Request::PutDocument {
+        revision,
+        offset,
+        total_size,
+        ..
+      } => {
+        assert_eq!(offset, 0);
+        Response::DocumentAcknowledged {
+          revision,
+          offset: total_size,
+          complete: true,
+        }
+      }
+      Request::AppendTracking {
+        path,
+        offset,
+        data_base64,
+        ..
+      } => {
+        assert_eq!(path, RUN_SYSTEM_PATH);
+        assert_eq!(offset, 0);
+        assert_eq!(STANDARD.decode(data_base64).unwrap(), bytes);
+        Response::Acknowledged {
+          offset: bytes.len() as u64,
+        }
+      }
+      Request::SealRun {
+        streams,
+        incomplete,
+        ..
+      } => {
+        assert_eq!(
+          streams,
+          BTreeMap::from([(RUN_SYSTEM_PATH.into(), bytes.len() as u64)])
+        );
+        assert!(!incomplete);
+        Response::Archive {
+          archive: ArchiveRecord {
+            status: "pending".into(),
+            incomplete,
+            file: None,
+            last_error: None,
+          },
+        }
+      }
+      other => panic!("unexpected capture publication: {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let (root, api, scope) = fixture(&url);
+  let run = root.path().join("run");
+  fs::directories(&run.join("outputs")).unwrap();
+  std::fs::write(run.join("snapshot.json"), b"{}").unwrap();
+  std::fs::write(run.join("run-state.json"), serde_json::to_vec(&json!({
+    "schema_version": 1, "run_id": "run", "status": "completed", "started_at": "1970-01-01T00:00:00Z", "finished_at": "1970-01-01T00:00:01Z",
+    "machine_id": "machine-1", "system_capture_id": "capture-1", "system_capture_status": "complete"
+  })).unwrap()).unwrap();
+  std::fs::write(run.join(RUN_SYSTEM_PATH), bytes).unwrap();
+  let metadata = std::fs::metadata(run.join(RUN_SYSTEM_PATH)).unwrap();
+  std::fs::write(run.join(".system-profile-checkpoint.json"), serde_json::to_vec(&json!({
+    "capture_id": "capture-1", "file_identity": format!("{}:{}", metadata.dev(), metadata.ino()), "committed_bytes": bytes.len(), "closed": true
+  })).unwrap()).unwrap();
+  let mut queue = Queue::new(
+    root.path().join("queue"),
+    json!({"endpoint": api.endpoint, "scope": scope}),
+  )
+  .unwrap();
+  assert!(
+    publish_cycle(
+      &api,
+      &mut queue,
+      &scope,
+      &run,
+      &BTreeSet::new(),
+      true,
+      &mut |_| Ok(())
+    )
+    .unwrap()
+  );
+  assert_eq!(system_upload_report(&queue)["status"], "published");
+  assert_eq!(queue.state.streams[RUN_SYSTEM_PATH], bytes.len() as u64);
+  task.join().unwrap();
+}
+
 fn fixture(url: &str) -> (tempfile::TempDir, Api, RunScope) {
   let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
   let config = root.path().join("client.toml");

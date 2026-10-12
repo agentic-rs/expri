@@ -492,6 +492,7 @@ pub fn compact(connection: &mut Connection, now_ms: i64) -> Result<usize> {
 mod local;
 pub use local::{LocalStatus, LocalStore};
 mod quarantine;
+pub mod run_capture;
 
 #[cfg(test)]
 mod tests;

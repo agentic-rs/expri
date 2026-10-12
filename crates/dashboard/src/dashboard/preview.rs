@@ -16,6 +16,10 @@ pub fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
       "task_exit_code",
       "detached",
       "logging_error",
+      "machine_id",
+      "system_capture_id",
+      "system_capture_status",
+      "system_capture_error",
     ],
     truncated,
   );

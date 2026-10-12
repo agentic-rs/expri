@@ -38,6 +38,7 @@ import {
   type RunSort,
   type Source,
   type Updates,
+  type WorkspaceView,
 } from "./dashboard_model";
 import { canArchiveRun, canRestoreRun, runArchivalMatchesScope, runArchivalScope, runIsArchived, type ArchivalAction } from "./run_archival";
 import { normalizeRunAnnotations, runAnnotationsMatchesScope, runAnnotationsScope } from "./run_annotations";
@@ -51,6 +52,8 @@ import {
   type StorageKind,
 } from "./dashboard_storage";
 import { LiveUpdates, type LiveUpdatesState } from "./live_updates";
+import { SystemMonitor } from "./system_monitor";
+import { RunSystemMonitor, runSystemItem } from "./run_system";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import {
   DashboardView,
@@ -71,6 +74,8 @@ export * from "./live_updates";
 export * from "./run_archival";
 export * from "./run_annotations";
 export * from "./dashboard_theme";
+export * from "./system_monitor";
+export * from "./run_system";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -96,6 +101,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const archival_lane = new RequestLane(() => pending_deep_link);
   const annotations_lane = new RequestLane(() => pending_deep_link);
   const storage_lane = new RequestLane(() => pending_deep_link);
+  const system_lane = new RequestLane(() => pending_deep_link);
+  const run_system_lane = new RequestLane(() => pending_deep_link);
   const quiet_lanes = {
     updates: new RequestLane(() => pending_deep_link),
     catalog: new RequestLane(() => pending_deep_link),
@@ -106,6 +113,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     chart: new RequestLane(() => pending_deep_link),
     artifacts: new RequestLane(() => pending_deep_link),
     storage: new RequestLane(() => pending_deep_link),
+    system: new RequestLane(() => pending_deep_link),
+    run_system: new RequestLane(() => pending_deep_link),
   };
   const foreground_lanes = [
     catalog_lane,
@@ -120,6 +129,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     archival_lane,
     annotations_lane,
     storage_lane,
+    system_lane,
+    run_system_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
   let auto_refresh: AutoRefresh | null = null;
@@ -137,6 +148,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const chart_revisions = new Map<string, string>();
   const log_revisions = new Map<string, string | null>();
   const artifact_revisions = new Map<string, string>();
+  const run_system_revisions = new Map<string, string>();
+  const run_system_snapshots = new Map<string, number>();
   let comparison_revision: { context: string; revision: string } | null = null;
   let last_catalog: Catalog | null = null;
   let legacy_catalog: Catalog | null = null;
@@ -179,7 +192,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let rendered_comparison: Comparison | null = null;
   let artifacts: ArtifactCatalog | null = null;
   let artifacts_loaded = false;
-  let workspace_view: "workspace" | "storage" = "workspace";
+  let workspace_view: WorkspaceView = "workspace";
+  let run_system_supported = false;
+  let system_run_aligned = false;
   let storage_kind: StorageKind = "input";
   let storage_offset = 0;
   let storage_catalog: StorageCatalog | null = null;
@@ -251,6 +266,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     run_columns_supported: true,
     run_columns_warnings: [],
   };
+  const system_monitor = new SystemMonitor(system_lane, quiet_lanes.system, now, publish);
+  const run_system_monitor = new RunSystemMonitor(run_system_lane, quiet_lanes.run_system, publish);
   function snapshot(): DashboardSnapshot {
     const source = currentSource();
     return {
@@ -271,6 +288,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       artifacts,
       selected_files: [...selected_files],
       workspace_view,
+      system_monitor: system_monitor.snapshot(),
+      run_system: run_system_monitor.snapshot(),
+      run_system_supported,
+      system_run_aligned,
+      system_now: now(),
       storage_kind,
       storage_offset,
       storage_catalog,
@@ -407,7 +429,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       discardDeepLink();
       cancelRefresh();
       clearSelectionTimeout();
-      void openRun(id);
+      const aligned_system = workspace_view === "system" && system_run_aligned;
+      const system_tab = run_system_supported && (aligned_system || (workspace_view === "workspace" && review?.tab === "system"));
+      const return_to_runs = workspace_view !== "workspace" && !aligned_system;
+      void openRun(id, "inspection", undefined, system_tab ? "system" : "charts");
+      if (return_to_runs) actions.workspace_view("workspace");
     },
     clear_selection: () => {
       discardDeepLink();
@@ -489,13 +515,39 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (value === workspace_view ||
         (value === "storage" && currentSource()?.kind !== "hosted_project")) return;
       workspace_view = value;
-      if (value === "workspace") {
+      cancelQuietRefresh();
+      system_run_aligned = value === "system" && run_system_supported && review?.kind === "run";
+      syncRunSystemMode();
+      system_monitor.setActive(value === "system" && !system_run_aligned);
+      if (value !== "storage") {
         storage_lane.cancel();
         clearStorageSearchTimeout();
         ui.storage_loading = false;
       }
       publish();
       if (value === "storage") void loadStorage();
+    },
+    system_monitor: {
+      machine: (value) => { cancelQuietRefresh(); system_monitor.chooseMachine(value); },
+      period: (value) => { cancelQuietRefresh(); system_monitor.choosePeriod(value); },
+      resolution: (value) => { cancelQuietRefresh(); system_monitor.chooseResolution(value); },
+      metric: (name, checked) => system_monitor.chooseMetric(name, checked),
+      more_machines: () => { cancelQuietRefresh(); void system_monitor.moreMachines(); },
+      refresh: () => { cancelQuietRefresh(); void system_monitor.refresh(); },
+      time_zone: changeChartTimeZone,
+    },
+    run_system: {
+      axis: value => run_system_monitor.axis(value),
+      reduction: value => run_system_monitor.reduction(value),
+      metric: (name, checked) => run_system_monitor.metric(name, checked),
+      focus_run: id => { cancelQuietRefresh(); run_system_monitor.focusRun(id); },
+      refresh: () => { cancelQuietRefresh(); void run_system_monitor.refresh(); },
+      time_zone: changeChartTimeZone,
+    },
+    system_alignment: aligned => {
+      if (aligned === system_run_aligned || (aligned && (!run_system_supported || review?.kind !== "run"))) return;
+      cancelQuietRefresh(); system_run_aligned = aligned;
+      syncRunSystemMode(); system_monitor.setActive(workspace_view === "system" && !aligned); publish();
     },
     storage_kind: (value) => {
       if (storage_kind === value) return;
@@ -610,13 +662,19 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       active
         ? apiUrl("/api/events", {
             source: source_id,
-            run_id: workspace_view === "storage" ? [] : review?.run_ids ?? [],
+            run_id: workspace_view === "workspace" || (workspace_view === "system" && system_run_aligned) ? review?.run_ids ?? [] : [],
           })
         : null,
     );
   }
   function currentSource(): Source | undefined {
     return sources.find((source) => source.source_id === source_id);
+  }
+  function runSystemActive(): boolean {
+    return run_system_supported && !!review && ((workspace_view === "workspace" && review.tab === "system") || (workspace_view === "system" && system_run_aligned));
+  }
+  function syncRunSystemMode(): void {
+    run_system_monitor.setContext(source_id, review?.run_ids ?? [], runSystemActive());
   }
   function clearStorageSearchTimeout(): void {
     if (storage_search_timeout !== undefined) clearTimeout(storage_search_timeout);
@@ -632,7 +690,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     ui.storage_search = "";
     ui.storage_loading = false;
     ui.storage_error = null;
-    if (currentSource()?.kind !== "hosted_project") workspace_view = "workspace";
+    if (workspace_view === "storage" && currentSource()?.kind !== "hosted_project") workspace_view = "workspace";
   }
   async function loadStorage(): Promise<void> {
     const source = currentSource();
@@ -900,6 +958,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     updateUi({ refreshing: false });
   }
   function hideReview(): void {
+    system_run_aligned = false;
+    run_system_monitor.setContext(source_id, [], false);
+    run_system_revisions.clear();
+    run_system_snapshots.clear();
+    system_monitor.setActive(workspace_view === "system");
     resetArchivalAction();
     resetAnnotationsAction();
     clearSelectionTimeout();
@@ -956,6 +1019,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     kind: "run" | "compare",
     ids: string[],
     origin: Review["origin"] = "inspection",
+    tab: ReviewTab = "charts",
   ): void {
     resetArchivalAction();
     resetAnnotationsAction();
@@ -978,9 +1042,13 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       run_ids: ids,
       metric_names: [],
       metric_selection_set: false,
-      tab: "charts",
+      tab,
       log_stream: "stdout",
     };
+    system_run_aligned = workspace_view === "system" && tab === "system";
+    run_system_revisions.clear();
+    run_system_snapshots.clear();
+    syncRunSystemMode();
     metric_names = [];
     log_view = null;
     rendered_detail = null;
@@ -1000,13 +1068,19 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     });
   }
   function syncReviewTabs(): void {
+    syncRunSystemMode();
     publish();
   }
   function selectReviewTab(tab: ReviewTab): void {
-    if (!review || (review.kind === "compare" && tab !== "charts")) return;
+    if (!review || (tab === "system" && !run_system_supported) || (review.kind === "compare" && tab !== "charts" && tab !== "system")) return;
     cancelQuietRefresh();
     review.tab = tab;
+    if (tab === "system") { chart_lane.cancel(); compare_lane.cancel(); ui.chart_busy = false; ui.comparison_busy = false; }
     syncReviewTabs();
+    if (tab === "charts") {
+      if (review.kind === "compare" && !rendered_comparison) void loadComparison();
+      else if (!cached_chart || cached_chart.context !== chartUrl()) updateChart();
+    }
     if (tab === "files") ensureArtifacts();
     else {
       artifact_lane.cancel();
@@ -1199,8 +1273,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     };
     ensureLog();
     ensureArtifacts();
-    if (chart_context === null) updateChart();
-    else { alignChartContext(); chartControls(); }
+    if (review?.tab !== "system") {
+      if (chart_context === null) updateChart();
+      else { alignChartContext(); chartControls(); }
+    }
     return true;
   }
   function resetArchivalAction(): void {
@@ -1318,8 +1394,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     id: string,
     origin: Review["origin"] = "inspection",
     previous?: Review,
+    tab: ReviewTab = "charts",
   ): Promise<void> {
-    beginReview("run", [id], origin);
+    beginReview("run", [id], origin, tab);
     if (previous && review) {
       review.metric_names = [...previous.metric_names];
       review.metric_selection_set = previous.metric_selection_set;
@@ -1429,8 +1506,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       if (!renderComparison(result)) return false;
       updateUi({ comparison_busy: false });
       publish();
-      if (chart_context === null) updateChart();
-      else { alignChartContext(); chartControls(); }
+      if (review.tab !== "system") {
+        if (chart_context === null) updateChart();
+        else { alignChartContext(); chartControls(); }
+      }
       return true;
     } catch (error) {
       updateUi({ review_loading: false });
@@ -1499,6 +1578,12 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     return projects === null ? catalog : projects;
   }
   function applyCatalog(catalog: Catalog, quiet = false): void {
+    run_system_supported = catalog.capabilities?.includes("run-system-metrics-v1") === true;
+    if (!run_system_supported) {
+      system_run_aligned = false;
+      if (review?.tab === "system") review.tab = "charts";
+      system_monitor.setActive(workspace_view === "system");
+    }
     ui.run_management_enabled = catalog.access_mode === "hosted" && catalog.run_management_enabled === true;
     last_catalog_snapshot = now();
     if (quiet && JSON.stringify(last_catalog) === JSON.stringify(catalog)) return;
@@ -1538,6 +1623,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       catalog_warnings: catalog.warnings,
     });
     sourceNote();
+    syncRunSystemMode();
   }
   function emptyCatalog(): void {
     list_lane.cancel();
@@ -1688,6 +1774,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     cancelQuietRefresh();
     const generation = ++refresh_generation;
     updateUi({ refreshing: true, global_error: null });
+    let monitor_refresh = workspace_view === "system" && !system_run_aligned ? system_monitor.refresh() : null;
+    let mapped_refresh = runSystemActive() ? run_system_monitor.refresh() : null;
     let successful = false;
     try {
       const catalog = await loadCatalog(catalog_lane, true);
@@ -1707,20 +1795,16 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           if (current_review.kind === "run") {
             const id = current_review.run_ids[0];
             if (id && !(await loadRun(id, true))) return;
-          } else if (!(await loadComparison())) return;
+          } else if (current_review.tab !== "system" && !(await loadComparison())) return;
           if (generation !== refresh_generation || current_review !== review) return;
-          if (
+          if (current_review.tab !== "system" && (
             !(await refreshCurrentLog(log_lane)) ||
             !(await refreshCurrentArtifacts(artifact_lane)) ||
             (await refreshCurrentChart(chart_lane)) !== "applied"
-          )
+          ))
             return;
         }
         successful = generation === refresh_generation;
-      }
-      if (successful) {
-        last_checked = now();
-        last_full_snapshot = now();
       }
     } catch (error) {
       if (generation === refresh_generation) {
@@ -1729,7 +1813,18 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         updateUi({ review_loading: false });
       }
     } finally {
+      // Machine history does not depend on project catalog or run-list health.
+      // Await it even after those reads fail, while keeping combined freshness honest.
+      if (!monitor_refresh && workspace_view === "system" && !system_run_aligned && generation === refresh_generation)
+        monitor_refresh = system_monitor.refresh();
+      if (!mapped_refresh && runSystemActive() && generation === refresh_generation) mapped_refresh = run_system_monitor.refresh();
+      if (mapped_refresh && (await mapped_refresh) !== "success") successful = false;
+      if (monitor_refresh && (await monitor_refresh) !== "success") successful = false;
       if (generation === refresh_generation) {
+        if (successful) {
+          last_checked = now();
+          last_full_snapshot = now();
+        }
         updateUi({ refreshing: false });
         auto_refresh?.refreshCompleted(successful);
       }
@@ -1738,6 +1833,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   async function quietRefresh(): Promise<RefreshOutcome> {
     if (availability() !== "ready") return "cancelled";
     if (workspace_view === "storage") return quietStorageRefresh();
+    if (workspace_view === "system") return quietSystemRefresh();
+    if (runSystemActive()) return quietMappedSystemRefresh();
     const generation = quiet_generation;
     const current = () => generation === quiet_generation && availability() === "ready";
     const acknowledgements: (() => void)[] = [];
@@ -1981,6 +2078,122 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       return "failure";
     }
   }
+  async function refreshMappedSystem(updates: Updates | undefined, force: boolean, current: () => boolean): Promise<RefreshOutcome> {
+    if (!current() || !runSystemActive() || !review) return "cancelled";
+    const snapshot = run_system_monitor.snapshot(), source = source_id;
+    const changed = review.run_ids.filter(id => {
+      const item = updates?.runs.find(item => item.run_id === id);
+      const context = apiUrl("/api/run-system", { source, run_id: id });
+      const revision = JSON.stringify([item?.metadata_revision, item?.system_revision]);
+      return force || !runSystemItem(snapshot, id) || Object.hasOwn(snapshot.errors, id) ||
+        (item?.system_revision === undefined ? now() - (run_system_snapshots.get(context) ?? 0) >= 30_000 : run_system_revisions.get(context) !== revision);
+    });
+    if (!changed.length) return "success";
+    const outcome = await run_system_monitor.refresh(true, changed);
+    if (!current()) return "cancelled";
+    if (outcome !== "cancelled") {
+      const result = run_system_monitor.snapshot();
+      for (const id of changed) if (runSystemItem(result, id) && !Object.hasOwn(result.errors, id)) {
+        const item = updates?.runs.find(item => item.run_id === id), context = apiUrl("/api/run-system", { source, run_id: id });
+        boundedSet(run_system_revisions, context, JSON.stringify([item?.metadata_revision, item?.system_revision]));
+        boundedSet(run_system_snapshots, context, now());
+      }
+    }
+    return outcome;
+  }
+  async function quietMappedSystemRefresh(): Promise<RefreshOutcome> {
+    const generation = quiet_generation, source = source_id, current_review = review, view = workspace_view;
+    const current = () => !disposed && generation === quiet_generation && source_id === source &&
+      workspace_view === view && review === current_review && runSystemActive();
+    const full_snapshot = now() - last_full_snapshot >= 5 * 60_000;
+    let updates: Updates | undefined, successful = true;
+    try {
+      if (updates_supported) {
+        try {
+          updates = await quiet_lanes.updates.run<Updates>(apiUrl("/api/updates", { source, run_id: current_review?.run_ids ?? [] }));
+        } catch (error) {
+          if (error instanceof RequestError && error.status === 404) { updates_supported = false; auto_refresh?.setInterval(30_000); }
+          else successful = false;
+        }
+        if (!current() || (updates_supported && !updates && successful)) return "cancelled";
+      }
+      // Retained readings are independent of project/history availability.
+      const mapped = refreshMappedSystem(updates, full_snapshot || !updates_supported || !updates, current);
+      try {
+        if (!updates_supported || full_snapshot || (updates?.catalog_revision != null && catalog_revision !== updates.catalog_revision) ||
+          (updates?.catalog_revision == null && now() - last_catalog_snapshot >= 30_000)) {
+          const catalog = await loadCatalog(quiet_lanes.catalog);
+          if (catalog && current()) {
+            applyCatalog(catalog, true);
+            if (updates?.catalog_revision != null) catalog_revision = updates.catalog_revision;
+          } else successful = false;
+        }
+      } catch { successful = false; }
+      if (current()) {
+        try {
+          const revision = updates?.source_revision;
+          if (source && (!list_ready || last_run_list_context !== listUrl() || full_snapshot ||
+            (revision != null ? source_revisions.get(source) !== revision : now() - last_list_snapshot >= 30_000))) {
+            const url = listUrl(), result = await quiet_lanes.list.run<RunList>(url);
+            if (result && current() && url === listUrl()) {
+              applyRunList(result, url, true);
+              if (revision != null) boundedSet(source_revisions, source, revision);
+            } else successful = false;
+          }
+        } catch { successful = false; }
+      }
+      if (current() && view === "workspace" && current_review?.kind === "run" && current_review.run_ids[0]) {
+        const id = current_review.run_ids[0], hint = updates?.runs.find(item => item.run_id === id);
+        const context = apiUrl("/api/run", { source, run_id: id }), previous = detail_revisions.get(context);
+        if (full_snapshot || !updates || !updates_supported || previous?.metadata_revision !== hint?.metadata_revision) {
+          try {
+            const detail = await quiet_lanes.detail.run<Detail>(context);
+            if (detail && current()) {
+              if (!renderDetail(detail, true)) successful = false;
+              else {
+                boundedSet(detail_cache, id, detail);
+                boundedSet(detail_revisions, context, { metadata_revision: hint?.metadata_revision, view_revision: JSON.stringify(current_review.run_ids.map(id => {
+                  const item = updates?.runs.find(item => item.run_id === id);
+                  return [item?.run_id, item?.metadata_revision, item?.metrics_revision, item?.missing];
+                })) });
+                updateUi({ review_loading: false, review_error: null, review_warnings: detail.warnings });
+              }
+            } else successful = false;
+          } catch { successful = false; }
+        }
+      }
+      const outcome = await mapped;
+      if (!current() || outcome === "cancelled") return "cancelled";
+      if (outcome !== "success" || !successful) return "failure";
+      if (full_snapshot || !updates_supported) last_full_snapshot = now();
+      last_checked = now();
+      updateUi({ global_error: null });
+      return "success";
+    } catch { return current() ? "failure" : "cancelled"; }
+  }
+  async function quietSystemRefresh(): Promise<RefreshOutcome> {
+    if (system_run_aligned) return quietMappedSystemRefresh();
+    const generation = quiet_generation, source = source_id;
+    const current = () => !disposed && generation === quiet_generation && workspace_view === "system" && source_id === source;
+    let history_outcome: RefreshOutcome = "success";
+    try {
+      if (source_id && now() - last_list_snapshot >= 30_000) {
+        const url = listUrl(), result = await quiet_lanes.list.run<RunList>(url);
+        if (!result || !current() || url !== listUrl()) return "cancelled";
+        applyRunList(result, url, true);
+      }
+    } catch {
+      if (!current()) return "cancelled";
+      history_outcome = "failure";
+    }
+    try {
+      if (!current()) return "cancelled";
+      const outcome = await system_monitor.refresh(true);
+      if (!current()) return "cancelled";
+      if (outcome === "success" && history_outcome === "success") last_checked = now();
+      return outcome === "success" ? history_outcome : outcome;
+    } catch { return current() ? "failure" : "cancelled"; }
+  }
   async function quietStorageRefresh(): Promise<RefreshOutcome> {
     const source = currentSource();
     if (source?.kind !== "hosted_project" || !source.project_id) return "cancelled";
@@ -2110,6 +2323,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     live_updates.dispose();
     auto_refresh?.dispose();
     chart_controller.dispose();
+    system_monitor.cancel();
+    run_system_monitor.cancel();
     for (const lane of foreground_lanes) lane.cancel();
     clearSearchTimeout();
     clearStorageSearchTimeout();

@@ -145,6 +145,7 @@ pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
       let mut collector = Collector::new()?;
       let (inventory, sample) = collector.collect()?;
       let sample = store.record(inventory, sample)?;
+      let _ = store.export_run_captures();
       store.compact(now_ms())?;
       print(
         &json!({"machine_id": store.machine_id(), "sample": sample, "machine": store.profile()?}),

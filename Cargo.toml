@@ -29,6 +29,7 @@ expri-server = { version = "=0.1.5", path = "crates/server" }
 expri-system = { version = "=0.1.5", path = "crates/system", default-features = false }
 attohttpc = { version = "0.30.1", default-features = false }
 base64 = "0.22.1"
+flate2 = "1.1.9"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 form_urlencoded = "1.2.2"
 globset = "0.4.18"
@@ -64,6 +65,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
+flate2.workspace = true
 chrono.workspace = true
 clap = { version = "4.6.1", features = ["derive"] }
 expri-core.workspace = true

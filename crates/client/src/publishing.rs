@@ -340,8 +340,19 @@ fn mark_abandoned(directory: &Path) -> Result<()> {
     Some("preparing" | "running")
   ) {
     state["status"] = json!("lost");
-    state["finished_at"] = json!(now());
+    let known_end = expri_system::store::run_capture::known_end_ms(directory, &state)
+      .and_then(chrono::DateTime::from_timestamp_millis)
+      .map(|time| time.to_rfc3339());
+    state["finished_at"] = json!(known_end.unwrap_or_else(now));
     state["error"] = json!("Run supervisor exited before publishing a terminal state");
+    expri_system::store::run_capture::finalize_state(directory, &mut state);
+    fs::atomic_json(&path, &state)?;
+  } else if matches!(
+    state["status"].as_str(),
+    Some("completed" | "failed" | "cancelled" | "lost")
+  ) && state["system_capture_status"] == "capturing"
+  {
+    expri_system::store::run_capture::finalize_state(directory, &mut state);
     fs::atomic_json(&path, &state)?;
   }
   Ok(())

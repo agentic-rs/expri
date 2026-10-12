@@ -6,6 +6,7 @@ pub mod global_config;
 pub mod identifiers;
 pub mod lock;
 pub mod protocol;
+pub mod run_system;
 pub mod service;
 pub mod service_auth;
 pub mod service_catalog;

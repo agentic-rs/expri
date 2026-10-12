@@ -1,5 +1,5 @@
 use crate::config::TargetConfig;
-use crate::controller::protocol::{ProtocolPreference, python_run_script};
+use crate::controller::protocol::{ProtocolPreference, python_run_script, python_script_string};
 use crate::controller::transport::Remote;
 use crate::error::{ExpriError, Result};
 use crate::protocol::JobRequest;
@@ -131,7 +131,7 @@ except (OSError, ValueError, RuntimeError) as error:
   print(str(error), file=sys.stderr)
   sys.exit(1)
 "#,
-    jobs = serde_json::to_string(expri_worker::JOBS_SCRIPT)?,
+    jobs = python_script_string(expri_worker::JOBS_SCRIPT),
     request = serde_json::to_string(&serde_json::to_string(request)?)?,
   ))
 }

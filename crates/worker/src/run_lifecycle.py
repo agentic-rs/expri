@@ -11,6 +11,9 @@ import tempfile as _lifecycle_tempfile
 import threading as _lifecycle_threading
 import time as _lifecycle_time
 
+if "_capture_begin" not in globals():
+  from system_capture import _capture_begin, _capture_close
+
 
 def _lifecycle_now():
   return _lifecycle_datetime.datetime.now(_lifecycle_datetime.timezone.utc).isoformat()
@@ -54,6 +57,55 @@ def _lifecycle_message(message):
     pass
 
 
+def _lifecycle_existing_machine_id():
+  """Read optional host identity without creating storage or requiring SQLite."""
+  try:
+    import sqlite3
+  except ImportError:
+    return None
+  try:
+    override = _lifecycle_os.environ.get("EXPRI_STORAGE_DIR")
+    if override is not None:
+      if not override or ".." in _lifecycle_pathlib.Path(override).parts:
+        return None
+      root = _lifecycle_pathlib.Path(_lifecycle_os.path.abspath(override))
+      owned = [root]
+    else:
+      home = _lifecycle_os.environ.get("HOME")
+      if not home or ".." in _lifecycle_pathlib.Path(home).parts:
+        return None
+      boundary = _lifecycle_pathlib.Path(_lifecycle_os.path.abspath(home)) / ".tokn"
+      root = boundary / "expri"
+      owned = [boundary, root]
+    for directory in owned:
+      if not _lifecycle_stat.S_ISDIR(directory.lstat().st_mode):
+        return None
+    database = root / "profiles.sqlite3"
+    if not _lifecycle_stat.S_ISREG(database.lstat().st_mode):
+      return None
+    for suffix in ("-wal", "-shm", "-journal"):
+      try:
+        metadata = database.with_name(database.name + suffix).lstat()
+      except FileNotFoundError:
+        continue
+      if not _lifecycle_stat.S_ISREG(metadata.st_mode):
+        return None
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)
+    try:
+      row = connection.execute("SELECT machine_id FROM system_local WHERE singleton=1").fetchone()
+    finally:
+      connection.close()
+    machine_id = row[0] if row is not None else None
+    if (not isinstance(machine_id, str) or not machine_id or len(machine_id) > 96
+        or machine_id in (".", "..")
+        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+               for character in machine_id)):
+      return None
+    return machine_id
+  except (OSError, ValueError, sqlite3.Error):
+    return None
+
+
 def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
   """Snapshot before acknowledgement; return a detached receipt or foreground exit."""
   if request.get("service") is not None and request["service"].get("publish", True):
@@ -73,6 +125,10 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
     "logs": {"stdout": "logs/stdout.log", "stderr": "logs/stderr.log"},
     "status": "preparing", "started_at": _lifecycle_now(),
   }
+  machine_id = _lifecycle_existing_machine_id()
+  if machine_id is not None:
+    state["machine_id"] = machine_id
+  _capture_begin(run_dir, state)
   _lifecycle_write_json(run_dir / "run-state.json", state)
   _lifecycle_message("run: " + snapshot["run_id"])
   _lifecycle_message("run directory: " + str(run_dir))
@@ -93,6 +149,7 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
     )
   except Exception as error:
     state.update(status="failed", exit_code=1, finished_at=_lifecycle_now(), error="worker launch failed: " + str(error))
+    _capture_close(run_dir, state)
     _lifecycle_write_json(run_dir / "run-state.json", state)
     raise
   # Reap if the launcher remains alive; this thread never delays CLI/SSH exit.
@@ -105,6 +162,7 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
       if current.get("status") not in ("completed", "failed", "cancelled"):
         current.update(status="failed", exit_code=exit_code if exit_code >= 0 else 128 - exit_code,
                        finished_at=_lifecycle_now(), error="worker exited before acquiring its run lease")
+        _capture_close(run_dir, current)
         _lifecycle_write_json(run_dir / "run-state.json", current)
       raise RuntimeError(current.get("error", "worker exited before acknowledging readiness"))
     if _lifecycle_time.monotonic() >= deadline:
@@ -194,6 +252,7 @@ def execute_worker(payload, context):
         state["error"] = "run cancellation requested"
       status = "cancelled" if cancelled else ("completed" if exit_code == 0 else "failed")
       state.update(status=status, exit_code=exit_code, finished_at=_lifecycle_now())
+      _capture_close(run_dir, state)
       _lifecycle_write_json(state_path, state)
     finally:
       lease.close()

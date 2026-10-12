@@ -6,6 +6,71 @@ use super::*;
 use crate::service::types::FileStorage;
 
 impl<S: ObjectStorage> HostedDashboard<'_, S> {
+  pub(super) fn run_system_data(
+    &self,
+    record: &FileRecord,
+    run_id: &str,
+    window: &expri_runs::system_metrics::RunSystemWindow,
+    cursor: Option<u64>,
+    limit: usize,
+    deadline: Instant,
+  ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
+    expri_runs::system_metrics::read(
+      SystemDeadlineReader {
+        reader: self.run_system_reader(record, deadline)?,
+        deadline,
+      },
+      || {
+        self
+          .run_system_reader(record, deadline)
+          .map(|reader| SystemDeadlineReader { reader, deadline })
+      },
+      run_id,
+      window,
+      cursor,
+      limit,
+    )
+  }
+
+  fn run_system_reader(
+    &self,
+    record: &FileRecord,
+    deadline: Instant,
+  ) -> Result<Box<dyn Read + '_>> {
+    if record.size == 0 {
+      verify_bytes(record, &[]).map_err(system_profile_error)?;
+      return Ok(Box::new(std::io::empty()));
+    }
+    match record.storage {
+      FileStorage::Tracking { .. } => Ok(Box::new(CaptureFileReader {
+        file: self
+          .store
+          .tracking_open(record)
+          .map_err(system_profile_error)?,
+        remaining: record.size,
+        deadline,
+      })),
+      FileStorage::Object => Ok(Box::new(ObjectReader {
+        response: self
+          .object_response(record, None, deadline)
+          .map_err(system_profile_error)?
+          .take(record.size),
+        remaining: record.size,
+        deadline,
+        digest: Sha256::new(),
+        expected_digest: record.sha256.clone(),
+      })),
+      FileStorage::Stream => Ok(Box::new(StreamReader {
+        dashboard: self,
+        record: record.clone(),
+        offset: 0,
+        buffer: Vec::new(),
+        cursor: 0,
+        deadline,
+      })),
+    }
+  }
+
   pub(super) fn metric_data(
     &self,
     scope: &RunScope,
@@ -185,6 +250,62 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
       ));
     }
     Ok(response)
+  }
+}
+
+struct CaptureFileReader {
+  file: std::fs::File,
+  remaining: u64,
+  deadline: Instant,
+}
+
+struct SystemDeadlineReader<R> {
+  reader: R,
+  deadline: Instant,
+}
+
+impl<R: Read> Read for SystemDeadlineReader<R> {
+  fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+    if Instant::now() >= self.deadline {
+      return Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "run system read deadline exceeded",
+      ));
+    }
+    self.reader.read(output).map_err(|error| {
+      if Instant::now() >= self.deadline {
+        std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "run system read deadline exceeded",
+        )
+      } else {
+        error
+      }
+    })
+  }
+}
+
+impl Read for CaptureFileReader {
+  fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+    if self.remaining == 0 || output.is_empty() {
+      return Ok(0);
+    }
+    if Instant::now() >= self.deadline {
+      return Err(std::io::Error::other(
+        "hosted run system read time budget exceeded",
+      ));
+    }
+    let length = output
+      .len()
+      .min(self.remaining.min(usize::MAX as u64) as usize);
+    let count = self.file.read(&mut output[..length])?;
+    if count == 0 {
+      return Err(std::io::Error::other(
+        "captured system stream is shorter than its acknowledged extent",
+      ));
+    }
+    self.remaining -= count as u64;
+    Ok(count)
   }
 }
 

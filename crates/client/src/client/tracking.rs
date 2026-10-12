@@ -19,6 +19,11 @@ pub(super) fn negotiate(api: &Api, queue: &mut Queue) -> Result<Protocol> {
   } else {
     match api.request(&Request::Capabilities) {
       Ok(Response::Capabilities { features }) => {
+        queue.state.run_system_supported = Some(
+          features
+            .iter()
+            .any(|feature| feature == expri_core::run_system::RUN_SYSTEM_CAPABILITY),
+        );
         if features.iter().any(|feature| feature == "tracking-v1") {
           Protocol::TrackingV1
         } else {
@@ -33,6 +38,23 @@ pub(super) fn negotiate(api: &Api, queue: &mut Queue) -> Result<Protocol> {
   queue.state.protocol = Some(protocol);
   queue.save()?;
   Ok(protocol)
+}
+
+pub(super) fn system_supported(api: &Api, queue: &mut Queue) -> Result<bool> {
+  if let Some(supported) = queue.state.run_system_supported {
+    return Ok(supported && queue.state.protocol == Some(Protocol::TrackingV1));
+  }
+  let supported = match api.request(&Request::Capabilities) {
+    Ok(Response::Capabilities { features }) => features
+      .iter()
+      .any(|feature| feature == expri_core::run_system::RUN_SYSTEM_CAPABILITY),
+    Err(crate::error::ExpriError::ServiceRejected { status: 400, .. }) => false,
+    Err(error) => return Err(error),
+    _ => return Err(message("service returned invalid protocol capabilities")),
+  };
+  queue.state.run_system_supported = Some(supported);
+  queue.save()?;
+  Ok(supported && queue.state.protocol == Some(Protocol::TrackingV1))
 }
 
 pub(super) fn sync_document(

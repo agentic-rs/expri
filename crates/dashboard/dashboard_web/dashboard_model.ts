@@ -35,6 +35,7 @@ export type Run = {
   run_id: string;
   run_key?: string;
   origin?: string;
+  machine_id?: string;
   task: string | null;
   status: string;
   started_at: string | null;
@@ -85,6 +86,7 @@ export type Catalog = {
   warnings: Warning[];
   access_mode?: "local" | "hosted";
   run_management_enabled?: boolean;
+  capabilities?: string[];
 };
 export type RunList = {
   source: Source;
@@ -207,7 +209,8 @@ export function artifactScopeMatchesRun(
     identity.run_id === scope.run_id
   );
 }
-export type ReviewTab = "charts" | "overview" | "logs" | "files";
+export type ReviewTab = "charts" | "system" | "overview" | "logs" | "files";
+export type WorkspaceView = "workspace" | "storage" | "system";
 export type Review = {
   kind: "run" | "compare";
   origin: "inspection" | "selection";
@@ -224,6 +227,7 @@ export type RunRevision = {
   metrics_revision: string | null;
   stdout_revision: string | null;
   stderr_revision: string | null;
+  system_revision?: string | null;
   missing: boolean;
 };
 export type Updates = {
@@ -284,14 +288,14 @@ export class RequestError extends Error {
   }
 }
 
-async function boundedText(response: Response, maximum_bytes: number): Promise<string> {
+async function boundedText(response: Response, maximum_bytes: number, limit_message: string): Promise<string> {
   const declared = response.headers?.get("content-length");
   if (declared && Number(declared) > maximum_bytes)
-    throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+    throw new Error(limit_message);
   if (!response.body?.getReader) {
     const value = await response.text();
     if (new TextEncoder().encode(value).length > maximum_bytes)
-      throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+      throw new Error(limit_message);
     return value;
   }
   const reader = response.body.getReader(),
@@ -305,7 +309,7 @@ async function boundedText(response: Response, maximum_bytes: number): Promise<s
       length += part.value.byteLength;
       if (length > maximum_bytes) {
         await reader.cancel();
-        throw new Error("The chart exceeds the 2 MiB preview limit. Select fewer metrics.");
+        throw new Error(limit_message);
       }
       value += decoder.decode(part.value, { stream: true });
     }
@@ -338,8 +342,8 @@ export class RequestLane {
       body: JSON.stringify(body),
     });
   }
-  runJson<T>(url: string, maximum_bytes = 2 * 1024 * 1024): Promise<T | undefined> {
-    return this.request(url, async (response) => JSON.parse(await boundedText(response, maximum_bytes)) as T);
+  runJson<T>(url: string, maximum_bytes = 2 * 1024 * 1024, limit_message = "The chart exceeds the 2 MiB preview limit. Select fewer metrics."): Promise<T | undefined> {
+    return this.request(url, async (response) => JSON.parse(await boundedText(response, maximum_bytes, limit_message)) as T);
   }
   private async request<T>(
     url: string,
