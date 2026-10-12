@@ -51,8 +51,9 @@ expri system history --resolution hourly
 New machine configuration and profile history live in `~/.tokn/expri`.
 The foreground daemon samples every ten seconds. Optional machine-scoped
 publishing runs independently, so server outages do not delay collection.
-Both local and server stores keep 72 hours of raw samples and retain historical
-hourly summaries indefinitely. Existing project configuration, caches, and run
+Both local and server stores keep 72 hours of machine detail and retain historical
+hourly summaries indefinitely. New runs also preserve their exact system observations
+for as long as the run is retained. Existing project configuration, caches, and run
 storage keep their current paths. See [system profiles](docs/system-profiles.md)
 for GPU support, service authentication, publishing, and history queries.
 
@@ -516,6 +517,16 @@ Counter readings become rates over their measured intervals, and missing
 observations remain gaps. The bottom status bar refreshes the visible monitor
 without loading hidden run logs or charts. See [system profiles](docs/system-profiles.md)
 to start and publish collection.
+
+The run inspector's **System metrics** tab automatically maps captured whole-machine
+readings to the run's start and finish times. Select Run elapsed or Wall clock,
+compare Last / Min / Max / Mean summaries, or open the System page in Run period
+mode. Exact samples and referenced inventories remain in the run's
+`outputs/system-profile.jsonl`, independently of the 72-hour machine-history window.
+Overlapping runs share machine readings; these measurements describe the machine,
+not resource usage attributed to an individual process. Runs without a capture
+show an explicit unavailable state. Upgrade the run worker, restart the upgraded collector, and upgrade
+the hosted server to support `run-system-metrics-v1`, before starting new captures.
 
 Opening a run starts with its curves in a compact metric grid. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads

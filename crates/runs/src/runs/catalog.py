@@ -180,6 +180,21 @@ def _catalog_summary(run_id, state, warnings):
       summary["machine_id"] = machine_id
     else:
       _catalog_warning(warnings, run_id, "run-state.json has invalid or missing machine_id")
+  for field in ("system_capture_id", "system_capture_status", "system_capture_error"):
+    value = state.get(field)
+    if value is None:
+      continue
+    valid = isinstance(value, str)
+    if field == "system_capture_id":
+      valid = valid and len(value) <= 96 and value not in {".", ".."} and _catalog_re.fullmatch(r"[A-Za-z0-9._-]+", value) is not None
+    elif field == "system_capture_status":
+      valid = valid and value in {"capturing", "complete", "incomplete"}
+    else:
+      valid = valid and len(value.encode("utf-8")) <= 1024 and not any(ord(character) < 32 or 127 <= ord(character) < 160 for character in value)
+    if valid:
+      summary[field] = value
+    else:
+      _catalog_warning(warnings, run_id, "run-state.json has invalid or missing " + field)
   task = state.get("task")
   if isinstance(task, str) and task.strip():
     summary["task"] = task

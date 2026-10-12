@@ -202,3 +202,216 @@ fn sqlite_inventory_pages_remain_byte_bounded_and_browser_cursors_cover_every_ma
     ]
   );
 }
+
+fn publish_run_state(store: &Store<MockStorage>, scope: &RunScope, state: &Value) {
+  let bytes = serde_json::to_vec(state).unwrap();
+  store
+    .execute(Request::PutDocument {
+      scope: scope.clone(),
+      path: "run-state.json".into(),
+      revision: 1,
+      offset: 0,
+      total_size: bytes.len() as u64,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+    .unwrap();
+}
+
+fn append_capture(
+  store: &Store<MockStorage>,
+  scope: &RunScope,
+  offset: u64,
+  records: &[expri_core::run_system::RunSystemRecord],
+) -> u64 {
+  let mut bytes = Vec::new();
+  for record in records {
+    bytes.extend(serde_json::to_vec(record).unwrap());
+    bytes.push(b'\n');
+  }
+  for (index, batch) in bytes.chunks(STREAM_BATCH).enumerate() {
+    store
+      .execute(Request::AppendTracking {
+        scope: scope.clone(),
+        path: expri_core::run_system::RUN_SYSTEM_PATH.into(),
+        offset: offset + (index * STREAM_BATCH) as u64,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(batch),
+      })
+      .unwrap();
+  }
+  offset + bytes.len() as u64
+}
+
+#[test]
+fn retained_run_capture_is_independent_of_global_retention_and_has_its_own_refresh_revision() {
+  use expri_core::run_system::RunSystemRecord as Record;
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "run-captured".into(),
+  };
+  let state = json!({"schema_version":1,"run_id":scope.run_id,"machine_id":"machine-test","system_capture_id":"capture-test","system_capture_status":"complete","task":"train","status":"completed","started_at":"1970-01-01T00:00:10Z","finished_at":"1970-01-01T00:00:20Z","exit_code":0});
+  publish_run_state(&store, &scope, &state);
+  let dashboard = HostedDashboard::new(&store).unwrap();
+  let before = dashboard
+    .updates("hosted:project:worker", std::slice::from_ref(&scope.run_id))
+    .unwrap();
+  let mut raw = sample(999, 11_000, 0);
+  raw.metrics = BTreeMap::from([(
+    "cpu/usage_percent".into(),
+    MetricReading {
+      kind: MetricKind::Gauge,
+      value: 37.0,
+    },
+  )]);
+  let records = vec![
+    Record::Capture {
+      schema_version: 1,
+      capture_id: "capture-test".into(),
+      machine_id: "machine-test".into(),
+      start_ms: 10_000,
+    },
+    Record::Inventory {
+      inventory: InventoryRevision {
+        revision: 1,
+        inventory: inventory(10_000),
+      },
+    },
+    Record::Sample {
+      sample: raw.clone(),
+    },
+    Record::End {
+      end_ms: 20_000,
+      complete: true,
+      warnings: Vec::new(),
+    },
+  ];
+  append_capture(&store, &scope, 0, &records);
+  let after = dashboard
+    .updates("hosted:project:worker", std::slice::from_ref(&scope.run_id))
+    .unwrap();
+  assert!(before["runs"][0]["system_revision"].is_null());
+  assert!(after["runs"][0]["system_revision"].is_string());
+  assert_eq!(
+    before["runs"][0]["metrics_revision"],
+    after["runs"][0]["metrics_revision"]
+  );
+  let response = crate::dashboard::server::route_content(
+    &dashboard,
+    "/api/run-system?source=hosted-project:project&run_id=worker:run-captured&limit=1",
+  );
+  assert_eq!(response.status, 200);
+  let result: expri_runs::system_metrics::RunSystemMetrics =
+    serde_json::from_slice(&response.body).unwrap();
+  assert_eq!(result.run_id, "worker:run-captured");
+  assert_eq!(result.status, "complete");
+  assert_eq!(result.samples[0], raw);
+  assert_eq!(result.metric_summaries["cpu/usage_percent"].last, 37.0);
+  assert!(
+    store.system_machine("machine-test", None).is_err(),
+    "no global machine history exists or is needed for this old retained capture"
+  );
+}
+
+#[test]
+fn missing_and_spoofed_run_capture_metadata_never_falls_back_to_global_machine_history() {
+  use expri_core::run_system::RunSystemRecord as Record;
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let at = chrono::Utc::now().timestamp_millis();
+  let mut profile = batch("machine-test", at);
+  profile.samples.push(sample(1, at, 0));
+  store
+    .execute(Request::PutSystemProfile { batch: profile })
+    .unwrap();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "run-legacy".into(),
+  };
+  publish_run_state(
+    &store,
+    &scope,
+    &json!({"schema_version":1,"run_id":scope.run_id,"machine_id":"machine-test","task":"train","status":"running","started_at":"1970-01-01T00:00:10Z"}),
+  );
+  let dashboard = HostedDashboard::new(&store).unwrap();
+  let legacy = dashboard
+    .run_system("hosted:project:worker", &scope.run_id, None, 100)
+    .unwrap();
+  assert_eq!(legacy.status, "unavailable");
+  assert!(legacy.samples.is_empty());
+  assert!(legacy.metric_summaries.is_empty());
+  let scope = RunScope {
+    run_id: "run-spoof".into(),
+    ..scope
+  };
+  publish_run_state(
+    &store,
+    &scope,
+    &json!({"schema_version":1,"run_id":scope.run_id,"machine_id":"machine-test","system_capture_id":"capture-test","task":"train","status":"running","started_at":"1970-01-01T00:00:10Z"}),
+  );
+  append_capture(
+    &store,
+    &scope,
+    0,
+    &[Record::Capture {
+      schema_version: 1,
+      capture_id: "capture-test".into(),
+      machine_id: "machine-other".into(),
+      start_ms: 10_000,
+    }],
+  );
+  let response = crate::dashboard::server::route_content(
+    &dashboard,
+    "/api/run-system?source=hosted:project:worker&run_id=run-spoof",
+  );
+  assert_eq!(response.status, 409);
+  for query in [
+    "cursor=-1",
+    "cursor=9223372036854775808",
+    "limit=0",
+    "limit=1025",
+    "token=secret",
+  ] {
+    assert_eq!(
+      crate::dashboard::server::route_content(
+        &dashboard,
+        &format!("/api/run-system?source=hosted:project:worker&run_id=run-spoof&{query}")
+      )
+      .status,
+      400
+    );
+  }
+}
+
+#[test]
+fn overview_schema_two_is_reparsed_for_capture_metadata_without_worker_republication() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "run-capture-meta".into(),
+  };
+  let state = json!({"schema_version":1,"run_id":scope.run_id,"machine_id":"machine-test","system_capture_id":"capture-test","system_capture_status":"incomplete","system_capture_error":"collector stopped","task":"train","status":"running","started_at":"1970-01-01T00:00:10Z"});
+  publish_run_state(&store, &scope, &state);
+  store.dashboard_cache_overview(&scope,"tracking:1",&json!({"overview_schema":2,"run":{"run_id":scope.run_id,"machine_id":"machine-test","task":"train","status":"running","started_at":state["started_at"]},"task_filter":"train","metadata_truncated":false,"warnings":[]})).unwrap();
+  let dashboard = HostedDashboard::new(&store).unwrap();
+  let result = dashboard
+    .list("hosted:project:worker", None, None, None, 100, 0)
+    .unwrap();
+  assert_eq!(result["runs"][0]["system_capture_id"], "capture-test");
+  assert_eq!(result["runs"][0]["system_capture_status"], "incomplete");
+  assert_eq!(
+    result["runs"][0]["system_capture_error"],
+    "collector stopped"
+  );
+  assert_eq!(
+    store
+      .dashboard_cached_overview(&scope, "tracking:1")
+      .unwrap()
+      .unwrap()["overview_schema"],
+    3
+  );
+}

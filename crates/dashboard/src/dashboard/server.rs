@@ -732,6 +732,7 @@ fn route_content_checked(
           .map_err(service_error)?,
       ))
     }
+    "/api/run-system" => system_profiles::run_system(dashboard, &query),
     "/api/artifacts" => {
       query.allow(&["source", "run_id"])?;
       Ok(Reply::json(

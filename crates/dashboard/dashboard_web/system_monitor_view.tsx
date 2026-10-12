@@ -16,7 +16,7 @@ const PERIODS: { value: SystemPeriod; label: string }[] = [
   { value: "1h", label: "1 hour" }, { value: "6h", label: "6 hours" }, { value: "24h", label: "24 hours" },
   { value: "72h", label: "72 hours" }, { value: "7d", label: "7 days" }, { value: "30d", label: "30 days" },
 ];
-function Choices<T extends string>({ name, legend, value, options, on_change }: {
+export function SystemChoices<T extends string>({ name, legend, value, options, on_change }: {
   name: string; legend: string; value: T; options: { value: T; label: string }[]; on_change: (value: T) => void;
 }) {
   return <fieldset className="choice-group" id={`${name}-options`}>
@@ -30,6 +30,7 @@ function Choices<T extends string>({ name, legend, value, options, on_change }: 
 function timestamp(value: number | null, time_zone: ChartTimeZone): string {
   return value === null ? "No observation yet" : formatChartX(String(BigInt(value) * 1_000_000n), "wall_clock", time_zone);
 }
+const Choices = SystemChoices;
 function InventoryTimestamp({ value, time_zone }: { value: number | null; time_zone: ChartTimeZone }) {
   const parts = value === null ? null : dateParts(BigInt(value) * 1_000_000n, time_zone);
   return <span title={timestamp(value, time_zone)}>{parts ? `${parts.date_text.slice(5)} ${parts.time_text.slice(0, 8)} ${parts.offset_text}` : timestamp(value, time_zone)}</span>;
@@ -65,14 +66,18 @@ function sampledPoints(points: SystemPoint[], maximum = 600): SystemPoint[] {
   const indices = [...retained].sort((a, b) => a - b);
   return indices.map((index, position) => ({ ...points[index]!, break_before: points.slice(indices[position - 1] ?? index, index + 1).some(point => point.break_before) }));
 }
-function SystemPlot({ series, start_ms, end_ms, resolution, time_zone }: {
+export function SystemPlot({ series, start_ms, end_ms, resolution, time_zone, x_axis = "wall_clock", title_label }: {
   series: SystemSeries; start_ms: number; end_ms: number; resolution: SystemResolution; time_zone: ChartTimeZone;
+  x_axis?: "run_elapsed" | "wall_clock"; title_label?: string;
 }) {
   const [active_index, setActiveIndex] = useState<number | null>(null);
-  const range: ChartRange = { x_axis: "wall_clock", start_x: String(BigInt(start_ms) * 1_000_000n), end_x: String(BigInt(end_ms) * 1_000_000n) };
+  const range: ChartRange = x_axis === "run_elapsed"
+    ? { x_axis: "elapsed", start_x: "0", end_x: String(BigInt(end_ms - start_ms) * 1_000_000n) }
+    : { x_axis: "wall_clock", start_x: String(BigInt(start_ms) * 1_000_000n), end_x: String(BigInt(end_ms) * 1_000_000n) };
+  const point_x = (point: SystemPoint): string => String(BigInt(point.observed_at_ms - (x_axis === "run_elapsed" ? start_ms : 0)) * 1_000_000n);
   const points = sampledPoints(series.points), values = series.points.map(point => point.value);
   const minimum = Math.min(...values), maximum = Math.max(...values);
-  const x = (point: SystemPoint): number => 65 + chartXFraction(String(BigInt(point.observed_at_ms) * 1_000_000n), range) * 620;
+  const x = (point: SystemPoint): number => 65 + chartXFraction(point_x(point), range) * 620;
   const y = (point: SystemPoint): number => 20 + (1 - chartYFraction(point.value, minimum, maximum)) * 180;
   const segments: SystemPoint[][] = [];
   for (const point of points) { if (!segments.length || point.break_before) segments.push([]); segments.at(-1)!.push(point); }
@@ -80,8 +85,8 @@ function SystemPlot({ series, start_ms, end_ms, resolution, time_zone }: {
   const last = series.points.at(-1);
   const coverage_ms = series.points.reduce((sum, point) => sum + point.coverage_ms, 0);
   return <section className="system-chart evidence-panel" data-system-metric={series.metric_name}>
-    <header className="metric-chart-header"><h2>{series.metric_name}</h2>{last && <div className="metric-chart-summary"><span>{resolution === "hourly" ? "Latest mean" : "Last"}</span><strong>{systemMetricValue(last.value, series.metric_name, series.kind)}</strong></div>}</header>
-    <svg viewBox="-120 0 840 250" role="img" tabIndex={0} aria-label={`${series.metric_name}, ${resolution === "hourly" ? "hourly means" : "recorded samples"}. Use left and right arrows to inspect readings.`}
+    <header className="metric-chart-header"><h2>{title_label ?? series.metric_name}</h2>{last && <div className="metric-chart-summary"><span>{resolution === "hourly" ? "Latest mean" : "Last"}</span><strong>{systemMetricValue(last.value, series.metric_name, series.kind)}</strong></div>}</header>
+    <svg viewBox="-120 0 840 285" role="img" tabIndex={0} aria-label={`${title_label ?? series.metric_name}, ${resolution === "hourly" ? "hourly means" : "recorded samples"}, ${x_axis === "run_elapsed" ? "time since run started" : "date and time"}. Use left and right arrows to inspect readings.`}
       onPointerMove={event => {
         const bounds = event.currentTarget.getBoundingClientRect(), target = (event.clientX - bounds.left) / bounds.width * 840 - 120;
         let nearest = 0;
@@ -103,24 +108,25 @@ function SystemPlot({ series, start_ms, end_ms, resolution, time_zone }: {
       })}
       {[0, .5, 1].map(fraction => {
         const value = BigInt(range.start_x) + BigInt(Math.round((end_ms - start_ms) * fraction)) * 1_000_000n;
-        const tick_value = value / 1_000_000_000n * 1_000_000_000n;
-        return <text className="tick" key={fraction} x={65 + fraction * 620} y="225" textAnchor={fraction === 0 ? "start" : fraction === 1 ? "end" : "middle"}><title>{formatChartX(String(value), "wall_clock", time_zone)}</title>{formatChartTick(String(tick_value), range, time_zone)}</text>;
+        const tick_value = x_axis === "wall_clock" ? value / 1_000_000_000n * 1_000_000_000n : value;
+        return <text className="tick" key={fraction} x={65 + fraction * 620} y="255" textAnchor={fraction === 0 ? "start" : fraction === 1 ? "end" : "middle"}><title>{formatChartX(String(value), range.x_axis, time_zone)}</title>{formatChartTick(String(tick_value), range, time_zone)}</text>;
       })}
       {segments.map((segment, index) => <polyline key={index} fill="none" stroke="currentColor" strokeWidth="2" points={segment.map(point => `${x(point)},${y(point)}`).join(" ")} />)}
       {points.map((point, index) => <circle key={index} cx={x(point)} cy={y(point)} r="2" fill="currentColor" />)}
       {active && <g className="system-chart-inspection"><line x1={x(active)} x2={x(active)} y1="20" y2="200" /><circle cx={x(active)} cy={y(active)} r="4" /></g>}
     </svg>
-    <div className="system-point-inspection" aria-live="polite">{active ? <><strong>{systemMetricValue(active.value, series.metric_name, series.kind)}</strong> · {timestamp(active.observed_at_ms, time_zone)} · {active.sample_count} sample{active.sample_count === 1 ? "" : "s"} · {(active.coverage_ms / 1000).toLocaleString()}s measured</> : <span className="muted">{series.points.length.toLocaleString()} {resolution === "hourly" ? "hourly means" : "readings"} · {(coverage_ms / 1000).toLocaleString()}s measured{points.length < series.points.length ? " · Curve sampled to 600 points" : ""}</span>}</div>
+    <div className="system-point-inspection" aria-live="polite">{active ? <><strong>{systemMetricValue(active.value, series.metric_name, series.kind)}</strong> · {x_axis === "run_elapsed" && <>{formatChartX(point_x(active), "elapsed")} since run started · </>}{timestamp(active.observed_at_ms, time_zone)} · {active.sample_count} sample{active.sample_count === 1 ? "" : "s"} · {(active.coverage_ms / 1000).toLocaleString()}s measured</> : <span className="muted">{series.points.length.toLocaleString()} {resolution === "hourly" ? "hourly means" : "readings"} · {(coverage_ms / 1000).toLocaleString()}s measured{points.length < series.points.length ? " · Curve sampled to 600 points" : ""}</span>}</div>
   </section>;
 }
-export function SystemMonitorPage({ state: s, actions: a, time_zone, access_mode }: { state: SystemMonitorSnapshot; actions: SystemMonitorActions; time_zone: ChartTimeZone; access_mode: "local" | "hosted" }) {
+export function SystemMonitorPage({ state: s, actions: a, time_zone, access_mode, show_heading = true }: { state: SystemMonitorSnapshot; actions: SystemMonitorActions; time_zone: ChartTimeZone; access_mode: "local" | "hosted"; show_heading?: boolean }) {
   const [machine_search, setMachineSearch] = useState(""), [metric_search, setMetricSearch] = useState("");
   const machines = s.machines.filter(machine => machine.machine_id === s.machine_id || `${machine.machine_id} ${machine.inventory.hostname}`.toLocaleLowerCase().includes(machine_search.toLocaleLowerCase()));
   const profile = s.profile, inventory = profile?.inventory;
   const all_metrics = [...new Set([...s.selected_metrics, ...s.metric_names])];
   const visible_metrics = all_metrics.filter(name => s.selected_metrics.includes(name) || name.toLocaleLowerCase().includes(metric_search.toLocaleLowerCase())).slice(0, 64);
   return <section className="system-monitor" aria-labelledby="system-heading" aria-busy={s.loading}>
-    <div className="workspace-heading"><div><h1 id="system-heading" tabIndex={-1}>System monitor</h1><p className="muted">Whole-machine readings, recorded independently of runs.</p></div>{s.loading && <span className="muted" role="status">Loading readings…</span>}</div>
+    {show_heading && <div className="workspace-heading"><div><h1 id="system-heading" tabIndex={-1}>System monitor</h1><p className="muted">Whole-machine readings, recorded independently of runs.</p></div>{s.loading && <span className="muted" role="status">Loading readings…</span>}</div>}
+    {!show_heading && s.loading && <p className="muted" role="status">Loading readings…</p>}
     {s.error && <div className="notice error" role="alert">{s.error}{s.loaded_at_ms !== null && <p>Showing the last successful readings.</p>}<button type="button" className="text-button" onClick={a.refresh} disabled={s.loading}>Retry system monitoring</button></div>}
     {!s.machines.length && !s.loading && !s.error && <div className="empty-state"><h2>No recorded machines</h2><p>Start <code>expri system daemon</code> on a machine to collect readings. {access_mode === "hosted" ? "Publish them to this server to view its history here." : "Local readings appear here once collected."}</p></div>}
     {!!s.machines.length && <>

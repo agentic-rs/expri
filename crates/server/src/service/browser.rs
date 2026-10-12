@@ -488,6 +488,7 @@ mod tests {
       "/api/system-machines",
       "/api/system-profile?machine_id=machine-test",
       &history_path,
+      "/api/run-system?source=hosted:project:worker&run_id=run-example",
     ] {
       assert_eq!(
         handle(&store, &auth, &request("GET", path, b"")).status(),

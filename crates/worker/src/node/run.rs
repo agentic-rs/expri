@@ -61,6 +61,7 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
   if let Some(machine_id) = existing_machine_id() {
     state["machine_id"] = json!(machine_id);
   }
+  expri_system::store::run_capture::begin_state(&snapshot.run_dir, &mut state);
   write_state(&state_path, &state)?;
   let _ = writeln!(std::io::stderr(), "run: {}", snapshot.run_id);
   let _ = writeln!(
@@ -218,6 +219,7 @@ fn execute_snapshot(
     }
   }
   state["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
+  expri_system::store::run_capture::close_state(&snapshot.run_dir, &mut state);
   state["status"] = json!(if cancelled {
     "cancelled"
   } else if result.is_ok() {
@@ -391,6 +393,7 @@ fn start_detached(
       state["exit_code"] = json!(error.exit_code());
       state["error"] = json!(error.to_string());
       state["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
+      expri_system::store::run_capture::close_state(&snapshot.run_dir, state);
       write_state(&snapshot.run_dir.join("run-state.json"), state)?;
     }
   }

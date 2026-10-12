@@ -86,6 +86,7 @@ export type Catalog = {
   warnings: Warning[];
   access_mode?: "local" | "hosted";
   run_management_enabled?: boolean;
+  capabilities?: string[];
 };
 export type RunList = {
   source: Source;
@@ -208,7 +209,7 @@ export function artifactScopeMatchesRun(
     identity.run_id === scope.run_id
   );
 }
-export type ReviewTab = "charts" | "overview" | "logs" | "files";
+export type ReviewTab = "charts" | "system" | "overview" | "logs" | "files";
 export type WorkspaceView = "workspace" | "storage" | "system";
 export type Review = {
   kind: "run" | "compare";
@@ -226,6 +227,7 @@ export type RunRevision = {
   metrics_revision: string | null;
   stdout_revision: string | null;
   stderr_revision: string | null;
+  system_revision?: string | null;
   missing: boolean;
 };
 export type Updates = {

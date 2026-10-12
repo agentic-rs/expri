@@ -45,6 +45,10 @@ pub(super) struct QueueState {
   #[serde(default)]
   pub(super) protocol: Option<Protocol>,
   #[serde(default)]
+  pub(super) run_system_supported: Option<bool>,
+  #[serde(default)]
+  pub(super) run_system_capture: bool,
+  #[serde(default)]
   pub(super) documents: BTreeMap<String, SavedDocument>,
   #[serde(default)]
   pub(super) archive: Option<ArchiveRecord>,
@@ -84,6 +88,8 @@ impl Queue {
         files: BTreeMap::new(),
         streams: BTreeMap::new(),
         protocol: None,
+        run_system_supported: None,
+        run_system_capture: false,
         documents: BTreeMap::new(),
         archive: None,
       }

@@ -84,6 +84,14 @@ page changes cancel stale requests. Failed run-history requests do not prevent
 healthy monitor updates, and visiting System keeps the existing inspector,
 chart, and log nodes mounted. Unsupported servers show an unavailable state.
 
+Run system metrics have their own source and request lanes, so metric names cannot
+collide with user-recorded names. The inspector and comparison use captured raw
+readings with Run elapsed or Wall clock axes; they never manufacture training
+steps or change the existing first-metric elapsed axis. Full summaries are
+independent of the bounded chart preview. System's Run period mode reads the same
+retained run capture instead of the rolling machine history. Missing legacy
+captures, incomplete collection, and boundary-crossing intervals remain explicit.
+
 ## Verification
 
 Run the frontend type check, production build, and regression suite described in

@@ -62,6 +62,21 @@ pub(super) fn machines(dashboard: &impl DashboardView, query: &Query) -> Result<
   machine_reply(page, limit)
 }
 
+pub(super) fn run_system(dashboard: &impl DashboardView, query: &Query) -> Result<Reply, Reply> {
+  query.allow(&["source", "run_id", "cursor", "limit"])?;
+  let cursor = optional_integer(query, "cursor", 0)?.map(|value| value as u64);
+  let limit = limit(query, expri_runs::system_metrics::MAX_ROWS)?;
+  let response = dashboard
+    .run_system(
+      query.optional("source").unwrap_or("local"),
+      query.required("run_id")?,
+      cursor,
+      limit,
+    )
+    .map_err(service_error)?;
+  Ok(Reply::serialized(&response))
+}
+
 fn machine_reply(mut page: crate::dashboard::SystemMachines, limit: usize) -> Result<Reply, Reply> {
   let count = page_count(&page.machines, limit)?;
   if count < page.machines.len() {

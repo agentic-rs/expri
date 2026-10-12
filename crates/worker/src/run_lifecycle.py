@@ -11,6 +11,9 @@ import tempfile as _lifecycle_tempfile
 import threading as _lifecycle_threading
 import time as _lifecycle_time
 
+if "_capture_begin" not in globals():
+  from system_capture import _capture_begin, _capture_close
+
 
 def _lifecycle_now():
   return _lifecycle_datetime.datetime.now(_lifecycle_datetime.timezone.utc).isoformat()
@@ -125,6 +128,7 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
   machine_id = _lifecycle_existing_machine_id()
   if machine_id is not None:
     state["machine_id"] = machine_id
+  _capture_begin(run_dir, state)
   _lifecycle_write_json(run_dir / "run-state.json", state)
   _lifecycle_message("run: " + snapshot["run_id"])
   _lifecycle_message("run directory: " + str(run_dir))
@@ -145,6 +149,7 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
     )
   except Exception as error:
     state.update(status="failed", exit_code=1, finished_at=_lifecycle_now(), error="worker launch failed: " + str(error))
+    _capture_close(run_dir, state)
     _lifecycle_write_json(run_dir / "run-state.json", state)
     raise
   # Reap if the launcher remains alive; this thread never delays CLI/SSH exit.
@@ -157,6 +162,7 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
       if current.get("status") not in ("completed", "failed", "cancelled"):
         current.update(status="failed", exit_code=exit_code if exit_code >= 0 else 128 - exit_code,
                        finished_at=_lifecycle_now(), error="worker exited before acquiring its run lease")
+        _capture_close(run_dir, current)
         _lifecycle_write_json(run_dir / "run-state.json", current)
       raise RuntimeError(current.get("error", "worker exited before acknowledging readiness"))
     if _lifecycle_time.monotonic() >= deadline:
@@ -246,6 +252,7 @@ def execute_worker(payload, context):
         state["error"] = "run cancellation requested"
       status = "cancelled" if cancelled else ("completed" if exit_code == 0 else "failed")
       state.update(status=status, exit_code=exit_code, finished_at=_lifecycle_now())
+      _capture_close(run_dir, state)
       _lifecycle_write_json(state_path, state)
     finally:
       lease.close()

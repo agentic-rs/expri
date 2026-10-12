@@ -58,6 +58,15 @@ impl DashboardView for Dashboard {
   fn catalog(&self) -> Result<Value> {
     Dashboard::catalog(self)
   }
+  fn run_system(
+    &self,
+    source: &str,
+    run_id: &str,
+    cursor: Option<u64>,
+    limit: usize,
+  ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
+    self.run_system_metrics(source, run_id, cursor, limit)
+  }
   fn system_machines(
     &self,
     limit: usize,
@@ -172,7 +181,7 @@ impl Dashboard {
   pub fn catalog(&self) -> Result<Value> {
     let (sources, warnings) = self.sources()?;
     Ok(
-      json!({"project_name": self.project_name, "initial_source": self.initial_source,
+      json!({"project_name": self.project_name, "initial_source": self.initial_source, "capabilities":[expri_core::run_system::RUN_SYSTEM_CAPABILITY],
       "sources": sources, "warnings": bounded_warnings(&warnings)}),
     )
   }

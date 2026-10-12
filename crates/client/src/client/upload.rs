@@ -148,9 +148,29 @@ pub(super) fn sync_stream(
   source: &Path,
   terminal: bool,
 ) -> Result<()> {
+  sync_stream_up_to(api, queue, scope, path, source, terminal, None)
+}
+
+pub(super) fn sync_stream_up_to(
+  api: &Api,
+  queue: &mut Queue,
+  scope: &RunScope,
+  path: &str,
+  source: &Path,
+  terminal: bool,
+  committed_size: Option<u64>,
+) -> Result<()> {
   let mut file = fs::open(source)?;
   let size = file.metadata()?.len();
-  let size = if path == "outputs/metrics.jsonl" && !terminal {
+  if committed_size.is_some_and(|committed| committed > size) {
+    return Err(message(
+      "run stream is shorter than its durable capture checkpoint",
+    ));
+  }
+  let size = committed_size.unwrap_or(size);
+  let size = if (path == "outputs/metrics.jsonl" || path == expri_core::run_system::RUN_SYSTEM_PATH)
+    && !terminal
+  {
     closed_prefix(&mut file, size)?
   } else {
     size

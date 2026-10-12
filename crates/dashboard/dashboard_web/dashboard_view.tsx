@@ -22,6 +22,8 @@ import {
 import type { ChartAxis, ChartTimeZone } from "./interactive_charts";
 import type { SystemMonitorSnapshot } from "./system_monitor";
 import { SystemMonitorPage, type SystemMonitorActions } from "./system_monitor_view";
+import type { RunSystemSnapshot } from "./run_system";
+import { RunSystemPanel, type RunSystemActions } from "./run_system_view";
 import {
   apiUrl,
   dateText,
@@ -121,6 +123,10 @@ export type DashboardSnapshot = DashboardUi & {
   selected_files: string[];
   workspace_view: WorkspaceView;
   system_monitor: SystemMonitorSnapshot;
+  run_system: RunSystemSnapshot;
+  run_system_supported: boolean;
+  system_run_aligned: boolean;
+  system_now: number;
   storage_kind: StorageKind;
   storage_offset: number;
   storage_catalog: StorageCatalog | null;
@@ -165,6 +171,8 @@ export type DashboardActions = {
   refresh_files: () => void;
   workspace_view: (view: WorkspaceView) => void;
   system_monitor: SystemMonitorActions;
+  run_system: RunSystemActions;
+  system_alignment: (aligned: boolean) => void;
   storage_kind: (kind: StorageKind) => void;
   storage_search: (search: string) => void;
   storage_previous: () => void;
@@ -1171,8 +1179,10 @@ function ReviewWorkspace({
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
 }) {
-  const tabs: ReviewTab[] = ["charts", "overview", "logs", "files"];
-  const available: ReviewTab[] = s.review?.kind === "compare" ? ["charts"] : tabs;
+  const tabs: ReviewTab[] = ["charts", "system", "overview", "logs", "files"];
+  const available: ReviewTab[] = s.review?.kind === "compare"
+    ? s.run_system_supported ? ["charts", "system"] : ["charts"]
+    : tabs.filter(tab => tab !== "system" || s.run_system_supported);
   const review_run = s.review?.kind === "run" ? (
     s.detail && runIdentity(s.detail.run) === s.review.run_ids[0] ? s.detail.run :
       s.runs.find((run) => runIdentity(run) === s.review?.run_ids[0])
@@ -1237,8 +1247,7 @@ function ReviewWorkspace({
               onClick={() => a.tab(tab)}
               onKeyDown={(event) => moveTab(event, tab, available, a.tab, "review-tab-")}
             >
-              <Icon name={tab} />{tab[0]?.toUpperCase()}
-              {tab.slice(1)}
+              <Icon name={tab} />{tab === "system" ? "System metrics" : `${tab[0]?.toUpperCase()}${tab.slice(1)}`}
             </button>
           ))}
         </div>
@@ -1370,6 +1379,14 @@ function ReviewWorkspace({
               Hover to inspect · Drag to zoom · Click a legend entry to show or hide a run. Time views omit samples without timestamps.
             </p>
           </section>
+        </div>
+        <div
+          id="review-panel-system"
+          role="tabpanel"
+          aria-labelledby="review-tab-system"
+          hidden={s.review?.tab !== "system"}
+        >
+          <RunSystemPanel scope_id="inspector" state={s.run_system} actions={a.run_system} runs={[...s.runs, ...(s.detail ? [s.detail.run] : []), ...(s.comparison?.comparison.runs.map(row => row.run) ?? [])]} time_zone={s.time_zone} now={s.system_now} />
         </div>
         <div
           id="review-panel-overview"
@@ -1559,7 +1576,18 @@ export function DashboardView({ store, actions }: {
               <ReviewWorkspace snapshot={s} actions={actions} />
             </div>
             <div id="system-workspace" hidden={s.workspace_view !== "system"}>
-              <SystemMonitorPage state={s.system_monitor} actions={actions.system_monitor} time_zone={s.time_zone} access_mode={s.access_mode} />
+              <div className="workspace-heading"><div><h1 id="system-heading" tabIndex={-1}>System monitor</h1><p className="muted">Whole-machine readings, recorded independently of runs.</p></div></div>
+              {s.run_system_supported && s.review?.kind === "run" && <RadioTags
+                name="system_context" legend="Period scope" value={s.system_run_aligned ? "run" : "machine"}
+                options={[{ id: "system-context-run", value: "run", label: "Run period" }, { id: "system-context-machine", value: "machine", label: "All machines" }]}
+                on_change={value => actions.system_alignment(value === "run")}
+              />}
+              <div id="system-run-context" hidden={!s.system_run_aligned}>
+                <RunSystemPanel scope_id="workspace" state={s.run_system} actions={actions.run_system} runs={[...s.runs, ...(s.detail ? [s.detail.run] : [])]} time_zone={s.time_zone} now={s.system_now} />
+              </div>
+              <div id="system-machine-context" hidden={s.system_run_aligned}>
+                <SystemMonitorPage state={s.system_monitor} actions={actions.system_monitor} time_zone={s.time_zone} access_mode={s.access_mode} show_heading={false} />
+              </div>
             </div>
             <div id="storage-workspace" hidden={!storage_visible}>
               <div className="workspace-heading storage-heading">

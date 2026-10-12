@@ -34,8 +34,8 @@ const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Version normalized run metadata independently of the unchanged artifact digest.
-// Schema 2 preserves the validated physical machine identity for monitor alignment.
-const OVERVIEW_SCHEMA_VERSION: u64 = 2;
+// Schema 3 also preserves validated capture identity and completion metadata.
+const OVERVIEW_SCHEMA_VERSION: u64 = 3;
 
 struct MetricReadMode {
   minimum: usize,
@@ -53,6 +53,45 @@ pub(super) struct HostedDashboard<'a, S> {
 impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S> {
   fn catalog(&self) -> Result<Value> {
     HostedDashboard::catalog(self)
+  }
+  fn run_system(
+    &self,
+    source: &str,
+    run_id: &str,
+    cursor: Option<u64>,
+    limit: usize,
+  ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
+    let (_, scope) = self.scope(source, run_id)?;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    let state = self
+      .json_artifact(&scope, "run-state.json", STATE_LIMIT, deadline)
+      .map_err(system_profile_error)?;
+    let canonical = crate::runs::summary_from_state(&scope.run_id, state);
+    let Some(window) =
+      expri_runs::system_metrics::RunSystemWindow::from_state(&scope.run_id, &canonical["run"])
+    else {
+      return Ok(
+        expri_runs::system_metrics::RunSystemMetrics::unavailable_for_run(
+          run_id,
+          &canonical["run"],
+          "Validated run capture identity and period are unavailable.",
+        ),
+      );
+    };
+    let Some(record) = self
+      .store
+      .dashboard_artifact(&scope, expri_core::run_system::RUN_SYSTEM_PATH)
+      .map_err(system_profile_error)?
+    else {
+      return Ok(
+        expri_runs::system_metrics::RunSystemMetrics::unavailable_for_run(
+          run_id,
+          &canonical["run"],
+          "This run has no captured system observations.",
+        ),
+      );
+    };
+    self.run_system_data(&record, run_id, &window, cursor, limit, deadline)
   }
   fn system_machines(
     &self,
@@ -227,7 +266,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       );
     }
     Ok(
-      json!({"project_name": "Hosted experiments", "access_mode": "hosted", "initial_source": sources.first().map_or("", |source| source.source_id.as_str()), "sources": sources, "warnings": warnings}),
+      json!({"project_name": "Hosted experiments", "access_mode": "hosted", "capabilities":[expri_core::run_system::RUN_SYSTEM_CAPABILITY], "initial_source": sources.first().map_or("", |source| source.source_id.as_str()), "sources": sources, "warnings": warnings}),
     )
   }
 

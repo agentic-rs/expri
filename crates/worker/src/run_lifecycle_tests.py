@@ -15,6 +15,7 @@ from unittest.mock import patch
 import jobs
 import run_lifecycle
 import run_logs
+import system_capture
 
 
 SOURCE_DIR = Path(__file__).resolve().parent
@@ -117,6 +118,128 @@ class RunLifecycleTests(unittest.TestCase):
     finally:
       connection.close()
     return database
+
+  def capture_profile(self):
+    database = self.profile_identity()
+    connection = sqlite3.connect(database)
+    try:
+      connection.executescript("""
+        ALTER TABLE system_local ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE system_local ADD COLUMN inventory_revision INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE system_samples(machine_id TEXT, sequence INTEGER, observed_at_ms INTEGER, inventory_revision INTEGER, payload TEXT);
+        CREATE TABLE system_inventories(machine_id TEXT, revision INTEGER, payload TEXT);
+        CREATE TABLE system_local_quarantine(machine_id TEXT, kind TEXT, record_key INTEGER);
+      """)
+    finally:
+      connection.close()
+    return database
+
+  def test_foreground_and_detached_runs_finalize_optional_empty_capture(self):
+    self.capture_profile()
+    for detached in (False, True):
+      with self.subTest(detached=detached):
+        self.request["detach"] = detached
+        (self.repo / "task.py").write_text("print('task output')")
+        receipt = run_lifecycle.start_run(str(self.repo), self.request, fixture_context(), worker_source())
+        if detached:
+          self.run = Path(receipt["run_dir"])
+          state = self.wait_terminal()
+        else:
+          self.assertEqual(receipt, 0)
+          runs = sorted((self.repo / ".expri/runs").iterdir(), key=lambda path: path.stat().st_mtime_ns)
+          self.run = runs[-1]
+          state = self.state()
+        self.assertEqual(state["status"], "completed", state)
+        self.assertEqual(state["system_capture_status"], "complete", state)
+        records = [json.loads(line) for line in (self.run / "outputs/system-profile.jsonl").read_text().splitlines()]
+        self.assertEqual(records[0]["kind"], "capture")
+        self.assertEqual(records[0]["capture_id"], state["system_capture_id"])
+        self.assertEqual(records[0]["start_ms"], system_capture._capture_time(state["started_at"]))
+        self.assertEqual(records[-1], {"kind": "end", "end_ms": system_capture._capture_time(state["finished_at"]), "complete": True, "warnings": []})
+
+  def test_capture_io_failure_preserves_pending_state_for_recovery(self):
+    self.capture_profile()
+    run = self.repo / "run-capture"
+    (run / "outputs").mkdir(parents=True)
+    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z", "finished_at": "1970-01-01T00:00:02Z"}
+    system_capture._capture_begin(run, state)
+    with patch.object(system_capture, "_capture_checkpoint", side_effect=OSError("temporary disk failure")):
+      system_capture._capture_close(run, state)
+    self.assertEqual(state["system_capture_status"], "capturing")
+    self.assertIn("system_capture_error", state)
+    system_capture._capture_close(run, state)
+    self.assertEqual(state["system_capture_status"], "complete")
+    records = [json.loads(line) for line in (run / "outputs/system-profile.jsonl").read_text().splitlines()]
+    self.assertEqual([record["kind"] for record in records], ["capture", "end"])
+
+  def test_capture_preserves_user_output_and_refuses_unsupported_live_collector(self):
+    import fcntl
+    database = self.capture_profile()
+    run = self.repo / "run-capture"
+    (run / "outputs").mkdir(parents=True)
+    output = run / "outputs/system-profile.jsonl"
+    output.write_text("user data")
+    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z"}
+    system_capture._capture_begin(run, state)
+    self.assertNotIn("system_capture_id", state)
+    self.assertEqual(output.read_text(), "user data")
+    output.unlink()
+    with (database.parent / "collector.lock").open("wb") as lease:
+      fcntl.flock(lease, fcntl.LOCK_EX)
+      system_capture._capture_begin(run, state)
+    self.assertNotIn("system_capture_id", state)
+    self.assertFalse(output.exists())
+
+  def test_capture_fsync_does_not_hold_the_independent_collector_write_lock(self):
+    database = self.capture_profile()
+    run = self.repo / "run-capture"
+    (run / "outputs").mkdir(parents=True)
+    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z", "finished_at": "1970-01-01T00:00:02Z"}
+    system_capture._capture_begin(run, state)
+    stream_identity = (run / "outputs/system-profile.jsonl").stat().st_ino
+    fsync = system_capture._capture_os.fsync
+    collector_writes = []
+    def inspect_fsync(descriptor):
+      if os.fstat(descriptor).st_ino == stream_identity:
+        connection = sqlite3.connect(database, timeout=0)
+        try:
+          connection.execute("UPDATE system_local SET inventory_revision=inventory_revision")
+          connection.commit()
+          collector_writes.append(True)
+        finally:
+          connection.close()
+      return fsync(descriptor)
+    with patch.object(system_capture._capture_os, "fsync", side_effect=inspect_fsync):
+      system_capture._capture_close(run, state)
+    self.assertEqual(state["system_capture_status"], "complete", state)
+    self.assertGreaterEqual(len(collector_writes), 2)
+
+  def test_capture_retains_exact_window_and_counters_without_experiment_steps(self):
+    database = self.capture_profile()
+    inventory = {"revision": 1, "inventory": {"observed_at_ms": 999, "hostname": "host", "os_name": None, "os_version": None, "kernel_version": None, "architecture": "test", "cpu": {"brand": "cpu", "vendor": "test", "logical_cpu_count": 1, "physical_core_count": 1}, "memory_total_bytes": 1024, "measurement_scope": "whole machine", "devices": [], "warnings": []}}
+    connection = sqlite3.connect(database)
+    try:
+      connection.execute("INSERT INTO system_inventories VALUES(?,?,?)", ("machine-fixture", 1, json.dumps(inventory)))
+      for sequence, observed_at in enumerate([999, 1000, 1999, 2000], 1):
+        sample = {"sequence": sequence, "session_id": "session-test", "observed_at_ms": observed_at, "interval_ms": 10, "collection_duration_ms": 1, "inventory_revision": 1, "metrics": {"cpu/usage_percent": {"kind": "gauge", "value": 30}}, "counters": {"network/test/received_bytes": "18446744073709551615"}, "warnings": []}
+        connection.execute("INSERT INTO system_samples VALUES(?,?,?,?,?)", ("machine-fixture", sequence, observed_at, 1, json.dumps(sample)))
+      connection.commit()
+    finally:
+      connection.close()
+    run = self.repo / "run-capture"
+    (run / "outputs").mkdir(parents=True)
+    metrics = run / "outputs/metrics.jsonl"
+    metrics.write_text('{"step":3,"loss":0.5}\n')
+    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z", "finished_at": "1970-01-01T00:00:02Z"}
+    system_capture._capture_begin(run, state)
+    system_capture._capture_close(run, state)
+    self.assertEqual(state["system_capture_status"], "complete", state)
+    records = [json.loads(line) for line in (run / "outputs/system-profile.jsonl").read_text().splitlines()]
+    samples = [record["sample"] for record in records if record["kind"] == "sample"]
+    self.assertEqual([sample["observed_at_ms"] for sample in samples], [1000, 1999])
+    self.assertEqual(samples[0]["counters"]["network/test/received_bytes"], "18446744073709551615")
+    self.assertTrue(all("step" not in sample for sample in samples))
+    self.assertEqual(metrics.read_text(), '{"step":3,"loss":0.5}\n')
 
   def test_foreground_and_detached_runs_preserve_existing_machine_identity(self):
     database = self.profile_identity()

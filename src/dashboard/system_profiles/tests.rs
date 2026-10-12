@@ -195,3 +195,89 @@ fn system_routes_retain_the_local_host_and_origin_boundary() {
     }
   }
 }
+
+#[test]
+fn local_run_system_reads_the_retained_run_file_without_opening_global_profile_storage() {
+  use expri_core::run_system::RunSystemRecord as Record;
+  let directory = tempfile::tempdir().unwrap();
+  let missing = directory.path().join("global-missing/profiles.sqlite3");
+  let dashboard = dashboard(directory.path(), &missing);
+  let run = directory.path().join(".expri/runs/run-system");
+  fs::create_dir_all(run.join("outputs")).unwrap();
+  fs::write(run.join("run-state.json"),json!({"schema_version":1,"run_id":"run-system","task":"train","machine_id":"machine-test","system_capture_id":"capture-test","system_capture_status":"complete","status":"completed","started_at":"1970-01-01T00:00:10Z","finished_at":"1970-01-01T00:00:20Z","exit_code":0}).to_string()).unwrap();
+  let inventory = SystemInventory {
+    observed_at_ms: 10_000,
+    hostname: "retained-local".into(),
+    os_name: None,
+    os_version: None,
+    kernel_version: None,
+    architecture: "x86_64".into(),
+    cpu: CpuInventory {
+      brand: "CPU".into(),
+      vendor: "vendor".into(),
+      logical_cpu_count: 4,
+      physical_core_count: None,
+    },
+    memory_total_bytes: 1024,
+    measurement_scope: "host".into(),
+    devices: Vec::new(),
+    warnings: Vec::new(),
+  };
+  let sample = SystemSample {
+    sequence: 700,
+    session_id: "session-retained".into(),
+    observed_at_ms: 11_000,
+    interval_ms: 0,
+    collection_duration_ms: 0,
+    inventory_revision: 1,
+    metrics: BTreeMap::from([(
+      "memory/used_bytes".into(),
+      MetricReading {
+        kind: MetricKind::Gauge,
+        value: 512.0,
+      },
+    )]),
+    counters: BTreeMap::new(),
+    warnings: Vec::new(),
+  };
+  let records = vec![
+    Record::Capture {
+      schema_version: 1,
+      capture_id: "capture-test".into(),
+      machine_id: "machine-test".into(),
+      start_ms: 10_000,
+    },
+    Record::Inventory {
+      inventory: InventoryRevision {
+        revision: 1,
+        inventory,
+      },
+    },
+    Record::Sample {
+      sample: sample.clone(),
+    },
+    Record::End {
+      end_ms: 20_000,
+      complete: true,
+      warnings: Vec::new(),
+    },
+  ];
+  let mut bytes = Vec::new();
+  for record in records {
+    bytes.extend(serde_json::to_vec(&record).unwrap());
+    bytes.push(b'\n');
+  }
+  fs::write(run.join(expri_core::run_system::RUN_SYSTEM_PATH), bytes).unwrap();
+  let result = super::super::server::route_content(
+    &dashboard,
+    "/api/run-system?source=local&run_id=run-system&limit=1",
+  );
+  assert_eq!(result.status, 200);
+  let result: expri_runs::system_metrics::RunSystemMetrics =
+    serde_json::from_slice(&result.body).unwrap();
+  assert_eq!(result.status, "complete");
+  assert_eq!(result.samples, [sample]);
+  assert!(!missing.parent().unwrap().exists());
+  let before = dashboard.updates("local", &["run-system".into()]).unwrap();
+  assert!(before["runs"][0]["system_revision"].is_string());
+}

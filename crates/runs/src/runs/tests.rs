@@ -86,6 +86,46 @@ fn catalog_preserves_explicit_machine_identity_without_inferring_legacy_records(
   );
 }
 
+#[test]
+fn native_and_python_catalogs_keep_only_valid_optional_capture_metadata() {
+  let (_directory, root) = fixture();
+  let runs = root.join(".expri/runs");
+  let mut saved = state("captured", "running", "2026-10-12T00:00:00Z");
+  saved["system_capture_id"] = json!("capture-valid");
+  saved["system_capture_status"] = json!("capturing");
+  saved["system_capture_error"] = json!("collector unavailable");
+  run(&runs, "captured", Some(&saved));
+  let mut invalid = state("invalid", "running", "2026-10-12T00:00:00Z");
+  invalid["system_capture_id"] = json!("../capture");
+  invalid["system_capture_status"] = json!("success");
+  invalid["system_capture_error"] = json!("x".repeat(1025));
+  run(&runs, "invalid", Some(&invalid));
+  let report = parity(&root, &request_list(), false);
+  let valid = report["runs"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|run| run["run_id"] == "captured")
+    .unwrap();
+  assert_eq!(valid["system_capture_id"], "capture-valid");
+  assert_eq!(valid["system_capture_status"], "capturing");
+  assert_eq!(valid["system_capture_error"], "collector unavailable");
+  let invalid = report["runs"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|run| run["run_id"] == "invalid")
+    .unwrap();
+  for field in [
+    "system_capture_id",
+    "system_capture_status",
+    "system_capture_error",
+  ] {
+    assert!(invalid.get(field).is_none());
+  }
+  assert_eq!(report["warnings"].as_array().unwrap().len(), 3);
+}
+
 fn python_query(
   root: &Path,
   request: &RunQueryRequest,

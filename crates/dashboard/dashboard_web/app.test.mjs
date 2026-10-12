@@ -192,7 +192,7 @@ function chartData(label, query) {
   })), warnings: [{ run_index: 1, message: label }], warnings_truncated: false, parameter_rows: [], parameters_truncated: false };
 }
 
-async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null } = {}) {
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null, system_metrics = false } = {}) {
   const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
   const runs = project_runs ?? Array.from({ length: count }, (_, index) => ({
@@ -209,10 +209,10 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     if (overridden !== undefined && overridden !== null) return overridden;
     if (parsed.pathname === "/api/updates") return updates ? response({ catalog_revision: model.catalog_revision, source_revision: model.list_revision, ...(model.projects_status === 200 ? { storage_revision: model.storage_revision } : {}), runs: query.getAll("run_id").map(run_id => {
       const missing = model.missing_run_ids.has(run_id) || !runs.some(run => runIdentity(run) === run_id);
-      return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, missing };
+      return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, ...(system_metrics ? { system_revision: model.system_revision ?? "system-1" } : {}), missing };
     }) }) : response({ error: "Unknown endpoint" }, 404);
-    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local", run_management_enabled: model.run_management_enabled });
-    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [], run_management_enabled: model.run_management_enabled }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local", run_management_enabled: model.run_management_enabled, ...(system_metrics ? { capabilities: ["run-system-metrics-v1"] } : {}) });
+    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [], run_management_enabled: model.run_management_enabled, ...(system_metrics ? { capabilities: ["run-system-metrics-v1"] } : {}) }) : response({ error: "Project browsing unavailable" }, model.projects_status);
     if (parsed.pathname === "/api/runs/archive" || parsed.pathname === "/api/runs/restore") {
       assert.equal(options.method, "POST");
       assert.equal(options.credentials, "same-origin");
@@ -341,6 +341,149 @@ function monitorReply(request, value = 20) {
   }
   return null;
 }
+
+function retainedReply(request, version = 1, status = "complete") {
+  if (request.pathname !== "/api/run-system") return null;
+  const run_id = request.searchParams.get("run_id"), start_ms = Date.parse("2026-10-03T01:00:00Z");
+  const empty = { run_id, capture_id: null, machine_id: null, start_ms: null, end_ms: null, status: "unavailable", inventories: [], samples: [], metric_summaries: {}, sample_count: 0, next_cursor: null, warnings: [] };
+  if (status === "unavailable") return response(empty);
+  const count = Math.min(3, version + 1), cursor = Number(request.searchParams.get("cursor")), limit = Number(request.searchParams.get("limit"));
+  const all = Array.from({ length: count }, (_, index) => ({ sequence: 100 + index * 500, session_id: "retained-session", observed_at_ms: start_ms + [500, 1500, 2500][index], interval_ms: index === 0 ? 500 : 1000, collection_duration_ms: 1, inventory_revision: 1,
+    metrics: { "cpu/usage_percent": { kind: "gauge", value: 20 + index * 5 }, "network/rx_bytes": { kind: "counter_delta", value: 10_000_000 } }, counters: {}, warnings: [] }));
+  const samples = all.slice(cursor, cursor + limit), next_cursor = cursor + limit < all.length ? cursor + limit : null;
+  return response({ ...empty, capture_id: "retained-capture", machine_id: "captured-machine", start_ms, end_ms: start_ms + 3000, status,
+    inventories: samples.length ? [{ revision: 1, inventory: { observed_at_ms: start_ms, hostname: "Retained host", os_name: "Linux", os_version: null, kernel_version: null, architecture: "x86_64", cpu: { brand: "Historical CPU", vendor: "Vendor", logical_cpu_count: 8, physical_core_count: 4 }, memory_total_bytes: 16 * 1024 ** 3, measurement_scope: "host", devices: [], warnings: [] } }] : [], samples, sample_count: all.length, next_cursor,
+    metric_summaries: { "cpu/usage_percent": { kind: "gauge", count: all.length, min: 20, max: all.at(-1).metrics["cpu/usage_percent"].value, last: all.at(-1).metrics["cpu/usage_percent"].value, mean: 25, unit: "percent" }, "network/rx_bytes": { kind: "counter_delta", count: all.length, min: 10_000_000, max: 20_000_000, last: 10_000_000, mean: 12_000_000, unit: "bytes/s" } }, warnings: status === "incomplete" ? ["Collection interrupted before the run finished."] : [] });
+}
+
+test("retained System metrics are lazy, align to run start, and preserve separate experiment metrics and mounted panels", async t => {
+  const model = await reviewFixture(t, { system_metrics: true, override: request => retainedReply(request) }); await inspect(model);
+  const { nodes } = model, history = nodes.get("run-rows"), preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), counts = requestCounts(model.requests);
+  assert.equal(counts["/api/run-system"], undefined);
+  await click(nodes.get("review-tab-system"));
+  await settled(() => nodes.get("review-panel-system").querySelectorAll(".system-chart").length === 2);
+  const panel = nodes.get("review-panel-system");
+  assert.equal(panel.hidden, false); assert.equal(nodes.get("review-panel-charts").hidden, true);
+  assert.match(panel.textContent, /Historical CPU/); assert.match(panel.textContent, /captured-machine/);
+  assert.match(panel.textContent, /system\/cpu\/usage_percent/); assert.match(panel.textContent, /Run elapsed/);
+  assert.equal(panel.querySelector('input[name="inspector-run-system-axis"][value="run_elapsed"]').checked, true);
+  assert.equal(nodes.document.querySelectorAll("#inspector-run-system-axis-run_elapsed").length, 1);
+  const plot = panel.querySelector("svg"); await act(async () => plot.focus()); await emit(plot, "keydown", { key: "Home" });
+  assert.match(panel.querySelector(".system-point-inspection").textContent, /500 ms since run started/);
+  assert.doesNotMatch(panel.textContent, /training step|Global step/);
+  assert.equal(nodes.get("chart-preview"), preview); assert.equal(nodes.get("run-rows"), history);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"]);
+  assert.equal(model.requests.some(url => url.startsWith("/api/system-")), false);
+  await click(panel.querySelector('input[value="wall_clock"]'));
+  await click(panel.querySelector('input[name="inspector-run-system-time-zone"][value="utc"]'));
+  assert.match(panel.querySelector("svg").getAttribute("aria-label"), /date and time/);
+  assert.equal(panel.querySelector('input[value="wall_clock"]').checked, true, "hidden workspace radios use a distinct native group");
+  await click(nodes.get("review-tab-charts")); assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview);
+});
+
+test("System page automatically uses the selected run capture and legacy missing captures stay explicit", async t => {
+  let status = "unavailable";
+  const model = await reviewFixture(t, { system_metrics: true, override: request => retainedReply(request, 1, status) ?? monitorReply(request) }); await inspect(model);
+  const { nodes } = model;
+  await click(nodes.get("workspace-view-system")); await settled(() => nodes.get("system-run-context").textContent.includes("No retained system capture"));
+  assert.equal(nodes.get("system-context-run").checked, true);
+  assert.equal(nodes.get("system-machine-context").hidden, true); assert.equal(model.requests.some(url => url.startsWith("/api/system-")), false);
+  assert.doesNotMatch(nodes.get("system-run-context").textContent, /Recorded CPU/);
+  await click(nodes.get("system-context-machine")); await settled(() => nodes.get("system-machine-context").querySelectorAll(".system-chart").length === 2);
+  assert.equal(nodes.get("system-run-context").hidden, true); assert.match(nodes.get("system-machine-context").textContent, /Recorded CPU/);
+  status = "incomplete"; await click(nodes.get("system-context-run"));
+  await settled(() => nodes.get("system-run-context").textContent.includes("capture is incomplete"));
+  assert.match(nodes.get("system-run-context").textContent, /Collection interrupted/);
+  await click(nodes.get("workspace-view-workspace")); await click(nodes.get("close-review"));
+  await click(nodes.get("workspace-view-system")); await settled(() => nodes.get("system-machine-context").querySelector(".system-monitor").getAttribute("aria-busy") === "false");
+  assert.equal(nodes.get("system-run-context").hidden, true); assert.equal(nodes.document.getElementById("system-context-run"), null);
+});
+
+test("system_revision refreshes retained metrics independently of experiment changes and failed history or catalog", async t => {
+  let version = 1;
+  const model = await autoFixture(t, { system_metrics: true, override: request => retainedReply(request, version) }); await inspect(model);
+  const { nodes, clock } = model;
+  await click(nodes.get("review-tab-system")); await settled(() => nodes.get("review-panel-system").querySelectorAll(".system-chart").length === 2);
+  await clock.advance(5000);
+  const counts = requestCounts(model.requests), panel = nodes.get("review-panel-system"), control = panel.querySelector('input[type="checkbox"]');
+  control.focus(); model.model.metrics_revision = "experiment-only"; await clock.advance(5000);
+  assert.equal(requestCounts(model.requests)["/api/run-system"], counts["/api/run-system"]);
+  for (const path of ["/api/run", "/api/chart-data", "/api/compare", "/api/log", "/api/artifacts"]) assert.equal(requestCounts(model.requests)[path], counts[path], path);
+  assert.equal(nodes.document.activeElement, control);
+  version = 2; model.model.system_revision = "system-2"; model.model.list_revision = "history-2"; model.model.failed_list = true;
+  await clock.advance(5000);
+  assert.match(panel.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /30%/);
+  assert.match(nodes.get("updated-at").textContent, /reconnecting|retry|retrying/i);
+  const changed = requestCounts(model.requests);
+  model.model.failed_list = false; await clock.advance(10000);
+  assert.ok(requestCounts(model.requests)["/api/runs"] > changed["/api/runs"]);
+  assert.equal(requestCounts(model.requests)["/api/run-system"], changed["/api/run-system"], "healthy capture was acknowledged independently of history");
+  model.model.failed_catalog = true;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.match(nodes.get("global-error").textContent, /Catalog temporarily unavailable/);
+  assert.match(panel.textContent, /Historical CPU/);
+  assert.ok(requestCounts(model.requests)["/api/run-system"] > changed["/api/run-system"]);
+});
+
+test("comparison System metrics show full capture summaries and load only the chosen raw timeline", async t => {
+  const model = await autoFixture(t, { system_metrics: true, override: request => retainedReply(request) }), { nodes, clock } = model;
+  await selectRow(nodes, 0); await selectRow(nodes, 1); await click(nodes.get("compare-button"));
+  await settled(() => nodes.get("review-title").textContent === "2 runs");
+  const preview = nodes.get("chart-preview"), counts = requestCounts(model.requests);
+  await click(nodes.get("review-tab-system")); await settled(() => nodes.get("review-panel-system").querySelectorAll(".run-system-comparison tbody tr").length === 2 && nodes.get("review-panel-system").getAttribute("aria-busy") !== "true");
+  await settled(() => nodes.get("review-panel-system").querySelectorAll(".system-chart").length === 2);
+  const panel = nodes.get("review-panel-system"), queries = model.requests.filter(url => url.startsWith("/api/run-system")).map(url => new URL(url, "http://localhost").searchParams);
+  assert.equal(queries.find(query => query.get("run_id") === "run-1").get("limit"), "1");
+  assert.match(panel.querySelector(".run-system-comparison").textContent, /25%/);
+  await click(panel.querySelector('input[name="inspector-run-system-focus"][value="run-1"]'));
+  await settled(() => panel.querySelector('input[value="run-1"]').checked && panel.querySelector(".run-system-context").textContent.includes("run-1"));
+  await clock.advance(5000); model.model.metrics_revision = "training-only"; await clock.advance(5000);
+  assert.equal(requestCounts(model.requests)["/api/compare"], counts["/api/compare"]);
+  assert.equal(requestCounts(model.requests)["/api/chart-data"], counts["/api/chart-data"]);
+  assert.equal(nodes.get("chart-preview"), preview);
+});
+
+test("aligned System page uses its own revision and refreshes healthy captures without hidden inspector traffic", async t => {
+  let version = 1;
+  const model = await autoFixture(t, { system_metrics: true, override: request => retainedReply(request, version) ?? monitorReply(request) }); await inspect(model);
+  const { nodes, clock } = model;
+  await click(nodes.get("workspace-view-system"));
+  await settled(() => nodes.get("system-run-context").querySelectorAll(".system-chart").length === 2);
+  await clock.advance(5000);
+  const counts = requestCounts(model.requests), panel = nodes.get("system-run-context");
+  model.model.metrics_revision = "training-only"; model.model.metadata_revision = "metadata-2"; model.model.system_revision = "system-2";
+  model.model.list_revision = "list-2"; model.model.failed_list = true; version = 2;
+  await clock.advance(5000);
+  assert.match(panel.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /30%/);
+  for (const path of ["/api/run", "/api/chart-data", "/api/compare", "/api/log", "/api/artifacts", "/api/system-history"]) assert.equal(requestCounts(model.requests)[path], counts[path], path);
+  const captured_reads = requestCounts(model.requests)["/api/run-system"];
+  model.model.failed_list = false; await clock.advance(10000);
+  assert.equal(requestCounts(model.requests)["/api/run-system"], captured_reads);
+  assert.equal(nodes.get("system-context-run").checked, true);
+});
+
+test("recorded system-prefixed training names stay separate from retained System source summaries", async t => {
+  let model;
+  model = await reviewFixture(t, { system_metrics: true, override: request => {
+    if (request.pathname === "/api/run" && model) {
+      const record = detailRecord(model.sources[0], model.runs[0]);
+      record.metrics["system/cpu/usage_percent"] = { count: 1, last: { step: 100, value: 99 }, min: { step: 100, value: 99 }, max: { step: 100, value: 99 } };
+      record.metric_count = 3;
+      return response(record);
+    }
+    return retainedReply(request);
+  } });
+  await inspect(model); const { nodes } = model;
+  assert.match(nodes.get("run-metric-options").textContent, /system\/cpu\/usage_percent/);
+  const names = chartQuery(nodes).getAll("metric");
+  await click(nodes.get("review-tab-system"));
+  await settled(() => nodes.get("review-panel-system").querySelector(".system-chart"));
+  assert.match(nodes.get("review-panel-system").querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /25%/);
+  assert.match(nodes.get("review-panel-system").querySelector(".system-metric-picker").textContent, /system\/cpu\/usage_percent/);
+  await click(nodes.get("review-tab-charts"));
+  assert.deepEqual(chartQuery(nodes).getAll("metric"), names);
+  assert.match(nodes.get("run-metric-options").textContent, /system\/cpu\/usage_percent/);
+});
 
 test("System loads only on demand, preserves full history and inspector nodes, and supports semantic chart inspection", async t => {
   const model = await reviewFixture(t, { hosted: true, projects: true, override: request => monitorReply(request) }), { nodes } = model;

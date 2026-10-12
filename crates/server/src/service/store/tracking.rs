@@ -11,6 +11,7 @@ use super::*;
 
 mod projection;
 mod raw_io;
+mod run_system;
 
 use projection::{index_metrics, seal_metric_tail};
 use raw_io::{append_raw, io_error, open_raw};
@@ -436,6 +437,10 @@ impl<S: ObjectStorage> Store<S> {
       ) {
         return Err(ApiError::new(409, "run is not terminal"));
       }
+      if state["system_capture_id"].is_string() && state["system_capture_status"] == "capturing" {
+        return Err(ApiError::new(409, "run system capture is still draining"));
+      }
+      run_system::validate_seal(&self.directory, &files, &state)?;
       for record in &files {
         if let FileTarget::Run { path, .. } = &record.target
           && stream_path(path)

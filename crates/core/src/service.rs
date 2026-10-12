@@ -435,7 +435,10 @@ pub fn validate_target(target: &FileTarget) -> crate::error::Result<()> {
 pub fn stream_path(path: &str) -> bool {
   matches!(
     path,
-    "outputs/metrics.jsonl" | "logs/stdout.log" | "logs/stderr.log"
+    "outputs/metrics.jsonl"
+      | "outputs/system-profile.jsonl"
+      | "logs/stdout.log"
+      | "logs/stderr.log"
   )
 }
 

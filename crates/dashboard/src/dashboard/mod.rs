@@ -30,6 +30,18 @@ pub struct Source {
 /// Shared dashboard views keep local and hosted routes on the same API contract.
 pub trait DashboardView {
   fn catalog(&self) -> Result<Value>;
+  fn run_system(
+    &self,
+    _source: &str,
+    run_id: &str,
+    _cursor: Option<u64>,
+    _limit: usize,
+  ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
+    Ok(expri_runs::system_metrics::RunSystemMetrics::unavailable(
+      run_id,
+      "Run system observations are unavailable for this dashboard.",
+    ))
+  }
   fn system_machines(
     &self,
     _limit: usize,

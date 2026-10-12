@@ -7,6 +7,85 @@ use serde_json::json;
 
 mod outage;
 
+#[test]
+fn exact_run_capture_retries_survive_restart_and_seal_only_after_drain() {
+  use expri_core::run_system::{RUN_SYSTEM_PATH, RunSystemRecord};
+  let dir = tempfile::tempdir().unwrap();
+  let store = Store::open(dir.path(), MockStorage::default()).unwrap();
+  let mut bytes = serde_json::to_vec(&RunSystemRecord::Capture {
+    schema_version: 1,
+    capture_id: "capture-1".into(),
+    machine_id: "machine-1".into(),
+    start_ms: 0,
+  })
+  .unwrap();
+  bytes.push(b'\n');
+  append(&store, RUN_SYSTEM_PATH, 0, &bytes).unwrap();
+  // Replay a lost acknowledgement without duplicating the raw prefix.
+  append(&store, RUN_SYSTEM_PATH, 0, &bytes).unwrap();
+  put(&store, "run-state.json", 1, &serde_json::to_vec(&json!({"status":"completed","system_capture_id":"capture-1","system_capture_status":"capturing","machine_id":"machine-1","started_at":"1970-01-01T00:00:00Z","finished_at":"1970-01-01T00:00:01Z"})).unwrap());
+  assert_eq!(seal(&store, false).unwrap_err().status, 409);
+  drop(store);
+  let store = Store::open(dir.path(), MockStorage::default()).unwrap();
+  put(&store, "run-state.json", 2, &serde_json::to_vec(&json!({"status":"completed","system_capture_id":"capture-1","system_capture_status":"complete","machine_id":"machine-1","started_at":"1970-01-01T00:00:00Z","finished_at":"1970-01-01T00:00:01Z"})).unwrap());
+  assert_eq!(seal(&store, false).unwrap_err().status, 409);
+  let mut end = serde_json::to_vec(&RunSystemRecord::End {
+    end_ms: 1000,
+    complete: true,
+    warnings: Vec::new(),
+  })
+  .unwrap();
+  end.push(b'\n');
+  append(&store, RUN_SYSTEM_PATH, bytes.len() as u64, &end).unwrap();
+  bytes.extend_from_slice(&end);
+  seal(&store, false).unwrap();
+  let record = store.file(&run_target(RUN_SYSTEM_PATH)).unwrap();
+  assert_eq!(record.size, bytes.len() as u64);
+  assert!(matches!(
+    record.storage,
+    FileStorage::Tracking { sealed: true, .. }
+  ));
+  let Response::Stream {
+    data_base64,
+    total_size,
+    ..
+  } = store
+    .execute(Request::ReadStream {
+      scope: scope(),
+      path: RUN_SYSTEM_PATH.into(),
+      offset: 0,
+      limit: STREAM_BATCH,
+    })
+    .unwrap()
+  else {
+    panic!("capture read expected")
+  };
+  assert_eq!(total_size, bytes.len() as u64);
+  assert_eq!(
+    base64::engine::general_purpose::STANDARD
+      .decode(data_base64)
+      .unwrap(),
+    bytes
+  );
+  assert_eq!(
+    store
+      .db()
+      .unwrap()
+      .query_row("SELECT COUNT(*) FROM tracking_metric_rows", [], |row| row
+        .get::<_, u64>(
+        0
+      ))
+      .unwrap(),
+    0
+  );
+  assert_eq!(
+    append(&store, RUN_SYSTEM_PATH, bytes.len() as u64, b"tail\n")
+      .unwrap_err()
+      .status,
+    409
+  );
+}
+
 fn run_target(path: &str) -> FileTarget {
   FileTarget::Run {
     scope: scope(),

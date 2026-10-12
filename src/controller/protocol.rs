@@ -3,6 +3,22 @@ use crate::error::{ExpriError, Result};
 use crate::protocol::{EnvironmentCommandRequest, RunQueryRequest};
 use crate::shell;
 
+/// Keep bundled fallback programs below SSH/Linux's single-argument limit,
+/// including nested source strings used by detached workers.
+pub(crate) fn python_script_string(script: &str) -> String {
+  use base64::{Engine, engine::general_purpose::STANDARD};
+  use flate2::{Compression, write::ZlibEncoder};
+  use std::io::Write;
+  let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+  encoder
+    .write_all(script.as_bytes())
+    .expect("encode bundled Python source");
+  let encoded = STANDARD.encode(encoder.finish().expect("finish bundled Python source"));
+  format!(
+    "__import__('zlib').decompress(__import__('base64').b64decode('{encoded}')).decode('utf-8')"
+  )
+}
+
 trait RemoteProtocol {
   fn name(&self) -> &'static str;
   fn apply_sync(&self, remote: &Remote, request_path: &str) -> Result<()>;
@@ -167,7 +183,7 @@ except (OSError, ValueError) as error:
   print(str(error), file=sys.stderr)
   sys.exit(1)
 "#,
-    catalog = serde_json::to_string(crate::runs::CATALOG_SCRIPT).expect("catalog script"),
+    catalog = python_script_string(crate::runs::CATALOG_SCRIPT),
     request = serde_json::to_string(&serde_json::to_string(request).expect("run query"))
       .expect("query string"),
   )
@@ -481,8 +497,7 @@ try:
 }
 
 fn python_environment_preamble() -> String {
-  let runtime =
-    serde_json::to_string(crate::environment::RUNTIME_SCRIPT).expect("runtime script string");
+  let runtime = python_script_string(crate::environment::RUNTIME_SCRIPT);
   let env_remove =
     serde_json::to_string(crate::environment::ENV_REMOVE).expect("environment variable names");
   format!(
@@ -537,14 +552,10 @@ def prepare_environment(environment, repo_root, state_dir, extras, sync_args, in
 
 pub(crate) fn python_run_script(request_path: &str) -> String {
   let request_path = serde_json::to_string(request_path).expect("request path string");
-  let snapshot =
-    serde_json::to_string(expri_worker::SNAPSHOT_SCRIPT).expect("snapshot script string");
-  let maintenance =
-    serde_json::to_string(expri_worker::MAINTENANCE_SCRIPT).expect("maintenance script string");
-  let run_logs =
-    serde_json::to_string(expri_worker::RUN_LOGS_SCRIPT).expect("run logging script string");
-  let lifecycle =
-    serde_json::to_string(expri_worker::RUN_LIFECYCLE_SCRIPT).expect("run lifecycle script string");
+  let snapshot = python_script_string(expri_worker::SNAPSHOT_SCRIPT);
+  let maintenance = python_script_string(expri_worker::MAINTENANCE_SCRIPT);
+  let run_logs = python_script_string(expri_worker::RUN_LOGS_SCRIPT);
+  let lifecycle = python_script_string(&expri_worker::run_lifecycle_script());
   let common = format!(
     r#"import json, os, pathlib, subprocess, sys
 {preamble}
@@ -569,7 +580,7 @@ raise SystemExit(lifecycle_module["execute_worker"](payload, context))
 "#,
   )
   .expect("worker script string");
-  let common = serde_json::to_string(&common).expect("run script string");
+  let common = python_script_string(&common);
   format!(
     r#"RUN_SOURCE = {common}
 exec(RUN_SOURCE)
@@ -591,8 +602,7 @@ pub(crate) fn python_environment_script(request: &EnvironmentCommandRequest) -> 
   let request =
     serde_json::to_string(&serde_json::to_string(request).expect("environment request"))
       .expect("request string");
-  let maintenance =
-    serde_json::to_string(expri_worker::MAINTENANCE_SCRIPT).expect("maintenance script string");
+  let maintenance = python_script_string(expri_worker::MAINTENANCE_SCRIPT);
   python_preserve_command_exit_code(format!(
     r#"import json, os, pathlib, subprocess, sys
 {preamble}
