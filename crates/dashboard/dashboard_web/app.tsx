@@ -429,7 +429,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       discardDeepLink();
       cancelRefresh();
       clearSelectionTimeout();
-      void openRun(id);
+      const aligned_system = workspace_view === "system" && system_run_aligned;
+      const system_tab = run_system_supported && (aligned_system || (workspace_view === "workspace" && review?.tab === "system"));
+      const return_to_runs = workspace_view !== "workspace" && !aligned_system;
+      void openRun(id, "inspection", undefined, system_tab ? "system" : "charts");
+      if (return_to_runs) actions.workspace_view("workspace");
     },
     clear_selection: () => {
       discardDeepLink();
@@ -1015,6 +1019,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     kind: "run" | "compare",
     ids: string[],
     origin: Review["origin"] = "inspection",
+    tab: ReviewTab = "charts",
   ): void {
     resetArchivalAction();
     resetAnnotationsAction();
@@ -1037,10 +1042,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       run_ids: ids,
       metric_names: [],
       metric_selection_set: false,
-      tab: "charts",
+      tab,
       log_stream: "stdout",
     };
-    system_run_aligned = false;
+    system_run_aligned = workspace_view === "system" && tab === "system";
     run_system_revisions.clear();
     run_system_snapshots.clear();
     syncRunSystemMode();
@@ -1389,8 +1394,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     id: string,
     origin: Review["origin"] = "inspection",
     previous?: Review,
+    tab: ReviewTab = "charts",
   ): Promise<void> {
-    beginReview("run", [id], origin);
+    beginReview("run", [id], origin, tab);
     if (previous && review) {
       review.metric_names = [...previous.metric_names];
       review.metric_selection_set = previous.metric_selection_set;

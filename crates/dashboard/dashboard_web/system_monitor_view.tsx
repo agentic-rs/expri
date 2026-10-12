@@ -66,9 +66,10 @@ function sampledPoints(points: SystemPoint[], maximum = 600): SystemPoint[] {
   const indices = [...retained].sort((a, b) => a - b);
   return indices.map((index, position) => ({ ...points[index]!, break_before: points.slice(indices[position - 1] ?? index, index + 1).some(point => point.break_before) }));
 }
-export function SystemPlot({ series, start_ms, end_ms, resolution, time_zone, x_axis = "wall_clock", title_label }: {
+export function SystemPlot({ series, start_ms, end_ms, resolution, time_zone, x_axis = "wall_clock", title_label, summary_last }: {
   series: SystemSeries; start_ms: number; end_ms: number; resolution: SystemResolution; time_zone: ChartTimeZone;
   x_axis?: "run_elapsed" | "wall_clock"; title_label?: string;
+  summary_last?: number | null;
 }) {
   const [active_index, setActiveIndex] = useState<number | null>(null);
   const range: ChartRange = x_axis === "run_elapsed"
@@ -83,9 +84,10 @@ export function SystemPlot({ series, start_ms, end_ms, resolution, time_zone, x_
   for (const point of points) { if (!segments.length || point.break_before) segments.push([]); segments.at(-1)!.push(point); }
   const active = active_index === null ? null : points[Math.min(active_index, points.length - 1)] ?? null;
   const last = series.points.at(-1);
+  const last_value = summary_last === undefined ? last?.value : summary_last;
   const coverage_ms = series.points.reduce((sum, point) => sum + point.coverage_ms, 0);
   return <section className="system-chart evidence-panel" data-system-metric={series.metric_name}>
-    <header className="metric-chart-header"><h2>{title_label ?? series.metric_name}</h2>{last && <div className="metric-chart-summary"><span>{resolution === "hourly" ? "Latest mean" : "Last"}</span><strong>{systemMetricValue(last.value, series.metric_name, series.kind)}</strong></div>}</header>
+    <header className="metric-chart-header"><h2>{title_label ?? series.metric_name}</h2>{last_value !== undefined && <div className="metric-chart-summary"><span>{resolution === "hourly" ? "Latest mean" : "Last"}</span><strong>{last_value === null ? "—" : systemMetricValue(last_value, series.metric_name, series.kind)}</strong></div>}</header>
     <svg viewBox="-120 0 840 285" role="img" tabIndex={0} aria-label={`${title_label ?? series.metric_name}, ${resolution === "hourly" ? "hourly means" : "recorded samples"}, ${x_axis === "run_elapsed" ? "time since run started" : "date and time"}. Use left and right arrows to inspect readings.`}
       onPointerMove={event => {
         const bounds = event.currentTarget.getBoundingClientRect(), target = (event.clientX - bounds.left) / bounds.width * 840 - 120;

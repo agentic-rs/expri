@@ -732,9 +732,8 @@ function RunBrowser({
                       disabled={s.list_busy}
                       title={runLabel(run)}
                       onClick={() => {
-                        if (s.workspace_view !== "workspace") a.workspace_view("workspace");
                         a.inspect_run(identity);
-                        revealOnCompactLayout("review-title");
+                        revealOnCompactLayout(s.workspace_view === "system" && s.system_run_aligned ? "system-heading" : "review-title");
                       }}
                     >
                       {runNickname(run) ?? run.run_id}

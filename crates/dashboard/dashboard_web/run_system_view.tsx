@@ -66,7 +66,7 @@ export function RunSystemPanel({ state: s, actions: a, runs, time_zone, now, sco
     {item?.preview_truncated && <p className="notice warning">The chart preview shows the first 8192 retained readings or its bounded byte window. Summary values cover the complete capture.</p>}
     <div className="system-charts">{item && data?.start_ms !== null && s.selected_metrics.map(name => {
       const series = item.series.find(series => series.metric_name === name);
-      return series?.points.length ? <SystemPlot key={`${s.focused_run_id}:${name}:${s.x_axis}`} series={series} start_ms={data!.start_ms!} end_ms={runSystemEnd(data!, now)} resolution="detail" time_zone={time_zone} x_axis={s.x_axis} title_label={`system/${name}`} /> : <p className="notice" key={name}>system/{name}: no displayed readings in this capture.</p>;
+      return series?.points.length ? <SystemPlot key={`${s.focused_run_id}:${name}:${s.x_axis}`} series={series} start_ms={data!.start_ms!} end_ms={runSystemEnd(data!, now)} resolution="detail" time_zone={time_zone} x_axis={s.x_axis} title_label={`system/${name}`} summary_last={ownSummary(data!.metric_summaries, name)?.last ?? null} /> : <p className="notice" key={name}>system/{name}: no displayed readings in this capture.</p>;
     })}</div>
     {!s.loading && data && data.status !== "unavailable" && !s.metric_names.length && <p className="notice">No system metric readings were recorded during this run.</p>}
   </section>;

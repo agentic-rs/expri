@@ -90,15 +90,24 @@ test("comparison fetches complete summaries cheaply and only expands the focused
 });
 
 test("byte-limited paging stops at sixteen pages and refreshes full summaries without losing its bounded preview", async t => {
-  let pages = 0;
+  let pages = 0, end_ms = START + 1_000_000, sample_count = 1000; const queries = [];
   const m = monitor(t, async url => {
-    pages++; const cursor = Number(new URL(url, "http://localhost").searchParams.get("cursor"));
-    return reply({ ...capture(undefined, [sample(10_000 + cursor, cursor + 1)]), sample_count: 1000, next_cursor: cursor + 1 });
+    pages++; const query = new URL(url, "http://localhost").searchParams; queries.push(query);
+    const cursor = Number(query.get("cursor"));
+    return reply({ ...capture(undefined, [sample(10_000 + cursor, cursor + 1)]), end_ms, sample_count, next_cursor: cursor + 1 < sample_count ? cursor + 1 : null });
   });
   await settled(() => !m.snapshot().loading);
   assert.equal(pages, 16); assert.equal(m.snapshot().items["worker:run-a"].preview_truncated, true);
   const original = m.snapshot().items["worker:run-a"].data.samples;
   await m.refresh(true); assert.equal(pages, 17); assert.deepEqual(m.snapshot().items["worker:run-a"].data.samples, original);
+  assert.equal(queries.at(-1).get("limit"), "1", "quiet truncated refresh reads one full-summary page");
+  end_ms -= 60_000;
+  await m.refresh(true); assert.equal(pages, 34, "a changed canonical window reloads its bounded preview once");
+  assert.equal(m.snapshot().items["worker:run-a"].data.end_ms, end_ms);
+  sample_count = 10;
+  await m.refresh(true); assert.equal(pages, 45, "a truncated source regression resets previously retained readings");
+  assert.equal(m.snapshot().items["worker:run-a"].data.samples.length, 10);
+  assert.equal(m.snapshot().items["worker:run-a"].preview_truncated, false);
 });
 
 test("quiet refresh supersedes foreground work and clears loading; old source responses cannot restore a capture", async t => {

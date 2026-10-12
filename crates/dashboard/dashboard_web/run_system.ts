@@ -127,7 +127,7 @@ export class RunSystemMonitor {
           const value = await lane.runJson<unknown>(apiUrl("/api/run-system", { source, run_id, cursor, limit: Math.max(1, limit) }), READ_LIMIT, READ_LIMIT_MESSAGE);
           if (value === undefined || !current()) return "cancelled";
           const page = parseRunSystem(value, run_id);
-          if (previous && (page.capture_id !== previous.data.capture_id || page.start_ms !== previous.data.start_ms || page.machine_id !== previous.data.machine_id || page.sample_count < previous.cursor)) {
+          if (previous && (page.capture_id !== previous.data.capture_id || page.start_ms !== previous.data.start_ms || page.end_ms !== previous.data.end_ms || page.machine_id !== previous.data.machine_id || page.sample_count < previous.data.sample_count)) {
             previous = undefined; retained = []; inventories.clear();
             if (cursor > 0 || summary_only) {
               if (++restarts > 1) invalid();

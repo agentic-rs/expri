@@ -643,8 +643,8 @@ def artifact_files(browser, run_id):
         ? sticky.getBoundingClientRect().height : 0;
       window.scrollTo(0, Math.max(0, scrollY + card.getBoundingClientRect().top - offset - 12));''')
   start = len(trace_records())
-  browser.keys('#review-tab-charts', '\ue010')  # End selects the fourth tab.
-  wait_for(lambda: evaluate("return document.querySelector('#review-tab-files').getAttribute('aria-selected') === 'true';"), 'End did not select the fourth Files tab')
+  browser.keys('#review-tab-charts', '\ue010')  # End selects the last enabled tab.
+  wait_for(lambda: evaluate("return document.querySelector('#review-tab-files').getAttribute('aria-selected') === 'true';"), 'End did not select the last Files tab')
   row = wait_for(checkpoint_row, 'Files did not show the published checkpoint')
   assert row['size'] == '17 MiB', 'checkpoint size did not use the expected binary unit'
   assert 'Cloud' in row['locations'] and 'Worker (reported)' in row['locations'] and 'Local' not in row['locations'], 'hosted availability claimed local browser files or omitted reported worker data'
@@ -716,7 +716,7 @@ def artifact_files(browser, run_id):
       browser.call('POST', '/window', {'handle': handle})
       browser.call('DELETE', '/window')
   browser.call('POST', '/window', {'handle': original_window})
-  print('Firefox Files passed: lazy inventory, fourth keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
+  print('Firefox Files passed: lazy inventory, last keyboard tab, reported locations, selected CLI, exact 17 MiB checkpoint and acknowledged result ZIP.', flush=True)
 
 
 def project_storage(run_id=None):
@@ -1029,8 +1029,23 @@ def workspace(run_id, second_run_id):
     assert visible('#review-panel-charts') and not visible('#review-panel-overview'), 'inspection did not open Charts first'
     assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'chart review eagerly fetched logs'
     assert not any(record['path'] == '/api/artifacts' for record in trace_records()[start:]), 'chart review eagerly fetched files'
-    browser.call('POST', '/element/' + browser.element('#review-tab-charts') + '/value', {'text': '\ue014'})
-    wait_for(lambda: visible('#review-panel-overview'), 'review tabs do not support ArrowRight')
+    assert not any(record['path'] == '/api/run-system' for record in trace_records()[start:]), 'chart review eagerly fetched system metrics'
+    browser.keys('#review-tab-charts', '\ue014')
+    wait_for(lambda: visible('#review-panel-system'), 'ArrowRight from Charts did not open System metrics')
+    assert evaluate('''const tab = document.querySelector('#review-tab-system');
+      const panel = document.querySelector('#review-panel-system');
+      return document.activeElement === tab && tab.getAttribute('aria-selected') === 'true'
+        && tab.tabIndex === 0 && document.querySelector('#review-tab-charts').tabIndex === -1
+        && document.querySelectorAll('.review-tabs [role="tab"][tabindex="0"]').length === 1
+        && tab.getAttribute('aria-controls') === panel.id
+        && panel.getAttribute('aria-labelledby') === tab.id;'''), 'System metrics keyboard navigation lost focus, selection, or panel association'
+    wait_for(lambda: any(record['path'] == '/api/run-system' for record in trace_records()[start:]), 'System metrics did not lazily request the selected run capture')
+    assert not visible('#review-panel-charts') and not visible('#review-panel-overview'), 'System metrics left another review panel visible'
+    assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'System metrics eagerly fetched logs'
+    assert not any(record['path'] == '/api/artifacts' for record in trace_records()[start:]), 'System metrics eagerly fetched files'
+    browser.keys('#review-tab-system', '\ue014')
+    wait_for(lambda: visible('#review-panel-overview'), 'ArrowRight from System metrics did not open Overview')
+    assert evaluate("return document.activeElement === document.querySelector('#review-tab-overview');"), 'Overview keyboard navigation lost focus'
     assert 'learning_rate' in evaluate("return document.querySelector('#run-detail').textContent;"), 'Overview omitted parameters'
     assert not any(record['path'] == '/api/log' for record in trace_records()[start:]), 'Overview eagerly fetched logs'
     browser.click('#review-tab-logs')
@@ -1123,7 +1138,7 @@ def workspace(run_id, second_run_id):
       compact_focus_visible(browser, 'review-title', width)
       browser.click('#close-review')
       compact_focus_visible(browser, 'runs-heading', width)
-    print('Firefox workspace passed: parent-rendered comparison, exact hover, native legend/zoom/keyboard, duplicate coordinates, dashboard/standalone CSP, lazy logs, refresh/selection cleanup, desktop/narrow layout.', flush=True)
+    print('Firefox workspace passed: parent-rendered comparison, exact hover, native legend/zoom/keyboard, System metrics tab focus and lazy capture loading, duplicate coordinates, dashboard/standalone CSP, lazy logs, refresh/selection cleanup, desktop/narrow layout.', flush=True)
   finally:
     browser.close()
 
