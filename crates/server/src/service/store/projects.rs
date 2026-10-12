@@ -295,6 +295,7 @@ impl<S: ObjectStorage> Store<S> {
   pub(super) fn request_project(&self, request: &Request) -> ApiResult<Option<String>> {
     let project = match request {
       Request::Capabilities
+      | Request::Queue { .. }
       | Request::BrowseRuns { .. }
       | Request::BrowseRunFiles { .. }
       | Request::ProjectStorage { .. }
@@ -393,6 +394,11 @@ impl<S: ObjectStorage> Store<S> {
         params![project_id, expected_revision],
       )
       .map_err(database)?;
+    super::resource_queue::cancel_project(
+      &transaction,
+      project_id,
+      super::resource_queue::now_ms(),
+    )?;
     let protected = outside_references("candidate.object_key");
     transaction.execute(&format!("INSERT OR IGNORE INTO project_cleanup_tasks(project_id,kind,value)
       SELECT ?1,'object',object_key FROM (SELECT object_key FROM files WHERE {TARGET_PROJECT}=?1 AND json_extract(record,'$.storage')='object' UNION SELECT object_key FROM uploads WHERE {TARGET_PROJECT}=?1) AS candidate WHERE NOT ({protected})"), [project_id]).map_err(database)?;

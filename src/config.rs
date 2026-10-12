@@ -128,12 +128,14 @@ pub struct TaskOptionsConfig {
   pub command: Vec<String>,
   #[serde(default)]
   pub uv: bool,
+  pub resources: Option<crate::queue_cli::ResourceDefaults>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TaskConfig {
   pub command: Vec<String>,
   pub uv: bool,
+  pub resources: Option<crate::queue_cli::ResourceDefaults>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,10 +337,12 @@ impl From<&TaskDefinition> for TaskConfig {
       TaskDefinition::Command(command) => Self {
         command: command.clone(),
         uv: false,
+        resources: None,
       },
       TaskDefinition::Options(options) => Self {
         command: options.command.clone(),
         uv: options.uv,
+        resources: options.resources.clone(),
       },
     }
   }

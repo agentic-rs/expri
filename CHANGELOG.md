@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `run --queue` freezes source and submits managed tasks to a shared server queue.
+  Foreground `queue daemon` workers reserve logical CPU slots, memory, and whole
+  GPUs from explicit budgets, with automatic placement or worker/device pins.
+  `queue list`, `show`, `workers`, and `cancel` report tables or `--json`.
+  Durable claims and launch journals prevent duplicate execution on retries;
+  uncertain attempts retain reservations until reconciliation or confirmed recovery.
+  Back up the service data directory before upgrading to SQLite schema 8.
+
 - `run --smoke` marks managed runs and generates `smoke-run-…` IDs. An updated
   server automatically archives finished published smoke runs with the existing
   15-day retention, including failed and cancelled runs; worker files remain

@@ -18,19 +18,22 @@ pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
     .ok_or_else(|| message("service client configuration file is missing"))?;
   let table: toml::Table =
     toml::from_str(&text).map_err(|_| message("service client configuration is invalid"))?;
-  let config =
-    if table.is_empty() || table.contains_key("server") || table.contains_key("system_profile") {
-      let global: GlobalConfig =
-        toml::from_str(&text).map_err(|_| message("global expri configuration is invalid"))?;
-      global.validate()?;
-      let server = global.server.ok_or_else(|| message(NO_SERVER))?;
-      if server.token.is_none() && server.token_env.is_none() {
-        return Err(message(NO_CREDENTIAL));
-      }
-      server
-    } else {
-      toml::from_str(&text).map_err(|_| message("service client configuration is invalid"))?
-    };
+  let config = if table.is_empty()
+    || table.contains_key("server")
+    || table.contains_key("system_profile")
+    || table.contains_key("queue_worker")
+  {
+    let global: GlobalConfig =
+      toml::from_str(&text).map_err(|_| message("global expri configuration is invalid"))?;
+    global.validate()?;
+    let server = global.server.ok_or_else(|| message(NO_SERVER))?;
+    if server.token.is_none() && server.token_env.is_none() {
+      return Err(message(NO_CREDENTIAL));
+    }
+    server
+  } else {
+    toml::from_str(&text).map_err(|_| message("service client configuration is invalid"))?
+  };
   config.validate()?;
   Ok(config)
 }

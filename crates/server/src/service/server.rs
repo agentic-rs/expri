@@ -397,6 +397,7 @@ fn authorize<S: ObjectStorage>(
       ..
     } => worker.project_id == scope.project_id && worker.origin == scope.origin,
     Request::ReferenceFile { .. }
+    | Request::Queue { .. }
     | Request::ImportOutput { .. }
     | Request::ProjectStorage { .. }
     | Request::PreviewProjectDelete { .. }
@@ -1024,6 +1025,80 @@ mod tests {
     request
       .body(serde_json::to_vec(operation).unwrap())
       .unwrap()
+  }
+
+  #[test]
+  fn execution_queue_requires_owner_credentials_for_reads_and_claims() {
+    use expri_core::resource_queue::QueueRequest;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let mut auth = auth();
+    auth.machines.push((
+      b"machine-token-with-at-least-24-characters".to_vec(),
+      MachineAuth {
+        machine_id: "machine-one".into(),
+        token_env: "unused".into(),
+      },
+    ));
+    for operation in [
+      QueueRequest::ListJobs {
+        project_id: None,
+        status: None,
+        cursor: None,
+        limit: 10,
+      },
+      QueueRequest::ListWorkers {
+        cursor: None,
+        limit: 10,
+      },
+      QueueRequest::Claim {
+        worker_id: "worker".into(),
+        session_id: "session".into(),
+        claim_id: "claim".into(),
+      },
+      QueueRequest::Recover {
+        attempt_id: "attempt".into(),
+        confirmed_stopped: true,
+      },
+    ] {
+      let operation = Request::Queue { request: operation };
+      assert!(authorize_role(&store, Role::Owner, &operation).is_ok());
+      assert!(authorize_role(&store, Role::IssuedOwner { digest: [0; 32] }, &operation).is_ok());
+      for token in [
+        "worker-token-with-at-least-24-characters",
+        "machine-token-with-at-least-24-characters",
+      ] {
+        assert_eq!(
+          route(&store, &auth, request(Some(token), &operation))
+            .unwrap_err()
+            .status,
+          403
+        );
+      }
+      assert_eq!(
+        route(&store, &auth, request(None, &operation))
+          .unwrap_err()
+          .status,
+        401
+      );
+    }
+    let operation = Request::Queue {
+      request: QueueRequest::ListJobs {
+        project_id: None,
+        status: None,
+        cursor: None,
+        limit: 10,
+      },
+    };
+    assert!(
+      route(
+        &store,
+        &auth,
+        request(Some("owner-token-with-at-least-24-characters"), &operation)
+      )
+      .is_ok()
+    );
   }
 
   #[test]

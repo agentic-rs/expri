@@ -18,6 +18,7 @@ mod cli_credentials;
 mod dashboard_storage;
 mod projects;
 mod references;
+mod resource_queue;
 mod run_annotations;
 mod run_retention;
 mod system_profiles;
@@ -27,7 +28,7 @@ const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
-pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 7;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 8;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -200,6 +201,7 @@ impl<S: ObjectStorage> Store<S> {
     projects::initialize(&connection)?;
     run_annotations::initialize(&connection)?;
     run_retention::initialize(&connection)?;
+    resource_queue::initialize(&connection)?;
     expri_system::store::initialize(&connection)?;
     asset_imports::initialize(&directory, &connection)?;
     cli_credentials::initialize(&connection)?;
@@ -958,7 +960,11 @@ impl<S: ObjectStorage> Store<S> {
           expri_core::run_system::RUN_SYSTEM_CAPABILITY.into(),
           "run-annotations-v1".into(),
           expri_core::service_catalog::SERVICE_CATALOG_CAPABILITY.into(),
+          expri_core::resource_queue::RESOURCE_QUEUE_CAPABILITY.into(),
         ],
+      }),
+      Request::Queue { request } => Ok(Response::Queue {
+        response: self.resource_queue(request)?,
       }),
       Request::PutDocument {
         scope,

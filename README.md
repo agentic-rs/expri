@@ -278,6 +278,47 @@ reaches an updated server, the server automatically archives the run, including
 failed or cancelled runs, using the existing 15-day retention period. Local and
 worker run files remain available. The dashboard shows a **Smoke** badge.
 
+### Shared resource queue
+
+With an updated server and an explicitly configured execution worker, queue a
+managed task instead of choosing when to start it:
+
+```sh
+expri run --queue --project-id vision --cpus 4 --memory 16GiB --gpus 1 train --epochs 3
+expri queue list
+expri queue show job-abc123 --json
+expri queue cancel job-abc123
+expri queue workers
+```
+
+Submission freezes and uploads the source before returning a job ID, so the
+laptop can disconnect. Workers automatically claim the oldest job that fits
+their declared budget. CPU counts are logical slots and memory is a reservation
+among queued jobs; whole GPUs are assigned exclusively among these jobs.
+`--gpu-id` selects exact devices, while `--gpu-model` and `--gpu-memory` constrain
+automatic selection. `--worker` pins placement. Options belong before the task
+name, and `--json` selects a structured receipt or report.
+
+Defaults can live alongside a task's command:
+
+```toml
+[tasks.train]
+command = ["python", "train.py"]
+
+[tasks.train.resources]
+cpus = 4
+memory = "16GiB"
+gpus = 1
+gpu_model = "A100"
+```
+
+These defaults apply to `run --queue`. Memory must be supplied in the task or
+CLI; CPU defaults to one slot and GPUs to zero. Each worker needs a local
+`[queue_worker]` declaration and a foreground `expri queue daemon`. Read
+[worker setup and recovery](docs/self-hosted-service.md#shared-resource-queue)
+or `expri skill queue`. The job receives a run ID only after dispatch; published
+runs then appear in the existing dashboard.
+
 Each configured-environment run receives these variables:
 
 | Variable | Meaning |

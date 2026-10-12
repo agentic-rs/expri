@@ -10,6 +10,7 @@ expri -T gpu run train --epochs 3
 expri -T gpu run --detach --json train --epochs 3
 expri -T gpu run --smoke --detach --json train --epochs 1
 expri -T gpu run --no-push train --epochs 3
+expri run --queue --project-id vision --cpus 4 --memory 16GiB --gpus 1 --json train --epochs 3
 ```
 
 Put all expri run options before the task name. In
@@ -19,6 +20,13 @@ the run. Put the top-level `-T` before `run`.
 Remote runs push source first unless `--no-push` is selected. Local runs execute
 locally even if the project defines a single target. `--dry-run` previews the
 workflow instead of launching the task.
+
+`--queue` freezes and uploads source, then returns a job receipt before execution.
+It requires a configured environment and an explicit memory reservation in the
+CLI or task defaults. CPU defaults to one logical slot and GPUs to zero.
+Queued runs use an explicitly enrolled foreground execution worker, with automatic
+placement or `--worker`. Read `expri skill queue` for setup and recovery. The job
+ID and eventual run ID are separate; queue and detach are mutually exclusive.
 
 ## Managed runs and outputs
 

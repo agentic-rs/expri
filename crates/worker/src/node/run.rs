@@ -37,6 +37,28 @@ pub fn execute_request_at(
   request: &RunRequest,
   repo_root: &Path,
 ) -> Result<Option<serde_json::Value>> {
+  start_prepared(request, prepare_request_at(request, repo_root)?)
+}
+
+pub struct PreparedRun {
+  pub snapshot: RunSnapshot,
+  repo_root: std::path::PathBuf,
+  state: serde_json::Value,
+}
+
+/// Queue supervisors must verify their preparation/task groups stopped before
+/// their terminal record can release a server-side resource reservation.
+pub fn enable_queue_cleanup(prepared: &mut PreparedRun) -> Result<()> {
+  prepared.state["queue_cleanup"] = json!(true);
+  write_state(
+    &prepared.snapshot.run_dir.join("run-state.json"),
+    &prepared.state,
+  )
+}
+
+/// Allocate the immutable run and metadata without launching any subprocess.
+/// Queue callers journal `snapshot.run_dir` before calling `start_prepared`.
+pub fn prepare_request_at(request: &RunRequest, repo_root: &Path) -> Result<PreparedRun> {
   let repo_root = fs::canonicalize(repo_root)?;
   request.environment.validate()?;
   if let Some(service) = &request.service {
@@ -95,11 +117,54 @@ pub fn execute_request_at(
     );
   }
   if request.detach {
-    return start_detached(request, &repo_root, &snapshot, &mut state).map(Some);
+    fs::write(
+      snapshot.run_dir.join("run-request.json"),
+      serde_json::to_vec(request)?,
+    )?;
   }
-  let _run_lock = crate::lock::run_lock(&snapshot.run_dir)?;
-  execute_snapshot(request, &repo_root, &snapshot, state, false)?;
+  Ok(PreparedRun {
+    snapshot,
+    repo_root,
+    state,
+  })
+}
+
+pub fn start_prepared(
+  request: &RunRequest,
+  mut prepared: PreparedRun,
+) -> Result<Option<serde_json::Value>> {
+  if request.detach {
+    return start_detached(
+      request,
+      &prepared.repo_root,
+      &prepared.snapshot,
+      &mut prepared.state,
+    )
+    .map(Some);
+  }
+  let _run_lock = crate::lock::run_lock(&prepared.snapshot.run_dir)?;
+  execute_snapshot(
+    request,
+    &prepared.repo_root,
+    &prepared.snapshot,
+    prepared.state,
+    false,
+  )?;
   Ok(None)
+}
+
+/// Publish a definitive prelaunch cancellation/failure without spawning a task.
+pub fn abort_prepared(mut prepared: PreparedRun, cancelled: bool, reason: &str) -> Result<()> {
+  let _lease = crate::lock::run_lock(&prepared.snapshot.run_dir)?;
+  prepared.state["status"] = json!(if cancelled { "cancelled" } else { "failed" });
+  prepared.state["exit_code"] = json!(if cancelled { 130 } else { 1 });
+  prepared.state["error"] = json!(reason);
+  prepared.state["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
+  expri_system::store::run_capture::close_state(&prepared.snapshot.run_dir, &mut prepared.state);
+  write_state(
+    &prepared.snapshot.run_dir.join("run-state.json"),
+    &prepared.state,
+  )
 }
 
 /// A profile belongs to this machine only when an existing local store says so.
@@ -134,7 +199,9 @@ fn execute_snapshot(
   let mut cancelled = false;
   let mut logs_created = None;
   let mut result = (|| {
-    let logs = logs_created.insert(if worker {
+    let logs = logs_created.insert(if worker && state["queue_cleanup"] == true {
+      RunLogs::create_queued_detached(&snapshot.run_dir)?
+    } else if worker {
       RunLogs::create_detached(&snapshot.run_dir)?
     } else {
       RunLogs::create(&snapshot.run_dir)?
@@ -160,6 +227,14 @@ fn execute_snapshot(
         .service
         .as_ref()
         .map(|service| service.client_config.as_path()),
+      if state["queue_cleanup"] == true {
+        request
+          .service
+          .as_ref()
+          .map(|service| service.project_id.as_str())
+      } else {
+        None
+      },
       &mut || {
         let requested = logs.cancel_requested()?;
         cancelled |= requested;
@@ -225,6 +300,12 @@ fn execute_snapshot(
     Ok(())
   })();
   cancelled |= logs_created.as_ref().is_some_and(RunLogs::was_cancelled);
+  if logs_created
+    .as_ref()
+    .is_some_and(RunLogs::cleanup_uncertain)
+  {
+    state["queue_cleanup_uncertain"] = json!(true);
+  }
   if worker {
     match regular_cancel_request(&snapshot.run_dir) {
       // A request racing terminal publication is allowed to lose to completion.
@@ -266,13 +347,15 @@ fn prepare_assets(
   repo_root: &Path,
   snapshot: &RunSnapshot,
   client_config: Option<&Path>,
+  project_id: Option<&str>,
   cancel: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
   if snapshot.assets.is_empty() {
     return Ok(());
   }
   let ignored_config = repo_root.join(".expri/config.toml");
-  let client_config = if crate::assets::inspect(&ignored_config)?.is_some() {
+  let client_config = if project_id.is_none() && crate::assets::inspect(&ignored_config)?.is_some()
+  {
     crate::assets::optional_regular(&ignored_config)?;
     Some(ignored_config.as_path())
   } else {
@@ -282,8 +365,13 @@ fn prepare_assets(
     if cancel()? {
       return Err(ExpriError::Message("run cancellation requested".into()));
     }
-    let cached =
-      crate::assets::download::ensure(repo_root, &asset.descriptor, client_config, cancel)?;
+    let cached = crate::assets::download::ensure_scoped(
+      repo_root,
+      &asset.descriptor,
+      client_config,
+      project_id,
+      cancel,
+    )?;
     crate::assets::bind_verified(
       &cached,
       &snapshot.code_dir.join(&asset.path),
@@ -464,6 +552,9 @@ pub fn worker(run_dir: &Path) -> Result<()> {
   if state["run_id"].as_str() != Some(run_id)
     || state["status"] != "preparing"
     || state["detached"] != true
+    || state
+      .get("queue_cleanup")
+      .is_some_and(|value| !value.is_boolean())
     || state.get("smoke").is_some_and(|value| !value.is_boolean())
     || state["smoke"].as_bool().unwrap_or(false) != request.smoke
   {
@@ -614,8 +705,8 @@ mod tests {
     let second_descriptor = cached_asset(root.path(), b"second");
     let second = environment::snapshot::create(root.path(), &[]).unwrap();
     let canonical = root.path().canonicalize().unwrap();
-    prepare_assets(&canonical, &first, None, &mut || Ok(false)).unwrap();
-    prepare_assets(&canonical, &second, None, &mut || Ok(false)).unwrap();
+    prepare_assets(&canonical, &first, None, None, &mut || Ok(false)).unwrap();
+    prepare_assets(&canonical, &second, None, None, &mut || Ok(false)).unwrap();
     assert_eq!(first.assets[0].descriptor, first_descriptor);
     assert_eq!(second.assets[0].descriptor, second_descriptor);
     assert_eq!(
@@ -651,6 +742,7 @@ mod tests {
       &root.path().canonicalize().unwrap(),
       &snapshot,
       None,
+      None,
       &mut || Ok(true),
     )
     .unwrap_err()
@@ -681,6 +773,7 @@ mod tests {
       &canonical,
       &snapshot,
       Some(&canonical.join("absent-publishing-config")),
+      None,
       &mut || Ok(false),
     )
     .unwrap_err()
@@ -690,7 +783,7 @@ mod tests {
     assert!(!snapshot.code_dir.join("data/train.bin").exists());
     assert!(!snapshot.run_dir.join(".venv").exists());
     fs::remove_file(ignored_config).unwrap();
-    let error = prepare_assets(&canonical, &snapshot, None, &mut || Ok(false))
+    let error = prepare_assets(&canonical, &snapshot, None, None, &mut || Ok(false))
       .unwrap_err()
       .to_string();
     assert!(error.contains("client config"), "{error}");

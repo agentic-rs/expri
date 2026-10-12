@@ -30,7 +30,7 @@ pub fn resolve(
   source.validate()?;
   check_cancelled(cancelled)?;
   match source {
-    Source::Expri { .. } => private_download(repo, source, None, client_config, cancelled),
+    Source::Expri { .. } => private_download(repo, source, None, client_config, None, cancelled),
     Source::Local => Err(message(
       "local assets must be added from an existing local file",
     )),
@@ -45,7 +45,22 @@ pub fn ensure(
   client_config: Option<&Path>,
   cancelled: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<PathBuf> {
+  ensure_scoped(repo, descriptor, client_config, None, cancelled)
+}
+
+/// Reproduce a recorded asset in an explicitly selected project without copying
+/// credentials or requiring a project default in the shared machine login.
+pub fn ensure_scoped(
+  repo: &Path,
+  descriptor: &Descriptor,
+  client_config: Option<&Path>,
+  project_id: Option<&str>,
+  cancelled: &mut dyn FnMut() -> Result<bool>,
+) -> Result<PathBuf> {
   descriptor.validate()?;
+  if let Some(project_id) = project_id {
+    crate::service::validate_component(project_id)?;
+  }
   check_cancelled(cancelled)?;
   let destination = cache_file(repo, &descriptor.sha256);
   if verified(&destination, descriptor.size, &descriptor.sha256, cancelled)? {
@@ -62,6 +77,7 @@ pub fn ensure(
       },
       Some(descriptor),
       client_config,
+      project_id,
       cancelled,
     ) {
       Ok(_) => return Ok(destination),
@@ -76,6 +92,7 @@ pub fn ensure(
         &descriptor.source,
         Some(descriptor),
         client_config,
+        project_id,
         cancelled,
       )?;
     }
@@ -90,6 +107,7 @@ pub fn ensure(
         },
         Some(descriptor),
         client_config,
+        project_id,
         cancelled,
       )?;
     }
@@ -99,6 +117,13 @@ pub fn ensure(
 }
 
 fn matching_client(client_config: Option<&Path>) -> Result<(PathBuf, String, String)> {
+  matching_client_scoped(client_config, None)
+}
+
+fn matching_client_scoped(
+  client_config: Option<&Path>,
+  project_id: Option<&str>,
+) -> Result<(PathBuf, String, String)> {
   let path = client_config.ok_or_else(|| {
     message("private assets require --client-config or the worker's service client config")
   })?;
@@ -114,9 +139,12 @@ fn matching_client(client_config: Option<&Path>) -> Result<(PathBuf, String, Str
       "private asset client endpoint must be an HTTP(S) origin without credentials",
     ));
   }
-  let project_id = config.project_id.ok_or_else(|| {
-    message("private assets require project_id in the selected client configuration")
-  })?;
+  let project_id = project_id
+    .map(str::to_owned)
+    .or(config.project_id)
+    .ok_or_else(|| {
+      message("private assets require project_id in the selected client configuration")
+    })?;
   crate::service::validate_component(&project_id)?;
   Ok((path, project_id, actual.origin().ascii_serialization()))
 }
@@ -126,9 +154,10 @@ fn private_download(
   source: &Source,
   expected: Option<&Descriptor>,
   client_config: Option<&Path>,
+  project_id: Option<&str>,
   cancelled: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<Descriptor> {
-  let (config, project_id, endpoint) = matching_client(client_config)?;
+  let (config, project_id, endpoint) = matching_client_scoped(client_config, project_id)?;
   let Source::Expri { input_id } = source else {
     return Err(message("asset source is not an expri input"));
   };

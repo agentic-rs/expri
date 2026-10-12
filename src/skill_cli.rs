@@ -24,6 +24,8 @@ enum SkillTopic {
   Push,
   /// Start foreground or detached tasks with isolated code and outputs.
   Run,
+  /// Queue frozen tasks with resource reservations and operate execution workers.
+  Queue,
   /// Inspect status and logs, cancel detached runs, and fetch worker results.
   Runs,
   /// Record scalar metrics and parameters, then compare experiments.
@@ -49,6 +51,7 @@ impl SkillTopic {
       Self::Config => include_str!("skill/config.md"),
       Self::Push => include_str!("skill/push.md"),
       Self::Run => include_str!("skill/run.md"),
+      Self::Queue => include_str!("skill/queue.md"),
       Self::Runs => include_str!("skill/runs.md"),
       Self::Metrics => include_str!("skill/metrics.md"),
       Self::Artifacts => include_str!("skill/artifacts.md"),

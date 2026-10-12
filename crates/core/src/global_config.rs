@@ -19,6 +19,47 @@ pub struct GlobalConfig {
   pub server: Option<ClientConfig>,
   #[serde(default)]
   pub system_profile: SystemProfileConfig,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub queue_worker: Option<QueueWorkerConfig>,
+}
+
+/// Execution is explicitly enabled only by this machine-local declaration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueWorkerConfig {
+  pub worker_id: String,
+  pub project_ids: Vec<String>,
+  pub capacity: crate::resource_queue::WorkerCapacity,
+}
+
+impl QueueWorkerConfig {
+  pub fn validate(&self) -> Result<()> {
+    use crate::resource_queue::GpuVendor;
+    self.capacity.validate()?;
+    crate::identifiers::validate_component(&self.worker_id)?;
+    if self.project_ids.is_empty() || self.project_ids.len() > 64 {
+      return Err(invalid(
+        "queue_worker.project_ids requires an explicit nonempty project allowlist",
+      ));
+    }
+    let mut projects = std::collections::BTreeSet::new();
+    for project in &self.project_ids {
+      crate::identifiers::validate_component(project)?;
+      if !projects.insert(project) {
+        return Err(invalid(
+          "queue_worker.project_ids contains a duplicate project",
+        ));
+      }
+    }
+    for gpu in &self.capacity.gpus {
+      if gpu.vendor == GpuVendor::Apple && gpu.memory_bytes.is_some() {
+        return Err(invalid(
+          "queue_worker Apple GPU memory is shared; omit dedicated memory_bytes",
+        ));
+      }
+    }
+    Ok(())
+  }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,6 +103,9 @@ impl GlobalConfig {
 
   pub fn validate(&self) -> Result<()> {
     self.interval(None)?;
+    if let Some(worker) = &self.queue_worker {
+      worker.validate()?;
+    }
     if let Some(server) = &self.server {
       if server.token.is_none() && server.token_env.is_none() {
         server.validate_url()?;

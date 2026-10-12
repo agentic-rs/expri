@@ -14,6 +14,7 @@ mod node;
 mod output;
 mod push_cli;
 mod query_cli;
+mod queue_cli;
 mod runs;
 mod runs_cli;
 mod service;
@@ -69,6 +70,8 @@ enum Command {
   Config(config_cli::ConfigCommand),
   /// Query published runs and files using the configured server connection.
   Query(query_cli::QueryCommand),
+  /// Manage shared queued jobs and run a local execution worker.
+  Queue(queue_cli::QueueCommand),
   /// Print progressive agent guidance, with deeper instructions by topic.
   Skill(skill_cli::SkillCommand),
   /// Collect and inspect machine system profiles in global expri storage.
@@ -226,10 +229,16 @@ struct DownloadCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("receipt_mode").args(["queue", "detach"]).multiple(false)))]
 struct RunCommand {
-  /// Print the detached start receipt as JSON.
-  #[arg(long, requires = "detach")]
+  /// Print the queued or detached start receipt as JSON.
+  #[arg(long, requires = "receipt_mode")]
   json: bool,
+  /// Freeze source and enqueue the run on the configured shared server.
+  #[arg(long, conflicts_with_all = ["detach", "no_push", "control_path", "control_persist"])]
+  queue: bool,
+  #[command(flatten)]
+  resources: queue_cli::RunResources,
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -284,6 +293,7 @@ fn run() -> Result<()> {
     Command::Logout(command) => login_cli::run_logout(command, cli.target.as_deref(), cli.quiet),
     Command::Config(command) => config_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Query(command) => query_cli::run(command, cli.target.as_deref(), cli.quiet),
+    Command::Queue(command) => queue_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Skill(command) => skill_cli::run(command),
     Command::System(command) => system_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Assets(command) => assets_cli::run(command, cli.target.as_deref(), cli.quiet),
@@ -463,7 +473,10 @@ fn run_setup(
 }
 
 fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
-  let context = CommandContext::load(command.config, command.repo)?;
+  let context = CommandContext::load(command.config.clone(), command.repo.clone())?;
+  if command.queue {
+    return queue_cli::submit(command, context, target, quiet);
+  }
   let mut task_parts = command.task.into_iter();
   let name = task_parts
     .next()
@@ -694,6 +707,57 @@ mod tests {
       cli.command,
       Command::Run(RunCommand { no_push: true, .. })
     ));
+  }
+
+  #[test]
+  fn queued_receipts_and_resource_flags_require_explicit_queue_mode() {
+    for args in [
+      vec!["expri", "run", "--json", "train"],
+      vec!["expri", "run", "--cpus", "4", "train"],
+      vec!["expri", "run", "--queue", "--detach", "train"],
+      vec!["expri", "run", "--queue", "--no-push", "train"],
+      vec![
+        "expri",
+        "run",
+        "--queue",
+        "--control-path",
+        "socket",
+        "train",
+      ],
+      vec![
+        "expri",
+        "run",
+        "--queue",
+        "--control-persist",
+        "5m",
+        "train",
+      ],
+      vec!["expri", "queue", "recover", "attempt-abc123"],
+    ] {
+      assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+    }
+    let cli = Cli::try_parse_from([
+      "expri", "run", "--queue", "--json", "--memory", "16GiB", "train", "--cpus", "2",
+    ])
+    .unwrap();
+    let Command::Run(command) = cli.command else {
+      panic!("expected run command");
+    };
+    assert!(command.queue && command.json);
+    assert!(command.resources.cpus.is_none());
+    assert_eq!(command.task, ["train", "--cpus", "2"]);
+    assert!(Cli::try_parse_from(["expri", "run", "--detach", "--json", "train"]).is_ok());
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "queue",
+        "recover",
+        "attempt-abc123",
+        "--confirmed-stopped",
+        "--json",
+      ])
+      .is_ok()
+    );
   }
 
   #[test]
