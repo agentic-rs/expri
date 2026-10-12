@@ -33,7 +33,10 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
     done INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0,
     last_error TEXT, needs_attention INTEGER NOT NULL DEFAULT 0,
     UNIQUE(project_id,origin,run_id,kind,value,multipart));
-    CREATE INDEX IF NOT EXISTS run_cleanup_ready ON run_cleanup_tasks(done,retry_at,id);")
+    CREATE INDEX IF NOT EXISTS run_cleanup_ready ON run_cleanup_tasks(done,retry_at,id);
+    CREATE TABLE IF NOT EXISTS smoke_run_archivals (
+    project_id TEXT NOT NULL, origin TEXT NOT NULL, run_id TEXT NOT NULL,
+    archived_at INTEGER NOT NULL, PRIMARY KEY(project_id,origin,run_id));")
     .map_err(|_| crate::error::ExpriError::Message("cannot initialize run retention".into()))
 }
 
@@ -107,6 +110,49 @@ fn state(db: &Connection, scope: &RunScope, at: i64) -> ApiResult<RunArchival> {
 fn refresh(db: &Connection, scope: &RunScope) -> ApiResult<()> {
   record_run_activity(db, scope)?;
   db.execute("INSERT INTO project_change_revisions(project_id,revision) VALUES(?1,1) ON CONFLICT(project_id) DO UPDATE SET revision=revision+1", [&scope.project_id]).map_err(database)?;
+  Ok(())
+}
+
+/// Apply smoke retention once per run, in the transaction publishing its first
+/// complete terminal tracking state. The durable marker survives restoration
+/// and later metadata updates. Opaque legacy object uploads do not use this path.
+pub(super) fn archive_smoke_document(
+  db: &Connection,
+  target: &FileTarget,
+  value: &serde_json::Value,
+) -> ApiResult<()> {
+  let FileTarget::Run { scope, path } = target else {
+    return Ok(());
+  };
+  if path != "run-state.json"
+    || value["smoke"].as_bool() != Some(true)
+    || value["run_id"].as_str() != Some(scope.run_id.as_str())
+    || !value
+      .get("schema_version")
+      .map_or(Some(0), serde_json::Value::as_u64)
+      .is_some_and(|schema| schema <= 1)
+    || !matches!(
+      value["status"].as_str(),
+      Some("completed" | "failed" | "cancelled" | "lost")
+    )
+  {
+    return Ok(());
+  }
+  let at = now();
+  let first_archival = db.execute(
+    "INSERT OR IGNORE INTO smoke_run_archivals(project_id,origin,run_id,archived_at) VALUES(?1,?2,?3,?4)",
+    params![scope.project_id, scope.origin, scope.run_id, at],
+  ).map_err(database)?;
+  if first_archival == 0 {
+    return Ok(());
+  }
+  let inserted = db.execute(
+    "INSERT OR IGNORE INTO run_retention(project_id,origin,run_id,archived_at,delete_after) VALUES(?1,?2,?3,?4,?5)",
+    params![scope.project_id, scope.origin, scope.run_id, at, at.saturating_add(RETENTION_SECONDS)],
+  ).map_err(database)?;
+  if inserted != 0 {
+    refresh(db, scope)?;
+  }
   Ok(())
 }
 

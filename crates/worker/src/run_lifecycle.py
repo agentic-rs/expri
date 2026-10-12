@@ -115,8 +115,13 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
   detached = request.get("detach", False)
   if type(detached) is not bool:
     raise ValueError("detach must be boolean")
+  smoke = request.get("smoke", False)
+  if type(smoke) is not bool:
+    raise ValueError("smoke must be boolean")
   repo_root = str(_lifecycle_pathlib.Path(repo_root).resolve(strict=True))
-  snapshot = context["create_snapshot"](repo_root, request.get("remote_managed", []), request.get("expected_sync"))
+  snapshot = context["create_snapshot"](
+    repo_root, request.get("remote_managed", []), request.get("expected_sync"), smoke=smoke,
+  )
   run_dir = _lifecycle_pathlib.Path(snapshot["run_dir"])
   state = {
     "schema_version": 1, "run_id": snapshot["run_id"], "task": request["name"],
@@ -125,6 +130,8 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
     "logs": {"stdout": "logs/stdout.log", "stderr": "logs/stderr.log"},
     "status": "preparing", "started_at": _lifecycle_now(),
   }
+  if smoke:
+    state["smoke"] = True
   machine_id = _lifecycle_existing_machine_id()
   if machine_id is not None:
     state["machine_id"] = machine_id
@@ -173,7 +180,10 @@ def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
       raise RuntimeError("worker did not acknowledge its run lease; cancellation requested")
     _lifecycle_time.sleep(0.02)
   current = _lifecycle_json.loads((run_dir / "run-state.json").read_text())
-  return {"run_id": snapshot["run_id"], "run_dir": str(run_dir), "status": current["status"], "detached": True}
+  receipt = {"run_id": snapshot["run_id"], "run_dir": str(run_dir), "status": current["status"], "detached": True}
+  if smoke:
+    receipt["smoke"] = True
+  return receipt
 
 
 def execute_worker(payload, context):

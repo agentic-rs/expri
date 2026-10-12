@@ -106,6 +106,39 @@ class RunLifecycleTests(unittest.TestCase):
     state = self.wait_terminal()
     self.assertEqual(state["status"], "completed", state)
 
+  def test_smoke_mark_survives_python_supervision_without_local_archival(self):
+    self.request["smoke"] = True
+    receipt = self.start()
+    self.assertTrue(receipt["smoke"])
+    self.assertTrue(receipt["run_id"].startswith("smoke-run-"))
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "completed", state)
+    self.assertTrue(state["smoke"])
+    self.assertTrue(json.loads((self.run / "snapshot.json").read_text())["smoke"])
+    self.assertTrue(json.loads((self.run / "run-request.json").read_text())["smoke"])
+    self.assertNotIn("archived_at", state)
+    self.assertTrue((self.run / "outputs").is_dir())
+
+  def test_smoke_failed_and_cancelled_python_runs_keep_the_mark(self):
+    self.request["smoke"] = True
+    self.start("raise SystemExit(7)")
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "failed", state)
+    self.assertTrue(state["smoke"])
+    self.start("import time; print('ready', flush=True); time.sleep(30)")
+    self.wait_file(self.run / "logs/stdout.log")
+    jobs.execute_job(self.repo, {"operation": "cancel", "run_id": self.run.name})
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "cancelled", state)
+    self.assertTrue(state["smoke"])
+
+  def test_smoke_marker_rejects_non_boolean_values_before_snapshot(self):
+    for value in ("true", 1, None):
+      self.request["smoke"] = value
+      with self.assertRaisesRegex(ValueError, "smoke must be boolean"):
+        self.start()
+      self.assertFalse((self.repo / ".expri/runs").exists())
+
   def profile_identity(self, machine_id="machine-fixture"):
     profiles = self.repo / "profiles"
     profiles.mkdir()

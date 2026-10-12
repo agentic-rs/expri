@@ -412,6 +412,6 @@ fn overview_schema_two_is_reparsed_for_capture_metadata_without_worker_republica
       .dashboard_cached_overview(&scope, "tracking:1")
       .unwrap()
       .unwrap()["overview_schema"],
-    3
+    OVERVIEW_SCHEMA_VERSION
   );
 }

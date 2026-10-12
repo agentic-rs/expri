@@ -214,6 +214,7 @@ impl<S: ObjectStorage> Store<S> {
         .map_err(|_| ApiError::new(422, "tracking document contains invalid JSON"))?;
       if !previous.is_some_and(|(_, _, complete)| complete) {
         super::asset_imports::index_uses(&tx, &target, &value)?;
+        super::run_retention::archive_smoke_document(&tx, &target, &value)?;
       }
     }
     tx.execute("INSERT INTO tracking_versions(target,revision,size,total_size,document,complete,sealed) VALUES(?1,?2,?3,?4,1,?5,?5)

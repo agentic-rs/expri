@@ -36,6 +36,7 @@ export type Run = {
   run_key?: string;
   origin?: string;
   machine_id?: string;
+  smoke?: boolean;
   task: string | null;
   status: string;
   started_at: string | null;

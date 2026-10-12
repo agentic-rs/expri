@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `run --smoke` marks managed runs and generates `smoke-run-…` IDs. An updated
+  server automatically archives finished published smoke runs with the existing
+  15-day retention, including failed and cancelled runs; worker files remain
+  available. Local and hosted dashboards show a Smoke badge.
+
 - User-facing query, configuration, login, service, system, asset, artifact,
   transfer, and detached-start reports now use tables by default. Scripts must
   request `--json` to retain structured output. Use `run --detach --json TASK`

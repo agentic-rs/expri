@@ -172,6 +172,11 @@ def _catalog_summary(run_id, state, warnings):
   if state.get("run_id") != run_id:
     _catalog_warning(warnings, run_id, "run-state.json run_id does not match its directory")
     return summary, None
+  if "smoke" in state:
+    if type(state["smoke"]) is bool:
+      summary["smoke"] = state["smoke"]
+    else:
+      _catalog_warning(warnings, run_id, "run-state.json has invalid or missing smoke")
   machine_id = state.get("machine_id")
   if machine_id is not None:
     if (isinstance(machine_id, str) and len(machine_id) <= 96 and

@@ -253,6 +253,10 @@ struct RunCommand {
   #[arg(long)]
   no_publish: bool,
 
+  /// Mark an isolated smoke run; published runs archive on the server after finishing.
+  #[arg(long)]
+  smoke: bool,
+
   /// Start an isolated run in the background and return its run identifier.
   #[arg(long)]
   detach: bool,
@@ -478,6 +482,11 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     if command.no_publish {
       disable_publishing(&mut context.target.service);
     }
+    if command.smoke && context.target.environment.is_none() {
+      return Err(ExpriError::Message(
+        "--smoke requires a configured target environment".to_string(),
+      ));
+    }
     if context
       .target
       .service
@@ -556,6 +565,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
       sync_args,
       expected_sync,
       detach: command.detach,
+      smoke: command.smoke,
       json: command.json,
     });
   }
@@ -582,6 +592,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     args,
     dry_run: command.dry_run,
     detach: command.detach,
+    smoke: command.smoke,
     json: command.json,
     verbosity,
     quiet,
@@ -783,7 +794,29 @@ mod tests {
   }
 
   #[test]
-  fn detached_legacy_remote_tasks_fail_before_push_or_transport() {
+  fn smoke_option_before_task_marks_the_run_and_after_task_remains_an_argument() {
+    for (args, smoke, task) in [
+      (
+        vec!["expri", "run", "--smoke", "train"],
+        true,
+        vec!["train"],
+      ),
+      (
+        vec!["expri", "run", "train", "--smoke"],
+        false,
+        vec!["train", "--smoke"],
+      ),
+    ] {
+      let Command::Run(command) = Cli::try_parse_from(args).unwrap().command else {
+        panic!("expected run command");
+      };
+      assert_eq!(command.smoke, smoke);
+      assert_eq!(command.task, task);
+    }
+  }
+
+  #[test]
+  fn isolated_run_options_require_remote_environment_before_push_or_transport() {
     let fixture = tempfile::tempdir().unwrap();
     let config = fixture.path().join("expri.toml");
     std::fs::write(
@@ -798,24 +831,26 @@ ctl_bin = "/missing-must-not-launch-ctl"
 "#,
     )
     .unwrap();
-    let cli = Cli::try_parse_from([
-      "expri",
-      "run",
-      "--config",
-      config.to_str().unwrap(),
-      "--detach",
-      "train",
-    ])
-    .unwrap();
-    let Command::Run(command) = cli.command else {
-      panic!("expected run command");
-    };
-    let error = run_task(command, Some("gpu"), 0, true).unwrap_err();
-    assert_eq!(
-      error.to_string(),
-      "--detach requires a configured target environment"
-    );
-    assert!(!fixture.path().join(".expri").exists());
+    for option in ["--detach", "--smoke"] {
+      let cli = Cli::try_parse_from([
+        "expri",
+        "run",
+        "--config",
+        config.to_str().unwrap(),
+        option,
+        "train",
+      ])
+      .unwrap();
+      let Command::Run(command) = cli.command else {
+        panic!("expected run command");
+      };
+      let error = run_task(command, Some("gpu"), 0, true).unwrap_err();
+      assert_eq!(
+        error.to_string(),
+        format!("{option} requires a configured target environment")
+      );
+      assert!(!fixture.path().join(".expri").exists());
+    }
   }
 
   #[test]

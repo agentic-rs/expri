@@ -241,6 +241,25 @@ pub fn apply_run_with_preference(
     .apply_run(remote, request_path)
 }
 
+/// Older native workers ignore unknown request fields, so negotiate the smoke
+/// marker explicitly before dispatching either foreground or detached runs.
+pub(crate) fn smoke_run_preference(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<ProtocolPreference> {
+  let expri = ExpriNodeProtocol::new(node_bin.to_string());
+  let selected = select_capability_protocol(
+    preference,
+    Some(crate::node::cli::SMOKE_RUNS_CAPABILITY),
+    || expri.supports_capability(remote, crate::node::cli::SMOKE_RUNS_CAPABILITY),
+  )?;
+  Ok(match selected {
+    SelectedProtocol::ExpriNode => ProtocolPreference::ExpriNode,
+    SelectedProtocol::Python => ProtocolPreference::Python,
+  })
+}
+
 pub fn apply_environment_with_preference(
   remote: &Remote,
   request: &EnvironmentCommandRequest,
@@ -885,6 +904,30 @@ mod tests {
     });
     assert!(
       matches!(result, Err(ExpriError::Message(message)) if message == "transport unavailable")
+    );
+  }
+
+  #[test]
+  fn smoke_protocol_cannot_silently_drop_the_marker_on_older_nodes() {
+    let capability = Some(crate::node::cli::SMOKE_RUNS_CAPABILITY);
+    assert_eq!(
+      select_capability_protocol(ProtocolPreference::Auto, capability, || Ok(false)).unwrap(),
+      SelectedProtocol::Python,
+    );
+    assert_eq!(
+      select_capability_protocol(ProtocolPreference::Auto, capability, || Ok(true)).unwrap(),
+      SelectedProtocol::ExpriNode,
+    );
+    let error = select_capability_protocol(ProtocolPreference::ExpriNode, capability, || Ok(false))
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("smoke-runs-v1"), "{error}");
+    assert_eq!(
+      select_capability_protocol(ProtocolPreference::Python, capability, || panic!(
+        "Python must not probe"
+      ))
+      .unwrap(),
+      SelectedProtocol::Python,
     );
   }
 

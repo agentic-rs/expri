@@ -35,8 +35,10 @@ def _snapshot_checkout_lock(lock_path):
       _snapshot_fcntl.flock(lock, _snapshot_fcntl.LOCK_UN)
 
 
-def create_snapshot(repo_root, remote_managed, expected_sync=None):
+def create_snapshot(repo_root, remote_managed, expected_sync=None, smoke=False):
   """Return an isolated run directory after locking and verifying the checkout."""
+  if type(smoke) is not bool:
+    raise ValueError("smoke must be boolean")
   root = _snapshot_pathlib.Path(repo_root).resolve(strict=True)
   state_dir = root / ".expri"
   _snapshot_private_directory(state_dir)
@@ -70,7 +72,9 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
       )
     runs_dir = state_dir / "runs"
     _snapshot_private_directory(runs_dir)
-    run_dir = _snapshot_pathlib.Path(_snapshot_tempfile.mkdtemp(prefix="run-", dir=runs_dir))
+    run_dir = _snapshot_pathlib.Path(_snapshot_tempfile.mkdtemp(
+      prefix="smoke-run-" if smoke else "run-", dir=runs_dir,
+    ))
     code_dir = run_dir / "code"
     try:
       code_dir.mkdir()
@@ -104,6 +108,8 @@ def create_snapshot(repo_root, remote_managed, expected_sync=None):
         "source": source,
         "files": files,
       }
+      if smoke:
+        manifest["smoke"] = True
       (run_dir / "snapshot.json").write_text(_snapshot_json.dumps(manifest, indent=2), encoding="utf-8")
       return {"run_id": run_dir.name, "run_dir": str(run_dir), "code_dir": str(code_dir)}
     except BaseException:

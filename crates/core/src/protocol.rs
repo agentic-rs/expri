@@ -42,6 +42,8 @@ pub struct RunRequest {
   pub service: Option<RunServiceConfig>,
   #[serde(default)]
   pub detach: bool,
+  #[serde(default, skip_serializing_if = "is_false")]
+  pub smoke: bool,
   #[serde(default)]
   pub remote_managed: Vec<String>,
   #[serde(default)]
@@ -155,4 +157,35 @@ pub struct SyncApplyRequest {
   #[serde(default)]
   pub remote_managed: Vec<String>,
   pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn smoke_request_is_opt_in_and_rejects_non_boolean_markers() {
+    let legacy = serde_json::json!({
+      "name": "train", "command": ["python", "train.py"], "environment": {},
+    });
+    let mut request: RunRequest = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(!request.smoke);
+    assert!(
+      serde_json::to_value(&request)
+        .unwrap()
+        .get("smoke")
+        .is_none()
+    );
+    request.smoke = true;
+    assert_eq!(serde_json::to_value(&request).unwrap()["smoke"], true);
+    for value in [
+      serde_json::json!("true"),
+      serde_json::json!(1),
+      serde_json::Value::Null,
+    ] {
+      let mut invalid = legacy.clone();
+      invalid["smoke"] = value;
+      assert!(serde_json::from_value::<RunRequest>(invalid).is_err());
+    }
+  }
 }

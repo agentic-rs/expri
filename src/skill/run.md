@@ -8,6 +8,7 @@ expri run --dry-run train --epochs 3
 expri run train --epochs 3
 expri -T gpu run train --epochs 3
 expri -T gpu run --detach --json train --epochs 3
+expri -T gpu run --smoke --detach --json train --epochs 1
 expri -T gpu run --no-push train --epochs 3
 ```
 
@@ -25,6 +26,12 @@ With `[environment]` configured, each run gets a frozen source snapshot, uv
 environment, logs, and records under `.expri/runs/<run_id>/`. An empty environment
 table is sufficient for ordinary uv isolation. Legacy tasks without an
 environment execute in the checkout and do not support detach.
+
+`--smoke` also requires a configured environment. It marks the run explicitly
+and generates a `smoke-run-…` ID. With automatic publishing and an updated
+server, every finished smoke run is archived on the server, including failed,
+cancelled, and lost runs. Existing 15-day retention applies; local/worker files
+remain available. `--no-publish` records the smoke mark without server archival.
 
 Inside a managed task:
 

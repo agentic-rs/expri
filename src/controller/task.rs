@@ -17,6 +17,7 @@ pub struct LocalTaskOptions {
   pub args: Vec<String>,
   pub dry_run: bool,
   pub detach: bool,
+  pub smoke: bool,
   pub json: bool,
   pub verbosity: u8,
   pub quiet: bool,
@@ -39,6 +40,7 @@ pub struct RemoteTaskOptions {
   pub args: Vec<String>,
   pub dry_run: bool,
   pub detach: bool,
+  pub smoke: bool,
   pub json: bool,
   pub verbosity: u8,
   pub quiet: bool,
@@ -131,6 +133,11 @@ fn require_asset_environment(environment: Option<&EnvironmentConfig>) -> Result<
 }
 
 pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
+  if options.smoke && options.environment.is_none() {
+    return Err(ExpriError::Message(
+      "--smoke requires a configured environment".to_string(),
+    ));
+  }
   if crate::environment::snapshot::has_assets(&options.repo_root, &options.remote_managed)? {
     require_asset_environment(options.environment.as_ref())?;
   }
@@ -147,6 +154,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       sync_args: options.sync_args,
       expected_sync: None,
       detach: options.detach,
+      smoke: options.smoke,
     };
     if options.dry_run {
       if !options.quiet {
@@ -212,6 +220,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
 }
 
 pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
+  if options.smoke && options.target.environment.is_none() {
+    return Err(ExpriError::Message(
+      "--smoke requires a configured target environment".to_string(),
+    ));
+  }
   let has_assets =
     crate::environment::snapshot::has_assets(&options.repo_root, &options.remote_managed)?;
   if has_assets {
@@ -230,6 +243,7 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       sync_args: options.sync_args,
       expected_sync: options.expected_sync,
       detach: options.detach,
+      smoke: options.smoke,
     };
     let mut preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
     let node_bin = options
@@ -259,6 +273,9 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     if has_assets {
       super::protocol::require_run_assets(&remote, preference, &node_bin)?;
       preference = ProtocolPreference::ExpriNode;
+    }
+    if request.smoke {
+      preference = super::protocol::smoke_run_preference(&remote, preference, &node_bin)?;
     }
     let request_dir = tempfile::Builder::new().prefix("expri-run-").tempdir()?;
     let request_path = request_dir.path().join("run-request.json");
@@ -422,7 +439,7 @@ mod tests {
     let options = LocalTaskOptions {
       repo_root: root.path().into(), project_name: None, name: "train".into(),
       task: TaskConfig { command: vec!["python".into(), "train.py".into()], uv: false },
-      args: Vec::new(), dry_run: true, detach: false, json: false, verbosity: 0, quiet: true,
+      args: Vec::new(), dry_run: true, detach: false, smoke: false, json: false, verbosity: 0, quiet: true,
       environment: None,
       service: Some(toml::from_str(
         "client_config='/etc/expri/worker.toml'\nproject_id='project'\norigin='local'\npublish=false\n",
