@@ -3,9 +3,13 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 
 use crate::error::{ExpriError, Result};
+use crate::output::print_report;
 
 #[derive(Debug, Args)]
 pub struct ArtifactCommand {
+  /// Print the complete report as JSON instead of a human-readable table.
+  #[arg(long, global = true)]
+  json: bool,
   #[command(subcommand)]
   command: ArtifactSubcommand,
 }
@@ -35,7 +39,7 @@ enum ArtifactSubcommand {
   },
 }
 
-pub fn run(command: ArtifactCommand, target: Option<&str>) -> Result<()> {
+pub fn run(command: ArtifactCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
     return Err(ExpriError::Message(
       "artifact registration runs on the training machine; omit -T".into(),
@@ -64,7 +68,9 @@ pub fn run(command: ArtifactCommand, target: Option<&str>) -> Result<()> {
       crate::service::registrations::unregister(&run_dir, &path)?
     }
   };
-  println!("{}", serde_json::to_string(&report)?);
+  if command.json || !quiet {
+    print_report(&report, command.json)?;
+  }
   Ok(())
 }
 

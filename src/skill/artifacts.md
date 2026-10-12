@@ -1,5 +1,8 @@
 # Expri artifacts
 
+Reports show tables by default. Agents and scripts should add `--json` to read
+structured results; `--quiet` suppresses human reports.
+
 Use artifact registration to hand a finalized output to the run's independent
 publisher while training continues. Registration writes a small durable local
 outbox; the publisher hashes and uploads the bytes separately.

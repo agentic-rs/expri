@@ -25,8 +25,9 @@ expri system status
 expri system daemon --no-publish
 ```
 
-`sample` saves one inventory and observation and prints JSON, including the
-stable `machine_id`. `daemon` runs in the foreground and samples every ten
+`sample` saves one inventory and observation and prints a table, including the
+stable machine ID. Add `--json` to obtain the complete machine-readable report.
+`daemon` runs in the foreground and samples every ten
 seconds by default. Run it on every machine you want to record. It operates
 without `expri.toml` or an active experiment and allows one collector per storage
 directory. Stop it with Ctrl-C. Start it again after a restart; expri does not
@@ -218,9 +219,14 @@ expri system history --resolution hourly --start 2026-10-01T00:00:00Z --end 2026
 expri service system list
 expri service system profile machine-actual-id
 expri service system history machine-actual-id --resolution hourly
+# Use complete JSON reports in scripts or agents.
+expri system history --resolution hourly --json
+expri service system list --json
 ```
 
-Commands print JSON. History defaults to 72 hours of detail or 30 days of hourly
+Reports default to human-readable tables; `--json` preserves the complete
+structured report for automation. `--quiet` suppresses tables, while an explicit
+`--json` still prints the report. History defaults to 72 hours of detail or 30 days of hourly
 data; specify RFC3339 `--start`/`--end` timestamps with a timezone to select a
 different range. Reads are bounded and return `next_cursor`; pass that value
 with `--cursor` to continue. `service system profile --inventory-revision N`

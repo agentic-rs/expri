@@ -16,7 +16,11 @@ use serde_json::Value;
 
 fn command(root: &Path) -> Command {
   let mut command = Command::new(env!("CARGO_BIN_EXE_expri"));
-  command.arg("system").arg("--storage-dir").arg(root);
+  command
+    .arg("system")
+    .arg("--json")
+    .arg("--storage-dir")
+    .arg(root);
   command
 }
 
@@ -35,6 +39,23 @@ fn fixture() -> (tempfile::TempDir, PathBuf) {
     .unwrap()
     .join("global expri");
   (directory, root)
+}
+
+#[test]
+fn missing_system_status_is_a_human_table_without_creating_storage() {
+  let (_directory, root) = fixture();
+  let output = Command::new(env!("CARGO_BIN_EXE_expri"))
+    .args(["system", "--storage-dir"])
+    .arg(&root)
+    .arg("status")
+    .output()
+    .unwrap();
+  assert!(output.status.success());
+  let text = String::from_utf8(output.stdout).unwrap();
+  assert!(text.contains("FIELD"));
+  assert!(text.contains("Collector running"));
+  assert!(serde_json::from_str::<Value>(&text).is_err());
+  assert!(!root.exists());
 }
 
 fn seed(root: &Path) -> LocalStore {

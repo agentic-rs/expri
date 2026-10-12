@@ -169,6 +169,59 @@ fn authentication_rejection_stops_watch_without_replaying_or_printing_credential
 }
 
 #[test]
+fn fetch_watch_delivers_changed_summaries_and_propagates_reporter_failure() {
+  let (_temporary, root) = root();
+  let (url, task) = mock(1, |request, _| {
+    assert!(matches!(
+      serde_json::from_slice::<Request>(&request.body).unwrap(),
+      Request::ListRuns { .. }
+    ));
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::Runs { runs: Vec::new() }).unwrap(),
+    )
+  });
+  let mut options = options(&root, config(&root, &url));
+  options.watch = true;
+  options.quiet = false;
+  let mut reported = Vec::new();
+  let error = fetch_with_reporter(options, |summary| {
+    reported.push(summary.clone());
+    Err(fs::message("output unavailable"))
+  })
+  .unwrap_err();
+  task.join().unwrap();
+  assert!(error.to_string().contains("output unavailable"));
+  assert_eq!(reported.len(), 1);
+  assert_eq!(reported[0]["project_id"], "project");
+  assert_eq!(reported[0]["status"], "fetched");
+  assert_eq!(reported[0]["run_count"], 0);
+  assert!(reported[0].get("runs").is_none());
+}
+
+#[test]
+fn fetch_reporter_is_not_called_for_one_shot_or_dry_run_reports() {
+  for dry_run in [false, true] {
+    let (_temporary, root) = root();
+    let (url, task) = mock(1, |_, _| {
+      (
+        200,
+        Vec::new(),
+        serde_json::to_vec(&Response::Runs { runs: Vec::new() }).unwrap(),
+      )
+    });
+    let mut options = options(&root, config(&root, &url));
+    options.watch = dry_run;
+    options.dry_run = dry_run;
+    let report = fetch_with_reporter(options, |_| panic!("unexpected watch summary")).unwrap();
+    task.join().unwrap();
+    assert_eq!(report["dry_run"], dry_run);
+    assert_eq!(report["run_count"], 0);
+  }
+}
+
+#[test]
 fn expired_run_between_catalog_and_fetch_preserves_local_data_and_continues_other_runs() {
   let (_temporary, root) = root();
   let expired = scope();

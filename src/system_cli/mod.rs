@@ -15,10 +15,14 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::error::{ExpriError, Result};
+use crate::output::print_report;
 use config::GlobalConfig;
 
 #[derive(Debug, Args)]
 pub struct SystemCommand {
+  /// Print the complete report as JSON instead of a human-readable table.
+  #[arg(long, global = true)]
+  json: bool,
   /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri directory.
   #[arg(long, global = true)]
   storage_dir: Option<PathBuf>,
@@ -111,8 +115,10 @@ pub(super) fn now_ms() -> i64 {
   Utc::now().timestamp_millis()
 }
 
-fn print(value: &impl Serialize) -> Result<()> {
-  println!("{}", serde_json::to_string_pretty(value)?);
+fn print(value: &impl Serialize, json: bool, quiet: bool) -> Result<()> {
+  if json || !quiet {
+    print_report(value, json)?;
+  }
   Ok(())
 }
 
@@ -129,7 +135,7 @@ fn existing_store(paths: &StoragePaths) -> Result<LocalStore> {
   })
 }
 
-pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
+pub fn run(command: SystemCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
     return Err(ExpriError::Message(
       "system commands run on the current machine; omit -T".into(),
@@ -149,6 +155,8 @@ pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
       store.compact(now_ms())?;
       print(
         &json!({"machine_id": store.machine_id(), "sample": sample, "machine": store.profile()?}),
+        command.json,
+        quiet,
       )
     }
     SystemSubcommand::Daemon {
@@ -165,11 +173,11 @@ pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
       };
       daemon::run(writable_paths(&paths)?, interval, client_config)
     }
-    SystemSubcommand::Status => status(&paths),
+    SystemSubcommand::Status => status(&paths, command.json, quiet),
     SystemSubcommand::History(options) => {
       let store = existing_store(&paths)?;
       let query = options.query(store.machine_id().into())?;
-      print(&store.history(&query)?)
+      print(&store.history(&query)?, command.json, quiet)
     }
     SystemSubcommand::Publish { client_config } => {
       let client_config = publishing_config(&paths, client_config)?;
@@ -183,7 +191,11 @@ pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
       let client = SystemProfileClient::new(&client_config)?;
       let mut store = LocalStore::open(&paths.profile_database())?;
       let acknowledgement = daemon::publish_batch(&mut store, &client)?;
-      print(&json!({"published": acknowledgement.is_some(), "acknowledgement": acknowledgement}))
+      print(
+        &json!({"published": acknowledgement.is_some(), "acknowledgement": acknowledgement}),
+        command.json,
+        quiet,
+      )
     }
   }
 }
@@ -201,7 +213,7 @@ fn publishing_config(paths: &StoragePaths, explicit: Option<PathBuf>) -> Result<
   resolve_client_config(Some(&selected))
 }
 
-fn status(paths: &StoragePaths) -> Result<()> {
+fn status(paths: &StoragePaths, json: bool, quiet: bool) -> Result<()> {
   let store = LocalStore::open_readonly(&paths.profile_database())?;
   let active = if paths.root().exists() {
     let root = std::fs::canonicalize(paths.root())?;
@@ -213,12 +225,16 @@ fn status(paths: &StoragePaths) -> Result<()> {
     false
   };
   let publishing = daemon::read_status(&paths.root().join("publishing.json"))?;
-  print(&json!({
-    "storage_dir": paths.root(), "collector_running": active,
-    "local": store.as_ref().map(LocalStore::status).transpose()?,
-    "machine": store.as_ref().map(LocalStore::profile).transpose()?.flatten(),
-    "publishing": publishing,
-  }))
+  print(
+    &json!({
+      "storage_dir": paths.root(), "collector_running": active,
+      "local": store.as_ref().map(LocalStore::status).transpose()?,
+      "machine": store.as_ref().map(LocalStore::profile).transpose()?.flatten(),
+      "publishing": publishing,
+    }),
+    json,
+    quiet,
+  )
 }
 
 #[derive(Debug, Args)]
@@ -259,7 +275,7 @@ enum ServiceSystemSubcommand {
   },
 }
 
-pub fn run_service(command: ServiceSystemCommand) -> Result<()> {
+pub fn run_service(command: ServiceSystemCommand, json: bool, quiet: bool) -> Result<()> {
   match command.command {
     ServiceSystemSubcommand::List {
       config,
@@ -268,7 +284,11 @@ pub fn run_service(command: ServiceSystemCommand) -> Result<()> {
     } => {
       let client = SystemProfileClient::new(&resolve_client_config(config.as_deref())?)?;
       let (machines, next_cursor) = client.machines(limit as usize, cursor.as_deref())?;
-      print(&json!({"machines": machines, "next_cursor": next_cursor}))
+      print(
+        &json!({"machines": machines, "next_cursor": next_cursor}),
+        json,
+        quiet,
+      )
     }
     ServiceSystemSubcommand::Profile {
       config,
@@ -277,6 +297,8 @@ pub fn run_service(command: ServiceSystemCommand) -> Result<()> {
     } => print(
       &SystemProfileClient::new(&resolve_client_config(config.as_deref())?)?
         .machine(&machine_id, inventory_revision)?,
+      json,
+      quiet,
     ),
     ServiceSystemSubcommand::History {
       config,
@@ -285,6 +307,8 @@ pub fn run_service(command: ServiceSystemCommand) -> Result<()> {
     } => print(
       &SystemProfileClient::new(&resolve_client_config(config.as_deref())?)?
         .history(&options.query(machine_id)?)?,
+      json,
+      quiet,
     ),
   }
 }
@@ -294,6 +318,37 @@ mod tests {
   use super::*;
   use crate::{Cli, Command};
   use clap::Parser;
+
+  #[test]
+  fn report_json_flags_work_before_and_after_nested_commands() {
+    for operation in ["sample", "status", "history", "publish"] {
+      let default = Cli::try_parse_from(["expri", "system", operation]).unwrap();
+      let Command::System(command) = default.command else {
+        unreachable!()
+      };
+      assert!(!command.json);
+      for args in [
+        vec!["expri", "system", "--json", operation],
+        vec!["expri", "system", operation, "--json"],
+      ] {
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Command::System(command) = parsed.command else {
+          unreachable!()
+        };
+        assert!(command.json);
+      }
+    }
+    for operation in ["list", "profile", "history"] {
+      for position in [2, 4] {
+        let mut args = vec!["expri", "service", "system", operation];
+        if operation != "list" {
+          args.push("machine-1");
+        }
+        args.insert(position, "--json");
+        assert!(Cli::try_parse_from(args).is_ok());
+      }
+    }
+  }
 
   #[test]
   fn system_options_and_service_history_do_not_require_a_project() {
@@ -327,7 +382,7 @@ mod tests {
       unreachable!()
     };
     assert!(
-      run(command, Some("gpu"))
+      run(command, Some("gpu"), false)
         .unwrap_err()
         .to_string()
         .contains("current machine")

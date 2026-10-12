@@ -33,7 +33,7 @@ pub use catalog::ServiceCatalogClient;
 pub use download::{fetch, input_download, input_download_prepared};
 pub use login::{login, logout, revoke_login, validate_login_url};
 pub use system_profile::SystemProfileClient;
-pub use watch::fetch as fetch_files;
+pub use watch::{fetch as fetch_files, fetch_with_reporter as fetch_files_with_reporter};
 
 pub(super) fn validate_config(path: &Path) -> Result<()> {
   Api::new(path).map(|_| ())

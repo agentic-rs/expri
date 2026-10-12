@@ -1,5 +1,8 @@
 # Expri server login
 
+Reports show tables by default. Agents and scripts should add `--json` to read
+structured results; `--quiet` suppresses human reports.
+
 Use the primary hosted dashboard password to authenticate this machine:
 
 ```sh
@@ -43,7 +46,7 @@ Logout revokes the current issued token and clears its saved credential while
 keeping the URL and project selection. An already rejected/revoked token is
 cleared with a warning. Other server or transport errors preserve the credential
 for retry. With no saved credential, logout does nothing. A saved URL without a
-credential reports `token_source: null` and requires login before client queries.
+credential reports `token_source: null` in `--json` output and requires login before client queries.
 
 Existing manually configured tokens and `token_env` files still work. Logout
 cannot revoke static credentials; `expri config server unset` removes that local

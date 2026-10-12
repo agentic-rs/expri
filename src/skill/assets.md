@@ -1,5 +1,8 @@
 # Expri assets
 
+Reports show tables by default. Agents and scripts should add `--json` to read
+structured results; `--quiet` suppresses human reports.
+
 Use managed assets for reusable datasets, model files, and checkpoints. Training
 opens an ordinary path; a committed adjacent `<path>.expri.toml` sidecar pins its
 size and SHA256. Payloads and `.expri/assets/` cache files stay outside Git.

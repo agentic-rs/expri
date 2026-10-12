@@ -447,6 +447,16 @@ publishing files locally. Dry-run reports identify labels that need the run's
 inventory to resolve; they do not treat those labels as unavailable files.
 Reports are bounded and watch summaries stay compact.
 
+## CLI report formats
+
+User-facing reports use tables by default. Add `--json` to query, service,
+system, config, login/logout, asset, artifact, and fetch commands for structured
+output. Existing runs and metrics commands also support `--json`. Scripts
+that parse command output must select this flag explicitly. For a detached
+start receipt, use `expri run --detach --json TASK`; put these options before
+the task name. `--quiet` suppresses human reports, while explicit JSON remains
+available. Foreground task output and logs continue to stream normally.
+
 ## Configure the CLI's server connection
 
 Authenticate using the password for the primary hosted dashboard:
@@ -510,7 +520,7 @@ Use `expri config server set --url URL --token-stdin` with a supplied token
 through a pipe or redirected file. `expri config server unset` removes only the
 connection and preserves system settings; it does not revoke a remote token.
 `config server show` reports a retained URL without credentials using
-`token_configured: false` and `token_source: null`. Inspection of missing
+`token_configured: false` and `token_source: null` in `--json` output. Inspection of missing
 configuration creates no files.
 
 Query and service client commands use this connection by default. `--config PATH`
@@ -532,16 +542,23 @@ does not download run bytes or populate a local review cache:
 expri query runs
 expri query runs --project-id vision
 expri query runs --project-id vision --origin gpu-1 --archival all
-expri query files --project-id vision --origin gpu-1 --run-id run-abc123
-expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --prefix outputs/
+expri query files --run-id run-abc123
+expri query files --run-id run-abc123 --prefix outputs/
 ```
 
 The server must advertise `service-catalog-v1`. Credentials with unrestricted
 server access see all projects and origins by default; optional `--project-id` and `--origin` narrow
 the selection. Worker credentials see only their bound project and origin;
-machine-profile credentials cannot browse runs. Active runs are the default.
+machine-profile credentials cannot browse runs. Run lists select active runs by default.
 `--archival archived` selects archived runs still within their restore window;
 `--archival all` selects both. Expired/deleting runs are unavailable.
+
+File queries need only `--run-id` when exactly one accessible run has that ID.
+Resolution includes active runs and archived runs within their restore window.
+If multiple scopes match, the command reports the conflict; add `--project-id`
+and/or `--origin` to narrow the selection. Providing both selects the scope
+directly. Resolution uses the existing `service-catalog-v1` catalog and may page
+through newer runs; supplying both scope fields avoids that lookup for large catalogs.
 
 Run pages include the full `scope`, task, last published execution status,
 timestamps and bounded warnings when metadata is missing or unavailable. A run
@@ -551,9 +568,12 @@ a stable catalog order rather than a sort by live activity. Query the worker
 with `runs status`, `runs logs`, or `runs cancel` for live supervision.
 `service run status` continues to describe archival and cleanup.
 
-Commands print JSON. Run pages default to 50 rows and file pages to 100;
+Commands print tables by default; `--json` returns the complete page for
+automation. Run pages default to 50 rows and file pages to 100;
 `--limit` accepts 1 to 100. Pass the returned `next_cursor` through `--cursor`,
-keeping the same scope and filters. Received catalogs support pagination beyond
+keeping the same scope and filters. File pages report their resolved project and
+origin; optionally pass both on later pages to pin that scope if another run
+with the same ID is published. Received catalogs support pagination beyond
 the old 500-run and 1,000-file listing limits. The original scoped
 `expri service list` command keeps its existing behavior.
 

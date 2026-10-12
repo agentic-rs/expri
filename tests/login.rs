@@ -52,6 +52,10 @@ impl Fixture {
   }
 
   fn run(&self, args: &[&str], password: Option<&str>) -> Output {
+    self.run_output(args, password, true)
+  }
+
+  fn run_output(&self, args: &[&str], password: Option<&str>, json: bool) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_expri"));
     command
       .args(args)
@@ -65,6 +69,9 @@ impl Fixture {
       })
       .stdout(Stdio::piped())
       .stderr(Stdio::piped());
+    if json {
+      command.arg("--json");
+    }
     let mut child = command.spawn().unwrap();
     if let Some(password) = password {
       let mut input = child.stdin.take().unwrap();
@@ -146,6 +153,7 @@ struct HttpRequest {
 }
 
 fn request(stream: &mut TcpStream) -> HttpRequest {
+  stream.set_nonblocking(false).unwrap();
   stream
     .set_read_timeout(Some(Duration::from_secs(5)))
     .unwrap();
@@ -534,5 +542,53 @@ fn failed_persistence_revokes_the_unsaved_token_and_keeps_original_configuration
   assert_eq!(fs::read(fixture.config()).unwrap(), before);
   assert!(fixture.root.join("config.lock").is_dir());
   assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
+  server.join().unwrap();
+}
+
+#[test]
+fn authentication_and_configuration_default_to_private_human_tables() {
+  let fixture = Fixture::new();
+  let (url, server) = serve(4, |index, request, _| match index {
+    0 => {
+      login_request(&request);
+      (200, issued('A'))
+    }
+    1 => {
+      assert_eq!(request.path, "/v1/logout");
+      bearer(&request, 'A');
+      (204, Vec::new())
+    }
+    2 => {
+      login_request(&request);
+      (200, issued('B'))
+    }
+    3 => {
+      assert_eq!(request.path, "/v1/logout");
+      bearer(&request, 'B');
+      (204, Vec::new())
+    }
+    _ => unreachable!(),
+  });
+  write_config(&fixture.root, &url, None, 30);
+  let logged_in = fixture.run_output(&["login", "--password-stdin"], Some(PASSWORD), false);
+  assert!(logged_in.status.success());
+  let text = String::from_utf8(logged_in.stdout).unwrap();
+  for field in ["FIELD", "VALUE", "Logged in", "Until revoked", &url] {
+    assert!(text.contains(field), "{text}");
+  }
+  assert!(serde_json::from_str::<Value>(&text).is_err());
+  let shown = fixture.run_output(&["config", "server", "show"], None, false);
+  assert!(shown.status.success());
+  assert!(String::from_utf8_lossy(&shown.stdout).contains("Server / url"));
+  let logged_out = fixture.run_output(&["logout"], None, false);
+  assert!(logged_out.status.success());
+  assert!(String::from_utf8_lossy(&logged_out.stdout).contains("Logged out"));
+  assert_eq!(
+    success(fixture.run(&["login", "--password-stdin", "-q"], Some(PASSWORD)))["logged_in"],
+    true
+  );
+  let quiet = fixture.run_output(&["logout", "-q"], None, false);
+  assert!(quiet.status.success());
+  assert!(quiet.stdout.is_empty());
   server.join().unwrap();
 }

@@ -1,5 +1,8 @@
 # Expri configuration
 
+Reports show tables by default. Agents and scripts should add `--json` to read
+structured results; `--quiet` suppresses human reports.
+
 Read the existing project configuration before adding tasks or selecting a
 worker. Most controller commands load `expri.toml` from the current directory;
 they do not search ancestor directories.

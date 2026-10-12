@@ -11,6 +11,7 @@ mod global_config;
 mod login_cli;
 mod metrics_cli;
 mod node;
+mod output;
 mod push_cli;
 mod query_cli;
 mod runs;
@@ -165,6 +166,9 @@ struct PushCommand {
 
 #[derive(Debug, Args)]
 struct FetchCommand {
+  /// Print the structured transfer report for automation.
+  #[arg(long)]
+  json: bool,
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -223,6 +227,9 @@ struct DownloadCommand {
 
 #[derive(Debug, Args)]
 struct RunCommand {
+  /// Print the detached start receipt as JSON.
+  #[arg(long, requires = "detach")]
+  json: bool,
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -269,16 +276,16 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
-    Command::Login(command) => login_cli::run_login(command, cli.target.as_deref()),
-    Command::Logout(command) => login_cli::run_logout(command, cli.target.as_deref()),
-    Command::Config(command) => config_cli::run(command, cli.target.as_deref()),
-    Command::Query(command) => query_cli::run(command, cli.target.as_deref()),
+    Command::Login(command) => login_cli::run_login(command, cli.target.as_deref(), cli.quiet),
+    Command::Logout(command) => login_cli::run_logout(command, cli.target.as_deref(), cli.quiet),
+    Command::Config(command) => config_cli::run(command, cli.target.as_deref(), cli.quiet),
+    Command::Query(command) => query_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Skill(command) => skill_cli::run(command),
-    Command::System(command) => system_cli::run(command, cli.target.as_deref()),
+    Command::System(command) => system_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Assets(command) => assets_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Push(command) => push_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Fetch(command) => fetch_cli::run(command, cli.target.as_deref(), cli.quiet),
-    Command::Artifact(command) => artifacts_cli::run(command, cli.target.as_deref()),
+    Command::Artifact(command) => artifacts_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Download(command) => {
       run_download(command, cli.target.as_deref(), cli.verbose, cli.quiet)
     }
@@ -289,7 +296,7 @@ fn run() -> Result<()> {
     }
     Command::Runs(command) => runs_cli::run(command, cli.target.as_deref(), cli.verbose, cli.quiet),
     Command::Dashboard(command) => dashboard::run(command, cli.target.as_deref()),
-    Command::Service(command) => service::run(command, cli.target.as_deref()),
+    Command::Service(command) => service::run(command, cli.target.as_deref(), cli.quiet),
     Command::Node { command } => {
       if cli.target.is_some() {
         return Err(ExpriError::Message(
@@ -549,6 +556,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
       sync_args,
       expected_sync,
       detach: command.detach,
+      json: command.json,
     });
   }
 
@@ -574,6 +582,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     args,
     dry_run: command.dry_run,
     detach: command.detach,
+    json: command.json,
     verbosity,
     quiet,
     environment,

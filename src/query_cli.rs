@@ -3,13 +3,18 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use expri_client::{ServiceCatalogClient, resolve_client_config};
 use expri_core::service::RunScope;
-use expri_core::service_catalog::{RunArchiveFilter, RunFilesQuery, RunListQuery};
-use serde_json::Value;
+use expri_core::service_catalog::{
+  RunArchiveFilter, RunFilesPage, RunFilesQuery, RunListPage, RunListQuery, RunSelector,
+  validate_run_files_options,
+};
 
 use crate::error::{ExpriError, Result};
 
 #[derive(Debug, Args)]
 pub struct QueryCommand {
+  /// Print the complete structured page for scripts and agents.
+  #[arg(long, global = true)]
+  json: bool,
   #[command(subcommand)]
   command: QuerySubcommand,
 }
@@ -22,17 +27,30 @@ enum QuerySubcommand {
   Files(FilesOptions),
 }
 
-pub fn run(command: QueryCommand, target: Option<&str>) -> Result<()> {
+pub fn run(command: QueryCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
     return Err(ExpriError::Message(
       "query commands run on the current machine; omit --target".into(),
     ));
   }
-  let report = match command.command {
-    QuerySubcommand::Runs(options) => runs(options)?,
-    QuerySubcommand::Files(options) => files(options)?,
-  };
-  println!("{}", serde_json::to_string(&report)?);
+  match command.command {
+    QuerySubcommand::Runs(options) => {
+      let page = runs(options)?;
+      if command.json {
+        crate::output::print_report(&page, true)?;
+      } else if !quiet {
+        print_runs(&page);
+      }
+    }
+    QuerySubcommand::Files(options) => {
+      let page = files(options)?;
+      if command.json {
+        crate::output::print_report(&page, true)?;
+      } else if !quiet {
+        print_files(&page);
+      }
+    }
+  }
   Ok(())
 }
 
@@ -62,10 +80,12 @@ struct FilesOptions {
   /// Override the global [server] connection with another client configuration.
   #[arg(long)]
   config: Option<PathBuf>,
+  /// Narrow the run ID to this project; needed only when the ID is ambiguous.
   #[arg(long)]
-  project_id: String,
+  project_id: Option<String>,
+  /// Narrow the run ID to this worker; needed only when the ID is ambiguous.
   #[arg(long)]
-  origin: String,
+  origin: Option<String>,
   #[arg(long)]
   run_id: String,
   /// Literal path prefix, such as outputs/; % and _ are ordinary characters.
@@ -78,7 +98,7 @@ struct FilesOptions {
   cursor: Option<String>,
 }
 
-fn runs(options: RunsOptions) -> Result<Value> {
+fn runs(options: RunsOptions) -> Result<RunListPage> {
   let archival = match options.archival.as_str() {
     "active" => RunArchiveFilter::Active,
     "archived" => RunArchiveFilter::Archived,
@@ -93,26 +113,229 @@ fn runs(options: RunsOptions) -> Result<Value> {
     cursor: options.cursor,
   };
   query.validate()?;
-  let page =
-    ServiceCatalogClient::new(&resolve_client_config(options.config.as_deref())?)?.runs(&query)?;
-  serde_json::to_value(page).map_err(Into::into)
+  ServiceCatalogClient::new(&resolve_client_config(options.config.as_deref())?)?.runs(&query)
 }
 
-fn files(options: FilesOptions) -> Result<Value> {
+fn files(options: FilesOptions) -> Result<RunFilesPage> {
+  let selector = RunSelector {
+    project_id: options.project_id,
+    origin: options.origin,
+    run_id: options.run_id,
+  };
+  selector.validate()?;
+  validate_run_files_options(
+    options.prefix.as_deref(),
+    options.limit as usize,
+    options.cursor.as_deref(),
+  )?;
+  let client = ServiceCatalogClient::new(&resolve_client_config(options.config.as_deref())?)?;
+  let scope = match selector.explicit_scope() {
+    Some(scope) => scope,
+    None => resolved_scope(&client, &selector)?,
+  };
   let query = RunFilesQuery {
-    scope: RunScope {
-      project_id: options.project_id,
-      origin: options.origin,
-      run_id: options.run_id,
-    },
+    scope,
     prefix: options.prefix,
     limit: options.limit as usize,
     cursor: options.cursor,
   };
   query.validate()?;
-  let page =
-    ServiceCatalogClient::new(&resolve_client_config(options.config.as_deref())?)?.files(&query)?;
-  serde_json::to_value(page).map_err(Into::into)
+  client.files(&query)
+}
+
+fn resolved_scope(client: &ServiceCatalogClient, selector: &RunSelector) -> Result<RunScope> {
+  let matches = client.run_scopes(selector)?;
+  match matches.as_slice() {
+    [scope] => Ok(scope.clone()),
+    [] => Err(ExpriError::Message(format!(
+      "no accessible run matches run ID {} and the supplied filters",
+      selector.run_id,
+    ))),
+    _ => {
+      let rows = matches
+        .iter()
+        .map(|scope| {
+          vec![
+            scope.project_id.clone(),
+            scope.origin.clone(),
+            scope.run_id.clone(),
+          ]
+        })
+        .collect::<Vec<_>>();
+      let table = crate::output::table(&["PROJECT", "ORIGIN", "RUN"], &rows, &[32, 32, 40]);
+      Err(ExpriError::Message(format!(
+        "run ID {} is ambiguous; at least two accessible runs match:\n{table}Use --project-id and/or --origin to choose one.",
+        selector.run_id,
+      )))
+    }
+  }
+}
+
+fn optional(value: Option<&str>) -> String {
+  value.unwrap_or("-").into()
+}
+
+fn print_runs(page: &RunListPage) {
+  let rows = page
+    .runs
+    .iter()
+    .map(|run| {
+      vec![
+        run.scope.project_id.clone(),
+        run.scope.origin.clone(),
+        run.scope.run_id.clone(),
+        optional(run.task.as_deref()),
+        run.status.clone(),
+        optional(run.started_at.as_deref()),
+        run
+          .exit_code
+          .map(|code| code.to_string())
+          .unwrap_or_else(|| "-".into()),
+        if run.archived { "yes" } else { "no" }.into(),
+      ]
+    })
+    .collect::<Vec<_>>();
+  print!(
+    "{}",
+    crate::output::table(
+      &[
+        "PROJECT", "ORIGIN", "RUN", "TASK", "STATUS", "STARTED", "EXIT", "ARCHIVED"
+      ],
+      &rows,
+      &[18, 18, 32, 24, 12, 25, 6, 8],
+    )
+  );
+  if rows.is_empty() {
+    println!("No published runs.");
+  }
+  for run in &page.runs {
+    for warning in &run.warnings {
+      eprintln!(
+        "warning: {}/{}/{}: {}",
+        run.scope.project_id,
+        run.scope.origin,
+        run.scope.run_id,
+        crate::output::text(warning)
+      );
+    }
+  }
+  print_cursor(page.next_cursor.as_deref());
+}
+
+fn print_files(page: &RunFilesPage) {
+  println!(
+    "Project: {}  Origin: {}  Run: {}",
+    page.scope.project_id, page.scope.origin, page.scope.run_id
+  );
+  let rows = page
+    .files
+    .iter()
+    .map(|file| {
+      use expri_core::service_catalog::RunFileAvailability;
+      let availability = match file.availability {
+        RunFileAvailability::Received => "received",
+        RunFileAvailability::ReportedOnly => "reported_only",
+        RunFileAvailability::ReceivedDifferentVersion => "received_different_version",
+      };
+      let labels = file
+        .reported
+        .as_ref()
+        .map(|reported| {
+          reported
+            .labels
+            .iter()
+            .map(|label| {
+              if file.labels_pending {
+                format!("{label} (pending)")
+              } else {
+                label.clone()
+              }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+        })
+        .filter(|labels| !labels.is_empty())
+        .unwrap_or_else(|| "-".into());
+      vec![
+        file.path.clone(),
+        availability.into(),
+        file
+          .received
+          .as_ref()
+          .map(|received| crate::output::bytes(received.size))
+          .unwrap_or_else(|| "-".into()),
+        file
+          .reported
+          .as_ref()
+          .map(|reported| crate::output::bytes(reported.size))
+          .unwrap_or_else(|| "-".into()),
+        labels,
+        optional(
+          file
+            .reported
+            .as_ref()
+            .and_then(|reported| reported.sync_status.as_deref()),
+        ),
+      ]
+    })
+    .collect::<Vec<_>>();
+  print!(
+    "{}",
+    crate::output::table(
+      &[
+        "PATH",
+        "AVAILABILITY",
+        "RECEIVED SIZE",
+        "REPORTED SIZE",
+        "LABELS",
+        "SYNC"
+      ],
+      &rows,
+      &[52, 26, 13, 13, 30, 18],
+    )
+  );
+  if rows.is_empty() {
+    println!("No files.");
+  }
+  if let Some(time) = &page.inventory_recorded_at {
+    println!("Inventory recorded: {}", crate::output::text(time));
+  }
+  if page.reported_inventory_truncated {
+    eprintln!("warning: reported file inventory was truncated; received records remain available");
+  }
+  for warning in &page.warnings {
+    eprintln!("warning: {}", crate::output::text(warning));
+  }
+  for file in &page.files {
+    if let Some(error) = file
+      .reported
+      .as_ref()
+      .and_then(|reported| reported.sync_error.as_ref())
+    {
+      eprintln!(
+        "warning: {}: {}",
+        crate::output::text(&file.path),
+        crate::output::text(error)
+      );
+    }
+    if matches!(
+      file.received.as_ref().map(|received| &received.storage),
+      Some(expri_core::service::FileStorage::Tracking { sealed: false, .. })
+    ) {
+      println!(
+        "{}: received tracking data is still growing.",
+        crate::output::text(&file.path)
+      );
+    }
+  }
+  print_cursor(page.next_cursor.as_deref());
+}
+
+fn print_cursor(cursor: Option<&str>) {
+  if let Some(cursor) = cursor {
+    println!("\nNext cursor: {}", crate::output::text(cursor));
+    println!("Continue with --cursor and the same scope and filters.");
+  }
 }
 
 #[cfg(test)]
@@ -172,7 +395,8 @@ mod tests {
     for limit in ["0", "101"] {
       assert!(Cli::try_parse_from(["expri", "query", "runs", "--limit", limit]).is_err());
     }
-    assert!(Cli::try_parse_from(["expri", "query", "files", "--run-id", "run-one"]).is_err());
+    assert!(Cli::try_parse_from(["expri", "query", "files", "--run-id", "run-one"]).is_ok());
+    assert!(Cli::try_parse_from(["expri", "query", "files"]).is_err());
   }
 
   #[test]
@@ -191,11 +415,41 @@ mod tests {
       unreachable!()
     };
     assert!(
-      run(command, cli.target.as_deref())
+      run(command, cli.target.as_deref(), false)
         .unwrap_err()
         .to_string()
         .contains("current machine")
     );
+  }
+
+  #[test]
+  fn file_selector_and_page_options_fail_before_configuration_or_network() {
+    for (option, value) in [
+      ("--run-id", "../run"),
+      ("--project-id", "../project"),
+      ("--origin", "../worker"),
+      ("--prefix", "/absolute"),
+      ("--cursor", "../file"),
+    ] {
+      let mut args = vec![
+        "expri",
+        "query",
+        "files",
+        "--config",
+        "/missing/client.toml",
+      ];
+      if option != "--run-id" {
+        args.extend(["--run-id", "run-one"]);
+      }
+      args.extend([option, value]);
+      let cli = Cli::try_parse_from(args).unwrap();
+      let Command::Query(command) = cli.command else {
+        unreachable!()
+      };
+      let error = run(command, None, false).unwrap_err();
+      assert!(!error.to_string().contains("client.toml"));
+      assert!(error.to_string().contains("invalid"), "{error}");
+    }
   }
 
   #[test]

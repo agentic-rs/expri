@@ -134,7 +134,7 @@ except ProcessLookupError:
 
 def client(container, action, *args, check=True, config=None):
   config = config or ('/tmp/worker.toml' if container == worker else '/tmp/owner.toml')
-  return execute(container, 'expri', 'service', *action.split(), '--config', config, *args, check=check)
+  return execute(container, 'expri', 'service', *action.split(), '--json', '--config', config, *args, check=check)
 
 def browser(path, *, method='GET', cookie=None, bearer_env=None, password_env=None,
     json_password_env=None, origin='https://expri.example.net', payload=None, limit=512 * 1024):
@@ -1050,7 +1050,7 @@ prefix = "acceptance"
     copy(ROOT / 'crates/worker/python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
     execute(worker, 'python3', '/tmp/seed.py')
   with workflow_progress.phase('Training through a service outage and publisher resume'):
-    receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
+    receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train').stdout)
     run_id, run_dir = receipt['run_id'], receipt['run_dir']
     assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
     push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
@@ -1079,7 +1079,7 @@ for process in Path('/proc').iterdir():
 print(count)''')
     assert killed == '1', 'did not find exactly one independent publisher'
     wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['publishing']['worker_active'] is False, 'stopped publisher retained its lease')
-    resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--run-dir', run_dir).stdout)
+    resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--json', '--run-dir', run_dir).stdout)
     assert resumed['run_id'] == run_id, 'resume started a different run'
     docker('start', service)
     wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to restart')
@@ -1107,7 +1107,7 @@ print(count)''')
   with workflow_progress.phase('Live checkpoint downloads and result uploads'):
     sync_gate = '/tmp/expri-live-sync.release'
     python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
-    second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train /tmp/expri-live-sync.release').stdout)
+    second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train /tmp/expri-live-sync.release').stdout)
     assert second['run_id'] != run_id, 'second experiment reused the first run identity'
     live_repo = '/home/tester/live-review'
     watch_config = '''[project]
@@ -1232,11 +1232,11 @@ print(process.pid)
   with workflow_progress.phase('Failed and cancelled run publication'):
     # Failed and cancelled runs must also finish publication, without a selected
     # final checkpoint preventing their metadata/logs from draining.
-    failed = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach fail').stdout)
+    failed = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json fail').stdout)
     wait_for(lambda: drained(failed['run_dir']), 'failed run publisher did not drain', timeout=120)
     failed_state = json.loads(python(worker, f"from pathlib import Path;print(Path({failed['run_dir']!r}+'/run-state.json').read_text())"))
     assert failed_state['status'] == 'failed' and failed_state['exit_code'] == 7, 'publishing changed the failed task result'
-    cancelled = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach wait').stdout)
+    cancelled = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json wait').stdout)
     wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({cancelled['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'running', 'cancellation fixture did not start')
     execute(worker, 'expri', 'runs', 'cancel', cancelled['run_id'], '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json')
     wait_for(lambda: drained(cancelled['run_dir']), 'cancelled run publisher did not drain', timeout=120)
@@ -1289,7 +1289,7 @@ print(process.pid)
     long_chart_data_checks()
   with workflow_progress.phase('Offline asset training and local result review'):
     docker('stop', '--time', '1', service, s3)
-    offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach train').stdout)
+    offline_run = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train').stdout)
     wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'offline training could not reuse its verified private input cache', timeout=90)
     offline_proof = json.loads(python(worker, f"from pathlib import Path;print(Path({offline_run['run_dir']!r}+'/outputs/input-proof.json').read_text())"))
     assert offline_proof['size'] == len(b'private-input-fixture') * 1024, 'offline training did not consume its pinned private asset'

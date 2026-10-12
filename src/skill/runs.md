@@ -4,9 +4,11 @@ Use the same target used to launch the run. Omit `-T` for locally recorded runs.
 Prefer JSON reports for agent inspection.
 
 For published server records, use `expri query runs` and `expri query files`.
-They return bounded JSON pages through the global `[server]` connection without
-SSH or a local project. Read `expri skill query` for full scope, pagination, and
-file availability. Their execution state is the last publication; the worker
+They show tables by default; add `--json` for bounded JSON pages through the global `[server]` connection without
+SSH or a local project. `expri query files --run-id run-abc123 --json` resolves a
+unique accessible active or retained archived run; add `--project-id` and/or
+`--origin` if the ID is ambiguous. Read `expri skill query` for resolved scopes,
+pagination, and file availability. Their execution state is the last publication; the worker
 commands below inspect live supervision.
 
 ```sh

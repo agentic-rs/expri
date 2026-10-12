@@ -267,9 +267,17 @@ fn quote(value: &str) -> String {
 
 fn start(fixture: &Fixture, mode: &str, rate: &str, synchronize: bool) -> Value {
   let args = if synchronize {
-    vec!["run", "--detach", "train", mode, rate]
+    vec!["run", "--detach", "--json", "train", mode, rate]
   } else {
-    vec!["run", "--no-push", "--detach", "train", mode, rate]
+    vec![
+      "run",
+      "--no-push",
+      "--detach",
+      "--json",
+      "train",
+      mode,
+      rate,
+    ]
   };
   let receipt = fixture.json(&args);
   assert_eq!(receipt["detached"], true);

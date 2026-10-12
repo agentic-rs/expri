@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- User-facing query, configuration, login, service, system, asset, artifact,
+  transfer, and detached-start reports now use tables by default. Scripts must
+  request `--json` to retain structured output. Use `run --detach --json TASK`
+  for a machine-readable start receipt. Worker protocols and foreground task
+  streams retain their existing formats.
+
 ## 0.1.5
 
 Expri now covers the experiment workflow from preparing a worker and starting a

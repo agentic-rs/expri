@@ -228,13 +228,21 @@ fn detached_start_uses_durable_capability_and_accepts_quoted_request_paths() {
   fixture.node("durable-runs-v1");
   let request = fixture.repo.join("request 'with spaces'.json");
   fs::write(&request, br#"{"detach":true}"#).unwrap();
-  start_with_preference(
+  let receipt = start_with_preference(
     &fixture.remote,
     request.to_str().unwrap(),
     ProtocolPreference::Auto,
     "./node-stub",
   )
+  .unwrap()
   .unwrap();
+  assert_eq!(
+    receipt,
+    json!({
+      "run_id": "run-new", "run_dir": "/remote/.expri/runs/run-new",
+      "status": "preparing", "detached": true,
+    })
+  );
   fixture.node("run-records-v1");
   let error = start_with_preference(
     &fixture.remote,

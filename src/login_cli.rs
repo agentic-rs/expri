@@ -8,13 +8,16 @@ use expri_client::{login, revoke_login, validate_login_url};
 use expri_core::service::ClientConfig;
 use expri_core::service_auth::{LoginRequest, validate_cli_token};
 use expri_core::storage::StoragePaths;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::error::{ExpriError, Result};
 use crate::global_config::{load, replacement_committed, save_server_if_unchanged};
 
 #[derive(Debug, Args)]
 pub struct LoginCommand {
+  /// Print the structured result for automation.
+  #[arg(long)]
+  json: bool,
   /// Server URL; defaults to the URL already saved in global configuration.
   #[arg(long)]
   url: Option<String>,
@@ -28,12 +31,15 @@ pub struct LoginCommand {
 
 #[derive(Debug, Args)]
 pub struct LogoutCommand {
+  /// Print the structured result for automation.
+  #[arg(long)]
+  json: bool,
   /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri directory.
   #[arg(long)]
   storage_dir: Option<PathBuf>,
 }
 
-pub fn run_login(command: LoginCommand, target: Option<&str>) -> Result<()> {
+pub fn run_login(command: LoginCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   current_machine(target)?;
   let paths = StoragePaths::resolve(command.storage_dir.as_deref())?;
   let snapshot = load(&paths)?;
@@ -79,20 +85,21 @@ pub fn run_login(command: LoginCommand, target: Option<&str>) -> Result<()> {
   {
     warnings.push("previous CLI credential could not be revoked; it remains valid until revoked");
   }
-  println!(
-    "{}",
-    serde_json::to_string_pretty(&json!({
+  print_auth_report(
+    &json!({
       "logged_in": true,
       "url": url,
       "config_file": paths.config_file(),
       "expires_at_ms": credential.expires_at_ms,
       "warnings": warnings,
-    }))?
-  );
+    }),
+    command.json,
+    quiet,
+  )?;
   Ok(())
 }
 
-pub fn run_logout(command: LogoutCommand, target: Option<&str>) -> Result<()> {
+pub fn run_logout(command: LogoutCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   current_machine(target)?;
   let paths = StoragePaths::resolve(command.storage_dir.as_deref())?;
   let snapshot = load(&paths)?;
@@ -116,15 +123,59 @@ pub fn run_logout(command: LogoutCommand, target: Option<&str>) -> Result<()> {
     connection.token_env = None;
     save_server_if_unchanged(&paths, Some(server), Some(connection))?;
   }
-  println!(
-    "{}",
-    serde_json::to_string_pretty(&json!({
+  print_auth_report(
+    &json!({
       "logged_in": false,
       "url": snapshot.server.as_ref().map(|server| &server.url),
       "config_file": paths.config_file(),
       "warnings": warnings,
-    }))?
+    }),
+    command.json,
+    quiet,
+  )?;
+  Ok(())
+}
+
+fn print_auth_report(report: &Value, json: bool, quiet: bool) -> Result<()> {
+  if json {
+    return crate::output::print_report(report, true);
+  }
+  if quiet {
+    return Ok(());
+  }
+  let logged_in = report["logged_in"] == true;
+  let mut fields = vec![
+    vec![
+      "Status".into(),
+      if logged_in { "Logged in" } else { "Logged out" }.into(),
+    ],
+    vec![
+      "Server".into(),
+      report["url"].as_str().unwrap_or("-").into(),
+    ],
+    vec![
+      "Configuration".into(),
+      report["config_file"].as_str().unwrap_or("-").into(),
+    ],
+  ];
+  if logged_in {
+    fields.push(vec![
+      "Validity".into(),
+      report["expires_at_ms"]
+        .as_i64()
+        .map(|expiry| expiry.to_string())
+        .unwrap_or_else(|| "Until revoked".into()),
+    ]);
+  }
+  print!(
+    "{}",
+    crate::output::table(&["FIELD", "VALUE"], &fields, &[16, 80])
   );
+  if let Some(warnings) = report["warnings"].as_array() {
+    for warning in warnings.iter().filter_map(Value::as_str) {
+      eprintln!("warning: {}", crate::output::text(warning));
+    }
+  }
   Ok(())
 }
 
@@ -257,8 +308,8 @@ mod tests {
       ])
       .unwrap();
       let result = match cli.command {
-        Command::Login(command) => run_login(command, cli.target.as_deref()),
-        Command::Logout(command) => run_logout(command, cli.target.as_deref()),
+        Command::Login(command) => run_login(command, cli.target.as_deref(), false),
+        Command::Logout(command) => run_logout(command, cli.target.as_deref(), false),
         _ => unreachable!(),
       };
       assert!(result.unwrap_err().to_string().contains("current machine"));

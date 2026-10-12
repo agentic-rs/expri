@@ -14,6 +14,12 @@ expri system history
 expri system history --resolution hourly
 ```
 
+Reports default to human-readable tables. Add `--json` when an agent or script
+needs complete structured fields, such as `expri system sample --json` or
+`expri service system list --json`. `--quiet` suppresses tables; explicit
+`--json` still prints the report. The foreground daemon keeps its operational
+messages rather than producing a final report.
+
 `sample` writes an inventory and one observation, returning the stable machine
 ID. Run the foreground `daemon` on each machine for continuous collection.
 It defaults to ten-second sampling and holds a singleton lease. Ctrl-C stops
@@ -77,7 +83,8 @@ expri service system history machine-actual-id --resolution hourly
 expri service system profile machine-actual-id --inventory-revision 1
 ```
 
-History uses bounded pages. Pass returned `next_cursor` through `--cursor`;
+History uses bounded pages. The table shows its next cursor, and `--json`
+includes `next_cursor` in the structured report. Pass it through `--cursor`;
 use timezone-qualified RFC3339 `--start`/`--end` to select a range. Read the
 inventory revision referenced by a historical sample when device identities
 changed. Existing run/asset/cache paths keep their current locations.

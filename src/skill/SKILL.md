@@ -45,7 +45,7 @@ prints an embedded Markdown guide and works without project configuration.
 - `query runs` and `query files` read published server JSON through the global
   `[server]` connection without a repository or target. Use `expri skill query`
   for scope, pagination, and received/reported availability.
-- Prefer `--json` where supported when reading reports. Use the installed CLI's
+- Reports are human-readable tables by default. Prefer `--json` when reading reports. Use the installed CLI's
   `--help` for exact flags, for example `expri runs status --help`.
 
 Topic examples use `gpu`, `train`, and `run-abc123` as placeholders. Substitute
