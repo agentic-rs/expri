@@ -2458,6 +2458,215 @@ function archivalRun(run_id, { origin = "gpu-a", status = "completed", archived 
   };
 }
 
+function annotatedRun(run_id, options = {}) {
+  const run = archivalRun(run_id, options);
+  return { ...run, nickname: null, tags: [], annotations: { scope: run.archival.scope, nickname: null, tags: [] } };
+}
+
+test("nickname and multiple tags save to the exact machine run without changing identity or chart", async t => {
+  const runs = [annotatedRun("run-shared"), annotatedRun("run-shared", { origin: "gpu-b" })];
+  const posts = [];
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs, override: (url, init) => {
+    if (url.pathname !== "/api/runs/annotations") return null;
+    const body = JSON.parse(init.body);
+    posts.push(body);
+    assert.equal(init.method, "POST");
+    assert.equal(init.credentials, "same-origin");
+    const run = runs.find(item => item.origin === body.origin && item.run_id === body.run_id);
+    assert.ok(run);
+    run.nickname = body.nickname;
+    run.tags = body.tags;
+    run.annotations = { scope: run.archival.scope, nickname: body.nickname, tags: body.tags };
+    return response(run.annotations);
+  } });
+  const { nodes } = model;
+  await click(nodes.document.querySelector('[data-run-key="gpu-b:run-shared"] .run-link'));
+  const preview = nodes.get("chart-preview");
+  setValue(nodes.get("run-nickname"), " Baseline λ "); await emit(nodes.get("run-nickname"), "input");
+  setValue(nodes.get("run-tag-input"), " baseline "); await emit(nodes.get("run-tag-input"), "input");
+  await click(nodes.get("add-run-tag"));
+  setValue(nodes.get("run-tag-input"), "model-a"); await emit(nodes.get("run-tag-input"), "input");
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  assert.deepEqual(posts, [{ project_id: "vision", origin: "gpu-b", run_id: "run-shared", nickname: "Baseline λ", tags: ["baseline", "model-a"] }]);
+  assert.equal(runs[0].nickname, null);
+  assert.match(nodes.get("review-title").textContent, /Baseline λ/);
+  const row = nodes.document.querySelector('[data-run-key="gpu-b:run-shared"]');
+  assert.match(row.textContent, /Baseline λ/);
+  assert.match(row.textContent, /run-shared/);
+  assert.match(row.textContent, /baseline.*model-a/);
+  assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(nodes.get("save-run-annotations").disabled, true);
+});
+
+test("annotation drafts survive refresh and failed saves, with explicit cancel to current values", async t => {
+  const run = annotatedRun("run-1");
+  let fail = true;
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run], override: (url, init) => {
+    if (url.pathname !== "/api/runs/annotations") return null;
+    if (fail) return response({ error: "Connection unavailable" }, 503);
+    const body = JSON.parse(init.body);
+    run.nickname = body.nickname;
+    run.tags = body.tags;
+    run.annotations = { scope: run.archival.scope, nickname: body.nickname, tags: body.tags };
+    return response(run.annotations);
+  } });
+  const { nodes } = model;
+  await click(nodes.document.querySelector(".run-link"));
+  setValue(nodes.get("run-nickname"), "Unsaved"); await emit(nodes.get("run-nickname"), "input");
+  run.nickname = "Changed by CLI";
+  run.annotations = { ...run.annotations, nickname: run.nickname };
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("run-nickname").value, "Unsaved");
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  assert.match(nodes.get("run-annotations-error").textContent, /Connection unavailable/);
+  assert.equal(nodes.get("run-nickname").value, "Unsaved");
+  setValue(nodes.get("run-nickname"), "Newer draft"); await emit(nodes.get("run-nickname"), "input");
+  run.nickname = "Unsaved";
+  run.annotations = { ...run.annotations, nickname: run.nickname };
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("run-nickname").value, "Newer draft", "a previous failed submission cannot erase subsequent edits");
+  fail = false;
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  assert.equal(run.nickname, "Newer draft");
+  assert.equal(nodes.get("save-run-annotations").disabled, true);
+  setValue(nodes.get("run-nickname"), "Other draft"); await emit(nodes.get("run-nickname"), "input");
+  await click(nodes.get("cancel-run-annotations"));
+  assert.equal(nodes.get("run-nickname").value, "Newer draft");
+});
+
+for (const refresh_order of ["before save", "after save"]) {
+  test(`annotation save retains newer detail and rejects refresh responses arriving ${refresh_order}`, async t => {
+    const run = annotatedRun("run-1");
+    const post = deferred(), detail = deferred();
+    let delay_detail = false, detail_signal, old_response;
+    const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run], override: (url, init) => {
+      if (url.pathname === "/api/runs/annotations") return post.promise;
+      if (url.pathname === "/api/run" && delay_detail) { detail_signal = init.signal; return detail.promise; }
+      return null;
+    } });
+    const { nodes } = model;
+    await click(nodes.document.querySelector(".run-link"));
+    setValue(nodes.get("run-nickname"), "Saved"); await emit(nodes.get("run-nickname"), "input");
+    await emit(nodes.get("save-run-annotations").form, "submit");
+    model.metric_value = 1.75;
+    if (refresh_order === "after save") {
+      old_response = detailRecord(model.project_sources[0], { ...run }, 0.5);
+      delay_detail = true;
+    }
+    await click(nodes.get("refresh-button"));
+    if (delay_detail) await settled(() => detail_signal);
+    const lastLoss = () => [...nodes.get("run-detail").querySelectorAll("tbody tr")]
+      .find(row => row.children[0].textContent === "loss").children[2].textContent;
+    if (!delay_detail) assert.equal(lastLoss(), "1.75");
+    delay_detail = false;
+    await act(async () => {
+      run.nickname = "Saved";
+      run.annotations = { ...run.annotations, nickname: "Saved" };
+      post.resolve(response(run.annotations));
+      await microtasks();
+    });
+    if (refresh_order === "after save") {
+      assert.equal(detail_signal.aborted, true);
+      await act(async () => { detail.resolve(response(old_response)); await microtasks(); });
+    } else {
+      assert.equal(lastLoss(), "1.75", "saving annotations must retain freshly loaded metric summaries");
+    }
+    assert.match(nodes.get("review-title").textContent, /Saved/);
+    assert.equal(nodes.get("run-nickname").value, "Saved");
+  });
+}
+
+test("a failed annotation save does not strand a pending run list", async t => {
+  const run = annotatedRun("run-1");
+  const pending = deferred();
+  let delay_list = false, list_signal;
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run], override: (url, init) => {
+    if (url.pathname === "/api/runs/annotations") return response({ error: "Temporary failure" }, 503);
+    if (url.pathname === "/api/runs" && delay_list) { list_signal = init.signal; return pending.promise; }
+    return null;
+  } });
+  const { nodes } = model;
+  await click(nodes.document.querySelector(".run-link"));
+  setValue(nodes.get("run-nickname"), "Draft"); await emit(nodes.get("run-nickname"), "input");
+  delay_list = true;
+  await click(nodes.get("refresh-button"));
+  await settled(() => list_signal);
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  assert.match(nodes.get("run-annotations-error").textContent, /Temporary failure/);
+  assert.equal(list_signal.aborted, false);
+  await act(async () => {
+    pending.resolve(response({ source: model.project_sources[0], runs: [run], warnings: [], total_count: 1, offset: 0, next_offset: null }));
+    await microtasks();
+  });
+  assert.equal(nodes.get("runs-region").getAttribute("aria-busy"), "false");
+});
+
+test("run pagination remembers actual offsets when annotation-rich pages contain fewer rows", async t => {
+  const runs = Array.from({ length: 7 }, (_, index) => annotatedRun(`run-${index}`));
+  const source = { source_id: "hosted-project:vision", project_id: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs, override: url => {
+    if (url.pathname !== "/api/runs") return null;
+    const offset = Number(url.searchParams.get("offset"));
+    const count = offset === 2 ? 3 : 2;
+    return response({ source, runs: runs.slice(offset, offset + count), warnings: [], total_count: runs.length,
+      offset, next_offset: offset + count < runs.length ? offset + count : null });
+  } });
+  const { nodes } = model;
+  const ids = () => [...nodes.document.querySelectorAll("#run-rows tr")].map(row => row.dataset.runKey);
+  assert.deepEqual(ids(), ["gpu-a:run-0", "gpu-a:run-1"]);
+  await click(nodes.get("next-page"));
+  assert.equal(nodes.get("page-label").textContent, "Page 2");
+  assert.deepEqual(ids(), ["gpu-a:run-2", "gpu-a:run-3", "gpu-a:run-4"]);
+  await click(nodes.get("next-page"));
+  assert.equal(nodes.get("page-label").textContent, "Page 3");
+  assert.deepEqual(ids(), ["gpu-a:run-5", "gpu-a:run-6"]);
+  await click(nodes.get("previous-page"));
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.get("page-label").textContent, "Page 2");
+  assert.deepEqual(ids(), ["gpu-a:run-2", "gpu-a:run-3", "gpu-a:run-4"]);
+  await click(nodes.get("previous-page"));
+  assert.equal(nodes.get("page-label").textContent, "Page 1");
+  assert.deepEqual(ids(), ["gpu-a:run-0", "gpu-a:run-1"]);
+});
+
+test("late annotation replies cannot replace a newly inspected run", async t => {
+  const pending = deferred();
+  let signal;
+  const runs = [annotatedRun("run-a"), annotatedRun("run-b")];
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs, override: (url, init) => {
+    if (url.pathname !== "/api/runs/annotations") return null;
+    signal = init.signal;
+    return pending.promise;
+  } });
+  const { nodes } = model;
+  await click(nodes.document.querySelector('[data-run-key="gpu-a:run-a"] .run-link'));
+  setValue(nodes.get("run-nickname"), "Old run draft"); await emit(nodes.get("run-nickname"), "input");
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  await click(nodes.document.querySelector('[data-run-key="gpu-a:run-b"] .run-link'));
+  assert.equal(signal.aborted, true);
+  await act(async () => {
+    pending.resolve(response({ scope: runs[0].archival.scope, nickname: "Old run draft", tags: [] }));
+    await microtasks();
+  });
+  assert.match(nodes.get("review-title").textContent, /run-b/);
+  assert.equal(nodes.get("run-nickname").value, "");
+  assert.equal(nodes.document.getElementById("run-annotations-error"), null);
+});
+
+test("annotations remain read-only in preview dashboards and unavailable on older servers", async t => {
+  const run = annotatedRun("run-1");
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run] });
+  const { nodes } = model;
+  model.run_management_enabled = false;
+  await click(nodes.get("refresh-button"));
+  await click(nodes.document.querySelector(".run-link"));
+  assert.equal(nodes.get("run-nickname").matches(":disabled"), true);
+  assert.equal(nodes.get("save-run-annotations").matches(":disabled"), true);
+  delete run.annotations;
+  await click(nodes.get("refresh-button"));
+  assert.equal(nodes.document.getElementById("run-annotations-panel"), null);
+});
+
 test("hosted archive tags filter in one click without replacing training statuses", async t => {
   const model = await reviewFixture(t, { hosted: true, projects: true,
     project_runs: [archivalRun("active"), archivalRun("archived", { archived: true })] }), { nodes } = model;

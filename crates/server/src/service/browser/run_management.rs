@@ -1,5 +1,5 @@
 use http::{Request as HttpRequest, Response as HttpResponse};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::{BrowserAuth, HostedDashboard, ObjectStorage, response};
 use crate::service::store::{ApiError, ApiResult};
@@ -11,6 +11,24 @@ struct RunSelection {
   project_id: String,
   origin: String,
   run_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnnotationSelection {
+  project_id: String,
+  origin: String,
+  run_id: String,
+  // Unlike a defaulted Option, the replacement must explicitly clear or set it.
+  #[serde(deserialize_with = "required_nickname")]
+  nickname: Option<String>,
+  tags: Vec<String>,
+}
+
+fn required_nickname<'de, D: Deserializer<'de>>(
+  deserializer: D,
+) -> Result<Option<String>, D::Error> {
+  Option::<String>::deserialize(deserializer)
 }
 
 pub(super) fn mutate<S: ObjectStorage>(
@@ -48,8 +66,31 @@ pub(super) fn mutate<S: ObjectStorage>(
   {
     return Err(ApiError::new(415, "run management requires JSON"));
   }
-  if request.body().len() > 4096 {
-    return Err(ApiError::new(413, "run management request exceeds 4 KiB"));
+  let annotations = request.uri().path() == "/api/runs/annotations";
+  let body_limit = if annotations { 16 * 1024 } else { 4096 };
+  if request.body().len() > body_limit {
+    return Err(ApiError::new(
+      413,
+      if annotations {
+        "run annotations request exceeds 16 KiB"
+      } else {
+        "run management request exceeds 4 KiB"
+      },
+    ));
+  }
+  if annotations {
+    let selection: AnnotationSelection = serde_json::from_slice(request.body())
+      .map_err(|_| ApiError::new(400, "invalid run annotations request"))?;
+    let scope = RunScope {
+      project_id: selection.project_id,
+      origin: selection.origin,
+      run_id: selection.run_id,
+    };
+    validate_scope(&scope).map_err(|_| ApiError::new(400, "invalid run selection"))?;
+    let annotations = dashboard.set_run_annotations(&scope, selection.nickname, selection.tags)?;
+    let body = serde_json::to_vec(&annotations)
+      .map_err(|_| ApiError::new(500, "cannot encode run annotations"))?;
+    return Ok(response(200, "application/json", body));
   }
   let selection: RunSelection = serde_json::from_slice(request.body())
     .map_err(|_| ApiError::new(400, "invalid run management request"))?;
@@ -146,7 +187,11 @@ mod tests {
   fn archival_requires_session_same_origin_and_primary_capability() {
     let (_directory, store, auth, cookie) = fixture();
     let body = serde_json::to_vec(&scope()).unwrap();
-    for path in ["/api/runs/archive", "/api/runs/restore"] {
+    for path in [
+      "/api/runs/archive",
+      "/api/runs/restore",
+      "/api/runs/annotations",
+    ] {
       assert_eq!(
         handle(&store, &auth, true, &request("POST", path, &body, None)).status(),
         401
@@ -194,6 +239,196 @@ mod tests {
     let restored: Value = serde_json::from_slice(restored.body()).unwrap();
     assert_eq!(restored["status"], "active");
     assert!(restored["delete_after"].is_null());
+  }
+
+  fn annotations_body(nickname: Value, tags: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+      "project_id": "vision", "origin": "gpu-1", "run_id": "run-1", "nickname": nickname, "tags": tags,
+    }))
+    .unwrap()
+  }
+
+  #[test]
+  fn annotations_replace_and_clear_the_scoped_metadata() {
+    let (_directory, store, auth, cookie) = fixture();
+    let body = annotations_body(json!("  Baseline  "), json!([" train ", "train", "gold"]));
+    let reply = handle(
+      &store,
+      &auth,
+      true,
+      &request("POST", "/api/runs/annotations", &body, Some(&cookie)),
+    );
+    assert_eq!(reply.status(), 200);
+    let value: Value = serde_json::from_slice(reply.body()).unwrap();
+    assert_eq!(
+      value,
+      json!({"scope":scope(),"nickname":"Baseline","tags":["train","gold"]})
+    );
+    assert_eq!(
+      store.run_annotations(&scope()).unwrap().nickname.as_deref(),
+      Some("Baseline")
+    );
+
+    let body = annotations_body(Value::Null, json!([]));
+    let reply = handle(
+      &store,
+      &auth,
+      true,
+      &request("POST", "/api/runs/annotations", &body, Some(&cookie)),
+    );
+    assert_eq!(reply.status(), 200);
+    assert_eq!(
+      serde_json::from_slice::<Value>(reply.body()).unwrap(),
+      json!({"scope":scope(),"nickname":null,"tags":[]})
+    );
+  }
+
+  #[test]
+  fn annotations_require_explicit_strict_fields_and_valid_values() {
+    let (_directory, store, auth, cookie) = fixture();
+    let path = "/api/runs/annotations";
+    let mut invalid = vec![
+      br#"{"project_id":"vision","origin":"gpu-1","run_id":"run-1","tags":[]}"#.to_vec(),
+      br#"{"project_id":"vision","origin":"gpu-1","run_id":"run-1","nickname":null}"#.to_vec(),
+      br#"{"project_id":"vision","origin":"gpu-1","run_id":"run-1","nickname":null,"tags":[],"extra":"secret"}"#.to_vec(),
+      br#"{"project_id":"vision","origin":"gpu-1","run_id":"run-1","nickname":null,"tags":[],"tags":[]}"#.to_vec(),
+      br#"{"project_id":"vision","origin":"gpu-1","run_id":"run-1","nickname":null,"tags":[],"nickname":"secret"}"#.to_vec(),
+      br#"{"project_id":"vision","origin":"gpu-1","run_id":"../run-1","nickname":null,"tags":[]}"#.to_vec(),
+      b"invalid-json-secret".to_vec(),
+    ];
+    for (nickname, tags) in [
+      (json!(42), json!([])),
+      (Value::Null, Value::Null),
+      (Value::Null, json!([42])),
+      (Value::Null, json!([" "])),
+      (Value::Null, json!(["line\nbreak"])),
+      (json!("line\nbreak"), json!([])),
+      (json!("x".repeat(129)), json!([])),
+      (Value::Null, json!(["x".repeat(49)])),
+      (Value::Null, json!(vec!["tag"; 17])),
+    ] {
+      invalid.push(annotations_body(nickname, tags));
+    }
+    for body in invalid {
+      let reply = handle(
+        &store,
+        &auth,
+        true,
+        &request("POST", path, &body, Some(&cookie)),
+      );
+      assert_eq!(
+        reply.status(),
+        400,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+      );
+      assert!(!String::from_utf8_lossy(reply.body()).contains("secret"));
+    }
+    assert_eq!(
+      store.run_annotations(&scope()).unwrap().tags,
+      Vec::<String>::new()
+    );
+  }
+
+  #[test]
+  fn annotations_bound_the_wire_body_without_rejecting_escaped_valid_values() {
+    let (_directory, store, auth, cookie) = fixture();
+    let path = "/api/runs/annotations";
+    let tags: Vec<_> = (b'a'..=b'p')
+      .map(|suffix| format!("{}{}", "😀".repeat(47), suffix as char))
+      .collect();
+    let body = String::from_utf8(annotations_body(json!("😀".repeat(128)), json!(tags)))
+      .unwrap()
+      .replace('😀', "\\ud83d\\ude00")
+      .into_bytes();
+    assert!(body.len() > 4096 && body.len() <= 16 * 1024);
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        true,
+        &request("POST", path, &body, Some(&cookie))
+      )
+      .status(),
+      200
+    );
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        true,
+        &request("POST", path, &vec![b' '; 16 * 1024 + 1], Some(&cookie))
+      )
+      .status(),
+      413
+    );
+
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        true,
+        &request(
+          "POST",
+          &format!("{path}?run_id=run-1"),
+          &body,
+          Some(&cookie)
+        )
+      )
+      .status(),
+      400
+    );
+    for content_type in ["text/plain", "application/json; boundary=unexpected"] {
+      let mut wrong_type = request("POST", path, &body, Some(&cookie));
+      wrong_type
+        .headers_mut()
+        .insert("Content-Type", content_type.parse().unwrap());
+      assert_eq!(handle(&store, &auth, true, &wrong_type).status(), 415);
+    }
+    let mut duplicate = request("POST", path, &body, Some(&cookie));
+    duplicate
+      .headers_mut()
+      .append("Content-Type", "application/json".parse().unwrap());
+    assert_eq!(handle(&store, &auth, true, &duplicate).status(), 415);
+  }
+
+  #[test]
+  fn annotations_reject_missing_and_unavailable_runs() {
+    let (directory, store, auth, cookie) = fixture();
+    let path = "/api/runs/annotations";
+    let body = annotations_body(json!("Baseline"), json!(["gold"]));
+    let mut missing: Value = serde_json::from_slice(&body).unwrap();
+    missing["run_id"] = json!("missing");
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        true,
+        &request(
+          "POST",
+          path,
+          &serde_json::to_vec(&missing).unwrap(),
+          Some(&cookie)
+        )
+      )
+      .status(),
+      404
+    );
+    store.archive_run(&scope()).unwrap();
+    rusqlite::Connection::open(directory.path().join("metadata.sqlite3"))
+      .unwrap()
+      .execute("UPDATE run_retention SET delete_after=0", [])
+      .unwrap();
+    assert_eq!(
+      handle(
+        &store,
+        &auth,
+        true,
+        &request("POST", path, &body, Some(&cookie))
+      )
+      .status(),
+      410
+    );
   }
 
   #[test]

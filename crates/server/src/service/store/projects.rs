@@ -301,7 +301,9 @@ impl<S: ObjectStorage> Store<S> {
       | Request::ProjectDeletion { .. }
       | Request::ArchiveRun { .. }
       | Request::RestoreRun { .. }
-      | Request::RunArchival { .. } => return Ok(None),
+      | Request::RunArchival { .. }
+      | Request::RunAnnotations { .. }
+      | Request::SetRunAnnotations { .. } => return Ok(None),
       Request::BeginUpload { target, .. }
       | Request::GetFile { target }
       | Request::DownloadUrl { target } => project_of(target),
@@ -437,6 +439,12 @@ impl<S: ObjectStorage> Store<S> {
         )
         .map_err(database)?;
     }
+    transaction
+      .execute(
+        "DELETE FROM run_annotations WHERE project_id=?1",
+        [project_id],
+      )
+      .map_err(database)?;
     transaction
       .execute(
         "DELETE FROM dashboard_run_activity WHERE project_id=?1",

@@ -781,7 +781,7 @@ fn cleanup_failure_columns_migrate_existing_schema_three_without_losing_pending_
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
       .unwrap(),
-    5
+    6
   );
   backend.state.0.lock().unwrap().fail_delete = false;
   reopened

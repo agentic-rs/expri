@@ -283,7 +283,9 @@ fn authorize<S: ObjectStorage>(
     | Request::ProjectDeletion { .. }
     | Request::ArchiveRun { .. }
     | Request::RestoreRun { .. }
-    | Request::RunArchival { .. } => false,
+    | Request::RunArchival { .. }
+    | Request::RunAnnotations { .. }
+    | Request::SetRunAnnotations { .. } => false,
     Request::Capabilities => true,
     Request::SealRun {
       incomplete: true, ..
@@ -1414,6 +1416,12 @@ mod tests {
       Request::ArchiveRun { scope: scope() },
       Request::RestoreRun { scope: scope() },
       Request::RunArchival { scope: scope() },
+      Request::RunAnnotations { scope: scope() },
+      Request::SetRunAnnotations {
+        scope: scope(),
+        nickname: Some("Baseline".into()),
+        tags: vec!["baseline".into()],
+      },
     ] {
       assert_eq!(
         authorize(&store, Some(worker), &operation)

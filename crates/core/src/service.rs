@@ -116,6 +116,16 @@ pub enum Request {
   RunArchival {
     scope: RunScope,
   },
+  /// Inspect user-managed run metadata. Owner-only.
+  RunAnnotations {
+    scope: RunScope,
+  },
+  /// Replace user-managed run metadata without changing worker records. Owner-only.
+  SetRunAnnotations {
+    scope: RunScope,
+    nickname: Option<String>,
+    tags: Vec<String>,
+  },
   Capabilities,
   PutDocument {
     scope: RunScope,
@@ -215,6 +225,9 @@ pub enum Response {
   RunArchival {
     archival: RunArchival,
   },
+  RunAnnotations {
+    annotations: RunAnnotations,
+  },
   Capabilities {
     features: Vec<String>,
   },
@@ -308,6 +321,13 @@ pub struct RunArchival {
   pub delete_after: Option<String>,
   pub pending_tasks: u64,
   pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RunAnnotations {
+  pub scope: RunScope,
+  pub nickname: Option<String>,
+  pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

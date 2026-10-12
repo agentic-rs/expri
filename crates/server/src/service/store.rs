@@ -15,6 +15,7 @@ mod asset_imports;
 mod dashboard_storage;
 mod projects;
 mod references;
+mod run_annotations;
 mod run_retention;
 mod tracking;
 
@@ -135,7 +136,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot read service metadata version".into())
       })?;
-    if version > 5 {
+    if version > 6 {
       return Err(crate::error::ExpriError::Message(
         "service metadata schema is newer than this binary".into(),
       ));
@@ -189,11 +190,12 @@ impl<S: ObjectStorage> Store<S> {
     archive::initialize(&connection)
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
     projects::initialize(&connection)?;
+    run_annotations::initialize(&connection)?;
     run_retention::initialize(&connection)?;
     asset_imports::initialize(&directory, &connection)?;
-    // Older binaries must not drop captured asset provenance or ignore deletion fences.
+    // Older binaries must not drop captured provenance, annotations, or deletion fences.
     connection
-      .pragma_update(None, "user_version", 5)
+      .pragma_update(None, "user_version", 6)
       .map_err(|_| {
         crate::error::ExpriError::Message("cannot upgrade service metadata version".into())
       })?;
@@ -617,6 +619,7 @@ impl<S: ObjectStorage> Store<S> {
         .map_err(database)?;
       metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
       metadata_revision.push(run_retention::revision(&db, scope)?);
+      metadata_revision.push(run_annotations::revision(&db, scope)?);
       runs.push(RunUpdate {
         run_id: run_id.clone(),
         metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
@@ -878,6 +881,16 @@ impl<S: ObjectStorage> Store<S> {
       Request::RunArchival { scope } => Ok(Response::RunArchival {
         archival: self.run_archival(&scope)?,
       }),
+      Request::RunAnnotations { scope } => Ok(Response::RunAnnotations {
+        annotations: self.run_annotations(&scope)?,
+      }),
+      Request::SetRunAnnotations {
+        scope,
+        nickname,
+        tags,
+      } => Ok(Response::RunAnnotations {
+        annotations: self.set_run_annotations(&scope, nickname, tags)?,
+      }),
       Request::ProjectStorage { project_id } => Ok(Response::ProjectStorage {
         stats: self.project_storage(&project_id)?,
       }),
@@ -901,6 +914,7 @@ impl<S: ObjectStorage> Store<S> {
           "output-assets-v1".into(),
           "project-storage-management-v1".into(),
           "run-retention-v1".into(),
+          "run-annotations-v1".into(),
         ],
       }),
       Request::PutDocument {

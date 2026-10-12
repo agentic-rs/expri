@@ -15,7 +15,7 @@ use super::storage::ObjectStorage;
 use super::store::{ApiError, ApiResult, Store};
 use super::types::{
   FileRecord, FileTarget, ProjectDeletePreview, ProjectDeletionStatus, ProjectStorageStats,
-  RunArchival, RunScope, STREAM_BATCH, validate_component,
+  RunAnnotations, RunArchival, RunScope, STREAM_BATCH, validate_component,
 };
 use crate::dashboard::artifacts::Download;
 use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
@@ -26,6 +26,7 @@ use crate::metrics::{self, Reduction, RunMetrics};
 
 const SOURCE_LIMIT: usize = 1000;
 const OVERVIEW_LIMIT: usize = 500;
+const LIST_RESPONSE_LIMIT: usize = 480 * 1024;
 const STATE_LIMIT: u64 = 256 * 1024;
 const JSON_LIMIT: u64 = 1024 * 1024;
 const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
@@ -128,6 +129,15 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
 
   pub fn run_archival(&self, scope: &RunScope) -> ApiResult<RunArchival> {
     self.store.run_archival(scope)
+  }
+
+  pub fn set_run_annotations(
+    &self,
+    scope: &RunScope,
+    nickname: Option<String>,
+    tags: Vec<String>,
+  ) -> ApiResult<RunAnnotations> {
+    self.store.set_run_annotations(scope, nickname, tags)
   }
 
   pub fn project_storage(&self, project_id: &str) -> ApiResult<ProjectStorageStats> {
@@ -423,6 +433,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         }).collect::<Vec<_>>()
       });
       for (mut report, scope) in next.into_iter().zip(group) {
+        // Payload reads may be fenced while an expired run finishes cleanup.
+        // Its retained dashboard metadata still describes that cleanup row.
+        if report["run"]["archival"].is_null()
+          && let Err(error) = self.decorate_run_metadata(&mut report["run"], scope)
+          && let Some(warnings) = report["warnings"].as_array_mut()
+        {
+          warnings.push(json!({"run_id": scope.run_id, "message": error.message}));
+        }
         source.decorate_run(&mut report["run"], scope);
         if let Some(warnings) = report["warnings"].as_array_mut() {
           source.decorate_warnings(warnings, scope);
@@ -444,18 +462,29 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         continue;
       }
       if !search.is_empty()
-        && !["run_id", "status", "origin"].iter().any(|field| {
-          run[field]
-            .as_str()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains(&search)
-        })
+        && !["run_id", "status", "origin", "nickname"]
+          .iter()
+          .any(|field| {
+            run[field]
+              .as_str()
+              .unwrap_or_default()
+              .to_lowercase()
+              .contains(&search)
+          })
         && !report["task_filter"]
           .as_str()
           .unwrap_or_default()
           .to_lowercase()
           .contains(&search)
+        && !run["tags"].as_array().is_some_and(|tags| {
+          tags.iter().any(|tag| {
+            tag
+              .as_str()
+              .unwrap_or_default()
+              .to_lowercase()
+              .contains(&search)
+          })
+        })
       {
         continue;
       }
@@ -513,16 +542,34 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let total_count = rows.len();
     let mut metadata_truncated = overview_truncated;
-    let rows: Vec<_> = rows
-      .into_iter()
-      .skip(offset)
-      .take(limit)
-      .map(|row| preview(&row, &mut metadata_truncated))
-      .collect();
-    let next_offset = offset.saturating_add(rows.len());
-    Ok(
-      json!({"source": source, "runs": rows, "warnings": bounded_warnings(&warnings), "total_count": total_count, "catalog_total_count": page.total_count, "limit": limit, "offset": offset, "next_offset": (next_offset < total_count).then_some(next_offset), "metadata_truncated": metadata_truncated}),
-    )
+    let mut result = json!({"source": source, "runs": [], "warnings": bounded_warnings(&warnings), "total_count": total_count, "catalog_total_count": page.total_count, "limit": limit, "offset": offset, "next_offset": null, "metadata_truncated": metadata_truncated});
+    let mut budget = LIST_RESPONSE_LIMIT
+      .checked_sub(serde_json::to_vec(&result)?.len())
+      .ok_or_else(|| message("hosted list metadata exceeds the response size limit"))?;
+    let mut retained = Vec::new();
+    for row in rows.into_iter().skip(offset).take(limit) {
+      let mut row_truncated = false;
+      let row = run_preview(&row, &mut row_truncated);
+      // Reserve each comma too. The empty envelope already reserves [] and
+      // null, which is at least as large as any supported next-offset value.
+      let bytes = serde_json::to_vec(&row)?.len() + usize::from(!retained.is_empty());
+      if bytes > budget {
+        break;
+      }
+      budget -= bytes;
+      metadata_truncated |= row_truncated;
+      retained.push(row);
+    }
+    if retained.is_empty() && offset < total_count {
+      return Err(message(
+        "hosted run metadata exceeds the response size limit",
+      ));
+    }
+    let next_offset = offset.saturating_add(retained.len());
+    result["runs"] = json!(retained);
+    result["next_offset"] = json!((next_offset < total_count).then_some(next_offset));
+    result["metadata_truncated"] = json!(metadata_truncated);
+    Ok(result)
   }
 
   pub(super) fn columns(&self, source_id: &str) -> Result<Value> {
@@ -630,8 +677,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut metadata_truncated = false;
     let mut metadata = run_metadata(&record, &mut metadata_truncated);
-    for asset in metadata["state"]["assets"]
-      .as_array_mut()
+    for asset in metadata
+      .get_mut("state")
+      .and_then(|state| state.get_mut("assets"))
+      .and_then(Value::as_array_mut)
       .into_iter()
       .flatten()
     {
@@ -648,21 +697,17 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut run = preview(&record["run"], &mut metadata_truncated);
     self
-      .decorate_archival(&mut run, &scope)
+      .decorate_run_metadata(&mut run, &scope)
       .map_err(api_error)?;
     source.decorate_run(&mut run, &scope);
     source.decorate_warnings(&mut warnings, &scope);
     if metadata_truncated || params_truncated {
       warnings.push(json!({"message": "Hosted previews are limited; download the original run records for complete metadata and parameters."}));
     }
-    let result_upload = match self
-      .store
-      .execute(super::types::Request::ArchiveStatus {
-        scope: scope.clone(),
-      })
-      .map_err(api_error)?
-    {
-      super::types::Response::Archive { archive } => {
+    let result_upload = match self.store.execute(super::types::Request::ArchiveStatus {
+      scope: scope.clone(),
+    }) {
+      Ok(super::types::Response::Archive { archive }) => {
         let mut value = serde_json::to_value(&archive)?;
         value["download_url"] = if archive.status == "archived" && archive.file.is_some() {
           let query = form_urlencoded::Serializer::new(String::new())
@@ -674,6 +719,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         };
         expri_core::service::upload_report(value)
       }
+      // Expired runs retain cleanup metadata, but their result payload and
+      // upload state are no longer available through the tracking API.
+      Err(error) if error.status == 410 => Value::Null,
+      Err(error) => return Err(api_error(error)),
       _ => return Err(message("invalid result upload response")),
     };
     Ok(
@@ -768,7 +817,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let mut comparison = metrics::compare(&runs, &filters, reduction)?;
     for run in &mut comparison.runs {
       run.params = None;
-      run.run = preview(&run.run, &mut false);
+      run.run = run_preview(&run.run, &mut false);
     }
     comparison.warnings = bounded_warnings(&comparison.warnings);
     if omitted {
@@ -988,7 +1037,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if let Some(mut value) = self.store.dashboard_cached_overview(scope, &version)?
       && value["overview_schema"] == 1
     {
-      self.decorate_archival(&mut value["run"], scope)?;
+      self.decorate_run_metadata(&mut value["run"], scope)?;
       return Ok(value);
     }
     let mut warnings = Vec::new();
@@ -1028,13 +1077,27 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         .store
         .dashboard_cache_overview(scope, &version, &result)?;
     }
-    self.decorate_archival(&mut result["run"], scope)?;
+    self.decorate_run_metadata(&mut result["run"], scope)?;
     Ok(result)
   }
 
-  fn decorate_archival(&self, run: &mut Value, scope: &RunScope) -> ApiResult<()> {
+  fn decorate_run_metadata(&self, run: &mut Value, scope: &RunScope) -> ApiResult<()> {
     run["archival"] = serde_json::to_value(self.run_archival(scope)?)
       .map_err(|_| ApiError::new(500, "cannot encode run archival"))?;
+    let annotations = self.store.dashboard_run_annotations(scope)?;
+    run["nickname"] = json!(annotations.nickname);
+    run["tags"] = json!(annotations.tags);
+    // Retained names remain readable while expired runs finish cleanup, but
+    // only available runs expose the editor's replacement capability.
+    run["annotations"] = if matches!(
+      run["archival"]["status"].as_str(),
+      Some("active" | "archived")
+    ) {
+      serde_json::to_value(annotations)
+        .map_err(|_| ApiError::new(500, "cannot encode run annotations"))?
+    } else {
+      Value::Null
+    };
     Ok(())
   }
 
@@ -1143,6 +1206,18 @@ fn started_at(run: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
   run["started_at"]
     .as_str()
     .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+}
+
+fn run_preview(run: &Value, truncated: &mut bool) -> Value {
+  let mut result = preview(run, truncated);
+  // Editor values are independently bounded, so keep the full replacement
+  // even if other state fields consume the ordinary preview budget.
+  for field in ["nickname", "tags", "annotations"] {
+    if let Some(value) = run.get(field) {
+      result[field] = value.clone();
+    }
+  }
+  result
 }
 
 fn metric_record(scope: &RunScope, run: Value, params: Option<Value>) -> RunMetrics {

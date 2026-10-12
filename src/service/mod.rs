@@ -19,7 +19,7 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSubcommand {
-  /// Archive finished hosted runs, restore them, or inspect their retention status.
+  /// Edit hosted run names and tags, or manage archival and retention.
   Run {
     #[command(subcommand)]
     command: RunCommand,
@@ -120,6 +120,26 @@ enum RunCommand {
   Restore(RunOptions),
   /// Show the run's archival deadline and durable cleanup status.
   Status(RunOptions),
+  /// Show a hosted run's nickname and tags.
+  Annotations(RunOptions),
+  /// Replace nickname and tags; omitted values are cleared. Requires an owner token.
+  Annotate(AnnotateOptions),
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("annotation_values").required(true).multiple(true)))]
+struct AnnotateOptions {
+  #[command(flatten)]
+  options: RunOptions,
+  /// Optional display name (up to 128 characters); run ID stays unchanged.
+  #[arg(long, group = "annotation_values")]
+  nickname: Option<String>,
+  /// Repeat for each tag (up to 16 tags, 48 characters each).
+  #[arg(long = "tag", group = "annotation_values")]
+  tags: Vec<String>,
+  /// Clear both nickname and tags.
+  #[arg(long, group = "annotation_values", conflicts_with_all = ["nickname", "tags"])]
+  clear: bool,
 }
 
 #[derive(Debug, Args)]
@@ -264,6 +284,15 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       RunCommand::Archive(options) => client::archive_run(&options.config, &options.scope())?,
       RunCommand::Restore(options) => client::restore_run(&options.config, &options.scope())?,
       RunCommand::Status(options) => client::run_archival(&options.config, &options.scope())?,
+      RunCommand::Annotations(options) => {
+        client::run_annotations(&options.config, &options.scope())?
+      }
+      RunCommand::Annotate(options) => client::set_run_annotations(
+        &options.options.config,
+        &options.options.scope(),
+        options.nickname,
+        options.tags,
+      )?,
     },
     ServiceSubcommand::Project { command } => match command {
       ProjectCommand::Stats(options) => {
@@ -476,12 +505,62 @@ mod tests {
         RunCommand::Archive(options)
         | RunCommand::Restore(options)
         | RunCommand::Status(options) => options,
+        _ => panic!("expected archival command"),
       };
       assert_eq!(options.scope().run_id, "run-1");
       assert_eq!(options.scope().origin, "gpu-1");
       assert!(Cli::try_parse_from(&args[..args.len() - 2]).is_err());
       assert!(Cli::try_parse_from(["expri", operation, "--config", "owner.toml"]).is_err());
     }
+  }
+
+  #[test]
+  fn run_annotations_require_an_explicit_replacement_or_clear() {
+    let base = [
+      "expri",
+      "run",
+      "annotate",
+      "--config",
+      "owner.toml",
+      "--project-id",
+      "vision",
+      "--origin",
+      "gpu-1",
+      "--run-id",
+      "run-1",
+    ];
+    assert!(Cli::try_parse_from(base).is_err());
+    let args = base.into_iter().chain([
+      "--nickname",
+      "Baseline",
+      "--tag",
+      "model-a",
+      "--tag",
+      "baseline",
+    ]);
+    let parsed = Cli::try_parse_from(args).unwrap();
+    let ServiceSubcommand::Run {
+      command: RunCommand::Annotate(options),
+    } = parsed.service.command
+    else {
+      panic!("expected annotations replacement");
+    };
+    assert_eq!(options.nickname.as_deref(), Some("Baseline"));
+    assert_eq!(options.tags, ["model-a", "baseline"]);
+    assert_eq!(options.options.scope().origin, "gpu-1");
+    assert!(Cli::try_parse_from(base.into_iter().chain(["--clear"])).is_ok());
+    assert!(Cli::try_parse_from(base.into_iter().chain(["--clear", "--tag", "baseline"])).is_err());
+    assert!(
+      Cli::try_parse_from(
+        base
+          .into_iter()
+          .chain(["--clear", "--nickname", "Baseline"])
+      )
+      .is_err()
+    );
+    let mut show = base;
+    show[2] = "annotations";
+    assert!(Cli::try_parse_from(show).is_ok());
   }
 
   #[test]

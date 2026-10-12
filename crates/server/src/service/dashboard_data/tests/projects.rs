@@ -94,6 +94,130 @@ fn list<'a>(
 }
 
 #[test]
+fn annotations_follow_the_scope_and_refresh_cached_list_detail_and_comparison() {
+  let fixture = Fixture::new();
+  let selected = run(&fixture, "project", "worker-a", "shared", 2.);
+  let other_worker = run(&fixture, "project", "worker-b", "shared", 4.);
+  let other_project = run(&fixture, "other", "worker-a", "shared", 8.);
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let source = "hosted-project:project";
+  let query = list(None, None, 100, 0);
+  let first = dashboard.list_table(source, &query).unwrap();
+  assert!(
+    first["runs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .all(|run| run["nickname"].is_null() && run["tags"] == json!([]))
+  );
+  let before = dashboard
+    .updates(source, &["worker-a:shared".into()])
+    .unwrap();
+  let annotations = dashboard
+    .set_run_annotations(
+      &selected,
+      Some("Baseline α".into()),
+      vec!["Fast-path".into(), "gold".into()],
+    )
+    .unwrap();
+  let expected = json!(annotations);
+  let after = dashboard
+    .updates(source, &["worker-a:shared".into()])
+    .unwrap();
+  assert_ne!(before["source_revision"], after["source_revision"]);
+  let cached = dashboard.list_table(source, &query).unwrap();
+  let selected_row = cached["runs"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|run| run["origin"] == "worker-a")
+    .unwrap();
+  assert_eq!(selected_row["nickname"], "Baseline α");
+  assert_eq!(selected_row["tags"], json!(["Fast-path", "gold"]));
+  assert_eq!(selected_row["annotations"], expected);
+  for search in ["BASELINE", "α", "FAST-PATH", "GOLD"] {
+    let mut search_query = list(None, None, 100, 0);
+    search_query.search = Some(search);
+    let page = dashboard.list_table(source, &search_query).unwrap();
+    assert_eq!(page["total_count"], 1);
+    assert_eq!(page["runs"][0]["origin"], "worker-a");
+  }
+  let detail = dashboard.detail(source, "worker-a:shared").unwrap();
+  assert_eq!(detail["run"]["annotations"], expected);
+  assert_eq!(
+    dashboard
+      .detail("hosted:project:worker-a", "shared")
+      .unwrap()["run"]["annotations"],
+    expected
+  );
+  let comparison = dashboard
+    .compare(
+      source,
+      &["worker-a:shared".into(), "worker-b:shared".into()],
+      &["loss".into()],
+      Reduction::Last,
+    )
+    .unwrap();
+  let comparison_run = comparison["comparison"]["runs"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|run| run["run"]["origin"] == "worker-a")
+    .unwrap();
+  assert_eq!(comparison_run["run"]["annotations"], expected);
+  for scope in [other_worker, other_project] {
+    assert_eq!(
+      fixture.store.run_annotations(&scope).unwrap().nickname,
+      None
+    );
+    assert!(
+      fixture
+        .store
+        .run_annotations(&scope)
+        .unwrap()
+        .tags
+        .is_empty()
+    );
+  }
+
+  // Producer publication changes training metadata without replacing annotations.
+  let bytes = json!({"schema_version":1,"run_id":"shared","task":"train","status":"failed","nickname":"producer name","tags":["producer tag"]}).to_string().into_bytes();
+  fixture
+    .store
+    .execute(Request::PutDocument {
+      scope: selected.clone(),
+      path: "run-state.json".into(),
+      revision: 2,
+      offset: 0,
+      total_size: bytes.len() as u64,
+      data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+    .unwrap();
+  let republished = dashboard.list_table(source, &query).unwrap();
+  let row = republished["runs"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|run| run["origin"] == "worker-a")
+    .unwrap();
+  assert_eq!(row["status"], "failed");
+  assert_eq!(row["annotations"], expected);
+  dashboard
+    .set_run_annotations(&selected, None, Vec::new())
+    .unwrap();
+  let mut old_search = list(None, None, 100, 0);
+  old_search.search = Some("baseline");
+  assert_eq!(
+    dashboard.list_table(source, &old_search).unwrap()["total_count"],
+    0
+  );
+  assert_eq!(
+    dashboard.detail(source, "worker-a:shared").unwrap()["run"]["annotations"],
+    json!({"scope":selected,"nickname":null,"tags":[]})
+  );
+}
+
+#[test]
 fn archival_filters_keep_machine_scope_training_state_and_cached_views_current() {
   let fixture = Fixture::new();
   let archived_scope = run(&fixture, "project", "worker-a", "shared", 2.);
@@ -173,6 +297,169 @@ fn archival_filters_keep_machine_scope_training_state_and_cached_views_current()
       .list_table("hosted-project:other", &query)
       .unwrap()["total_count"],
     1
+  );
+}
+
+#[test]
+fn maximum_annotations_and_table_values_paginate_within_the_json_response_limit() {
+  let fixture = Fixture::new();
+  let nickname = "😀".repeat(128);
+  let tags: Vec<_> = (0..16)
+    .map(|index| {
+      format!(
+        "{}{}",
+        "😀".repeat(47),
+        char::from_u32(0x1f600 + index).unwrap()
+      )
+    })
+    .collect();
+  // Scalar table previews permit 256 serialized bytes, including the quotes.
+  let scalar = format!("{}xy", "界".repeat(84));
+  let params: serde_json::Map<_, _> = (0..8)
+    .map(|index| (format!("column_{index}"), json!(scalar)))
+    .collect();
+  let expected_keys: BTreeSet<_> = (0..100)
+    .map(|index| format!("worker:run-{index:03}"))
+    .collect();
+  for index in 0..100 {
+    let scope = RunScope {
+      project_id: "project".into(),
+      origin: "worker".into(),
+      run_id: format!("run-{index:03}"),
+    };
+    put(
+      &fixture,
+      &scope,
+      "run-state.json",
+      json!({"schema_version":1,"run_id":scope.run_id,"task":"train","status":"completed"}),
+    );
+    put(
+      &fixture,
+      &scope,
+      "outputs/params.json",
+      Value::Object(params.clone()),
+    );
+    fixture
+      .store
+      .set_run_annotations(&scope, Some(nickname.clone()), tags.clone())
+      .unwrap();
+  }
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let options = table::TableOptions::parse(
+    (0..8).map(|index| format!("/column_{index}")).collect(),
+    vec![],
+    "last",
+    None,
+    None,
+  )
+  .unwrap();
+  let mut offset = 0;
+  let mut received = BTreeSet::new();
+  let mut pages = 0;
+  loop {
+    let query = list(None, Some(&options), 100, offset);
+    let page = dashboard
+      .list_table("hosted-project:project", &query)
+      .unwrap();
+    assert!(serde_json::to_vec(&page).unwrap().len() <= LIST_RESPONSE_LIMIT);
+    assert_eq!(page["total_count"], 100);
+    let runs = page["runs"].as_array().unwrap();
+    assert!(!runs.is_empty());
+    if offset == 0 {
+      assert!(
+        page["next_offset"]
+          .as_u64()
+          .is_some_and(|next| next > 0 && next < 100)
+      );
+    }
+    for run in runs {
+      assert!(
+        received.insert(run["run_key"].as_str().unwrap().to_owned()),
+        "duplicate run: {run}"
+      );
+      assert_eq!(run["nickname"], nickname);
+      assert_eq!(run["tags"], json!(tags));
+      assert_eq!(run["annotations"]["nickname"], nickname);
+      assert_eq!(run["annotations"]["tags"], json!(tags));
+      assert_eq!(run["table_values_truncated"], false);
+      for index in 0..8 {
+        assert_eq!(
+          run["table_values"]["params"][format!("/column_{index}")],
+          scalar
+        );
+      }
+    }
+    pages += 1;
+    match page["next_offset"].as_u64() {
+      Some(next) => {
+        assert_eq!(next as usize, offset + runs.len());
+        offset = next as usize;
+      }
+      None => break,
+    }
+  }
+  assert!(pages > 1);
+  assert_eq!(received, expected_keys);
+}
+
+#[test]
+fn expired_annotations_keep_direct_cleanup_review_readable_without_editing_capability() {
+  let fixture = Fixture::new();
+  let selected = run(&fixture, "project", "worker-a", "shared", 2.);
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  dashboard
+    .set_run_annotations(&selected, Some("Baseline".into()), vec!["gold".into()])
+    .unwrap();
+  dashboard.archive_run(&selected).unwrap();
+  let connection =
+    rusqlite::Connection::open(fixture._directory.path().join("metadata.sqlite3")).unwrap();
+  connection
+    .execute("UPDATE run_retention SET delete_after=0", [])
+    .unwrap();
+  let mut query = list(None, None, 100, 0);
+  query.archived = true;
+  let list = dashboard
+    .list_table("hosted-project:project", &query)
+    .unwrap();
+  // The existing retention policy hides expired rows from normal browsing.
+  assert_eq!(list["total_count"], 0);
+  let detail = dashboard
+    .detail("hosted-project:project", "worker-a:shared")
+    .unwrap();
+  assert_eq!(detail["run"]["archival"]["status"], "deleting");
+  assert_eq!(detail["run"]["nickname"], "Baseline");
+  assert_eq!(detail["run"]["tags"], json!(["gold"]));
+  assert!(detail["run"]["annotations"].is_null());
+  assert!(detail["result_upload"].is_null());
+  for field in ["state", "snapshot", "environment", "params"] {
+    assert!(detail[field].is_null(), "{field}: {}", detail[field]);
+  }
+  assert_eq!(detail["metrics"], json!({}));
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  assert_eq!(
+    fixture.store.run_annotations(&selected).unwrap_err().status,
+    410
+  );
+  assert_eq!(
+    dashboard
+      .set_run_annotations(&selected, Some("Changed".into()), vec![])
+      .unwrap_err()
+      .status,
+    410
+  );
+  assert!(
+    dashboard
+      .result_zip_download("hosted-project:project", "worker-a:shared")
+      .is_err()
+  );
+  assert!(
+    dashboard
+      .artifact_download(
+        "hosted-project:project",
+        "worker-a:shared",
+        "outputs/checkpoint.pt"
+      )
+      .is_err()
   );
 }
 
