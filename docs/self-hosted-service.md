@@ -52,7 +52,8 @@ prefix = "expri"
 Provide distinct random bearer tokens of at least 24 printable characters using
 the named environment variables. Each worker token is restricted to its project
 and origin; workers can download that project's inputs but cannot publish inputs.
-Only the owner token has unrestricted access.
+The configured owner token and separately issued CLI login credentials have
+unrestricted API access. Worker and machine credentials retain their bound scopes.
 
 Provide S3 credentials to the service through `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`. Workers and laptops
@@ -156,8 +157,8 @@ Select up to 64 files. **Download selected files** provides individual browser
 download links; the browser handles file bytes directly. Cloud downloads require
 your dashboard session and use short-lived attachment links with no referrer.
 Browser restart recovery depends on your browser; use the generated CLI fetch
-command for expri's durable resume. Enter the path to an existing service client
-configuration on the computer running that command. No token is copied from the
+command for expri's durable resume. It uses the computer's global server connection;
+optionally enter a client configuration path to override it. No token is copied from the
 browser into the command. Browser downloads in Storage use the same authenticated
 attachment flow. For large checkpoints, use the generated CLI fetch command for
 durable resume. Private input and checkpoint uploads remain CLI operations.
@@ -179,11 +180,13 @@ A recovery export is visibly marked as a partial result.
 
 The primary dashboard allows archiving and restoring finished runs. Project
 deletion requires explicit configuration. Preview dashboards remain read-only.
+CLI login credentials have unrestricted API authority, including project deletion;
+`dashboard.allow_project_deletion` governs the browser controls.
 Sign-in issues an eight-hour Secure, HttpOnly,
 SameSite=Strict cookie; the browser never receives an owner/worker API token.
 Logout revokes the session. Restart the service after changing its password;
 restarts invalidate existing sessions. The CLI continues to use its existing
-bearer authentication.
+bearer authentication, including separately issued CLI login tokens.
 
 Keep the backend on loopback behind HTTPS. The reverse proxy must preserve the
 browser's `Host`, `Origin`, `Cookie`, and `Sec-Fetch-Site` headers. Keep the
@@ -192,7 +195,7 @@ native login/logout forms send `Origin: null`, which the service rejects.
 If forwarding an explicit header list, also retain `Authorization` and
 `Content-Type` for CLI requests. Buffer request bodies, use HTTP/1.0 upstream,
 and strip `Expect` so the service receives fixed-length requests. Configure per-client rate limiting
-for `/login`; a limit of ten requests per minute with a small burst is suitable
+for `/login` and `/v1/login`; a limit of ten requests per minute with a small burst is suitable
 for this single-user setup. Do not cache authenticated responses or log request
 bodies, credentials, or signed S3 URL queries.
 
@@ -355,7 +358,7 @@ prefix. Data still waiting on the worker can be lost. Pull the received files
 normally, or use an owner configuration to request a recovery upload:
 
 ```sh
-expri service upload --config owner.toml --project-id vision --origin gpu-1 \
+expri service upload --project-id vision --origin gpu-1 \
   --run-id run-abc123 --partial
 ```
 
@@ -415,7 +418,7 @@ laptop's client separately from the worker's publishing credentials:
 
 ```toml
 [fetch]
-client_config = "/home/me/.config/expri/owner.toml"
+client_config = "/home/me/.tokn/expri/config.toml"
 project_id = "vision"
 origins = ["gpu-1", "gpu-2"]
 labels = ["best", "latest"]
@@ -444,17 +447,146 @@ publishing files locally. Dry-run reports identify labels that need the run's
 inventory to resolve; they do not treat those labels as unavailable files.
 Reports are bounded and watch summaries stay compact.
 
-Use an owner client configuration with the same URL and the owner token's
-variable name. Fetch metadata, metrics, parameters, and logs by default, and
+## Configure the CLI's server connection
+
+Authenticate using the password for the primary hosted dashboard:
+
+```sh
+expri login --url https://expri.example.net
+expri config server show
+```
+
+The interactive prompt hides the password. For automation, supply one password
+line through a pipe or redirected file with `--password-stdin`:
+
+```sh
+printf '%s' "$EXPRI_DASHBOARD_PASSWORD" | expri login --url https://expri.example.net --password-stdin
+```
+
+Login exchanges that password for an independently issued API token with
+unrestricted server access. The password is never saved. The token is stored in
+`[server]` in `~/.tokn/expri/config.toml`, with a private directory and a
+`0600` configuration file on Unix; command output and `config server show` hide it. Updates
+are atomic and preserve system-profile settings. A concurrent connection change
+during authentication prevents login from overwriting the newer selection. If
+login reports that the token was saved but durability could not be confirmed,
+inspect `expri config server show` before retrying; the saved token is not revoked.
+
+Once a URL is saved, `expri login` defaults to it. Login and logout run on the
+current machine and accept `--storage-dir`; `EXPRI_STORAGE_DIR` also selects the
+global root. `expri logout` revokes the current issued credential and clears its
+saved token while retaining the URL and project selection for the next login.
+Other clients' issued tokens and browser sessions remain active.
+
+Issued API tokens have no expiry and survive server restarts. Restart the service
+after rotating the dashboard password, unrestricted API token, or primary
+dashboard authority; this invalidates previously issued credentials. Disabling
+the primary dashboard at startup also revokes them. Restoring an older password
+or API secret does not resurrect invalidated tokens. An already
+rejected or revoked credential can be cleared by logout with a warning. If
+revocation cannot be confirmed because of another server or transport error,
+logout keeps the saved credential for retry. Static server/worker tokens cannot
+be revoked through logout; use `expri config server unset` to remove a manually
+configured connection locally.
+
+Upgrade the server to enable `POST /v1/login` and `POST /v1/logout`. The primary
+configured dashboard host accepts these endpoints; preview and unknown hosts do
+not. The reverse proxy must forward these paths and preserve `Host`,
+`Content-Type`, and `Authorization` for logout. Login does not use browser
+cookies. The server allows ten login attempts per minute and at most 256 active
+issued credentials; reaching the limit rejects a new login without evicting
+other clients. Revoke unused credentials before creating more.
+
+Manual API tokens and existing environment-based client files remain supported.
+A manually configured global connection looks like:
+
+```toml
+[server]
+url = "https://expri.example.net"
+token = "your-server-token"
+```
+
+Use `expri config server set --url URL --token-stdin` with a supplied token
+through a pipe or redirected file. `expri config server unset` removes only the
+connection and preserves system settings; it does not revoke a remote token.
+`config server show` reports a retained URL without credentials using
+`token_configured: false` and `token_source: null`. Inspection of missing
+configuration creates no files.
+
+Query and service client commands use this connection by default. `--config PATH`
+overrides it with another global config or a standalone client file containing
+`url` and exactly one of `token` or `token_env`. A global `[server]` may retain
+only a URL after logout; authenticate again before issuing client requests.
+The server determines permissions from the token. `service serve --config`
+still selects the server daemon's configuration. Remote run publishing keeps
+its explicit worker-local client path. Read `expri skill login` for the agent
+workflow.
+
+## Browse published runs and files
+
+After configuring the global server connection, browsing
+on the current machine requires no `expri.toml` or project checkout and
+does not download run bytes or populate a local review cache:
+
+```sh
+expri query runs
+expri query runs --project-id vision
+expri query runs --project-id vision --origin gpu-1 --archival all
+expri query files --project-id vision --origin gpu-1 --run-id run-abc123
+expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --prefix outputs/
+```
+
+The server must advertise `service-catalog-v1`. Credentials with unrestricted
+server access see all projects and origins by default; optional `--project-id` and `--origin` narrow
+the selection. Worker credentials see only their bound project and origin;
+machine-profile credentials cannot browse runs. Active runs are the default.
+`--archival archived` selects archived runs still within their restore window;
+`--archival all` selects both. Expired/deleting runs are unavailable.
+
+Run pages include the full `scope`, task, last published execution status,
+timestamps and bounded warnings when metadata is missing or unavailable. A run
+ID can appear on more than one worker, so keep its project and origin with it.
+Results order by descending run ID, then ascending project and origin; this is
+a stable catalog order rather than a sort by live activity. Query the worker
+with `runs status`, `runs logs`, or `runs cancel` for live supervision.
+`service run status` continues to describe archival and cleanup.
+
+Commands print JSON. Run pages default to 50 rows and file pages to 100;
+`--limit` accepts 1 to 100. Pass the returned `next_cursor` through `--cursor`,
+keeping the same scope and filters. Received catalogs support pagination beyond
+the old 500-run and 1,000-file listing limits. The original scoped
+`expri service list` command keeps its existing behavior.
+
+File pages combine authoritative `received` metadata with the worker's last
+published `reported` inventory. `availability` is `received`, `reported_only`,
+or `received_different_version` when known sizes or checksums disagree. Received
+storage identifies an object, a legacy stream, or versioned tracking data;
+unsealed tracking data describes the received prefix of a growing file.
+Reported files can still be waiting for upload. `best`/`latest` labels remain
+pending until a received object matches the reported size and checksum.
+An absent checksum cannot confirm a label or prove that two versions differ.
+
+`--prefix` matches a literal path prefix; `%` and `_` are ordinary characters.
+No checkpoint bytes or signed download URLs are returned. The reported inventory
+is bounded to 200 outputs and 64 KiB; `reported_inventory_truncated` and warnings
+expose incomplete or unavailable inventories. Received records still appear
+when that inventory is unavailable. Use `service fetch` to download selected
+files. Read the progressive agent guide with `expri skill query` and inspect
+exact flags with `expri query --help`.
+
+## Download selected server files
+
+Use server credentials with access to the requested project. Fetch metadata,
+metrics, parameters, and logs by default, and
 select checkpoints separately:
 
 ```sh
-expri service list --config owner.toml --project-id vision --origin gpu-1
-expri service fetch --config owner.toml --project-id vision --origin gpu-1 \
+expri service list --project-id vision --origin gpu-1
+expri service fetch --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo .
-expri service fetch --config owner.toml --project-id vision --origin gpu-1 \
+expri service fetch --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo . --artifact outputs/checkpoint.pt
-expri service fetch --config owner.toml --project-id vision --origin gpu-1 \
+expri service fetch --project-id vision --origin gpu-1 \
   --run-id run-abc123 --repo . --artifact result.zip
 expri dashboard
 ```
@@ -494,7 +626,7 @@ Input IDs are immutable within a project. Publish a changed dataset with a new
 ID rather than replacing bytes under the old ID:
 
 ```sh
-expri service input upload --config owner.toml --project-id vision \
+expri service input upload --project-id vision \
   --input-id dataset-v1 --file /private/data/train.bin
 expri service input download --config worker.toml --project-id vision \
   --input-id dataset-v1 --destination .expri/inputs/dataset-v1.bin
@@ -504,7 +636,7 @@ The hosted project's **Storage → Private inputs** view lists completed input I
 sizes and provides individual browser downloads. Expri stores the input ID,
 size, and digest, not the original filename passed to `--file`; choose a
 download destination when using the CLI. A worker may retrieve inputs in its
-project, while publishing a new input requires the owner client.
+project, while publishing a new input requires a token with owner permissions.
 
 Pass the downloaded path to the experiment as needed. Keep input files outside
 Git and code snapshots. This version handles datasets/files; credentials and
@@ -549,7 +681,7 @@ existing destination must already reference that same object.
 For example, expose an uploaded checkpoint as a private input for later runs:
 
 ```sh
-expri service reference --config owner.toml \
+expri service reference \
   --source '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-1"},"path":"outputs/best.pt"}' \
   --target '{"kind":"input","project_id":"vision","input_id":"checkpoint-v1"}' \
   --size "$CHECKPOINT_SIZE" --sha256 "$CHECKPOINT_SHA256"
@@ -562,7 +694,7 @@ Workers may retrieve referenced inputs, but only the owner may create references
 To publish one file independently of run completion, use `expri service file-upload`:
 
 ```sh
-expri service file-upload --config owner.toml \
+expri service file-upload \
   --target '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-1"},"path":"outputs/best.pt"}' \
   --file /private/checkpoints/best.pt
 ```
@@ -593,11 +725,11 @@ deletion or re-entering its password.
 Owner tokens can manage the same lifecycle from the CLI:
 
 ```sh
-expri service run archive --config owner.toml --project-id vision \
+expri service run archive --project-id vision \
   --origin gpu-1 --run-id run-1
-expri service run status --config owner.toml --project-id vision \
+expri service run status --project-id vision \
   --origin gpu-1 --run-id run-1
-expri service run restore --config owner.toml --project-id vision \
+expri service run restore --project-id vision \
   --origin gpu-1 --run-id run-1
 ```
 
@@ -641,8 +773,8 @@ than once. The deletion preview estimates reclaimable objects, excluding keys
 referenced by another project. Inspect the same figures from the owner CLI:
 
 ```sh
-expri service project stats --config owner.toml --project-id vision
-expri service project delete-preview --config owner.toml --project-id vision
+expri service project stats --project-id vision
+expri service project delete-preview --project-id vision
 ```
 
 Project deletion removes its server-side runs, private inputs, tracking files,
@@ -671,9 +803,9 @@ the preview, refresh and review the new preview before submitting again.
 The owner CLI also requires the preview's revision and exact project ID:
 
 ```sh
-expri service project delete --config owner.toml --project-id vision \
+expri service project delete --project-id vision \
   --revision 'REVISION_FROM_PREVIEW' --confirm-project vision
-expri service project deletion --config owner.toml --project-id vision
+expri service project deletion --project-id vision
 ```
 
 Metadata removal and a durable cleanup queue are committed together. Cleanup

@@ -42,7 +42,10 @@ client_config = "/home/me/.tokn/expri/machine-client.toml"
 
 Collection continues while uploads retry. `status` includes the last publishing
 error and timestamp. `expri system publish` sends one pending batch without
-starting collection. Removing the profile database creates a new machine ID;
+starting collection. This explicit command can use the global `[server]` connection
+when no client override is selected. Configuring `[server]` alone does not enable
+the daemon's background publishing; select machine credentials through the
+profile publishing settings or `--client-config`. Removing the profile database creates a new machine ID;
 do not clone it onto another independently collecting machine.
 
 ## Read retention correctly
@@ -68,10 +71,10 @@ temperature/power are unavailable in this version. CPU/counter rates start with
 warmup. A system profile is not a per-training-process measurement.
 
 ```sh
-expri service system list --config owner.toml
-expri service system profile --config owner.toml machine-actual-id
-expri service system history --config owner.toml machine-actual-id --resolution hourly
-expri service system profile --config owner.toml machine-actual-id --inventory-revision 1
+expri service system list
+expri service system profile machine-actual-id
+expri service system history machine-actual-id --resolution hourly
+expri service system profile machine-actual-id --inventory-revision 1
 ```
 
 History uses bounded pages. Pass returned `next_cursor` through `--cursor`;

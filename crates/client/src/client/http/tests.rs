@@ -18,6 +18,100 @@ pub(in crate::client) fn api(url: &str) -> Api {
 }
 
 #[test]
+fn malformed_client_configuration_diagnostics_do_not_echo_embedded_credentials() {
+  let config = tempfile::NamedTempFile::new().unwrap();
+  let path = config.path().canonicalize().unwrap();
+  std::fs::write(&path, "url = \"https://must-not-leak@example.invalid/\n").unwrap();
+  let detail = Api::new(&path).err().unwrap().to_string();
+  assert_eq!(detail, "service client configuration is invalid");
+}
+
+#[test]
+fn stored_tokens_in_flat_and_global_configs_use_bearer_auth_and_redact_rejections() {
+  for global in [false, true] {
+    let (url, server) = mock(1, |request, _| {
+      assert_eq!(request.path, "/service/v1/request");
+      assert_eq!(request.headers["authorization"], "Bearer must-not-leak");
+      (
+        401,
+        Vec::new(),
+        br#"{"error":"must-not-leak rejected"}"#.to_vec(),
+      )
+    });
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let path = file.path().canonicalize().unwrap();
+    let table = if global { "[server]\n" } else { "" };
+    std::fs::write(
+      &path,
+      format!("{table}url='{url}/service/'\ntoken='must-not-leak'\n"),
+    )
+    .unwrap();
+    let api = Api::new(&path).unwrap();
+    let error = api.request(&Request::Capabilities).unwrap_err();
+    assert!(matches!(
+      error,
+      ExpriError::ServiceRejected { status: 401, .. }
+    ));
+    assert!(!error.to_string().contains("must-not-leak"));
+    assert!(error.to_string().contains("[redacted]"));
+    server.join().unwrap();
+  }
+}
+
+#[test]
+fn valid_configuration_does_not_contact_the_endpoint_until_request() {
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  listener.set_nonblocking(true).unwrap();
+  let address = listener.local_addr().unwrap();
+  let file = tempfile::NamedTempFile::new().unwrap();
+  std::fs::write(
+    file.path(),
+    format!("[server]\nurl='http://{address}'\ntoken='stored-secret'\n"),
+  )
+  .unwrap();
+  let api = Api::new(file.path()).unwrap();
+  assert_eq!(api.endpoint, format!("http://{address}/v1/request"));
+  assert_eq!(
+    listener.accept().unwrap_err().kind(),
+    std::io::ErrorKind::WouldBlock
+  );
+}
+
+#[test]
+fn resolved_environment_tokens_use_the_stored_token_character_policy_without_leaking() {
+  let config: ClientConfig =
+    toml::from_str("url='https://example.net'\ntoken_env='MUST_NOT_LEAK_ENV'\n").unwrap();
+  for token in [
+    "",
+    "must-not-leak space",
+    "must-not-leak\n",
+    "must-not-leak-🔒",
+    "must-not-leak\u{007f}",
+  ] {
+    let error = resolve_token(config.clone(), |name| {
+      assert_eq!(name, "MUST_NOT_LEAK_ENV");
+      Ok(token.into())
+    })
+    .unwrap_err();
+    assert_eq!(
+      error.to_string(),
+      "service token must be nonempty ASCII graphic characters"
+    );
+    assert!(!format!("{error:?} {error}").contains("must-not-leak"));
+    assert!(!error.to_string().contains("MUST_NOT_LEAK_ENV"));
+  }
+  assert_eq!(
+    resolve_token(config.clone(), |_| Ok("x".into())).unwrap(),
+    "x"
+  );
+  let error = resolve_token(config, |_| Err(std::env::VarError::NotPresent)).unwrap_err();
+  assert_eq!(
+    error.to_string(),
+    "service token environment variable is missing"
+  );
+}
+
+#[test]
 fn rejected_status_survives_an_unreadable_response_body() {
   for status in [401, 403, 410, 503] {
     let (url, server) = mock(1, move |_, _| {

@@ -5,7 +5,7 @@ Each machine stores this new data under `~/.tokn/expri`:
 
 ```text
 ~/.tokn/expri/
-  config.toml        # Optional machine-level system-profile settings
+  config.toml        # Server connection and optional system-profile settings
   profiles.sqlite3  # Stable machine ID, inventories, samples, hourly history, upload receipts
   collector.lock    # Live collector lease
   publishing.json   # Last publisher status and error
@@ -214,9 +214,10 @@ The CLI can also inspect the same local or hosted history:
 expri system history
 expri system history --resolution hourly
 expri system history --resolution hourly --start 2026-10-01T00:00:00Z --end 2026-10-12T00:00:00Z
-expri service system list --config owner.toml
-expri service system profile --config owner.toml machine-actual-id
-expri service system history --config owner.toml machine-actual-id --resolution hourly
+# Service inspection uses [server] in ~/.tokn/expri/config.toml by default.
+expri service system list
+expri service system profile machine-actual-id
+expri service system history machine-actual-id --resolution hourly
 ```
 
 Commands print JSON. History defaults to 72 hours of detail or 30 days of hourly

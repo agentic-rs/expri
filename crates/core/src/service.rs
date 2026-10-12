@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::service_catalog::{RunFilesPage, RunFilesQuery, RunListPage, RunListQuery};
 use crate::system_profile::{
   MachineProfile, ProfileAcknowledgement, ProfileBatch, ProfileHistory, ProfileHistoryQuery,
 };
@@ -13,12 +14,94 @@ pub const STREAM_BATCH: usize = 64 * 1024;
 pub const MAX_REQUEST: usize = 1024 * 1024;
 pub const MAX_SYSTEM_MACHINES: usize = 100;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
   pub url: String,
-  pub token_env: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub token: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub token_env: Option<String>,
   #[serde(default)]
   pub project_id: Option<String>,
+}
+
+impl std::fmt::Debug for ClientConfig {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("ClientConfig")
+      .field("url", &"[configured]")
+      .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+      .field("token_env", &self.token_env.as_ref().map(|_| "[redacted]"))
+      .field(
+        "project_id",
+        &self.project_id.as_ref().map(|_| "[configured]"),
+      )
+      .finish()
+  }
+}
+
+impl ClientConfig {
+  /// Validate the connection URL independently of any saved credential.
+  pub fn validate_url(&self) -> crate::error::Result<()> {
+    use crate::error::ExpriError;
+
+    let invalid = |message: &str| ExpriError::Message(message.into());
+    let url = url::Url::parse(&self.url).map_err(|_| invalid("invalid service URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+      || url.host_str().is_none()
+      || !url.username().is_empty()
+      || url.password().is_some()
+      || url.query().is_some()
+      || url.fragment().is_some()
+    {
+      return Err(invalid(
+        "service URL must be HTTP(S) without embedded credentials, query or fragment",
+      ));
+    }
+    Ok(())
+  }
+
+  /// Validate syntax without resolving credentials or contacting the server.
+  pub fn validate(&self) -> crate::error::Result<()> {
+    use crate::error::ExpriError;
+
+    self.validate_url()?;
+    let invalid = |message: &str| ExpriError::Message(message.into());
+    match (&self.token, &self.token_env) {
+      (Some(token), None) => {
+        validate_client_token(token)?;
+      }
+      (None, Some(name)) => {
+        let mut bytes = name.bytes();
+        if !bytes
+          .next()
+          .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+          || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+          return Err(invalid(
+            "service token_env must be an environment variable name",
+          ));
+        }
+      }
+      _ => {
+        return Err(invalid(
+          "service client configuration requires exactly one of token or token_env",
+        ));
+      }
+    }
+    Ok(())
+  }
+}
+
+/// Match the server's bearer-token character set without imposing its length policy.
+pub fn validate_client_token(token: &str) -> crate::error::Result<()> {
+  if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+    return Err(crate::error::ExpriError::Message(
+      "service token must be nonempty ASCII graphic characters".into(),
+    ));
+  }
+  Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -95,6 +178,14 @@ pub struct AssetProvenance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  /// Paginated run discovery across the scopes visible to the authenticated caller.
+  BrowseRuns {
+    query: RunListQuery,
+  },
+  /// Received files and bounded worker-reported outputs for one published run.
+  BrowseRunFiles {
+    query: RunFilesQuery,
+  },
   /// Publish machine inventory, recent details, and authoritative hourly snapshots.
   PutSystemProfile {
     batch: ProfileBatch,
@@ -234,6 +325,12 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  RunPage {
+    page: RunListPage,
+  },
+  RunFilesPage {
+    page: RunFilesPage,
+  },
   SystemProfileAcknowledged {
     acknowledgement: ProfileAcknowledgement,
   },
@@ -453,6 +550,106 @@ pub fn upload_report(mut report: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn client_config(token: Option<&str>, token_env: Option<&str>) -> ClientConfig {
+    ClientConfig {
+      url: "https://example.net".into(),
+      token: token.map(str::to_owned),
+      token_env: token_env.map(str::to_owned),
+      project_id: Some("vision".into()),
+    }
+  }
+
+  #[test]
+  fn client_authentication_requires_exactly_one_valid_source() {
+    assert!(
+      client_config(Some("stored-secret"), None)
+        .validate()
+        .is_ok()
+    );
+    assert!(
+      client_config(None, Some("EXPRI_UNSET_TEST_TOKEN"))
+        .validate()
+        .is_ok()
+    );
+    for (token, env) in [
+      (None, None),
+      (Some("stored-secret"), Some("EXPRI_TOKEN")),
+      (Some(""), None),
+      (Some("stored\nsecret"), None),
+      (Some("stored secret"), None),
+      (Some("secret\u{007f}"), None),
+      (Some("stored-secret-🔒"), None),
+      (None, Some("")),
+      (None, Some("9EXPRI_TOKEN")),
+      (None, Some("EXPRI=TOKEN")),
+      (None, Some("EXPRI\nTOKEN")),
+    ] {
+      assert!(client_config(token, env).validate().is_err());
+    }
+    // Client configuration keeps legacy short tokens compatible.
+    assert!(client_config(Some("x"), None).validate().is_ok());
+    assert!(
+      client_config(Some("!#$%&()*+,-./:;<=>?@[\\]^_`{|}~"), None)
+        .validate()
+        .is_ok()
+    );
+  }
+
+  #[test]
+  fn connection_url_validation_does_not_imply_authenticated_client_configuration() {
+    let mut config = client_config(None, None);
+    config.validate_url().unwrap();
+    assert!(config.validate().is_err());
+    config.url = "https://must-not-leak@host".into();
+    assert!(config.validate_url().is_err());
+    assert!(
+      !config
+        .validate_url()
+        .unwrap_err()
+        .to_string()
+        .contains("must-not-leak")
+    );
+  }
+
+  #[test]
+  fn client_urls_are_validated_without_echoing_credentials() {
+    for url in [
+      "https://must-not-leak@host",
+      "https://user:must-not-leak@host",
+      "https://host/?token=must-not-leak",
+      "https://host/#must-not-leak",
+      "file:///must-not-leak",
+      "must-not-leak",
+    ] {
+      let mut config = client_config(Some("stored-secret"), None);
+      config.url = url.into();
+      let error = config.validate().unwrap_err();
+      assert!(!format!("{error:?} {error} {config:?}").contains("must-not-leak"));
+    }
+    let mut config = client_config(Some("stored-secret"), None);
+    config.url = "http://localhost:4444/service/".into();
+    config.validate().unwrap();
+  }
+
+  #[test]
+  fn client_configuration_serializes_credentials_but_debug_redacts_them() {
+    for config in [
+      client_config(Some("must-not-leak"), None),
+      client_config(None, Some("MUST_NOT_LEAK_ENV")),
+    ] {
+      let debug = format!("{config:?}");
+      assert!(debug.contains("[redacted]"));
+      assert!(!debug.contains("must-not-leak"));
+      assert!(!debug.contains("MUST_NOT_LEAK_ENV"));
+      let encoded = toml::to_string(&config).unwrap();
+      let restored: ClientConfig = toml::from_str(&encoded).unwrap();
+      restored.validate().unwrap();
+      assert_eq!(restored.token, config.token);
+      assert_eq!(restored.token_env, config.token_env);
+      assert_eq!(restored.project_id, config.project_id);
+    }
+  }
 
   #[test]
   fn scope_and_paths_keep_service_objects_out_of_environment_and_parent_directories() {

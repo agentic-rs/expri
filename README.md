@@ -27,12 +27,14 @@ index. Load deeper instructions only for the workflow at hand:
 expri skill
 expri skill run
 expri skill assets
+expri skill query
+expri skill login
 expri skill --help
 ```
 
-Topics cover configuration, source pushing, task launch, run inspection,
-metrics, artifacts, assets, environments, service publishing/fetching, and
-machine system profiles.
+Topics cover configuration, server login, source pushing, task launch, run inspection,
+metrics, artifacts, assets, environments, server queries, service publishing/fetching,
+and machine system profiles.
 The Markdown is embedded in the CLI, works offline without project
 configuration, and does not install files.
 
@@ -549,13 +551,13 @@ survive worker publishing. Local and cached dashboards remain read-only.
 Older hosted servers show the nickname and tag fields disabled until the server
 is upgraded, so branch previews can still show the new layout.
 
-The owner CLI reads or replaces the same values:
+The service CLI reads or replaces the same values using credentials with owner permissions:
 
 ```sh
-expri service run annotations --config owner.toml --project-id vision --origin gpu-1 --run-id run-1
-expri service run annotate --config owner.toml --project-id vision --origin gpu-1 --run-id run-1 \
+expri service run annotations --project-id vision --origin gpu-1 --run-id run-1
+expri service run annotate --project-id vision --origin gpu-1 --run-id run-1 \
   --nickname "Baseline" --tag baseline --tag model-a
-expri service run annotate --config owner.toml --project-id vision --origin gpu-1 --run-id run-1 --clear
+expri service run annotate --project-id vision --origin gpu-1 --run-id run-1 --clear
 ```
 
 `annotate` replaces both fields: omitted nickname or tags are cleared. Nicknames
@@ -660,7 +662,7 @@ Finished hosted runs can be archived on the primary dashboard. They disappear
 from the normal list and can be restored from the **Archived** view for 15 days.
 After that deadline, durable cleanup removes their hosted data and unreferenced
 S3 outputs, preserving private inputs, shared objects, and worker/laptop copies.
-Owner CLI commands are `expri service run archive`, `restore`, and `status`;
+Server management commands are `expri service run archive`, `restore`, and `status`;
 `service upload` still produces result ZIPs. AB remains read-only. See
 [run retention](docs/self-hosted-service.md#run-archival-and-retention).
 The project's **Storage** view lists completed private inputs and uploaded
@@ -672,9 +674,47 @@ result ZIPs. Pending upload sizes appear separately. Optional project deletion
 requires a preview, the exact project name, and the dashboard password; durable
 cleanup retries interruptions and removes eligible S3 versions. AB remains
 read-only. See [storage management](docs/self-hosted-service.md#storage-usage-and-project-deletion)
-for configuration and owner CLI commands.
+for configuration and server management commands.
 The local dashboard remains available for offline review after downloading
 results.
+
+Sign in with the primary dashboard password to save this machine's server connection:
+
+```sh
+expri login --url https://expri.example.net
+expri config server show
+```
+
+The interactive password prompt is hidden. Login exchanges the password for a
+separate API token with unrestricted server access and saves it privately in `[server]` in
+`~/.tokn/expri/config.toml`; it never stores the password or prints the token.
+Use `--password-stdin` for a pipe or redirected password file. Later `expri login`
+uses the saved URL. Query and service client commands use this connection by
+default; `--config PATH` selects an explicit override.
+
+Issued tokens have no expiry and survive service restarts. `expri logout`
+revokes the current issued token and clears its local credential while keeping
+the URL and project selection. Changing the dashboard password, unrestricted
+server API token, or primary dashboard authority invalidates issued tokens after
+restarting the service. Upgrade the server to enable CLI login and logout.
+
+Existing manual tokens and `token_env` client files remain supported. Use
+`expri config server set --url URL --token-stdin` to store a supplied token;
+`expri config server show` hides it. Connection updates preserve system-profile
+settings. Read [login and configuration](docs/self-hosted-service.md#configure-the-clis-server-connection)
+or `expri skill login` for details.
+
+Browse published records without a project checkout:
+
+```sh
+expri query runs
+expri query runs --project-id vision --origin gpu-1
+expri query files --project-id vision --origin gpu-1 --run-id run-abc123
+```
+
+These commands return bounded JSON pages with `next_cursor`. File rows distinguish
+received data from reported outputs still awaiting upload. Execution status is
+the last published state. See [server browsing](docs/self-hosted-service.md#browse-published-runs-and-files).
 
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and
 worker configuration, browser sign-in, input files, selective downloads, and offline dashboard

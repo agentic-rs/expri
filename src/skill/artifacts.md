@@ -70,7 +70,7 @@ adding files and moving labels are rejected. Use the explicit
 
 ```sh
 expri -T gpu runs fetch run-abc123 --artifact outputs/checkpoint-1000.pt
-expri service fetch --config owner.toml --project-id vision --origin gpu-1 --run-id run-abc123 --artifact outputs/checkpoint-1000.pt
+expri service fetch --project-id vision --origin gpu-1 --run-id run-abc123 --artifact outputs/checkpoint-1000.pt
 ```
 
 The first command reads directly from a worker; the second reads the existing

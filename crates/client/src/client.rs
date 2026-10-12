@@ -1,8 +1,10 @@
+mod catalog;
 mod checkpoints;
 mod download;
 pub(super) mod fs;
 mod http;
 mod inventory;
+mod login;
 mod queue;
 mod system_profile;
 #[cfg(test)]
@@ -27,7 +29,9 @@ use http::Api;
 use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
+pub use catalog::ServiceCatalogClient;
 pub use download::{fetch, input_download, input_download_prepared};
+pub use login::{login, logout, revoke_login, validate_login_url};
 pub use system_profile::SystemProfileClient;
 pub use watch::fetch as fetch_files;
 

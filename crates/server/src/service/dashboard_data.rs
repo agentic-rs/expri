@@ -1189,6 +1189,42 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     self.json_record(&record, path, limit, deadline)
   }
 
+  /// CLI catalog reads only published state or the small worker output manifest.
+  /// Reuse the verified tracking/object readers without reading checkpoint bytes.
+  pub(in crate::service) fn catalog_document(
+    &self,
+    scope: &RunScope,
+    path: &str,
+    limit: u64,
+    deadline: Instant,
+  ) -> ApiResult<Option<Value>> {
+    if !matches!(
+      path,
+      "run-state.json" | crate::run_artifacts::INVENTORY_PATH
+    ) || limit > STATE_LIMIT
+    {
+      return Err(ApiError::new(400, "invalid catalog metadata selection"));
+    }
+    if Instant::now() >= deadline {
+      return Err(ApiError::new(
+        504,
+        "catalog metadata read budget exceeded; retry to refresh",
+      ));
+    }
+    let record = match self.store.execute(super::types::Request::GetFile {
+      target: FileTarget::Run {
+        scope: scope.clone(),
+        path: path.into(),
+      },
+    }) {
+      Ok(super::types::Response::File { file }) => file,
+      Err(error) if error.status == 404 => return Ok(None),
+      Err(error) => return Err(error),
+      _ => return Err(ApiError::new(500, "invalid catalog metadata response")),
+    };
+    self.json_record(&record, path, limit, deadline)
+  }
+
   fn json_record(
     &self,
     record: &FileRecord,

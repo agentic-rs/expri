@@ -4,9 +4,31 @@ Use an existing expri service to publish run metadata, metrics, logs, and select
 finalized checkpoints, then fetch them onto the reviewing machine. Worker
 publishing credentials and laptop fetching credentials are separate.
 
-For `service` commands, `--config` selects a service client file rather than
-the project's `expri.toml`. `service fetch --repo` selects the review checkout
-and defaults to the current directory; provide it when fetching from elsewhere.
+Use `expri login --url URL` with the primary dashboard password to configure
+this machine's server connection. Its prompt is hidden; it saves a separately
+issued API token, without saving the password. Read `expri skill login` for
+stdin input, logout, and token lifecycle.
+
+Query and service client commands default to `[server]` in
+`~/.tokn/expri/config.toml`. Existing manually supplied tokens remain supported:
+
+```toml
+[server]
+url = "https://expri.example.net"
+token = "your-server-token"
+```
+
+`expri config server set --url URL --token-stdin` stores a supplied token;
+`config server show` hides it. `unset` removes the local connection without
+revoking the token. Writes are private and atomic, preserving system-profile
+settings. `EXPRI_STORAGE_DIR` overrides the global storage root. Inspection
+creates no files.
+
+For query and service client commands, `--config` selects another global config
+or a standalone `url` plus `token`/`token_env` file. It selects a server connection
+rather than the project's `expri.toml`. `service serve --config` is server
+configuration. `service fetch --repo` selects the review checkout and defaults
+to the current directory; provide it when fetching from elsewhere.
 
 ## Configure the executing worker
 
@@ -63,12 +85,39 @@ acknowledged and the server ZIP job accepted; its ZIP can still be uploading.
 
 ## Fetch onto the reviewing machine
 
-Use an existing owner client file with the same service URL and its owner token
-variable. Configure the laptop's `expri.toml`:
+Browse the server directly before choosing runs and files to fetch:
+
+```sh
+expri query runs
+expri query runs --project-id vision --origin gpu-1 --archival all
+expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --prefix outputs/
+```
+
+These commands need a server advertising `service-catalog-v1` and the configured
+server credentials; no local project is needed. Credentials with unrestricted
+server access browse all scopes by default. Worker tokens are limited to their own
+project/origin; machine-profile tokens cannot browse runs. `query runs` defaults
+to active runs and 50 rows; `query files` defaults to 100. Pass `next_cursor` using
+`--cursor`, with the same filters, to continue. Limits are 1 to 100 per page.
+
+Keep every run's full project/origin/run ID scope. Status is the last published
+execution state; `service run status` is archival status, and worker `runs status`,
+`runs logs`, and `runs cancel` provide live supervision. Missing metadata produces warnings.
+
+Files distinguish received data, reported-only outputs and known version
+mismatches. Inspect both `received` and `reported`, plus `labels_pending`, before
+choosing checkpoints. A label is confirmed only by a matching received object
+size and checksum. Unsealed tracking data is a received prefix. Reported inventory
+has a 200-file/64-KiB limit and explicit truncation/unavailability warnings.
+`--prefix` is literal. Browsing does not download checkpoint bytes or return
+signed URLs; use `service fetch` for downloads. Read `expri skill query` for
+query-specific guidance. Legacy `service list` is unchanged.
+
+For project-wide fetching, reference the global connection from the laptop's `expri.toml`:
 
 ```toml
 [fetch]
-client_config = "/home/me/.config/expri/owner.toml"
+client_config = "/home/me/.tokn/expri/config.toml"
 project_id = "vision"
 origins = ["gpu-1"]
 labels = ["best", "latest"]
@@ -77,8 +126,8 @@ labels = ["best", "latest"]
 ```sh
 expri fetch --dry-run
 expri fetch --watch
-expri service list --config owner.toml --project-id vision --origin gpu-1
-expri service fetch --config owner.toml --project-id vision --origin gpu-1 --run-id run-abc123 --artifact outputs/checkpoint-1000.pt
+expri service list --project-id vision --origin gpu-1
+expri service fetch --project-id vision --origin gpu-1 --run-id run-abc123 --artifact outputs/checkpoint-1000.pt
 expri dashboard
 ```
 

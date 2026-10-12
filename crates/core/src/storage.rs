@@ -209,7 +209,7 @@ fn private_directory(path: &Path) -> Result<()> {
   Ok(())
 }
 
-/// Create a managed regular file privately, rejecting an existing symlink.
+/// Create a managed regular file privately, rejecting existing symlinks and hardlinks.
 /// Canonical aliases in the trusted external parent are supported.
 pub fn ensure_private_file(path: &Path) -> Result<File> {
   let parent = path
@@ -237,7 +237,15 @@ pub fn ensure_private_file(path: &Path) -> Result<File> {
           "managed system file must be a regular file without symlinks",
         ));
       }
-      let file = OpenOptions::new().read(true).write(true).open(&path)?;
+      single_link(&before)?;
+      let mut existing = OpenOptions::new();
+      existing.read(true).write(true);
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::OpenOptionsExt;
+        existing.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+      }
+      let file = existing.open(&path)?;
       let after = fs::symlink_metadata(&path)?;
       if !after.is_file() || after.file_type().is_symlink() {
         return Err(invalid("managed system file changed while opening"));
@@ -261,12 +269,26 @@ pub fn ensure_private_file(path: &Path) -> Result<File> {
   #[cfg(unix)]
   {
     use std::os::unix::fs::PermissionsExt;
+    single_link(&file.metadata()?)?;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
   }
   file.sync_all()?;
   #[cfg(unix)]
   File::open(parent)?.sync_all()?;
   Ok(file)
+}
+
+fn single_link(metadata: &fs::Metadata) -> Result<()> {
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() != 1 {
+      return Err(invalid("managed system file must not have hardlinks"));
+    }
+  }
+  #[cfg(not(unix))]
+  let _ = metadata;
+  Ok(())
 }
 
 fn invalid(message: &str) -> ExpriError {
@@ -349,5 +371,50 @@ mod tests {
         .is_err()
     );
     assert!(!outside.join("expri").exists());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn managed_hardlinks_never_change_external_permissions_or_contents() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let external = root.join("external.toml");
+    fs::write(&external, "external configuration stays intact\n").unwrap();
+    fs::set_permissions(&external, fs::Permissions::from_mode(0o640)).unwrap();
+    let storage = StoragePaths::from_root(root.join("managed")).unwrap();
+    storage.ensure_private().unwrap();
+    let linked = storage.config_file();
+    fs::hard_link(&external, &linked).unwrap();
+    assert!(
+      ensure_private_file(&linked)
+        .unwrap_err()
+        .to_string()
+        .contains("hardlinks")
+    );
+    assert_eq!(
+      fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+      0o640
+    );
+    assert_eq!(
+      fs::read_to_string(&external).unwrap(),
+      "external configuration stays intact\n"
+    );
+    assert_eq!(
+      fs::read_to_string(&linked).unwrap(),
+      "external configuration stays intact\n"
+    );
+    // A normal existing managed file can still be tightened after the link is removed.
+    fs::remove_file(&linked).unwrap();
+    fs::write(&linked, "managed\n").unwrap();
+    fs::set_permissions(&linked, fs::Permissions::from_mode(0o640)).unwrap();
+    let file = ensure_private_file(&linked).unwrap();
+    assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::read_to_string(&linked).unwrap(), "managed\n");
+    assert_eq!(
+      fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+      0o640
+    );
   }
 }

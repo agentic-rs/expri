@@ -133,8 +133,33 @@ fn local_config_context_errors_do_not_disclose_credentials() {
     project_context(Some(&config))
       .unwrap_err()
       .to_string()
-      .contains("size limit")
+      .contains("32 KiB")
   );
+}
+
+#[test]
+fn private_project_context_accepts_global_server_settings_and_keeps_scope_explicit() {
+  let temporary = tempfile::tempdir().unwrap();
+  let path = temporary.path().canonicalize().unwrap().join("config.toml");
+  fs::write(&path, "[system_profile]\ninterval_seconds=10\n[server]\nurl='https://service.example.net/'\ntoken='stored-asset-context-test-token'\nproject_id='example-project'\n").unwrap();
+  assert_eq!(
+    project_context(Some(&path)).unwrap(),
+    (path.as_path(), "example-project".into())
+  );
+  for contents in [
+    "[server]\nurl='https://service.example.net/'\ntoken='stored-asset-context-test-token'\n",
+    "[server]\nurl='https://service.example.net/'\ntoken='stored-asset-context-test-token'\ntoken_env='SECRET_ENV_NAME'\nproject_id='example-project'\n",
+    "[server]\nurl='https://service.example.net/prefix/'\ntoken='stored-asset-context-test-token'\nproject_id='example-project'\n",
+  ] {
+    fs::write(&path, contents).unwrap();
+    let error = project_context(Some(&path)).unwrap_err().to_string();
+    assert!(
+      !error.contains("stored-asset-context-test-token"),
+      "{error}"
+    );
+    assert!(!error.contains("SECRET_ENV_NAME"), "{error}");
+  }
+  assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 1);
 }
 
 #[test]

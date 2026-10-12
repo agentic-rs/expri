@@ -4,6 +4,41 @@ Read the existing project configuration before adding tasks or selecting a
 worker. Most controller commands load `expri.toml` from the current directory;
 they do not search ancestor directories.
 
+## Global server connection
+
+Authenticate with the primary dashboard password to save the global connection:
+
+```sh
+expri login --url https://expri.example.net
+expri config server show
+```
+
+The prompt hides the password. Login saves a separate issued API token, without
+saving the password or printing credentials. `expri login` later uses the saved
+URL; `expri logout` revokes its issued token and keeps the URL for future login.
+Read `expri skill login` for stdin input, token lifecycle, and server requirements.
+
+Query and service client commands use `[server]` in `~/.tokn/expri/config.toml`.
+Existing manual credentials remain supported:
+
+```toml
+[server]
+url = "https://expri.example.net"
+token = "your-server-token"
+```
+
+`expri config server set --url URL --token-stdin` stores a token supplied through
+a pipe or redirected file. Updates preserve system-profile settings and use
+private, atomic writes. `config server show` hides credentials;
+`config server unset` removes the connection without revoking a remote token.
+`EXPRI_STORAGE_DIR` overrides the global root; config, login, and logout also
+accept `--storage-dir`.
+
+Query and service client `--config PATH` selects another global or standalone
+connection file. Existing `token_env` files remain supported. `expri service
+serve --config PATH` selects the daemon's own settings. Project controller
+`--config` still selects `expri.toml`, as described below.
+
 ## Paths and private targets
 
 - `--config /path/to/expri.toml` selects the config. Its parent directory is the

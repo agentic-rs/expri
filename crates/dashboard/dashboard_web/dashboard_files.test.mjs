@@ -44,15 +44,28 @@ test("resumable fetch commands preserve literal shell arguments and include only
   assert.deepEqual(args, ["service", "fetch", "--config", config, "--project-id", "vision", "--origin", "gpu-1", "--run-id", "run-123", "--repo", ".", "--artifact", path]);
 });
 
-test("fetch commands require a client path and valid scope and bound artifact selection", () => {
+test("fetch commands use global settings by default without changing literal file arguments", () => {
+  const path = "outputs/model 'two' $(printf unsafe) `echo unsafe` $HOME.pt";
+  for (const config_path of [undefined, "", "   "]) {
+    const command = artifactFetchCommand(scope, [file(path)], [path], config_path);
+    assert.ok(command);
+    const output = execFileSync("/bin/sh", ["-c", "expri() { printf '%s\\0' \"$@\"; }\n" + command]);
+    const args = output.toString().split("\0").slice(0, -1);
+    assert.deepEqual(args, ["service", "fetch", "--project-id", "vision", "--origin", "gpu-1", "--run-id", "run-123", "--repo", ".", "--artifact", path]);
+  }
+});
+
+test("fetch commands require valid scope and bound artifact selection, with optional client override", () => {
   const files = Array.from({ length: 65 }, (_, index) => file(`outputs/${index}.pt`));
-  assert.equal(artifactFetchCommand(scope, files, [files[0].path], ""), null);
   assert.equal(artifactFetchCommand(scope, files, [files[0].path], "client\0.toml"), null);
-  assert.equal(artifactFetchCommand(null, files, [files[0].path], "owner.toml"), null);
-  assert.equal(artifactFetchCommand({ ...scope, origin: "../worker" }, files, [files[0].path], "owner.toml"), null);
-  assert.equal(artifactFetchCommand(scope, files, files.map(file => file.path), "owner.toml"), null);
-  assert.equal(artifactFetchCommand(scope, [file("outputs/../secret")], ["outputs/../secret"], "owner.toml"), null);
-  assert.equal(artifactFetchCommand(scope, [file("outputs/local.pt", { cloud: false })], ["outputs/local.pt"], "owner.toml"), null);
+  for (const config_path of ["", "client.toml"]) {
+    assert.equal(artifactFetchCommand(null, files, [files[0].path], config_path), null);
+    assert.equal(artifactFetchCommand({ ...scope, origin: "../worker" }, files, [files[0].path], config_path), null);
+    assert.equal(artifactFetchCommand(scope, files, files.map(file => file.path), config_path), null);
+    assert.equal(artifactFetchCommand(scope, [file("outputs/../secret")], ["outputs/../secret"], config_path), null);
+    assert.equal(artifactFetchCommand(scope, [file("outputs/local.pt", { cloud: false })], ["outputs/local.pt"], config_path), null);
+    assert.equal(artifactFetchCommand(scope, files, [], config_path), null);
+  }
 });
 
 test("file sizes distinguish unknown values and binary units", () => {

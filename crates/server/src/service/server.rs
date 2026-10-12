@@ -18,6 +18,8 @@ use super::types::{
 };
 use crate::error::{ExpriError, Result};
 
+mod cli_auth;
+
 const HEADER_LIMIT: usize = 16 * 1024;
 const WORKERS: usize = 4;
 const QUEUE: usize = 16;
@@ -36,10 +38,12 @@ struct Auth {
   workers: Vec<(Vec<u8>, WorkerAuth)>,
   machines: Vec<(Vec<u8>, MachineAuth)>,
   sites: Vec<DashboardSite>,
+  login_limiter: cli_auth::LoginLimiter,
 }
 
 enum Role<'a> {
   Owner,
+  IssuedOwner { digest: [u8; 32] },
   Worker(&'a WorkerAuth),
   Machine(&'a MachineAuth),
 }
@@ -123,6 +127,7 @@ impl Auth {
       workers,
       machines,
       sites,
+      login_limiter: cli_auth::LoginLimiter::default(),
     })
   }
 
@@ -169,7 +174,11 @@ impl Auth {
     Ok(())
   }
 
-  fn role(&self, request: &HttpRequest<Vec<u8>>) -> ApiResult<Role<'_>> {
+  fn role<S: ObjectStorage>(
+    &self,
+    store: &Store<S>,
+    request: &HttpRequest<Vec<u8>>,
+  ) -> ApiResult<Role<'_>> {
     let mut headers = request.headers().get_all("authorization").iter();
     let header = headers
       .next()
@@ -191,12 +200,26 @@ impl Auth {
     {
       return Ok(Role::Worker(worker));
     }
-    self
+    if let Some(machine) = self
       .machines
       .iter()
       .find(|(token, _)| constant_eq(supplied, token))
       .map(|(_, machine)| Role::Machine(machine))
-      .ok_or_else(|| ApiError::new(401, "bearer authentication required"))
+    {
+      return Ok(machine);
+    }
+    if let Ok(token) = std::str::from_utf8(supplied)
+      && expri_core::service_auth::validate_cli_token(token).is_ok()
+      && self.sites.iter().any(|site| !site.preview)
+    {
+      let site = cli_auth::primary_site(self, request)?;
+      let epoch = site.auth.cli_credential_epoch(&self.owner);
+      let digest = cli_auth::token_digest(token);
+      if store.accepts_cli_credential(&digest, &epoch, cli_auth::now_ms())? {
+        return Ok(Role::IssuedOwner { digest });
+      }
+    }
+    Err(ApiError::new(401, "bearer authentication required"))
   }
 }
 
@@ -276,7 +299,7 @@ fn authorize_role<S: ObjectStorage>(
   request: &Request,
 ) -> ApiResult<()> {
   let machine = match role {
-    Role::Owner => return authorize(store, None, request),
+    Role::Owner | Role::IssuedOwner { .. } => return authorize(store, None, request),
     Role::Worker(worker) => return authorize(store, Some(worker), request),
     Role::Machine(machine) => machine,
   };
@@ -295,6 +318,28 @@ fn authorize_role<S: ObjectStorage>(
       "machine token is outside its system profile",
     ))
   }
+}
+
+fn narrow_worker_catalog(role: &Role<'_>, request: &mut Request) -> ApiResult<()> {
+  if let (Role::Worker(worker), Request::BrowseRuns { query }) = (role, request) {
+    if query
+      .project_id
+      .as_deref()
+      .is_some_and(|project| project != worker.project_id)
+      || query
+        .origin
+        .as_deref()
+        .is_some_and(|origin| origin != worker.origin)
+    {
+      return Err(ApiError::new(
+        403,
+        "worker token is outside this project or origin",
+      ));
+    }
+    query.project_id = Some(worker.project_id.clone());
+    query.origin = Some(worker.origin.clone());
+  }
+  Ok(())
 }
 
 fn authorize<S: ObjectStorage>(
@@ -327,6 +372,13 @@ fn authorize<S: ObjectStorage>(
     return Ok(());
   };
   let allowed = match request {
+    Request::BrowseRuns { query } => {
+      query.project_id.as_deref() == Some(worker.project_id.as_str())
+        && query.origin.as_deref() == Some(worker.origin.as_str())
+    }
+    Request::BrowseRunFiles { query } => {
+      worker.project_id == query.scope.project_id && worker.origin == query.scope.origin
+    }
     Request::BeginUpload { target, .. } => allowed_target(worker, target, false),
     Request::PartUrl { upload_id, .. }
     | Request::RecordPart { upload_id, .. }
@@ -401,6 +453,14 @@ pub fn serve(
     storage.create_bucket()?;
   }
   let store = Store::open(&data_dir, storage)?;
+  let epoch = auth
+    .sites
+    .iter()
+    .find(|site| !site.preview)
+    .map(|site| site.auth.cli_credential_epoch(&auth.owner));
+  store
+    .set_cli_credential_epoch(epoch.as_ref())
+    .map_err(|_| ExpriError::Message("cannot activate CLI credential binding".into()))?;
   let dashboard = if auth.sites.is_empty() {
     None
   } else {
@@ -611,6 +671,9 @@ fn dispatch<S: ObjectStorage>(
   dashboard: Option<&HostedDashboard<'_, S>>,
   request: HttpRequest<Vec<u8>>,
 ) -> HttpResponse<Vec<u8>> {
+  if matches!(request.uri().path(), "/v1/login" | "/v1/logout") {
+    return cli_auth::handle(store, auth, &request);
+  }
   if !auth.sites.is_empty() && !matches!(request.uri().path(), "/health" | "/v1/request") {
     return match auth.site(&request) {
       Ok(Some(site)) => super::browser::handle(
@@ -658,7 +721,7 @@ fn route<S: ObjectStorage>(
   if request.method() != "POST" {
     return Err(ApiError::new(405, "service requests require POST"));
   }
-  let role = auth.role(&request)?;
+  let role = auth.role(store, &request)?;
   let mut content_types = request.headers().get_all("content-type").iter();
   if !content_types
     .next()
@@ -676,8 +739,9 @@ fn route<S: ObjectStorage>(
       "service requests require application/json",
     ));
   }
-  let operation: Request = serde_json::from_slice(request.body())
+  let mut operation: Request = serde_json::from_slice(request.body())
     .map_err(|_| ApiError::new(400, "invalid service request"))?;
+  narrow_worker_catalog(&role, &mut operation)?;
   authorize_role(store, role, &operation)?;
   let response = store.execute(operation)?;
   let mut body = LimitedBytes(Vec::new());
@@ -746,6 +810,14 @@ fn read_request(stream: &mut TcpStream) -> ApiResult<HttpRequest<Vec<u8>>> {
   };
   if body_length > types::MAX_REQUEST {
     return Err(ApiError::new(413, "request body exceeds 1 MiB"));
+  }
+  if matches!(request.uri().path(), "/v1/login" | "/v1/logout")
+    && body_length > expri_core::service_auth::MAX_AUTH_REQUEST_BYTES
+  {
+    return Err(ApiError::new(
+      413,
+      "CLI authentication request exceeds its size limit",
+    ));
   }
   let mut body = bytes.split_off(header_length);
   if body.len() > body_length {
@@ -929,6 +1001,7 @@ mod tests {
       owner: b"owner-token-with-at-least-24-characters".to_vec(),
       sites: Vec::new(),
       machines: Vec::new(),
+      login_limiter: cli_auth::LoginLimiter::default(),
       workers: vec![(
         b"worker-token-with-at-least-24-characters".to_vec(),
         WorkerAuth {
@@ -951,6 +1024,148 @@ mod tests {
     request
       .body(serde_json::to_vec(operation).unwrap())
       .unwrap()
+  }
+
+  #[test]
+  fn catalog_owner_discovery_and_worker_defaults_preserve_scope_boundaries() {
+    use base64::Engine;
+    use expri_core::service_catalog::{
+      RunArchiveFilter, RunFilesQuery, RunListQuery, SERVICE_CATALOG_CAPABILITY, encode_run_cursor,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let own = scope();
+    let other_project = RunScope {
+      project_id: "other-project".into(),
+      ..own.clone()
+    };
+    let other_origin = RunScope {
+      origin: "other-worker".into(),
+      ..own.clone()
+    };
+    for published in [&own, &other_project, &other_origin] {
+      store
+        .execute(Request::AppendTracking {
+          scope: published.clone(),
+          path: "logs/stdout.log".into(),
+          offset: 0,
+          data_base64: base64::engine::general_purpose::STANDARD.encode(b"started\n"),
+        })
+        .unwrap();
+    }
+    let selected = RunListQuery {
+      project_id: None,
+      origin: None,
+      archival: RunArchiveFilter::Active,
+      limit: 100,
+      cursor: None,
+    };
+    let browse = Request::BrowseRuns {
+      query: selected.clone(),
+    };
+    let owner = "owner-token-with-at-least-24-characters";
+    let worker = "worker-token-with-at-least-24-characters";
+    let Response::Capabilities { features } = serde_json::from_slice(
+      &route(&store, &auth, request(Some(owner), &Request::Capabilities)).unwrap(),
+    )
+    .unwrap() else {
+      panic!("expected capabilities")
+    };
+    assert!(
+      features
+        .iter()
+        .any(|feature| feature == SERVICE_CATALOG_CAPABILITY)
+    );
+    let Response::RunPage { page } =
+      serde_json::from_slice(&route(&store, &auth, request(Some(owner), &browse)).unwrap())
+        .unwrap()
+    else {
+      panic!("expected run page")
+    };
+    assert_eq!(page.runs.len(), 3);
+    let Response::RunPage { page } =
+      serde_json::from_slice(&route(&store, &auth, request(Some(worker), &browse)).unwrap())
+        .unwrap()
+    else {
+      panic!("expected run page")
+    };
+    assert_eq!(page.runs.len(), 1);
+    assert_eq!(page.runs[0].scope, own);
+
+    for (project_id, origin) in [
+      (Some(other_project.project_id.clone()), None),
+      (None, Some(other_origin.origin.clone())),
+    ] {
+      let operation = Request::BrowseRuns {
+        query: RunListQuery {
+          project_id,
+          origin,
+          ..selected.clone()
+        },
+      };
+      assert_eq!(
+        route(&store, &auth, request(Some(worker), &operation))
+          .unwrap_err()
+          .status,
+        403
+      );
+    }
+    let operation = Request::BrowseRuns {
+      query: RunListQuery {
+        cursor: Some(encode_run_cursor(&other_project).unwrap()),
+        ..selected.clone()
+      },
+    };
+    assert_eq!(
+      route(&store, &auth, request(Some(worker), &operation))
+        .unwrap_err()
+        .status,
+      400
+    );
+    let operation = Request::BrowseRuns {
+      query: RunListQuery {
+        project_id: Some(own.project_id.clone()),
+        origin: Some(own.origin.clone()),
+        ..selected
+      },
+    };
+    assert!(route(&store, &auth, request(Some(worker), &operation)).is_ok());
+
+    for published in [&own, &other_project, &other_origin] {
+      let operation = Request::BrowseRunFiles {
+        query: RunFilesQuery {
+          scope: published.clone(),
+          prefix: Some("logs/".into()),
+          limit: 100,
+          cursor: None,
+        },
+      };
+      let result = route(&store, &auth, request(Some(worker), &operation));
+      if published == &own {
+        let Response::RunFilesPage { page } = serde_json::from_slice(&result.unwrap()).unwrap()
+        else {
+          panic!("expected files page")
+        };
+        assert_eq!(page.scope, own);
+        assert_eq!(page.files.len(), 1);
+        assert_eq!(page.files[0].path, "logs/stdout.log");
+      } else {
+        assert_eq!(result.unwrap_err().status, 403);
+      }
+      assert!(route(&store, &auth, request(Some(owner), &operation)).is_ok());
+    }
+    assert_eq!(
+      route(
+        &store,
+        &auth,
+        request(Some(worker), &Request::RunAnnotations { scope: own })
+      )
+      .unwrap_err()
+      .status,
+      403
+    );
   }
 
   #[test]
@@ -1086,6 +1301,23 @@ mod tests {
       Request::ListRuns {
         project_id: "project".into(),
         origin: "worker".into(),
+      },
+      Request::BrowseRuns {
+        query: expri_core::service_catalog::RunListQuery {
+          project_id: None,
+          origin: None,
+          archival: expri_core::service_catalog::RunArchiveFilter::Active,
+          limit: 100,
+          cursor: None,
+        },
+      },
+      Request::BrowseRunFiles {
+        query: expri_core::service_catalog::RunFilesQuery {
+          scope: scope(),
+          prefix: None,
+          limit: 100,
+          cursor: None,
+        },
       },
     ] {
       assert_eq!(

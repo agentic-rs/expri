@@ -12,6 +12,9 @@ use super::types::*;
 
 mod archive;
 mod asset_imports;
+mod catalog_files;
+mod catalog_runs;
+mod cli_credentials;
 mod dashboard_storage;
 mod projects;
 mod references;
@@ -172,6 +175,9 @@ impl<S: ObjectStorage> Store<S> {
       CREATE TABLE IF NOT EXISTS project_storage_revisions (
         project_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS dashboard_activity_source ON dashboard_run_activity(project_id,origin,sequence);
+      CREATE INDEX IF NOT EXISTS catalog_activity_run_key ON dashboard_run_activity(run_id DESC,project_id,origin);
+      CREATE INDEX IF NOT EXISTS catalog_activity_project_key ON dashboard_run_activity(project_id,run_id DESC,origin);
+      CREATE INDEX IF NOT EXISTS catalog_activity_origin_key ON dashboard_run_activity(origin,run_id DESC,project_id);
       CREATE INDEX IF NOT EXISTS dashboard_files_scope ON files(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),json_extract(target,'$.scope.origin'),json_extract(target,'$.scope.run_id'));
       CREATE INDEX IF NOT EXISTS dashboard_storage_inputs ON files(json_extract(target,'$.kind'),json_extract(target,'$.project_id'),sequence DESC);
       CREATE INDEX IF NOT EXISTS dashboard_storage_outputs ON files(json_extract(target,'$.kind'),json_extract(target,'$.scope.project_id'),sequence DESC);
@@ -196,6 +202,7 @@ impl<S: ObjectStorage> Store<S> {
     run_retention::initialize(&connection)?;
     expri_system::store::initialize(&connection)?;
     asset_imports::initialize(&directory, &connection)?;
+    cli_credentials::initialize(&connection)?;
     // Older binaries must not drop captured provenance, annotations, or deletion fences.
     connection
       .pragma_update(None, "user_version", METADATA_SCHEMA_VERSION)
@@ -880,6 +887,12 @@ impl<S: ObjectStorage> Store<S> {
     }
     self.ensure_request_runs(&request)?;
     match request {
+      Request::BrowseRuns { query } => Ok(Response::RunPage {
+        page: self.browse_runs(&query)?,
+      }),
+      Request::BrowseRunFiles { query } => Ok(Response::RunFilesPage {
+        page: self.browse_run_files(&query)?,
+      }),
       Request::PutSystemProfile { batch } => Ok(Response::SystemProfileAcknowledged {
         acknowledgement: self.put_system_profile(&batch)?,
       }),
@@ -944,6 +957,7 @@ impl<S: ObjectStorage> Store<S> {
           expri_core::system_profile::SYSTEM_PROFILE_CAPABILITY.into(),
           expri_core::run_system::RUN_SYSTEM_CAPABILITY.into(),
           "run-annotations-v1".into(),
+          expri_core::service_catalog::SERVICE_CATALOG_CAPABILITY.into(),
         ],
       }),
       Request::PutDocument {
