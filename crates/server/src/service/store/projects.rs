@@ -295,6 +295,8 @@ impl<S: ObjectStorage> Store<S> {
   pub(super) fn request_project(&self, request: &Request) -> ApiResult<Option<String>> {
     let project = match request {
       Request::Capabilities
+      | Request::BrowseRuns { .. }
+      | Request::BrowseRunFiles { .. }
       | Request::ProjectStorage { .. }
       | Request::PreviewProjectDelete { .. }
       | Request::DeleteProject { .. }

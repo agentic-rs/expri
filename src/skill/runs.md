@@ -3,6 +3,12 @@
 Use the same target used to launch the run. Omit `-T` for locally recorded runs.
 Prefer JSON reports for agent inspection.
 
+For published server records, use `expri query runs` and `expri query files`.
+They return bounded JSON pages through the global `[server]` connection without
+SSH or a local project. Read `expri skill query` for full scope, pagination, and
+file availability. Their execution state is the last publication; the worker
+commands below inspect live supervision.
+
 ```sh
 expri runs list --json
 expri -T gpu runs list --task train --status failed --limit 5 --json

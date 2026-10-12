@@ -1,6 +1,6 @@
 ---
 name: expri
-description: Run and inspect repo-local experiments with the expri CLI, including remote workers, isolated Python environments, metrics, managed assets, and result transfers.
+description: Run experiments and query published results with the expri CLI, including remote workers, isolated Python environments, metrics, managed assets, and result transfers.
 ---
 
 # Expri for agents
@@ -13,7 +13,7 @@ prints an embedded Markdown guide and works without project configuration.
 
 | Command | Read when you need to |
 | --- | --- |
-| `expri skill config` | Find configuration, define tasks, or select a target |
+| `expri skill config` | Configure the global server, define tasks, or select a target |
 | `expri skill push` | Transfer source and config to a worker |
 | `expri skill run` | Launch a task, including a detached experiment |
 | `expri skill runs` | Inspect status/logs, cancel, or retrieve worker results |
@@ -21,6 +21,7 @@ prints an embedded Markdown guide and works without project configuration.
 | `expri skill artifacts` | Hand finalized checkpoints to background publishing |
 | `expri skill assets` | Pin datasets/models or reuse a producing run's output |
 | `expri skill environment` | Prepare uv, check base-package reuse, or prune |
+| `expri skill query` | Browse published server runs and file availability |
 | `expri skill service` | Publish runs or fetch results from an existing service |
 | `expri skill system` | Collect machine inventory/utilization and inspect system history |
 
@@ -40,6 +41,9 @@ prints an embedded Markdown guide and works without project configuration.
 - `push` sends source to a worker; `runs fetch` retrieves a worker run over
   SSH/ctl; `fetch` retrieves service results using `[fetch]`. These have different
   configuration and selection rules.
+- `query runs` and `query files` read published server JSON through the global
+  `[server]` connection without a repository or target. Use `expri skill query`
+  for scope, pagination, and received/reported availability.
 - Prefer `--json` where supported when reading reports. Use the installed CLI's
   `--help` for exact flags, for example `expri runs status --help`.
 

@@ -85,11 +85,10 @@ export function artifactFetchCommand(
   scope: ArtifactScope | null,
   files: ArtifactFile[],
   selected: string[],
-  config_path: string,
+  config_path: string = "",
 ): string | null {
   if (
     !scope ||
-    !config_path.trim() ||
     config_path.includes("\0") ||
     !parseRunDeepLink(apiUrl("", scope))
   )
@@ -99,8 +98,7 @@ export function artifactFetchCommand(
   );
   if (!paths.length || paths.length > 64) return null;
   const args = [
-    "--config",
-    config_path,
+    ...(config_path.trim() ? ["--config", config_path] : []),
     "--project-id",
     scope.project_id,
     "--origin",
@@ -464,12 +462,12 @@ export function FilesPanel({
                   : ""}
               </p>
               <label className="field">
-                Service client config path
+                Client config override (optional)
                 <input
                   id="artifact-config-path"
                   type="text"
                   autoComplete="off"
-                  placeholder="/path/to/owner.toml"
+                  placeholder="/path/to/client.toml"
                   maxLength={4096}
                   value={config_path}
                   onChange={(event) => {
@@ -479,8 +477,8 @@ export function FilesPanel({
                 />
               </label>
               <p className="muted">
-                Use an existing client config; keep credentials in its named environment variable.
-                Do not enter tokens here.
+                Leave blank to use your global server connection. Enter a client config path to
+                override it. Do not enter tokens here.
               </p>
               {command ? (
                 <>
@@ -506,7 +504,7 @@ export function FilesPanel({
                   </button>
                 </>
               ) : (
-                <p className="muted">Enter the config file path to generate a runnable command.</p>
+                <p className="muted">A command could not be generated for this selection.</p>
               )}
               <p className="muted" role="status">
                 {copy_status}

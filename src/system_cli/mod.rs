@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
-use expri_client::SystemProfileClient;
+use expri_client::{SystemProfileClient, resolve_client_config};
 use expri_core::lock::{self, LockAttempt};
 use expri_core::storage::StoragePaths;
 use expri_core::system_profile::{DETAIL_RETENTION_MS, ProfileHistoryQuery, ProfileResolution};
@@ -171,12 +171,7 @@ pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
       print(&store.history(&query)?)
     }
     SystemSubcommand::Publish { client_config } => {
-      let config = GlobalConfig::load(&paths.config_file())?;
-      let client_config = config.client_config(client_config).ok_or_else(|| {
-        ExpriError::Message(
-          "publishing requires --client-config or system_profile.publish.client_config".into(),
-        )
-      })?;
+      let client_config = publishing_config(&paths, client_config)?;
       let database = paths.profile_database();
       if !database.exists() {
         return Err(ExpriError::Message(
@@ -190,6 +185,19 @@ pub fn run(command: SystemCommand, target: Option<&str>) -> Result<()> {
       print(&json!({"published": acknowledgement.is_some(), "acknowledgement": acknowledgement}))
     }
   }
+}
+
+// An explicit publishing request may use [server]. Continuous collection still
+// enables its publisher only through an explicit or saved profile publishing setting.
+fn publishing_config(paths: &StoragePaths, explicit: Option<PathBuf>) -> Result<PathBuf> {
+  if let Some(explicit) = explicit {
+    return resolve_client_config(Some(&explicit));
+  }
+  let config = GlobalConfig::load(&paths.config_file())?;
+  let selected = config
+    .client_config(None)
+    .unwrap_or_else(|| paths.config_file());
+  resolve_client_config(Some(&selected))
 }
 
 fn status(paths: &StoragePaths) -> Result<()> {
@@ -220,10 +228,11 @@ pub struct ServiceSystemCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSystemSubcommand {
-  /// List system-profile machines using an owner service client.
+  /// List system-profile machines visible to the configured server credentials.
   List {
+    /// Override the global [server] connection with a standalone client file.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=100))]
     limit: u32,
     #[arg(long)]
@@ -231,16 +240,18 @@ enum ServiceSystemSubcommand {
   },
   /// Inspect a current or historical machine inventory.
   Profile {
+    /// Override the global [server] connection with a standalone client file.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     machine_id: String,
     #[arg(long)]
     inventory_revision: Option<u64>,
   },
   /// Read retained machine details or permanent hourly history.
   History {
+    /// Override the global [server] connection with a standalone client file.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
     machine_id: String,
     #[command(flatten)]
     options: HistoryArgs,
@@ -254,7 +265,7 @@ pub fn run_service(command: ServiceSystemCommand) -> Result<()> {
       limit,
       cursor,
     } => {
-      let client = SystemProfileClient::new(&config)?;
+      let client = SystemProfileClient::new(&resolve_client_config(config.as_deref())?)?;
       let (machines, next_cursor) = client.machines(limit as usize, cursor.as_deref())?;
       print(&json!({"machines": machines, "next_cursor": next_cursor}))
     }
@@ -262,12 +273,18 @@ pub fn run_service(command: ServiceSystemCommand) -> Result<()> {
       config,
       machine_id,
       inventory_revision,
-    } => print(&SystemProfileClient::new(&config)?.machine(&machine_id, inventory_revision)?),
+    } => print(
+      &SystemProfileClient::new(&resolve_client_config(config.as_deref())?)?
+        .machine(&machine_id, inventory_revision)?,
+    ),
     ServiceSystemSubcommand::History {
       config,
       machine_id,
       options,
-    } => print(&SystemProfileClient::new(&config)?.history(&options.query(machine_id)?)?),
+    } => print(
+      &SystemProfileClient::new(&resolve_client_config(config.as_deref())?)?
+        .history(&options.query(machine_id)?)?,
+    ),
   }
 }
 
@@ -295,7 +312,7 @@ mod tests {
         "system",
         "history",
         "--config",
-        "owner.toml",
+        "client.toml",
         "machine-1",
         "--resolution",
         "hourly",
@@ -314,6 +331,70 @@ mod tests {
         .to_string()
         .contains("current machine")
     );
+  }
+
+  #[test]
+  fn service_system_reads_accept_global_defaults_and_explicit_client_selection() {
+    #[derive(clap::Parser)]
+    struct SystemCli {
+      #[command(flatten)]
+      system: ServiceSystemCommand,
+    }
+    for operation in ["list", "profile", "history"] {
+      for explicit in [false, true] {
+        let mut args = vec!["expri", operation];
+        if operation != "list" {
+          args.push("machine-1");
+        }
+        if explicit {
+          args.extend(["--config", "client.toml"]);
+        }
+        let parsed = SystemCli::try_parse_from(args).unwrap();
+        let config = match parsed.system.command {
+          ServiceSystemSubcommand::List { config, .. }
+          | ServiceSystemSubcommand::Profile { config, .. }
+          | ServiceSystemSubcommand::History { config, .. } => config,
+        };
+        assert_eq!(config, explicit.then(|| PathBuf::from("client.toml")));
+      }
+    }
+  }
+
+  #[test]
+  fn requested_profile_publish_uses_selected_global_server_and_legacy_override() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let paths = StoragePaths::from_root(root.clone()).unwrap();
+    std::fs::write(
+      paths.config_file(),
+      "[server]\nurl='https://service.example.invalid'\ntoken='fixture-server-token'\n",
+    )
+    .unwrap();
+    assert_eq!(
+      publishing_config(&paths, None).unwrap(),
+      paths.config_file()
+    );
+
+    let standalone = root.join("machine.toml");
+    std::fs::write(
+      &standalone,
+      "url='https://service.example.invalid'\ntoken_env='EXPRI_MACHINE_TOKEN'\n",
+    )
+    .unwrap();
+    let global = format!(
+      "[system_profile.publish]\nclient_config={}\n",
+      toml::Value::String(standalone.to_string_lossy().into_owned())
+    );
+    std::fs::write(paths.config_file(), global).unwrap();
+    assert_eq!(publishing_config(&paths, None).unwrap(), standalone);
+
+    // Explicit client selection does not parse broken unrelated global settings.
+    std::fs::write(paths.config_file(), "invalid global settings").unwrap();
+    assert_eq!(
+      publishing_config(&paths, Some(standalone.clone())).unwrap(),
+      standalone
+    );
+    assert_eq!(std::fs::read_dir(root).unwrap().count(), 2);
   }
 
   #[test]

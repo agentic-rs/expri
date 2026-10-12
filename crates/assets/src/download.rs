@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -99,12 +98,6 @@ pub fn ensure(
   Ok(destination)
 }
 
-#[derive(Deserialize)]
-struct ClientEndpoint {
-  url: String,
-  project_id: Option<String>,
-}
-
 fn matching_client(client_config: Option<&Path>) -> Result<(PathBuf, String, String)> {
   let path = client_config.ok_or_else(|| {
     message("private assets require --client-config or the worker's service client config")
@@ -112,34 +105,17 @@ fn matching_client(client_config: Option<&Path>) -> Result<(PathBuf, String, Str
   // A user-selected read-only configuration can live behind a system alias
   // such as macOS /tmp. Managed transfer/cache paths remain symlink-free.
   let path = std::fs::canonicalize(path)?;
-  let mut bytes = Vec::new();
-  open(&path)?.take(32 * 1024 + 1).read_to_end(&mut bytes)?;
-  if bytes.len() > 32 * 1024 {
-    return Err(message("service client config exceeds its size limit"));
-  }
-  let text =
-    std::str::from_utf8(&bytes).map_err(|_| message("service client config must be UTF-8"))?;
-  // Do not include parser errors: configuration may contain credential material.
-  let config: ClientEndpoint =
-    toml::from_str(text).map_err(|_| message("cannot read service client endpoint"))?;
+  let config = crate::service::load_client_config(&path)?;
   let actual =
     reqwest::Url::parse(&config.url).map_err(|_| message("invalid service client endpoint"))?;
-  if !matches!(actual.scheme(), "http" | "https")
-    || actual.host_str().is_none()
-    || actual.path() != "/"
-    || !actual.username().is_empty()
-    || actual.password().is_some()
-    || actual.query().is_some()
-    || actual.fragment().is_some()
-  {
+  // Keep the origin/project transfer namespace distinct from service prefixes.
+  if actual.path() != "/" {
     return Err(message(
       "private asset client endpoint must be an HTTP(S) origin without credentials",
     ));
   }
   let project_id = config.project_id.ok_or_else(|| {
-    message(
-      "private assets require project_id in the ignored .expri/config.toml client configuration",
-    )
+    message("private assets require project_id in the selected client configuration")
   })?;
   crate::service::validate_component(&project_id)?;
   Ok((path, project_id, actual.origin().ascii_serialization()))

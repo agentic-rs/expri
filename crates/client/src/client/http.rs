@@ -5,13 +5,32 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
-use super::super::types::{ClientConfig, MAX_REQUEST, Request, Response};
-use super::fs::{self, message};
+use super::super::types::{ClientConfig, MAX_REQUEST, Request, Response, validate_client_token};
+use super::fs::message;
 use crate::error::{ExpriError, Result};
 
 /// Select the same process-wide provider used by the hosted S3 implementation.
 fn init_tls() {
   let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn resolve_token(
+  config: ClientConfig,
+  read_env: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
+) -> Result<String> {
+  let token = match (config.token, config.token_env) {
+    (Some(token), None) => token,
+    (None, Some(name)) => {
+      read_env(&name).map_err(|_| message("service token environment variable is missing"))?
+    }
+    _ => {
+      return Err(message(
+        "service client configuration requires exactly one of token or token_env",
+      ));
+    }
+  };
+  validate_client_token(&token)?;
+  Ok(token)
 }
 
 pub(super) struct Api {
@@ -33,26 +52,9 @@ impl Api {
 
   pub(super) fn new(path: &Path) -> Result<Self> {
     init_tls();
-    let config: ClientConfig = toml::from_str(
-      &String::from_utf8(fs::read_bounded(path, 32 * 1024)?)
-        .map_err(|_| message("service client config must be UTF-8"))?,
-    )?;
+    let config = crate::load_client_config(path)?;
     let url = reqwest::Url::parse(&config.url).map_err(|_| message("invalid service URL"))?;
-    if !matches!(url.scheme(), "http" | "https")
-      || !url.username().is_empty()
-      || url.password().is_some()
-      || url.query().is_some()
-      || url.fragment().is_some()
-    {
-      return Err(message(
-        "service URL must be HTTP(S) without embedded credentials, query or fragment",
-      ));
-    }
-    let token = std::env::var(&config.token_env)
-      .map_err(|_| message("service token environment variable is missing"))?;
-    if token.is_empty() || token.chars().any(char::is_control) {
-      return Err(message("service token environment variable is invalid"));
-    }
+    let token = resolve_token(config, |name| std::env::var(name))?;
     let build = |timeout| {
       Client::builder()
         .redirect(reqwest::redirect::Policy::none())

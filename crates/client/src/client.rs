@@ -1,3 +1,4 @@
+mod catalog;
 mod checkpoints;
 mod download;
 pub(super) mod fs;
@@ -26,6 +27,7 @@ use http::Api;
 use queue::{Queue, SavedFile};
 use upload::{sync_file, sync_stream};
 
+pub use catalog::ServiceCatalogClient;
 pub use download::{fetch, input_download, input_download_prepared};
 pub use system_profile::SystemProfileClient;
 pub use watch::fetch as fetch_files;

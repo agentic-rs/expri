@@ -32,6 +32,8 @@ enum SkillTopic {
   Assets,
   /// Prepare Python environments, check package reuse, and prune old environments.
   Environment,
+  /// Query published server runs and file availability with bounded JSON pages.
+  Query,
   /// Publish runs and fetch results through an existing self-hosted service.
   Service,
   /// Collect and publish machine system profiles with global detail/hourly history.
@@ -49,6 +51,7 @@ impl SkillTopic {
       Self::Artifacts => include_str!("skill/artifacts.md"),
       Self::Assets => include_str!("skill/assets.md"),
       Self::Environment => include_str!("skill/environment.md"),
+      Self::Query => include_str!("skill/query.md"),
       Self::Service => include_str!("skill/service.md"),
       Self::System => include_str!("skill/system.md"),
     }

@@ -4,6 +4,27 @@ Read the existing project configuration before adding tasks or selecting a
 worker. Most controller commands load `expri.toml` from the current directory;
 they do not search ancestor directories.
 
+## Global server connection
+
+Query and service client commands use `[server]` in `~/.tokn/expri/config.toml`:
+
+```toml
+[server]
+url = "https://expri.example.net"
+token = "your-server-token"
+```
+
+Run `expri config server set --url URL --token-stdin` with the token supplied
+through stdin. It writes private configuration atomically and preserves existing
+system-profile settings. `expri config server show` hides the token;
+`expri config server unset` removes only the connection. `EXPRI_STORAGE_DIR`
+overrides the global root; config commands also accept `--storage-dir`.
+
+Query and service client `--config PATH` overrides this default with another global config
+or a standalone connection file. Existing `token_env` files remain supported.
+`expri service serve --config PATH` selects the daemon's own server settings.
+Project controller `--config` still selects `expri.toml`, as described below.
+
 ## Paths and private targets
 
 - `--config /path/to/expri.toml` selects the config. Its parent directory is the

@@ -1,11 +1,8 @@
 //! Private repository context stays outside committed asset descriptors.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-use expri_core::service::ClientConfig;
 
 use super::{Source, assets, checkout_lease, git_ignored, message};
 use crate::error::Result;
@@ -85,32 +82,17 @@ pub(super) fn project_context(config: Option<&Path>) -> Result<(&Path, String)> 
     message("private assets require .expri/config.toml or --client-config with a project_id")
   })?;
   let canonical = fs::canonicalize(path)?;
-  let mut bytes = Vec::new();
-  assets::open(&canonical)?
-    .take(32 * 1024 + 1)
-    .read_to_end(&mut bytes)?;
-  if bytes.len() > 32 * 1024 {
-    return Err(message("service client config exceeds its size limit"));
-  }
-  let text =
-    std::str::from_utf8(&bytes).map_err(|_| message("service client config must be UTF-8"))?;
-  let config: ClientConfig =
-    toml::from_str(text).map_err(|_| message("service client configuration is invalid"))?;
+  let config = expri_client::load_client_config(&canonical)?;
   let endpoint = url::Url::parse(&config.url).map_err(|_| message("invalid client service URL"))?;
-  if !matches!(endpoint.scheme(), "http" | "https")
-    || endpoint.host_str().is_none()
-    || endpoint.path() != "/"
-    || !endpoint.username().is_empty()
-    || endpoint.password().is_some()
-    || endpoint.query().is_some()
-    || endpoint.fragment().is_some()
-  {
+  // Asset transfer namespaces identify the service by its origin, so a path
+  // prefix is not interchangeable with the root endpoint.
+  if endpoint.path() != "/" {
     return Err(message(
       "client service URL must be an HTTP(S) root without credentials or query parameters",
     ));
   }
   let project_id = config.project_id.ok_or_else(|| {
-    message("private assets require project_id in the local client configuration")
+    message("private assets require project_id in the selected client configuration")
   })?;
   expri_core::service::validate_component(&project_id)?;
   Ok((path, project_id))

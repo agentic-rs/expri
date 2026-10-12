@@ -409,19 +409,21 @@ fn unsafe_redirect_schemes_and_embedded_credentials_are_rejected() {
 fn missing_private_project_fails_before_credentials_or_network_are_used() {
   let (_temporary, repo) = fixture();
   let path = repo.join("client.toml");
-  std::fs::write(
-    &path,
-    "url = 'https://wrong.example'\ntoken_env = 'MISSING_TOKEN'\n",
-  )
-  .unwrap();
   let source = Source::Expri {
     input_id: "input".into(),
   };
-  let error = resolve(&repo, &source, Some(&path), &mut || Ok(false))
-    .unwrap_err()
-    .to_string();
-  assert!(error.contains("project_id"));
-  assert!(!error.contains("MISSING_TOKEN"));
+  for contents in [
+    "url = 'https://wrong.example'\ntoken_env = 'MISSING_TOKEN'\n",
+    "[server]\nurl='https://wrong.example'\ntoken='stored-asset-download-test-token'\n",
+  ] {
+    std::fs::write(&path, contents).unwrap();
+    let error = resolve(&repo, &source, Some(&path), &mut || Ok(false))
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("project_id"));
+    assert!(!error.contains("MISSING_TOKEN"));
+    assert!(!error.contains("stored-asset-download-test-token"));
+  }
   let expected = descriptor(source, b"private bytes");
   let cache = cache_file(&repo, &expected.sha256);
   directories(cache.parent().unwrap()).unwrap();
@@ -430,6 +432,30 @@ fn missing_private_project_fails_before_credentials_or_network_are_used() {
     ensure(&repo, &expected, None, &mut || Ok(false)).unwrap(),
     cache
   );
+}
+
+#[test]
+fn matching_private_client_accepts_both_config_formats_without_resolving_environment_tokens() {
+  let (_temporary, repo) = fixture();
+  let config = repo.join("config.toml");
+  for contents in [
+    "url='https://private.example.net'\nproject_id='example-project'\ntoken_env='EXPRI_ASSET_TEST_MISSING_ENV_947AD'\n",
+    "[system_profile]\ninterval_seconds=10\n[server]\nurl='https://private.example.net'\nproject_id='example-project'\ntoken='stored-asset-download-test-token'\n",
+    "[server]\nurl='https://private.example.net'\nproject_id='example-project'\ntoken_env='EXPRI_ASSET_TEST_MISSING_ENV_947AD'\n",
+  ] {
+    std::fs::write(&config, contents).unwrap();
+    assert_eq!(
+      matching_client(Some(&config)).unwrap(),
+      (
+        config.clone(),
+        "example-project".into(),
+        "https://private.example.net".into()
+      )
+    );
+  }
+  std::fs::write(&config, "[server]\nurl='https://private.example.net/prefix/'\nproject_id='example-project'\ntoken='stored-asset-download-test-token'\n").unwrap();
+  assert!(matching_client(Some(&config)).is_err());
+  assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 1);
 }
 
 #[cfg(unix)]
@@ -461,11 +487,11 @@ fn registered_private_input_uses_existing_service_transfer_and_only_keeps_one_fu
   let (_temporary, repo) = fixture();
   let mut mock = Mock::start(private_steps(b"private v1"));
   let config = repo.join("client.toml");
-  // Use the same harmless, already-present test token convention as service tests.
+  // An explicitly selected global file uses its stored token end to end.
   std::fs::write(
     &config,
     format!(
-      "url={:?}\ntoken_env='PATH'\nproject_id='example-project'\n",
+      "[server]\nurl={:?}\ntoken='stored-asset-download-test-token'\nproject_id='example-project'\n",
       mock.url
     ),
   )
@@ -475,16 +501,15 @@ fn registered_private_input_uses_existing_service_transfer_and_only_keeps_one_fu
   };
   let actual = resolve(&repo, &source, Some(&config), &mut || Ok(false)).unwrap();
   assert_eq!(actual, descriptor(source.clone(), b"private v1"));
-  mock.finish();
+  let requests = mock.finish();
+  assert!(requests[0].contains("authorization: Bearer stored-asset-download-test-token"));
   let staging =
     transfer_directory_scoped(&repo, &source, None, Some((&mock.url, "example-project"))).unwrap();
   assert!(!staging.join("file").exists());
   let record = staging.join(".expri-input-downloads/file/input-record.json");
-  assert!(
-    !std::fs::read_to_string(record)
-      .unwrap()
-      .contains("temporary-private-secret")
-  );
+  let receipt = std::fs::read_to_string(record).unwrap();
+  assert!(!receipt.contains("temporary-private-secret"));
+  assert!(!receipt.contains("stored-asset-download-test-token"));
   assert_eq!(
     std::fs::read(ensure(&repo, &actual, None, &mut || Ok(false)).unwrap()).unwrap(),
     b"private v1"

@@ -297,6 +297,28 @@ fn authorize_role<S: ObjectStorage>(
   }
 }
 
+fn narrow_worker_catalog(role: &Role<'_>, request: &mut Request) -> ApiResult<()> {
+  if let (Role::Worker(worker), Request::BrowseRuns { query }) = (role, request) {
+    if query
+      .project_id
+      .as_deref()
+      .is_some_and(|project| project != worker.project_id)
+      || query
+        .origin
+        .as_deref()
+        .is_some_and(|origin| origin != worker.origin)
+    {
+      return Err(ApiError::new(
+        403,
+        "worker token is outside this project or origin",
+      ));
+    }
+    query.project_id = Some(worker.project_id.clone());
+    query.origin = Some(worker.origin.clone());
+  }
+  Ok(())
+}
+
 fn authorize<S: ObjectStorage>(
   store: &Store<S>,
   worker: Option<&WorkerAuth>,
@@ -327,6 +349,13 @@ fn authorize<S: ObjectStorage>(
     return Ok(());
   };
   let allowed = match request {
+    Request::BrowseRuns { query } => {
+      query.project_id.as_deref() == Some(worker.project_id.as_str())
+        && query.origin.as_deref() == Some(worker.origin.as_str())
+    }
+    Request::BrowseRunFiles { query } => {
+      worker.project_id == query.scope.project_id && worker.origin == query.scope.origin
+    }
     Request::BeginUpload { target, .. } => allowed_target(worker, target, false),
     Request::PartUrl { upload_id, .. }
     | Request::RecordPart { upload_id, .. }
@@ -676,8 +705,9 @@ fn route<S: ObjectStorage>(
       "service requests require application/json",
     ));
   }
-  let operation: Request = serde_json::from_slice(request.body())
+  let mut operation: Request = serde_json::from_slice(request.body())
     .map_err(|_| ApiError::new(400, "invalid service request"))?;
+  narrow_worker_catalog(&role, &mut operation)?;
   authorize_role(store, role, &operation)?;
   let response = store.execute(operation)?;
   let mut body = LimitedBytes(Vec::new());
@@ -954,6 +984,148 @@ mod tests {
   }
 
   #[test]
+  fn catalog_owner_discovery_and_worker_defaults_preserve_scope_boundaries() {
+    use base64::Engine;
+    use expri_core::service_catalog::{
+      RunArchiveFilter, RunFilesQuery, RunListQuery, SERVICE_CATALOG_CAPABILITY, encode_run_cursor,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let own = scope();
+    let other_project = RunScope {
+      project_id: "other-project".into(),
+      ..own.clone()
+    };
+    let other_origin = RunScope {
+      origin: "other-worker".into(),
+      ..own.clone()
+    };
+    for published in [&own, &other_project, &other_origin] {
+      store
+        .execute(Request::AppendTracking {
+          scope: published.clone(),
+          path: "logs/stdout.log".into(),
+          offset: 0,
+          data_base64: base64::engine::general_purpose::STANDARD.encode(b"started\n"),
+        })
+        .unwrap();
+    }
+    let selected = RunListQuery {
+      project_id: None,
+      origin: None,
+      archival: RunArchiveFilter::Active,
+      limit: 100,
+      cursor: None,
+    };
+    let browse = Request::BrowseRuns {
+      query: selected.clone(),
+    };
+    let owner = "owner-token-with-at-least-24-characters";
+    let worker = "worker-token-with-at-least-24-characters";
+    let Response::Capabilities { features } = serde_json::from_slice(
+      &route(&store, &auth, request(Some(owner), &Request::Capabilities)).unwrap(),
+    )
+    .unwrap() else {
+      panic!("expected capabilities")
+    };
+    assert!(
+      features
+        .iter()
+        .any(|feature| feature == SERVICE_CATALOG_CAPABILITY)
+    );
+    let Response::RunPage { page } =
+      serde_json::from_slice(&route(&store, &auth, request(Some(owner), &browse)).unwrap())
+        .unwrap()
+    else {
+      panic!("expected run page")
+    };
+    assert_eq!(page.runs.len(), 3);
+    let Response::RunPage { page } =
+      serde_json::from_slice(&route(&store, &auth, request(Some(worker), &browse)).unwrap())
+        .unwrap()
+    else {
+      panic!("expected run page")
+    };
+    assert_eq!(page.runs.len(), 1);
+    assert_eq!(page.runs[0].scope, own);
+
+    for (project_id, origin) in [
+      (Some(other_project.project_id.clone()), None),
+      (None, Some(other_origin.origin.clone())),
+    ] {
+      let operation = Request::BrowseRuns {
+        query: RunListQuery {
+          project_id,
+          origin,
+          ..selected.clone()
+        },
+      };
+      assert_eq!(
+        route(&store, &auth, request(Some(worker), &operation))
+          .unwrap_err()
+          .status,
+        403
+      );
+    }
+    let operation = Request::BrowseRuns {
+      query: RunListQuery {
+        cursor: Some(encode_run_cursor(&other_project).unwrap()),
+        ..selected.clone()
+      },
+    };
+    assert_eq!(
+      route(&store, &auth, request(Some(worker), &operation))
+        .unwrap_err()
+        .status,
+      400
+    );
+    let operation = Request::BrowseRuns {
+      query: RunListQuery {
+        project_id: Some(own.project_id.clone()),
+        origin: Some(own.origin.clone()),
+        ..selected
+      },
+    };
+    assert!(route(&store, &auth, request(Some(worker), &operation)).is_ok());
+
+    for published in [&own, &other_project, &other_origin] {
+      let operation = Request::BrowseRunFiles {
+        query: RunFilesQuery {
+          scope: published.clone(),
+          prefix: Some("logs/".into()),
+          limit: 100,
+          cursor: None,
+        },
+      };
+      let result = route(&store, &auth, request(Some(worker), &operation));
+      if published == &own {
+        let Response::RunFilesPage { page } = serde_json::from_slice(&result.unwrap()).unwrap()
+        else {
+          panic!("expected files page")
+        };
+        assert_eq!(page.scope, own);
+        assert_eq!(page.files.len(), 1);
+        assert_eq!(page.files[0].path, "logs/stdout.log");
+      } else {
+        assert_eq!(result.unwrap_err().status, 403);
+      }
+      assert!(route(&store, &auth, request(Some(owner), &operation)).is_ok());
+    }
+    assert_eq!(
+      route(
+        &store,
+        &auth,
+        request(Some(worker), &Request::RunAnnotations { scope: own })
+      )
+      .unwrap_err()
+      .status,
+      403
+    );
+  }
+
+  #[test]
   fn machine_tokens_publish_and_read_only_their_profile_without_worker_or_browser_access() {
     use expri_core::system_profile::{
       CpuInventory, InventoryRevision, PROFILE_SCHEMA_VERSION, ProfileBatch, ProfileHistoryQuery,
@@ -1086,6 +1258,23 @@ mod tests {
       Request::ListRuns {
         project_id: "project".into(),
         origin: "worker".into(),
+      },
+      Request::BrowseRuns {
+        query: expri_core::service_catalog::RunListQuery {
+          project_id: None,
+          origin: None,
+          archival: expri_core::service_catalog::RunArchiveFilter::Active,
+          limit: 100,
+          cursor: None,
+        },
+      },
+      Request::BrowseRunFiles {
+        query: expri_core::service_catalog::RunFilesQuery {
+          scope: scope(),
+          prefix: None,
+          limit: 100,
+          cursor: None,
+        },
       },
     ] {
       assert_eq!(

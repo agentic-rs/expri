@@ -1,6 +1,7 @@
 mod artifacts_cli;
 mod assets_cli;
 mod config;
+mod config_cli;
 mod context;
 mod controller;
 mod dashboard;
@@ -9,6 +10,7 @@ mod fetch_cli;
 mod metrics_cli;
 mod node;
 mod push_cli;
+mod query_cli;
 mod runs;
 mod runs_cli;
 mod service;
@@ -56,6 +58,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+  /// Configure machine-wide expri settings and the default server connection.
+  Config(config_cli::ConfigCommand),
+  /// Query published runs and files using the configured server connection.
+  Query(query_cli::QueryCommand),
   /// Print progressive agent guidance, with deeper instructions by topic.
   Skill(skill_cli::SkillCommand),
   /// Collect and inspect machine system profiles in global expri storage.
@@ -257,6 +263,8 @@ fn main() {
 fn run() -> Result<()> {
   let cli = Cli::parse();
   match cli.command {
+    Command::Config(command) => config_cli::run(command, cli.target.as_deref()),
+    Command::Query(command) => query_cli::run(command, cli.target.as_deref()),
     Command::Skill(command) => skill_cli::run(command),
     Command::System(command) => system_cli::run(command, cli.target.as_deref()),
     Command::Assets(command) => assets_cli::run(command, cli.target.as_deref(), cli.quiet),
