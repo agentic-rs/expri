@@ -23,6 +23,16 @@ pub(super) fn run(
   let _lease = collector_lease(&paths)?;
   let mut store = LocalStore::open(&paths.profile_database())?;
   let mut collector = Collector::with_interval(interval)?;
+  let capture_paths = paths.clone();
+  if thread::Builder::new()
+    .name("expri-run-capture-exporter".into())
+    .spawn(move || materialize_loop(capture_paths))
+    .is_err()
+  {
+    eprintln!(
+      "warning: run capture exporter could not start; observations remain in the durable outbox for recovery"
+    );
+  }
   eprintln!(
     "System profile: {} (every {}s, {})",
     store.machine_id(),
@@ -55,6 +65,22 @@ pub(super) fn run(
       deadline = now + interval;
     }
     thread::sleep(deadline.saturating_duration_since(Instant::now()));
+  }
+}
+
+fn materialize_loop(paths: StoragePaths) {
+  loop {
+    if let Ok(Some(mut store)) = LocalStore::open_existing(&paths.profile_database()) {
+      loop {
+        // Output files can be slow or temporarily unavailable. Their durable
+        // outbox is independent of the thread collecting machine observations.
+        if store.export_run_captures().is_err() {
+          break;
+        }
+        thread::sleep(Duration::from_millis(250));
+      }
+    }
+    thread::sleep(Duration::from_secs(1));
   }
 }
 

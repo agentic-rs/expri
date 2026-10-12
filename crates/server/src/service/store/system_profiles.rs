@@ -31,7 +31,7 @@ impl<S: ObjectStorage> Store<S> {
     profiles::ingest(&mut *self.db()?, batch, now_ms()).map_err(profile_error)
   }
 
-  pub(super) fn list_system_machines(
+  pub(in crate::service) fn list_system_machines(
     &self,
     limit: usize,
     cursor: Option<&str>,
@@ -48,7 +48,7 @@ impl<S: ObjectStorage> Store<S> {
     profiles::list_machines(&*self.db()?, limit, cursor).map_err(profile_error)
   }
 
-  pub(super) fn system_machine(
+  pub(in crate::service) fn system_machine(
     &self,
     machine_id: &str,
     inventory_revision: Option<u64>,
@@ -62,7 +62,10 @@ impl<S: ObjectStorage> Store<S> {
       .ok_or_else(|| ApiError::new(404, "system machine or inventory revision is missing"))
   }
 
-  pub(super) fn system_history(&self, query: &ProfileHistoryQuery) -> ApiResult<ProfileHistory> {
+  pub(in crate::service) fn system_history(
+    &self,
+    query: &ProfileHistoryQuery,
+  ) -> ApiResult<ProfileHistory> {
     self.system_history_at(query, now_ms())
   }
 

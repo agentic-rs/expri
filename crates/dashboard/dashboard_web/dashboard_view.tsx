@@ -20,6 +20,10 @@ import {
   runSortLabel,
 } from "./run_table";
 import type { ChartAxis, ChartTimeZone } from "./interactive_charts";
+import type { SystemMonitorSnapshot } from "./system_monitor";
+import { SystemMonitorPage, type SystemMonitorActions } from "./system_monitor_view";
+import type { RunSystemSnapshot } from "./run_system";
+import { RunSystemPanel, type RunSystemActions } from "./run_system_view";
 import {
   apiUrl,
   dateText,
@@ -45,6 +49,7 @@ import {
   type RunSort,
   type Source,
   type Warning,
+  type WorkspaceView,
 } from "./dashboard_model";
 
 export type EmptyRuns = { title: string; message: string; setup: boolean };
@@ -116,7 +121,12 @@ export type DashboardSnapshot = DashboardUi & {
   comparison: Comparison | null;
   artifacts: ArtifactCatalog | null;
   selected_files: string[];
-  workspace_view: "workspace" | "storage";
+  workspace_view: WorkspaceView;
+  system_monitor: SystemMonitorSnapshot;
+  run_system: RunSystemSnapshot;
+  run_system_supported: boolean;
+  system_run_aligned: boolean;
+  system_now: number;
   storage_kind: StorageKind;
   storage_offset: number;
   storage_catalog: StorageCatalog | null;
@@ -159,7 +169,10 @@ export type DashboardActions = {
   select_file: (path: string, checked: boolean) => void;
   clear_files: () => void;
   refresh_files: () => void;
-  workspace_view: (view: "workspace" | "storage") => void;
+  workspace_view: (view: WorkspaceView) => void;
+  system_monitor: SystemMonitorActions;
+  run_system: RunSystemActions;
+  system_alignment: (aligned: boolean) => void;
   storage_kind: (kind: StorageKind) => void;
   storage_search: (search: string) => void;
   storage_previous: () => void;
@@ -719,9 +732,8 @@ function RunBrowser({
                       disabled={s.list_busy}
                       title={runLabel(run)}
                       onClick={() => {
-                        if (s.workspace_view !== "workspace") a.workspace_view("workspace");
                         a.inspect_run(identity);
-                        revealOnCompactLayout("review-title");
+                        revealOnCompactLayout(s.workspace_view === "system" && s.system_run_aligned ? "system-heading" : "review-title");
                       }}
                     >
                       {runNickname(run) ?? run.run_id}
@@ -1166,8 +1178,10 @@ function ReviewWorkspace({
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
 }) {
-  const tabs: ReviewTab[] = ["charts", "overview", "logs", "files"];
-  const available: ReviewTab[] = s.review?.kind === "compare" ? ["charts"] : tabs;
+  const tabs: ReviewTab[] = ["charts", "system", "overview", "logs", "files"];
+  const available: ReviewTab[] = s.review?.kind === "compare"
+    ? s.run_system_supported ? ["charts", "system"] : ["charts"]
+    : tabs.filter(tab => tab !== "system" || s.run_system_supported);
   const review_run = s.review?.kind === "run" ? (
     s.detail && runIdentity(s.detail.run) === s.review.run_ids[0] ? s.detail.run :
       s.runs.find((run) => runIdentity(run) === s.review?.run_ids[0])
@@ -1232,8 +1246,7 @@ function ReviewWorkspace({
               onClick={() => a.tab(tab)}
               onKeyDown={(event) => moveTab(event, tab, available, a.tab, "review-tab-")}
             >
-              <Icon name={tab} />{tab[0]?.toUpperCase()}
-              {tab.slice(1)}
+              <Icon name={tab} />{tab === "system" ? "System metrics" : `${tab[0]?.toUpperCase()}${tab.slice(1)}`}
             </button>
           ))}
         </div>
@@ -1367,6 +1380,14 @@ function ReviewWorkspace({
           </section>
         </div>
         <div
+          id="review-panel-system"
+          role="tabpanel"
+          aria-labelledby="review-tab-system"
+          hidden={s.review?.tab !== "system"}
+        >
+          <RunSystemPanel scope_id="inspector" state={s.run_system} actions={a.run_system} runs={[...s.runs, ...(s.detail ? [s.detail.run] : []), ...(s.comparison?.comparison.runs.map(row => row.run) ?? [])]} time_zone={s.time_zone} now={s.system_now} />
+        </div>
+        <div
           id="review-panel-overview"
           role="tabpanel"
           aria-labelledby="review-tab-overview"
@@ -1451,7 +1472,7 @@ function WorkspaceNavigation({ snapshot: s, actions, storage_enabled }: {
   actions: DashboardActions;
   storage_enabled: boolean;
 }) {
-  const views: ("workspace" | "storage")[] = storage_enabled ? ["workspace", "storage"] : ["workspace"];
+  const views: WorkspaceView[] = storage_enabled ? ["workspace", "system", "storage"] : ["workspace", "system"];
   return (
     <nav aria-label="Workspace navigation">
       <fieldset id="workspace-view-options" className="workspace-navigation">
@@ -1465,9 +1486,16 @@ function WorkspaceNavigation({ snapshot: s, actions, storage_enabled }: {
               id={`workspace-view-${view}`}
               value={view}
               checked={s.workspace_view === view}
-              onChange={() => actions.workspace_view(view)}
+              onChange={(event) => {
+                actions.workspace_view(view);
+                // Pointer navigation reveals the stacked page. Keyboard radio
+                // changes retain focus so arrow keys can continue through pages.
+                const native = event.nativeEvent;
+                if ("detail" in native && typeof native.detail === "number" && native.detail > 0)
+                  revealOnCompactLayout(view === "system" ? "system-heading" : view === "storage" ? "storage-heading" : s.review ? "review-title" : "runs-heading");
+              }}
             />
-            <span><Icon name={view === "workspace" ? "runs" : "storage"} />{view === "workspace" ? "Runs" : "Storage"}</span>
+            <span><Icon name={view === "workspace" ? "runs" : view === "system" ? "system" : "storage"} />{view === "workspace" ? "Runs" : view === "system" ? "System" : "Storage"}</span>
           </label>
         ))}
       </fieldset>
@@ -1543,12 +1571,26 @@ export function DashboardView({ store, actions }: {
               auto_enabled={s.auto_enabled}
               on_project_removed={actions.refresh}
             />
-            <div id="run-workspace" hidden={storage_visible}>
+            <div id="run-workspace" hidden={s.workspace_view !== "workspace"}>
               <ReviewWorkspace snapshot={s} actions={actions} />
+            </div>
+            <div id="system-workspace" hidden={s.workspace_view !== "system"}>
+              <div className="workspace-heading"><div><h1 id="system-heading" tabIndex={-1}>System monitor</h1><p className="muted">Whole-machine readings, recorded independently of runs.</p></div></div>
+              {s.run_system_supported && s.review?.kind === "run" && <RadioTags
+                name="system_context" legend="Period scope" value={s.system_run_aligned ? "run" : "machine"}
+                options={[{ id: "system-context-run", value: "run", label: "Run period" }, { id: "system-context-machine", value: "machine", label: "All machines" }]}
+                on_change={value => actions.system_alignment(value === "run")}
+              />}
+              <div id="system-run-context" hidden={!s.system_run_aligned}>
+                <RunSystemPanel scope_id="workspace" state={s.run_system} actions={actions.run_system} runs={[...s.runs, ...(s.detail ? [s.detail.run] : [])]} time_zone={s.time_zone} now={s.system_now} />
+              </div>
+              <div id="system-machine-context" hidden={s.system_run_aligned}>
+                <SystemMonitorPage state={s.system_monitor} actions={actions.system_monitor} time_zone={s.time_zone} access_mode={s.access_mode} show_heading={false} />
+              </div>
             </div>
             <div id="storage-workspace" hidden={!storage_visible}>
               <div className="workspace-heading storage-heading">
-                <h1 id="storage-heading">Storage</h1>
+                <h1 id="storage-heading" tabIndex={-1}>Storage</h1>
               </div>
               {project_id && (
                 <StoragePanel

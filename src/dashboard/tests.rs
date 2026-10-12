@@ -662,7 +662,7 @@ fn update_probes_read_only_bounded_output_metadata_and_never_parse_contents() {
     removed["runs"][0],
     json!({
       "run_id":"run-a", "metadata_revision":null,"metrics_revision":null,
-      "stdout_revision":null,"stderr_revision":null,"missing":true,
+      "system_revision":null,"stdout_revision":null,"stderr_revision":null,"missing":true,
     })
   );
 }

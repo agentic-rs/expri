@@ -12,6 +12,7 @@ expri-core.workspace = true
 expri-runs.workspace = true
 expri-client.workspace = true
 expri-assets.workspace = true
+expri-system.workspace = true
 chrono.workspace = true
 libc.workspace = true
 serde.workspace = true

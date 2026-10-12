@@ -11,6 +11,7 @@ use crate::service::storage::{CompletedPart, ObjectMetadata};
 use crate::service::types::{Request, Response as ApiResponse};
 
 mod projects;
+mod system_profiles;
 
 #[test]
 fn run_previews_keep_complete_bounded_editor_values_when_metadata_is_truncated() {
@@ -916,6 +917,69 @@ fn hosted_update_probes_skip_storage_reads_and_separate_changed_resources() {
     .unwrap();
   assert_eq!(identifier["runs"][0]["missing"], false);
   assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+}
+
+#[test]
+fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest() {
+  let fixture = Fixture::new();
+  let scope = Fixture::scope("run-machine");
+  let state = json!({
+    "schema_version": 1, "run_id": scope.run_id, "machine_id": "machine-physical",
+    "task": "train", "status": "running", "started_at": "2026-10-03T01:00:00Z",
+  });
+  fixture.run_file(
+    &scope.run_id,
+    "run-state.json",
+    serde_json::to_vec(&state).unwrap(),
+  );
+  let record = fixture
+    .store
+    .dashboard_artifact(&scope, "run-state.json")
+    .unwrap()
+    .unwrap();
+  let version = record.sha256.clone().unwrap();
+  fixture.store.dashboard_cache_overview(&scope, &version, &json!({
+    "overview_schema": 1,
+    "run": {"run_id": scope.run_id, "task": "train", "status": "running", "started_at": state["started_at"]},
+    "task_filter": "train", "metadata_truncated": false, "warnings": [],
+  })).unwrap();
+  assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let rows = dashboard
+    .list("hosted:project:worker", None, None, None, 20, 0)
+    .unwrap();
+  assert_eq!(rows["runs"][0]["machine_id"], "machine-physical");
+  assert_eq!(
+    fixture.backend.objects.lock().unwrap().requests.len(),
+    1,
+    "old normalized schema requires a fresh state parse"
+  );
+  let cached = fixture
+    .store
+    .dashboard_cached_overview(&scope, &version)
+    .unwrap()
+    .unwrap();
+  assert_eq!(cached["overview_schema"], OVERVIEW_SCHEMA_VERSION);
+  assert_eq!(cached["run"]["machine_id"], "machine-physical");
+  assert_eq!(
+    fixture
+      .store
+      .dashboard_artifact(&scope, "run-state.json")
+      .unwrap()
+      .unwrap()
+      .sha256,
+    record.sha256,
+    "parser upgrade does not require worker republication"
+  );
+  let repeated = dashboard
+    .list("hosted:project:worker", None, None, None, 20, 0)
+    .unwrap();
+  assert_eq!(repeated["runs"][0]["machine_id"], "machine-physical");
+  assert_eq!(
+    fixture.backend.objects.lock().unwrap().requests.len(),
+    1,
+    "new normalized schema is reused for the same artifact version"
+  );
 }
 
 #[test]

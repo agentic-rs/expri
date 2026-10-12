@@ -519,6 +519,7 @@ dependencies = [
 name = "expri"
 version = "0.1.5"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "clap",
  "expri-assets",
@@ -529,6 +530,7 @@ dependencies = [
  "expri-server",
  "expri-system",
  "expri-worker",
+ "flate2",
  "serde",
  "serde_json",
  "tempfile",
@@ -560,6 +562,7 @@ dependencies = [
  "chrono",
  "expri-core",
  "expri-runs",
+ "expri-system",
  "libc",
  "reqwest",
  "rustls",
@@ -666,6 +669,7 @@ dependencies = [
  "expri-client",
  "expri-core",
  "expri-runs",
+ "expri-system",
  "libc",
  "serde",
  "serde_json",
@@ -704,6 +708,7 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
+ "crc32fast",
  "miniz_oxide",
  "zlib-rs",
 ]

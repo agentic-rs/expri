@@ -1262,7 +1262,7 @@ fn unverified_empty_shared_stage_is_detached_without_touching_the_cache() {
 fn finalized_stream_objects_refresh_instead_of_claiming_resumed_bytes() {
   let (_temporary, root) = root();
   let bytes = b"line\n";
-  let (url, task) = mock(12, |request, origin| {
+  let (url, task) = mock(STREAMS.len() * 4, |request, origin| {
     if request.path == "/v1/request" {
       assert!(matches!(
         serde_json::from_slice::<Request>(&request.body).unwrap(),

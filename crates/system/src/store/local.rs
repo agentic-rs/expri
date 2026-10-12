@@ -115,6 +115,53 @@ impl LocalStore {
     Self::open_at(path, chrono::Utc::now().timestamp_millis())
   }
 
+  /// Open known local storage for capture registration without creating an
+  /// absent database or silently initializing an unrelated/malformed store.
+  pub fn open_existing(path: &Path) -> Result<Option<Self>> {
+    let Some(existing) = Self::open_readonly(path)? else {
+      return Ok(None);
+    };
+    sql(
+      existing
+        .connection
+        .prepare("SELECT sequence,inventory_revision FROM system_local WHERE singleton=1"),
+    )?;
+    sql(
+      existing
+        .connection
+        .prepare("SELECT sequence,observed_at_ms,payload FROM system_samples LIMIT 0"),
+    )?;
+    sql(
+      existing
+        .connection
+        .prepare("SELECT revision,payload FROM system_inventories LIMIT 0"),
+    )?;
+    let machine_id = existing.machine_id;
+    let connection = sql(Connection::open_with_flags(
+      path,
+      rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    ))?;
+    sql(connection.busy_timeout(Duration::from_secs(5)))?;
+    sql(connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;"))?;
+    run_capture::initialize(&connection)?;
+    let actual: String = sql(connection.query_row(
+      "SELECT machine_id FROM system_local WHERE singleton=1",
+      [],
+      |row| row.get(0),
+    ))?;
+    if actual != machine_id {
+      return Err(rejection(
+        409,
+        "local machine identity changed while opening capture storage",
+      ));
+    }
+    Ok(Some(Self {
+      connection,
+      machine_id,
+      retention_anchor: (chrono::Utc::now().timestamp_millis(), Instant::now()),
+    }))
+  }
+
   /// The startup wall clock is trusted. During this process, monotonic elapsed
   /// time bounds destructive retention even if the wall clock jumps forward.
   pub fn open_at(path: &Path, now_ms: i64) -> Result<Self> {
@@ -144,6 +191,7 @@ impl LocalStore {
     }
     let mut connection = sql(Connection::open(&path))?;
     initialize(&connection)?;
+    run_capture::initialize(&connection)?;
     // DELETE mode avoids persistent globally readable SHM files; rollback journals
     // inherit the database's 0600 mode. Readers and writers use bounded busy waits.
     sql(connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;"))?;
@@ -214,6 +262,7 @@ impl LocalStore {
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate),
     )?;
+    run_capture::check_support(&transaction, &self.machine_id)?;
     quarantine::repair_clock(&transaction, &self.machine_id, sample.observed_at_ms)?;
     let (sequence, current_revision): (u64, u64) = sql(transaction.query_row(
       "SELECT sequence,inventory_revision FROM system_local WHERE singleton=1",
@@ -269,6 +318,7 @@ impl LocalStore {
       "UPDATE system_local SET sequence=?1,inventory_revision=?2 WHERE singleton=1",
       params![integer(sample.sequence)?, integer(revision)?],
     ))?;
+    run_capture::record(&transaction, &self.machine_id, &sample)?;
     sql(transaction.commit())?;
     Ok(sample)
   }
@@ -324,7 +374,12 @@ impl LocalStore {
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate),
     )?;
+    run_capture::check_support(&transaction, &self.machine_id)?;
+    let supported: bool = sql(transaction.query_row("SELECT EXISTS(SELECT 1 FROM system_run_capture_support p JOIN system_local l ON l.singleton=p.singleton WHERE p.sequence=l.sequence)", [], |row| row.get(0)))?;
     quarantine::repair_clock(&transaction, &self.machine_id, now_ms)?;
+    if supported {
+      run_capture::update_support(&transaction)?;
+    }
     let removed = prune_transaction(&transaction, retention_now, PRUNE_BATCH)?;
     sql(transaction.commit())?;
     Ok(removed)

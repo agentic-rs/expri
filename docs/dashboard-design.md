@@ -6,14 +6,14 @@ and consistent controls across history, inspection, storage, files, logs, and lo
 
 ## Layout and navigation
 
-The header contains project or source selection, native Runs / Storage radio
+The header contains project or source selection, native Runs / System / Storage radio
 navigation, appearance, and session actions. The bottom status bar holds Refresh,
 Auto refresh, and freshness information. Small project catalogs use
 selectable tags; larger catalogs use a select. Header controls wrap on smaller
 screens without occupying a separate navigation rail.
 
 Full run history occupies a persistent left panel above 1000 CSS pixels, with
-inspection, comparison, or Storage in the remaining space. The panels have
+inspection, comparison, System, or Storage in the remaining space. The panels have
 independent vertical scrolling and keep pagination reachable at short viewport
 heights. Below that width, the panels stack. Explicit inspection and comparison
 move focus and the viewport
@@ -65,6 +65,32 @@ redesign preserves run identity, retention behavior, and editor drafts. Because
 history remains visible in Storage, storage update polling also refreshes history
 when its revision changes, with a bounded fallback for older servers. It does
 not fetch hidden inspection details, charts, or logs.
+
+## System monitoring
+
+System monitoring uses machine identities and history independently of projects
+and run selection. Inventory shows the last observation and last receipt
+separately. Small machine catalogs use native radio tags. Period, resolution,
+metric, and timezone controls share the dashboard's compact visual system.
+
+Detail plots preserve session changes, missing readings, and clock regressions
+as disconnected segments. Counter deltas become rates using their measured
+intervals. Hourly plots show coverage-weighted means or throughput, without
+treating uncovered time as zero. Device warnings and measurement scope remain
+visible; charts do not attribute whole-machine measurements to a process.
+
+The monitor has separate request lanes and bounded pagination. Selection and
+page changes cancel stale requests. Failed run-history requests do not prevent
+healthy monitor updates, and visiting System keeps the existing inspector,
+chart, and log nodes mounted. Unsupported servers show an unavailable state.
+
+Run system metrics have their own source and request lanes, so metric names cannot
+collide with user-recorded names. The inspector and comparison use captured raw
+readings with Run elapsed or Wall clock axes; they never manufacture training
+steps or change the existing first-metric elapsed axis. Full summaries are
+independent of the bounded chart preview. System's Run period mode reads the same
+retained run capture instead of the rolling machine history. Missing legacy
+captures, incomplete collection, and boundary-crossing intervals remain explicit.
 
 ## Verification
 

@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use super::types::*;
 use super::{InputUploadOptions, PublishOptions};
 use crate::error::Result;
+use expri_core::run_system::{RUN_SYSTEM_PATH, RunSystemRecord};
 use fs::message;
 use http::Api;
 use queue::{Queue, SavedFile};
@@ -43,8 +44,9 @@ const METADATA: [&str; 5] = [
   "outputs/params.json",
   "run-state.json",
 ];
-const STREAMS: [&str; 3] = [
+const STREAMS: [&str; 4] = [
   "outputs/metrics.jsonl",
+  RUN_SYSTEM_PATH,
   "logs/stdout.log",
   "logs/stderr.log",
 ];
@@ -166,6 +168,7 @@ impl Publisher {
       "files": files,
       "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
       "protocol": self.queue.state.protocol,
+      "system_capture_upload": system_upload_report(&self.queue),
       "result_upload": upload_report(json!(self.queue.state.archive)),
     })
   }
@@ -337,6 +340,30 @@ fn publish_cycle(
     return Err(message("run snapshot metadata is missing"));
   }
   let protocol = tracking::negotiate(api, queue)?;
+  let mut capture_failure = None;
+  let capture = match system_capture_owned(run_dir, &state) {
+    Ok(capture) => capture,
+    Err(error) => {
+      capture_failure = Some(error);
+      false
+    }
+  };
+  let capture_ready = state["system_capture_status"] != "capturing";
+  let capture_supported = if capture {
+    match tracking::system_supported(api, queue) {
+      Ok(supported) => supported,
+      Err(error) => {
+        capture_failure = Some(error);
+        false
+      }
+    }
+  } else {
+    false
+  };
+  if state["system_capture_id"].is_string() && !queue.state.run_system_capture {
+    queue.state.run_system_capture = true;
+    queue.save()?;
+  }
   for path in METADATA
     .iter()
     .filter(|path| **path != "run-state.json" && **path != crate::run_artifacts::INVENTORY_PATH)
@@ -348,6 +375,27 @@ fn publish_cycle(
     }
   }
   for path in STREAMS {
+    if path == RUN_SYSTEM_PATH {
+      if capture && capture_supported {
+        let result = (|| {
+          let prefix = expri_system::store::run_capture::committed_prefix(run_dir, &state)?;
+          upload::sync_stream_up_to(
+            api,
+            queue,
+            scope,
+            path,
+            &run_dir.join(path),
+            done && capture_ready,
+            prefix,
+          )
+        })();
+        if let Err(error) = result {
+          capture_failure = Some(error);
+        }
+        progress(queue_progress(queue))?;
+      }
+      continue;
+    }
     let source = run_dir.join(path);
     if fs::inspect(&source)?.is_some() {
       if !queue
@@ -394,7 +442,17 @@ fn publish_cycle(
     sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
     progress(queue_progress(queue))?;
   }
+  // Capture retries keep their durable queue, while ordinary logs and task
+  // metadata above continue to reach the service in the same cycle.
+  if let Some(error) = capture_failure {
+    return Err(error);
+  }
   if done {
+    // The task can finish before the collector's last observation commits.
+    // Publish its terminal state now, but keep its capture open while draining.
+    if capture && !capture_ready {
+      return Ok(false);
+    }
     if !super::registrations::close_if_ready(run_dir, || inventory::record(run_dir))? {
       return Ok(false);
     }
@@ -408,6 +466,42 @@ fn publish_cycle(
     }
   }
   Ok(done)
+}
+
+fn system_capture_owned(run_dir: &Path, state: &Value) -> Result<bool> {
+  use std::io::{BufRead, BufReader, Read};
+  let Some(capture_id) = state["system_capture_id"].as_str() else {
+    return Ok(false);
+  };
+  validate_component(capture_id)?;
+  let file = fs::open(&run_dir.join(RUN_SYSTEM_PATH))?;
+  let mut reader = BufReader::new(file.take(1024 * 1024));
+  let mut header = String::new();
+  reader.read_line(&mut header)?;
+  let record: RunSystemRecord = serde_json::from_str(&header)?;
+  record.validate()?;
+  let RunSystemRecord::Capture {
+    capture_id: returned,
+    machine_id,
+    start_ms,
+    ..
+  } = record
+  else {
+    return Err(message("run system capture has no identity header"));
+  };
+  let started_at = state["started_at"]
+    .as_str()
+    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+    .map(|timestamp| timestamp.timestamp_millis());
+  if returned != capture_id
+    || state["machine_id"].as_str() != Some(machine_id.as_str())
+    || started_at != Some(start_ms)
+  {
+    return Err(message(
+      "run system capture belongs to another run or machine",
+    ));
+  }
+  Ok(true)
 }
 
 fn sync_metadata(
@@ -440,6 +534,30 @@ fn queue_progress(queue: &Queue) -> Value {
       + queue.state.documents.values().filter(|saved| saved.complete).count(),
     "stream_offsets": streams,
     "archive": queue.state.archive,
+    "system_capture_upload": system_upload_report(queue),
+  })
+}
+
+fn system_upload_report(queue: &Queue) -> Value {
+  if !queue.state.run_system_capture {
+    return Value::Null;
+  }
+  if queue.state.run_system_supported != Some(true)
+    || queue.state.protocol != Some(queue::Protocol::TrackingV1)
+  {
+    return json!({
+      "status": "unsupported", "retained_local": true,
+      "message": if queue.state.protocol == Some(queue::Protocol::Legacy) {
+        "This legacy publishing queue does not support run system captures; exact readings remain in the local run. Start new runs with the upgraded service."
+      } else {
+        "The service does not support run system captures; exact readings remain in the local run. Upgrade the service before starting new runs."
+      }
+    });
+  }
+  json!({
+    "status": if queue.state.archive.is_some() { "published" } else { "publishing" },
+    "retained_local": true,
+    "acknowledged_bytes": queue.state.streams.get(RUN_SYSTEM_PATH).copied().unwrap_or(0),
   })
 }
 

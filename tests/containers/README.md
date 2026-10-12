@@ -129,8 +129,10 @@ certificate through its test-only WebDriver configuration. `browser-forms.log` r
 without passwords, cookies or request bodies.
 
 After the worker uploads two runs, Firefox checks the workspace against those
-results: selecting runs updates charts, tabs support the keyboard, logs load on
-demand, Refresh preserves the comparison, and filters clear it. The suite checks
+results: selecting runs updates charts, tabs support the keyboard, and moving from
+Charts through System metrics to Overview preserves focus and loads run captures
+on demand. Logs load on demand, Refresh preserves the comparison, and filters
+clear it. The suite checks
 desktop columns at verified 1440, 1024, and 1001 CSS pixel viewports, stacking
 at 1000 CSS pixels, and overflow at 320, 360, and 500 CSS pixels, saving `workspace-desktop.png`,
 `workspace-narrow.png`, and
@@ -161,7 +163,7 @@ request returns 404. Only a fixture-controlled file enables that proxy behavior;
 authentication failures and other endpoints retain their upstream responses.
 
 Hosted Files data checks verify the registered checkpoint's cloud status and
-labels. The browser Files check opens the fourth tab with native keyboard input,
+labels. The browser Files check opens the last enabled tab with native keyboard input,
 selects the separate uploaded 17 MiB checkpoint, generates a scoped CLI command,
 and downloads the actual attachment through Firefox. It verifies its SHA256 and saves
 `workspace-files.png` and `workspace-files-narrow.png`. A test-only HTTPS object

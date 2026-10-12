@@ -11,6 +11,13 @@ use serde_json::Value;
 use crate::error::{ExpriError, Result};
 use crate::metric_charts::{ChartData, ChartXAxis};
 use crate::metrics::Reduction;
+use expri_core::system_profile::{MachineProfile, ProfileHistory, ProfileHistoryQuery};
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SystemMachines {
+  pub machines: Vec<MachineProfile>,
+  pub next_cursor: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Source {
@@ -23,6 +30,35 @@ pub struct Source {
 /// Shared dashboard views keep local and hosted routes on the same API contract.
 pub trait DashboardView {
   fn catalog(&self) -> Result<Value>;
+  fn run_system(
+    &self,
+    _source: &str,
+    run_id: &str,
+    _cursor: Option<u64>,
+    _limit: usize,
+  ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
+    Ok(expri_runs::system_metrics::RunSystemMetrics::unavailable(
+      run_id,
+      "Run system observations are unavailable for this dashboard.",
+    ))
+  }
+  fn system_machines(
+    &self,
+    _limit: usize,
+    _cursor: Option<&str>,
+  ) -> Result<Option<SystemMachines>> {
+    Ok(None)
+  }
+  fn system_profile(
+    &self,
+    _machine_id: &str,
+    _inventory_revision: Option<u64>,
+  ) -> Result<Option<MachineProfile>> {
+    Ok(None)
+  }
+  fn system_history(&self, _query: &ProfileHistoryQuery) -> Result<Option<ProfileHistory>> {
+    Ok(None)
+  }
   fn projects(&self) -> Result<Option<Value>> {
     Ok(None)
   }

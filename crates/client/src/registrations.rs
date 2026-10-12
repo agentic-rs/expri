@@ -161,7 +161,10 @@ fn load(run_dir: &Path) -> Result<Registry> {
 
 fn validate_path(path: &str) -> Result<()> {
   crate::run_artifacts::validate_path(path)?;
-  if path == "outputs/metrics.jsonl" || path == "outputs/params.json" {
+  if path == "outputs/metrics.jsonl"
+    || path == "outputs/params.json"
+    || path == expri_core::run_system::RUN_SYSTEM_PATH
+  {
     return Err(message(
       "tracking files cannot be registered as checkpoints",
     ));

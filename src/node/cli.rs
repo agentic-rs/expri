@@ -98,27 +98,24 @@ pub fn run(command: NodeCommand) -> Result<()> {
 }
 
 fn capabilities(command: CapabilitiesCommand) -> Result<()> {
+  let available = [
+    UV_ENVIRONMENT_CAPABILITY,
+    ENVIRONMENT_MAINTENANCE_CAPABILITY,
+    RUN_RECORDS_CAPABILITY,
+    DURABLE_RUNS_CAPABILITY,
+    RUN_METRICS_CAPABILITY,
+    RUN_PUBLISHING_CAPABILITY,
+    ASSETS_CAPABILITY,
+    expri_core::run_system::RUN_SYSTEM_CAPABILITY,
+  ];
   if let Some(requested) = command.has {
-    if ![
-      UV_ENVIRONMENT_CAPABILITY,
-      ENVIRONMENT_MAINTENANCE_CAPABILITY,
-      RUN_RECORDS_CAPABILITY,
-      RUN_METRICS_CAPABILITY,
-      DURABLE_RUNS_CAPABILITY,
-      RUN_PUBLISHING_CAPABILITY,
-      ASSETS_CAPABILITY,
-    ]
-    .contains(&requested.as_str())
-    {
+    if !available.contains(&requested.as_str()) {
       return Err(ExpriError::Message(format!(
         "unsupported node capability: {requested}"
       )));
     }
   } else {
-    println!(
-      "{}",
-      serde_json::json!({"capabilities": [UV_ENVIRONMENT_CAPABILITY, ENVIRONMENT_MAINTENANCE_CAPABILITY, RUN_RECORDS_CAPABILITY, DURABLE_RUNS_CAPABILITY, RUN_METRICS_CAPABILITY, RUN_PUBLISHING_CAPABILITY, ASSETS_CAPABILITY]})
-    );
+    println!("{}", serde_json::json!({"capabilities": available}));
   }
   Ok(())
 }

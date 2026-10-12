@@ -96,7 +96,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
       Vec::new()
     };
     Ok(
-      json!({"project_name":"Hosted experiments","access_mode":"hosted","initial_source":sources.first().map_or("",|source|source.source_id.as_str()),"sources":sources,"warnings":warnings}),
+      json!({"project_name":"Hosted experiments","access_mode":"hosted","capabilities":[expri_core::run_system::RUN_SYSTEM_CAPABILITY],"initial_source":sources.first().map_or("",|source|source.source_id.as_str()),"sources":sources,"warnings":warnings}),
     )
   }
 }

@@ -272,6 +272,7 @@ impl Fixture {
       .env_remove("UV_CACHE_DIR")
       .env_remove("PYTHONUNBUFFERED")
       .env_remove("EXPRI_TEST_CLI_CONFIG")
+      .env("EXPRI_STORAGE_DIR", self._directory.path().join("profiles"))
       .env("EXPRI_TEST_SOURCE_ROOT", &self.repo_root)
       .env("UV_PROJECT", "/ambient/wrong-project")
       .env("UV_PYTHON", "/ambient/wrong-python")
@@ -560,6 +561,198 @@ fn native_and_python_setup_steps_share_prepared_environment_after_bootstrap() {
       read_json(&fixture.repo_root.join(".expri/setup-state.json")),
       serde_json::to_value(request).unwrap()
     );
+  }
+}
+
+#[test]
+fn native_and_python_runs_capture_the_existing_machine_identity() {
+  for backend in [Backend::Native, Backend::Python] {
+    let fixture = Fixture::new();
+    let database = fixture._directory.path().join("profiles/profiles.sqlite3");
+    let store = expri_system::store::LocalStore::open(&database).unwrap();
+    let machine_id = store.machine_id().to_owned();
+    drop(store);
+    let output = fixture.execute(backend, 0, false);
+    assert!(
+      output.status.success(),
+      "{backend:?}: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let state = read_json(&fixture.run_dir().join("run-state.json"));
+    assert_eq!(state["status"], "completed", "{state}");
+    assert_eq!(state["machine_id"], machine_id);
+    assert!(
+      state["system_capture_id"].as_str().is_some(),
+      "{backend:?}: {state}"
+    );
+    assert_eq!(
+      state["system_capture_status"], "complete",
+      "{backend:?}: {state}"
+    );
+    let records = fs::read_to_string(
+      fixture
+        .run_dir()
+        .join(expri_core::run_system::RUN_SYSTEM_PATH),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<expri_core::run_system::RunSystemRecord>(line).unwrap())
+    .collect::<Vec<_>>();
+    assert!(
+      matches!(records.first(), Some(expri_core::run_system::RunSystemRecord::Capture { machine_id: id, .. }) if id == &machine_id)
+    );
+    assert!(matches!(
+      records.last(),
+      Some(expri_core::run_system::RunSystemRecord::End { complete: true, .. })
+    ));
+  }
+}
+
+fn capture_observation(store: &mut expri_system::store::LocalStore, observed_at_ms: i64) {
+  use expri_core::system_profile::{
+    CpuInventory, MetricKind, MetricReading, SystemInventory, SystemSample,
+  };
+  let inventory = SystemInventory {
+    observed_at_ms,
+    hostname: "fixture".into(),
+    os_name: None,
+    os_version: None,
+    kernel_version: None,
+    architecture: "test".into(),
+    cpu: CpuInventory {
+      brand: "cpu".into(),
+      vendor: "test".into(),
+      logical_cpu_count: 1,
+      physical_core_count: Some(1),
+    },
+    memory_total_bytes: 1024,
+    measurement_scope: "whole machine".into(),
+    devices: Vec::new(),
+    warnings: Vec::new(),
+  };
+  let sample = SystemSample {
+    sequence: 0,
+    session_id: "session-fixture".into(),
+    observed_at_ms,
+    interval_ms: 10,
+    collection_duration_ms: 1,
+    inventory_revision: 0,
+    metrics: BTreeMap::from([(
+      "cpu/usage_percent".into(),
+      MetricReading {
+        kind: MetricKind::Gauge,
+        value: 30.0,
+      },
+    )]),
+    counters: BTreeMap::from([("network/test/received_bytes".into(), u64::MAX)]),
+    warnings: Vec::new(),
+  };
+  store.record(inventory, sample).unwrap();
+}
+
+#[test]
+fn native_and_python_runs_return_before_the_collector_interval_and_retain_the_final_reading() {
+  for backend in [Backend::Native, Backend::Python] {
+    let fixture = Fixture::new();
+    let database = fixture._directory.path().join("profiles/profiles.sqlite3");
+    let mut store = expri_system::store::LocalStore::open(&database).unwrap();
+    capture_observation(&mut store, chrono::Utc::now().timestamp_millis() - 10_000);
+    let root = fs::canonicalize(database.parent().unwrap()).unwrap();
+    let expri_core::lock::LockAttempt::Acquired(lease) =
+      expri_core::lock::try_lock_file(&root.join("collector.lock"), true).unwrap()
+    else {
+      panic!("fixture collector lease");
+    };
+    let started = std::time::Instant::now();
+    let output = fixture.execute(backend, 0, false);
+    assert!(
+      output.status.success(),
+      "{backend:?}: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(5),
+      "task completion waited for the collector"
+    );
+    let run = fixture.run_dir();
+    let state = read_json(&run.join("run-state.json"));
+    assert_eq!(state["status"], "completed");
+    assert_eq!(
+      state["system_capture_status"], "capturing",
+      "{backend:?}: {state}"
+    );
+    assert!(state.get("system_capture_error").is_none(), "{state}");
+    let finish = chrono::DateTime::parse_from_rfc3339(state["finished_at"].as_str().unwrap())
+      .unwrap()
+      .timestamp_millis();
+    capture_observation(&mut store, finish - 1);
+    capture_observation(&mut store, finish);
+    store.export_run_captures().unwrap();
+    let completed = read_json(&run.join("run-state.json"));
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["exit_code"], 0);
+    assert_eq!(
+      completed["system_capture_status"], "complete",
+      "{backend:?}: {completed}"
+    );
+    let records = fs::read_to_string(run.join(expri_core::run_system::RUN_SYSTEM_PATH))
+      .unwrap()
+      .lines()
+      .map(|line| serde_json::from_str::<expri_core::run_system::RunSystemRecord>(line).unwrap())
+      .collect::<Vec<_>>();
+    let samples = records
+      .iter()
+      .filter_map(|record| {
+        if let expri_core::run_system::RunSystemRecord::Sample { sample } = record {
+          Some(sample)
+        } else {
+          None
+        }
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].observed_at_ms, finish - 1);
+    assert_eq!(samples[0].counters["network/test/received_bytes"], u64::MAX);
+    assert!(
+      matches!(records.last(), Some(expri_core::run_system::RunSystemRecord::End { end_ms,complete:true,.. }) if *end_ms == finish)
+    );
+    drop(lease);
+  }
+}
+
+#[test]
+fn native_and_python_runs_continue_without_missing_or_malformed_profiles() {
+  for backend in [Backend::Native, Backend::Python] {
+    for malformed in [false, true] {
+      let fixture = Fixture::new();
+      let profiles = fixture._directory.path().join("profiles");
+      if malformed {
+        fs::create_dir(&profiles).unwrap();
+        fs::write(
+          profiles.join("profiles.sqlite3"),
+          b"invalid profile database",
+        )
+        .unwrap();
+      }
+      let output = fixture.execute(backend, 0, false);
+      assert!(
+        output.status.success(),
+        "{backend:?}, malformed={malformed}: {}",
+        String::from_utf8_lossy(&output.stderr)
+      );
+      let state = read_json(&fixture.run_dir().join("run-state.json"));
+      assert_eq!(state["status"], "completed", "{state}");
+      assert!(state.get("machine_id").is_none(), "{state}");
+      if malformed {
+        assert_eq!(
+          fs::read(profiles.join("profiles.sqlite3")).unwrap(),
+          b"invalid profile database"
+        );
+        assert_eq!(fs::read_dir(profiles).unwrap().count(), 1);
+      } else {
+        assert!(!profiles.exists());
+      }
+    }
   }
 }
 

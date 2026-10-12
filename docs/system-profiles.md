@@ -117,7 +117,7 @@ inventory revisions are retained indefinitely.
 Each local sample and its hourly updates commit atomically before raw expiry.
 The publisher uploads absolute, versioned hourly snapshots. A retry of the
 same snapshot does not add its counts twice, and an older snapshot cannot
-overwrite a newer one. An outage longer than 72 hours loses raw detail while
+overwrite a newer one. An outage longer than 72 hours loses uncaptured machine detail while
 its hourly history can still be uploaded later. The server accepts those old
 summaries without reconstructing them from expired raw data.
 
@@ -145,6 +145,71 @@ jump; the wall clock at process startup is still the initial time reference.
 
 ## Inspect local and hosted history
 
+Open the dashboard's **System** page to browse machine inventory and utilization.
+Machine choices are independent of project selection. Period presets, Detail or
+Hourly resolution, and Local or UTC time controls share the chart workspace.
+Detailed charts show counter rates over their measured intervals; hourly charts
+show means or throughput over measured coverage. Missing readings remain gaps.
+The displayed measurements describe the whole system visible to the collector.
+
+Hosted dashboards read profiles through the authenticated browser session and
+do not require machine credentials in the browser. Local dashboards read an
+existing profile store using `EXPRI_STORAGE_DIR` or the normal home-directory
+location. Opening the page does not start collection or create a profile store.
+
+New native and Python fallback runs record the existing store's stable
+`machine_id` in `run-state.json` when it is available at launch. Start collection
+or run `expri system sample` before launching a run to establish that identity,
+and use the same `EXPRI_STORAGE_DIR` on both commands if overriding storage.
+Missing or unreadable profiles leave the run without a mapping and do not stop
+the experiment. Existing runs do not acquire an inferred machine identity from
+their hostname or worker label.
+
+## Exact system metrics for runs
+
+Upgrade the run worker and restart the upgraded collector before launching new runs. Native and Python
+launchers reserve `outputs/system-profile.jsonl` when existing local profile
+storage is available. They record `system_capture_id` alongside `machine_id` in
+run state. An existing user file at that path is never replaced.
+
+The collector copies each matching raw sample and its inventory into a durable
+capture outbox in the same transaction as collection. The exporter appends the
+original records to the run file, flushes them to disk, and checkpoints the
+committed byte prefix before releasing outbox rows. This preserves exact readings
+even when exporting or publishing is interrupted for more than 72 hours.
+The run file, hosted tracking stream, and result archive follow normal run
+retention and deletion. Rolling machine detail and hourly history remain separate.
+
+The mapping uses the run's existing period: `started_at` includes environment
+preparation, and observations satisfy `start <= observed_at < finish`. Overlapping
+runs capture the same whole-machine readings. Original intervals, sequence,
+session, inventory revisions, warnings, and decimal counter strings remain intact.
+Counter charts show rates over the full measured interval, including intervals
+that begin before the run. They do not prorate a boundary interval into exact
+per-process usage. Missing observations and clock changes remain visible.
+
+At task completion the capture remains pending until the collector commits past
+the finish boundary or its lease proves collection stopped. The task can return
+while capture publication finishes. A collector that cannot acknowledge the
+boundary yields an explicit incomplete capture without changing the task exit
+code. Recorded readings remain available; no boundary sample is invented.
+
+Run captures use the existing experiment publisher and credentials. The server
+must advertise `run-system-metrics-v1` for automatic stream uploads. Unsupported
+servers still receive normal experiment data; publishing status explains that
+the exact capture remains local. New browser APIs read only the run's own uploaded
+capture, never arbitrary global machine history inferred from run metadata.
+
+Open **System metrics** in a run or comparison to inspect mapped values, full
+summaries, and Run elapsed or Wall clock charts. The System page's Run period
+mode uses retained captures, so older runs can be inspected after machine detail
+expires. Pre-existing runs without a capture remain explicitly unavailable;
+hourly averages cannot reconstruct exact short-run readings. Browser pages and
+chart previews are bounded with visible truncation notes. The full raw file is
+included by default when fetching a run from the service.
+
+The CLI can also inspect the same local or hosted history:
+
 ```sh
 expri system history
 expri system history --resolution hourly
@@ -163,5 +228,5 @@ retrieves a historical inventory referenced by a sample or summary.
 `status` reports lease-based collector liveness, durable sample/hour counts,
 current inventory, and the last publisher status. Publisher status includes its
 observation timestamp and may describe an earlier attempt when the collector is
-stopped. All machine-profile data stays in SQLite; it does not create experiment
-tracking streams or upload profile data to S3.
+stopped. Independent machine profiles stay in SQLite. Run-owned copies additionally
+use experiment tracking streams and can be included in result archives in S3.
