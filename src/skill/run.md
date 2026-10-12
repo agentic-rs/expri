@@ -7,7 +7,7 @@ environment is configured. Use `expri skill config` if either is unclear.
 expri run --dry-run train --epochs 3
 expri run train --epochs 3
 expri -T gpu run train --epochs 3
-expri -T gpu run --detach train --epochs 3
+expri -T gpu run --detach --json train --epochs 3
 expri -T gpu run --no-push train --epochs 3
 ```
 
@@ -41,7 +41,8 @@ checkpoint registration uses `expri skill artifacts`.
 
 ## Detached execution
 
-`--detach` returns a JSON receipt with the run ID and directory once its
+`--detach` returns a table with the run ID and directory. Add `--json` before
+the task name to capture a structured start receipt once its
 supervisor can accept requests. Environment preparation continues in the
 background. Capture the receipt's actual run ID, then inspect:
 

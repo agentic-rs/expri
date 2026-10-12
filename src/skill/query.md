@@ -2,7 +2,8 @@
 
 Use `expri query runs` and `expri query files` to inspect published server records
 before downloading results. They run on the current machine without a project
-checkout or SSH target and print bounded JSON pages. They read metadata, without
+checkout or SSH target. Tables are the default; add `--json` for bounded structured
+pages when an agent or script reads the result. They read metadata, without
 downloading run files or filling the local review cache.
 
 The connection defaults to `[server]` in `~/.tokn/expri/config.toml`;
@@ -16,7 +17,7 @@ query runs. The server must advertise `service-catalog-v1`.
 ## Find published runs
 
 ```sh
-expri query runs
+expri query runs --json
 expri query runs --project-id vision --origin gpu-1 --archival all --limit 20
 expri query runs --config /etc/expri/client.toml --project-id vision
 ```
@@ -34,7 +35,7 @@ for live supervision; `service run status` describes archival and cleanup.
 ## Inspect file availability
 
 ```sh
-expri query files --project-id vision --origin gpu-1 --run-id run-abc123
+expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --json
 expri query files --project-id vision --origin gpu-1 --run-id run-abc123 --prefix outputs/ --limit 50
 ```
 
@@ -52,7 +53,7 @@ mismatch. The reported inventory is bounded to 200 files and 64 KiB, with
 `reported_inventory_truncated` and warnings exposing omissions or unavailability.
 Received records still appear when the inventory is unavailable.
 
-Both queries accept `--limit` from 1 to 100. Copy a response's `next_cursor`
+Both queries accept `--limit` from 1 to 100. Tables print a next-cursor hint. In `--json` output, copy the response's `next_cursor`
 exactly into `--cursor` and keep the same scope and filters. Continue until
 `next_cursor` is null; byte bounds can make a page shorter than its requested
 limit. Run cursors identify full scopes; file cursors are raw paths.

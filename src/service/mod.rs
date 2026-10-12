@@ -1,6 +1,6 @@
 pub use expri_client::FetchOptions;
 use expri_client::{client, resolve_client_config};
-pub(crate) use expri_client::{fetch_files, publishing, registrations, validate_component};
+pub(crate) use expri_client::{publishing, registrations, validate_component};
 use expri_core::service as types;
 use expri_server as server;
 
@@ -10,9 +10,13 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use crate::error::{ExpriError, Result};
+use crate::output::print_report;
 
 #[derive(Debug, Args)]
 pub struct ServiceCommand {
+  /// Print the complete report as JSON instead of a human-readable table.
+  #[arg(long, global = true)]
+  json: bool,
   #[command(subcommand)]
   command: ServiceSubcommand,
 }
@@ -286,14 +290,16 @@ pub struct InputDownloadOptions {
   pub destination: PathBuf,
 }
 
-pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
+pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
     return Err(ExpriError::Message(
       "service commands run on the current machine; omit --target".into(),
     ));
   }
   let report = match command.command {
-    ServiceSubcommand::System(command) => return crate::system_cli::run_service(command),
+    ServiceSubcommand::System(system) => {
+      return crate::system_cli::run_service(system, command.json, quiet);
+    }
     ServiceSubcommand::Run { command } => match command {
       RunCommand::Archive(options) => client::archive_run(
         &resolve_client_config(options.config.as_deref())?,
@@ -380,7 +386,9 @@ pub fn run(command: ServiceCommand, target: Option<&str>) -> Result<()> {
       InputCommand::Download(options) => client::input_download(options.try_into()?)?,
     },
   };
-  println!("{}", serde_json::to_string(&report)?);
+  if command.json || !quiet {
+    print_report(&report, command.json)?;
+  }
   Ok(())
 }
 
@@ -573,7 +581,20 @@ mod tests {
     }
     for args in cases {
       let default = std::iter::once("expri").chain(args.iter().copied());
-      assert!(Cli::try_parse_from(default).is_ok(), "{args:?}");
+      assert!(
+        !Cli::try_parse_from(default).unwrap().service.json,
+        "{args:?}"
+      );
+      for position in [1, args.len() + 1] {
+        let mut json_args = std::iter::once("expri")
+          .chain(args.iter().copied())
+          .collect::<Vec<_>>();
+        json_args.insert(position, "--json");
+        assert!(
+          Cli::try_parse_from(json_args).unwrap().service.json,
+          "{args:?}"
+        );
+      }
       let explicit = std::iter::once("expri")
         .chain(args.iter().copied())
         .chain(["--config", "client.toml"]);

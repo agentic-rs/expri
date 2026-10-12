@@ -411,3 +411,33 @@ fn local_add_and_explicit_update_preserve_original_files_and_never_use_network()
   assert!(!missing.status.success());
   assert!(String::from_utf8_lossy(&missing.stderr).contains("upload"));
 }
+
+#[test]
+fn asset_reports_default_to_tables_and_explicit_json_overrides_quiet() {
+  let root = tempfile::tempdir().unwrap();
+  fs::write(root.path().join("dataset.bin"), b"dataset").unwrap();
+  let added = expri(root.path(), &["assets", "add", "dataset.bin"]);
+  assert!(
+    added.status.success(),
+    "{}",
+    String::from_utf8_lossy(&added.stderr)
+  );
+  let text = String::from_utf8(added.stdout).unwrap();
+  assert!(text.contains("dataset.bin"));
+  assert!(text.to_ascii_lowercase().contains("path"));
+  assert!(serde_json::from_str::<serde_json::Value>(&text).is_err());
+
+  let status = expri(root.path(), &["assets", "status"]);
+  assert!(status.status.success());
+  let text = String::from_utf8(status.stdout).unwrap();
+  assert!(text.contains("dataset.bin"));
+  assert!(text.contains("ready"));
+  assert!(serde_json::from_str::<serde_json::Value>(&text).is_err());
+
+  let quiet = expri(root.path(), &["assets", "status", "--quiet"]);
+  assert!(quiet.status.success());
+  assert!(quiet.stdout.is_empty());
+  let report = succeeds(root.path(), &["assets", "status", "--quiet", "--json"]);
+  assert_eq!(report["assets"][0]["path"], "dataset.bin");
+  assert_eq!(report["assets"][0]["status"], "ready");
+}

@@ -1,7 +1,8 @@
 use crate::FetchCommand;
 use crate::context::CommandContext;
 use crate::error::{ExpriError, Result};
-use crate::service::{FetchOptions, fetch_files};
+use crate::output::{print_json_line, print_report};
+use crate::service::FetchOptions;
 
 pub fn run(command: FetchCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
@@ -10,11 +11,18 @@ pub fn run(command: FetchCommand, target: Option<&str>, quiet: bool) -> Result<(
         .into(),
     ));
   }
+  let json = command.json;
   let context = CommandContext::load(command.config.clone(), command.repo.clone())?;
-  let options = fetch_options(context, command, quiet)?;
-  let report = fetch_files(options)?;
-  if !quiet {
-    println!("{}", serde_json::to_string(&report)?);
+  let options = fetch_options(context, command, quiet && !json)?;
+  let report = expri_client::fetch_files_with_reporter(options, |summary| {
+    if json {
+      print_json_line(summary)
+    } else {
+      print_report(summary, false)
+    }
+  })?;
+  if json || !quiet {
+    print_report(&report, json)?;
   }
   Ok(())
 }
@@ -58,6 +66,7 @@ mod tests {
       repo: None,
       dry_run: true,
       watch: true,
+      json: false,
     }
   }
 

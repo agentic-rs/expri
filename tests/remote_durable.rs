@@ -144,7 +144,7 @@ if '--progress' in sys.argv:
   }
 
   fn start(&self, mode: &str) -> Value {
-    let output = self.run(&["run", "--no-push", "--detach", "train", mode]);
+    let output = self.run(&["run", "--no-push", "--detach", "--json", "train", mode]);
     let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["detached"], true);
     assert!(
@@ -224,6 +224,44 @@ fn await_file(path: &Path) {
 }
 
 #[test]
+fn detached_remote_receipts_default_to_a_table_for_native_and_python_workers() {
+  for protocol in ["expri-node", "python"] {
+    let fixture = Fixture::new(protocol, false);
+    let output = fixture.run(&["run", "--no-push", "--detach", "train", "finish"]);
+    let run = fs::read_dir(fixture.remote.join(".expri/runs"))
+      .unwrap()
+      .next()
+      .unwrap()
+      .unwrap()
+      .path();
+    let id = run.file_name().unwrap().to_str().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+      stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>(),
+      ["FIELD", "VALUE"]
+    );
+    assert!(stdout.contains("Run id"));
+    assert!(stdout.contains(id));
+    assert!(stdout.contains("Run dir"));
+    assert!(
+      stdout
+        .lines()
+        .any(|line| line.contains("Detached") && line.contains("yes"))
+    );
+    assert!(!stdout.contains("login-banner"));
+    assert!(serde_json::from_str::<Value>(&stdout).is_err());
+    await_file(&run.join("outputs/started"));
+    fs::write(run.join("outputs/release"), "finish").unwrap();
+    assert_eq!(fixture.terminal(id)["state"]["exit_code"], 7);
+  }
+}
+
+#[test]
 fn remote_backends_detach_follow_logs_finish_and_cancel_without_profile_contamination() {
   for (protocol, old_node) in [("expri-node", false), ("python", false), ("auto", true)] {
     let fixture = Fixture::new(protocol, old_node);
@@ -281,11 +319,11 @@ fn remote_backends_detach_follow_logs_finish_and_cancel_without_profile_contamin
 }
 
 #[test]
-fn detached_default_sync_and_verbose_transfer_keep_stdout_a_json_receipt() {
+fn detached_json_with_default_sync_and_verbose_transfer_keeps_stdout_a_json_receipt() {
   for protocol in ["expri-node", "python"] {
     let fixture = Fixture::new(protocol, false);
     fixture.prepare_local_source();
-    let output = fixture.run(&["-v", "run", "--detach", "train", "finish"]);
+    let output = fixture.run(&["-v", "run", "--detach", "--json", "train", "finish"]);
     let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["detached"], true);
     let diagnostics = String::from_utf8_lossy(&output.stderr);

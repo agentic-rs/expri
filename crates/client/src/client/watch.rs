@@ -711,6 +711,18 @@ impl<'a> Watcher<'a> {
 }
 
 pub fn fetch(options: FetchOptions) -> Result<Value> {
+  fetch_with_reporter(options, |summary| {
+    println!("{}", serde_json::to_string(summary)?);
+    Ok(())
+  })
+}
+
+/// Fetch project files while delivering changed watch summaries to the caller.
+/// One-shot and dry-run reports are returned without invoking the reporter.
+pub fn fetch_with_reporter(
+  options: FetchOptions,
+  mut report_summary: impl FnMut(&Value) -> Result<()>,
+) -> Result<Value> {
   let mut watcher = Watcher::new(&options)?;
   let mut last_report = None;
   let mut failures = 0;
@@ -734,7 +746,7 @@ pub fn fetch(options: FetchOptions) -> Result<Value> {
       "retrying_runs":report["retrying_runs"], "downloaded_bytes":report["downloaded_bytes"],
       "active_transfers":report["active_transfers"]});
     if !options.quiet && last_report.as_ref() != Some(&summary) {
-      println!("{}", serde_json::to_string(&summary)?);
+      report_summary(&summary)?;
       last_report = Some(summary);
     }
     thread::sleep(Duration::from_secs(poll_delay(failures)));

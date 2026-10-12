@@ -14,6 +14,9 @@ const TOKEN_LIMIT: usize = 4096;
 
 #[derive(Debug, Args)]
 pub struct ConfigCommand {
+  /// Print the structured result for automation.
+  #[arg(long, global = true)]
+  json: bool,
   /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri directory.
   #[arg(long, global = true)]
   storage_dir: Option<PathBuf>,
@@ -46,7 +49,7 @@ enum ServerCommand {
   Unset,
 }
 
-pub fn run(command: ConfigCommand, target: Option<&str>) -> Result<()> {
+pub fn run(command: ConfigCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
     return Err(message(
       "global configuration belongs to the current machine; omit -T",
@@ -54,6 +57,7 @@ pub fn run(command: ConfigCommand, target: Option<&str>) -> Result<()> {
   }
   let paths = StoragePaths::resolve(command.storage_dir.as_deref())?;
   paths.validate_existing()?;
+  let json = command.json;
   let ConfigSubcommand::Server { command } = command.command;
   let report = match command {
     ServerCommand::Show => {
@@ -84,7 +88,9 @@ pub fn run(command: ConfigCommand, target: Option<&str>) -> Result<()> {
       report(&paths, &config)
     }
   };
-  println!("{}", serde_json::to_string_pretty(&report)?);
+  if json || !quiet {
+    crate::output::print_report(&report, json)?;
+  }
   Ok(())
 }
 

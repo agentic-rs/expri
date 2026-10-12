@@ -134,7 +134,7 @@ impl Fixture {
 
   fn start(&self, mode: &str, preparing: bool) -> Value {
     let mut command = self.command();
-    command.args(["run", "--detach", "train", mode]);
+    command.args(["run", "--detach", "--json", "train", mode]);
     if preparing {
       command.env("EXPRI_TEST_PREPARE_BLOCK", "1");
     }
@@ -201,6 +201,90 @@ fn publishing_error(fixture: &Fixture, id: &str) -> Value {
     );
     thread::sleep(Duration::from_millis(25));
   }
+}
+
+#[test]
+fn detached_cli_receipts_default_to_a_table_and_json_overrides_quiet() {
+  for (args, json, quiet) in [
+    (vec!["run", "--detach", "train", "success"], false, false),
+    (
+      vec!["-q", "run", "--detach", "train", "success"],
+      false,
+      true,
+    ),
+    (
+      vec!["-q", "run", "--detach", "--json", "train", "success"],
+      true,
+      true,
+    ),
+  ] {
+    let fixture = Fixture::new();
+    let output = fixture.run(&args);
+    let run = fs::read_dir(fixture.repo.join(".expri/runs"))
+      .unwrap()
+      .next()
+      .unwrap()
+      .unwrap()
+      .path();
+    let id = run.file_name().unwrap().to_str().unwrap();
+    if json {
+      let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+      assert_eq!(receipt["run_id"], id);
+      assert_eq!(receipt["run_dir"], run.to_string_lossy().as_ref());
+      assert_eq!(receipt["detached"], true);
+      assert!(receipt["status"].is_string());
+    } else if quiet {
+      assert!(output.stdout.is_empty());
+    } else {
+      let stdout = String::from_utf8(output.stdout).unwrap();
+      assert_eq!(
+        stdout
+          .lines()
+          .next()
+          .unwrap()
+          .split_whitespace()
+          .collect::<Vec<_>>(),
+        ["FIELD", "VALUE"]
+      );
+      assert!(stdout.contains("Run id"));
+      assert!(stdout.contains(id));
+      assert!(stdout.contains("Run dir"));
+      assert!(stdout.contains("Status"));
+      assert!(
+        stdout
+          .lines()
+          .any(|line| line.contains("Detached") && line.contains("yes"))
+      );
+      assert!(serde_json::from_str::<Value>(&stdout).is_err());
+    }
+    assert_eq!(terminal(&fixture, id)["status"], "completed");
+  }
+}
+
+#[test]
+fn detached_node_run_keeps_its_json_wire_receipt() {
+  let fixture = Fixture::new();
+  let request = fixture.repo.join(".expri/node-request.json");
+  fs::write(
+    &request,
+    serde_json::to_vec(&serde_json::json!({
+      "name": "train", "command": ["python3", "train.py", "success"],
+      "environment": {}, "service": null, "remote_managed": ["uv.lock"],
+      "extras": [], "sync_args": [], "expected_sync": null, "detach": true,
+    }))
+    .unwrap(),
+  )
+  .unwrap();
+  let output = fixture.run(&["node", "run", "--request", request.to_str().unwrap()]);
+  let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+  assert_eq!(receipt["detached"], true);
+  let id = receipt["run_id"].as_str().unwrap();
+  assert!(
+    Path::new(receipt["run_dir"].as_str().unwrap())
+      .join(".worker-ready")
+      .is_file()
+  );
+  assert_eq!(terminal(&fixture, id)["status"], "completed");
 }
 
 #[test]

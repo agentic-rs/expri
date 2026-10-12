@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::assets::{self, Asset, Descriptor, Source};
 use crate::error::{ExpriError, Result};
+use crate::output::print_report;
 
 mod context;
 use context::{client_config, parse_output, parse_source, project_context};
@@ -88,6 +89,7 @@ struct Options {
   /// Local expri client configuration for private inputs; never stored in sidecars.
   #[arg(long)]
   client_config: Option<PathBuf>,
+  /// Print the complete report as JSON instead of a human-readable table.
   #[arg(long)]
   json: bool,
 }
@@ -281,7 +283,7 @@ pub fn run(command: AssetsCommand, target: Option<&str>, quiet: bool) -> Result<
     }
   };
   if json_output || !quiet {
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    print_report(&report, json_output)?;
   }
   Ok(())
 }

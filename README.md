@@ -32,6 +32,10 @@ expri skill login
 expri skill --help
 ```
 
+User-facing reports print readable tables by default. Add `--json` for scripts
+and agents; use `--quiet` to suppress a human report. For a detached launch, put
+`--detach --json` before the task name to capture its start receipt.
+
 Topics cover configuration, server login, source pushing, task launch, run inspection,
 metrics, artifacts, assets, environments, server queries, service publishing/fetching,
 and machine system profiles.
@@ -289,7 +293,8 @@ the command, timestamps, status, exit code, and log paths. Older run directories
 remain readable when optional records or logs are missing.
 
 Execution stays in the foreground by default. On Unix, `run --detach <task>`
-starts a separate supervisor session and returns a JSON receipt containing the
+starts a separate supervisor session and prints a start table; add `--json`
+before the task name for a structured receipt containing the
 run ID and directory after the supervisor owns the run and can accept requests.
 Environment preparation then continues in the background; inspect status and
 stderr for its progress. The run survives a terminal or SSH disconnect. Detach
@@ -712,7 +717,8 @@ expri query runs --project-id vision --origin gpu-1
 expri query files --project-id vision --origin gpu-1 --run-id run-abc123
 ```
 
-These commands return bounded JSON pages with `next_cursor`. File rows distinguish
+These commands show tables by default. Add `--json` for complete bounded pages
+with `next_cursor`; table output shows the next cursor when more rows are available. File rows distinguish
 received data from reported outputs still awaiting upload. Execution status is
 the last published state. See [server browsing](docs/self-hosted-service.md#browse-published-runs-and-files).
 

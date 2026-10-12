@@ -38,7 +38,7 @@ pub fn start_with_preference(
   request_path: &str,
   preference: ProtocolPreference,
   node_bin: &str,
-) -> Result<()> {
+) -> Result<Option<serde_json::Value>> {
   let native = select_native(remote, preference, node_bin)?;
   let command = if native {
     format!(
@@ -51,11 +51,10 @@ pub fn start_with_preference(
     python_command(remote, &python_run_script(request_path))
   };
   let bytes = remote.capture_bytes(&with_profile(&command))?;
-  if !remote.dry_run {
-    let report = parse_report(&bytes)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+  if remote.dry_run {
+    return Ok(None);
   }
-  Ok(())
+  Ok(Some(parse_report(&bytes)?))
 }
 
 fn execute_with_preference(

@@ -17,6 +17,7 @@ pub struct LocalTaskOptions {
   pub args: Vec<String>,
   pub dry_run: bool,
   pub detach: bool,
+  pub json: bool,
   pub verbosity: u8,
   pub quiet: bool,
   pub environment: Option<EnvironmentConfig>,
@@ -38,6 +39,7 @@ pub struct RemoteTaskOptions {
   pub args: Vec<String>,
   pub dry_run: bool,
   pub detach: bool,
+  pub json: bool,
   pub verbosity: u8,
   pub quiet: bool,
   pub remote_managed: Vec<String>,
@@ -152,7 +154,12 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       }
       return Ok(());
     }
-    return crate::node::run::apply_request_at(&request, &options.repo_root);
+    if let Some(report) = crate::node::run::execute_request_at(&request, &options.repo_root)?
+      && (options.json || !options.quiet)
+    {
+      crate::output::print_report(&report, options.json)?;
+    }
+    return Ok(());
   }
   if options
     .service
@@ -268,7 +275,13 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     remote.upload_file(&request_path, &format!("{inbox}/run-request.json"))?;
     let request_path = format!(".expri/inbox/{request_id}/run-request.json");
     if options.detach {
-      return super::jobs::start_with_preference(&remote, &request_path, preference, &node_bin);
+      if let Some(report) =
+        super::jobs::start_with_preference(&remote, &request_path, preference, &node_bin)?
+        && (options.json || !options.quiet)
+      {
+        crate::output::print_report(&report, options.json)?;
+      }
+      return Ok(());
     }
     return apply_run_with_preference(&remote, &request_path, preference, &node_bin);
   }
@@ -409,7 +422,7 @@ mod tests {
     let options = LocalTaskOptions {
       repo_root: root.path().into(), project_name: None, name: "train".into(),
       task: TaskConfig { command: vec!["python".into(), "train.py".into()], uv: false },
-      args: Vec::new(), dry_run: true, detach: false, verbosity: 0, quiet: true,
+      args: Vec::new(), dry_run: true, detach: false, json: false, verbosity: 0, quiet: true,
       environment: None,
       service: Some(toml::from_str(
         "client_config='/etc/expri/worker.toml'\nproject_id='project'\norigin='local'\npublish=false\n",

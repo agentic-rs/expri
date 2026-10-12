@@ -83,3 +83,4 @@ serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 url.workspace = true
+unicode-width = "0.2.2"

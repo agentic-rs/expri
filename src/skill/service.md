@@ -9,6 +9,12 @@ this machine's server connection. Its prompt is hidden; it saves a separately
 issued API token, without saving the password. Read `expri skill login` for
 stdin input, logout, and token lifecycle.
 
+User-facing reports default to tables. Add `--json` when an agent or script
+needs the complete structured report. For example, use
+`expri service list --project-id vision --origin gpu-1 --json`.
+`--quiet` suppresses tables; explicit `--json` still prints the report.
+Serving and background worker commands retain their operational messages.
+
 Query and service client commands default to `[server]` in
 `~/.tokn/expri/config.toml`. Existing manually supplied tokens remain supported:
 
@@ -111,7 +117,8 @@ size and checksum. Unsealed tracking data is a received prefix. Reported invento
 has a 200-file/64-KiB limit and explicit truncation/unavailability warnings.
 `--prefix` is literal. Browsing does not download checkpoint bytes or return
 signed URLs; use `service fetch` for downloads. Read `expri skill query` for
-query-specific guidance. Legacy `service list` is unchanged.
+query-specific guidance. Legacy `service list` keeps its existing scoped listing;
+add `--json` to retain its structured output.
 
 For project-wide fetching, reference the global connection from the laptop's `expri.toml`:
 

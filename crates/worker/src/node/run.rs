@@ -26,6 +26,17 @@ pub fn apply_request(request: &RunRequest) -> Result<()> {
 }
 
 pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
+  if let Some(receipt) = execute_request_at(request, repo_root)? {
+    println!("{receipt}");
+  }
+  Ok(())
+}
+
+/// Execute a run while leaving a detached receipt's presentation to the caller.
+pub fn execute_request_at(
+  request: &RunRequest,
+  repo_root: &Path,
+) -> Result<Option<serde_json::Value>> {
   let repo_root = fs::canonicalize(repo_root)?;
   request.environment.validate()?;
   if let Some(service) = &request.service {
@@ -80,10 +91,11 @@ pub fn apply_request_at(request: &RunRequest, repo_root: &Path) -> Result<()> {
     );
   }
   if request.detach {
-    return start_detached(request, &repo_root, &snapshot, &mut state);
+    return start_detached(request, &repo_root, &snapshot, &mut state).map(Some);
   }
   let _run_lock = crate::lock::run_lock(&snapshot.run_dir)?;
-  execute_snapshot(request, &repo_root, &snapshot, state, false)
+  execute_snapshot(request, &repo_root, &snapshot, state, false)?;
+  Ok(None)
 }
 
 /// A profile belongs to this machine only when an existing local store says so.
@@ -313,7 +325,7 @@ fn start_detached(
   repo_root: &Path,
   snapshot: &RunSnapshot,
   state: &mut serde_json::Value,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
   use std::os::unix::process::CommandExt;
   let launch = (|| {
     fs::write(
@@ -353,8 +365,7 @@ fn start_detached(
         {
           receipt["dashboard_url"] = json!(url);
         }
-        println!("{receipt}");
-        return Ok(());
+        return Ok(receipt);
       }
       if let Some(status) = child.try_wait()? {
         return Err(ExpriError::CommandFailed {
@@ -406,7 +417,7 @@ fn start_detached(
   _: &Path,
   _: &RunSnapshot,
   _: &mut serde_json::Value,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
   Err(ExpriError::Message(
     "detached runs require a Unix target".to_string(),
   ))

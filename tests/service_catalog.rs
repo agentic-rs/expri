@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,7 @@ use expri_core::service_catalog::{
 use serde_json::Value;
 
 fn request(stream: &mut TcpStream) -> Request {
+  stream.set_nonblocking(false).unwrap();
   stream
     .set_read_timeout(Some(Duration::from_secs(5)))
     .unwrap();
@@ -107,7 +108,7 @@ fn fixture(endpoint: &str) -> (tempfile::TempDir, PathBuf) {
   (directory, config)
 }
 
-fn cli(config: &Path, args: &[&str]) -> Value {
+fn query_output(config: &Path, args: &[&str]) -> Output {
   let output = Command::new(env!("CARGO_BIN_EXE_expri"))
     .args(["query"])
     .args(args)
@@ -124,6 +125,15 @@ fn cli(config: &Path, args: &[&str]) -> Value {
     String::from_utf8_lossy(&output.stderr)
   );
   assert!(!String::from_utf8_lossy(&output.stdout).contains("catalog-fixture-token"));
+  assert!(!String::from_utf8_lossy(&output.stderr).contains("catalog-fixture-token"));
+  output
+}
+
+fn cli(config: &Path, args: &[&str]) -> Value {
+  let args = std::iter::once("--json")
+    .chain(args.iter().copied())
+    .collect::<Vec<_>>();
+  let output = query_output(config, &args);
   serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -151,6 +161,7 @@ fn run_list_defaults_to_all_accessible_runs_without_reading_or_writing_a_project
     }],
     next_cursor: Some(cursor.clone()),
   };
+  let expected = serde_json::to_value(&page).unwrap();
   let (endpoint, server) = mock_catalog(
     vec![
       Response::RunPage { page },
@@ -174,12 +185,15 @@ fn run_list_defaults_to_all_accessible_runs_without_reading_or_writing_a_project
   );
   let (_directory, config) = fixture(&endpoint);
   let page = cli(&config, &["runs"]);
+  assert_eq!(page, expected);
   assert_eq!(page["runs"][0]["scope"]["origin"], "worker");
   assert_eq!(page["runs"][0]["status"], "completed");
   let next = page["next_cursor"].as_str().unwrap();
+  let output = query_output(&config, &["runs", "--json", "--cursor", next]);
+  let continued: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert_eq!(
-    cli(&config, &["runs", "--cursor", next])["runs"],
-    serde_json::json!([])
+    continued,
+    serde_json::json!({ "runs": [], "next_cursor": null })
   );
   server.join().unwrap();
   let mut names = std::fs::read_dir(config.parent().unwrap())
@@ -227,6 +241,7 @@ fn run_files_expose_pending_uploads_and_versions_with_literal_prefix_and_continu
     reported_inventory_truncated: false,
     warnings: Vec::new(),
   };
+  let expected = serde_json::to_value(&page).unwrap();
   let (endpoint, server) =
     mock_catalog(vec![Response::RunFilesPage { page }], move |request, _| {
       let Request::BrowseRunFiles { query } = request else {
@@ -256,6 +271,7 @@ fn run_files_expose_pending_uploads_and_versions_with_literal_prefix_and_continu
       "outputs/a_%/older.pt",
     ],
   );
+  assert_eq!(page, expected);
   assert_eq!(page["files"][0]["availability"], "reported_only");
   assert_eq!(
     page["files"][1]["availability"],
@@ -263,6 +279,250 @@ fn run_files_expose_pending_uploads_and_versions_with_literal_prefix_and_continu
   );
   assert_eq!(page["files"][1]["labels_pending"], true);
   assert_eq!(page["next_cursor"], paths[1]);
+  server.join().unwrap();
+}
+
+#[test]
+fn run_list_defaults_to_a_table_with_scopes_status_and_pagination() {
+  let archived_scope = RunScope {
+    project_id: "second-project".into(),
+    origin: "gpu-worker".into(),
+    run_id: "archived-run".into(),
+  };
+  let cursor = encode_run_cursor(&archived_scope).unwrap();
+  let page = RunListPage {
+    runs: vec![
+      RunListEntry {
+        scope: scope(),
+        task: Some("train".into()),
+        status: "running".into(),
+        started_at: Some("2026-10-12T02:00:00Z".into()),
+        finished_at: None,
+        exit_code: None,
+        archived: false,
+        warnings: vec!["worker inventory is incomplete".into()],
+      },
+      RunListEntry {
+        scope: archived_scope,
+        task: None,
+        status: "failed".into(),
+        started_at: None,
+        finished_at: None,
+        exit_code: Some(17),
+        archived: true,
+        warnings: Vec::new(),
+      },
+    ],
+    next_cursor: Some(cursor.clone()),
+  };
+  let (endpoint, server) = mock_catalog(vec![Response::RunPage { page }], |request, _| {
+    let Request::BrowseRuns { query } = request else {
+      panic!("expected run list");
+    };
+    assert_eq!(query.archival, RunArchiveFilter::All);
+  });
+  let (_directory, config) = fixture(&endpoint);
+  let output = query_output(&config, &["runs", "--archival", "all"]);
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  let headers = stdout.lines().next().unwrap().to_ascii_lowercase();
+  for header in ["project", "origin", "run", "task", "status", "archived"] {
+    assert!(
+      headers.contains(header),
+      "missing table header {header}: {stdout}"
+    );
+  }
+  assert!(stdout.lines().any(|line| {
+    ["project", "worker", "run-one", "train", "running"]
+      .iter()
+      .all(|value| line.contains(value))
+  }));
+  assert!(stdout.lines().any(|line| {
+    [
+      "second-project",
+      "gpu-worker",
+      "archived-run",
+      "failed",
+      "17",
+    ]
+    .iter()
+    .all(|value| line.contains(value))
+  }));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("worker inventory is incomplete"));
+  assert!(stdout.contains("Next cursor:"));
+  assert!(stdout.contains(&cursor));
+  assert!(serde_json::from_str::<Value>(&stdout).is_err());
+  server.join().unwrap();
+}
+
+#[test]
+fn file_table_distinguishes_received_reported_and_different_versions() {
+  let received = ReceivedRunFile {
+    size: 3,
+    sha256: Some("a".repeat(64)),
+    storage: FileStorage::Object,
+  };
+  let reported = ReportedRunFile {
+    size: 4,
+    sha256: Some("b".repeat(64)),
+    labels: vec!["latest".into(), "best".into()],
+    sync_status: Some("registered".into()),
+    sync_error: None,
+  };
+  let page = RunFilesPage {
+    scope: scope(),
+    files: vec![
+      RunFileEntry {
+        path: "outputs/a_received.pt".into(),
+        availability: RunFileAvailability::Received,
+        received: Some(received.clone()),
+        reported: None,
+        labels_pending: false,
+      },
+      RunFileEntry {
+        path: "outputs/b_pending.pt".into(),
+        availability: RunFileAvailability::ReportedOnly,
+        received: None,
+        reported: Some(reported.clone()),
+        labels_pending: true,
+      },
+      RunFileEntry {
+        path: "outputs/c_stale.pt".into(),
+        availability: RunFileAvailability::ReceivedDifferentVersion,
+        received: Some(received),
+        reported: Some(reported),
+        labels_pending: true,
+      },
+    ],
+    next_cursor: Some("outputs/c_stale.pt".into()),
+    inventory_recorded_at: Some("2026-10-12T02:00:00Z".into()),
+    reported_inventory_truncated: true,
+    warnings: vec!["some files have not uploaded yet".into()],
+  };
+  let (endpoint, server) = mock_catalog(vec![Response::RunFilesPage { page }], |request, _| {
+    let Request::BrowseRunFiles { query } = request else {
+      panic!("expected file list");
+    };
+    assert_eq!(query.scope, scope());
+  });
+  let (_directory, config) = fixture(&endpoint);
+  let output = query_output(
+    &config,
+    &[
+      "files",
+      "--project-id",
+      "project",
+      "--origin",
+      "worker",
+      "--run-id",
+      "run-one",
+    ],
+  );
+  let stdout = String::from_utf8(output.stdout).unwrap();
+  let headers = stdout
+    .lines()
+    .find(|line| line.contains("AVAILABILITY"))
+    .unwrap();
+  for header in ["PATH", "RECEIVED SIZE", "REPORTED SIZE", "LABELS", "SYNC"] {
+    assert!(
+      headers.contains(header),
+      "missing table header {header}: {stdout}"
+    );
+  }
+  let received = stdout
+    .lines()
+    .find(|line| line.contains("outputs/a_received.pt"))
+    .unwrap();
+  let pending = stdout
+    .lines()
+    .find(|line| line.contains("outputs/b_pending.pt"))
+    .unwrap();
+  let stale = stdout
+    .lines()
+    .find(|line| line.contains("outputs/c_stale.pt"))
+    .unwrap();
+  assert!(received.split_whitespace().any(|value| value == "received"));
+  assert!(received.split_whitespace().any(|value| value == "3"));
+  assert!(
+    pending
+      .split_whitespace()
+      .any(|value| value == "reported_only")
+  );
+  assert!(pending.split_whitespace().any(|value| value == "4"));
+  assert!(pending.contains("latest"));
+  assert!(pending.contains("best"));
+  assert!(pending.contains("(pending)"));
+  assert!(
+    stale
+      .split_whitespace()
+      .any(|value| value == "received_different_version")
+  );
+  assert!(stale.split_whitespace().any(|value| value == "3"));
+  assert!(stale.split_whitespace().any(|value| value == "4"));
+  assert!(pending.contains("registered"));
+  assert!(stale.contains("registered"));
+  assert!(stdout.contains("project"));
+  assert!(stdout.contains("worker"));
+  assert!(stdout.contains("run-one"));
+  let stderr = String::from_utf8(output.stderr).unwrap();
+  assert!(stderr.contains("some files have not uploaded yet"));
+  assert!(stderr.to_ascii_lowercase().contains("truncated"));
+  assert!(stdout.contains("Next cursor:"));
+  assert!(stdout.contains("outputs/c_stale.pt"));
+  assert!(serde_json::from_str::<Value>(&stdout).is_err());
+  server.join().unwrap();
+}
+
+#[test]
+fn empty_catalog_tables_explain_that_no_results_matched() {
+  let (endpoint, server) = mock_catalog(
+    vec![
+      Response::RunPage {
+        page: RunListPage {
+          runs: Vec::new(),
+          next_cursor: None,
+        },
+      },
+      Response::RunFilesPage {
+        page: RunFilesPage {
+          scope: scope(),
+          files: Vec::new(),
+          next_cursor: None,
+          inventory_recorded_at: None,
+          reported_inventory_truncated: false,
+          warnings: Vec::new(),
+        },
+      },
+    ],
+    |request, index| match (index, request) {
+      (0, Request::BrowseRuns { .. }) | (1, Request::BrowseRunFiles { .. }) => {}
+      _ => panic!("unexpected empty catalog request"),
+    },
+  );
+  let (_directory, config) = fixture(&endpoint);
+  let runs = query_output(&config, &["runs"]);
+  assert!(
+    String::from_utf8(runs.stdout)
+      .unwrap()
+      .contains("No published runs.")
+  );
+  let files = query_output(
+    &config,
+    &[
+      "files",
+      "--project-id",
+      "project",
+      "--origin",
+      "worker",
+      "--run-id",
+      "run-one",
+    ],
+  );
+  assert!(
+    String::from_utf8(files.stdout)
+      .unwrap()
+      .contains("No files")
+  );
   server.join().unwrap();
 }
 
@@ -294,6 +554,7 @@ fn global_server_setup_drives_browsing_and_never_prints_the_stored_token() {
   let mut setup = Command::new(env!("CARGO_BIN_EXE_expri"))
     .args([
       "config",
+      "--json",
       "server",
       "set",
       "--url",
@@ -349,14 +610,20 @@ fn global_server_setup_drives_browsing_and_never_prints_the_stored_token() {
     serde_json::from_slice::<Value>(&output.stdout).unwrap()
   };
   assert_eq!(
-    command(&["config", "server", "show"])["server"]["url"],
+    command(&["config", "server", "show", "--json"])["server"]["url"],
     endpoint
   );
   let before = std::fs::read(root.join("config.toml")).unwrap();
-  assert_eq!(command(&["query", "runs"])["runs"], serde_json::json!([]));
+  assert_eq!(
+    command(&["query", "runs", "--json"])["runs"],
+    serde_json::json!([])
+  );
   assert_eq!(std::fs::read(root.join("config.toml")).unwrap(), before);
   server.join().unwrap();
-  assert_eq!(command(&["config", "server", "unset"])["configured"], false);
+  assert_eq!(
+    command(&["config", "server", "unset", "--json"])["configured"],
+    false
+  );
   let config: toml::Value =
     toml::from_str(&std::fs::read_to_string(root.join("config.toml")).unwrap()).unwrap();
   assert!(config.get("server").is_none());
