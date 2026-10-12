@@ -7,7 +7,8 @@ and consistent controls across history, inspection, storage, files, logs, and lo
 ## Layout and navigation
 
 The header contains project or source selection, native Runs / Storage radio
-navigation, appearance, refresh, and session actions. Small project catalogs use
+navigation, appearance, and session actions. The bottom status bar holds Refresh,
+Auto refresh, and freshness information. Small project catalogs use
 selectable tags; larger catalogs use a select. Header controls wrap on smaller
 screens without occupying a separate navigation rail.
 

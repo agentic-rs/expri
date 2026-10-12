@@ -192,8 +192,11 @@ main { min-width: 0; max-width: none; margin: 0; padding: 0; }
 #dashboard-root { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 #workspace-page { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
 #dashboard-root > .notice { flex-shrink: 0; }
-.workspace-main > footer { flex-shrink: 0; display: flex; justify-content: space-between; gap: 10px; padding: 4px 12px; border-top: 1px solid var(--line); color: var(--subtle); font-size: 10px; line-height: 16px; }
-.workspace-main > footer .deployment-revision { margin-left: auto; overflow-wrap: anywhere; }
+.workspace-status-bar { flex-shrink: 0; display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 4px 10px; border-top: 1px solid var(--line-strong); color: var(--muted); background: var(--paper); font-size: 10px; line-height: 16px; }
+.workspace-status-bar #utility-controls-root { order: 1; margin-left: auto; }
+.workspace-status-bar .workspace-caption { display: none; }
+.workspace-status-bar .deployment-revision { min-width: 0; overflow-wrap: anywhere; }
+.workspace-status-bar .freshness { max-width: none; }
 .workspace-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 12px; }
 .workspace-description, .page-description { color: var(--muted); font-size: 12px; margin-top: 3px; }
 .page-context { color: var(--muted); font-size: 11px; }
@@ -660,10 +663,22 @@ details.inspector-controls { display: block; }
   .refresh-context { flex-wrap: nowrap; }
   .freshness { max-width: none; }
   .workspace-main, #dashboard-root { display: block; }
+  .workspace-main { padding-bottom: 104px; }
+  .workspace-status-bar { position: fixed; z-index: 8; inset: auto 0 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 18px minmax(0, 1fr); gap: 4px; height: 104px; min-height: 104px; padding: 6px 10px; }
+  .workspace-status-bar #dashboard-kind, .workspace-status-bar .deployment-revision { grid-column: 1; grid-row: 1; }
+  .workspace-status-bar:has(.deployment-revision) #dashboard-kind { display: none; }
+  .workspace-status-bar .deployment-revision { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .workspace-status-bar #utility-controls-root { grid-column: 1; grid-row: 2; align-self: stretch; margin: 0; width: 100%; }
+  .workspace-status-bar .refresh-status { width: 100%; align-items: start; justify-content: space-between; gap: 10px; }
+  .workspace-status-bar .refresh-context { display: flex; flex-direction: column; align-items: start; gap: 3px; min-width: 0; }
+  .workspace-status-bar .freshness { white-space: normal; max-width: none; font-size: 10px; line-height: 14px; }
+  .workspace-status-bar .button { min-height: 36px; flex-shrink: 0; }
+  .workspace-status-bar .auto-refresh { min-height: 36px; }
   .workspace-grid, .workspace-grid.has-review { grid-template-columns: minmax(0, 1fr); }
   .run-history { height: min(68dvh, 620px); min-height: 360px; border-right: 0; border-bottom: 1px solid var(--line-strong); }
   .runs-scroll { min-height: 120px; }
   .main-workspace { overflow: visible; padding: 12px; }
+  .workspace-grid.has-review #run-workspace:not([hidden]) { min-height: 100dvh; }
   .review-empty { min-height: 210px; }
   .filters { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
   .filters > #archival-options, .filters > #status-options, .filters > .machine-filter { grid-column: auto; }
@@ -679,6 +694,12 @@ details.inspector-controls { display: block; }
   .login-main { padding: 32px; }
   .login-card { padding: 28px; }
 }
+@media (min-width: 721px) and (max-width: 1000px) {
+  .workspace-main { padding-bottom: 70px; }
+  .workspace-status-bar { height: 70px; min-height: 70px; }
+  .workspace-status-bar .refresh-context { flex-direction: row; align-items: center; gap: 10px; }
+  .workspace-status-bar .freshness { white-space: nowrap; }
+}
 @media (max-width: 720px) {
   .topbar-inner { gap: 7px 10px; }
   .brand { font-size: 18px; }
@@ -688,7 +709,6 @@ details.inspector-controls { display: block; }
   #navigation-root { order: 1; margin-left: 0; }
   .navigation-item > span { padding-inline: 6px; }
   .theme-choice span { padding-inline: 5px; }
-  #utility-controls-root { order: 2; flex-basis: 100%; margin-left: 0; }
   #theme-controls-root { order: 1; margin-left: auto; }
   .project-context { order: 4; }
   .topbar .session-actions { order: 1; margin-left: 0; }

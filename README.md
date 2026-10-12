@@ -466,7 +466,8 @@ expri -T runpod runs fetch run-abc123             # Refresh metadata and logs
 ```
 
 The header contains source/project selection, **Runs / Storage** navigation,
-refresh, and appearance controls. **Appearance** offers Light, Dark, and System
+and appearance controls. The bottom status bar contains Refresh, Auto refresh,
+and freshness information. **Appearance** offers Light, Dark, and System
 themes and remembers your choice in this browser. Full run history stays in the
 left panel above 1000 CSS pixels, including while Storage is open. Inspection,
 comparison, or Storage uses the remaining width; narrower screens stack history

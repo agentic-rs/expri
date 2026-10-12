@@ -28,7 +28,6 @@
             <span class="read-only">Read only</span>
           </div>
           <div id="navigation-root"></div>
-          <div id="utility-controls-root"></div>
           <div id="theme-controls-root" class="header-theme"></div>
           <form id="logout-form" class="session-actions" method="post" action="/logout" hidden>
             <button class="text-button" type="submit">Sign out</button>
@@ -38,7 +37,11 @@
       <main class="workspace-main">
         <div id="dashboard-root"></div>
         <noscript><p class="notice">Enable JavaScript to review recorded experiment results.</p></noscript>
-        <footer><span id="dashboard-kind"></span><span>Experiment workspace</span></footer>
+        <footer class="workspace-status-bar">
+          <span id="dashboard-kind"></span>
+          <div id="utility-controls-root"></div>
+          <span class="workspace-caption">Experiment workspace</span>
+        </footer>
       </main>
     </div>
   </body>

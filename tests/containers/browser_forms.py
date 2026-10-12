@@ -445,7 +445,7 @@ def time_axes(browser, run_ids, prefix='workspace'):
     assert full['range'] == full['domain'], 'axis switch reused an incompatible zoom range'
     assert full['hidden'] == [run_ids[1]], 'axis switch lost the hidden actual run ID'
     chart_context(browser)
-    duplicate = evaluate('''const card = [...document.querySelector('#chart-preview').querySelectorAll('section.card')].find(node => node.querySelector('h2')?.textContent === 'duplicate_probe');
+    duplicate = evaluate('''const card = document.querySelector('#chart-preview section[data-chart-metric="duplicate_probe"]');
       return {text: card.textContent, circles: card.querySelectorAll('circle.point').length, svgs: card.querySelectorAll('svg').length};''')
     assert duplicate['text'].count('3 of 3 samples omitted') == 2 and duplicate['circles'] == 0 and duplicate['svgs'] == 0, 'time chart invented a timestamp or plotted an entirely legacy series'
     assert 'No timestamped samples are available to plot' in duplicate['text'], 'empty time chart did not explain its missing samples'
@@ -802,7 +802,30 @@ def project_storage(run_id=None):
     browser.close()
 
 
+def status_bar_layout(browser, width):
+  geometry = browser.call('POST', '/execute/sync', {'script': '''const bounds = node => {
+      const rect = node.getBoundingClientRect();
+      return {left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom};
+    };
+    const bar = document.querySelector('footer.workspace-status-bar');
+    return {viewport_width: innerWidth, viewport_height: innerHeight,
+      client_width: document.documentElement.clientWidth, bar: bounds(bar),
+      controls: ['#refresh-button', '.auto-refresh', '#updated-at', '.deployment-revision']
+        .map(selector => ({selector, node: bar.querySelector(selector)}))
+        .filter(item => item.node?.getClientRects().length)
+        .map(item => ({selector: item.selector, ...bounds(item.node)}))};''', 'args': []})
+  assert geometry['viewport_width'] == width, f'status bar viewport is not {width} CSS pixels wide'
+  bar = geometry['bar']
+  assert bar['left'] >= 0 and bar['right'] <= geometry['client_width'] + 1, f'{width}px status bar overflows horizontally'
+  assert bar['top'] >= 0 and bar['bottom'] <= geometry['viewport_height'] + 1, f'{width}px status bar is outside the viewport'
+  for control in geometry['controls']:
+    assert control['left'] >= bar['left'] - 1 and control['right'] <= bar['right'] + 1, f'{width}px status bar clips {control["selector"]} horizontally'
+    assert control['top'] >= bar['top'] - 1 and control['bottom'] <= bar['bottom'] + 1, f'{width}px status bar clips {control["selector"]} vertically'
+  return geometry
+
+
 def workspace_layout(browser, width, wide=False):
+  status_bar_layout(browser, width)
   geometry = browser.call('POST', '/execute/sync', {'script': '''window.scrollTo(0, 0);
     const bounds = selector => {
       const rect = document.querySelector(selector).getBoundingClientRect();
@@ -873,6 +896,15 @@ def table_scroll_contained(browser, width):
   finally:
     browser.call('POST', '/execute/sync', {'script': "document.querySelector('#runs-region').scrollLeft = 0;", 'args': []})
   return before
+
+
+def compact_focus_visible(browser, target, width):
+  def focused_near_top():
+    return browser.call('POST', '/execute/sync', {'script': '''const node = document.getElementById(arguments[0]);
+      const rect = node?.getBoundingClientRect();
+      return !!rect && node.getClientRects().length > 0 && document.activeElement === node
+        && rect.top >= -1 && rect.top <= 80 && rect.bottom <= innerHeight;''', 'args': [target]})
+  wait_for(focused_near_top, f'{width}px explicit navigation did not reveal and focus {target} near the viewport top')
 
 
 def choose_run_table_columns(browser):
@@ -1084,6 +1116,13 @@ def workspace(run_id, second_run_id):
     assert evaluate("return document.querySelectorAll('#run-rows tr').length;") == 0, 'Failed status filter retained completed runs'
     browser.click('#clear-filters')
     wait_for(lambda: evaluate("return document.querySelector('#status-any').checked && document.querySelectorAll('#run-rows tr').length === 2;"), 'Clear filters did not restore the Any status tag')
+    for width in [1000, 390, 320]:
+      browser.set_viewport(width, 800)
+      browser.click('#run-rows tr:first-child .run-link')
+      wait_for(lambda: evaluate("return !document.querySelector('#chart-card').hidden && document.querySelector('#chart-preview svg') !== null && document.querySelector('#chart-card').getAttribute('aria-busy') === 'false';"), 'compact inspection did not finish loading its charts')
+      compact_focus_visible(browser, 'review-title', width)
+      browser.click('#close-review')
+      compact_focus_visible(browser, 'runs-heading', width)
     print('Firefox workspace passed: parent-rendered comparison, exact hover, native legend/zoom/keyboard, duplicate coordinates, dashboard/standalone CSP, lazy logs, refresh/selection cleanup, desktop/narrow layout.', flush=True)
   finally:
     browser.close()

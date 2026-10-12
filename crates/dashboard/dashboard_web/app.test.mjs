@@ -370,6 +370,7 @@ test("project switching stays in the header while history and inspection retain 
   assert.equal(nodes.document.querySelector(".app-sidebar"), null, "project controls do not reserve a sidebar");
   assert.ok(nodes.get("workspace-view-storage").closest("#navigation-root"));
   assert.ok(nodes.get("refresh-button").closest("#utility-controls-root"));
+  assert.ok(nodes.get("utility-controls-root").closest("footer.workspace-status-bar"), "refresh and live status belong to the bottom bar");
   assert.equal(nodes.document.querySelector(".workspace-grid").classList.contains("has-review"), false);
   const panes = workspacePanes(nodes);
   assert.equal(latestRunQuery(model).has("status"), false, "history starts with every training status");
