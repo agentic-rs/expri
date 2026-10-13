@@ -357,6 +357,31 @@ def chart_axis_diagnostics(browser, requested):
     error_hidden: document.querySelector('#chart-error').hidden};''', 'args': [requested]})
 
 
+def chart_x_fraction(value, domain):
+  start, end = (int(coordinate) for coordinate in domain)
+  coordinate = int(value)
+  assert start < end and start <= coordinate <= end, 'recorded chart coordinate is outside its domain'
+  # Subtract exact epoch nanoseconds before floating-point conversion. Converting
+  # absolute timestamps first would collapse nearby samples at large epochs.
+  return (coordinate - start) / (end - start)
+
+
+def chart_sample_window(coordinates, domain):
+  points = sorted(set(int(coordinate) for coordinate in coordinates))
+  assert len(points) >= 4, 'native zoom needs several distinct recorded coordinates'
+  start = points[max(1, (len(points) - 1) // 5)]
+  end = points[min(len(points) - 2, (len(points) - 1) * 13 // 20)]
+  assert int(domain[0]) < start < end < int(domain[1]), 'recorded sample zoom is not inside the full domain'
+  return chart_x_fraction(start, domain), chart_x_fraction(end, domain)
+
+
+def visible_chart_coordinates(browser, metric, run_index):
+  return browser.call('POST', '/execute/sync', {'script': '''const card = [...document.querySelector('#chart-preview').querySelectorAll('[data-interactive-chart]')]
+    .find(node => node.dataset.chartMetric === arguments[0]);
+    return [...card.querySelectorAll('circle.point')].filter(node => node.dataset.chartSeries === String(arguments[1]) && node.getAttribute('display') !== 'none')
+      .map(node => node.dataset.xValue);''', 'args': [metric, run_index]})
+
+
 def time_axes(browser, run_ids, prefix='workspace'):
   def evaluate(script, *args):
     return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
@@ -382,12 +407,17 @@ def time_axes(browser, run_ids, prefix='workspace'):
     assert 'x_axis=' + axis in evaluate("return document.querySelector('#open-chart').href;"), 'Open chart lost the selected axis'
   def sample():
     return evaluate('''const card = [...document.querySelector('#chart-preview').querySelectorAll('[data-interactive-chart]')].find(node => node.querySelector('h2').textContent === 'loss');
-      const row = card.querySelector('[data-chart-readout-run]'); if (!row) return null;
+      const row = [...card.querySelectorAll('[data-chart-readout-run]')].find(node =>
+        ['chartStep', 'chartValue', 'chartX', 'chartTimestamp'].every(name => node.dataset[name] !== undefined && node.dataset[name] !== ''));
+      if (!row) return null;
       const circle = [...card.querySelectorAll('circle.point')].find(node => node.dataset.chartSeries === row.dataset.chartReadoutRun
-        && node.dataset.xValue === row.dataset.chartX && node.dataset.timestamp === row.dataset.chartTimestamp);
+        && node.dataset.xValue === row.dataset.chartX && node.dataset.timestamp === row.dataset.chartTimestamp && node.getAttribute('display') !== 'none');
+      if (!circle) return null;
       return {run_index: row.dataset.chartReadoutRun, run_id: row.querySelector('code').textContent,
         step: row.dataset.chartStep, value: row.dataset.chartValue, x: row.dataset.chartX, timestamp: row.dataset.chartTimestamp, text: row.textContent,
-        recorded: circle ? {x: circle.dataset.xValue, timestamp: circle.dataset.timestamp, label: circle.getAttribute('aria-label')} : null};''')
+        recorded: {x: circle.dataset.xValue, timestamp: circle.dataset.timestamp, label: circle.getAttribute('aria-label')}};''')
+  def visible_coordinates():
+    return visible_chart_coordinates(browser, 'loss', 1)
   def assert_recorded_sample(row, axis):
     assert row['run_index'] == '1' and row['run_id'] == run_ids[0], 'time readout inspected a hidden or unrelated run'
     assert 0 <= int(row['step']) < 80 and float(row['value']) == 1 / (int(row['step']) + 1), 'time readout changed the original step or metric value'
@@ -422,7 +452,10 @@ def time_axes(browser, run_ids, prefix='workspace'):
       assert evaluate("return document.querySelector('#open-chart').href;") == href, 'timezone display change altered the server chart URL'
       assert evaluate("return document.querySelector('#open-chart-label').textContent;") == 'Open UTC chart', 'standalone server chart timezone is ambiguous'
       chart_context(browser)
-      browser.pointer(loss + '//*[@data-chart-hit]', .35, using='xpath')
+      coordinates = visible_coordinates()
+      assert coordinates, 'timezone zoom contains no visible recorded first-run samples'
+      fraction = chart_x_fraction(coordinates[len(coordinates) // 2], after['range'])
+      browser.pointer(loss + '//*[@data-chart-hit]', fraction, using='xpath')
       row = wait_for(sample, 'timezone hover lost the exact recorded sample')
       assert_recorded_sample(row, 'wall_clock')
       if zone == 'local':
@@ -461,9 +494,13 @@ def time_axes(browser, run_ids, prefix='workspace'):
     assert row['step'] == '0' and float(row['value']) == 1, 'keyboard inspection changed the first time sample'
     if axis == 'elapsed':
       assert row['x'] == '0', 'elapsed axis did not anchor the first metric event at zero'
-    browser.pointer(loss + '//*[@data-chart-hit]', .2, .65, using='xpath')
+    # Wall-clock gaps between runs include collection/recovery/transfer delays.
+    # Drag within the visible run's recorded samples rather than that empty gap.
+    start_fraction, end_fraction = chart_sample_window(visible_coordinates(), full['domain'])
+    browser.pointer(loss + '//*[@data-chart-hit]', start_fraction, end_fraction, using='xpath')
     zoomed = state()
     assert int(full['domain'][0]) < int(zoomed['range'][0]) < int(zoomed['range'][1]) < int(full['domain'][1]), 'native drag did not narrow the time domain'
+    assert visible_coordinates(), 'native time zoom excluded every visible first-run sample'
     if axis == 'wall_clock':
       timezone_tags()
     Path('/tmp/' + prefix + '-' + axis + '.png').write_bytes(base64.b64decode(browser.call('GET', '/screenshot')))
@@ -1464,10 +1501,12 @@ def automatic_refresh(run_id, updated_run_id):
     chart_context(browser)
     loss_prefix = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
     browser.click(loss_prefix + '//button[code="' + run_id + '"]', using='xpath')
-    browser.pointer(loss_prefix + '//*[@data-chart-hit]', .2, .65, using='xpath')
+    start_fraction, end_fraction = chart_sample_window(visible_chart_coordinates(browser, 'loss', 2), loss_state()['domain'])
+    browser.pointer(loss_prefix + '//*[@data-chart-hit]', start_fraction, end_fraction, using='xpath')
     before = loss_state()
     assert before['hidden'] == [run_id], 'fixture did not hide the requested actual run'
     assert 0 < int(before['range'][0]) < int(before['range'][1]) < int(before['domain'][1]), 'fixture did not establish an absolute elapsed-time zoom'
+    assert visible_chart_coordinates(browser, 'loss', 2), 'elapsed refresh zoom excluded every visible updated-run sample'
     selected_labels = selection()
     evaluate("window.__refresh_original_preview = document.querySelector('#chart-preview');")
     # Keep one native pointer gesture active while the worker publishes. The
@@ -1525,9 +1564,11 @@ def automatic_refresh(run_id, updated_run_id):
     wait_for(lambda: (loss_state() or {}).get('time_zone') == 'utc', 'pause/resume fixture did not choose UTC')
     assert loss_state()['hidden'] == [run_id], 'time-axis switch forgot the hidden run'
     chart_context(browser)
-    browser.pointer(loss_prefix + '//*[@data-chart-hit]', .2, .65, using='xpath')
+    start_fraction, end_fraction = chart_sample_window(visible_chart_coordinates(browser, 'loss', 2), loss_state()['domain'])
+    browser.pointer(loss_prefix + '//*[@data-chart-hit]', start_fraction, end_fraction, using='xpath')
     before = loss_state()
     assert int(before['domain'][0]) < int(before['range'][0]) < int(before['range'][1]) < int(before['domain'][1]), 'pause/resume fixture did not lock a wall-clock range'
+    assert visible_chart_coordinates(browser, 'loss', 2), 'wall-clock refresh zoom excluded every visible updated-run sample'
 
     browser.click('#auto-refresh-toggle')
     wait_for(lambda: 'Auto updates off' in evaluate("return document.querySelector('#updated-at').textContent;"), 'pause control did not report its state')
