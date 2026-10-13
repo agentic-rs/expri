@@ -35,6 +35,10 @@ only. `run --no-publish` disables only that run's publication.
 
 ## Publishing configuration
 
+Deploy the updated server before upgrading run workers; complete system captures
+require its nine-file tracking archive limit. Stop an older standalone collector
+before starting the shared worker service.
+
 The existing server must advertise `system-profile-v1`. Configure a dedicated
 machine token with `[[machines]]`, its actual `machine_id`, and `token_env` on
 that server. Use matching machine service credentials locally. Project worker

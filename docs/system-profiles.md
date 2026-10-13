@@ -193,9 +193,11 @@ their hostname or worker label.
 
 ## Exact system metrics for runs
 
-Upgrade the run worker and restart the upgraded collector before launching new runs. Native and Python
-launchers reserve `outputs/system-profile.jsonl` when existing local profile
-storage is available. They record `system_capture_id` alongside `machine_id` in
+Deploy the updated server first so complete captures fit its nine-file tracking
+archive limit. Then upgrade run workers and stop any older standalone collector
+before launching new runs. Native runs start the shared service automatically.
+Native and Python launchers reserve `outputs/system-profile.jsonl` when existing
+local profile storage is available. They record `system_capture_id` alongside `machine_id` in
 run state. An existing user file at that path is never replaced.
 
 The collector copies each matching raw sample and its inventory into a durable

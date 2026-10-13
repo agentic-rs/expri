@@ -13,7 +13,7 @@ User-facing reports default to tables. Add `--json` when an agent or script
 needs the complete structured report. For example, use
 `expri service list --project-id vision --origin gpu-1 --json`.
 `--quiet` suppresses tables; explicit `--json` still prints the report.
-Serving and background worker commands retain their operational messages.
+Serving and foreground worker services retain their operational messages.
 
 Query and service client commands default to `[server]` in
 `~/.tokn/expri/config.toml`. Existing manually supplied tokens remain supported:
@@ -91,7 +91,11 @@ observer while the service keeps uploading. `resume` retries the matching saved
 job without rerunning training or creating a second publisher. Credential and
 option conflicts are reported rather than changing a saved job's destination.
 Each local run has one publishing destination; checkpoint receipts and publisher
-status are shared by that run.
+status are shared by that run. `--artifact` selects finalized files only when
+first registering a manual publication job. Automatically registered runs
+already have a saved job; later selections conflict with its pinned options.
+Use `artifact register` for live checkpoints before the inventory closes and
+`service file-upload` with the original run scope for additional post-run files.
 Each job snapshots only its required token into private worker storage outside
 the checkout, so a shared service never swaps process environment credentials.
 
@@ -100,6 +104,8 @@ in the terminal and rejects a duplicate. `service status` is read-only and never
 starts it. `service stop` stops collection/uploads, retains jobs and leaves
 training alive. The next run or publication starts it again. It does not start
 automatically at boot; the next start recovers saved jobs.
+Deploy the updated server before upgrading workers to automatic collection;
+complete system captures require its nine-file tracking archive limit.
 Keep original run files and `.expri/publish` until acknowledgment. Inspect publishing separately from task
 exit status. For tracking runs, `published` means tracking/checkpoint work was
 acknowledged and the server ZIP job accepted; its ZIP can still be uploading.

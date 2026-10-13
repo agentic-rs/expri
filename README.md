@@ -543,8 +543,10 @@ mode. Exact samples and referenced inventories remain in the run's
 `outputs/system-profile.jsonl`, independently of the 72-hour machine-history window.
 Overlapping runs share machine readings; these measurements describe the machine,
 not resource usage attributed to an individual process. Runs without a capture
-show an explicit unavailable state. Upgrade the run worker, restart the upgraded collector, and upgrade
-the hosted server to support `run-system-metrics-v1`, before starting new captures.
+show an explicit unavailable state. Deploy the updated hosted server first so
+its archive limit accepts all nine tracking files. Then upgrade workers and stop
+any older standalone collector before starting new captures; native runs start
+the shared worker service automatically.
 
 Opening a run starts with its curves in a compact metric grid. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads
@@ -663,8 +665,9 @@ checkpoints into the local review cache. One worker service collects machine
 history and retries publication jobs while training continues.
 `expri service publish` queues ongoing publication of an existing run and
 returns; `--wait` waits quietly and `--watch` shows progress until completion.
-Uploads keep durable multipart receipts; downloads verify file SHA256
-digests before publishing downloaded files. The server bundles and uploads
+Jobs retain their initial artifact selection; use `service file-upload` for
+additional post-run files. Uploads keep durable multipart receipts; downloads
+verify file SHA256 digests before publishing downloaded files. The server bundles and uploads
 acknowledged tracking files into `result.zip` in S3; checkpoints and inputs
 remain separate objects.
 

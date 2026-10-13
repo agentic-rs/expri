@@ -424,13 +424,28 @@ older completed S3 runs remain readable. An older server's unknown-capability
 response permits legacy publishing, while authentication and connection failures
 leave negotiation pending for retry.
 
-Large result files are selected explicitly after the run is terminal:
+For a run without a saved publication job, select finalized result files at
+its first manual registration. Selections remain pinned for subsequent retries:
 
 ```sh
 expri service publish --config worker.toml \
   --project-id vision --origin gpu-1 \
   --run-dir .expri/runs/run-abc123 --artifact outputs/checkpoint.pt
 ```
+
+An automatically registered run already has a saved job. Adding `--artifact`
+to a later `publish` request conflicts with that job's options. Register live
+checkpoints before its inventory closes, or upload additional files afterward
+with their original run scope:
+
+```sh
+expri service file-upload --config worker.toml \
+  --target '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-abc123"},"path":"outputs/checkpoint.pt"}' \
+  --file .expri/runs/run-abc123/outputs/checkpoint.pt
+```
+
+`file-upload` uploads the selected file independently of the saved run job and
+does not change its artifact selection or seal another result bundle.
 
 Multipart upload IDs and acknowledged parts survive retries and service
 restarts. A lost acknowledgement is reconciled with the service's stored receipt.
