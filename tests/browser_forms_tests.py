@@ -1,11 +1,16 @@
 """Keep native chart gestures inside recorded samples despite run timing gaps."""
 import importlib.util
+import json
 from pathlib import Path
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('browser_forms', Path(__file__).parent / 'containers/browser_forms.py')
 forms = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(forms)
+with patch.object(sys, 'path', [str(Path(__file__).parent / 'containers'), *sys.path]):
+  spec.loader.exec_module(forms)
 
 
 class ChartGestureTests(unittest.TestCase):
@@ -48,6 +53,40 @@ class ChartGestureTests(unittest.TestCase):
     for point, domain in [('1', ['1', '1']), ('11', ['0', '10']), ('-1', ['0', '10'])]:
       with self.subTest(point=point, domain=domain), self.assertRaises(AssertionError):
         forms.chart_x_fraction(point, domain)
+
+
+class PhaseCoordinationTests(unittest.TestCase):
+  def test_readers_keep_a_complete_phase_during_partial_replacement_writes(self):
+    with tempfile.TemporaryDirectory(prefix='expri-phase-test-') as directory:
+      path = Path(directory) / 'phase.json'
+      for previous in [None, 'publish-worker', 'published-worker']:
+        with self.subTest(previous=previous):
+          path.unlink(missing_ok=True)
+          if previous is not None:
+            forms.fixture_coordination.write_phase(path, previous)
+          def partial_dump(value, output):
+            content = json.dumps(value)
+            split = len(content) // 2
+            output.write(content[:split])
+            output.flush()
+            self.assertEqual(forms.fixture_coordination.read_phase(path), previous or '')
+            output.write(content[split:])
+          with patch.object(forms.fixture_coordination.json, 'dump', side_effect=partial_dump):
+            forms.fixture_coordination.write_phase(path, 'finished-runs')
+          self.assertEqual(forms.fixture_coordination.read_phase(path), 'finished-runs')
+          self.assertEqual(list(Path(directory).iterdir()), [path])
+
+  def test_failed_serialization_preserves_the_previous_phase_and_removes_temporary_file(self):
+    with tempfile.TemporaryDirectory(prefix='expri-phase-test-') as directory:
+      path = Path(directory) / 'phase.json'
+      forms.fixture_coordination.write_phase(path, 'publish-80')
+      def failed_dump(_value, output):
+        output.write('{')
+        raise OSError('injected incomplete phase write')
+      with patch.object(forms.fixture_coordination.json, 'dump', side_effect=failed_dump), self.assertRaises(OSError):
+        forms.fixture_coordination.write_phase(path, 'published-80')
+      self.assertEqual(forms.fixture_coordination.read_phase(path), 'publish-80')
+      self.assertEqual(list(Path(directory).iterdir()), [path])
 
 
 if __name__ == '__main__':

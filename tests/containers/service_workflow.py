@@ -576,6 +576,11 @@ def acknowledged_prefix_checks(updated):
   execute(worker, 'expri', 'service', 'start', '--json')
   wait_for(lambda: worker_service_status(worker)['ready'] is True, 'worker service did not restart after prefix recovery')
 
+def browser_phase(path, value=None):
+  args = [] if value is None else [value]
+  return execute(firefox, 'python3', '/opt/expri-browser/fixture_coordination.py',
+    path, *args, timeout=10).stdout.decode().strip()
+
 def automatic_dashboard_checks(run_id, updated):
   global refresh_browser
   coordination = '/tmp/expri-refresh-coordination.json'
@@ -585,9 +590,9 @@ def automatic_dashboard_checks(run_id, updated):
     if refresh_browser.poll() is not None:
       raise RuntimeError('Firefox auto-refresh test exited before fixture coordination finished: ' +
         log_tail(logs / 'browser-auto-refresh.log'))
-    return python(firefox, f"import json;from pathlib import Path;p=Path({coordination!r});print(json.loads(p.read_text()).get('phase','') if p.exists() else '')")
+    return browser_phase(coordination)
   def set_phase(value):
-    python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase':{value!r}}}))")
+    browser_phase(coordination, value)
   python(firefox, f"from pathlib import Path;Path({coordination!r}).unlink(missing_ok=True)")
   with (logs / 'browser-auto-refresh.log').open('wb') as output:
     refresh_browser = subprocess.Popen(['docker', 'exec', '--user', 'tester', firefox,
@@ -683,7 +688,7 @@ def project_dashboard_checks(first, second):
   def phase():
     if refresh_browser.poll() is not None:
       raise RuntimeError('Firefox project test exited before publication: ' + log_tail(logs / 'browser-project.log'))
-    return python(firefox, f"import json;from pathlib import Path;p=Path({coordination!r});print(json.loads(p.read_text()).get('phase','') if p.exists() else '')")
+    return browser_phase(coordination)
   with (logs / 'browser-project.log').open('wb') as output:
     refresh_browser = subprocess.Popen(['docker', 'exec', '--user', 'tester', firefox,
       'python3', '/opt/expri-browser/browser_forms.py', '--project', first['run_id']],
@@ -705,7 +710,7 @@ with (root / 'logs/stdout.log').open('a') as output:
       client(container, 'publish', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
         '--queue-dir', queue, config=config)
       wait_run_acknowledged(container, fixture['run_dir'], queue, origin=origin)
-      python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'published-{origin}'}}))")
+      browser_phase(coordination, 'published-' + origin)
     wait_for(lambda: phase() == 'finish-runs', 'Firefox did not request terminal project artifacts', timeout=90)
     for origin, container, fixture, config, queue in [
       ('worker', worker, first, '/tmp/worker.toml', WORKER_QUEUE),
@@ -736,7 +741,7 @@ assert record['status']=='completed' and record['exit_code']==0 and record['fini
 print('project terminal tracking queue verified')
 ''')
     project_artifact_checks(first, second)
-    python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'finished-runs'}}))")
+    browser_phase(coordination, 'finished-runs')
     wait_for(lambda: refresh_browser.poll() is not None, 'Firefox project workflow did not finish', timeout=90)
     if refresh_browser.returncode:
       raise RuntimeError('Firefox project workflow failed: ' + log_tail(logs / 'browser-project.log'))

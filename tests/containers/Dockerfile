@@ -83,6 +83,7 @@ RUN case "$(dpkg --print-architecture)" in \
   && printf '%s  /tmp/geckodriver.tar.gz\n' "$digest" | sha256sum --check \
   && tar --extract --gzip --file /tmp/geckodriver.tar.gz --directory /usr/local/bin \
   && rm /tmp/geckodriver.tar.gz
-COPY tests/containers/browser_proxy.py tests/containers/browser_forms.py /opt/expri-browser/
+COPY tests/containers/browser_proxy.py tests/containers/browser_forms.py \
+  tests/containers/fixture_coordination.py /opt/expri-browser/
 ENV HOME=/home/tester PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT ["python3", "/opt/expri-browser/browser_proxy.py"]
