@@ -347,7 +347,15 @@ fn bounded_slices_resume_stream_offsets_and_never_seal_a_shorter_prefix() {
   std::fs::create_dir(options.run_dir.join("logs")).unwrap();
   std::fs::write(options.run_dir.join("logs/stdout.log"), vec![b'a'; size]).unwrap();
   let job = prepare_manual(&options).unwrap();
-  assert!(!run_job(&job, Arc::new(AtomicBool::new(false)), &mut |_| Ok(())).unwrap());
+  let mut report = Value::Null;
+  assert!(
+    !run_job(&job, Arc::new(AtomicBool::new(false)), &mut |value| {
+      report = value;
+      Ok(())
+    })
+    .unwrap()
+  );
+  assert_eq!(report["backlog_remaining"], true);
   let queue = job
     .queue_dir
     .join("runs/project/worker/run-fixture/queue.json");
@@ -356,13 +364,73 @@ fn bounded_slices_resume_stream_offsets_and_never_seal_a_shorter_prefix() {
   assert!(saved["archive"].is_null());
   let recovered: PreparedJob = serde_json::from_value(serde_json::to_value(job).unwrap()).unwrap();
   assert!(
-    run_job(
-      &recovered,
-      Arc::new(AtomicBool::new(false)),
-      &mut |_| Ok(())
-    )
+    run_job(&recovered, Arc::new(AtomicBool::new(false)), &mut |value| {
+      report = value;
+      Ok(())
+    })
     .unwrap()
   );
+  assert_eq!(report["backlog_remaining"], false);
+  server.join().unwrap();
+}
+
+#[test]
+fn caught_up_and_idle_runs_do_not_hint_backlog_and_direct_reports_stay_unchanged() {
+  let (url, server) = mock(5, |request, _| {
+    let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => Response::Capabilities {
+        features: vec!["tracking-v1".into()],
+      },
+      Request::PutDocument {
+        revision,
+        total_size,
+        ..
+      } => Response::DocumentAcknowledged {
+        revision,
+        offset: total_size,
+        complete: true,
+      },
+      Request::AppendTracking {
+        offset,
+        data_base64,
+        ..
+      } => Response::Acknowledged {
+        offset: offset + STANDARD.decode(data_base64).unwrap().len() as u64,
+      },
+      _ => panic!("active idle run must not upload objects or seal"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let (_root, options) = fixture(&url);
+  fs::atomic_json(
+    &options.run_dir.join("run-state.json"),
+    &json!({"run_id":"run-fixture", "status":"running"}),
+  )
+  .unwrap();
+  std::fs::write(
+    options.run_dir.join("outputs/metrics.jsonl"),
+    b"{\"step\":1,\"metrics\":{\"loss\":0.5}}\n",
+  )
+  .unwrap();
+  let job = prepare_manual(&options).unwrap();
+  let stop = Arc::new(AtomicBool::new(false));
+  for _ in 0..2 {
+    let mut report = Value::Null;
+    assert!(
+      !run_job(&job, Arc::clone(&stop), &mut |value| {
+        report = value;
+        Ok(())
+      })
+      .unwrap()
+    );
+    assert_eq!(
+      report["backlog_remaining"], false,
+      "caught-up watch must keep the idle cadence"
+    );
+  }
+  let direct = Publisher::new(&options).unwrap();
+  assert!(direct.report(false).get("backlog_remaining").is_none());
+  assert!(direct.progress(false).get("backlog_remaining").is_none());
   server.join().unwrap();
 }
 

@@ -184,6 +184,7 @@ pub(super) fn sync_stream_up_to(
     ));
   }
   let target_size = size;
+  let initial_offset = offset;
   let size = api
     .stream_budget
     .map_or(size, |budget| size.min(offset.saturating_add(budget)));
@@ -242,6 +243,7 @@ pub(super) fn sync_stream_up_to(
     queue.state.streams.insert(path.into(), 0);
     queue.save()?;
   }
+  api.note_stream_backlog(offset > initial_offset && offset < target_size);
   Ok(offset == target_size)
 }
 

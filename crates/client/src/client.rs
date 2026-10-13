@@ -119,6 +119,7 @@ impl Publisher {
   }
 
   pub(super) fn cycle(&mut self, progress: &mut dyn FnMut(Value) -> Result<()>) -> Result<bool> {
+    self.api.reset_stream_backlog();
     let checkpoints_done = self.checkpoints.poll(
       &self.api,
       &self.run_dir,
@@ -156,19 +157,26 @@ impl Publisher {
           .map(|file| file.path),
       );
     }
-    json!({
+    let mut report = json!({
       "scope": self.scope, "terminal": done,
       "files": files,
       "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
       "protocol": self.queue.state.protocol,
       "system_capture_upload": system_upload_report(&self.queue),
       "result_upload": upload_report(json!(self.queue.state.archive)),
-    })
+    });
+    if self.api.cooperative() {
+      report["backlog_remaining"] = json!(self.api.backlog_remaining());
+    }
+    report
   }
 
   pub(super) fn progress(&self, done: bool) -> Value {
     let mut progress = queue_progress(&self.queue);
     progress["terminal"] = json!(done);
+    if self.api.cooperative() {
+      progress["backlog_remaining"] = json!(self.api.backlog_remaining());
+    }
     progress["queue_dir"] = json!(self.queue.directory);
     if let Ok(checkpoints) = super::registrations::records(&self.run_dir) {
       progress["checkpoints"] = json!({

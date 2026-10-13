@@ -108,6 +108,7 @@ pub(crate) struct Api {
   async_objects: Option<reqwest::Client>,
   stop: Option<Arc<AtomicBool>>,
   pub(super) stream_budget: Option<u64>,
+  stream_backlog: Arc<AtomicBool>,
 }
 
 impl Api {
@@ -156,6 +157,7 @@ impl Api {
         None
       },
       stream_budget: stop.as_ref().map(|_| 256 * 1024),
+      stream_backlog: Arc::new(AtomicBool::new(false)),
       stop,
     })
   }
@@ -169,6 +171,20 @@ impl Api {
 
   pub(super) fn cooperative(&self) -> bool {
     self.stop.is_some()
+  }
+
+  pub(super) fn reset_stream_backlog(&self) {
+    self.stream_backlog.store(false, Ordering::Release);
+  }
+
+  pub(super) fn note_stream_backlog(&self, progressed: bool) {
+    if self.cooperative() && progressed {
+      self.stream_backlog.store(true, Ordering::Release);
+    }
+  }
+
+  pub(super) fn backlog_remaining(&self) -> bool {
+    self.cooperative() && self.stream_backlog.load(Ordering::Acquire)
   }
 
   pub(super) fn binding_id(&self) -> String {

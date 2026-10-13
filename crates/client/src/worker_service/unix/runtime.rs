@@ -159,10 +159,16 @@ pub(in crate::worker_service) fn run_runtime(
             {
               continue;
             }
-            if let Ok(state) = registry::read_state(&path)
-              && state.retry_at_ms > registry::now()
-            {
-              continue;
+            if let Ok(state) = registry::read_state(&path) {
+              let now = registry::now();
+              if state.retry_at_ms > now {
+                // A useful bounded slice can be due before the ordinary idle
+                // scan. Keep its deadline without changing the fair job order.
+                let delay =
+                  Duration::from_millis(state.retry_at_ms.saturating_sub(now).min(1_000) as u64);
+                next_scan = next_scan.min(Instant::now() + delay);
+                continue;
+              }
             }
             let stop = context.stop_flag();
             let runner = runner.clone();
@@ -240,7 +246,11 @@ fn run_slice(directory: &Path, stop: Arc<AtomicBool>, runner: &Runner) -> Result
   let mut state = registry::read_state(directory)?;
   state.status = "publishing".into();
   state.save(directory)?;
+  let mut backlog_remaining = false;
   let result = runner(&job, stop.clone(), &mut |progress| {
+    // Only a fresh successful slice may request prompt continuation. Persisted
+    // progress can be stale when a legacy publisher currently owns the lease.
+    backlog_remaining = progress["backlog_remaining"].as_bool() == Some(true);
     state.progress = redact_value(progress, &job);
     state.save(directory)
   });
@@ -257,6 +267,8 @@ fn run_slice(directory: &Path, stop: Arc<AtomicBool>, runner: &Runner) -> Result
       state.failures = 0;
       state.retry_at_ms = if stop.load(Ordering::Acquire) {
         0
+      } else if backlog_remaining {
+        registry::now() + 100
       } else {
         registry::now() + 5_000
       };

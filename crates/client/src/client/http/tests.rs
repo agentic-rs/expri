@@ -17,6 +17,7 @@ pub(in crate::client) fn api(url: &str) -> Api {
     async_objects: None,
     stop: None,
     stream_budget: None,
+    stream_backlog: Arc::new(AtomicBool::new(false)),
   }
 }
 

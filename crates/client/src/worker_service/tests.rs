@@ -835,3 +835,131 @@ fn copied_run_binding_rejects_transplant_until_independent_handoffs_are_reset() 
     true
   );
 }
+
+#[test]
+fn acknowledged_backlog_continues_quickly_without_starving_idle_or_failed_jobs() {
+  let (temporary, paths, job) = fixture();
+  let mut ids = std::collections::BTreeMap::new();
+  for name in [
+    "backlog-0",
+    "backlog-1",
+    "backlog-2",
+    "backlog-3",
+    "backlog-4",
+    "idle",
+    "error",
+    "stale",
+  ] {
+    let independent =
+      independent_job_with_same_id(&job, &temporary.path().canonicalize().unwrap().join(name));
+    let report = registry::register(&paths, independent).unwrap();
+    ids.insert(
+      name.to_owned(),
+      report["job_id"].as_str().unwrap().to_owned(),
+    );
+  }
+  let root = files::existing(&paths).unwrap().unwrap().join("jobs");
+  let mut stale = registry::read_state(&root.join(&ids["stale"])).unwrap();
+  stale.progress = json!({"backlog_remaining": true});
+  stale.save(&root.join(&ids["stale"])).unwrap();
+  let calls = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+    String,
+    usize,
+  >::new()));
+  let observed = calls.clone();
+  let runner = Arc::new(
+    move |job: &PreparedJob, _: Arc<AtomicBool>, progress: &mut dyn FnMut(Value) -> Result<()>| {
+      let name = job
+        .run_dir()
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+      let count = {
+        let mut calls = observed.lock().unwrap();
+        let count = calls.entry(name.clone()).or_default();
+        *count += 1;
+        *count
+      };
+      if name.starts_with("backlog-") {
+        progress(
+          json!({"backlog_remaining": count < 4, "stream_offsets": {"outputs/metrics.jsonl": count * 262_144}}),
+        )?;
+        return Ok(count >= 4);
+      }
+      if name == "error" {
+        // An error must never adopt even a fresh continuation hint.
+        progress(json!({"backlog_remaining": true}))?;
+        return Err(expri_core::error::ExpriError::ServiceUnavailable {
+          reading_response: false,
+        });
+      }
+      // No new progress models idle work or a held legacy publishing lease.
+      Ok(false)
+    },
+  );
+  let service_paths = paths.clone();
+  let start = Instant::now();
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  let deadline = start + Duration::from_secs(4);
+  loop {
+    let snapshot = calls.lock().unwrap().clone();
+    let backlog_done = (0..5).all(|index| {
+      snapshot
+        .get(&format!("backlog-{index}"))
+        .copied()
+        .unwrap_or(0)
+        >= 4
+    });
+    let older_jobs_ran = ["idle", "error", "stale"]
+      .iter()
+      .all(|name| snapshot.get(*name) == Some(&1));
+    if backlog_done && older_jobs_ran {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "useful backlog was throttled or older jobs were starved: {snapshot:?}"
+    );
+    thread::sleep(Duration::from_millis(20));
+  }
+  for index in 0..5 {
+    let id = &ids[&format!("backlog-{index}")];
+    let deadline = start + Duration::from_secs(4);
+    while job_status(&paths, id).unwrap()["status"] != "published" {
+      assert!(Instant::now() < deadline);
+      thread::sleep(Duration::from_millis(10));
+    }
+  }
+  for name in ["idle", "stale"] {
+    let state = registry::read_state(&root.join(&ids[name])).unwrap();
+    assert_eq!(state.status, "queued");
+    assert!(state.retry_at_ms - state.updated_at_ms > 4_000);
+  }
+  let mut failed = registry::read_state(&root.join(&ids["error"])).unwrap();
+  assert_eq!(failed.status, "retrying");
+  assert_eq!(failed.failures, 1);
+  assert!(failed.retry_at_ms - failed.updated_at_ms > 4_000);
+  // Make the saved first retry due without waiting for five wall-clock seconds.
+  // The next failure must preserve the existing exponential cooldown.
+  failed.retry_at_ms = 0;
+  failed.save(&root.join(&ids["error"])).unwrap();
+  let deadline = Instant::now() + Duration::from_secs(2);
+  loop {
+    let state = registry::read_state(&root.join(&ids["error"])).unwrap();
+    if state.failures == 2 {
+      assert!(state.retry_at_ms - state.updated_at_ms > 9_000);
+      break;
+    }
+    assert!(Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(20));
+  }
+  assert_eq!(calls.lock().unwrap().get("idle"), Some(&1));
+  assert_eq!(calls.lock().unwrap().get("stale"), Some(&1));
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
