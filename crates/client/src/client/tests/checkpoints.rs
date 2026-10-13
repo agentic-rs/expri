@@ -293,9 +293,9 @@ fn live_checkpoint_transfer_does_not_block_metrics_and_terminal_seal_waits_for_i
     .open(options.run_dir.join("outputs/metrics.jsonl"))
     .unwrap();
   metrics.write_all(b"{\"step\":2}\n").unwrap();
-  let started = Instant::now();
   assert!(!publisher.cycle(&mut |_| Ok(())).unwrap());
-  assert!(started.elapsed() < Duration::from_secs(1));
+  assert!(!*server.release.0.lock().unwrap());
+  assert_eq!(server.state.lock().unwrap().object_puts, 0);
   assert!(server.state.lock().unwrap().metric_offsets.last().unwrap() > &initial_offset);
   fs::atomic_json(
     &options.run_dir.join("run-state.json"),
@@ -355,12 +355,9 @@ fn shared_checkpoint_transfer_outlives_control_slices_without_reloading_credenti
     .open(options.run_dir.join("outputs/metrics.jsonl"))
     .unwrap();
   metrics.write_all(b"{\"step\":2}\n").unwrap();
-  let started = Instant::now();
   assert!(!cycle());
-  assert!(
-    started.elapsed() < Duration::from_secs(1),
-    "a blocked object upload stalled its next metrics slice"
-  );
+  assert!(!*server.release.0.lock().unwrap());
+  assert_eq!(server.state.lock().unwrap().object_puts, 0);
   assert!(server.state.lock().unwrap().metric_offsets.last().unwrap() > &initial_offset);
   fs::atomic_json(
     &options.run_dir.join("run-state.json"),
