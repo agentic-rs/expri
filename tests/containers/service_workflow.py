@@ -147,7 +147,7 @@ def stop_worker_service(container):
   wait_for(lambda: worker_service_status(container)['running'] is False,
     'worker service did not release its lease after draining current transfers', timeout=60)
 
-def wait_run_acknowledged(container, run_dir, queue_dir, project_id='demo', origin='worker'):
+def wait_run_acknowledged(container, run_dir, queue_dir, project_id='demo', origin='worker', artifact_paths=()):
   # Registration only acknowledges the durable job. Browser coordination waits
   # for accepted stream offsets and exact metadata revisions in its transfer queue.
   acknowledged = f'''import hashlib, json
@@ -159,15 +159,24 @@ ready=path.is_file()
 if ready:
   saved=json.loads(path.read_text())
   ready=saved.get('protocol')=='tracking_v1'
+  inventory=root/'outputs/.expri-artifacts.json'
+  inventory_bytes=inventory.read_bytes() if inventory.is_file() else None
+  ready=ready and inventory_bytes is not None
+  if {bool(artifact_paths)!r} and inventory_bytes is not None:
+    reported={{entry['path']:entry for entry in json.loads(inventory_bytes).get('files',[])}}
+    for name in {list(artifact_paths)!r}:
+      source=root/name
+      ready=ready and source.is_file() and reported.get(name,{{}}).get('size')==source.stat().st_size
   for name in ['outputs/metrics.jsonl','logs/stdout.log','logs/stderr.log']:
     source=root/name
     if source.is_file():
       ready=ready and saved.get('streams',{{}}).get(name,0)>=source.stat().st_size
-  for name in ['run-state.json','snapshot.json','outputs/params.json']:
+  for name in ['run-state.json','snapshot.json','environment/environment-state.json','outputs/params.json','outputs/.expri-artifacts.json']:
     source=root/name
     if source.is_file():
       document=saved.get('documents',{{}}).get(name,{{}})
-      ready=ready and document.get('complete') is True and document.get('sha256')==hashlib.sha256(source.read_bytes()).hexdigest()
+      content=inventory_bytes if source==inventory else source.read_bytes()
+      ready=ready and document.get('complete') is True and document.get('sha256')==hashlib.sha256(content).hexdigest()
 print(ready)
 '''
   wait_for(lambda: python(container, acknowledged) == 'True',
@@ -626,11 +635,13 @@ for row, value in [(timed[0], 0.7), (timed[-1], 0.07)]:
 ''')
   client(host, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker-b',
     '--queue-dir', '/home/tester/project-machine-queue', config='/tmp/machine-worker.toml')
-  wait_run_acknowledged(host, run_dir, '/home/tester/project-machine-queue', origin='worker-b')
+  wait_run_acknowledged(host, run_dir, '/home/tester/project-machine-queue', origin='worker-b',
+    artifact_paths=['outputs/project-scope.txt'])
   python(worker, f"from pathlib import Path;Path({original['run_dir']!r}+'/outputs/project-scope.txt').write_text('worker scope fixture'+chr(10))")
   client(worker, 'publish', '--run-dir', original['run_dir'], '--project-id', 'demo', '--origin', 'worker',
     '--queue-dir', WORKER_QUEUE)
-  wait_run_acknowledged(worker, original['run_dir'], WORKER_QUEUE)
+  wait_run_acknowledged(worker, original['run_dir'], WORKER_QUEUE,
+    artifact_paths=['outputs/project-scope.txt'])
   assert json.loads(python(host, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['run_id'] == original['run_id'], 'second recorded machine did not preserve the colliding run ID'
   return {'run_id': original['run_id'], 'run_dir': run_dir}
 

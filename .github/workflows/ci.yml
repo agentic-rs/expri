@@ -100,8 +100,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Verify service workflow progress reporting
-        run: python3 -B tests/containers/workflow_progress_tests.py
+      - name: Verify service workflow fixtures and progress reporting
+        run: |
+          python3 -B tests/containers/workflow_progress_tests.py
+          python3 -B tests/service_workflow_helpers_tests.py
 
       - name: Test private inputs, offline runs, resumable checkpoints and local review
         env:
