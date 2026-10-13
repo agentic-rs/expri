@@ -1042,3 +1042,36 @@ fn stop_handles_delayed_or_lost_control_acknowledgments() {
     }
   }
 }
+
+#[test]
+fn accepted_control_socket_waits_for_a_delayed_request() {
+  use std::io::{BufRead, BufReader, Write};
+  use std::os::unix::net::UnixStream;
+
+  let (mut server, mut client) = UnixStream::pair().unwrap();
+  // Model an accepted socket on platforms that inherit the listener's mode.
+  server.set_nonblocking(true).unwrap();
+  client
+    .set_read_timeout(Some(Duration::from_secs(1)))
+    .unwrap();
+  let context = ServiceContext::new();
+  context.collection_ready("machine-fixture".into(), 1);
+  let (entered, handling) = mpsc::channel();
+  let handler = thread::spawn(move || {
+    entered.send(()).unwrap();
+    unix::handle(&mut server, &context, 0, 0)
+  });
+  handling.recv_timeout(Duration::from_secs(1)).unwrap();
+  thread::sleep(Duration::from_millis(30));
+  client.write_all(b"{\"operation\":\"status\"}\n").unwrap();
+  let mut response = String::new();
+  BufReader::new(client).read_line(&mut response).unwrap();
+  handler.join().unwrap().unwrap();
+  let response: Value = serde_json::from_str(&response).unwrap();
+  assert_eq!(response["ok"], true);
+  assert_eq!(response["value"]["ready"], true);
+  assert_eq!(
+    response["value"]["collection"]["machine_id"],
+    "machine-fixture"
+  );
+}

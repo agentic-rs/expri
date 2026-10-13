@@ -260,6 +260,7 @@ fn a_stalled_service_request_does_not_block_collection() {
         Err(error) => panic!("{error}"),
       }
     };
+    stream.set_nonblocking(false).unwrap();
     stream
       .set_read_timeout(Some(Duration::from_secs(5)))
       .unwrap();

@@ -215,6 +215,7 @@ fn collection_continues_during_publish_failure_and_retries_keep_the_original_aut
           Err(error) => panic!("fixture accept: {error}"),
         }
       };
+      stream.set_nonblocking(false).unwrap();
       stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();

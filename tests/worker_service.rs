@@ -39,6 +39,7 @@ impl Fixture {
           thread::sleep(Duration::from_millis(10));
           continue;
         };
+        socket.set_nonblocking(false).unwrap();
         socket
           .set_read_timeout(Some(Duration::from_secs(1)))
           .unwrap();

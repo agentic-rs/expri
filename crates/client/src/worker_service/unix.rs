@@ -328,6 +328,9 @@ pub(super) fn handle(
   active: usize,
   pending: usize,
 ) -> Result<()> {
+  // Accepted sockets inherit the listener's nonblocking mode on some Unix
+  // platforms. Apply bounded blocking I/O before waiting for the request.
+  stream.set_nonblocking(false)?;
   stream.set_read_timeout(Some(Duration::from_millis(200)))?;
   stream.set_write_timeout(Some(Duration::from_millis(200)))?;
   let request: Request = serde_json::from_slice(&read_frame(stream, 4 * 1024)?)
