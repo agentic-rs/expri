@@ -1,6 +1,13 @@
-//! A worker-local publisher outlives training and resumes the existing upload queue.
+//! Durable run registration and bounded publishing slices for the worker service.
+mod job;
+pub use job::{PreparedJob, prepare, prepare_manual, run_job};
+
+/// Join this service's cancelled object transfers before releasing its lease.
+pub fn drain_jobs(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
+  crate::client::checkpoints::drain(stop)
+}
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -139,8 +146,16 @@ fn read_intent(directory: &Path) -> Result<Intent> {
 fn read_state(directory: &Path) -> Result<PublishingState> {
   let state: PublishingState =
     serde_json::from_slice(&fs::read_bounded(&directory.join(STATE), RECORD_LIMIT)?)?;
+  let run: Value = serde_json::from_slice(&fs::read_bounded(
+    &directory.join("run-state.json"),
+    crate::client::RECORD_LIMIT,
+  )?)?;
+  let expected_id = run["run_id"]
+    .as_str()
+    .ok_or_else(|| error("run state has no run_id"))?;
+  validate_component(expected_id)?;
   if state.schema_version != 1
-    || state.run_id != run_id(directory)?
+    || state.run_id != expected_id
     || !matches!(
       state.status.as_str(),
       "pending" | "publishing" | "retrying" | "error" | "published"
@@ -159,7 +174,7 @@ fn runtime_config(intent: &Intent) -> Result<PathBuf> {
       "Publisher client configuration must stay outside the source checkout",
     ));
   }
-  client::validate_config(&path).map_err(|failure| error(safe_error(&failure)))?;
+  crate::load_client_config(&path).map_err(|failure| error(safe_error(&failure)))?;
   Ok(path)
 }
 
@@ -198,53 +213,25 @@ fn worker_lease(directory: &Path) -> Result<Option<FileLock>> {
   }
 }
 
-#[cfg(unix)]
-fn spawn_worker(intent: &Intent) -> Result<()> {
-  use std::os::unix::process::CommandExt;
-  let mut command = Command::new(std::env::current_exe()?);
-  command
-    .args(["service", "publish-worker", "--run-dir"])
-    .arg(&intent.run_dir)
-    .current_dir(&intent.repo_root)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
-  // Re-exec closes the upload/run leases. The publisher has its own lifetime.
-  unsafe {
-    command.pre_exec(|| {
-      if libc::setsid() < 0 {
-        return Err(std::io::Error::last_os_error());
-      }
-      Ok(())
-    });
-  }
-  let mut child = command.spawn()?;
-  thread::spawn(move || {
-    let _ = child.wait();
-  });
-  Ok(())
-}
-
-#[cfg(not(unix))]
-fn spawn_worker(_: &Intent) -> Result<()> {
-  Err(error(
-    "Automatic service publishing requires Unix process supervision",
-  ))
-}
-
 fn launch(intent: &Intent, state: &mut PublishingState, lease: FileLock) -> Result<()> {
-  if let Err(failure) = runtime_config(intent) {
-    let detail = safe_error(&failure);
-    state.fail(&intent.run_dir, detail.clone())?;
-    return Err(error(detail));
-  }
+  let job = match job::prepare_automatic(intent) {
+    Ok(job) => job,
+    Err(failure) => {
+      let detail = safe_error(&failure);
+      state.fail(&intent.run_dir, detail.clone())?;
+      return Err(error(detail));
+    }
+  };
   state.last_error = None;
   state.retry_after_seconds = None;
   state.save(&intent.run_dir, "pending")?;
-  // Release before re-exec so a fast child can claim the publisher lease.
-  // Concurrent candidates are harmless: only one worker obtains the lease.
+  // The shared service takes the same existing lease for each publishing slice.
   drop(lease);
-  if let Err(failure) = spawn_worker(intent)
+  let registered = expri_core::storage::StoragePaths::resolve(None).and_then(|paths| {
+    job.validate_storage(paths.root())?;
+    crate::worker_service::register(&paths, job)
+  });
+  if let Err(failure) = registered
     && let Some(_lease) = owned_lease(&intent.run_dir)?
   {
     let current = read_state(&intent.run_dir)?;
@@ -284,8 +271,14 @@ pub fn start(repo_root: &Path, run_dir: &Path, config: &RunServiceConfig) -> Res
   } else {
     fs::atomic_json(&request_path, &intent)?;
   }
-  let mut state = PublishingState::new(&intent)?;
-  state.save(&intent.run_dir, "pending")?;
+  let mut state = if intent.run_dir.join(STATE).try_exists()? {
+    read_state(&intent.run_dir)?
+  } else {
+    PublishingState::new(&intent)?
+  };
+  if state.status == "published" {
+    return Ok(());
+  }
   launch(&intent, &mut state, lease)
 }
 
@@ -297,6 +290,26 @@ pub fn resume(run_dir: &Path) -> Result<Value> {
     report["already_running"] = json!(true);
     return Ok(report);
   };
+  if directory.join(STATE).try_exists()? {
+    let state = read_state(&directory)?;
+    if state.status == "published" {
+      let mut report = serde_json::to_value(state)?;
+      client::project_result_upload(&mut report["progress"]);
+      report["started"] = json!(false);
+      return Ok(report);
+    }
+  }
+  let paths = expri_core::storage::StoragePaths::resolve(None)?;
+  if let Some(mut report) = crate::worker_service::resume_registered_run(&paths, &directory)? {
+    drop(lease);
+    let run_id = report["registration"]["scope"]["run_id"]
+      .as_str()
+      .ok_or_else(|| error("saved publication omitted its run identity"))?
+      .to_owned();
+    report["run_id"] = json!(run_id);
+    report["started"] = json!(report["status"] != "published");
+    return Ok(report);
+  }
   let intent = read_intent(&directory)?;
   let mut state = read_state(&directory)?;
   if state.status != "published" {

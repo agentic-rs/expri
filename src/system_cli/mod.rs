@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::error::{ExpriError, Result};
 use crate::output::print_report;
-use config::GlobalConfig;
+use config::{CollectionConfig, GlobalConfig};
 
 #[derive(Debug, Args)]
 pub struct SystemCommand {
@@ -34,7 +34,7 @@ pub struct SystemCommand {
 enum SystemSubcommand {
   /// Collect one inventory and sample, saving them in global storage.
   Sample,
-  /// Continuously collect locally and independently publish configured batches.
+  /// Deprecated compatibility alias for service start --foreground.
   Daemon {
     /// Override the global configuration; defaults to ten seconds.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=60))]
@@ -42,7 +42,7 @@ enum SystemSubcommand {
     /// Machine service client configuration; overrides global publishing settings.
     #[arg(long, conflicts_with = "no_publish")]
     client_config: Option<PathBuf>,
-    /// Collect locally without publishing this daemon's samples.
+    /// Collect locally without publishing this service's machine-profile samples.
     #[arg(long)]
     no_publish: bool,
   },
@@ -130,7 +130,8 @@ fn writable_paths(paths: &StoragePaths) -> Result<StoragePaths> {
 fn existing_store(paths: &StoragePaths) -> Result<LocalStore> {
   LocalStore::open_readonly(&paths.profile_database())?.ok_or_else(|| {
     ExpriError::Message(
-      "no local system profile yet; run expri system sample or expri system daemon".into(),
+      "no local system profile yet; run expri system sample or expri service start --foreground"
+        .into(),
     )
   })
 }
@@ -164,14 +165,15 @@ pub fn run(command: SystemCommand, target: Option<&str>, quiet: bool) -> Result<
       client_config,
       no_publish,
     } => {
-      let config = GlobalConfig::load(&paths.config_file())?;
-      let interval = config.interval(interval_seconds)?;
-      let client_config = if no_publish {
-        None
-      } else {
-        config.client_config(client_config)
-      };
-      daemon::run(writable_paths(&paths)?, interval, client_config)
+      let config = CollectionConfig::load(&paths, interval_seconds, client_config, no_publish)?;
+      let paths = writable_paths(&paths)?;
+      eprintln!(
+        "expri system daemon is deprecated; use expri service start --foreground. Running the shared worker service."
+      );
+      let collection_paths = paths.clone();
+      expri_client::worker_service::run_foreground(&paths, move |context| {
+        daemon::run(collection_paths, config, context)
+      })
     }
     SystemSubcommand::Status => status(&paths, command.json, quiet),
     SystemSubcommand::History(options) => {
@@ -200,6 +202,16 @@ pub fn run(command: SystemCommand, target: Option<&str>, quiet: bool) -> Result<
   }
 }
 
+/// The worker runtime calls this hook in its collection thread. Local readiness
+/// is independent of machine-profile credentials and network availability.
+pub(crate) fn collect_for_service(
+  paths: StoragePaths,
+  context: expri_client::worker_service::ServiceContext,
+) -> Result<()> {
+  let config = CollectionConfig::load(&paths, None, None, false)?;
+  daemon::run(writable_paths(&paths)?, config, context)
+}
+
 // An explicit publishing request may use [server]. Continuous collection still
 // enables its publisher only through an explicit or saved profile publishing setting.
 fn publishing_config(paths: &StoragePaths, explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -225,12 +237,14 @@ fn status(paths: &StoragePaths, json: bool, quiet: bool) -> Result<()> {
     false
   };
   let publishing = daemon::read_status(&paths.root().join("publishing.json"))?;
+  let collection = daemon::read_status(&paths.root().join("collector.json"))?;
   print(
     &json!({
       "storage_dir": paths.root(), "collector_running": active,
       "local": store.as_ref().map(LocalStore::status).transpose()?,
       "machine": store.as_ref().map(LocalStore::profile).transpose()?.flatten(),
       "publishing": publishing,
+      "collection": collection,
     }),
     json,
     quiet,

@@ -8,7 +8,9 @@ Each machine stores this new data under `~/.tokn/expri`:
   config.toml        # Server connection and optional system-profile settings
   profiles.sqlite3  # Stable machine ID, inventories, samples, hourly history, upload receipts
   collector.lock    # Live collector lease
+  collector.json   # Local collection status
   publishing.json   # Last publisher status and error
+  worker-service/  # Service lease, status and private durable run jobs
 ```
 
 Existing project configuration, assets, uv caches, runs, and experiment
@@ -22,19 +24,38 @@ on Unix. Resolving paths and inspecting an empty store creates no files.
 ```sh
 expri system sample
 expri system status
-expri system daemon --no-publish
+expri service start
+expri service status
+expri service stop
 ```
 
 `sample` saves one inventory and observation and prints a table, including the
 stable machine ID. Add `--json` to obtain the complete machine-readable report.
-`daemon` runs in the foreground and samples every ten
-seconds by default. Run it on every machine you want to record. It operates
-without `expri.toml` or an active experiment and allows one collector per storage
-directory. Stop it with Ctrl-C. Start it again after a restart; expri does not
-install an OS service. These commands execute on the current machine and reject
-`-T`; invoke them on the worker itself for worker measurements.
+Native runs start the shared worker service before recording their machine
+identity and capture period. Concurrent and later runs reuse it. `service start`
+starts it in the background or reuses the existing process; `--foreground` runs
+it in the current terminal and refuses a second owner. The service samples every
+ten seconds by default and operates without `expri.toml` or an active experiment.
+It stays running until stopped and starts again on the next run or publication.
+`service stop` stops collection and uploads, retaining saved work and leaving
+training alive. Ctrl-C stops a foreground service. After reboot, the next run,
+publication, or explicit start recovers saved jobs; expri does not install an OS
+service. Commands execute on the current machine and reject `-T`; invoke them on
+the worker itself. `service status` creates no files and reports collection,
+machine publishing and run jobs separately.
 
-For another interval, use `--interval-seconds 30` or create global configuration:
+The old `expri system daemon` command is a deprecated foreground compatibility
+alias for the shared worker service. Its `--no-publish` disables only machine
+history publication for that invocation. A run's `--no-publish` disables only
+that run's publication. Local collection and any configured machine publisher
+continue independently.
+
+When upgrading a worker with an older standalone collector already running,
+stop that collector through its terminal or process manager before starting the
+new service. Its collection lease prevents a second collector from taking over.
+Existing training and durable capture data remain available.
+
+For another interval, create global configuration:
 
 ```toml
 # ~/.tokn/expri/config.toml
@@ -91,12 +112,16 @@ client_config = "/home/me/.tokn/expri/machine-client.toml"
 ```
 
 ```sh
-expri system daemon
-expri system daemon --client-config /path/to/machine-client.toml
+expri service start
 expri system publish --client-config /path/to/machine-client.toml
 ```
 
-The daemon collects even while publishing fails. Its independent publisher
+Restart an already running service after changing its collection or publishing
+configuration. Machine publishing requires the explicit saved setting above;
+a general `[server]` connection alone leaves it `unconfigured` in service status.
+Run publication and machine history use their own scoped credentials.
+
+The worker service collects even while publishing fails. Its independent publisher
 retries bounded batches and stores acknowledgements per endpoint. `publish`
 sends one pending batch without starting a collector. The owner can read all
 machines; machine credentials can publish/read only their own machine. Existing

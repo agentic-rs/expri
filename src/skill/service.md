@@ -70,7 +70,9 @@ expri -T gpu run --detach train --epochs 3
 expri -T gpu runs status run-abc123 --json
 ```
 
-The independent publisher starts before environment preparation. Service outages
+The shared worker service starts lazily before machine/capture metadata and
+environment preparation. Later runs reuse it for collection and publication.
+Service outages
 leave queued work retrying while training continues. `run --no-publish train`
 disables publishing for that run while retaining private asset download access.
 Checkpoint contents need explicit artifact registration or selection.
@@ -79,12 +81,26 @@ Checkpoint contents need explicit artifact registration or selection.
 
 ```sh
 expri service resume --run-dir .expri/runs/run-abc123
-expri service publish --config /etc/expri/worker.toml --project-id vision --origin gpu-1 --run-dir .expri/runs/run-abc123 --watch
+expri service publish --config /etc/expri/worker.toml --project-id vision --origin gpu-1 --run-dir .expri/runs/run-abc123
+expri service status
 ```
 
-`resume` restores the saved automatic publisher without rerunning training.
-Keep original run files and `.expri/publish` until acknowledgment; publishers
-need resuming after a worker reboot. Inspect publishing separately from task
+`publish` durably queues ongoing publication through run completion and returns
+a receipt. `--wait` waits quietly; `--watch` observes progress. Ctrl-C stops the
+observer while the service keeps uploading. `resume` retries the matching saved
+job without rerunning training or creating a second publisher. Credential and
+option conflicts are reported rather than changing a saved job's destination.
+Each local run has one publishing destination; checkpoint receipts and publisher
+status are shared by that run.
+Each job snapshots only its required token into private worker storage outside
+the checkout, so a shared service never swaps process environment credentials.
+
+`service start` starts the background process or reuses it. `--foreground` runs
+in the terminal and rejects a duplicate. `service status` is read-only and never
+starts it. `service stop` stops collection/uploads, retains jobs and leaves
+training alive. The next run or publication starts it again. It does not start
+automatically at boot; the next start recovers saved jobs.
+Keep original run files and `.expri/publish` until acknowledgment. Inspect publishing separately from task
 exit status. For tracking runs, `published` means tracking/checkpoint work was
 acknowledged and the server ZIP job accepted; its ZIP can still be uploading.
 `result.zip` contains tracking data, with datasets and checkpoints excluded.

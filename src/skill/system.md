@@ -8,8 +8,10 @@ New profile data lives in `~/.tokn/expri`; `--storage-dir` overrides
 ```sh
 expri system sample
 expri system status
-expri system daemon --no-publish
-expri system daemon --client-config /path/to/machine-client.toml
+expri service start
+expri service start --foreground
+expri service status
+expri service stop
 expri system history
 expri system history --resolution hourly
 ```
@@ -17,14 +19,19 @@ expri system history --resolution hourly
 Reports default to human-readable tables. Add `--json` when an agent or script
 needs complete structured fields, such as `expri system sample --json` or
 `expri service system list --json`. `--quiet` suppresses tables; explicit
-`--json` still prints the report. The foreground daemon keeps its operational
+`--json` still prints the report. The foreground service keeps its operational
 messages rather than producing a final report.
 
 `sample` writes an inventory and one observation, returning the stable machine
-ID. Run the foreground `daemon` on each machine for continuous collection.
-It defaults to ten-second sampling and holds a singleton lease. Ctrl-C stops
-it; restart it after reboot. Commands run on the current machine and reject
-`-T`. `status` and inspection of an empty store create no files.
+ID. Native runs start one shared worker service lazily before capture metadata;
+later runs reuse it. It defaults to ten-second sampling, stays running until
+stopped and recovers saved publication jobs on the next start after reboot.
+`start` runs in the background; `--foreground` runs in the terminal and refuses
+a duplicate. `stop` leaves training alive and retains queued work. Ctrl-C stops
+a foreground service. Commands run on the current machine and reject `-T`.
+`service status` and inspection of an empty store create no files. `system daemon`
+is a deprecated foreground alias; its `--no-publish` disables machine publishing
+only. `run --no-publish` disables only that run's publication.
 
 ## Publishing configuration
 
@@ -50,8 +57,9 @@ Collection continues while uploads retry. `status` includes the last publishing
 error and timestamp. `expri system publish` sends one pending batch without
 starting collection. This explicit command can use the global `[server]` connection
 when no client override is selected. Configuring `[server]` alone does not enable
-the daemon's background publishing; select machine credentials through the
-profile publishing settings or `--client-config`. Removing the profile database creates a new machine ID;
+the worker service's background machine publishing; select machine credentials
+through the profile publishing settings. Restart the service after changing
+them. Removing the profile database creates a new machine ID;
 do not clone it onto another independently collecting machine.
 
 ## Read retention correctly

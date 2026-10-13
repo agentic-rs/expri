@@ -136,6 +136,43 @@ def client(container, action, *args, check=True, config=None):
   config = config or ('/tmp/worker.toml' if container == worker else '/tmp/owner.toml')
   return execute(container, 'expri', 'service', *action.split(), '--json', '--config', config, *args, check=check)
 
+def worker_service_status(container):
+  return json.loads(execute(container, 'expri', 'service', 'status', '--json').stdout)
+
+def stop_worker_service(container):
+  stopped = json.loads(execute(container, 'expri', 'service', 'stop', '--json').stdout)
+  assert stopped['jobs_preserved'] is True, 'stopping the worker service discarded its durable jobs'
+  if not stopped.get('already_stopped'):
+    assert stopped['training_preserved'] is True, 'worker service stop did not preserve training'
+  wait_for(lambda: worker_service_status(container)['running'] is False,
+    'worker service did not release its lease after draining current transfers', timeout=60)
+
+def wait_run_acknowledged(container, run_dir, queue_dir, project_id='demo', origin='worker'):
+  # Registration only acknowledges the durable job. Browser coordination waits
+  # for accepted stream offsets and exact metadata revisions in its transfer queue.
+  acknowledged = f'''import hashlib, json
+from pathlib import Path
+root=Path({run_dir!r})
+run_id=json.loads((root/'run-state.json').read_text())['run_id']
+path=Path({queue_dir!r})/'runs'/{project_id!r}/{origin!r}/run_id/'queue.json'
+ready=path.is_file()
+if ready:
+  saved=json.loads(path.read_text())
+  ready=saved.get('protocol')=='tracking_v1'
+  for name in ['outputs/metrics.jsonl','logs/stdout.log','logs/stderr.log']:
+    source=root/name
+    if source.is_file():
+      ready=ready and saved.get('streams',{{}}).get(name,0)>=source.stat().st_size
+  for name in ['run-state.json','snapshot.json','outputs/params.json']:
+    source=root/name
+    if source.is_file():
+      document=saved.get('documents',{{}}).get(name,{{}})
+      ready=ready and document.get('complete') is True and document.get('sha256')==hashlib.sha256(source.read_bytes()).hexdigest()
+print(ready)
+'''
+  wait_for(lambda: python(container, acknowledged) == 'True',
+    f'queued publication did not acknowledge {project_id}/{origin} tracking bytes and metadata', timeout=120)
+
 def browser(path, *, method='GET', cookie=None, bearer_env=None, password_env=None,
     json_password_env=None, origin='https://expri.example.net', payload=None, limit=512 * 1024):
   # Simulate the TLS reverse proxy inside the private Docker network. The Secure
@@ -402,7 +439,7 @@ with (root / 'outputs/metrics.jsonl').open('w') as output:
       'metrics': {{'loss': 1 / (index + 1), {unsafe_metric!r}: index % 37}}}}) + chr(10))
 ''')
   client(host, 'publish', '--run-dir', root, '--project-id', project_id, '--origin', 'fixture',
-    '--queue-dir', '/home/tester/chart-data-queue')
+    '--queue-dir', '/home/tester/chart-data-queue', '--wait')
   cookie = dashboard_login()
   query = urlencode({'source': f'hosted:{project_id}:fixture', 'run_id': run_id})
   start = time.monotonic()
@@ -456,17 +493,26 @@ if {log!r}:
 '''
   python(worker, code)
   client(worker, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+  wait_run_acknowledged(worker, run_dir, WORKER_QUEUE)
 
 def reset_copied_run_handoffs(container, run_dir):
-  # Copies retain payload bytes, but checkpoint identities and publication state
-  # belong to the source run and origin. The synthetic publisher rebuilds them.
-  python(container, f'''from pathlib import Path
+  # Capture and checkpoint identities belong to the source run and origin.
+  # Synthetic runs retain experiment payloads and rebuild their own handoffs.
+  python(container, f'''import json
+from pathlib import Path
 root = Path({run_dir!r})
+state_path = root / 'run-state.json'
+state = json.loads(state_path.read_text())
+for field in ['system_capture_id', 'system_capture_status', 'system_capture_error', 'machine_id']:
+  state.pop(field, None)
+state_path.write_text(json.dumps(state))
 for path in [
   'checkpoint-registrations.json', '.checkpoint-registrations.lock',
   'outputs/.expri-artifacts.json', 'publishing-request.json',
-  'publishing-state.json', '.publish.lock', 'run-request.json',
+  'publishing-state.json', '.publish.lock', 'publishing-binding.json',
+  '.publishing-binding.lock', 'run-request.json',
   '.run.lock', '.worker-ready', '.cancel-request',
+  'outputs/system-profile.jsonl', '.system-profile-checkpoint.json', '.system-profile.lock',
 ]:
   (root / path).unlink(missing_ok=True)
 ''')
@@ -487,9 +533,13 @@ snapshot['run_id'] = {run_id!r}
 ''')
   reset_copied_run_handoffs(worker, run_dir)
   client(worker, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE)
+  wait_run_acknowledged(worker, run_dir, WORKER_QUEUE)
   return {'run_id': run_id, 'run_dir': run_dir}
 
 def acknowledged_prefix_checks(updated):
+  # A continuous shared publisher could otherwise accept the deliberate tail.
+  # Drain and stop it before taking the acknowledged snapshot and appending bytes.
+  stop_worker_service(worker)
   records = tracking_files(updated['run_id'])
   metrics = records['outputs/metrics.jsonl']
   assert metrics['storage']['tracking']['sealed'] is False, 'active metrics were sealed before completion'
@@ -514,6 +564,8 @@ def acknowledged_prefix_checks(updated):
   docker('start', worker)
   wait_for(lambda: execute(worker, 'true', check=False).returncode == 0, 'worker did not resume after the recovery fixture')
   python(worker, f"from pathlib import Path;p=Path({updated['run_dir']!r}+'/outputs/metrics.jsonl');p.open('r+b').truncate({size});print('restored acknowledged fixture')")
+  execute(worker, 'expri', 'service', 'start', '--json')
+  wait_for(lambda: worker_service_status(worker)['ready'] is True, 'worker service did not restart after prefix recovery')
 
 def automatic_dashboard_checks(run_id, updated):
   global refresh_browser
@@ -574,9 +626,11 @@ for row, value in [(timed[0], 0.7), (timed[-1], 0.07)]:
 ''')
   client(host, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker-b',
     '--queue-dir', '/home/tester/project-machine-queue', config='/tmp/machine-worker.toml')
+  wait_run_acknowledged(host, run_dir, '/home/tester/project-machine-queue', origin='worker-b')
   python(worker, f"from pathlib import Path;Path({original['run_dir']!r}+'/outputs/project-scope.txt').write_text('worker scope fixture'+chr(10))")
   client(worker, 'publish', '--run-dir', original['run_dir'], '--project-id', 'demo', '--origin', 'worker',
     '--queue-dir', WORKER_QUEUE)
+  wait_run_acknowledged(worker, original['run_dir'], WORKER_QUEUE)
   assert json.loads(python(host, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['run_id'] == original['run_id'], 'second recorded machine did not preserve the colliding run ID'
   return {'run_id': original['run_id'], 'run_dir': run_dir}
 
@@ -639,6 +693,7 @@ with (root / 'logs/stdout.log').open('a') as output:
 ''')
       client(container, 'publish', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
         '--queue-dir', queue, config=config)
+      wait_run_acknowledged(container, fixture['run_dir'], queue, origin=origin)
       python(firefox, f"import json;from pathlib import Path;Path({coordination!r}).write_text(json.dumps({{'phase': 'published-{origin}'}}))")
     wait_for(lambda: phase() == 'finish-runs', 'Firefox did not request terminal project artifacts', timeout=90)
     for origin, container, fixture, config, queue in [
@@ -654,13 +709,17 @@ record.update(status='completed', exit_code=0, finished_at=datetime.now(timezone
 path.write_text(json.dumps(record))
 ''')
       client(container, 'publish', '--run-dir', fixture['run_dir'], '--project-id', 'demo', '--origin', origin,
-        '--queue-dir', queue, '--artifact', 'outputs/project-scope.txt', config=config)
+        '--queue-dir', queue, '--wait', config=config)
+      target = {'kind': 'run', 'scope': {'project_id': 'demo', 'origin': origin, 'run_id': fixture['run_id']}, 'path': 'outputs/project-scope.txt'}
+      uploaded = json.loads(client(container, 'file-upload', '--target', json.dumps(target),
+        '--file', fixture['run_dir'] + '/outputs/project-scope.txt', '--queue-dir', queue, config=config).stdout)
+      expected = (origin + ' scope fixture\n').encode()
+      assert uploaded['target'] == target and uploaded['size'] == len(expected) and uploaded['sha256'] == hashlib.sha256(expected).hexdigest(), 'terminal attachment upload receipt changed its scope or bytes'
       python(container, f'''import json
 from pathlib import Path
 saved=json.loads((Path({queue!r})/'runs/demo'/{origin!r}/{fixture['run_id']!r}/'queue.json').read_text())
 assert saved['protocol']=='tracking_v1' and saved['archive']['incomplete'] is False
 assert all(document['complete'] for document in saved['documents'].values())
-assert saved['files']['outputs/project-scope.txt']['upload']['complete'] is True
 record=json.loads((Path({fixture['run_dir']!r})/'run-state.json').read_text())
 assert record['status']=='completed' and record['exit_code']==0 and record['finished_at']
 print('project terminal tracking queue verified')
@@ -1053,7 +1112,9 @@ prefix = "acceptance"
     receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train').stdout)
     run_id, run_dir = receipt['run_id'], receipt['run_dir']
     assert receipt['dashboard_url'] == 'https://expri.example.net/?' + urlencode({'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}), 'automatic run link has the wrong identity'
-    push_args = ['--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker', '--queue-dir', WORKER_QUEUE]
+    initial_worker_service = worker_service_status(worker)
+    assert initial_worker_service['running'] is True and initial_worker_service['ready'] is True, 'native run did not start a ready shared collector/service'
+    assert initial_worker_service['collection']['sample_sequence'] > 0, 'service readiness preceded a committed local observation'
     def publishing(directory):
       return json.loads(python(worker, f"from pathlib import Path;print(Path({directory!r}+'/publishing-state.json').read_text())"))
     wait_for(lambda: api_proxy('/test/state')['lost_stream_ack'], 'live metrics did not arrive or the lost stream acknowledgement was not injected')
@@ -1061,31 +1122,20 @@ prefix = "acceptance"
     docker('stop', '--time', '1', service)
     wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({run_dir!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'training did not complete while service was offline')
     assert publishing(run_dir)['status'] != 'published', 'publisher claimed published during the outage'
-    # Kill only the independent publisher after training exits, then resume its
-    # saved intent and queue while the service is still unavailable.
-    killed = python(worker, f'''import os, signal
-from pathlib import Path
-count = 0
-for process in Path('/proc').iterdir():
-  if not process.name.isdigit():
-    continue
-  try:
-    argv = (process / 'cmdline').read_bytes().split(b'\\0')
-    if b'publish-worker' in argv and {run_dir.encode()!r} in argv:
-      os.kill(int(process.name), signal.SIGTERM)
-      count += 1
-  except (FileNotFoundError, ProcessLookupError, PermissionError):
-    pass
-print(count)''')
-    assert killed == '1', 'did not find exactly one independent publisher'
-    wait_for(lambda: json.loads(execute(worker, 'expri', 'runs', 'status', run_id, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)['publishing']['worker_active'] is False, 'stopped publisher retained its lease')
+    # Stop the one shared service through its control socket, preserving all
+    # registrations and transfer checkpoints; resume reuses the same saved job.
+    stop_worker_service(worker)
     resumed = json.loads(execute(worker, 'expri', 'service', 'resume', '--json', '--run-dir', run_dir).stdout)
     assert resumed['run_id'] == run_id, 'resume started a different run'
+    resumed_service = worker_service_status(worker)
+    assert resumed_service['running'] is True and resumed_service['ready'] is True, 'resume did not restart local collection while the network was unavailable'
+    assert resumed_service['pid'] != initial_worker_service['pid'], 'stopped shared service was not replaced'
     docker('start', service)
     wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to restart')
     def drained(directory):
       report = json.loads(execute(worker, 'expri', 'runs', 'status', Path(directory).name, '--config', '/home/tester/experiment/expri.toml', '--repo', '/home/tester/experiment', '--json').stdout)
-      return report['publishing']['status'] == 'published' and not report['publishing']['worker_active']
+      shared = worker_service_status(worker)
+      return report['publishing']['status'] == 'published' and any(job['scope']['run_id'] == Path(directory).name and job['status'] == 'published' for job in shared['jobs'])
     wait_for(lambda: drained(run_dir), 'automatic publisher failed to drain after recovery', timeout=120)
     queue_state = json.loads(python(worker, f"from pathlib import Path;print(Path({WORKER_QUEUE!r}+'/runs/demo/worker/'+{run_id!r}+'/queue.json').read_text())"))
     assert queue_state['protocol'] == 'tracking_v1' and set(queue_state['files']) <= {'outputs/checkpoint-1000.pt'}, 'fresh publishing queue used per-file multipart for tracking metadata or streams'
@@ -1097,11 +1147,16 @@ print(count)''')
     assert tracked['outputs/metrics.jsonl']['storage']['tracking']['sealed'] is True, 'terminal metrics were not sealed at their acknowledged extent'
   with workflow_progress.phase('Checkpoint upload recovery after lost acknowledgments'):
     api_proxy('/test/arm')
-    first = client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt', check=False)
+    checkpoint_target = {'kind': 'run', 'scope': {'project_id': 'demo', 'origin': 'worker', 'run_id': run_id}, 'path': 'outputs/checkpoint.pt'}
+    checkpoint_upload = ['--target', json.dumps(checkpoint_target), '--file', run_dir + '/outputs/checkpoint.pt', '--queue-dir', WORKER_QUEUE]
+    conflicting = client(worker, 'publish', '--run-dir', run_dir, '--project-id', 'demo', '--origin', 'worker',
+      '--queue-dir', WORKER_QUEUE, '--artifact', 'outputs/checkpoint.pt', check=False)
+    assert conflicting.returncode != 0, 'an existing automatic job accepted a different immutable artifact selection'
+    first = client(worker, 'file-upload', *checkpoint_upload, check=False)
     assert first.returncode != 0 and api_proxy('/test/state')['lost_ack'], 'lost part acknowledgement was not injected'
     docker('restart', '--time', '1', service)
     wait_for(lambda: python(host, "from urllib.request import urlopen;print(urlopen('http://service:8787/health',timeout=1).status)") == '200', 'service failed to recover multipart state')
-    client(worker, 'publish', *push_args, '--artifact', 'outputs/checkpoint.pt')
+    client(worker, 'file-upload', *checkpoint_upload)
     counts = api_proxy('/test/state')['part_urls']
     assert counts.get('1') == 1 and counts.get('2') == 1 and counts.get('3') == 1, counts
   with workflow_progress.phase('Live checkpoint downloads and result uploads'):
@@ -1109,6 +1164,9 @@ print(count)''')
     python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
     second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train /tmp/expri-live-sync.release').stdout)
     assert second['run_id'] != run_id, 'second experiment reused the first run identity'
+    shared = worker_service_status(worker)
+    assert shared['pid'] == resumed_service['pid'] and shared['ready'] is True, 'two runs spawned separate worker services or replaced their shared collector'
+    assert {job['scope']['run_id'] for job in shared['jobs']} == {run_id, second['run_id']}, 'shared service did not retain both run registrations'
     live_repo = '/home/tester/live-review'
     watch_config = '''[project]
 name = "Live result fetch"
@@ -1158,6 +1216,22 @@ print(json.dumps({{'status':json.loads((root / 'run-state.json').read_text())['s
 '''))
     assert live_result['status'] == 'running' and 'outputs/checkpoint-1000.pt' in live_result['downloaded'], 'live watcher did not commit a verified running-run download receipt'
     stop_result_fetch()
+    stop_worker_service(worker)
+    preserved = python(worker, f'''import fcntl, json
+from pathlib import Path
+root=Path({second['run_dir']!r})
+assert json.loads((root/'run-state.json').read_text())['status']=='running'
+with (root/'.run.lock').open('rb') as lease:
+  try:
+    fcntl.flock(lease, fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:
+    print('training lease preserved')
+  else:
+    raise AssertionError('stopping the worker service released the training supervisor lease')
+''')
+    assert preserved == 'training lease preserved', 'worker service stop changed the active training task'
+    execute(worker, 'expri', 'service', 'start', '--json')
+    wait_for(lambda: worker_service_status(worker)['ready'] is True, 'shared worker service did not resume both saved jobs')
     python(worker, f"from pathlib import Path;Path({sync_gate!r}).touch()")
     wait_for(lambda: json.loads(python(worker, f"from pathlib import Path;print(Path({second['run_dir']!r}+'/run-state.json').read_text())"))['status'] == 'completed', 'second experiment did not complete')
     wait_for(lambda: drained(second['run_dir']), 'second automatic publisher did not drain', timeout=120)

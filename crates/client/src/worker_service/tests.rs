@@ -1,0 +1,837 @@
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+
+use super::*;
+
+fn fixture() -> (tempfile::TempDir, StoragePaths, PreparedJob) {
+  let temporary = tempfile::Builder::new()
+    .prefix("expri-service-")
+    .tempdir()
+    .unwrap();
+  let root = temporary.path().canonicalize().unwrap();
+  let run = root.join("source/.expri/runs/run-fixture");
+  fs::create_dir_all(&run).unwrap();
+  fs::write(
+    run.join("run-state.json"),
+    br#"{"run_id":"run-fixture","status":"running"}"#,
+  )
+  .unwrap();
+  let paths = StoragePaths::from_root(root.join("storage")).unwrap();
+  let job = serde_json::from_value(json!({
+    "schema_version":1,"client":{"endpoint":"https://example.invalid/v1/request","token":"fixture-private-token"},
+    "run_dir":run,"scope":{"project_id":"project","origin":"worker","run_id":"run-fixture"},
+    "queue_dir":root.join("queue"),"artifacts":[],"watch":true,"automatic":false,
+    "repo_root":null,"dashboard_url":null,
+  })).unwrap();
+  (temporary, paths, job)
+}
+
+fn independent_job_with_same_id(job: &PreparedJob, copy_root: &std::path::Path) -> PreparedJob {
+  let run = copy_root.join("run-fixture");
+  fs::create_dir_all(&run).unwrap();
+  fs::write(
+    run.join("run-state.json"),
+    br#"{"run_id":"run-fixture","status":"running"}"#,
+  )
+  .unwrap();
+  let mut value = serde_json::to_value(job).unwrap();
+  value["run_dir"] = json!(run.canonicalize().unwrap());
+  serde_json::from_value(value).unwrap()
+}
+
+fn wait_ready(paths: &StoragePaths) {
+  let deadline = Instant::now() + Duration::from_secs(3);
+  loop {
+    if status(paths).unwrap()["ready"] == true {
+      return;
+    }
+    assert!(Instant::now() < deadline, "service never became ready");
+    thread::sleep(Duration::from_millis(20));
+  }
+}
+
+fn collector(context: ServiceContext) -> Result<()> {
+  context.collection_ready("machine-fixture".into(), 1);
+  while !context.wait(Duration::from_secs(60)) {}
+  Ok(())
+}
+
+#[test]
+fn status_is_readonly_and_does_not_create_storage() {
+  let (_temporary, paths, _) = fixture();
+  assert_eq!(status(&paths).unwrap()["running"], false);
+  assert_eq!(stop(&paths).unwrap()["already_stopped"], true);
+  assert!(!paths.root().exists());
+}
+
+#[test]
+fn registration_is_durable_private_idempotent_and_conflicts_cannot_replace_credentials() {
+  use std::os::unix::fs::PermissionsExt;
+  let (_temporary, paths, job) = fixture();
+  let first = registry::register(&paths, job.clone()).unwrap();
+  let repeated = registry::register(&paths, job.clone()).unwrap();
+  assert_eq!(first["job_id"], repeated["job_id"]);
+  assert_eq!(repeated["already_registered"], true);
+  let id = first["job_id"].as_str().unwrap();
+  let directory = files::existing(&paths)
+    .unwrap()
+    .unwrap()
+    .join("jobs")
+    .join(id);
+  assert_eq!(
+    fs::metadata(directory.join("request.json"))
+      .unwrap()
+      .permissions()
+      .mode()
+      & 0o777,
+    0o600
+  );
+  assert_eq!(
+    fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+    0o700
+  );
+  assert!(!first.to_string().contains("fixture-private-token"));
+  assert!(
+    !job_status(&paths, id)
+      .unwrap()
+      .to_string()
+      .contains("fixture-private-token")
+  );
+  let request_before = fs::read(directory.join("request.json")).unwrap();
+  let mut changed = serde_json::to_value(&job).unwrap();
+  changed["client"]["token"] = json!("different-private-token");
+  assert!(registry::register(&paths, serde_json::from_value(changed).unwrap()).is_err());
+  assert_eq!(
+    fs::read(directory.join("request.json")).unwrap(),
+    request_before
+  );
+  assert!(registry::read_job(&directory).unwrap() == job);
+}
+
+#[test]
+fn credentials_never_enter_a_source_checkout() {
+  let (temporary, _, job) = fixture();
+  let repo = temporary.path().join("source");
+  fs::create_dir(repo.join(".git")).unwrap();
+  let paths = StoragePaths::from_root(repo.join("private-storage")).unwrap();
+  assert!(
+    registry::register(&paths, job)
+      .unwrap_err()
+      .to_string()
+      .contains("outside")
+  );
+  assert!(!paths.root().join("worker-service/jobs").exists());
+}
+
+#[test]
+fn missing_public_state_is_rebuilt_from_durable_registration_without_exposing_secrets() {
+  let (_temporary, paths, job) = fixture();
+  let report = registry::register(&paths, job).unwrap();
+  let directory = files::existing(&paths).unwrap().unwrap();
+  let path = directory
+    .join("jobs")
+    .join(report["job_id"].as_str().unwrap());
+  fs::remove_file(path.join("state.json")).unwrap();
+  assert_eq!(registry::pending(&directory).unwrap(), vec![path]);
+  assert_eq!(
+    job_status(&paths, report["job_id"].as_str().unwrap()).unwrap()["status"],
+    "queued"
+  );
+}
+
+#[test]
+fn concurrent_jobs_have_independent_bounded_slots_and_stop_preserves_training() {
+  let (temporary, paths, job) = fixture();
+  let mut ids = Vec::new();
+  for index in 0..7 {
+    let run = temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join(format!("source/.expri/runs/run-{index}"));
+    fs::create_dir_all(&run).unwrap();
+    fs::write(
+      run.join("run-state.json"),
+      format!("{{\"run_id\":\"run-{index}\",\"status\":\"running\"}}"),
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(&job).unwrap();
+    value["run_dir"] = json!(run);
+    value["scope"]["run_id"] = json!(format!("run-{index}"));
+    let report = registry::register(&paths, serde_json::from_value(value).unwrap()).unwrap();
+    ids.push(report["job_id"].as_str().unwrap().to_owned());
+  }
+  let active = Arc::new(AtomicUsize::new(0));
+  let peak = Arc::new(AtomicUsize::new(0));
+  let completed = Arc::new(AtomicUsize::new(0));
+  let (active_job, peak_job, completed_job) = (active.clone(), peak.clone(), completed.clone());
+  let runner = Arc::new(
+    move |_: &PreparedJob, _: Arc<AtomicBool>, progress: &mut dyn FnMut(Value) -> Result<()>| {
+      let count = active_job.fetch_add(1, Ordering::SeqCst) + 1;
+      peak_job.fetch_max(count, Ordering::SeqCst);
+      thread::sleep(Duration::from_millis(200));
+      progress(json!({"confirmed": true}))?;
+      active_job.fetch_sub(1, Ordering::SeqCst);
+      completed_job.fetch_add(1, Ordering::SeqCst);
+      Ok(true)
+    },
+  );
+  let training_dir = temporary
+    .path()
+    .canonicalize()
+    .unwrap()
+    .join("live-training");
+  fs::create_dir(&training_dir).unwrap();
+  let _training = expri_core::lock::run_lock(&training_dir).unwrap();
+  let training_before = fs::read(training_dir.join(".run.lock")).unwrap();
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  let deadline = Instant::now() + Duration::from_secs(5);
+  while completed.load(Ordering::SeqCst) != ids.len() {
+    assert!(Instant::now() < deadline, "queued jobs were starved");
+    thread::sleep(Duration::from_millis(20));
+  }
+  assert!(peak.load(Ordering::SeqCst) >= 2);
+  assert!(peak.load(Ordering::SeqCst) <= 4);
+  assert_eq!(stop(&paths).unwrap()["training_preserved"], true);
+  service.join().unwrap().unwrap();
+  assert_eq!(status(&paths).unwrap()["running"], false);
+  for id in ids {
+    assert_eq!(job_status(&paths, &id).unwrap()["status"], "published");
+  }
+  assert_eq!(
+    fs::read(training_dir.join(".run.lock")).unwrap(),
+    training_before
+  );
+  assert!(matches!(
+    expri_core::lock::try_lock_file(&training_dir.join(".run.lock"), false).unwrap(),
+    expri_core::lock::LockAttempt::Busy
+  ));
+}
+
+#[test]
+fn duplicate_foreground_refuses_and_existing_ready_start_is_concurrent_idempotent() {
+  let (_temporary, paths, _) = fixture();
+  let service_paths = paths.clone();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  let duplicate_runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let failure = unix::run_runtime(&paths, collector, duplicate_runner, false).unwrap_err();
+  assert!(failure.to_string().contains("already running"));
+  let starts: Vec<_> = (0..8)
+    .map(|_| {
+      let paths = paths.clone();
+      thread::spawn(move || ensure_started(&paths))
+    })
+    .collect();
+  for start in starts {
+    assert_eq!(start.join().unwrap().unwrap()["ready"], true);
+  }
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn stopped_inflight_job_remains_durable_and_resumes_after_restart() {
+  let (_temporary, paths, job) = fixture();
+  let report = registry::register(&paths, job).unwrap();
+  let id = report["job_id"].as_str().unwrap().to_owned();
+  let (entered, started) = mpsc::channel();
+  let runner = Arc::new(
+    move |_: &PreparedJob, stop: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| {
+      entered.send(()).unwrap();
+      while !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+      }
+      Ok(false)
+    },
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  started.recv_timeout(Duration::from_secs(2)).unwrap();
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+  assert_eq!(job_status(&paths, &id).unwrap()["status"], "queued");
+  let service_paths = paths.clone();
+  let done = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(true),
+  );
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, done, false));
+  wait_ready(&paths);
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while job_status(&paths, &id).unwrap()["status"] != "published" {
+    assert!(Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(20));
+  }
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn long_storage_paths_use_a_private_short_socket() {
+  let (temporary, _, _) = fixture();
+  let paths = StoragePaths::from_root(
+    temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join("a-long-custom-storage-name".repeat(5)),
+  )
+  .unwrap();
+  let service_paths = paths.clone();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  assert_eq!(
+    status(&paths).unwrap()["collection"]["machine_id"],
+    "machine-fixture"
+  );
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn concurrent_cold_start_launches_one_service_after_committed_collection() {
+  let (_temporary, paths, _) = fixture();
+  let launches = Arc::new(AtomicUsize::new(0));
+  let service_thread = Arc::new(std::sync::Mutex::new(None));
+  let starts: Vec<_> = (0..8)
+    .map(|_| {
+      let paths = paths.clone();
+      let launches = launches.clone();
+      let service_thread = service_thread.clone();
+      thread::spawn(move || {
+        unix::ensure_with_launcher(&paths, move |_, paths| {
+          launches.fetch_add(1, Ordering::SeqCst);
+          let service_paths = paths.clone();
+          let runner = Arc::new(
+            |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+          );
+          *service_thread.lock().unwrap() = Some(thread::spawn(move || {
+            unix::run_runtime(
+              &service_paths,
+              |context| {
+                thread::sleep(Duration::from_millis(100));
+                collector(context)
+              },
+              runner,
+              false,
+            )
+          }));
+          Ok(None)
+        })
+      })
+    })
+    .collect();
+  for start in starts {
+    assert_eq!(start.join().unwrap().unwrap()["ready"], true);
+  }
+  assert_eq!(launches.load(Ordering::SeqCst), 1);
+  stop(&paths).unwrap();
+  service_thread
+    .lock()
+    .unwrap()
+    .take()
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn stopped_status_exposes_bounded_jobs_and_errors_without_reading_secret_requests() {
+  use std::os::unix::fs::PermissionsExt;
+  let (temporary, paths, job) = fixture();
+  let mut ids = Vec::new();
+  for index in 0..35 {
+    let copy = independent_job_with_same_id(
+      &job,
+      &temporary
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(format!("copy-{index}")),
+    );
+    let mut value = serde_json::to_value(copy).unwrap();
+    value["scope"]["origin"] = json!(format!("worker-{index}"));
+    let registered = registry::register(&paths, serde_json::from_value(value).unwrap()).unwrap();
+    ids.push(registered["job_id"].as_str().unwrap().to_owned());
+  }
+  let registry = files::existing(&paths).unwrap().unwrap();
+  let failed_path = registry.join("jobs").join(&ids[34]);
+  let mut failed = registry::read_state(&failed_path).unwrap();
+  failed.status = "error".into();
+  failed.last_error = Some("Publishing permission was rejected".into());
+  failed.save(&failed_path).unwrap();
+  let state_bytes = fs::read(failed_path.join("state.json")).unwrap();
+  fs::set_permissions(
+    failed_path.join("state.json"),
+    fs::Permissions::from_mode(0o400),
+  )
+  .unwrap();
+  // Status uses only safe public state, so it works even when the private
+  // request is unreadable/corrupt and cannot rewrite read-only job state.
+  fs::write(
+    failed_path.join("request.json"),
+    b"private request deliberately unavailable",
+  )
+  .unwrap();
+  let report = status(&paths).unwrap();
+  assert_eq!(report["running"], false);
+  assert_eq!(report["jobs_total"], 35);
+  assert_eq!(report["jobs"].as_array().unwrap().len(), 32);
+  assert_eq!(report["jobs_truncated"], 3);
+  assert_eq!(report["job_counts"]["error"], 1);
+  assert_eq!(report["job_counts"]["queued"], 34);
+  assert!(
+    report["jobs"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|job| job["status"] == "error")
+  );
+  assert!(!report.to_string().contains("fixture-private-token"));
+  assert_eq!(
+    fs::read(failed_path.join("state.json")).unwrap(),
+    state_bytes
+  );
+  assert_eq!(
+    fs::metadata(failed_path.join("state.json"))
+      .unwrap()
+      .permissions()
+      .mode()
+      & 0o777,
+    0o400
+  );
+  assert!(!registry.join("service.lock").exists());
+}
+
+#[test]
+fn collection_failure_is_preserved_after_cooperative_service_shutdown() {
+  let (_temporary, paths, _) = fixture();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let result = unix::run_runtime(
+    &paths,
+    |context| {
+      context.collection_status(
+        json!({"status": "failed", "last_error": "Local profile store is unavailable"}),
+      );
+      context.stop_flag().store(true, Ordering::Release);
+      Err(error("local profile store failure"))
+    },
+    runner,
+    false,
+  );
+  assert!(result.is_err());
+  let report = status(&paths).unwrap();
+  assert_eq!(report["running"], false);
+  assert_eq!(report["ready"], false);
+  assert_eq!(report["status"], "collection_failed");
+  assert_eq!(
+    report["collection"]["last_error"],
+    "Local profile store is unavailable"
+  );
+}
+
+#[test]
+fn corrupt_saved_job_retries_slowly_while_other_jobs_continue() {
+  let (temporary, paths, job) = fixture();
+  let corrupt = registry::register(&paths, job.clone()).unwrap();
+  let id = corrupt["job_id"].as_str().unwrap();
+  let directory = files::existing(&paths).unwrap().unwrap();
+  fs::write(
+    directory.join("jobs").join(id).join("request.json"),
+    b"invalid private request",
+  )
+  .unwrap();
+  let healthy_copy = independent_job_with_same_id(
+    &job,
+    &temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join("healthy-copy"),
+  );
+  let mut healthy = serde_json::to_value(healthy_copy).unwrap();
+  healthy["scope"]["origin"] = json!("healthy-worker");
+  let healthy = registry::register(&paths, serde_json::from_value(healthy).unwrap()).unwrap();
+  let healthy_id = healthy["job_id"].as_str().unwrap();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(true),
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while job_status(&paths, healthy_id).unwrap()["status"] != "published"
+    || job_status(&paths, id).unwrap()["status"] != "retrying"
+  {
+    assert!(Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(20));
+  }
+  thread::sleep(Duration::from_millis(250));
+  let corrupt_state = registry::read_state(&directory.join("jobs").join(id)).unwrap();
+  assert_eq!(corrupt_state.failures, 1);
+  assert!(
+    corrupt_state
+      .last_error
+      .unwrap()
+      .contains("Saved publishing registration")
+  );
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn resume_uses_saved_credentials_and_rejects_ambiguous_destinations() {
+  let (_temporary, paths, job) = fixture();
+  let run_dir = job.run_dir().to_path_buf();
+  let report = registry::register(&paths, job.clone()).unwrap();
+  let id = report["job_id"].as_str().unwrap();
+  let directory = files::existing(&paths)
+    .unwrap()
+    .unwrap()
+    .join("jobs")
+    .join(id);
+  let mut state = registry::read_state(&directory).unwrap();
+  state.status = "error".into();
+  state.last_error = Some("Transient caller context disappeared".into());
+  state.save(&directory).unwrap();
+  let service_paths = paths.clone();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  let resumed = resume_registered_run(&paths, &run_dir).unwrap().unwrap();
+  assert_eq!(resumed["job_id"], report["job_id"]);
+  assert_eq!(resumed["accepted"], true);
+  assert!(registry::read_job(&directory).unwrap() == job);
+  let mut alternate = serde_json::to_value(job).unwrap();
+  alternate["scope"]["origin"] = json!("second-worker");
+  let alternate: PreparedJob = serde_json::from_value(alternate).unwrap();
+  let alternate_id = alternate.identity().unwrap();
+  let alternate_root = directory.parent().unwrap().join(&alternate_id);
+  files::directory(&alternate_root).unwrap();
+  files::write(&alternate_root.join("request.json"), &alternate).unwrap();
+  registry::JobState {
+    schema_version: 1,
+    job_id: alternate_id,
+    status: "queued".into(),
+    updated_at_ms: 0,
+    retry_at_ms: 0,
+    failures: 0,
+    last_error: None,
+    report: alternate.safe_report(),
+    progress: json!({}),
+  }
+  .save(&alternate_root)
+  .unwrap();
+  assert!(
+    resume_registered_run(&paths, &run_dir)
+      .unwrap_err()
+      .to_string()
+      .contains("multiple saved")
+  );
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn idle_service_does_not_fsync_unchanged_status_each_tick() {
+  let (_temporary, paths, _) = fixture();
+  let service_paths = paths.clone();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let service = thread::spawn(move || unix::run_runtime(&service_paths, collector, runner, false));
+  wait_ready(&paths);
+  // Allow the initial ready transition to reach its durable public snapshot.
+  thread::sleep(Duration::from_millis(150));
+  let directory = files::existing(&paths).unwrap().unwrap();
+  let path = directory.join("status.json");
+  let before = fs::read(&path).unwrap();
+  let modified = fs::metadata(&path).unwrap().modified().unwrap();
+  thread::sleep(Duration::from_millis(300));
+  assert_eq!(fs::read(&path).unwrap(), before);
+  assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn saved_run_scan_isolates_unrelated_corruption_but_rejects_selected_job_corruption() {
+  let (temporary, paths, job) = fixture();
+  let selected_run = job.run_dir().to_path_buf();
+  let selected = registry::register(&paths, job.clone()).unwrap();
+  let other_run = temporary
+    .path()
+    .canonicalize()
+    .unwrap()
+    .join("source/.expri/runs/run-other");
+  fs::create_dir_all(&other_run).unwrap();
+  fs::write(
+    other_run.join("run-state.json"),
+    br#"{"run_id":"run-other","status":"running"}"#,
+  )
+  .unwrap();
+  let mut other = serde_json::to_value(&job).unwrap();
+  other["run_dir"] = json!(other_run);
+  other["scope"]["run_id"] = json!("run-other");
+  let unrelated = registry::register(&paths, serde_json::from_value(other).unwrap()).unwrap();
+  let root = files::existing(&paths).unwrap().unwrap().join("jobs");
+  let unrelated_root = root.join(unrelated["job_id"].as_str().unwrap());
+  fs::write(
+    unrelated_root.join("state.json"),
+    b"corrupt unrelated public state",
+  )
+  .unwrap();
+  assert!(registry::saved_run(&paths, &selected_run).unwrap().unwrap() == job);
+  fs::write(
+    unrelated_root.join("request.json"),
+    b"corrupt unrelated private request",
+  )
+  .unwrap();
+  assert!(registry::saved_run(&paths, &selected_run).unwrap().unwrap() == job);
+  let selected_root = root.join(selected["job_id"].as_str().unwrap());
+  fs::write(
+    selected_root.join("state.json"),
+    b"corrupt selected public state",
+  )
+  .unwrap();
+  assert!(
+    registry::saved_run(&paths, &selected_run)
+      .err()
+      .unwrap()
+      .to_string()
+      .contains("selected run is invalid")
+  );
+  fs::remove_file(selected_root.join("state.json")).unwrap();
+  fs::write(
+    selected_root.join("request.json"),
+    b"corrupt selected private request",
+  )
+  .unwrap();
+  // A valid matching public record identifies a broken selected private binding.
+  registry::JobState {
+    schema_version: 1,
+    job_id: selected["job_id"].as_str().unwrap().to_owned(),
+    status: "queued".into(),
+    updated_at_ms: 0,
+    retry_at_ms: 0,
+    failures: 0,
+    last_error: None,
+    report: job.safe_report(),
+    progress: json!({}),
+  }
+  .save(&selected_root)
+  .unwrap();
+  assert!(registry::saved_run(&paths, &selected_run).is_err());
+}
+
+#[test]
+fn one_local_run_has_one_destination_even_after_publication_or_error() {
+  let (temporary, paths, job) = fixture();
+  let first = registry::register(&paths, job.clone()).unwrap();
+  let root = files::existing(&paths).unwrap().unwrap();
+  let first_path = root.join("jobs").join(first["job_id"].as_str().unwrap());
+  for status in ["queued", "published", "error"] {
+    let mut state = registry::read_state(&first_path).unwrap();
+    state.status = status.into();
+    state.save(&first_path).unwrap();
+    for (field, value) in [
+      ("endpoint", "https://another.invalid/v1/request"),
+      ("origin", "second-origin"),
+      ("project_id", "second-project"),
+    ] {
+      let mut alternate = serde_json::to_value(&job).unwrap();
+      if field == "endpoint" {
+        alternate["client"][field] = json!(value);
+      } else {
+        alternate["scope"][field] = json!(value);
+      }
+      let alternate: PreparedJob = serde_json::from_value(alternate).unwrap();
+      let id = alternate.identity().unwrap();
+      let failure = register(&paths, alternate).unwrap_err();
+      assert!(
+        failure
+          .to_string()
+          .contains("another publishing destination")
+      );
+      assert!(!root.join("jobs").join(id).exists());
+      assert!(!root.join("service.lock").exists());
+      assert!(!root.join("service.log").exists());
+    }
+  }
+  assert_eq!(
+    registry::register(&paths, job.clone()).unwrap()["already_registered"],
+    true
+  );
+  let copy = independent_job_with_same_id(
+    &job,
+    &temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join("different-local-copy"),
+  );
+  let mut copy = serde_json::to_value(copy).unwrap();
+  copy["scope"]["project_id"] = json!("second-project");
+  copy["scope"]["origin"] = json!("second-origin");
+  copy["client"]["endpoint"] = json!("https://another.invalid/v1/request");
+  let accepted = registry::register(&paths, serde_json::from_value(copy).unwrap()).unwrap();
+  assert_eq!(accepted["accepted"], true);
+  assert_ne!(accepted["job_id"], first["job_id"]);
+}
+
+#[test]
+fn destination_guard_uses_validated_public_binding_and_private_fallback() {
+  let (_temporary, paths, job) = fixture();
+  let first = registry::register(&paths, job.clone()).unwrap();
+  let root = files::existing(&paths).unwrap().unwrap();
+  let first_path = root.join("jobs").join(first["job_id"].as_str().unwrap());
+  let mut alternate = serde_json::to_value(&job).unwrap();
+  alternate["scope"]["origin"] = json!("another-origin");
+  let alternate: PreparedJob = serde_json::from_value(alternate).unwrap();
+  // A corrupt public record is still protected by the valid private binding.
+  fs::write(first_path.join("state.json"), b"corrupt public record").unwrap();
+  assert!(registry::register(&paths, alternate.clone()).is_err());
+  // A validated public record still protects the run when the private request
+  // cannot be read; neither diagnostic needs to reveal its credential.
+  registry::JobState {
+    schema_version: 1,
+    job_id: first["job_id"].as_str().unwrap().into(),
+    status: "published".into(),
+    updated_at_ms: 0,
+    retry_at_ms: 0,
+    failures: 0,
+    last_error: None,
+    report: job.safe_report(),
+    progress: json!({}),
+  }
+  .save(&first_path)
+  .unwrap();
+  fs::write(first_path.join("request.json"), b"corrupt private record").unwrap();
+  let failure = registry::register(&paths, alternate)
+    .unwrap_err()
+    .to_string();
+  assert!(failure.contains("another publishing destination"));
+  assert!(!failure.contains("fixture-private-token"));
+}
+
+#[test]
+fn run_binding_pins_destination_across_storage_ledgers_without_credentials() {
+  use std::os::unix::fs::PermissionsExt;
+  let (temporary, first_paths, job) = fixture();
+  let second_paths = StoragePaths::from_root(
+    temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join("second-storage"),
+  )
+  .unwrap();
+  let first = registry::register(&first_paths, job.clone()).unwrap();
+  let binding_path = job.run_dir().join("publishing-binding.json");
+  let before = fs::read(&binding_path).unwrap();
+  assert!(!String::from_utf8_lossy(&before).contains("fixture-private-token"));
+  assert_eq!(
+    fs::metadata(&binding_path).unwrap().permissions().mode() & 0o777,
+    0o600
+  );
+  assert_eq!(
+    fs::metadata(job.run_dir().join(".publishing-binding.lock"))
+      .unwrap()
+      .permissions()
+      .mode()
+      & 0o777,
+    0o600
+  );
+  let second = registry::register(&second_paths, job.clone()).unwrap();
+  assert_eq!(first["job_id"], second["job_id"]);
+  assert_eq!(fs::read(&binding_path).unwrap(), before);
+  let third_paths = StoragePaths::from_root(
+    temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join("third-storage"),
+  )
+  .unwrap();
+  for (field, value) in [
+    ("endpoint", "https://another.invalid/v1/request"),
+    ("origin", "new-origin"),
+    ("project_id", "new-project"),
+  ] {
+    let mut different = serde_json::to_value(&job).unwrap();
+    if field == "endpoint" {
+      different["client"][field] = json!(value);
+    } else {
+      different["scope"][field] = json!(value);
+    }
+    let different: PreparedJob = serde_json::from_value(different).unwrap();
+    let identity = different.identity().unwrap();
+    let failure = register(&third_paths, different).unwrap_err().to_string();
+    assert!(failure.contains("another publishing destination"));
+    let root = files::existing(&third_paths).unwrap().unwrap();
+    assert!(!root.join("jobs").join(identity).exists());
+    assert!(!root.join("service.lock").exists());
+    assert_eq!(fs::read(&binding_path).unwrap(), before);
+  }
+}
+
+#[test]
+fn copied_run_binding_rejects_transplant_until_independent_handoffs_are_reset() {
+  let (temporary, paths, job) = fixture();
+  registry::register(&paths, job.clone()).unwrap();
+  let independent = independent_job_with_same_id(
+    &job,
+    &temporary
+      .path()
+      .canonicalize()
+      .unwrap()
+      .join("independent-run"),
+  );
+  fs::copy(
+    job.run_dir().join("publishing-binding.json"),
+    independent.run_dir().join("publishing-binding.json"),
+  )
+  .unwrap();
+  let failure = registry::register(&paths, independent.clone())
+    .unwrap_err()
+    .to_string();
+  assert!(failure.contains("belongs to another run"));
+  let id = independent.identity().unwrap();
+  assert!(
+    !files::existing(&paths)
+      .unwrap()
+      .unwrap()
+      .join("jobs")
+      .join(&id)
+      .exists()
+  );
+  // This fixture has fresh, empty handoff state, so removing a transplanted
+  // marker restores an independent run rather than reusing cloud receipts.
+  fs::remove_file(independent.run_dir().join("publishing-binding.json")).unwrap();
+  fs::remove_file(independent.run_dir().join(".publishing-binding.lock")).unwrap();
+  assert_eq!(
+    registry::register(&paths, independent).unwrap()["accepted"],
+    true
+  );
+}

@@ -14,7 +14,55 @@ pub(in crate::client) fn api(url: &str) -> Api {
     token: "must-not-leak".into(),
     control: client.clone(),
     objects: client,
+    async_objects: None,
+    stop: None,
+    stream_budget: None,
   }
+}
+
+#[test]
+fn concurrent_jobs_with_the_same_environment_name_keep_distinct_bound_tokens() {
+  let (url, server) = mock(2, |request, _| {
+    let token = request.headers["authorization"].as_str();
+    assert!(matches!(token, "Bearer worker-one" | "Bearer worker-two"));
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::Capabilities {
+        features: vec![token.into()],
+      })
+      .unwrap(),
+    )
+  });
+  let bindings = ["worker-one", "worker-two"].map(|token| {
+    let config = ClientConfig {
+      url: url.clone(),
+      project_id: None,
+      token: None,
+      token_env: Some("SHARED_NAME".into()),
+    };
+    ResolvedClient::from_config_with_env(config, |name| {
+      assert_eq!(name, "SHARED_NAME");
+      Ok(token.into())
+    })
+    .unwrap()
+  });
+  let tasks = bindings.map(|binding| {
+    std::thread::spawn(move || {
+      let expected = format!("Bearer {}", binding.token);
+      let bound = Api::new_with_resolved(&binding, Some(Arc::new(AtomicBool::new(false)))).unwrap();
+      let cloned = bound.clone();
+      let Response::Capabilities { features } = cloned.request(&Request::Capabilities).unwrap()
+      else {
+        panic!("capabilities expected")
+      };
+      assert_eq!(features, vec![expected]);
+    })
+  });
+  for task in tasks {
+    task.join().unwrap();
+  }
+  server.join().unwrap();
 }
 
 #[test]
@@ -24,6 +72,67 @@ fn malformed_client_configuration_diagnostics_do_not_echo_embedded_credentials()
   std::fs::write(&path, "url = \"https://must-not-leak@example.invalid/\n").unwrap();
   let detail = Api::new(&path).err().unwrap().to_string();
   assert_eq!(detail, "service client configuration is invalid");
+}
+
+#[test]
+fn shared_object_upload_cancels_while_waiting_for_a_response_after_body_delivery() {
+  use std::io::{BufRead, BufReader, Read};
+  use std::sync::mpsc;
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let origin = format!("http://{}", listener.local_addr().unwrap());
+  let resolved = ResolvedClient {
+    endpoint: format!("{origin}/v1/request"),
+    token: "bound-token".into(),
+  };
+  let stop = Arc::new(AtomicBool::new(false));
+  let api = Api::new_with_resolved(&resolved, Some(Arc::clone(&stop))).unwrap();
+  let (delivered, body_received) = mpsc::channel();
+  let (release, released) = mpsc::channel();
+  let server = std::thread::spawn(move || {
+    let (stream, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut length = 0;
+    loop {
+      line.clear();
+      reader.read_line(&mut line).unwrap();
+      assert!(!line.to_ascii_lowercase().starts_with("authorization:"));
+      if let Some((key, value)) = line.split_once(':')
+        && key.eq_ignore_ascii_case("content-length")
+      {
+        length = value.trim().parse::<usize>().unwrap();
+      }
+      if line == "\r\n" {
+        break;
+      }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    assert_eq!(body, b"checkpoint bytes");
+    delivered.send(()).unwrap();
+    released.recv().unwrap();
+    // Deliberately never send response headers. Dropping the client's future
+    // must cancel this wait rather than waiting for the normal900s timeout.
+  });
+  let file = tempfile::NamedTempFile::new().unwrap();
+  std::fs::write(file.path(), b"checkpoint bytes").unwrap();
+  let source = std::fs::File::open(file.path()).unwrap();
+  let (finished, result) = mpsc::channel();
+  let task = std::thread::spawn(move || {
+    finished
+      .send(api.put_object(&format!("{origin}/part"), source, 16))
+      .unwrap();
+  });
+  body_received.recv_timeout(Duration::from_secs(3)).unwrap();
+  stop.store(true, Ordering::Release);
+  let failure = result
+    .recv_timeout(Duration::from_secs(1))
+    .expect("shared object cancellation was not prompt")
+    .unwrap_err();
+  assert!(matches!(failure, ExpriError::DownloadCancelled));
+  task.join().unwrap();
+  release.send(()).unwrap();
+  server.join().unwrap();
 }
 
 #[test]

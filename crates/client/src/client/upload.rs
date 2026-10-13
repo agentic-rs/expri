@@ -3,7 +3,6 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use reqwest::blocking::Body;
 
 use super::super::types::*;
 use super::fs::message;
@@ -41,6 +40,7 @@ fn sync_file_checked(
   snapshot: bool,
   registration: Option<&crate::registrations::Registration>,
 ) -> Result<()> {
+  api.check_cancelled()?;
   validate_target(&target)?;
   verify_registration(path, registration)?;
   if queue
@@ -59,7 +59,7 @@ fn sync_file_checked(
   if snapshot && initial.len() > RECORD_LIMIT {
     return Err(message("run metadata exceeds the supported 16 MiB limit"));
   }
-  let sha256 = fs::digest(&mut source, initial.len())?;
+  let sha256 = fs::digest_with_cancel(&mut source, initial.len(), &mut || Ok(api.cancelled()))?;
   verify_registration(path, registration)?;
   if queue.state.files.get(key).is_some_and(|saved| {
     saved.target == target
@@ -140,6 +140,7 @@ pub(super) fn closed_prefix(file: &mut File, size: u64) -> Result<u64> {
   Ok(0)
 }
 
+#[cfg(test)]
 pub(super) fn sync_stream(
   api: &Api,
   queue: &mut Queue,
@@ -148,7 +149,7 @@ pub(super) fn sync_stream(
   source: &Path,
   terminal: bool,
 ) -> Result<()> {
-  sync_stream_up_to(api, queue, scope, path, source, terminal, None)
+  sync_stream_up_to(api, queue, scope, path, source, terminal, None).map(|_| ())
 }
 
 pub(super) fn sync_stream_up_to(
@@ -159,7 +160,8 @@ pub(super) fn sync_stream_up_to(
   source: &Path,
   terminal: bool,
   committed_size: Option<u64>,
-) -> Result<()> {
+) -> Result<bool> {
+  api.check_cancelled()?;
   let mut file = fs::open(source)?;
   let size = file.metadata()?.len();
   if committed_size.is_some_and(|committed| committed > size) {
@@ -181,6 +183,10 @@ pub(super) fn sync_stream_up_to(
       "run stream was truncated after synchronization; use a new run identity",
     ));
   }
+  let target_size = size;
+  let size = api
+    .stream_budget
+    .map_or(size, |budget| size.min(offset.saturating_add(budget)));
   file.seek(SeekFrom::Start(offset))?;
   let mut buffer = [0u8; STREAM_BATCH];
   while offset < size {
@@ -236,7 +242,7 @@ pub(super) fn sync_stream_up_to(
     queue.state.streams.insert(path.into(), 0);
     queue.save()?;
   }
-  Ok(())
+  Ok(offset == target_size)
 }
 
 fn finish_upload(
@@ -264,7 +270,9 @@ fn finish_upload(
   };
   let mut file = fs::open(&path)?;
   let initial = file.metadata()?;
-  if initial.len() != saved.size || fs::digest(&mut file, saved.size)? != saved.sha256 {
+  if initial.len() != saved.size
+    || fs::digest_with_cancel(&mut file, saved.size, &mut || Ok(api.cancelled()))? != saved.sha256
+  {
     return Err(message(
       "queued upload source changed; preserve the original finalized file",
     ));
@@ -307,6 +315,7 @@ fn finish_upload(
       {
         continue;
       }
+      api.check_cancelled()?;
       verify_registration(source, registration)?;
       let part_size = queue.state.files[key].upload.part_size;
       let offset = (number as u64 - 1) * part_size;
@@ -316,23 +325,7 @@ fn finish_upload(
         part_number: number,
       })?;
       file.seek(SeekFrom::Start(offset))?;
-      let body = Body::sized(file.try_clone()?.take(length), length);
-      let response = api.objects.put(&url).body(body).send().map_err(|_| {
-        message("object part upload failed; acknowledged parts are saved for retry")
-      })?;
-      if !response.status().is_success() {
-        return Err(message(format!(
-          "object part upload returned {}",
-          response.status()
-        )));
-      }
-      let etag = response
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty() && value.len() <= 256)
-        .ok_or_else(|| message("object part upload returned no valid ETag"))?
-        .to_string();
+      let etag = api.put_object(&url, file.try_clone()?, length)?;
       let part = CompletedPart {
         part_number: number,
         etag,
@@ -357,7 +350,8 @@ fn finish_upload(
     let verified = (|| -> Result<bool> {
       Ok(
         fs::unchanged(&initial, &file.metadata()?)
-          && fs::digest(&mut file, size)? == queue.state.files[key].sha256
+          && fs::digest_with_cancel(&mut file, size, &mut || Ok(api.cancelled()))?
+            == queue.state.files[key].sha256
           && fs::unchanged(&initial, &file.metadata()?),
       )
     })();
