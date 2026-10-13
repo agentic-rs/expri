@@ -1,6 +1,7 @@
 //! Typed machine-profile operations share the artifact client's bounded transport.
 
 use std::path::Path;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use expri_core::system_profile::{
   MachineProfile, ProfileAcknowledgement, ProfileBatch, ProfileHistory, ProfileHistoryQuery,
@@ -19,6 +20,19 @@ pub struct SystemProfileClient {
 impl SystemProfileClient {
   pub fn new(config: &Path) -> Result<Self> {
     Self::from_api(Api::new(config)?)
+  }
+
+  /// Bind this producer to the caller's resolved credential without mutating
+  /// process environment or re-reading another job's configuration.
+  pub fn from_config(config: crate::types::ClientConfig) -> Result<Self> {
+    Self::from_api(Api::new_with_resolved(
+      &super::http::ResolvedClient::from_config(config)?,
+      None,
+    )?)
+  }
+
+  pub fn from_resolved(client: &super::ResolvedClient, stop: Arc<AtomicBool>) -> Result<Self> {
+    Self::from_api(Api::new_with_resolved(client, Some(stop))?)
   }
 
   fn from_api(api: Api) -> Result<Self> {

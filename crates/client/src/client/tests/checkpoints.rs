@@ -60,6 +60,7 @@ impl Server {
         let fail_completion = fail_completion.clone();
         handlers.push(thread::spawn(move || {
           let request = read_request(&mut stream);
+          let is_object = request.path == "/checkpoint";
           let mut headers = Vec::new();
           let (status, bytes) = if request.path == "/checkpoint" {
             started.send(()).unwrap();
@@ -190,17 +191,23 @@ impl Server {
             };
             (200, serde_json::to_vec(&response).unwrap())
           };
-          write!(
-            stream,
-            "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n",
-            bytes.len()
-          )
-          .unwrap();
-          for (key, value) in headers {
-            write!(stream, "{key}: {value}\r\n").unwrap();
+          let written = (|| -> std::io::Result<()> {
+            write!(
+              stream,
+              "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n",
+              bytes.len()
+            )?;
+            for (key, value) in headers {
+              write!(stream, "{key}: {value}\r\n")?;
+            }
+            stream.write_all(b"\r\n")?;
+            stream.write_all(&bytes)
+          })();
+          // Shared cancellation deliberately closes a stalled object request;
+          // control-response failures remain assertion failures in the fixture.
+          if !is_object {
+            written.unwrap();
           }
-          stream.write_all(b"\r\n").unwrap();
-          stream.write_all(&bytes).unwrap();
         }));
       }
       for handler in handlers {
@@ -286,9 +293,9 @@ fn live_checkpoint_transfer_does_not_block_metrics_and_terminal_seal_waits_for_i
     .open(options.run_dir.join("outputs/metrics.jsonl"))
     .unwrap();
   metrics.write_all(b"{\"step\":2}\n").unwrap();
-  let started = Instant::now();
   assert!(!publisher.cycle(&mut |_| Ok(())).unwrap());
-  assert!(started.elapsed() < Duration::from_secs(1));
+  assert!(!*server.release.0.lock().unwrap());
+  assert_eq!(server.state.lock().unwrap().object_puts, 0);
   assert!(server.state.lock().unwrap().metric_offsets.last().unwrap() > &initial_offset);
   fs::atomic_json(
     &options.run_dir.join("run-state.json"),
@@ -329,6 +336,102 @@ fn live_checkpoint_transfer_does_not_block_metrics_and_terminal_seal_waits_for_i
     fs::hex(&Sha256::digest(b"completed-checkpoint"))
   );
   assert!(server.state.lock().unwrap().seals > 0);
+}
+
+#[test]
+fn shared_checkpoint_transfer_outlives_control_slices_without_reloading_credentials() {
+  let (_temporary, root) = root();
+  let server = Server::new(false);
+  let options = run(&root, &server);
+  let job = crate::publishing::prepare_manual(&options).unwrap();
+  std::fs::remove_file(&options.config).unwrap();
+  let stop = Arc::new(AtomicBool::new(false));
+  let cycle = || crate::publishing::run_job(&job, Arc::clone(&stop), &mut |_| Ok(())).unwrap();
+  assert!(!cycle());
+  server.started.recv_timeout(Duration::from_secs(3)).unwrap();
+  let initial_offset = server.state.lock().unwrap().metric_offsets[0];
+  let mut metrics = std::fs::OpenOptions::new()
+    .append(true)
+    .open(options.run_dir.join("outputs/metrics.jsonl"))
+    .unwrap();
+  metrics.write_all(b"{\"step\":2}\n").unwrap();
+  assert!(!cycle());
+  assert!(!*server.release.0.lock().unwrap());
+  assert_eq!(server.state.lock().unwrap().object_puts, 0);
+  assert!(server.state.lock().unwrap().metric_offsets.last().unwrap() > &initial_offset);
+  fs::atomic_json(
+    &options.run_dir.join("run-state.json"),
+    &json!({"run_id":"run-1", "status":"completed"}),
+  )
+  .unwrap();
+  assert!(!cycle());
+  assert_eq!(server.state.lock().unwrap().seals, 0);
+  server.release();
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while !cycle() {
+    assert!(Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(5));
+  }
+  assert_eq!(
+    registrations::list(&options.run_dir).unwrap()["files"][0]["sync_status"],
+    "cloud"
+  );
+  assert!(server.state.lock().unwrap().seals > 0);
+}
+
+#[test]
+fn shared_stop_joins_a_stalled_object_and_restart_reuses_its_durable_queue() {
+  let (_temporary, root) = root();
+  let server = Server::new(false);
+  let options = run(&root, &server);
+  let job = crate::publishing::prepare_manual(&options).unwrap();
+  let stop = Arc::new(AtomicBool::new(false));
+  assert!(!crate::publishing::run_job(&job, Arc::clone(&stop), &mut |_| Ok(())).unwrap());
+  server.started.recv_timeout(Duration::from_secs(3)).unwrap();
+  let directory = root.join("queue/runs/project/worker/run-1/checkpoints");
+  assert!(matches!(
+    crate::lock::try_lock_file(&directory.join(".sync.lock"), false).unwrap(),
+    crate::lock::LockAttempt::Busy
+  ));
+  let saved: Value =
+    serde_json::from_slice(&std::fs::read(directory.join("queue.json")).unwrap()).unwrap();
+  let upload_id = saved["files"]["outputs/checkpoint.pt"]["upload"]["upload_id"].clone();
+  let started = Instant::now();
+  crate::publishing::drain_jobs(&stop).unwrap();
+  assert!(
+    started.elapsed() < Duration::from_secs(1),
+    "stop waited for the ordinary900s object timeout"
+  );
+  assert!(matches!(
+    crate::lock::try_lock_file(&directory.join(".sync.lock"), false).unwrap(),
+    crate::lock::LockAttempt::Acquired(_)
+  ));
+  assert_eq!(
+    registrations::list(&options.run_dir).unwrap()["files"][0]["sync_status"],
+    "registered"
+  );
+  server.release();
+  fs::atomic_json(
+    &options.run_dir.join("run-state.json"),
+    &json!({"run_id":"run-1", "status":"completed"}),
+  )
+  .unwrap();
+  let restarted = Arc::new(AtomicBool::new(false));
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while !crate::publishing::run_job(&job, Arc::clone(&restarted), &mut |_| Ok(())).unwrap() {
+    assert!(Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(5));
+  }
+  let recovered: Value =
+    serde_json::from_slice(&std::fs::read(directory.join("queue.json")).unwrap()).unwrap();
+  assert_eq!(
+    recovered["files"]["outputs/checkpoint.pt"]["upload"]["upload_id"],
+    upload_id
+  );
+  assert_eq!(
+    registrations::list(&options.run_dir).unwrap()["files"][0]["sync_status"],
+    "cloud"
+  );
 }
 
 #[test]

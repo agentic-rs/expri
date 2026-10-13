@@ -10,7 +10,7 @@ use super::{RECORD_LIMIT, fs};
 use crate::error::Result;
 use crate::lock::{FileLock, LockAttempt};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct SavedFile {
   pub(super) target: FileTarget,
   pub(super) size: u64,

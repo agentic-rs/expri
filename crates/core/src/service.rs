@@ -476,15 +476,25 @@ pub struct ArchiveRecord {
   pub last_error: Option<String>,
 }
 
+/// Accepted tracking documents, ordered so run state follows its dependencies.
+pub const TRACKING_DOCUMENT_PATHS: [&str; 5] = [
+  "outputs/.expri-artifacts.json",
+  "snapshot.json",
+  "environment/environment-state.json",
+  "outputs/params.json",
+  "run-state.json",
+];
+
+/// Accepted append-only tracking streams, including the retained system capture.
+pub const TRACKING_STREAM_PATHS: [&str; 4] = [
+  "outputs/metrics.jsonl",
+  crate::run_system::RUN_SYSTEM_PATH,
+  "logs/stdout.log",
+  "logs/stderr.log",
+];
+
 pub fn document_path(path: &str) -> bool {
-  matches!(
-    path,
-    "run-state.json"
-      | "snapshot.json"
-      | "environment/environment-state.json"
-      | "outputs/params.json"
-      | "outputs/.expri-artifacts.json"
-  )
+  TRACKING_DOCUMENT_PATHS.contains(&path)
 }
 
 pub fn validate_scope(scope: &RunScope) -> crate::error::Result<()> {
@@ -537,13 +547,7 @@ pub fn validate_target(target: &FileTarget) -> crate::error::Result<()> {
 }
 
 pub fn stream_path(path: &str) -> bool {
-  matches!(
-    path,
-    "outputs/metrics.jsonl"
-      | "outputs/system-profile.jsonl"
-      | "logs/stdout.log"
-      | "logs/stderr.log"
-  )
+  TRACKING_STREAM_PATHS.contains(&path)
 }
 
 /// Translate presentation fields without changing the saved protocol or queue.

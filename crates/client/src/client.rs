@@ -1,8 +1,8 @@
 mod catalog;
-mod checkpoints;
+pub(crate) mod checkpoints;
 mod download;
 pub(super) mod fs;
-mod http;
+pub(crate) mod http;
 mod inventory;
 mod login;
 mod queue;
@@ -25,37 +25,24 @@ use super::types::*;
 use super::{InputUploadOptions, PublishOptions};
 use crate::error::Result;
 use expri_core::run_system::{RUN_SYSTEM_PATH, RunSystemRecord};
+use expri_core::service::{TRACKING_DOCUMENT_PATHS as METADATA, TRACKING_STREAM_PATHS as STREAMS};
 use fs::message;
 use http::Api;
 use queue::{Queue, SavedFile};
-use upload::{sync_file, sync_stream};
+use upload::sync_file;
+#[cfg(test)]
+use upload::sync_stream;
 
 pub use catalog::ServiceCatalogClient;
 pub use download::{fetch, input_download, input_download_prepared};
+pub use http::ResolvedClient;
 pub use login::{login, logout, revoke_login, validate_login_url};
 pub use resource_queue::ResourceQueueClient;
 pub use system_profile::SystemProfileClient;
 pub use watch::{fetch as fetch_files, fetch_with_reporter as fetch_files_with_reporter};
 
-pub(super) fn validate_config(path: &Path) -> Result<()> {
-  Api::new(path).map(|_| ())
-}
-
-const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
+pub(crate) const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const OBJECT_BATCH: u64 = 8 * 1024 * 1024;
-const METADATA: [&str; 5] = [
-  crate::run_artifacts::INVENTORY_PATH,
-  "snapshot.json",
-  "environment/environment-state.json",
-  "outputs/params.json",
-  "run-state.json",
-];
-const STREAMS: [&str; 4] = [
-  "outputs/metrics.jsonl",
-  RUN_SYSTEM_PATH,
-  "logs/stdout.log",
-  "logs/stderr.log",
-];
 
 fn terminal(state: &Value) -> bool {
   matches!(
@@ -66,7 +53,6 @@ fn terminal(state: &Value) -> bool {
 
 pub(super) struct Publisher {
   api: Api,
-  config: PathBuf,
   checkpoints: checkpoints::CheckpointLane,
   run_dir: PathBuf,
   scope: RunScope,
@@ -80,7 +66,7 @@ impl Publisher {
     match error {
       crate::error::ExpriError::ServiceRejected {
         status: 401 | 403, ..
-      } => Some("Service authentication rejected; repair credentials and resume publishing"),
+      } => Some("Service authentication rejected; inspect the credentials used by this publisher"),
       crate::error::ExpriError::ServiceRejected { status: 410, .. } => Some(
         "Service run or project has expired or been deleted; publishing stopped. Use a new run identifier, or a new project identifier if the project was deleted",
       ),
@@ -90,6 +76,10 @@ impl Publisher {
 
   pub(super) fn new(options: &PublishOptions) -> Result<Self> {
     let api = Api::new(&options.config)?;
+    Self::new_with_api(options, api)
+  }
+
+  pub(super) fn new_with_api(options: &PublishOptions, api: Api) -> Result<Self> {
     let run_dir = std::path::absolute(&options.run_dir)?;
     fs::directory(&run_dir)?;
     let state: Value = serde_json::from_slice(&fs::read_bounded(
@@ -121,7 +111,6 @@ impl Publisher {
     let queue = Queue::new(queue_dir, owner)?;
     Ok(Self {
       api,
-      config: options.config.clone(),
       checkpoints: checkpoints::CheckpointLane::default(),
       run_dir,
       scope,
@@ -132,8 +121,9 @@ impl Publisher {
   }
 
   pub(super) fn cycle(&mut self, progress: &mut dyn FnMut(Value) -> Result<()>) -> Result<bool> {
+    self.api.reset_stream_backlog();
     let checkpoints_done = self.checkpoints.poll(
-      &self.config,
+      &self.api,
       &self.run_dir,
       &self.scope,
       &self.queue.directory,
@@ -169,19 +159,26 @@ impl Publisher {
           .map(|file| file.path),
       );
     }
-    json!({
+    let mut report = json!({
       "scope": self.scope, "terminal": done,
       "files": files,
       "stream_offsets": self.queue.state.streams, "queue_dir": self.queue.directory,
       "protocol": self.queue.state.protocol,
       "system_capture_upload": system_upload_report(&self.queue),
       "result_upload": upload_report(json!(self.queue.state.archive)),
-    })
+    });
+    if self.api.cooperative() {
+      report["backlog_remaining"] = json!(self.api.backlog_remaining());
+    }
+    report
   }
 
   pub(super) fn progress(&self, done: bool) -> Value {
     let mut progress = queue_progress(&self.queue);
     progress["terminal"] = json!(done);
+    if self.api.cooperative() {
+      progress["backlog_remaining"] = json!(self.api.backlog_remaining());
+    }
     progress["queue_dir"] = json!(self.queue.directory);
     if let Ok(checkpoints) = super::registrations::records(&self.run_dir) {
       progress["checkpoints"] = json!({
@@ -301,7 +298,7 @@ pub fn upload(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
     .map_err(Into::into)
 }
 
-fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
+pub(crate) fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
   if values.len() > 64 {
     return Err(message("select at most 64 explicit artifacts"));
   }
@@ -347,6 +344,8 @@ fn publish_cycle(
   }
   let protocol = tracking::negotiate(api, queue)?;
   let mut capture_failure = None;
+  let mut streams_done = true;
+  let mut artifacts_done = true;
   let capture = match system_capture_owned(run_dir, &state) {
     Ok(capture) => capture,
     Err(error) => {
@@ -395,8 +394,9 @@ fn publish_cycle(
             prefix,
           )
         })();
-        if let Err(error) = result {
-          capture_failure = Some(error);
+        match result {
+          Ok(done) => streams_done &= done,
+          Err(error) => capture_failure = Some(error),
         }
         progress(queue_progress(queue))?;
       }
@@ -410,7 +410,7 @@ fn publish_cycle(
         .get(path)
         .is_some_and(|saved| saved.upload.complete)
       {
-        sync_stream(api, queue, scope, path, &source, done)?;
+        streams_done &= upload::sync_stream_up_to(api, queue, scope, path, &source, done, None)?;
       }
       if done && protocol == queue::Protocol::Legacy {
         sync_file(api, queue, path, run_target(scope, path), &source, false)?;
@@ -423,14 +423,18 @@ fn publish_cycle(
     .iter()
     .filter(|path| done && !registrations.iter().any(|file| file.path == **path))
   {
-    sync_file(
-      api,
-      queue,
-      path,
-      run_target(scope, path),
-      &run_dir.join(path),
-      false,
-    )?;
+    if api.cooperative() {
+      artifacts_done &= checkpoints::artifact(api, queue, scope, run_dir, path)?;
+    } else {
+      sync_file(
+        api,
+        queue,
+        path,
+        run_target(scope, path),
+        &run_dir.join(path),
+        false,
+      )?;
+    }
   }
   sync_metadata(
     api,
@@ -452,6 +456,16 @@ fn publish_cycle(
   // metadata above continue to reach the service in the same cycle.
   if let Some(error) = capture_failure {
     return Err(error);
+  }
+  if !streams_done
+    || !artifacts_done
+    || queue
+      .state
+      .files
+      .values()
+      .any(|saved| !saved.upload.complete)
+  {
+    return Ok(false);
   }
   if done {
     // The task can finish before the collector's last observation commits.

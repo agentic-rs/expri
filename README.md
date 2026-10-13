@@ -49,13 +49,17 @@ experiment runs:
 
 ```sh
 expri system sample
-expri system daemon --no-publish
+expri service start
+expri service status
 expri system status
 expri system history --resolution hourly
 ```
 
 New machine configuration and profile history live in `~/.tokn/expri`.
-The foreground daemon samples every ten seconds. Optional machine-scoped
+Native runs start one shared worker service lazily and reuse it across runs.
+It samples every ten seconds and stays running until `expri service stop` or a
+worker restart. Use `expri service start --foreground` to run it in a terminal.
+Optional machine-scoped
 publishing runs independently, so server outages do not delay collection.
 Both local and server stores keep 72 hours of machine detail and retain historical
 hourly summaries indefinitely. New runs also preserve their exact system observations
@@ -580,8 +584,10 @@ mode. Exact samples and referenced inventories remain in the run's
 `outputs/system-profile.jsonl`, independently of the 72-hour machine-history window.
 Overlapping runs share machine readings; these measurements describe the machine,
 not resource usage attributed to an individual process. Runs without a capture
-show an explicit unavailable state. Upgrade the run worker, restart the upgraded collector, and upgrade
-the hosted server to support `run-system-metrics-v1`, before starting new captures.
+show an explicit unavailable state. Deploy the updated hosted server first so
+its archive limit accepts all nine tracking files. Then upgrade workers and stop
+any older standalone collector before starting new captures; native runs start
+the shared worker service automatically.
 
 Opening a run starts with its curves in a compact metric grid. **Overview** holds
 its command, provenance, parameters and metric summaries; **Logs** loads
@@ -696,10 +702,13 @@ bundle in Firefox. CI checks that rebuilding produces the checked-in asset.
 
 Use `expri service` to forward run metadata, metrics and logs to a service backed
 by durable tracking files and SQLite, upload private input files, and fetch selected
-checkpoints into the local review cache. The worker publisher retries outages
-while training continues; `expri service publish --watch` also forwards existing
-runs. Uploads keep durable multipart receipts; downloads verify file SHA256
-digests before publishing downloaded files. The server bundles and uploads
+checkpoints into the local review cache. One worker service collects machine
+history and retries publication jobs while training continues.
+`expri service publish` queues ongoing publication of an existing run and
+returns; `--wait` waits quietly and `--watch` shows progress until completion.
+Jobs retain their initial artifact selection; use `service file-upload` for
+additional post-run files. Uploads keep durable multipart receipts; downloads
+verify file SHA256 digests before publishing downloaded files. The server bundles and uploads
 acknowledged tracking files into `result.zip` in S3; checkpoints and inputs
 remain separate objects.
 

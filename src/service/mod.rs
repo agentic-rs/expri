@@ -23,6 +23,25 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSubcommand {
+  /// Start the shared worker service, or reuse it when already running.
+  Start {
+    /// Collect and publish in this terminal; Ctrl-C stops the service.
+    #[arg(long)]
+    foreground: bool,
+    /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri storage.
+    #[arg(long)]
+    storage_dir: Option<PathBuf>,
+  },
+  /// Inspect the shared worker service without starting it.
+  Status {
+    #[arg(long)]
+    storage_dir: Option<PathBuf>,
+  },
+  /// Stop collection and publishing; training continues and queued work is retained.
+  Stop {
+    #[arg(long)]
+    storage_dir: Option<PathBuf>,
+  },
   /// Inspect machine inventories and system-profile history.
   System(crate::system_cli::ServiceSystemCommand),
   /// Edit hosted run annotations or manage archival and retention.
@@ -48,9 +67,9 @@ enum ServiceSubcommand {
     #[arg(long)]
     create_bucket: bool,
   },
-  /// Publish saved run data; watch forwards live metrics without blocking training.
+  /// Queue ongoing run publication and return; optionally wait or watch.
   Publish(PublishOptions),
-  /// Resume the saved automatic publisher on this worker.
+  /// Retry a run's saved publication job in the shared worker service.
   Resume {
     #[arg(long)]
     run_dir: PathBuf,
@@ -187,8 +206,12 @@ pub struct PublishOptions {
   pub origin: String,
   #[arg(long = "artifact")]
   pub artifacts: Vec<String>,
+  /// Watch publication progress; Ctrl-C stops watching while uploads continue.
   #[arg(long)]
   pub watch: bool,
+  /// Wait quietly until tracking and checkpoints are acknowledged and sealing is accepted.
+  #[arg(long, conflicts_with = "watch")]
+  pub wait: bool,
   #[arg(long, default_value = ".expri/publish")]
   pub queue_dir: PathBuf,
 }
@@ -297,6 +320,27 @@ pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result
     ));
   }
   let report = match command.command {
+    ServiceSubcommand::Start {
+      foreground,
+      storage_dir,
+    } => {
+      let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
+      if foreground {
+        let collection_paths = paths.clone();
+        return expri_client::worker_service::run_foreground(&paths, move |context| {
+          crate::system_cli::collect_for_service(collection_paths, context)
+        });
+      }
+      expri_client::worker_service::ensure_started(&paths)?
+    }
+    ServiceSubcommand::Status { storage_dir } => {
+      let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
+      expri_client::worker_service::status(&paths)?
+    }
+    ServiceSubcommand::Stop { storage_dir } => {
+      let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
+      expri_client::worker_service::stop(&paths)?
+    }
     ServiceSubcommand::System(system) => {
       return crate::system_cli::run_service(system, command.json, quiet);
     }
@@ -357,9 +401,40 @@ pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result
       let config = toml::from_str(&std::fs::read_to_string(config)?)?;
       return server::serve(config, listen, data_dir, create_bucket);
     }
-    ServiceSubcommand::Publish(options) => client::publish(options.try_into()?)?,
+    ServiceSubcommand::Publish(options) => {
+      let watch = options.watch;
+      let wait = options.wait || watch;
+      let mut options: expri_client::PublishOptions = options.try_into()?;
+      // Every saved job follows its run to terminal state and capture drain.
+      // CLI wait/watch controls observation, not the lifetime of publication.
+      options.watch = true;
+      let paths = expri_core::storage::StoragePaths::resolve(None)?;
+      let job = publishing::prepare_manual(&options)?;
+      let receipt = expri_client::worker_service::register(&paths, job)?;
+      if wait {
+        let job_id = receipt["job_id"]
+          .as_str()
+          .ok_or_else(|| ExpriError::Message("publication receipt omitted its job ID".into()))?;
+        let final_report = expri_client::worker_service::observe(&paths, job_id, watch)?;
+        if final_report["status"] != "published" {
+          if command.json || !quiet {
+            print_report(&final_report, command.json)?;
+          }
+          return Err(ExpriError::Message(
+            "publication has not completed; saved work remains available in service status".into(),
+          ));
+        }
+        final_report
+      } else {
+        receipt
+      }
+    }
     ServiceSubcommand::Resume { run_dir } => publishing::resume(&run_dir)?,
-    ServiceSubcommand::PublishWorker { run_dir } => return publishing::worker(&run_dir),
+    ServiceSubcommand::PublishWorker { run_dir } => {
+      // Older launchers may re-exec this hidden entry point after an upgrade.
+      // They register with the shared service instead of owning a run process.
+      publishing::resume(&run_dir)?
+    }
     ServiceSubcommand::Fetch(options) => client::fetch(options.try_into()?)?,
     ServiceSubcommand::List {
       config,
@@ -722,11 +797,19 @@ mod tests {
   }
 
   #[test]
-  fn service_exposes_only_directional_verbs() {
+  fn service_exposes_lifecycle_and_directional_verbs() {
     use clap::CommandFactory;
     let mut cli = Cli::command();
     let help = cli.render_long_help().to_string();
-    for name in ["publish", "fetch", "upload", "file-upload"] {
+    for name in [
+      "start",
+      "status",
+      "stop",
+      "publish",
+      "fetch",
+      "upload",
+      "file-upload",
+    ] {
       assert!(
         help
           .lines()
@@ -1000,6 +1083,8 @@ mod tests {
       panic!("unexpected operation");
     };
     assert_eq!(options.queue_dir, PathBuf::from(".expri/publish"));
+    assert!(!options.wait);
+    assert!(!options.watch);
     let command = Cli::try_parse_from([
       "expri",
       "input",
@@ -1021,6 +1106,35 @@ mod tests {
       panic!("unexpected operation");
     };
     assert_eq!(options.queue_dir, PathBuf::from(".expri/publish"));
+  }
+
+  #[test]
+  fn publishing_observation_modes_are_explicit_and_exclusive() {
+    let base = [
+      "expri",
+      "publish",
+      "--run-dir",
+      "run-1",
+      "--project-id",
+      "demo",
+      "--origin",
+      "worker",
+    ];
+    for flag in ["--wait", "--watch"] {
+      assert!(Cli::try_parse_from(base.into_iter().chain([flag])).is_ok());
+    }
+    assert!(Cli::try_parse_from(base.into_iter().chain(["--wait", "--watch"])).is_err());
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "start",
+        "--foreground",
+        "--storage-dir",
+        "/tmp/expri-test"
+      ])
+      .is_ok()
+    );
+    assert!(Cli::try_parse_from(["expri", "daemon"]).is_err());
   }
 
   #[test]

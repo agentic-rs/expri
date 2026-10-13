@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod support;
+
 const UV: &str = r#"#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
@@ -203,6 +205,12 @@ if '--progress' in sys.argv:
       assert!(Instant::now() < deadline, "run did not finish: {report}");
       thread::sleep(Duration::from_millis(50));
     }
+  }
+}
+
+impl Drop for Fixture {
+  fn drop(&mut self) {
+    support::stop_worker_service(&self._root.path().join("home/.tokn/expri"));
   }
 }
 

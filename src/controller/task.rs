@@ -162,8 +162,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       }
       return Ok(());
     }
-    if let Some(report) = crate::node::run::execute_request_at(&request, &options.repo_root)?
-      && (options.json || !options.quiet)
+    if let Some(report) = crate::node::run::execute_request_at_with_initializer(
+      &request,
+      &options.repo_root,
+      crate::node::cli::initialize_worker_service,
+    )? && (options.json || !options.quiet)
     {
       crate::output::print_report(&report, options.json)?;
     }

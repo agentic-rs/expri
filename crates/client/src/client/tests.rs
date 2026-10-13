@@ -14,10 +14,10 @@ use super::*;
 mod asset_imports;
 mod checkpoints;
 
-struct HttpRequest {
-  path: String,
-  headers: String,
-  body: Vec<u8>,
+pub(crate) struct HttpRequest {
+  pub(crate) path: String,
+  pub(crate) headers: String,
+  pub(crate) body: Vec<u8>,
 }
 
 fn read_request(stream: &mut TcpStream) -> HttpRequest {
@@ -54,7 +54,7 @@ fn read_request(stream: &mut TcpStream) -> HttpRequest {
   }
 }
 
-fn mock(
+pub(crate) fn mock(
   count: usize,
   mut handler: impl FnMut(HttpRequest, &str) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + 'static,
 ) -> (String, thread::JoinHandle<()>) {
