@@ -269,13 +269,22 @@ export function formatNumber(value: number): string {
     : "—";
 }
 
-export function formatDuration(run: Run): string {
-  if (!run.started_at || !run.finished_at) return "—";
-  const seconds = Math.max(
-    0,
-    Math.round((Date.parse(run.finished_at) - Date.parse(run.started_at)) / 1000),
-  );
-  if (!Number.isFinite(seconds)) return "—";
+export function runInProgress(run: Pick<Run, "status" | "finished_at">): boolean {
+  return (run.status === "preparing" || run.status === "running") && run.finished_at == null;
+}
+
+export function hasRunningDuration(run: Run): boolean {
+  return runInProgress(run) && run.started_at !== null && Number.isFinite(Date.parse(run.started_at));
+}
+
+export function formatDuration(run: Run, now_ms = Date.now()): string {
+  if (!run.started_at) return "—";
+  const start = Date.parse(run.started_at);
+  const end = run.finished_at == null
+    ? runInProgress(run) ? now_ms : NaN
+    : Date.parse(run.finished_at);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "—";
+  const seconds = Math.floor((end - start) / 1000);
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;

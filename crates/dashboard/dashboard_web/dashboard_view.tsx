@@ -1,4 +1,4 @@
-import { Fragment, useSyncExternalStore, useState, useEffect, type KeyboardEvent } from "react";
+import { Fragment, useSyncExternalStore, useState, useEffect, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
@@ -9,6 +9,8 @@ import { RunAssets } from "./dashboard_assets";
 import { RunDetailDiagnostics, RunRowDiagnostics, runWarnings, warningsOutsideRuns } from "./run_diagnostics";
 import { Icon } from "./dashboard_icons";
 import { RunControlPopover } from "./run_control_popover";
+import { RunDuration, RunDurationProvider, RunStatusTiming } from "./run_duration";
+import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
@@ -29,7 +31,8 @@ import { RunSystemPanel, type RunSystemActions } from "./run_system_view";
 import {
   apiUrl,
   dateText,
-  formatDuration,
+  hasRunningDuration,
+  runInProgress,
   formatNumber,
   formatValue,
   jsonObject,
@@ -747,11 +750,6 @@ function RunBrowser({
           </thead>
           <tbody id="run-rows">
             {s.runs.map((run) => {
-              const metadata = [formatDuration(run)].filter(
-                (value) => value !== "—",
-              );
-              if (run.exit_code !== null && run.exit_code !== 0)
-                metadata.push(`exit ${run.exit_code}`);
               const identity = runIdentity(run);
               const selected = s.selected.includes(identity);
               return (
@@ -816,7 +814,7 @@ function RunBrowser({
                     >
                       {run.status}
                     </span>
-                    {metadata.length > 0 && <div className="run-meta">{metadata.join(" · ")}</div>}
+                    <RunStatusTiming run={run} />
                   </td>
                   {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
                   <td className="task-column"><span className="run-task">{run.task ?? "—"}</span></td>
@@ -941,7 +939,7 @@ function RunBrowser({
     </aside>
   );
 }
-function Facts({ values }: { values: [string, string][] }) {
+function Facts({ values }: { values: [string, ReactNode][] }) {
   return (
     <dl className="facts">
       {values.map(([label, value]) => (
@@ -978,7 +976,7 @@ function Overview({ detail }: { detail: Detail | null }) {
                   ["Status", detail.run.status],
                   ["Started", dateText(detail.run.started_at)],
                   ["Finished", dateText(detail.run.finished_at)],
-                  ["Duration", formatDuration(detail.run)],
+                  ["Duration", <RunDuration run={detail.run} />],
                   ["Exit code", formatValue(detail.run.exit_code)],
                 ]}
               />
@@ -1251,7 +1249,7 @@ function ReviewWorkspace({
           <p>Open a run from the history to inspect its metrics, parameters, logs, and files. Select two to eight runs to compare.</p>
         </div>
       </section>
-      <section id="review-section" aria-live="polite" hidden={!s.review}>
+      <section id="review-section" hidden={!s.review}>
         <header className="inspector-header review-heading">
           <div className="inspector-identity">
             <p id="review-eyebrow" className="eyebrow">
@@ -1263,14 +1261,14 @@ function ReviewWorkspace({
                 : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
             {review_run && <div className="inspector-meta">
-              <span className={`status inspector-status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(review_run.status) ? review_run.status : ""}`}>
+              <span aria-live="polite" className={`status inspector-status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(review_run.status) ? review_run.status : ""}`}>
                 {review_run.status}
               </span>
               {runNickname(review_run) && <code className="run-identifier">{review_run.run_id}</code>}
               {review_run.task && <span title="Task"><span className="sr-only">Task: </span>{review_run.task}</span>}
               {review_run.origin && runNickname(review_run) && <span title="Machine"><span className="sr-only">Machine: </span>{review_run.origin}</span>}
               {review_run.started_at && <time dateTime={review_run.started_at} title="Started"><span className="sr-only">Started: </span>{dateText(review_run.started_at)}</time>}
-              {review_run.finished_at && <span title="Duration"><span className="sr-only">Duration: </span>{formatDuration(review_run)}</span>}
+              <RunDuration run={review_run} show_unknown={runInProgress(review_run)} />
               <RunSmokeMark run={review_run} />
               <RunTags run={review_run} />
             </div>}
@@ -1594,9 +1592,10 @@ function RefreshControls({ snapshot: s, actions }: {
     </div>
   );
 }
-export function DashboardView({ store, actions }: {
+export function DashboardView({ store, actions, duration_clock }: {
   store: DashboardStore;
   actions: DashboardActions;
+  duration_clock: RefreshClock;
 }) {
   const s = useSyncExternalStore(store.subscribe, store.get_snapshot);
   const source_controls = document.getElementById("source-controls-root");
@@ -1608,8 +1607,10 @@ export function DashboardView({ store, actions }: {
   const active_source = s.sources.find((source) => source.source_id === s.source_id);
   const project_id = active_source?.kind === "hosted_project" ? active_source.project_id : null;
   const storage_visible = s.workspace_view === "storage";
+  const duration_active = s.runs.some(hasRunningDuration) ||
+    Boolean(s.review?.kind === "run" && s.detail && hasRunningDuration(s.detail.run));
   return (
-    <>
+    <RunDurationProvider clock={duration_clock} active={duration_active}>
       {project && createPortal(s.project_name, project)}
       {kind && createPortal(s.access_mode === "hosted" ? "Hosted workspace" : "Local workspace", kind)}
       {source_controls && createPortal(<SourceControls snapshot={s} actions={actions} />, source_controls)}
@@ -1670,6 +1671,6 @@ export function DashboardView({ store, actions }: {
         </div>
       </div>
       <div id="live-status" className="sr-only" role="status" aria-live="polite">{s.live_status}</div>
-    </>
+    </RunDurationProvider>
   );
 }

@@ -361,6 +361,7 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .run-diagnostics li + li, .run-diagnostics-detail li + li { margin-top: 3px; }
 .run-diagnostics-detail strong { font-size: 11px; }
 .run-task { color: var(--ink); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-duration { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .run-meta { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .started-column { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .machine-name { font: 10px/1.5 var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }

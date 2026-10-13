@@ -50,11 +50,25 @@ test("formatters handle absent and invalid records without invented live duratio
   assert.equal(formatDuration(run), "1h 1m");
   assert.equal(formatDuration({ ...run, finished_at: null }), "—");
   assert.equal(formatDuration({ ...run, started_at: "invalid" }), "—");
-  assert.equal(formatDuration({ ...run, finished_at: "2026-10-03T00:00:00Z" }), "0s");
+  assert.equal(formatDuration({ ...run, finished_at: "2026-10-03T00:00:00Z" }), "—");
   assert.equal(formatValue(null), "—");
   assert.equal(formatValue({ learning_rate: 0.1 }), '{"learning_rate":0.1}');
   assert.equal(formatValue("<script>alert(1)</script>"), "<script>alert(1)</script>");
   assert.equal(formatNumber(Infinity), "—");
+});
+
+test("duration formatting uses the current time only for unfinished active runs and preserves unknown periods", () => {
+  const now_ms = Date.parse("2026-10-14T01:02:05Z"), run = { status: "running", started_at: "2026-10-14T01:01:00Z", finished_at: null };
+  assert.equal(formatDuration(run, now_ms), "1m 5s");
+  assert.equal(formatDuration({ ...run, status: "preparing" }, now_ms), "1m 5s");
+  assert.equal(formatDuration(run, now_ms + 999), "1m 5s", "elapsed time displays complete seconds");
+  assert.equal(formatDuration({ ...run, finished_at: "2026-10-14T01:01:30Z" }, now_ms), "30s", "a recorded finish takes precedence over the live clock");
+  for (const record of [
+    { ...run, status: "completed" }, { ...run, status: "lost" },
+    { ...run, started_at: null }, { ...run, started_at: "invalid" },
+    { ...run, finished_at: "invalid" }, { ...run, started_at: "2026-10-14T01:03:00Z" },
+    { ...run, finished_at: "2026-10-14T01:00:00Z" },
+  ]) assert.equal(formatDuration(record, now_ms), "—");
 });
 
 test("new requests abort old work and ignore late successes", async t => {
@@ -1395,6 +1409,91 @@ function requestCounts(requests) {
   return requests.reduce((counts, url) => { const path = new URL(url, "http://localhost").pathname; counts[path] = (counts[path] ?? 0) + 1; return counts; }, {});
 }
 
+function overviewDuration(nodes) {
+  const label = [...nodes.get("run-detail").querySelectorAll("dt")].find(node => node.textContent === "Duration");
+  assert.ok(label, "the Overview exposes its duration fact");
+  return label.nextElementSibling.querySelector(".run-duration");
+}
+
+test("running durations tick with automatic refresh off without requests or replacing rows and charts", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:02:05Z");
+  const runs = [
+    { ...publishedRun("run-live"), started_at: new Date(clock.time - 65_000).toISOString() },
+    { ...publishedRun("run-completed"), status: "completed", started_at: new Date(clock.time - 40_000).toISOString(), finished_at: new Date(clock.time - 10_000).toISOString(), exit_code: 0 },
+    { ...publishedRun("run-preparing"), status: "preparing", started_at: new Date(clock.time - 2_000).toISOString() },
+  ];
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); assert.equal(nodes.get("auto-refresh-toggle").checked, false);
+  await inspect(model); await click(nodes.get("review-tab-overview"));
+  const rows = [...nodes.get("run-rows").children], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
+  const header = nodes.document.querySelector(".inspector-meta .run-duration"), overview = overviewDuration(nodes), checked_at = nodes.get("updated-at").textContent;
+  const durations = () => rows.map(row => row.querySelector(".status-column .run-duration").textContent);
+  assert.deepEqual(durations(), ["1m 5s", "30s", "2s"]);
+  assert.equal(header.textContent, "1m 5s"); assert.equal(overview.textContent, "1m 5s");
+  assert.equal(clock.timers.size, 1, "all live run displays share one display timer");
+  await act(async () => { runCheckbox(nodes, 0).focus(); });
+  const requests = requestCounts(model.requests);
+  await clock.advance(2000);
+  assert.deepEqual(durations(), ["1m 7s", "30s", "4s"]);
+  assert.equal(header.textContent, "1m 7s"); assert.equal(overview.textContent, "1m 7s");
+  assert.deepEqual(requestCounts(model.requests), requests, "display ticks never poll the API");
+  assert.deepEqual([...nodes.get("run-rows").children], rows); assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(chartSource(nodes), chart_url); assert.equal(previewMounts(nodes), mounts);
+  assert.equal(nodes.document.activeElement, runCheckbox(nodes, 0)); assert.equal(nodes.get("updated-at").textContent, checked_at);
+  assert.equal(overviewDuration(nodes), overview);
+  for (const element of nodes.document.querySelectorAll(".run-duration")) assert.equal(element.getAttribute("aria-live"), "off", "second-by-second timing does not announce repeatedly");
+});
+
+test("running durations freeze at the recorded finish and stop scheduling after completion", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
+  const run = { ...publishedRun("run-finishes"), started_at: new Date(clock.time - 10_000).toISOString() };
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: [run] }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
+  await clock.advance(2000); assert.equal(overviewDuration(nodes).textContent, "12s");
+  run.status = "completed"; run.finished_at = new Date(clock.time - 1000).toISOString(); run.exit_code = 0;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  const row = nodes.get("run-rows").children[0], duration = row.querySelector(".run-duration"), header = nodes.document.querySelector(".inspector-meta .run-duration");
+  assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
+  assert.equal(duration.dataset.live, "false"); assert.equal(clock.timers.size, 0, "terminal records need no display timer");
+  const requests = requestCounts(model.requests);
+  await clock.advance(60_000);
+  assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
+  assert.deepEqual(requestCounts(model.requests), requests); assert.equal(nodes.get("run-rows").children[0], row);
+});
+
+test("running durations keep missing invalid and future starts explicitly unavailable", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
+  const runs = [null, "invalid", new Date(clock.time + 60_000).toISOString()].map((started_at, index) => ({ ...publishedRun(`run-unknown-${index}`), started_at }));
+  runs.push({ ...publishedRun("run-terminal-unknown"), status: "completed", started_at: null });
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
+  for (const row of [...nodes.get("run-rows").children].slice(0, 3)) {
+    const duration = row.querySelector(".run-duration");
+    assert.equal(duration.textContent, "—"); assert.equal(duration.title, "Elapsed time unavailable");
+    assert.equal(duration.getAttribute("aria-label"), "Elapsed time: unavailable");
+  }
+  assert.equal(nodes.get("run-rows").children[3].querySelector(".run-duration"), null, "unknown terminal timing does not invent elapsed time");
+  const header = nodes.document.querySelector(".inspector-meta .run-duration");
+  assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—");
+  const requests = requestCounts(model.requests); await clock.advance(2000);
+  assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—"); assert.deepEqual(requestCounts(model.requests), requests);
+});
+
+test("running duration display pauses while hidden resumes immediately and disposes its single timer", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
+  const run = { ...publishedRun("run-visible"), started_at: new Date(clock.time - 10_000).toISOString() };
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: [run] }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); await settledTable(nodes);
+  const duration = nodes.get("run-rows").querySelector(".run-duration"), requests = requestCounts(model.requests);
+  assert.equal(clock.timers.size, 1);
+  Object.defineProperty(nodes.document, "visibilityState", { configurable: true, value: "hidden" }); await emit(nodes.document, "visibilitychange");
+  assert.equal(clock.timers.size, 0); await clock.advance(5000); assert.equal(duration.textContent, "10s");
+  Object.defineProperty(nodes.document, "visibilityState", { configurable: true, value: "visible" }); await emit(nodes.document, "visibilitychange");
+  assert.equal(duration.textContent, "15s"); assert.equal(clock.timers.size, 1); assert.deepEqual(requestCounts(model.requests), requests);
+  await act(async () => { nodes.cleanup(); await microtasks(); }); nodes.cleanup = null;
+  assert.equal(clock.timers.size, 0); await clock.advance(30_000); assert.deepEqual(requestCounts(model.requests), requests);
+});
+
 test("React retains the actual chart container across reviews, tags, tabs and refresh", async t => {
   const model = await autoFixture(t), { nodes } = model;
   const frame = nodes.get("chart-preview");
@@ -2732,7 +2831,7 @@ test("full run history remains interactive beside Storage and opening a run retu
   const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs }), { nodes } = model;
   await settledTable(nodes);
   const history = nodes.get("run-rows"), panes = workspacePanes(nodes), preview = nodes.get("chart-preview");
-  assert.deepEqual([...history.querySelectorAll(".status-column")].map(node => node.textContent), ["completed", "running"]);
+  assert.deepEqual([...history.querySelectorAll(".status-column .status")].map(node => node.textContent), ["completed", "running"]);
   await click(nodes.get("workspace-view-storage"));
   await settled(() => nodes.document.getElementById("storage-rows") !== null);
   assert.equal(nodes.get("workspace-page").hidden, false);
