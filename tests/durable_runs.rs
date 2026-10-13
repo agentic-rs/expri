@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod support;
+
 const UV: &str = r#"#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 args = sys.argv[1:]
@@ -109,6 +111,7 @@ impl Fixture {
       "PATH",
       format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap()),
     );
+    command.env("EXPRI_STORAGE_DIR", self._root.path().join("profiles"));
     command
   }
 
@@ -165,6 +168,30 @@ impl Fixture {
         .is_file()
     );
     receipt
+  }
+}
+
+impl Drop for Fixture {
+  fn drop(&mut self) {
+    if let Ok(runs) = fs::read_dir(self.repo.join(".expri/runs")) {
+      for run in runs.flatten() {
+        let Ok(bytes) = fs::read(run.path().join("run-state.json")) else {
+          continue;
+        };
+        let Ok(state) = serde_json::from_slice::<Value>(&bytes) else {
+          continue;
+        };
+        if matches!(state["status"].as_str(), Some("preparing" | "running"))
+          && let Some(id) = state["run_id"].as_str()
+        {
+          let _ = self
+            .command()
+            .args(["runs", "cancel", id, "--json"])
+            .output();
+        }
+      }
+    }
+    support::stop_worker_service(&self._root.path().join("profiles"));
   }
 }
 
@@ -232,6 +259,72 @@ fn assert_smoke_snapshot(run: &Path) -> String {
     assert_eq!(value["smoke"], true, "{name} lost the smoke marker");
   }
   id.to_owned()
+}
+
+#[test]
+fn first_native_run_starts_collection_and_later_runs_reuse_it() {
+  let fixture = Fixture::new();
+  let profiles = fixture._root.path().join("profiles");
+  let before: Value =
+    serde_json::from_slice(&fixture.run(&["service", "status", "--json"]).stdout).unwrap();
+  assert_eq!(before["running"], false);
+  assert!(!profiles.exists(), "inspection must not create storage");
+
+  let first = fixture.start("cancel", false);
+  let first_run = Path::new(first["run_dir"].as_str().unwrap());
+  await_file(&first_run.join("outputs/heartbeat"));
+  let state = record(first_run, "run-state.json");
+  assert!(state["machine_id"].as_str().is_some());
+  assert!(state["system_capture_id"].as_str().is_some(), "{state}");
+  let initial: Value =
+    serde_json::from_slice(&fixture.run(&["service", "status", "--json"]).stdout).unwrap();
+  assert_eq!(initial["ready"], true);
+  assert_eq!(
+    initial["collection"]["publishing"]["status"],
+    "unconfigured"
+  );
+  let second = fixture.start("success", false);
+  let second_id = second["run_id"].as_str().unwrap();
+  assert_eq!(terminal(&fixture, second_id)["status"], "completed");
+  let reused: Value =
+    serde_json::from_slice(&fixture.run(&["service", "start", "--json"]).stdout).unwrap();
+  assert_eq!(reused["pid"], initial["pid"]);
+  assert_eq!(
+    record(
+      Path::new(second["run_dir"].as_str().unwrap()),
+      "run-state.json"
+    )["machine_id"],
+    state["machine_id"]
+  );
+
+  support::stop_worker_service(&profiles);
+  let heartbeat = first_run.join("outputs/heartbeat");
+  let old = fs::read(&heartbeat).unwrap();
+  thread::sleep(Duration::from_millis(100));
+  assert_ne!(
+    fs::read(&heartbeat).unwrap(),
+    old,
+    "stopping service must leave training alive"
+  );
+  let restarted: Value =
+    serde_json::from_slice(&fixture.run(&["service", "start", "--json"]).stdout).unwrap();
+  assert_ne!(restarted["pid"], initial["pid"]);
+  assert_eq!(restarted["collection"]["machine_id"], state["machine_id"]);
+  let id = first["run_id"].as_str().unwrap();
+  fixture.run(&["runs", "cancel", id, "--json"]);
+  assert_eq!(terminal(&fixture, id)["status"], "cancelled");
+}
+
+#[test]
+fn service_startup_failure_is_recorded_without_preventing_training() {
+  let fixture = Fixture::new();
+  fs::write(fixture._root.path().join("profiles"), b"blocked storage").unwrap();
+  let output = fixture.run(&["run", "train", "success"]);
+  assert!(String::from_utf8_lossy(&output.stderr).contains("training will continue locally"));
+  let state = record(&only_run(&fixture), "run-state.json");
+  assert_eq!(state["status"], "completed");
+  assert_eq!(state["exit_code"], 0);
+  assert!(state["worker_service_error"].as_str().is_some());
 }
 
 #[test]

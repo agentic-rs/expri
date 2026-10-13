@@ -205,7 +205,7 @@ fn foreground_daemon_is_singleton_and_keeps_sampling_when_publishing_fails() {
     if output.status.success() {
       let status: Value = serde_json::from_slice(&output.stdout).unwrap();
       if status["local"]["sample_sequence"].as_u64().unwrap_or(0) >= 2
-        && status["publishing"]["status"] == "retrying"
+        && status["publishing"]["status"] == "paused"
       {
         break status;
       }
@@ -260,6 +260,7 @@ fn a_stalled_service_request_does_not_block_collection() {
         Err(error) => panic!("{error}"),
       }
     };
+    stream.set_nonblocking(false).unwrap();
     stream
       .set_read_timeout(Some(Duration::from_secs(5)))
       .unwrap();

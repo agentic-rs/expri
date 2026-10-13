@@ -9,7 +9,9 @@ and private inputs remain separate S3 objects. Service outages leave training
 running. Required private inputs must already be downloaded before an offline
 run can start.
 
-Runs can start their own uploader when service publishing is configured. Explicit
+Native runs lazily start one shared worker service for the current user and
+storage root. It collects system observations and schedules each run's durable
+publication job with isolated credentials. Explicit
 service commands remain available for existing runs and selected checkpoints.
 The service does not schedule experiments.
 
@@ -18,13 +20,14 @@ Each transfer has a direction and a named action:
 | Data | Direction | Action |
 | --- | --- | --- |
 | Source and config | Laptop → worker checkout | `expri -T gpu-1 push` |
-| Live tracking and registered checkpoints | Worker → server/S3 | Automatic publisher, or `expri service publish --watch` |
+| Live tracking and registered checkpoints | Worker → server/S3 | Shared worker service, or `expri service publish` |
 | Completed private input files | Owner → S3 | `expri service input upload` |
 | Required private input files | S3 → worker asset cache | `expri assets add`/`download` and automatic run preparation |
 | Tracking bundle (`result.zip`) | Server → S3 | Automatic server upload, or `expri service upload` |
 | Run metadata and selected outputs | Server/S3 → laptop | `expri fetch --watch` |
 
-`--watch` repeats one action. Source pushing and result fetching run separately;
+For publishing, `--watch` observes the durable job and Ctrl-C stops only that
+observer. Source pushing and result fetching run separately;
 each has its own retry loop. The server coordinates file transfers, while signed
 URLs let workers and laptops transfer large file bytes directly to or from S3.
 
@@ -269,8 +272,11 @@ unless they supply their own service table. Use distinct origins for workers.
 `dashboard_url` is optional and must be a public HTTP(S) root URL without credentials,
 query parameters, or fragments.
 
-`expri run train` and `expri run --detach train` start an independent native
-publisher before environment preparation. It forwards metadata, metrics, and
+`expri run train` and `expri run --detach train` start or reuse the shared worker
+service before recording machine/capture metadata and preparing the environment.
+Local readiness waits for a committed machine observation, independent of
+network and credentials. Startup failure warns and records an error while
+training continues. The service forwards metadata, metrics, and
 logs, including preparation failures and cancellation. The task's exit code is
 independent of publishing: service outages leave queued work retrying after
 training finishes. Training registers finalized checkpoints for live upload.
@@ -286,12 +292,18 @@ expri runs show run-abc123
 expri service resume --run-dir .expri/runs/run-abc123
 ```
 
-`service resume` runs on the worker and restarts publishing from its saved intent
-and queue after a publisher stops or a configuration/token problem is corrected.
-It does not rerun training. The queue lives at the original checkout's
+`service resume` runs on the worker and retries the matching saved job and queue.
+It does not rerun training or create a duplicate job. Endpoint, credentials and
+upload options are pinned at registration; conflicting registration is rejected.
+Each local run binds to one publishing destination because checkpoint handoffs
+and publisher status belong to that run.
+Only the required token is snapshotted in private worker storage outside the
+checkout. The service never swaps process environment variables between jobs.
+The queue lives at the original checkout's
 `.expri/publish`; keep it and the original run files until publication is
-acknowledged. Publishers survive terminal closure and task completion, but must
-be resumed after a worker reboot. For new tracking runs, `published` means all
+acknowledged. The shared service survives terminal closure and task completion.
+After reboot, the next run, publication, or `service start` recovers saved jobs;
+expri does not install an OS startup service. For new tracking runs, `published` means all
 terminal tracking bytes and registered checkpoints were acknowledged and the server upload job was accepted;
 it does not mean the independent result ZIP upload has finished. Upload
 failures retain tracking data and retry without restarting training. For legacy
@@ -305,13 +317,41 @@ and no Python fallback. Upgrade older workers or use `expri run --no-publish tra
 for an individual run. Runs without service configuration keep their existing
 execution and fallback behavior.
 
-For existing runs, live publishing can also be started explicitly:
+Deploy the updated server before upgrading workers to automatic collection.
+Its archive limit includes all nine supported tracking files, including the
+system capture, so complete native runs can seal and upload their result bundle.
+
+Manage the shared worker process on the worker itself:
+
+```sh
+expri service start
+expri service start --foreground
+expri service status
+expri service stop
+```
+
+`start` is idempotent in background mode; `--foreground` refuses a duplicate.
+`status` never starts the service or creates files. `stop` leaves training alive
+and preserves queued work. The next run or publishing request starts it again.
+The process stays running while idle until explicitly stopped. Collection,
+machine-history publication and run publication have separate status and loops.
+Machine publishing needs its own configuration and scoped token; run tokens
+alone do not enable it. See [system profiles](system-profiles.md).
+
+For existing runs, publication can also be queued explicitly:
 
 ```sh
 expri service publish --config worker.toml \
   --project-id vision --origin gpu-1 \
-  --run-dir .expri/runs/run-abc123 --watch
+  --run-dir .expri/runs/run-abc123
 ```
+
+This registers ongoing publication through terminal state and capture drain,
+then returns a durable receipt. Add `--wait` to wait quietly or `--watch` to show
+progress until completion. Ctrl-C stops observation while the shared service
+continues uploading. Add `--json` for a structured receipt or final report.
+Waiting exits unsuccessfully if a job is rejected or the service stops before
+publication completes; the report preserves its saved status.
 
 The uploader checks every five seconds and forwards metadata snapshots,
 parameters, complete metric rows, and stdout/stderr bytes. It sends appended
@@ -384,7 +424,8 @@ older completed S3 runs remain readable. An older server's unknown-capability
 response permits legacy publishing, while authentication and connection failures
 leave negotiation pending for retry.
 
-Large result files are selected explicitly after the run is terminal:
+For a run without a saved publication job, select finalized result files at
+its first manual registration. Selections remain pinned for subsequent retries:
 
 ```sh
 expri service publish --config worker.toml \
@@ -392,11 +433,27 @@ expri service publish --config worker.toml \
   --run-dir .expri/runs/run-abc123 --artifact outputs/checkpoint.pt
 ```
 
+An automatically registered run already has a saved job. Adding `--artifact`
+to a later `publish` request conflicts with that job's options. Register live
+checkpoints before its inventory closes, or upload additional files afterward
+with their original run scope:
+
+```sh
+expri service file-upload --config worker.toml \
+  --target '{"kind":"run","scope":{"project_id":"vision","origin":"gpu-1","run_id":"run-abc123"},"path":"outputs/checkpoint.pt"}' \
+  --file .expri/runs/run-abc123/outputs/checkpoint.pt
+```
+
+`file-upload` uploads the selected file independently of the saved run job and
+does not change its artifact selection or seal another result bundle.
+
 Multipart upload IDs and acknowledged parts survive retries and service
 restarts. A lost acknowledgement is reconciled with the service's stored receipt.
 The client queue defaults to `.expri/publish`; use `--queue-dir` to keep its
-location stable across invocations. A one-shot failure exits nonzero and retains
-the queue. Watch mode retries service outages. Keep original output files until
+location stable across invocations. Accepted jobs retain their queues and retry
+service outages independently of the CLI observer. Registration errors exit
+nonzero; accepted work survives a startup failure and its receipt includes a
+warning. Keep original output files until
 upload acknowledgement; expri never removes them automatically.
 
 Only finalized files belong in explicit artifacts. Inputs and artifacts use

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Native runs now start one shared worker service lazily for collection and run
+  publication. `service start` runs in the background or reuses it;
+  `--foreground` runs in the terminal. `service status` is read-only, and
+  `service stop` preserves queued jobs and leaves training alive. Saved jobs
+  recover on the next start after a reboot. `system daemon` is a deprecated
+  foreground alias. Stop an older standalone collector before starting the new
+  service after upgrading the worker binary.
+- `service publish` now queues ongoing publication and returns a durable
+  receipt. Use `--wait` to wait quietly or `--watch` to observe progress; Ctrl-C
+  stops observation while publication continues. Jobs pin their destination,
+  options and private credential snapshot; conflicting registration is rejected.
+- Server archives now accept all nine supported tracking files, including run
+  system captures. Deploy the updated server before upgrading workers that
+  automatically capture system metrics.
+
 - `run --smoke` marks managed runs and generates `smoke-run-…` IDs. An updated
   server automatically archives finished published smoke runs with the existing
   15-day retention, including failed and cancelled runs; worker files remain

@@ -110,15 +110,22 @@ starting acceptance tests in the same job. Run those checks locally with
 subprocesses with fake command executables to check fixture failures and cleanup;
 these checks require no Docker daemon or network access.
 
-Configured runs start their own native publishers in this suite. Training
-finishes through a service outage; killing and resuming the publisher reuses
-its saved intent and acknowledged stream/upload offsets. Failed and cancelled
-runs also reach `published`, with their original task status preserved in hosted
-review. A small finalized checkpoint registered with `best` and `latest` labels
+Configured runs register with one native worker service per user and storage
+root. The suite checks readiness after a committed local system observation and
+reuses the same service PID for two runs. Training finishes through a server
+outage; `service stop` and run resume preserve the job registry and acknowledged
+stream/upload offsets. Stopping the service during a gated active run leaves its
+training lease and task status intact. Failed and cancelled runs also reach
+`published`, with their original task status preserved in hosted review.
+Manual publication returns a queued receipt; completed fixtures use `--wait`,
+and active browser fixtures wait for acknowledged stream offsets and exact
+metadata revisions before signaling Firefox. A small finalized checkpoint registered with `best` and `latest` labels
 uploads during training; an `expri fetch --watch` laptop watcher configured for `best` commits its
 verified download receipt while the run is still active. The separate 17 MiB
-unregistered checkpoint remains absent until explicitly selected and retains
-the multipart recovery and interrupted range-download checks.
+unregistered checkpoint remains absent until explicitly uploaded with
+`service file-upload`, retaining the multipart recovery and interrupted
+range-download checks. Changing an existing automatic job's artifact selection
+is rejected rather than silently replacing its immutable registration.
 
 The service suite also submits real browser login and logout forms over a
 generated internal HTTPS certificate. It reproduces `Origin: null` failures
@@ -154,8 +161,9 @@ a distinct worker token, preserving the first origin's actual run ID. It checks
 default All machines, native filtering, distinct selection and chart samples,
 Machine sorting, retained columns and chart exploration, live metric/log updates
 from both origins, and correctly scoped browser downloads and CLI commands.
-The additional publisher uses the existing host image and small attachments;
-it does not repeat the experiment or large checkpoint fault scenarios.
+The second origin's publishing job uses the host's shared service, its own frozen
+credential, and small attachments; it does not repeat the experiment or large
+checkpoint fault scenarios.
 `workspace-project-desktop.png` and `workspace-project-320.png` /
 `workspace-project-360.png` capture the project table. The original browser suite
 also verifies fallback to worker sources when an authenticated project-catalog

@@ -11,6 +11,8 @@ pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 pub const RUN_PUBLISHING_CAPABILITY: &str = "run-publishing-v1";
 pub const SMOKE_RUNS_CAPABILITY: &str = "smoke-runs-v1";
+#[cfg(unix)]
+pub const WORKER_SERVICE_CAPABILITY: &str = "worker-service-v1";
 pub const ASSETS_CAPABILITY: &str = "assets-v2";
 
 #[derive(Debug, Subcommand)]
@@ -71,7 +73,19 @@ pub fn run(command: NodeCommand) -> Result<()> {
     }
     NodeCommand::Capabilities(command) => capabilities(command),
     NodeCommand::Setup(command) => crate::node::setup::apply_request_file(&command.request),
-    NodeCommand::Run(command) => crate::node::run::apply_request_file(&command.request),
+    NodeCommand::Run(command) => {
+      let request: crate::protocol::RunRequest =
+        serde_json::from_slice(&std::fs::read(command.request)?)?;
+      let root = std::env::current_dir()?;
+      if let Some(receipt) = crate::node::run::execute_request_at_with_initializer(
+        &request,
+        &root,
+        initialize_worker_service,
+      )? {
+        println!("{receipt}");
+      }
+      Ok(())
+    }
     NodeCommand::RunWorker(command) => crate::node::run::worker(&command.run_dir),
     NodeCommand::Env(command) => {
       if let Some(path) = command.request {
@@ -98,6 +112,12 @@ pub fn run(command: NodeCommand) -> Result<()> {
   }
 }
 
+pub(crate) fn initialize_worker_service() -> Result<()> {
+  let paths = expri_core::storage::StoragePaths::resolve(None)?;
+  expri_client::worker_service::ensure_started(&paths)?;
+  Ok(())
+}
+
 fn capabilities(command: CapabilitiesCommand) -> Result<()> {
   let available = [
     UV_ENVIRONMENT_CAPABILITY,
@@ -107,6 +127,8 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     RUN_METRICS_CAPABILITY,
     RUN_PUBLISHING_CAPABILITY,
     SMOKE_RUNS_CAPABILITY,
+    #[cfg(unix)]
+    WORKER_SERVICE_CAPABILITY,
     ASSETS_CAPABILITY,
     expri_core::run_system::RUN_SYSTEM_CAPABILITY,
   ];

@@ -37,6 +37,16 @@ pub fn execute_request_at(
   request: &RunRequest,
   repo_root: &Path,
 ) -> Result<Option<serde_json::Value>> {
+  execute_request_at_with_initializer(request, repo_root, || Ok(()))
+}
+
+/// The CLI supplies worker-service startup after validation and before capture
+/// metadata is created. Library callers can retain control over their runtime.
+pub fn execute_request_at_with_initializer(
+  request: &RunRequest,
+  repo_root: &Path,
+  initialize: impl FnOnce() -> Result<()>,
+) -> Result<Option<serde_json::Value>> {
   let repo_root = fs::canonicalize(repo_root)?;
   request.environment.validate()?;
   if let Some(service) = &request.service {
@@ -49,6 +59,13 @@ pub fn execute_request_at(
     request.expected_sync.as_ref(),
     request.smoke,
   )?;
+  let service_unavailable = initialize().is_err();
+  if service_unavailable {
+    let _ = writeln!(
+      std::io::stderr(),
+      "warning: worker service could not become ready; training will continue locally. Inspect expri service status for details."
+    );
+  }
   let state_path = snapshot.run_dir.join("run-state.json");
   let mut state = json!({
     "schema_version": 1,
@@ -72,6 +89,10 @@ pub fn execute_request_at(
   });
   if request.smoke {
     state["smoke"] = json!(true);
+  }
+  if service_unavailable {
+    state["worker_service_error"] =
+      json!("Worker service could not become ready; local training continues");
   }
   if let Some(machine_id) = existing_machine_id() {
     state["machine_id"] = json!(machine_id);
@@ -724,10 +745,18 @@ mod tests {
       sync_args: vec![],
       expected_sync: None,
     };
-    let error = apply_request_at(&request, &canonical)
-      .unwrap_err()
-      .to_string();
+    let initialized = std::cell::Cell::new(false);
+    let error = execute_request_at_with_initializer(&request, &canonical, || {
+      initialized.set(true);
+      Ok(())
+    })
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("assets-v2"), "{error}");
+    assert!(
+      !initialized.get(),
+      "invalid snapshots must not start a service"
+    );
     assert!(!marker.exists());
     assert_eq!(
       fs::read_dir(canonical.join(".expri/runs")).unwrap().count(),

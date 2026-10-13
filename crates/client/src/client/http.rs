@@ -1,8 +1,13 @@
 use std::io::Read;
 use std::path::Path;
+use std::sync::{
+  Arc,
+  atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::super::types::{ClientConfig, MAX_REQUEST, Request, Response, validate_client_token};
@@ -33,11 +38,77 @@ pub(super) fn resolve_token(
   Ok(token)
 }
 
-pub(super) struct Api {
+/// An immutable credential binding. Serialize only into the worker's private
+/// job registry; this type deliberately does not implement Debug.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedClient {
+  endpoint: String,
+  token: String,
+}
+
+impl ResolvedClient {
+  pub fn resolve(path: &Path) -> Result<Self> {
+    Self::from_config(crate::load_client_config(path)?)
+  }
+
+  pub fn from_config(config: ClientConfig) -> Result<Self> {
+    Self::from_config_with_env(config, |name| std::env::var(name))
+  }
+
+  fn from_config_with_env(
+    config: ClientConfig,
+    read_env: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
+  ) -> Result<Self> {
+    let url = reqwest::Url::parse(&config.url).map_err(|_| message("invalid service URL"))?;
+    let token = resolve_token(config, read_env)?;
+    let resolved = Self {
+      endpoint: format!("{}/v1/request", url.as_str().trim_end_matches('/')),
+      token,
+    };
+    resolved.validate()?;
+    Ok(resolved)
+  }
+
+  pub fn validate(&self) -> Result<()> {
+    let url = reqwest::Url::parse(&self.endpoint)
+      .map_err(|_| message("invalid resolved service endpoint"))?;
+    if !matches!(url.scheme(), "http" | "https")
+      || !url.username().is_empty()
+      || url.password().is_some()
+      || url.query().is_some()
+      || url.fragment().is_some()
+      || !url.path().ends_with("/v1/request")
+    {
+      return Err(message("invalid resolved service endpoint"));
+    }
+    validate_client_token(&self.token)
+  }
+
+  pub fn endpoint(&self) -> &str {
+    &self.endpoint
+  }
+
+  pub fn redact(&self, detail: &str) -> String {
+    detail
+      .replace(&self.token, "[redacted]")
+      .chars()
+      .filter(|character| !character.is_control())
+      .take(512)
+      .collect()
+  }
+}
+
+#[derive(Clone)]
+pub(crate) struct Api {
   pub(super) endpoint: String,
   token: String,
   control: Client,
   pub(super) objects: Client,
+  async_objects: Option<reqwest::Client>,
+  stop: Option<Arc<AtomicBool>>,
+  pub(super) stream_budget: Option<u64>,
+  stream_backlog: Arc<AtomicBool>,
 }
 
 impl Api {
@@ -51,10 +122,15 @@ impl Api {
   }
 
   pub(super) fn new(path: &Path) -> Result<Self> {
+    Self::new_with_resolved(&ResolvedClient::resolve(path)?, None)
+  }
+
+  pub(crate) fn new_with_resolved(
+    resolved: &ResolvedClient,
+    stop: Option<Arc<AtomicBool>>,
+  ) -> Result<Self> {
     init_tls();
-    let config = crate::load_client_config(path)?;
-    let url = reqwest::Url::parse(&config.url).map_err(|_| message("invalid service URL"))?;
-    let token = resolve_token(config, |name| std::env::var(name))?;
+    resolved.validate()?;
     let build = |timeout| {
       Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -64,14 +140,142 @@ impl Api {
         .map_err(|_| message("cannot initialize service HTTP client"))
     };
     Ok(Self {
-      endpoint: format!("{}/v1/request", url.as_str().trim_end_matches('/')),
-      token,
+      endpoint: resolved.endpoint.clone(),
+      token: resolved.token.clone(),
       control: build(Duration::from_secs(30))?,
       objects: build(Duration::from_secs(900))?,
+      async_objects: if stop.is_some() {
+        Some(
+          reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(900))
+            .build()
+            .map_err(|_| message("cannot initialize object HTTP client"))?,
+        )
+      } else {
+        None
+      },
+      stream_budget: stop.as_ref().map(|_| 256 * 1024),
+      stream_backlog: Arc::new(AtomicBool::new(false)),
+      stop,
     })
   }
 
+  pub(super) fn cancelled(&self) -> bool {
+    self
+      .stop
+      .as_ref()
+      .is_some_and(|stop| stop.load(Ordering::Acquire))
+  }
+
+  pub(super) fn cooperative(&self) -> bool {
+    self.stop.is_some()
+  }
+
+  pub(super) fn reset_stream_backlog(&self) {
+    self.stream_backlog.store(false, Ordering::Release);
+  }
+
+  pub(super) fn note_stream_backlog(&self, progressed: bool) {
+    if self.cooperative() && progressed {
+      self.stream_backlog.store(true, Ordering::Release);
+    }
+  }
+
+  pub(super) fn backlog_remaining(&self) -> bool {
+    self.cooperative() && self.stream_backlog.load(Ordering::Acquire)
+  }
+
+  pub(super) fn binding_id(&self) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(self.endpoint.as_bytes());
+    hash.update([0]);
+    hash.update(self.token.as_bytes());
+    hash
+      .finalize()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect()
+  }
+
+  pub(super) fn cancel(&self) {
+    if let Some(stop) = &self.stop {
+      stop.store(true, Ordering::Release);
+    }
+  }
+
+  pub(super) fn belongs_to(&self, stop: &Arc<AtomicBool>) -> bool {
+    self
+      .stop
+      .as_ref()
+      .is_some_and(|bound| Arc::ptr_eq(bound, stop))
+  }
+
+  pub(super) fn put_object(&self, url: &str, file: std::fs::File, length: u64) -> Result<String> {
+    self.check_cancelled()?;
+    let (status, headers) = if let Some(client) = &self.async_objects {
+      use tokio::io::AsyncReadExt;
+      let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| message("cannot initialize cancellable object upload"))?;
+      runtime.block_on(async {
+        let stream =
+          tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file).take(length));
+        let mut request = Box::pin(
+          client
+            .put(url)
+            .header(reqwest::header::CONTENT_LENGTH, length)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send(),
+        );
+        loop {
+          self.check_cancelled()?;
+          match tokio::time::timeout(Duration::from_millis(50), &mut request).await {
+            Ok(response) => {
+              let response = response.map_err(|_| {
+                message("object part upload failed; acknowledged parts are saved for retry")
+              })?;
+              break Ok::<_, ExpriError>((response.status(), response.headers().clone()));
+            }
+            Err(_) => continue,
+          }
+        }
+      })?
+    } else {
+      let response = self
+        .objects
+        .put(url)
+        .body(reqwest::blocking::Body::sized(file.take(length), length))
+        .send()
+        .map_err(|_| {
+          message("object part upload failed; acknowledged parts are saved for retry")
+        })?;
+      (response.status(), response.headers().clone())
+    };
+    if !status.is_success() {
+      return Err(message(format!("object part upload returned {status}")));
+    }
+    headers
+      .get(reqwest::header::ETAG)
+      .and_then(|value| value.to_str().ok())
+      .filter(|value| !value.is_empty() && value.len() <= 256)
+      .map(str::to_owned)
+      .ok_or_else(|| message("object part upload returned no valid ETag"))
+  }
+
+  pub(super) fn check_cancelled(&self) -> Result<()> {
+    if self.cancelled() {
+      Err(ExpriError::DownloadCancelled)
+    } else {
+      Ok(())
+    }
+  }
+
   pub(super) fn request(&self, request: &Request) -> Result<Response> {
+    self.check_cancelled()?;
     let body = serde_json::to_vec(request)?;
     if body.len() > MAX_REQUEST {
       return Err(message("service request exceeds its size limit"));
