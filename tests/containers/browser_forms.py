@@ -929,7 +929,7 @@ def workspace_layout(browser, width, wide=False):
     assert abs(runs['top'] - review['top']) <= 1, f'{width}px Review is displaced below Runs'
     available = geometry['grid']['width'] - geometry['gap']
     assert abs(runs['width'] + review['width'] - available) <= 1, f'{width}px split panels leave unused workspace'
-    assert 280 <= runs['width'] <= 420, f'{width}px history pane is not a readable, compact run browser'
+    assert 360 <= runs['width'] <= 640, f'{width}px history pane does not reserve readable space for run columns'
     assert review['width'] > runs['width'], f'{width}px Review does not have room for inspecting charts'
   else:
     assert runs['bottom'] <= review['top'] + 1, f'{width}px Runs and Review are not stacked'
@@ -975,13 +975,33 @@ def compact_focus_visible(browser, target, width):
   wait_for(focused_near_top, f'{width}px explicit navigation did not reveal and focus {target} near the viewport top')
 
 
+def set_run_control(browser, control, opened):
+  trigger = f'#{control}-trigger'
+  panel = f'#{control}-panel'
+  def evaluate(script, *args):
+    return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
+  changed = evaluate("return document.querySelector(arguments[0]).getAttribute('aria-expanded') === 'true';", trigger) != opened
+  if changed:
+    browser.click(trigger)
+  wait_for(lambda: evaluate('''const trigger = document.querySelector(arguments[0]);
+    const panel = document.querySelector(arguments[1]);
+    return trigger.getAttribute('aria-expanded') === String(arguments[2])
+      && (panel.getClientRects().length > 0) === arguments[2];''', trigger, panel, opened),
+    f'{control} native trigger did not {"open" if opened else "close"} its panel')
+  if changed:
+    assert evaluate('''const trigger = document.querySelector(arguments[0]);
+      const panel = document.querySelector(arguments[1]);
+      return arguments[2] ? panel.contains(document.activeElement) : document.activeElement === trigger;''', trigger, panel, opened), \
+      f'{control} native trigger lost keyboard focus'
+
+
 def choose_run_table_columns(browser):
   def evaluate(script):
     return browser.call('POST', '/execute/sync', {'script': script, 'args': []})
-  browser.click('#run-columns summary')
-  wait_for(lambda: evaluate("return !!document.querySelector('input[aria-label=\"Parameter learning_rate\"]:not(:disabled)');"), 'parameter column discovery did not finish')
+  set_run_control(browser, 'run-columns', True)
+  wait_for(lambda: evaluate("return !!document.querySelector('#run-columns-panel input[aria-label=\"Parameter learning_rate\"]:not(:disabled)');"), 'parameter column discovery did not finish')
   for name in ['Parameter learning_rate', 'Metric loss']:
-    browser.click(f'input[aria-label="{name}"] + span')
+    browser.click(f'#run-columns-panel input[aria-label="{name}"] + span')
     wait_for(lambda: evaluate("return document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'choosing a run table column did not finish')
   wait_for(lambda: evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '2', 'native checkbox tags did not select both columns')
 
@@ -1051,21 +1071,30 @@ def run_table_columns(browser, run_ids):
     browser.set_viewport(width, 800)
     table_scroll_contained(browser, width)
     assert evaluate('''const table = document.querySelector('#runs-region');
-      return table.scrollWidth > table.clientWidth && ['#run-columns', '#run-column-search', '#run-reduction-options', '#search-input', '#task-input', '#status-options'].every(selector => {
+      return table.scrollWidth > table.clientWidth && ['#run-columns-trigger', '#run-filters-trigger', '#search-input'].every(selector => {
         const rect = document.querySelector(selector).getBoundingClientRect(); return rect.left >= 0 && rect.right <= document.documentElement.clientWidth + 1;
       });'''), f'{width}px custom table does not scroll or its controls are clipped'
+    for control, selectors in [('run-columns', ['#run-columns-panel', '#run-column-search', '#run-reduction-options']),
+        ('run-filters', ['#run-filters-panel', '#task-input', '#status-options', '#archival-options'])]:
+      set_run_control(browser, control, True)
+      assert evaluate('''return arguments[0].every(selector => {
+        const node = document.querySelector(selector), rect = node.getBoundingClientRect();
+        return node.getClientRects().length > 0 && rect.left >= 0 && rect.right <= document.documentElement.clientWidth + 1;
+      });''', selectors), f'{width}px open {control} panel controls are clipped'
     capture(f'workspace-columns-{width}')
+    set_run_control(browser, 'run-filters', False)
     preserved()
   browser.set_viewport(1440, 1000)
+  set_run_control(browser, 'run-columns', True)
   for name in ['Parameter learning_rate', 'Metric loss']:
-    browser.click(f'input[aria-label="{name}"] + span')
+    browser.click(f'#run-columns-panel input[aria-label="{name}"] + span')
     wait_for(settled, 'removing a table column did not finish')
   assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '0', 'removing all columns did not restore the compact table'
   preserved()
   if evaluate("return !document.querySelector('#reset-run-sort').disabled;"):
     browser.click('#reset-run-sort')
     wait_for(settled, 'resetting the table sort did not finish')
-  browser.click('#run-columns summary')
+  set_run_control(browser, 'run-columns', False)
   chart_context(browser)
   browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
   browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '\ue00c', using='xpath')
@@ -1181,7 +1210,8 @@ def workspace(run_id, second_run_id):
     assert not visible('#review-section'), 'filtering left an unrelated comparison visible'
     assert evaluate("return document.querySelectorAll('#run-rows input:checked').length;") == 0, 'filtering left an implicit selection'
     assert_chart_preview_cleaned(browser)
-    browser.click('#clear-filters')
+    set_run_control(browser, 'run-filters', True)
+    browser.click('#run-filters-panel #clear-filters')
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'Clear filters did not restore the runs')
     browser.click(f'input[aria-label="Select {run_id} for comparison"]')
     wait_for(lambda: check_selection([run_id]), 'selection did not recover after filtering')
@@ -1190,15 +1220,17 @@ def workspace(run_id, second_run_id):
     browser.click('#clear-selection')
     assert not visible('#review-section') and visible('#review-empty'), 'Clear selection did not reset the workspace'
     assert_chart_preview_cleaned(browser)
-    assert evaluate("return document.querySelectorAll('#status-options input[type=\"radio\"]').length;") == 8, 'fixed status choices are not native single-click radio tags'
+    set_run_control(browser, 'run-filters', True)
+    assert evaluate("return document.querySelectorAll('#run-filters-panel #status-options input[type=\"radio\"]').length;") == 8, 'fixed status choices are not native single-click radio tags'
     browser.click('#status-completed + span')
     wait_for(lambda: evaluate("return document.querySelector('#status-completed').checked && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'native Completed status tag did not finish filtering')
     browser.keys('#status-completed', '\ue014')
     wait_for(lambda: evaluate("return document.querySelector('#status-failed').checked && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'native status ArrowRight did not select Failed')
     assert evaluate("return getComputedStyle(document.querySelector('#status-failed + span')).outlineStyle;") == 'solid', 'keyboard status tag has no visible focus'
     assert evaluate("return document.querySelectorAll('#run-rows tr').length;") == 0, 'Failed status filter retained completed runs'
-    browser.click('#clear-filters')
+    browser.click('#run-filters-panel #clear-filters')
     wait_for(lambda: evaluate("return document.querySelector('#status-any').checked && document.querySelectorAll('#run-rows tr').length === 2;"), 'Clear filters did not restore the Any status tag')
+    set_run_control(browser, 'run-filters', False)
     for width in [1000, 390, 320]:
       browser.set_viewport(width, 800)
       browser.click('#run-rows tr:first-child .run-link')
@@ -1355,11 +1387,13 @@ def project_workspace(run_id):
     assert evaluate("return document.querySelectorAll('#machine-options input[type=\"radio\"]').length;") == 3, 'project machine tags do not match its two recorded origins'
     assert evaluate('''return [...document.querySelectorAll('#run-rows .run-link')].filter(node=>node.textContent===arguments[0]).length;''', run_id) == 2, 'project default collapsed duplicate actual run IDs'
     workspace_layout(browser, 1440, wide=True)
+    set_run_control(browser, 'run-filters', True)
     browser.click('#machine-worker-b + span')
     wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'native machine filter did not isolate worker-b')
     assert evaluate("return document.querySelector('#run-rows tr').dataset.runKey;") == keys[1], 'machine filter resolved the colliding ID to worker'
     browser.click('#machine-all + span')
     wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 4, 'All machines did not restore project history')
+    set_run_control(browser, 'run-filters', False)
     for key in keys:
       select(key)
     wait_for(lambda: chart_keys() == sorted(keys), 'cross-machine selection did not retain both qualified run identities')
@@ -1389,7 +1423,7 @@ def project_workspace(run_id):
     choose_run_table_columns(browser)
     browser.click('button[aria-label="Sort by Machine ascending"]')
     wait_for(settled, 'native Machine header did not finish sorting')
-    browser.click('#run-columns summary')
+    set_run_control(browser, 'run-columns', False)
     assert sorted([float(table_value(key)) for key in keys]) == [0.004, 0.07], 'project table columns mixed the two machine metric streams'
     assert selected_keys() == sorted(keys) and chart_keys() == sorted(keys), 'Machine sorting or columns lost the cross-machine comparison'
     assert evaluate("return document.querySelector('#chart-preview')===window.__project_chart_preview;"), 'Machine sorting or columns replaced chart exploration'
@@ -1411,18 +1445,18 @@ def project_workspace(run_id):
       evaluate("document.querySelector('#runs-region').scrollIntoView({block:'start'});")
       capture(f'workspace-project-{width}')
     browser.set_viewport(1440, 1000)
-    browser.click('#run-columns summary')
+    set_run_control(browser, 'run-columns', True)
     for name in ['Parameter learning_rate', 'Metric loss']:
-      browser.click(f'input[aria-label="{name}"] + span')
+      browser.click(f'#run-columns-panel input[aria-label="{name}"] + span')
       wait_for(settled, 'removing a project table column did not finish')
     assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '0', 'removing project columns did not restore its built-in table'
-    browser.click('#run-columns summary')
+    set_run_control(browser, 'run-columns', False)
     for width in [1440, 1024]:
       browser.set_viewport(width, 1000)
       stable_project_layout(width)
     browser.set_viewport(1440, 1000)
     choose_run_table_columns(browser)
-    browser.click('#run-columns summary')
+    set_run_control(browser, 'run-columns', False)
     stable_project_layout(1440, scroll=True)
     assert selected_keys() == sorted(keys) and chart_keys() == sorted(keys), 'layout changes lost the cross-machine comparison'
     assert evaluate("return document.querySelector('#chart-preview')===window.__project_chart_preview;"), 'layout changes replaced chart exploration'
@@ -1505,9 +1539,11 @@ def automatic_refresh(run_id, updated_run_id):
     browser.navigate('/login')
     browser.login()
     wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh fixture runs did not load')
-    browser.keys('#task-input', 'train')
+    set_run_control(browser, 'run-filters', True)
+    browser.keys('#run-filters-panel #task-input', 'train')
     wait_for(lambda: evaluate("return document.querySelector('#task-input').value;") == 'train' and
       evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh task filter did not apply')
+    set_run_control(browser, 'run-filters', False)
     wait_for(lambda: 'Live updates' in evaluate("return document.querySelector('#updated-at').textContent;"), 'native hosted EventSource did not connect', timeout=20)
     assert any(record['path'] == '/api/events' and record['status'] == 200 for record in trace_records()), 'native EventSource did not open its authenticated endpoint'
     for selected_run in [run_id, updated_run_id]:
@@ -1516,7 +1552,7 @@ def automatic_refresh(run_id, updated_run_id):
     choose_run_table_columns(browser)
     browser.click('button[aria-label="Sort by Run ascending"]')
     wait_for(lambda: evaluate("return document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'automatic update fixture did not finish run sorting')
-    browser.click('#run-columns summary')
+    set_run_control(browser, 'run-columns', False)
     select_chart_axis(browser, 'elapsed')
     wait_for(lambda: (loss_state() or {}).get('axis') == 'elapsed', 'auto-refresh fixture did not select elapsed time')
     # Let the initial revision baseline settle before proving a later unchanged

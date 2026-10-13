@@ -1,6 +1,9 @@
-export type IconName = "runs" | "storage" | "system" | "charts" | "overview" | "logs" | "files" | "refresh" | "compare" | "close" | "search";
+export type IconName = "runs" | "storage" | "system" | "charts" | "overview" | "logs" | "files" | "refresh" | "compare" | "close" | "search" | "filter" | "columns" | "issue";
 
 const PATHS: Record<IconName, string> = {
+  filter: "M4 7h16M4 17h16M9 4v6M15 14v6",
+  columns: "M4 4h16v16H4V4Zm5 0v16M15 4v16",
+  issue: "M12 8v5M12 17h.01M12 3 2 21h20L12 3Z",
   runs: "M4 5h16M4 12h16M4 19h16M7 3v4M7 10v4M7 17v4",
   storage: "M4 6c0-2 16-2 16 0s-16 2-16 0Zm0 0v6c0 2 16 2 16 0V6M4 12v6c0 2 16 2 16 0v-6",
   system: "M3 4h18v13H3V4Zm5 17h8M12 17v4M5 11h3l2-4 4 7 2-3h3",

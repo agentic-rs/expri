@@ -32,8 +32,8 @@ export function RunRowDiagnostics({ run, items }: { run: Run; items: Warning[] }
   if (!items.length) return null;
   return (
     <details className="run-diagnostics" aria-label={`Data issues for ${runLabel(run)}`}>
-      <summary>
-        <span className="run-diagnostics-label">Data issues ({items.length})</span>
+      <summary title={items[0]?.message}>
+        <span className="run-diagnostics-label sr-only">Data issues ({items.length})</span>
         <span className="run-diagnostics-message">{items[0]?.message}</span>
       </summary>
       {items.length > 1 && <ul>{items.slice(1).map((item) => <li key={item.message}>{item.message}</li>)}</ul>}
