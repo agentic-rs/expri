@@ -171,29 +171,40 @@ fn read_http(stream: &mut TcpStream) -> HttpMessage {
   }
 }
 
-fn reply(stream: &mut TcpStream, status: u16, headers: &str, body: &[u8], size: usize) {
+fn reply(
+  stream: &mut TcpStream,
+  status: u16,
+  headers: &str,
+  body: &[u8],
+  size: usize,
+) -> std::io::Result<()> {
   write!(
     stream,
     "HTTP/1.1 {status} fixture\r\nConnection: close\r\nContent-Length: {size}\r\n{headers}\r\n"
-  )
-  .unwrap();
-  stream.write_all(body).unwrap();
+  )?;
+  stream.write_all(body)?;
   let _ = stream.shutdown(Shutdown::Both);
+  Ok(())
 }
 
-fn reply_object(stream: &mut TcpStream, method: &str, range: Option<(usize, usize)>, bytes: &[u8]) {
+fn reply_object(
+  stream: &mut TcpStream,
+  method: &str,
+  range: Option<(usize, usize)>,
+  bytes: &[u8],
+) -> std::io::Result<()> {
   let headers = "Content-Type: application/octet-stream\r\nETag: \"fixture-object\"\r\n";
   if method == "HEAD" {
-    reply(stream, 200, headers, b"", bytes.len());
+    reply(stream, 200, headers, b"", bytes.len())
   } else if let Some((start, end)) = range {
     let headers = format!(
       "{headers}Content-Range: bytes {start}-{end}/{}\r\n",
       bytes.len()
     );
     let body = &bytes[start..=end];
-    reply(stream, 206, &headers, body, body.len());
+    reply(stream, 206, &headers, body, body.len())
   } else {
-    reply(stream, 200, headers, bytes, bytes.len());
+    reply(stream, 200, headers, bytes, bytes.len())
   }
 }
 
@@ -272,11 +283,12 @@ impl S3Fixture {
               "Content-Type: application/xml\r\n",
               xml.as_bytes(),
               xml.len(),
-            );
+            )
+            .unwrap();
           }
           "PUT" if query.contains_key("partNumber") => {
             parts.insert(key, request.body);
-            reply(&mut stream, 200, "ETag: \"fixture-part\"\r\n", b"", 0);
+            reply(&mut stream, 200, "ETag: \"fixture-part\"\r\n", b"", 0).unwrap();
           }
           "POST" if query.contains_key("uploadId") => {
             let bytes = parts
@@ -292,7 +304,8 @@ impl S3Fixture {
               "Content-Type: application/xml\r\n",
               xml.as_bytes(),
               xml.len(),
-            );
+            )
+            .unwrap();
           }
           "HEAD" | "GET" => {
             let bytes = thread_objects.lock().unwrap().get(&key).cloned();
@@ -311,18 +324,27 @@ impl S3Fixture {
                   while blocked.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(10));
                   }
-                  reply_object(&mut stream, "GET", range, &bytes);
+                  // Service stop intentionally closes an in-flight download.
+                  // Either its headers or body can observe that peer disconnect.
+                  if let Err(error) = reply_object(&mut stream, "GET", range, &bytes)
+                    && !matches!(
+                      error.kind(),
+                      std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                  {
+                    panic!("delayed fixture download failed: {error}");
+                  }
                 }));
               } else {
-                reply_object(&mut stream, &request.method, request.range, &bytes);
+                reply_object(&mut stream, &request.method, request.range, &bytes).unwrap();
               }
             } else {
-              reply(&mut stream, 404, "", b"", 0);
+              reply(&mut stream, 404, "", b"", 0).unwrap();
             }
           }
           "DELETE" => {
             thread_objects.lock().unwrap().remove(&key);
-            reply(&mut stream, 204, "", b"", 0);
+            reply(&mut stream, 204, "", b"", 0).unwrap();
           }
           _ => panic!(
             "unexpected S3 request {} {}",
