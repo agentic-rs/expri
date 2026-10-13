@@ -69,7 +69,9 @@ fn now() -> i64 {
 impl<S: ObjectStorage> Store<S> {
   pub(super) fn queue_archive(&self, snapshot: ArchiveSnapshot) -> ApiResult<ArchiveRecord> {
     let scope = scope_key(&snapshot.scope)?;
-    if snapshot.files.is_empty() || snapshot.files.len() > 8 {
+    if snapshot.files.is_empty()
+      || snapshot.files.len() > TRACKING_DOCUMENT_PATHS.len() + TRACKING_STREAM_PATHS.len()
+    {
       return Err(ApiError::new(
         400,
         "archive requires a bounded tracking snapshot",

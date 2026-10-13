@@ -38,6 +38,174 @@ fn stage_saved_archive_part(
 }
 
 #[test]
+fn complete_system_capture_archives_every_tracking_document_and_stream() {
+  use base64::Engine;
+  use expri_core::run_system::{RUN_SYSTEM_PATH, RunSystemRecord};
+
+  let directory = tempfile::tempdir().unwrap();
+  let scope = crate::service::store::tests::scope();
+  let storage = MockStorage::default();
+  let store = Store::open(directory.path(), storage.clone()).unwrap();
+  let mut expected = std::collections::BTreeMap::new();
+  let mut documents = std::collections::BTreeMap::new();
+  for path in TRACKING_DOCUMENT_PATHS {
+    let value = if path == "run-state.json" {
+      json!({"run_id":scope.run_id,"status":"completed","system_capture_id":"capture-full",
+        "system_capture_status":"complete","machine_id":"machine-full",
+        "started_at":"1970-01-01T00:00:00Z","finished_at":"1970-01-01T00:00:01Z"})
+    } else {
+      json!({"fixture_path":path})
+    };
+    let bytes = serde_json::to_vec(&value).unwrap();
+    store
+      .execute(Request::PutDocument {
+        scope: scope.clone(),
+        path: path.into(),
+        revision: 1,
+        offset: 0,
+        total_size: bytes.len() as u64,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+      })
+      .unwrap();
+    documents.insert(path.into(), 1);
+    expected.insert(path.to_owned(), bytes);
+  }
+  let mut capture = Vec::new();
+  for record in [
+    RunSystemRecord::Capture {
+      schema_version: 1,
+      capture_id: "capture-full".into(),
+      machine_id: "machine-full".into(),
+      start_ms: 0,
+    },
+    RunSystemRecord::End {
+      end_ms: 1000,
+      complete: true,
+      warnings: Vec::new(),
+    },
+  ] {
+    serde_json::to_writer(&mut capture, &record).unwrap();
+    capture.push(b'\n');
+  }
+  let mut streams = std::collections::BTreeMap::new();
+  for path in TRACKING_STREAM_PATHS {
+    let bytes = match path {
+      RUN_SYSTEM_PATH => capture.clone(),
+      "outputs/metrics.jsonl" => {
+        b"{\"schema_version\":1,\"step\":0,\"metrics\":{\"loss\":2}}\n".to_vec()
+      }
+      _ => format!("{path} original bytes\n").into_bytes(),
+    };
+    store
+      .execute(Request::AppendTracking {
+        scope: scope.clone(),
+        path: path.into(),
+        offset: 0,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+      })
+      .unwrap();
+    streams.insert(path.into(), bytes.len() as u64);
+    expected.insert(path.to_owned(), bytes);
+  }
+  store
+    .execute(Request::SealRun {
+      scope: scope.clone(),
+      documents,
+      streams,
+      incomplete: false,
+    })
+    .unwrap();
+  let encoded: String = store
+    .db()
+    .unwrap()
+    .query_row(
+      "SELECT snapshot FROM result_archives WHERE id=1",
+      [],
+      |row| row.get(0),
+    )
+    .unwrap();
+  let snapshot: ArchiveSnapshot = serde_json::from_str(&encoded).unwrap();
+  assert_eq!(snapshot.files.len(), expected.len());
+  assert_eq!(expected.len(), 9);
+  assert!(!snapshot.incomplete);
+
+  // A complete snapshot is accepted without widening the allowed paths or
+  // allowing duplicates to consume another path's place in the bounded set.
+  for files in [
+    Vec::new(),
+    {
+      let mut files = snapshot.files.clone();
+      files.push(files[0].clone());
+      files
+    },
+    {
+      let mut files = snapshot.files.clone();
+      files[1] = files[0].clone();
+      files
+    },
+    {
+      let mut files = snapshot.files.clone();
+      files[0].target = FileTarget::Run {
+        scope: scope.clone(),
+        path: "outputs/model.pt".into(),
+      };
+      files
+    },
+  ] {
+    assert_eq!(
+      store
+        .queue_archive(ArchiveSnapshot {
+          scope: scope.clone(),
+          incomplete: false,
+          files,
+        })
+        .unwrap_err()
+        .status,
+      400
+    );
+  }
+
+  let path = store.build_archive(1, &snapshot).unwrap();
+  let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+  assert_eq!(archive.len(), expected.len() + 1);
+  for (name, expected_bytes) in &expected {
+    let mut bytes = Vec::new();
+    archive
+      .by_name(name)
+      .unwrap()
+      .read_to_end(&mut bytes)
+      .unwrap();
+    assert_eq!(&bytes, expected_bytes, "{name}");
+  }
+  let manifest: serde_json::Value =
+    serde_json::from_reader(archive.by_name("manifest.json").unwrap()).unwrap();
+  assert_eq!(manifest["incomplete"], false);
+  let manifest_paths: std::collections::BTreeSet<_> = manifest["files"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|record| record["path"].as_str().unwrap())
+    .collect();
+  assert_eq!(
+    manifest_paths,
+    expected.keys().map(String::as_str).collect()
+  );
+  drop(archive);
+  let digest = stage_saved_archive_part(&store, &storage, "result-archive-1", &path, &scope);
+  let size = fs::metadata(&path).unwrap().len();
+  drop(store);
+  let store = Store::open(directory.path(), storage).unwrap();
+  assert!(store.archive_cycle().unwrap());
+  let archived = store.archive_status(&scope).unwrap();
+  assert_eq!(archived.status, "archived");
+  assert!(!archived.incomplete);
+  let file = archived.file.unwrap();
+  assert_eq!(file.size, size);
+  assert_eq!(file.sha256.as_deref(), Some(digest.as_str()));
+  assert!(!store.archive_cycle().unwrap());
+}
+
+#[test]
 fn failed_old_archive_cannot_replace_newer_full_archive_even_with_later_upload_sequence() {
   use base64::Engine;
   let directory = tempfile::tempdir().unwrap();

@@ -24,6 +24,7 @@ use super::types::*;
 use super::{InputUploadOptions, PublishOptions};
 use crate::error::Result;
 use expri_core::run_system::{RUN_SYSTEM_PATH, RunSystemRecord};
+use expri_core::service::{TRACKING_DOCUMENT_PATHS as METADATA, TRACKING_STREAM_PATHS as STREAMS};
 use fs::message;
 use http::Api;
 use queue::{Queue, SavedFile};
@@ -40,19 +41,6 @@ pub use watch::{fetch as fetch_files, fetch_with_reporter as fetch_files_with_re
 
 pub(crate) const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const OBJECT_BATCH: u64 = 8 * 1024 * 1024;
-const METADATA: [&str; 5] = [
-  crate::run_artifacts::INVENTORY_PATH,
-  "snapshot.json",
-  "environment/environment-state.json",
-  "outputs/params.json",
-  "run-state.json",
-];
-const STREAMS: [&str; 4] = [
-  "outputs/metrics.jsonl",
-  RUN_SYSTEM_PATH,
-  "logs/stdout.log",
-  "logs/stderr.log",
-];
 
 fn terminal(state: &Value) -> bool {
   matches!(

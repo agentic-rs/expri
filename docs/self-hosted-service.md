@@ -317,6 +317,10 @@ and no Python fallback. Upgrade older workers or use `expri run --no-publish tra
 for an individual run. Runs without service configuration keep their existing
 execution and fallback behavior.
 
+Deploy the updated server before upgrading workers to automatic collection.
+Its archive limit includes all nine supported tracking files, including the
+system capture, so complete native runs can seal and upload their result bundle.
+
 Manage the shared worker process on the worker itself:
 
 ```sh

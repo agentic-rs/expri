@@ -13,6 +13,9 @@
   receipt. Use `--wait` to wait quietly or `--watch` to observe progress; Ctrl-C
   stops observation while publication continues. Jobs pin their destination,
   options and private credential snapshot; conflicting registration is rejected.
+- Server archives now accept all nine supported tracking files, including run
+  system captures. Deploy the updated server before upgrading workers that
+  automatically capture system metrics.
 
 - `run --smoke` marks managed runs and generates `smoke-run-…` IDs. An updated
   server automatically archives finished published smoke runs with the existing

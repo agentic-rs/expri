@@ -21,6 +21,21 @@ fn exact_run_capture_retries_survive_restart_and_seal_only_after_drain() {
   .unwrap();
   bytes.push(b'\n');
   append(&store, RUN_SYSTEM_PATH, 0, &bytes).unwrap();
+  for path in TRACKING_DOCUMENT_PATHS {
+    if path != "run-state.json" {
+      put(&store, path, 1, b"{}");
+    }
+  }
+  for path in TRACKING_STREAM_PATHS {
+    if path != RUN_SYSTEM_PATH {
+      let bytes = if path == "outputs/metrics.jsonl" {
+        b"{\"schema_version\":1,\"step\":0,\"metrics\":{\"loss\":2}}\n".as_slice()
+      } else {
+        b"fixture log\n".as_slice()
+      };
+      append(&store, path, 0, bytes).unwrap();
+    }
+  }
   // Replay a lost acknowledgement without duplicating the raw prefix.
   append(&store, RUN_SYSTEM_PATH, 0, &bytes).unwrap();
   put(&store, "run-state.json", 1, &serde_json::to_vec(&json!({"status":"completed","system_capture_id":"capture-1","system_capture_status":"capturing","machine_id":"machine-1","started_at":"1970-01-01T00:00:00Z","finished_at":"1970-01-01T00:00:01Z"})).unwrap());
@@ -39,6 +54,13 @@ fn exact_run_capture_retries_survive_restart_and_seal_only_after_drain() {
   append(&store, RUN_SYSTEM_PATH, bytes.len() as u64, &end).unwrap();
   bytes.extend_from_slice(&end);
   seal(&store, false).unwrap();
+  let Response::Files { files } = store.list_files(&scope()).unwrap() else {
+    panic!("tracking catalog expected")
+  };
+  assert_eq!(
+    files.len(),
+    TRACKING_DOCUMENT_PATHS.len() + TRACKING_STREAM_PATHS.len()
+  );
   let record = store.file(&run_target(RUN_SYSTEM_PATH)).unwrap();
   assert_eq!(record.size, bytes.len() as u64);
   assert!(matches!(
@@ -76,7 +98,7 @@ fn exact_run_capture_retries_survive_restart_and_seal_only_after_drain() {
         0
       ))
       .unwrap(),
-    0
+    1
   );
   assert_eq!(
     append(&store, RUN_SYSTEM_PATH, bytes.len() as u64, b"tail\n")
