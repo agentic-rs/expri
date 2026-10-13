@@ -1,5 +1,90 @@
 use super::*;
 
+#[test]
+fn project_run_rows_retain_errors_after_aggregate_truncation_and_separate_origins() {
+  let fixture = Fixture::new();
+  let put_state = |origin: &str, id: &str, task: Value, started_at: Value| {
+    let scope = RunScope {
+      project_id: "project".into(),
+      origin: origin.into(),
+      run_id: id.into(),
+    };
+    put(
+      &fixture,
+      &scope,
+      "run-state.json",
+      json!({"schema_version":1,"run_id":id,"task":task,"status":"completed","started_at":started_at,"finished_at":"2026-10-09T00:01:00Z","exit_code":0}),
+    );
+    scope
+  };
+  let broken = put_state("worker-a", "shared", json!("train"), Value::Null);
+  fixture.publish(
+    FileTarget::Run {
+      scope: broken,
+      path: "outputs/params.json".into(),
+    },
+    b"{".to_vec(),
+  );
+  put_state(
+    "worker-b",
+    "shared",
+    json!("train"),
+    json!("2026-10-09T00:00:00Z"),
+  );
+  for index in 0..101 {
+    put_state(
+      "worker-noise",
+      &format!("noise-{index:03}"),
+      Value::Null,
+      json!("2026-10-09T00:00:00Z"),
+    );
+  }
+  let options =
+    table::TableOptions::parse(vec!["/rate".into()], Vec::new(), "last", None, None).unwrap();
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  for table in [None, Some(&options)] {
+    let report = dashboard
+      .list_table("hosted-project:project", &list(None, table, 1, 102))
+      .unwrap();
+    let row = &report["runs"][0];
+    assert_eq!(row["run_key"], "worker-a:shared");
+    assert_eq!(row["status"], "completed");
+    let warnings = row["warnings"].as_array().unwrap();
+    assert!(
+      warnings
+        .iter()
+        .any(|warning| warning["message"] == "run-state.json has invalid or missing started_at")
+    );
+    assert!(
+      warnings
+        .iter()
+        .all(|warning| warning["run_id"] == "worker-a:shared")
+    );
+    if table.is_some() {
+      assert!(warnings.iter().any(|warning| {
+        warning["message"]
+          .as_str()
+          .is_some_and(|message| message.contains("params.json"))
+      }));
+    }
+    assert!(
+      report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|warning| warning["run_id"] != "worker-a:shared")
+    );
+    let healthy = dashboard
+      .list_table(
+        "hosted-project:project",
+        &list(Some("worker-b"), table, 1, 0),
+      )
+      .unwrap();
+    assert_eq!(healthy["runs"][0]["run_key"], "worker-b:shared");
+    assert_eq!(healthy["runs"][0]["warnings"], json!([]));
+  }
+}
+
 fn put(fixture: &Fixture, scope: &RunScope, path: &str, value: Value) {
   let bytes = value.to_string().into_bytes();
   fixture

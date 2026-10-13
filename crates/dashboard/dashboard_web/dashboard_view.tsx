@@ -6,6 +6,7 @@ import { ProjectStorageManagement } from "./storage_management_view";
 import { RunArchivalPanel } from "./run_archival_view";
 import { RunAnnotationsPanel, RunTags } from "./run_annotations_view";
 import { RunAssets } from "./dashboard_assets";
+import { RunDetailDiagnostics, RunRowDiagnostics, runWarnings, warningsOutsideRuns } from "./run_diagnostics";
 import { Icon } from "./dashboard_icons";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -374,7 +375,7 @@ function RunColumnPicker({
         Run, task, status, and start time stay visible. Add up to eight parameter or metric columns.
       </p>
       {s.run_columns_loading && <p role="status">Finding recorded columns…</p>}
-      <Warnings id="run-columns-warnings" items={s.run_columns_warnings} />
+      <Warnings id="run-columns-warnings" items={warningsOutsideRuns(s.run_columns_warnings, s.runs)} />
       {choices.length > 0 && (
         <label className="field">
           Find a column
@@ -656,7 +657,7 @@ function RunBrowser({
           </button>
         </div>
       )}
-      <Warnings id="list-warnings" items={s.list_warnings} />
+      <Warnings id="list-warnings" items={warningsOutsideRuns(s.list_warnings, s.runs)} />
       <div className="table-scroll runs-scroll" id="runs-region" aria-busy={s.list_busy}>
         <table
           className={`runs-table${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-custom-columns" : ""}`}
@@ -752,6 +753,7 @@ function RunBrowser({
                       {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` :
                         run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
                     </div>}
+                    <RunRowDiagnostics run={run} items={runWarnings(run, s.list_warnings, s.run_columns_warnings)} />
                     {run.table_values_truncated && (
                       <div
                         className="run-value-warning"
@@ -1269,7 +1271,11 @@ function ReviewWorkspace({
           Loading run details…
         </div>
         <ErrorNotice id="review-error" message={s.review_error} />
-        <Warnings id="review-warnings" items={s.review_warnings} />
+        {s.review?.kind === "run" && <RunDetailDiagnostics
+          id="review-run-errors"
+          items={review_run ? runWarnings(review_run, s.review_warnings, s.list_warnings, s.run_columns_warnings) : s.review_warnings.filter((item) => item.run_id === s.review?.run_ids[0])}
+        />}
+        <Warnings id="review-warnings" items={s.review?.kind === "run" ? s.review_warnings.filter((item) => !item.run_id) : s.review_warnings} />
         <div
           id="review-panel-charts"
           role="tabpanel"

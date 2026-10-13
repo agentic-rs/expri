@@ -899,6 +899,12 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     last_run_list = result;
     last_run_list_context = context;
     last_list_snapshot = now();
+    // Discovery diagnostics describe saved files too. Recheck them after a fresh
+    // list read, even when repairing an unselected column leaves the rows equal.
+    if (run_columns_source === source_id && ui.run_columns_warnings.some((item) => item.run_id)) {
+      ui.run_columns_warnings = ui.run_columns_warnings.filter((item) => !item.run_id);
+      void loadRunColumns(true);
+    }
     if (quiet && unchanged && was_ready) return;
     runs = result.runs;
     reconcileArchivedSelection(runs);

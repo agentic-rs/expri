@@ -2,6 +2,88 @@ use super::*;
 use crate::config::Config;
 
 #[test]
+fn run_rows_retain_scoped_errors_after_the_aggregate_warning_limit() {
+  let fixture = Fixture::new();
+  for index in 0..101 {
+    let id = format!("run-noise-{index:03}");
+    let run = fixture.run(&id);
+    let mut state: Value =
+      serde_json::from_slice(&fs::read(run.join("run-state.json")).unwrap()).unwrap();
+    state["task"] = Value::Null;
+    fs::write(run.join("run-state.json"), state.to_string()).unwrap();
+  }
+  let run = fixture.run("run-visible");
+  let mut state: Value =
+    serde_json::from_slice(&fs::read(run.join("run-state.json")).unwrap()).unwrap();
+  state["started_at"] = Value::Null;
+  fs::write(run.join("run-state.json"), state.to_string()).unwrap();
+  fs::write(run.join("outputs/params.json"), "{").unwrap();
+  let options = table::TableOptions::parse(
+    vec!["/rate".into()],
+    vec!["loss".into()],
+    "last",
+    None,
+    None,
+  )
+  .unwrap();
+  for source in ["local", "cached:worker"] {
+    if source != "local" {
+      let cached = fixture.root.join("results/worker");
+      fs::create_dir_all(&cached).unwrap();
+      fs::rename(fixture.root.join(".expri/runs"), cached.join("runs")).unwrap();
+    }
+    for table in [None, Some(&options)] {
+      let report = fixture
+        .dashboard
+        .list_table(
+          source,
+          &table::ListQuery {
+            archived: false,
+            origin: None,
+            search: None,
+            task: None,
+            status: None,
+            limit: 1,
+            offset: 101,
+            table,
+          },
+        )
+        .unwrap();
+      let row = &report["runs"][0];
+      assert_eq!(row["run_id"], "run-visible");
+      assert_eq!(row["status"], "completed");
+      let warnings = row["warnings"].as_array().unwrap();
+      assert_eq!(
+      warnings
+        .iter()
+        .filter(|warning| warning["message"] == "run-state.json has invalid or missing started_at")
+        .count(),
+      1
+    );
+      assert!(
+        warnings
+          .iter()
+          .all(|warning| warning["run_id"] == "run-visible")
+      );
+      if table.is_some() {
+        assert!(warnings.iter().any(|warning| {
+          warning["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("params.json"))
+        }));
+      }
+      assert!(
+        report["warnings"]
+          .as_array()
+          .unwrap()
+          .iter()
+          .all(|warning| warning["run_id"] != "run-visible")
+      );
+    }
+  }
+}
+
+#[test]
 fn local_chart_data_endpoint_matches_standalone_selection_and_preserves_steps() {
   let fixture = Fixture::new();
   let run = fixture.run("run-a");

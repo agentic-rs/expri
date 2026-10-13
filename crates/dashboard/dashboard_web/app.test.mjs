@@ -192,7 +192,7 @@ function chartData(label, query) {
   })), warnings: [{ run_index: 1, message: label }], warnings_truncated: false, parameter_rows: [], parameters_truncated: false };
 }
 
-async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null, system_metrics = false } = {}) {
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null, system_metrics = false, list_warnings = [], column_warnings = [], detail_warnings = [] } = {}) {
   const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
   const runs = project_runs ?? Array.from({ length: count }, (_, index) => ({
@@ -200,7 +200,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
   const project_sources = [{ source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] }];
-  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_label: "chart-1", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
+  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_label: "chart-1", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [], list_warnings, column_warnings, detail_warnings };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -253,7 +253,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
         params: [{ key: "/learning_rate", label: "learning_rate" }, { key: "/batch_size", label: "batch_size" }],
         metrics: [{ key: "accuracy", label: "accuracy" }, { key: "loss", label: "loss" }],
         truncated: false,
-      }, warnings: [],
+      }, warnings: model.column_warnings,
     });
     if (parsed.pathname === "/api/runs") {
       if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
@@ -267,14 +267,14 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
           metrics: Object.fromEntries(query.getAll("metric").map(key => [key, model.metric_value])),
         } } : {}),
       }));
-      return response({ source, runs: rows, warnings: [], total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
+      return response({ source, runs: rows, warnings: model.list_warnings, total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
     }
     const metric = { count: 2, last: { step: 1, value: model.metric_value }, min: { step: 1, value: model.metric_value }, max: { step: 0, value: 1 } };
     if (parsed.pathname === "/api/run") {
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
       const run = runs.find(item => runIdentity(item) === query.get("run_id"));
       if (!run) return response({ error: "Run not found" }, 404);
-      return response({ ...detailRecord(source, run, model.metric_value), result_upload: model.result_upload });
+      return response({ ...detailRecord(source, run, model.metric_value), warnings: model.detail_warnings, result_upload: model.result_upload });
     }
     if (parsed.pathname === "/api/artifacts") {
       const selected_run = runs.find(run => runIdentity(run) === query.get("run_id"));
@@ -2362,6 +2362,126 @@ const project_source = { source_id: "hosted-project:vision", project_id: "vision
 function projectRuns() {
   return ["gpu-a", "gpu-b"].map(origin => ({ ...publishedRun("same-run"), origin, run_key: `${origin}:same-run` }));
 }
+
+test("run data errors stay on the exact worker row and deduplicate list and column diagnostics", async t => {
+  const runs = projectRuns(), message = "run-state.json has invalid or missing started_at";
+  const issue = { run_id: "gpu-a:same-run", message };
+  const unsafe_message = 'environment.json contains <img src=x onerror="alert(1)">';
+  runs[0] = { ...runs[0], status: "completed", started_at: null, exit_code: 0, warnings: [issue] };
+  const model = await reviewFixture(t, {
+    hosted: true, projects: true, project_runs: runs,
+    list_warnings: [issue, { message: "Run preview is limited." }],
+    column_warnings: [issue, { ...issue, message: unsafe_message }, { message: "Column discovery is limited." }],
+  });
+  const { nodes } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  const [affected, healthy] = nodes.get("run-rows").children;
+  const diagnostic = affected.querySelector("details.run-diagnostics");
+  assert.ok(diagnostic, "the affected row exposes its data errors");
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-label").textContent, "Data issues (2)");
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-message").textContent, message, "the first error is visible without expanding the row");
+  assert.equal(diagnostic.querySelectorAll("li").length, 1, "duplicate messages across the row, list, and columns appear once");
+  assert.equal(diagnostic.querySelector("li").textContent, unsafe_message);
+  assert.equal(diagnostic.querySelector("img"), null, "diagnostic text never creates HTML elements");
+  assert.equal(healthy.querySelector(".run-diagnostics"), null, "a duplicate run ID on a different worker stays healthy");
+  assert.doesNotMatch(healthy.textContent, /started_at|environment\.json/);
+  assert.equal(affected.querySelector(".status").textContent, "completed", "record validation preserves the recorded execution status");
+  assert.equal(nodes.get("list-warnings").textContent, "Run preview is limited.");
+  assert.equal(nodes.get("run-columns-warnings").textContent, "Column discovery is limited.");
+  await click(diagnostic.querySelector("summary"));
+  assert.equal(diagnostic.open, true, "remaining errors use a native expandable control");
+});
+
+test("run data errors appear in the inspector uniformly and disappear after a repaired refresh", async t => {
+  const run = { ...publishedRun("imported-paired-scale-20h-v1"), status: "completed", started_at: null, exit_code: 0 };
+  const issue = { run_id: run.run_id, message: "run-state.json has invalid or missing started_at" };
+  const detail_issue = { run_id: run.run_id, message: "environment.json is missing" };
+  const column_issue = { run_id: run.run_id, message: "snapshot.json is invalid" };
+  run.warnings = [issue];
+  const model = await reviewFixture(t, {
+    project_runs: [run], list_warnings: [issue],
+    column_warnings: [issue, column_issue],
+    detail_warnings: [issue, detail_issue, { message: "Metric preview is limited." }],
+  });
+  const { nodes } = model;
+  await openColumns(nodes); await inspect(model);
+  const errors = nodes.get("review-run-errors");
+  assert.equal(errors.hidden, false);
+  assert.equal(errors.classList.contains("error"), true);
+  assert.deepEqual([...errors.querySelectorAll("li")].map(item => item.textContent), [issue.message, detail_issue.message, column_issue.message]);
+  assert.equal(nodes.get("review-warnings").textContent, "Metric preview is limited.", "unscoped notices remain global");
+  assert.doesNotMatch(nodes.get("review-section").textContent, /Partial import|Start time unknown/, "historical names receive the same validation errors as other runs");
+  await click(nodes.get("review-tab-overview"));
+  assert.equal(errors.hidden, false, "data errors remain visible while changing inspector tabs");
+  run.started_at = "2026-10-07T01:00:00Z"; run.warnings = [];
+  model.list_warnings = []; model.column_warnings = []; model.detail_warnings = [{ message: "Metric preview is limited." }];
+  const counts = requestCounts(model.requests);
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  await settled(() => !columnCheckbox(nodes, "Parameter learning_rate").disabled);
+  await settled(() => nodes.get("run-rows").querySelector(".run-diagnostics") === null);
+  assert.ok(requestCounts(model.requests)["/api/run-columns"] > counts["/api/run-columns"], "repair rechecks the opened column diagnostics");
+  assert.ok(requestCounts(model.requests)["/api/run"] > counts["/api/run"], "repair reloads the inspected record");
+  assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics"), null);
+  assert.equal(nodes.get("review-run-errors").hidden, true);
+  assert.doesNotMatch(nodes.get("review-run-errors").textContent, /started_at|environment\.json|snapshot\.json/);
+  assert.equal(nodes.get("review-warnings").textContent, "Metric preview is limited.");
+});
+
+test("run data errors without a displayable matching worker row remain visible globally", async t => {
+  const runs = projectRuns().slice(0, 1);
+  const visible_issue = { run_id: "gpu-a:same-run", message: "run-state.json has invalid or missing started_at" };
+  const excluded_issue = { run_id: "gpu-b:same-run", message: "run-state.json cannot be read" };
+  const excluded_column_issue = { run_id: "gpu-b:same-run", message: "params.json cannot be read" };
+  const model = await reviewFixture(t, {
+    hosted: true, projects: true, project_runs: runs,
+    list_warnings: [visible_issue, excluded_issue], column_warnings: [excluded_column_issue],
+  });
+  const { nodes } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  assert.equal(nodes.get("list-warnings").hidden, false);
+  assert.equal(nodes.get("list-warnings").textContent, `${excluded_issue.run_id}: ${excluded_issue.message}`);
+  assert.equal(nodes.get("run-columns-warnings").textContent, `${excluded_column_issue.run_id}: ${excluded_column_issue.message}`);
+  const diagnostic = nodes.get("run-rows").querySelector(".run-diagnostics");
+  assert.match(diagnostic.textContent, /Data issues \(1\)/);
+  assert.match(diagnostic.textContent, /invalid or missing started_at/);
+  assert.doesNotMatch(diagnostic.textContent, /cannot be read/, "a missing worker row's errors cannot attach to a different worker with the same run ID");
+});
+
+test("run data errors show an explicit omission notice when the row preview reaches its limit", async t => {
+  const run = { ...publishedRun("run-many-errors"), warnings: Array.from({ length: 105 }, (_, index) => ({ message: `Invalid recorded field ${index}` })) };
+  const model = await reviewFixture(t, { project_runs: [run] }), { nodes } = model;
+  await settledTable(nodes);
+  const diagnostic = nodes.get("run-rows").querySelector(".run-diagnostics");
+  assert.equal(diagnostic.querySelectorAll("li").length, 100, "the first issue stays in the summary, with a bounded remaining list");
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-message").textContent, "Invalid recorded field 0");
+  assert.match(diagnostic.textContent, /Additional data issues omitted; inspect records with expri runs show\./);
+  assert.equal([...diagnostic.querySelectorAll("li")].some(item => item.textContent === "Invalid recorded field 100"), false);
+  await inspect(model);
+  assert.equal(nodes.get("review-run-errors").querySelectorAll("li").length, 101);
+  assert.match(nodes.get("review-run-errors").textContent, /Additional data issues omitted; inspect records with expri runs show\./);
+});
+
+test("run data errors from column discovery clear after an automatic unchanged-row refresh", async t => {
+  const issue = { run_id: "run-0", message: "outputs/metrics.jsonl has an invalid record" };
+  const model = await autoFixture(t, { column_warnings: [issue] }), { nodes, clock } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
+  const choice = columnCheckbox(nodes, "Parameter learning_rate"), row = nodes.get("run-rows").children[0];
+  assert.match(row.querySelector(".run-diagnostics").textContent, /invalid record/);
+  await clock.advance(5000);
+  const counts = requestCounts(model.requests);
+  model.model.column_warnings = [];
+  model.model.list_revision = "repaired-column-file";
+  await clock.advance(5000);
+  await settled(() => !columnCheckbox(nodes, "Parameter learning_rate").disabled);
+  await settled(() => nodes.get("run-rows").querySelector(".run-diagnostics") === null);
+  assert.ok(requestCounts(model.requests)["/api/runs"] > counts["/api/runs"]);
+  assert.ok(requestCounts(model.requests)["/api/run-columns"] > counts["/api/run-columns"], "an unchanged run-list body still rechecks saved-file diagnostics");
+  assert.equal(nodes.get("run-rows").children[0], row, "quiet repair preserves the row DOM");
+  assert.equal(columnCheckbox(nodes, "Parameter learning_rate"), choice);
+  assert.equal(choice.checked, true, "column discovery refresh keeps the selected table column");
+  assert.equal(nodes.document.querySelector(".runs-table").dataset.columnCount, "1");
+});
 
 test("project tables retain separate run and review panes before and after optional columns", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;

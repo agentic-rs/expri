@@ -324,6 +324,14 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .run-link.has-nickname, .run-nickname, .review-heading h2.has-nickname { font-family: var(--font-sans); font-weight: 600; }
 .run-link.has-nickname { font-size: 12px; }
 .run-identifier { font-family: var(--font-mono); }
+.run-diagnostics { margin-top: 5px; padding: 4px 5px; border-left: 2px solid var(--error-ink); color: var(--error-ink); background: var(--error-bg); font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.run-diagnostics summary { cursor: pointer; }
+.run-diagnostics-label { font-weight: 600; }
+.run-diagnostics-message { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; margin-top: 2px; }
+.run-diagnostics[open] .run-diagnostics-message { display: block; }
+.run-diagnostics ul, .run-diagnostics-detail ul { margin: 4px 0 0; padding-left: 15px; }
+.run-diagnostics li + li, .run-diagnostics-detail li + li { margin-top: 3px; }
+.run-diagnostics-detail strong { font-size: 11px; }
 .run-task { color: var(--ink); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-meta { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .started-column { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }

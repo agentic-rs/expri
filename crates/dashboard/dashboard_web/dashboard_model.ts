@@ -51,6 +51,7 @@ export type Run = {
     metrics: Record<string, number | null>;
   };
   table_values_truncated?: boolean;
+  warnings?: Warning[];
 };
 export type RunAnnotations = {
   scope: RunDeepLink;

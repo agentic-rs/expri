@@ -13,7 +13,7 @@ use clap::Args;
 use serde_json::{Value, json};
 
 use artifacts::{cache_record, open_fixed, optional_metadata, real_prefix};
-use preview::{bounded_warnings, preview};
+use preview::{bounded_warnings, preview, run_warnings};
 
 use crate::context::CommandContext;
 use crate::controller::run_pull;
@@ -406,7 +406,12 @@ impl Dashboard {
       .into_iter()
       .skip(offset)
       .take(limit)
-      .map(|record| preview(&record, &mut metadata_truncated))
+      .map(|record| {
+        let run_id = record["run_id"].as_str().unwrap();
+        let mut record = preview(&record, &mut metadata_truncated);
+        record["warnings"] = json!(run_warnings(&warnings, run_id));
+        record
+      })
       .collect();
     let next_offset = offset.saturating_add(records.len());
     let next_offset = (next_offset < total_count).then_some(next_offset);
