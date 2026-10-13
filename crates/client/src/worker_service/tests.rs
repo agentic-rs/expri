@@ -963,3 +963,82 @@ fn acknowledged_backlog_continues_quickly_without_starving_idle_or_failed_jobs()
   stop(&paths).unwrap();
   service.join().unwrap().unwrap();
 }
+
+#[test]
+fn stop_handles_delayed_or_lost_control_acknowledgments() {
+  use std::io::{BufRead, BufReader, Write};
+  use std::os::unix::fs::PermissionsExt;
+  use std::os::unix::net::UnixListener;
+
+  for outcome in ["delayed", "stopping", "stopped", "unacknowledged"] {
+    let (_temporary, paths, _) = fixture();
+    let directory = files::ensure(&paths).unwrap();
+    let lease_path = directory.join("service.lock");
+    files::private_file(&lease_path).unwrap();
+    let expri_core::lock::LockAttempt::Acquired(lease) =
+      expri_core::lock::try_lock_file(&lease_path, false).unwrap()
+    else {
+      panic!("fixture service lease must be available");
+    };
+    let socket = unix::socket(&directory).unwrap();
+    files::directory(socket.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let (finish, finished) = mpsc::channel();
+    let control = thread::spawn(move || {
+      let mut lease = Some(lease);
+      for operation in ["status", "stop"] {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut stream).read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["operation"], operation);
+        if operation == "stop" && outcome != "delayed" {
+          files::write(
+            &directory.join("status.json"),
+            &json!({
+              "ready": false,
+              "status": if outcome == "unacknowledged" { "running" } else { "stopping" },
+            }),
+          )
+          .unwrap();
+          if outcome == "stopped" {
+            drop(lease.take());
+          }
+          // Drop the accepted request without sending its acknowledgment. The
+          // caller must establish the accepted stop from the lease or status.
+          break;
+        }
+        let value = if operation == "stop" {
+          // Exceed the best-effort status timeout, as a loaded runtime can while
+          // finishing local durable writes before reading its control IPC.
+          thread::sleep(Duration::from_millis(350));
+          json!({"stopping": true, "jobs_preserved": true, "training_preserved": true})
+        } else {
+          json!({"running": true, "ready": true, "status": "running"})
+        };
+        let _ = writeln!(stream, "{}", json!({"ok": true, "value": value}));
+      }
+      drop(listener);
+      // Keep the stopping lease until the caller finishes its state probe.
+      finished.recv_timeout(Duration::from_secs(5)).unwrap();
+      drop(lease);
+    });
+    let report = stop(&paths);
+    finish.send(()).unwrap();
+    control.join().unwrap();
+    fs::remove_file(socket).unwrap();
+    if outcome == "unacknowledged" {
+      assert!(report.is_err(), "an active service must acknowledge stop");
+      continue;
+    }
+    let report = report.unwrap_or_else(|failure| panic!("{outcome}: {failure}"));
+    assert_eq!(report["jobs_preserved"], true, "{outcome}");
+    if outcome == "stopped" {
+      assert_eq!(report["stopped"], true);
+    } else {
+      assert_eq!(report["stopping"], true, "{outcome}");
+      assert_eq!(report["training_preserved"], true, "{outcome}");
+    }
+  }
+}

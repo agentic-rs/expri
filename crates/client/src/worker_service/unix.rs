@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use super::{ServiceContext, error, files, registry};
 
 const START_TIMEOUT: Duration = Duration::from_secs(3);
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const TICK: Duration = Duration::from_millis(50);
 
 #[derive(Serialize, Deserialize)]
@@ -70,8 +71,14 @@ fn request(directory: &Path, request: Request) -> Result<Value> {
   let path = socket(directory)?;
   validate_socket(&path)?;
   let mut stream = UnixStream::connect(path)?;
-  stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-  stream.set_write_timeout(Some(Duration::from_millis(200)))?;
+  // Status is best-effort and may fall back to its durable snapshot. Stop needs
+  // time for the runtime to finish a local registry scan before acknowledging.
+  let timeout = match request {
+    Request::Stop => STOP_TIMEOUT,
+    _ => Duration::from_millis(200),
+  };
+  stream.set_read_timeout(Some(timeout))?;
+  stream.set_write_timeout(Some(timeout))?;
   serde_json::to_writer(&mut stream, &request)?;
   stream.write_all(b"\n")?;
   let reply: Value = serde_json::from_slice(&read_frame(&mut stream, files::LIMIT as usize)?)
@@ -159,17 +166,36 @@ pub fn status(paths: &StoragePaths) -> Result<Value> {
 /// Stop the service cooperatively; training leases and process groups are untouched.
 pub fn stop(paths: &StoragePaths) -> Result<Value> {
   let current = service_status(paths)?;
-  if current["running"] != true {
-    return Ok(json!({"stopped": true, "already_stopped": true, "jobs_preserved": true}));
-  }
-  if current["status"] == "stopping" {
-    return Ok(
-      json!({"stopping": true, "already_stopping": true, "jobs_preserved": true, "training_preserved": true}),
-    );
+  if let Some(report) = stopped_or_stopping(&current) {
+    return Ok(report);
   }
   let directory =
     files::existing(paths)?.ok_or_else(|| error("worker service storage disappeared"))?;
-  request(&directory, Request::Stop)
+  match request(&directory, Request::Stop) {
+    Ok(report) => Ok(report),
+    Err(failure) => {
+      // The service may accept stop but exit before its reply reaches us. Its
+      // lease and durable state settle that ambiguous acknowledgment safely.
+      if let Ok(current) = service_status(paths)
+        && let Some(report) = stopped_or_stopping(&current)
+      {
+        return Ok(report);
+      }
+      Err(failure)
+    }
+  }
+}
+
+fn stopped_or_stopping(current: &Value) -> Option<Value> {
+  if current["running"] != true {
+    Some(json!({"stopped": true, "already_stopped": true, "jobs_preserved": true}))
+  } else if current["status"] == "stopping" {
+    Some(
+      json!({"stopping": true, "already_stopping": true, "jobs_preserved": true, "training_preserved": true}),
+    )
+  } else {
+    None
+  }
 }
 
 pub(super) fn wake(paths: &StoragePaths) -> Result<()> {

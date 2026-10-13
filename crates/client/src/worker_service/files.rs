@@ -51,6 +51,12 @@ pub(super) fn directory(path: &Path) -> Result<()> {
 }
 
 pub(super) fn validate(metadata: &fs::Metadata, directory: bool) -> Result<()> {
+  validate_metadata(metadata, directory, false)
+}
+
+fn validate_metadata(metadata: &fs::Metadata, directory: bool, allow_unlinked: bool) -> Result<()> {
+  #[cfg(not(unix))]
+  let _ = allow_unlinked;
   if metadata.file_type().is_symlink()
     || (directory && !metadata.is_dir())
     || (!directory && !metadata.is_file())
@@ -64,7 +70,7 @@ pub(super) fn validate(metadata: &fs::Metadata, directory: bool) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if metadata.uid() != unsafe { libc::geteuid() }
       || metadata.permissions().mode() & 0o077 != 0
-      || (!directory && metadata.nlink() != 1)
+      || (!directory && metadata.nlink() != 1 && !(allow_unlinked && metadata.nlink() == 0))
     {
       return Err(error(
         "worker service storage must be owned by the current user and private",
@@ -83,8 +89,13 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
   }
-  let file = options.open(path)?;
-  validate(&file.metadata()?, false)?;
+  read_open_file(options.open(path)?)
+}
+
+fn read_open_file(file: File) -> Result<Vec<u8>> {
+  // A durable atomic replacement can unlink this file after we opened it. Its
+  // immutable old snapshot remains safe to read; additional hardlinks do not.
+  validate_metadata(&file.metadata()?, false, true)?;
   let mut bytes = Vec::new();
   file.take(LIMIT + 1).read_to_end(&mut bytes)?;
   if bytes.len() as u64 > LIMIT {
@@ -129,4 +140,33 @@ fn sync_parent(path: &Path) -> Result<()> {
   )?
   .sync_all()?;
   Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use std::os::unix::fs::MetadataExt;
+
+  use super::*;
+
+  #[test]
+  fn opened_snapshot_survives_atomic_replacement_but_hardlinks_are_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let private = temporary.path().join("private");
+    directory(&private).unwrap();
+    let path = private.join("status.json");
+    write(&path, &serde_json::json!({"ready": false})).unwrap();
+    let previous = File::open(&path).unwrap();
+    write(&path, &serde_json::json!({"ready": true})).unwrap();
+    assert_eq!(previous.metadata().unwrap().nlink(), 0);
+    let old: serde_json::Value =
+      serde_json::from_slice(&read_open_file(previous).unwrap()).unwrap();
+    assert_eq!(old["ready"], false);
+    let current: serde_json::Value = serde_json::from_slice(&read(&path).unwrap()).unwrap();
+    assert_eq!(current["ready"], true);
+
+    let opened = File::open(&path).unwrap();
+    fs::hard_link(&path, private.join("linked.json")).unwrap();
+    assert!(read(&path).is_err());
+    assert!(read_open_file(opened).is_err());
+  }
 }
