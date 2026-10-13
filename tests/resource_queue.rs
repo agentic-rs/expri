@@ -374,7 +374,6 @@ struct Fixture {
   project: PathBuf,
   storage: PathBuf,
   worker_storage: PathBuf,
-  client: PathBuf,
   endpoint: String,
   starts: PathBuf,
   server: ChildGuard,
@@ -460,9 +459,7 @@ impl Fixture {
       );
       thread::sleep(Duration::from_millis(10));
     }
-    let client = base.join("client.toml");
     let connection = format!("url={endpoint:?}\ntoken={OWNER:?}\n");
-    fs::write(&client, &connection).unwrap();
     fs::write(
       storage.join("config.toml"),
       format!("[server]\n{connection}"),
@@ -473,7 +470,6 @@ impl Fixture {
       project,
       storage,
       worker_storage,
-      client,
       endpoint,
       starts: base.join("starts.txt"),
       server,
@@ -589,7 +585,12 @@ impl Fixture {
   ) -> ChildGuard {
     let mut config = connection
       .map(|connection| format!("[server]\n{connection}\n"))
-      .unwrap_or_default();
+      .unwrap_or_else(|| {
+        format!(
+          "[server]\nurl={:?}\ntoken={OWNER:?}\nproject_id='queue-project'\n",
+          self.endpoint
+        )
+      });
     config.push_str(&format!(
       "[queue_worker]\nworker_id='worker-a'\nproject_ids=['queue-project']\n[queue_worker.capacity]\ncpus={cpus}\nmemory_bytes={memory_bytes}\n"
     ));
@@ -603,12 +604,8 @@ impl Fixture {
       std::env::var("PATH").unwrap()
     );
     let mut command = self.command();
-    command
-      .args(["queue", "daemon", "--storage-dir"])
-      .arg(&self.worker_storage);
-    if connection.is_none() {
-      command.arg("--client-config").arg(&self.client);
-    }
+    command.args(["service", "start", "--foreground", "--storage-dir"]);
+    command.arg(&self.worker_storage);
     ChildGuard(
       command
         .env("EXPRI_STORAGE_DIR", &self.worker_storage)
@@ -640,6 +637,17 @@ impl Fixture {
       );
       thread::sleep(Duration::from_millis(25));
     }
+  }
+
+  fn service_report(&self, action: &str) -> Value {
+    let output = self
+      .command()
+      .args(["service", action, "--json", "--storage-dir"])
+      .arg(&self.worker_storage)
+      .output()
+      .unwrap();
+    assert_success(&output);
+    serde_json::from_slice(&output.stdout).unwrap()
   }
 
   fn queue(&self, request: Value) -> Value {
@@ -772,6 +780,86 @@ fn identity(attempt: &Value) -> Value {
     "session_id": attempt["session_id"],
     "fencing_token": attempt["fencing_token"],
   })
+}
+
+#[test]
+fn shared_service_reports_queue_capacity_and_stop_preserves_training_for_restart() {
+  let fixture = Fixture::new();
+  let gate = fixture.gate("shared-service");
+  let job = fixture.submit(&gate, &["--cpus", "2", "--memory", "2GiB"]);
+  let job_id = job["job_id"].as_str().unwrap();
+  let mut service = fixture.daemon(2, 2 << 30, false);
+  fixture.await_status(job_id, &["running"]);
+  fixture.await_starts(1);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    let status = fixture.service_report("status");
+    if status["ready"] == true && status["execution"]["outstanding_attempts"] == 1 {
+      assert_eq!(status["execution"]["worker_id"], "worker-a");
+      assert_eq!(status["execution"]["capacity"]["cpus"], 2);
+      assert_eq!(status["execution"]["available"]["cpus"], 0);
+      assert_eq!(status["execution"]["reserved"]["cpus"], 2);
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "executor status was not reported: {status}"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  fixture.service_report("stop");
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while service.0.try_wait().unwrap().is_none() {
+    assert!(Instant::now() < deadline, "shared service did not stop");
+    thread::sleep(Duration::from_millis(25));
+  }
+  assert_eq!(fixture.show(job_id)["status"], "running");
+  assert_eq!(fixture.starts().len(), 1);
+  let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
+  assert_eq!(workers["workers"][0]["reserved"]["cpus"], 2);
+  fs::write(&gate, b"release").unwrap();
+  let _restarted = fixture.daemon(2, 2 << 30, false);
+  fixture.await_status(job_id, &["completed"]);
+  assert_eq!(fixture.starts().len(), 1);
+  let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
+  assert_eq!(workers["workers"][0]["available"]["cpus"], 2);
+}
+
+#[test]
+fn shared_service_stop_interrupts_source_download_without_cancelling_running_training() {
+  let fixture = Fixture::new();
+  let first_gate = fixture.gate("shared-active");
+  let first = fixture.submit(&first_gate, &["--cpus", "1", "--memory", "1GiB"]);
+  let mut service = fixture.daemon(2, 2 << 30, false);
+  fixture.await_status(first["job_id"].as_str().unwrap(), &["running"]);
+  fixture.await_starts(1);
+  let blocked = fixture.s3.block_download();
+  let second_gate = fixture.gate("shared-blocked");
+  let second = fixture.submit(&second_gate, &["--cpus", "1", "--memory", "1GiB"]);
+  blocked.await_download();
+  assert_eq!(fixture.service_report("status")["ready"], true);
+  fixture.service_report("stop");
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while service.0.try_wait().unwrap().is_none() {
+    assert!(
+      Instant::now() < deadline,
+      "source download prevented service stop"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  assert_eq!(
+    fixture.show(first["job_id"].as_str().unwrap())["status"],
+    "running"
+  );
+  assert_eq!(
+    fixture.show(second["job_id"].as_str().unwrap())["status"],
+    "starting"
+  );
+  assert_eq!(fixture.starts().len(), 1);
+  let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
+  assert_eq!(workers["workers"][0]["reserved"]["cpus"], 2);
+  drop(blocked);
+  fs::write(&first_gate, b"release").unwrap();
 }
 
 #[test]

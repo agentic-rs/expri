@@ -70,7 +70,7 @@ enum Command {
   Config(config_cli::ConfigCommand),
   /// Query published runs and files using the configured server connection.
   Query(query_cli::QueryCommand),
-  /// Manage shared queued jobs and run a local execution worker.
+  /// Manage server-queued jobs and inspect execution workers.
   Queue(queue_cli::QueueCommand),
   /// Print progressive agent guidance, with deeper instructions by topic.
   Skill(skill_cli::SkillCommand),

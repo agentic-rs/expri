@@ -52,6 +52,7 @@ fn assignment() -> JobAssignment {
       task: "train".into(),
       resources: resources.clone(),
       worker_id: None,
+      assigned_worker_id: Some("worker-a".into()),
       status: JobStatus::Starting,
       submitted_at_ms: 0,
       updated_at_ms: 0,
@@ -300,4 +301,79 @@ fn disabling_publishing_preserves_private_asset_credentials_in_native_request() 
     !service.publish,
     "asset access must not re-enable result publishing"
   );
+}
+
+#[test]
+fn a_stopped_executor_does_not_create_storage_or_contact_the_server() {
+  let temporary = tempfile::tempdir().unwrap();
+  let paths =
+    StoragePaths::from_root(temporary.path().canonicalize().unwrap().join("storage")).unwrap();
+  let options = ExecutorOptions {
+    storage: paths.clone(),
+    worker: QueueWorkerConfig {
+      worker_id: "worker-stopped".into(),
+      project_ids: vec!["project-a".into()],
+      capacity: WorkerCapacity {
+        cpus: 1,
+        memory_bytes: 4096,
+        gpus: vec![],
+      },
+    },
+    client_config: temporary.path().join("missing-config.toml"),
+    poll_interval: Duration::from_secs(20),
+  };
+  let mut reports = vec![];
+  run_executor(options, Arc::new(AtomicBool::new(true)), |report| {
+    reports.push(report);
+  })
+  .unwrap();
+  assert_eq!(reports.last().unwrap()["status"], "stopped");
+  assert!(!paths.root().exists());
+  assert_eq!(fs::read_dir(temporary.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_offline_executor_retries_and_stops_without_waiting_for_its_poll_interval() {
+  let temporary = tempfile::tempdir().unwrap();
+  let root = temporary.path().canonicalize().unwrap();
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let address = listener.local_addr().unwrap();
+  drop(listener);
+  let config = root.join("config.toml");
+  fs::write(
+    &config,
+    format!("url='http://{address}'\ntoken='fixture-private-token'\n"),
+  )
+  .unwrap();
+  let options = ExecutorOptions {
+    storage: StoragePaths::from_root(root.join("storage")).unwrap(),
+    worker: QueueWorkerConfig {
+      worker_id: "worker-offline".into(),
+      project_ids: vec!["project-a".into()],
+      capacity: WorkerCapacity {
+        cpus: 1,
+        memory_bytes: 4096,
+        gpus: vec![],
+      },
+    },
+    client_config: config,
+    poll_interval: Duration::from_secs(20),
+  };
+  let stop = Arc::new(AtomicBool::new(false));
+  let thread_stop = stop.clone();
+  let (send, receive) = std::sync::mpsc::channel();
+  let executor = thread::spawn(move || {
+    run_executor(options, thread_stop, |report| {
+      send.send(report).unwrap();
+    })
+  });
+  let waiting = receive.recv_timeout(Duration::from_secs(3)).unwrap();
+  assert_eq!(waiting["status"], "waiting");
+  assert_eq!(waiting["last_error"], "server_unavailable");
+  assert!(!waiting.to_string().contains("fixture-private-token"));
+  stop.store(true, Ordering::Release);
+  let stopped = receive.recv_timeout(Duration::from_secs(1)).unwrap();
+  assert_eq!(stopped["status"], "stopped");
+  executor.join().unwrap().unwrap();
 }

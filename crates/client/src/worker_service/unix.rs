@@ -356,3 +356,5 @@ mod signals;
 pub use runtime::run_foreground;
 #[cfg(test)]
 pub(super) use runtime::run_runtime;
+#[cfg(test)]
+pub(super) use runtime::snapshot;

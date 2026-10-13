@@ -296,8 +296,9 @@ expri queue workers
 ```
 
 Submission freezes and uploads the source before returning a job ID, so the
-laptop can disconnect. Workers automatically claim the oldest job that fits
-their declared budget. CPU counts are logical slots and memory is a reservation
+laptop can disconnect. Workers report their budget and heartbeat to the server,
+which assigns fitting jobs across online workers and reserves their resources.
+CPU-only jobs prefer CPU-only workers. CPU counts are logical slots and memory is a reservation
 among queued jobs; whole GPUs are assigned exclusively among these jobs.
 `--gpu-id` selects exact devices, while `--gpu-model` and `--gpu-memory` constrain
 automatic selection. `--worker` pins placement. Options belong before the task
@@ -318,7 +319,9 @@ gpu_model = "A100"
 
 These defaults apply to `run --queue`. Memory must be supplied in the task or
 CLI; CPU defaults to one slot and GPUs to zero. Each worker needs a local
-`[queue_worker]` declaration and a foreground `expri queue daemon`. Read
+`[queue_worker]` declaration and the shared `expri service start` runtime; use
+`--foreground` to run it in a terminal.
+`queue workers` reports available/total resources and pending assignments. Read
 [worker setup and recovery](docs/self-hosted-service.md#shared-resource-queue)
 or `expri skill queue`. The job receives a run ID only after dispatch; published
 runs then appear in the existing dashboard.

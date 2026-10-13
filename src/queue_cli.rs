@@ -1,9 +1,7 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use expri_client::{ResourceQueueClient, resolve_client_config};
-use expri_core::global_config::GlobalConfig;
 use expri_core::identifiers::validate_component;
 use expri_core::resource_queue::{
   JobStatus, JobSubmission, QueueRequest, QueueResponse, ResourceRequest, SourceRef,
@@ -268,10 +266,8 @@ enum QueueSubcommand {
   Show(JobOptions),
   /// Cancel a waiting job or request cancellation of its running attempt.
   Cancel(JobOptions),
-  /// List registered workers and their declared schedulable resources.
+  /// List worker status, reservations, and available execution resources.
   Workers(WorkerListOptions),
-  /// Run the local execution worker in the foreground.
-  Daemon(DaemonOptions),
   /// Release an uncertain attempt after independently confirming it has stopped.
   Recover(RecoverOptions),
 }
@@ -324,16 +320,6 @@ struct RecoverOptions {
   confirmed_stopped: bool,
 }
 
-#[derive(Debug, Args)]
-struct DaemonOptions {
-  #[arg(long)]
-  storage_dir: Option<PathBuf>,
-  #[arg(long)]
-  client_config: Option<PathBuf>,
-  #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=20))]
-  poll_seconds: u16,
-}
-
 pub(crate) fn run(command: QueueCommand, target: Option<&str>, quiet: bool) -> Result<()> {
   if target.is_some() {
     return Err(invalid(
@@ -376,24 +362,6 @@ pub(crate) fn run(command: QueueCommand, target: Option<&str>, quiet: bool) -> R
       },
       options.report,
     ),
-    QueueSubcommand::Daemon(options) => {
-      let storage = StoragePaths::resolve(options.storage_dir.as_deref())?;
-      storage.validate_existing()?;
-      let config = GlobalConfig::load(&storage.config_file())?;
-      let worker = config
-        .queue_worker
-        .ok_or_else(|| invalid("queue daemon requires [queue_worker] in the global config"))?;
-      let client_config = options
-        .client_config
-        .unwrap_or_else(|| storage.config_file());
-      let client_config = std::fs::canonicalize(&client_config)?;
-      return expri_worker::queue::run_daemon(expri_worker::queue::DaemonOptions {
-        storage,
-        worker,
-        client_config,
-        poll_interval: Duration::from_secs(options.poll_seconds as u64),
-      });
-    }
   };
   // Reject bad selectors before reading credentials or contacting a server.
   request.validate()?;
@@ -425,10 +393,15 @@ fn print_response(response: QueueResponse, json_output: bool) -> Result<()> {
             crate::output::bytes(job.resources.memory_bytes),
             job.resources.gpus.to_string(),
             job
-              .attempt
-              .as_ref()
-              .map(|attempt| attempt.worker_id.as_str())
-              .or(job.worker_id.as_deref())
+              .assigned_worker_id
+              .as_deref()
+              .or_else(|| {
+                job
+                  .attempt
+                  .as_ref()
+                  .map(|attempt| attempt.worker_id.as_str())
+                  .or(job.worker_id.as_deref())
+              })
               .unwrap_or("-")
               .into(),
           ]
@@ -477,19 +450,22 @@ fn print_response(response: QueueResponse, json_output: bool) -> Result<()> {
           vec![
             worker.worker_id.clone(),
             worker.project_ids.join(", "),
-            worker.capacity.cpus.to_string(),
-            crate::output::bytes(worker.capacity.memory_bytes),
-            worker
-              .capacity
-              .gpus
-              .iter()
-              .map(|gpu| gpu.device_id.as_str())
-              .collect::<Vec<_>>()
-              .join(", "),
+            format!("{}/{}", worker.available.cpus, worker.capacity.cpus),
+            format!(
+              "{}/{}",
+              crate::output::bytes(worker.available.memory_bytes),
+              crate::output::bytes(worker.capacity.memory_bytes)
+            ),
+            format!(
+              "{}/{}",
+              worker.available.gpus.len(),
+              worker.capacity.gpus.len()
+            ),
+            worker.assigned_jobs.to_string(),
             worker.outstanding_attempts.to_string(),
             if worker.quarantined {
               "quarantined"
-            } else if worker.lease_expires_at_ms <= chrono::Utc::now().timestamp_millis() {
+            } else if !worker.online {
               "offline"
             } else {
               "online"
@@ -502,14 +478,38 @@ fn print_response(response: QueueResponse, json_output: bool) -> Result<()> {
         "{}",
         crate::output::table(
           &[
-            "WORKER", "PROJECTS", "CPU", "MEMORY", "GPUS", "ACTIVE", "STATUS"
+            "WORKER",
+            "PROJECTS",
+            "CPU FREE/TOTAL",
+            "MEMORY FREE/TOTAL",
+            "GPU FREE/TOTAL",
+            "ASSIGNED",
+            "ACTIVE",
+            "STATUS"
           ],
           &rows,
-          &[24, 32, 8, 12, 48, 8, 16]
+          &[24, 32, 14, 26, 14, 8, 8, 16]
         )
       );
       if workers.is_empty() {
         println!("No workers.");
+      }
+      for worker in &workers {
+        if !worker.available.gpus.is_empty() {
+          println!(
+            "{} free GPUs: {}",
+            crate::output::text(&worker.worker_id),
+            crate::output::text(
+              &worker
+                .available
+                .gpus
+                .iter()
+                .map(|gpu| gpu.device_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+            )
+          );
+        }
       }
       if let Some(cursor) = next_cursor {
         println!("Next cursor: {}", crate::output::text(&cursor));

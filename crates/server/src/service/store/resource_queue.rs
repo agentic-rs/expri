@@ -37,6 +37,10 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
     session_id TEXT NOT NULL,claim_id TEXT NOT NULL,record TEXT NOT NULL,
     previous_fencing_token TEXT,released INTEGER NOT NULL DEFAULT 0);
     CREATE INDEX IF NOT EXISTS queue_attempts_worker ON queue_attempts(worker_id,released);
+    CREATE TABLE IF NOT EXISTS queue_offers (
+    job_id TEXT PRIMARY KEY,worker_id TEXT NOT NULL,session_id TEXT NOT NULL,
+    allocation TEXT NOT NULL,created_at_ms INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS queue_offers_worker ON queue_offers(worker_id);
     CREATE TABLE IF NOT EXISTS queue_claims (
     worker_id TEXT NOT NULL,session_id TEXT NOT NULL,claim_id TEXT NOT NULL,attempt_id TEXT,
     PRIMARY KEY(worker_id,session_id,claim_id));
@@ -50,6 +54,11 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
       INSERT INTO project_change_revisions(project_id,revision) VALUES({row}.project_id,1)
       ON CONFLICT(project_id) DO UPDATE SET revision=revision+1; END;"))
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize execution queue revisions".into()))?;
+    db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS project_revision_queue_offers_{event} AFTER {event} ON queue_offers BEGIN
+      INSERT INTO project_change_revisions(project_id,revision)
+      SELECT project_id,1 FROM queue_jobs WHERE job_id={row}.job_id
+      ON CONFLICT(project_id) DO UPDATE SET revision=revision+1; END;"))
+      .map_err(|_| crate::error::ExpriError::Message("cannot initialize scheduling offer revisions".into()))?;
   }
   Ok(())
 }
@@ -139,7 +148,82 @@ fn outstanding(db: &Connection, worker_id: &str) -> ApiResult<Vec<AttemptSummary
   Ok(attempts)
 }
 
-fn worker(db: &Connection, worker_id: &str) -> ApiResult<WorkerSummary> {
+fn reservations(db: &Connection, worker_id: &str) -> ApiResult<Vec<ResourceAllocation>> {
+  let mut allocations = outstanding(db, worker_id)?
+    .into_iter()
+    .map(|attempt| attempt.allocation)
+    .collect::<Vec<_>>();
+  let mut statement = db
+    .prepare("SELECT allocation FROM queue_offers WHERE worker_id=?1 ORDER BY job_id")
+    .map_err(database)?;
+  for record in statement
+    .query_map([worker_id], |row| row.get::<_, String>(0))
+    .map_err(database)?
+  {
+    allocations.push(decode(&record.map_err(database)?)?);
+  }
+  if allocations.len() > MAX_OUTSTANDING_ATTEMPTS {
+    return Err(ApiError::new(
+      500,
+      "worker reservation ledger exceeds its limit",
+    ));
+  }
+  Ok(allocations)
+}
+
+fn availability(
+  capacity: &WorkerCapacity,
+  allocations: &[ResourceAllocation],
+) -> ApiResult<(ResourceAllocation, ResourceAllocation)> {
+  let cpus = allocations
+    .iter()
+    .try_fold(0u32, |total, allocation| total.checked_add(allocation.cpus));
+  let memory_bytes = allocations.iter().try_fold(0u64, |total, allocation| {
+    total.checked_add(allocation.memory_bytes)
+  });
+  let (Some(cpus), Some(memory_bytes)) = (cpus, memory_bytes) else {
+    return Err(ApiError::new(500, "worker reservation totals overflow"));
+  };
+  let mut gpus = allocations
+    .iter()
+    .flat_map(|allocation| allocation.gpus.iter().cloned())
+    .collect::<Vec<_>>();
+  gpus.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+  let ids = gpus
+    .iter()
+    .map(|gpu| &gpu.device_id)
+    .collect::<BTreeSet<_>>();
+  if cpus > capacity.cpus
+    || memory_bytes > capacity.memory_bytes
+    || ids.len() != gpus.len()
+    || gpus.iter().any(|gpu| !capacity.gpus.contains(gpu))
+  {
+    return Err(ApiError::new(
+      500,
+      "worker reservation exceeds registered capacity",
+    ));
+  }
+  let available = ResourceAllocation {
+    cpus: capacity.cpus - cpus,
+    memory_bytes: capacity.memory_bytes - memory_bytes,
+    gpus: capacity
+      .gpus
+      .iter()
+      .filter(|gpu| !ids.contains(&gpu.device_id))
+      .cloned()
+      .collect(),
+  };
+  Ok((
+    available,
+    ResourceAllocation {
+      cpus,
+      memory_bytes,
+      gpus,
+    },
+  ))
+}
+
+fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary> {
   let row: Option<(String, String, String, i64, i64, bool)> = db.query_row(
     "SELECT session_id,project_ids,capacity,last_seen_at_ms,lease_expires_at_ms,quarantined FROM queue_workers WHERE worker_id=?1",
     [worker_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
@@ -153,15 +237,23 @@ fn worker(db: &Connection, worker_id: &str) -> ApiResult<WorkerSummary> {
       |row| row.get(0),
     )
     .map_err(database)?;
+  let capacity = decode(&capacity)?;
+  let allocations = reservations(db, worker_id)?;
+  let assigned_jobs = allocations.len() as u32 - outstanding_attempts;
+  let (available, reserved) = availability(&capacity, &allocations)?;
   Ok(WorkerSummary {
     worker_id: worker_id.into(),
     session_id,
     project_ids: decode(&project_ids)?,
-    capacity: decode(&capacity)?,
+    capacity,
+    available,
+    reserved,
+    online: lease_expires_at_ms > now,
     last_seen_at_ms,
     lease_expires_at_ms,
     quarantined,
     outstanding_attempts,
+    assigned_jobs,
   })
 }
 
@@ -171,7 +263,7 @@ fn current_worker(
   session_id: &str,
   now: i64,
 ) -> ApiResult<WorkerSummary> {
-  let worker = worker(db, worker_id)?;
+  let worker = worker(db, worker_id, now)?;
   if worker.session_id != session_id {
     return Err(ApiError::new(
       409,
@@ -240,20 +332,21 @@ fn expire(db: &Connection, now: i64) -> ApiResult<()> {
     )?;
   }
   db.execute("UPDATE queue_workers SET quarantined=1 WHERE lease_expires_at_ms<=?1 AND EXISTS(SELECT 1 FROM queue_attempts WHERE worker_id=queue_workers.worker_id AND released=0)", [now]).map_err(database)?;
+  prune_offers(db, now)?;
   Ok(())
 }
 
 fn allocate(
   capacity: &WorkerCapacity,
   request: &ResourceRequest,
-  used: &[AttemptSummary],
+  used: &[ResourceAllocation],
   require_cuda: bool,
 ) -> Option<ResourceAllocation> {
-  let cpus = used.iter().try_fold(0u64, |total, attempt| {
-    total.checked_add(attempt.allocation.cpus as u64)
+  let cpus = used.iter().try_fold(0u64, |total, allocation| {
+    total.checked_add(allocation.cpus as u64)
   })?;
-  let memory = used.iter().try_fold(0u64, |total, attempt| {
-    total.checked_add(attempt.allocation.memory_bytes)
+  let memory = used.iter().try_fold(0u64, |total, allocation| {
+    total.checked_add(allocation.memory_bytes)
   })?;
   if cpus.checked_add(request.cpus as u64)? > capacity.cpus as u64
     || memory.checked_add(request.memory_bytes)? > capacity.memory_bytes
@@ -262,13 +355,7 @@ fn allocate(
   }
   let reserved: BTreeSet<&str> = used
     .iter()
-    .flat_map(|attempt| {
-      attempt
-        .allocation
-        .gpus
-        .iter()
-        .map(|gpu| gpu.device_id.as_str())
-    })
+    .flat_map(|allocation| allocation.gpus.iter().map(|gpu| gpu.device_id.as_str()))
     .collect();
   let model = request
     .gpu_model
@@ -302,6 +389,97 @@ fn allocate(
   })
 }
 
+/// Offers have never been accepted and cannot authorize execution. Unlike an
+/// expired accepted attempt, they may safely be released and placed elsewhere.
+fn prune_offers(db: &Connection, now: i64) -> ApiResult<()> {
+  db.execute("DELETE FROM queue_offers WHERE NOT EXISTS(
+    SELECT 1 FROM queue_jobs j JOIN queue_workers w ON w.worker_id=queue_offers.worker_id
+    WHERE j.job_id=queue_offers.job_id AND j.status='queued'
+    AND w.session_id=queue_offers.session_id AND w.lease_expires_at_ms>?1 AND w.quarantined=0
+    AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id)
+    AND EXISTS(SELECT 1 FROM json_each(w.project_ids) WHERE value=j.project_id)
+    AND (json_extract(j.record,'$.worker_id') IS NULL OR json_extract(j.record,'$.worker_id')=w.worker_id))", [now]).map_err(database)?;
+  Ok(())
+}
+
+/// Place jobs globally in submission order, skipping jobs that currently fit no
+/// worker. Existing valid offers remain stable until acceptance or invalidation.
+fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
+  prune_offers(db, now)?;
+  let pending: bool = db
+    .query_row(
+      "SELECT EXISTS(SELECT 1 FROM queue_jobs j WHERE j.status='queued'
+    AND NOT EXISTS(SELECT 1 FROM queue_offers WHERE job_id=j.job_id)
+    AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id))",
+      [],
+      |row| row.get(0),
+    )
+    .map_err(database)?;
+  if !pending {
+    return Ok(());
+  }
+  let ids = {
+    let mut statement = db.prepare("SELECT worker_id FROM queue_workers WHERE lease_expires_at_ms>?1 AND quarantined=0 ORDER BY worker_id").map_err(database)?;
+    statement
+      .query_map([now], |row| row.get::<_, String>(0))
+      .map_err(database)?
+      .collect::<rusqlite::Result<Vec<_>>>()
+      .map_err(database)?
+  };
+  let mut workers = ids
+    .into_iter()
+    .map(|id| Ok((worker(db, &id, now)?, reservations(db, &id)?)))
+    .collect::<ApiResult<Vec<_>>>()?;
+  // Leave GPU machines available for GPU work whenever a CPU machine fits.
+  // Stable worker IDs break ties independently of the order of worker polls.
+  workers.sort_by(|(left, _), (right, _)| {
+    left
+      .capacity
+      .gpus
+      .len()
+      .cmp(&right.capacity.gpus.len())
+      .then_with(|| left.worker_id.cmp(&right.worker_id))
+  });
+  let mut statement = db
+    .prepare(
+      "SELECT j.job_id,j.record,json_extract(j.spec,'$.environment.require_cuda') FROM queue_jobs j
+    WHERE j.status='queued' AND NOT EXISTS(SELECT 1 FROM queue_offers WHERE job_id=j.job_id)
+    AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id)
+    ORDER BY j.sequence",
+    )
+    .map_err(database)?;
+  let candidates = statement
+    .query_map([], |row| {
+      Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, bool>(2)?,
+      ))
+    })
+    .map_err(database)?;
+  for candidate in candidates {
+    let (job_id, record, require_cuda) = candidate.map_err(database)?;
+    let summary: JobSummary = decode(&record)?;
+    for (worker, used) in &mut workers {
+      if used.len() >= MAX_OUTSTANDING_ATTEMPTS
+        || !worker.project_ids.contains(&summary.project_id)
+        || summary
+          .worker_id
+          .as_ref()
+          .is_some_and(|pin| pin != &worker.worker_id)
+      {
+        continue;
+      }
+      if let Some(allocation) = allocate(&worker.capacity, &summary.resources, used, require_cuda) {
+        db.execute("INSERT INTO queue_offers(job_id,worker_id,session_id,allocation,created_at_ms) VALUES(?1,?2,?3,?4,?5)", params![job_id, worker.worker_id, worker.session_id, encode(&allocation)?, now]).map_err(database)?;
+        used.push(allocation);
+        break;
+      }
+    }
+  }
+  Ok(())
+}
+
 fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<String> {
   let require_cuda: bool = db
     .query_row(
@@ -324,7 +502,7 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
   let mut online = false;
   let mut available = false;
   for id in ids {
-    let worker = worker(db, &id)?;
+    let worker = worker(db, &id, now)?;
     if worker.lease_expires_at_ms <= now {
       continue;
     }
@@ -333,14 +511,11 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
       continue;
     }
     available = true;
-    if allocate(
-      &worker.capacity,
-      &job.resources,
-      &outstanding(db, &id)?,
-      require_cuda,
-    )
-    .is_some()
-    {
+    let reserved = reservations(db, &id)?;
+    if reserved.len() >= MAX_OUTSTANDING_ATTEMPTS {
+      continue;
+    }
+    if allocate(&worker.capacity, &job.resources, &reserved, require_cuda).is_some() {
       return Ok("waiting_for_worker_claim".into());
     }
   }
@@ -368,8 +543,23 @@ fn job(db: &Connection, job_id: &str, now: i64) -> ApiResult<JobSummary> {
   let (record, attempt_id) = row.ok_or_else(|| ApiError::new(404, "queue job is missing"))?;
   let mut job: JobSummary = decode(&record)?;
   job.attempt = attempt_id.map(|id| attempt(db, &id)).transpose()?;
+  job.assigned_worker_id = if let Some(attempt) = &job.attempt {
+    Some(attempt.worker_id.clone())
+  } else {
+    db.query_row(
+      "SELECT worker_id FROM queue_offers WHERE job_id=?1",
+      [job_id],
+      |row| row.get(0),
+    )
+    .optional()
+    .map_err(database)?
+  };
   job.pending_reason = if job.status == JobStatus::Queued {
-    Some(pending_reason(db, &job, now)?)
+    Some(if job.assigned_worker_id.is_some() {
+      "waiting_for_worker_claim".into()
+    } else {
+      pending_reason(db, &job, now)?
+    })
   } else {
     None
   };
@@ -422,6 +612,11 @@ fn redact_stopped_project_payloads(db: &Connection, project_id: &str) -> ApiResu
 
 pub(super) fn cancel_project(db: &Connection, project_id: &str, now: i64) -> ApiResult<()> {
   db.execute("UPDATE queue_jobs SET status='cancelled',record=json_set(record,'$.status','cancelled','$.updated_at_ms',?2) WHERE project_id=?1 AND status='queued'", params![project_id, now]).map_err(database)?;
+  db.execute(
+    "DELETE FROM queue_offers WHERE job_id IN (SELECT job_id FROM queue_jobs WHERE project_id=?1)",
+    [project_id],
+  )
+  .map_err(database)?;
   let mut statement = db.prepare("SELECT a.record FROM queue_attempts a JOIN queue_jobs j ON j.job_id=a.job_id WHERE j.project_id=?1 AND a.released=0").map_err(database)?;
   let records = statement
     .query_map([project_id], |row| row.get::<_, String>(0))
@@ -495,6 +690,7 @@ impl<S: ObjectStorage> Store<S> {
     request: QueueRequest,
     now: i64,
   ) -> ApiResult<OperationResult> {
+    schedule(db, now)?;
     let response = match request {
       QueueRequest::Submit { submission } => submit(db, *submission, now)?,
       QueueRequest::ListJobs {
@@ -537,7 +733,7 @@ impl<S: ObjectStorage> Store<S> {
           .map_err(database)?
           .collect::<rusqlite::Result<Vec<_>>>()
           .map_err(database)?;
-        let (workers, next_cursor) = page(ids, limit, |id| worker(db, id))?;
+        let (workers, next_cursor) = page(ids, limit, |id| worker(db, id, now))?;
         QueueResponse::Workers {
           workers,
           next_cursor,
@@ -559,7 +755,7 @@ impl<S: ObjectStorage> Store<S> {
         current_worker(db, &worker_id, &session_id, now)?;
         renew(db, &worker_id, now)?;
         QueueResponse::Worker {
-          worker: worker(db, &worker_id)?,
+          worker: worker(db, &worker_id, now)?,
           attempts: outstanding(db, &worker_id)?,
         }
       }
@@ -634,6 +830,20 @@ impl<S: ObjectStorage> Store<S> {
           sha256: submission.source.sha256,
         });
       }
+    };
+    schedule(db, now)?;
+    let response = match response {
+      QueueResponse::Job { job: summary } => QueueResponse::Job {
+        job: Box::new(job(db, &summary.job_id, now)?),
+      },
+      QueueResponse::Worker {
+        worker: summary,
+        attempts,
+      } => QueueResponse::Worker {
+        worker: worker(db, &summary.worker_id, now)?,
+        attempts,
+      },
+      response => response,
     };
     Ok(OperationResult::Response(response))
   }
@@ -723,6 +933,7 @@ fn submit(db: &Connection, submission: JobSubmission, now: i64) -> ApiResult<Que
     task: submission.task.clone(),
     resources: submission.resources.clone(),
     worker_id: submission.worker_id.clone(),
+    assigned_worker_id: None,
     status: JobStatus::Queued,
     pending_reason: None,
     submitted_at_ms: now,
@@ -739,6 +950,8 @@ fn cancel(db: &Connection, job_id: &str, now: i64) -> ApiResult<QueueResponse> {
   let current = job(db, job_id, now)?;
   if current.status == JobStatus::Queued {
     set_job_status(db, job_id, "cancelled", now)?;
+    db.execute("DELETE FROM queue_offers WHERE job_id=?1", [job_id])
+      .map_err(database)?;
   } else if let Some(mut attempt) = current.attempt
     && !attempt.status.is_terminal()
   {
@@ -777,7 +990,7 @@ fn register(
     )
     .map_err(database)?;
   if existing {
-    let previous = worker(db, worker_id)?;
+    let previous = worker(db, worker_id, now)?;
     if previous.lease_expires_at_ms > now && previous.session_id != session_id {
       return Err(ApiError::new(
         409,
@@ -813,6 +1026,13 @@ fn register(
         "worker capacity and eligible projects cannot change while reservations remain",
       ));
     }
+    if previous.session_id != session_id
+      || previous.capacity != capacity
+      || previous.project_ids != project_ids
+    {
+      db.execute("DELETE FROM queue_offers WHERE worker_id=?1", [worker_id])
+        .map_err(database)?;
+    }
     db.execute(
       "UPDATE queue_workers SET session_id=?2,capacity=?3,project_ids=?4 WHERE worker_id=?1",
       params![
@@ -840,7 +1060,7 @@ fn register(
   renew(db, worker_id, now)?;
   refresh_quarantine(db, worker_id)?;
   Ok(QueueResponse::Worker {
-    worker: worker(db, worker_id)?,
+    worker: worker(db, worker_id, now)?,
     attempts: outstanding(db, worker_id)?,
   })
 }
@@ -882,31 +1102,18 @@ fn claim(
       "worker has reached its outstanding attempt limit",
     ));
   }
-  // Read only small reservation summaries while finding the oldest fitting job.
-  let mut statement = db.prepare("SELECT j.job_id,j.record,json_extract(j.spec,'$.environment.require_cuda') FROM queue_jobs j WHERE j.status='queued'
-    AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id)
-    AND EXISTS(SELECT 1 FROM json_each(?1) WHERE value=j.project_id)
-    AND (json_extract(j.record,'$.worker_id') IS NULL OR json_extract(j.record,'$.worker_id')=?2)
-    ORDER BY j.sequence").map_err(database)?;
-  let candidates = statement
-    .query_map(params![encode(&worker.project_ids)?, worker_id], |row| {
-      Ok((
-        row.get::<_, String>(0)?,
-        row.get::<_, String>(1)?,
-        row.get::<_, bool>(2)?,
-      ))
-    })
+  // The coordinator already selected the executor and reserved its resources.
+  // Acceptance is the first moment execution can become possible; converting
+  // the offer and recording the idempotent claim happen in one transaction.
+  let selected: Option<(String, String)> = db
+    .query_row(
+      "SELECT o.job_id,o.allocation FROM queue_offers o JOIN queue_jobs j ON j.job_id=o.job_id
+    WHERE o.worker_id=?1 AND o.session_id=?2 AND j.status='queued' ORDER BY j.sequence LIMIT 1",
+      params![worker_id, session_id],
+      |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
     .map_err(database)?;
-  let mut selected = None;
-  for candidate in candidates {
-    let (job_id, record, require_cuda) = candidate.map_err(database)?;
-    let summary: JobSummary = decode(&record)?;
-    if let Some(allocation) = allocate(&worker.capacity, &summary.resources, &used, require_cuda) {
-      selected = Some((job_id, allocation));
-      break;
-    }
-  }
-  drop(statement);
   let attempt_id = if let Some((job_id, allocation)) = selected {
     let attempt_id = identifier("attempt-")?;
     let attempt = AttemptSummary {
@@ -916,7 +1123,7 @@ fn claim(
       session_id: session_id.into(),
       claim_id: claim_id.into(),
       fencing_token: identifier("fence-")?,
-      allocation,
+      allocation: decode(&allocation)?,
       run_id: None,
       status: AttemptStatus::Claimed,
       cancel_requested: false,
@@ -926,6 +1133,8 @@ fn claim(
       message: None,
     };
     db.execute("INSERT INTO queue_attempts(attempt_id,job_id,worker_id,session_id,claim_id,record) VALUES(?1,?2,?3,?4,?5,?6)", params![attempt_id, job_id, worker_id, session_id, claim_id, encode(&attempt)?]).map_err(database)?;
+    db.execute("DELETE FROM queue_offers WHERE job_id=?1", [&job_id])
+      .map_err(database)?;
     db.execute(
       "UPDATE queue_jobs SET attempt_id=?2 WHERE job_id=?1 AND status='queued'",
       params![job_id, attempt_id],

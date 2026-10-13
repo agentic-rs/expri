@@ -3,8 +3,10 @@
 ## Unreleased
 
 - `run --queue` freezes source and submits managed tasks to a shared server queue.
-  Foreground `queue daemon` workers reserve logical CPU slots, memory, and whole
-  GPUs from explicit budgets, with automatic placement or worker/device pins.
+  Configured executors in the shared worker service report explicit CPU, memory,
+  and whole-GPU budgets; the server assigns jobs across live workers and holds
+  reservations, with optional worker/device pins. Worker reports show available,
+  reserved and total resources.
   `queue list`, `show`, `workers`, and `cancel` report tables or `--json`.
   Durable claims and launch journals prevent duplicate execution on retries;
   uncertain attempts retain reservations until reconciliation or confirmed recovery.

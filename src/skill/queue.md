@@ -69,11 +69,19 @@ CPU-only workers omit GPU entries. Supply real NVIDIA UUIDs or AMD HIP/ROCR
 selectors; Apple GPUs use a cooperative whole-device reservation with dedicated
 memory omitted. Capacity is an explicit budget, not current system utilization.
 Execution workers require native Linux or macOS.
-The project allowlist and foreground daemon explicitly enable execution:
+The project allowlist enables execution in the shared worker service:
 
 ```sh
-expri queue daemon
+expri service start --foreground
+expri service status --json
 ```
+
+`service start` also supports background operation.
+Without `[queue_worker]`, the service collects and publishes without executing
+server jobs. `service stop` stops queue polling while existing training continues;
+its reservations remain held until the next start reconciles completion.
+If shutdown interrupts an accepted task before launch, its journal stays held
+for confirmed stopped-workload recovery rather than being relaunched automatically.
 
 Only unrestricted server/login tokens support queue operations. Scoped publishing
 and machine tokens cannot enable execution. Worker journals and sessions use
@@ -81,9 +89,13 @@ the new global `queue/` directory; existing project storage stays in place.
 
 ## Scheduling, retries, and recovery
 
-The worker atomically claims the oldest job that fits, retaining its allocation
-during source preparation and execution. Smaller fitting jobs may pass blocked
-jobs. `queue list` includes pending reasons. Pages default to 20 records, with
+The server assigns queued jobs across online workers using their reported budgets
+and held reservations. CPU-only jobs prefer CPU-only workers; optional worker and
+GPU constraints still apply. Workers poll for their assignments and accept them
+before preparing source or executing. Smaller fitting jobs may pass blocked jobs.
+`queue workers` shows available/total CPU, memory and GPUs, assigned work and active
+attempts. JSON also includes device identities and reserved resources.
+`queue list` includes assigned workers and pending reasons. Pages default to 20 records, with
 `--limit` up to 100 and `--cursor` for the next page.
 
 If a submission response is lost, repeat an identical submission with the
@@ -91,7 +103,9 @@ reported `--submission-id`. Source or specification changes require a new ID.
 Restarting the daemon reconciles durable journals without relaunching a job.
 There is no automatic execution retry or preemption.
 
-Losing the 60-second worker lease or supervisor marks an attempt uncertain and
+An assignment that has not been accepted is released when its worker lease expires
+and can be placed elsewhere. Losing the 60-second worker lease or supervisor after
+acceptance marks an attempt uncertain and
 holds its reservation. Known live supervisors can reconcile their linked run.
 Do not release an unknown attempt merely because a worker is unreachable.
 Independently stop and verify the workload before using:

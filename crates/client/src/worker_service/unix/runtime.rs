@@ -317,7 +317,11 @@ fn redact_value(value: Value, job: &PreparedJob) -> Value {
   }
 }
 
-pub(super) fn snapshot(context: &ServiceContext, active: usize, pending: usize) -> Value {
+pub(in crate::worker_service) fn snapshot(
+  context: &ServiceContext,
+  active: usize,
+  pending: usize,
+) -> Value {
   let state = context
     .state
     .lock()
@@ -334,6 +338,7 @@ pub(super) fn snapshot(context: &ServiceContext, active: usize, pending: usize) 
   json!({"schema_version": 1, "pid": std::process::id(), "running": true,
     "ready": state.ready && !context.is_stopping(), "status": status,
     "collection": state.detail, "active_jobs": active, "pending_jobs": pending,
+    "execution": context.execution.lock().unwrap_or_else(|poison| poison.into_inner()).clone(),
     "job_concurrency": JOBS, "updated_at_ms": registry::now()})
 }
 

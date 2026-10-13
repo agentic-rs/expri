@@ -570,14 +570,22 @@ selector = "GPU-your-device-uuid"
 Keep the existing `[server]` URL/token in this file. CPU-only workers can omit the
 GPU entries. `worker_id` must be unique, and `project_ids` is an explicit execution
 allowlist. Capacity is the operator's schedulable budget, not free memory or CPU
-utilization from system monitoring. Start the native Linux or macOS worker in the foreground:
+utilization from system monitoring. Start the native Linux or macOS shared worker service:
 
 ```sh
-expri queue daemon
+expri service start --foreground
+expri service status --json
 ```
 
-This command enrolls the worker, renews its lease, and starts fitting jobs
-automatically. CPU and memory reservations govern these queued jobs and do not
+The shared service enrolls explicitly configured executors, reports their budget
+and heartbeat, and accepts assignments from the server. `service start` can run
+in the background. Without `[queue_worker]`, collection and publishing
+continue without enabling task execution. A queue server outage does not stop
+local collection. `service stop` stops queue polling while training continues;
+the next start reconciles existing supervisors and held reservations.
+An accepted task interrupted before launch retains its journal and allocation
+for confirmed recovery; service restart does not automatically relaunch it.
+CPU and memory reservations govern these queued jobs and do not
 install operating-system limits. GPUs are reserved as whole devices and exposed
 with driver selectors: NVIDIA uses `CUDA_VISIBLE_DEVICES`, AMD uses HIP/ROCR
 selectors, and Apple GPUs use a cooperative whole-device reservation. Declare
@@ -592,8 +600,13 @@ terminal run. Workloads must keep children in these groups; processes that
 deliberately escape with a new session/group are outside this cooperative
 boundary. An unverified cleanup keeps the allocation uncertain.
 
-Workers claim the oldest fitting job atomically, holding all resources during
-source download, environment preparation, and execution. A job that does not fit
+The server places queued jobs across all live eligible workers, reserving resources
+atomically before offering an assignment. CPU-only jobs prefer CPU-only workers.
+Workers accept their assigned tasks, holding all resources during source download,
+environment preparation, and execution. `queue workers` reports available/total
+resources, assigned jobs and active attempts; JSON includes reserved resources
+and exact available GPU identities. `queue list` shows the assigned worker.
+A job that does not fit
 remains queued with a reason in `queue list`; smaller fitting jobs may pass it.
 There is no preemption, multi-machine job, or automatic execution retry in this
 version. Queue operations require unrestricted configured or issued login tokens;
@@ -608,7 +621,8 @@ published runs. Queue jobs themselves are currently visible through the CLI.
 Worker state, claim receipts, and launch journals live under
 `~/.tokn/expri/queue/`; existing project storage is not moved. A daemon restart
 reconciles known runs without launching them again. Losing a 60-second worker lease
-marks its attempts uncertain and keeps their reservations, because a disconnected
+releases only assignments the worker has not accepted. Accepted attempts become
+uncertain and keep their reservations, because a disconnected
 process may still run. Known supervisors can reconcile their linked run. If a
 supervisor or journal is lost, independently stop and verify the workload before:
 

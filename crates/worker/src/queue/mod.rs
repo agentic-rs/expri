@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use expri_client::ResourceQueueClient;
 use expri_core::config::RunServiceConfig;
@@ -19,19 +19,26 @@ use expri_core::resource_queue::{
   ResourceAllocation,
 };
 use expri_core::storage::StoragePaths;
+use serde_json::{Value, json};
 
 use crate::error::{ExpriError, Result};
 use crate::protocol::RunRequest;
 use journal::{Journal, Stage, private_directory, read_json, write_json};
 
-pub struct DaemonOptions {
+pub struct ExecutorOptions {
   pub storage: StoragePaths,
   pub worker: QueueWorkerConfig,
   pub client_config: PathBuf,
   pub poll_interval: Duration,
 }
 
-pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
+/// The shared service owns shutdown. Stopping this lane never cancels training
+/// or releases server reservations whose supervisors may still be running.
+pub fn run_executor(
+  mut options: ExecutorOptions,
+  stop: Arc<AtomicBool>,
+  mut report: impl FnMut(Value),
+) -> Result<()> {
   if !cfg!(any(target_os = "linux", target_os = "macos")) {
     return Err(message(
       "resource queue execution requires a native Linux or macOS worker",
@@ -40,13 +47,20 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
   options.worker.validate()?;
   if options.poll_interval.is_zero() || options.poll_interval > Duration::from_secs(20) {
     return Err(message(
-      "queue daemon polling must be between zero and 20 seconds",
+      "queue executor polling must be greater than zero and at most 20 seconds",
     ));
   }
+  let worker_id = options.worker.worker_id.clone();
+  let waiting = || {
+    json!({"status": "waiting", "worker_id": worker_id, "online": false,
+      "capacity": options.worker.capacity, "last_error": "server_unavailable",
+      "updated_at_ms": chrono::Utc::now().timestamp_millis()})
+  };
+  if stop.load(Ordering::Acquire) {
+    report(stopped_status(&worker_id));
+    return Ok(());
+  }
   let client_config = fs::canonicalize(&options.client_config)?;
-  // Read credentials through the existing global/legacy client loader. Registration
-  // is owner-only; a publishing token cannot enable execution.
-  let client = ResourceQueueClient::new(&client_config)?;
   options.storage.ensure_private()?;
   options.storage = StoragePaths::from_root(fs::canonicalize(options.storage.root())?)?;
   private_directory(&options.storage.queue_directory())?;
@@ -54,7 +68,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     crate::lock::try_lock_file(&options.storage.queue_directory().join("daemon.lock"), true)?
   else {
     return Err(message(
-      "a queue daemon already owns this storage directory",
+      "a queue executor already owns this storage directory",
     ));
   };
   private_directory(&options.storage.queue_workers_directory())?;
@@ -72,51 +86,100 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
   expri_core::identifiers::validate_component(&session)?;
   write_json(&session_path, &session)?;
   let session = Arc::new(Mutex::new(session));
-  let (_, attempts) = register(&client, &options.worker, &session, &session_path)?;
+  // An unavailable server must not fail local collection or prevent a saved
+  // service from starting. Credentials and capabilities are retried in this lane.
+  let client = loop {
+    if stop.load(Ordering::Acquire) {
+      report(stopped_status(&worker_id));
+      return Ok(());
+    }
+    match ResourceQueueClient::with_stop(&client_config, stop.clone()) {
+      Ok(client) => break client,
+      Err(_) => {
+        report(waiting());
+        wait_until_stopped(&stop, options.poll_interval);
+      }
+    }
+  };
+  let (worker, attempts) = loop {
+    if stop.load(Ordering::Acquire) {
+      report(stopped_status(&worker_id));
+      return Ok(());
+    }
+    match register(&client, &options.worker, &session, &session_path) {
+      Ok(registered) => break registered,
+      Err(_) => {
+        report(waiting());
+        wait_until_stopped(&stop, options.poll_interval);
+      }
+    }
+  };
   let _heartbeats = Heartbeats::start(
-    client_config.clone(),
+    client.clone(),
     options.worker.worker_id.clone(),
     directory.clone(),
     session.clone(),
+    stop.clone(),
   )?;
   eprintln!(
     "queue worker: {} (CPU and memory reservations are advisory)",
     options.worker.worker_id
   );
-  let mut daemon = Daemon {
+  let mut executor = Executor {
     options,
     client,
     client_config,
     directory,
     session,
     attempts,
+    stop: stop.clone(),
+    worker,
   };
-  loop {
-    match daemon.tick() {
-      Ok(()) => {}
-      Err(error) => eprintln!("queue worker waiting: {error}"),
+  while !stop.load(Ordering::Acquire) {
+    let result = executor.tick();
+    report(executor.report(result.is_ok()));
+    wait_until_stopped(&stop, executor.options.poll_interval);
+  }
+  drop(_heartbeats);
+  report(stopped_status(&worker_id));
+  Ok(())
+}
+
+fn stopped_status(worker_id: &str) -> Value {
+  json!({"status": "stopped", "worker_id": worker_id, "online": false,
+    "last_error": null, "updated_at_ms": chrono::Utc::now().timestamp_millis()})
+}
+
+fn wait_until_stopped(stop: &AtomicBool, duration: Duration) {
+  let deadline = Instant::now() + duration;
+  while !stop.load(Ordering::Acquire) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+      return;
     }
-    thread::sleep(daemon.options.poll_interval);
+    thread::sleep(remaining.min(Duration::from_millis(50)));
   }
 }
 
-struct Daemon {
-  options: DaemonOptions,
+struct Executor {
+  options: ExecutorOptions,
   client: ResourceQueueClient,
   client_config: PathBuf,
   directory: PathBuf,
   session: Arc<Mutex<String>>,
   attempts: Vec<AttemptSummary>,
+  stop: Arc<AtomicBool>,
+  worker: expri_core::resource_queue::WorkerSummary,
 }
 
-impl Daemon {
+impl Executor {
   fn tick(&mut self) -> Result<()> {
     let heartbeat = self.client.request(&QueueRequest::Heartbeat {
       worker_id: self.options.worker.worker_id.clone(),
       session_id: self.session_id(),
     });
-    let (mut quarantined, attempts) = match heartbeat {
-      Ok(QueueResponse::Worker { worker, attempts }) => (worker.quarantined, attempts),
+    let (worker, attempts) = match heartbeat {
+      Ok(QueueResponse::Worker { worker, attempts }) => (worker, attempts),
       Ok(_) => return Err(message("server returned an invalid queue heartbeat")),
       Err(error) if expired_session(&error) => {
         *self.session.lock().expect("queue session lock") = new_id("session");
@@ -130,13 +193,21 @@ impl Daemon {
       }
       Err(error) => return Err(error),
     };
+    let mut quarantined = worker.quarantined;
+    self.worker = worker;
     self.attempts = attempts;
+    if self.stop.load(Ordering::Acquire) {
+      return Ok(());
+    }
     let pending_claim = if self.directory.join("claim.json").exists() {
       Some(read_json::<String>(&self.directory.join("claim.json"))?)
     } else {
       None
     };
     for attempt in self.attempts.clone() {
+      if self.stop.load(Ordering::Acquire) {
+        return Ok(());
+      }
       if !quarantined
         && attempt.status == AttemptStatus::Claimed
         && attempt.session_id == self.session_id()
@@ -168,6 +239,9 @@ impl Daemon {
     // A local launch journal that the server no longer considers outstanding
     // remains visible and blocks execution unless its supervisor is terminal.
     for entry in fs::read_dir(self.directory.join("attempts"))? {
+      if self.stop.load(Ordering::Acquire) {
+        return Ok(());
+      }
       let path = entry?.path();
       let mut journal = Journal::load(&path)?;
       if !self
@@ -199,7 +273,8 @@ impl Daemon {
         quarantined = true;
       }
     }
-    if quarantined {
+    self.worker.quarantined = quarantined;
+    if quarantined || self.stop.load(Ordering::Acquire) {
       return Ok(());
     }
     self.claim()
@@ -207,6 +282,36 @@ impl Daemon {
 
   fn session_id(&self) -> String {
     self.session.lock().expect("queue session lock").clone()
+  }
+
+  fn report(&self, online: bool) -> Value {
+    let mut report = json!({
+      "worker_id": self.worker.worker_id,
+      "capacity": self.worker.capacity,
+      "available": self.worker.available,
+      "reserved": self.worker.reserved,
+      "quarantined": self.worker.quarantined,
+      "outstanding_attempts": self.worker.outstanding_attempts,
+      "assigned_jobs": self.worker.assigned_jobs,
+      "last_seen_at_ms": self.worker.last_seen_at_ms,
+    });
+    report["status"] = json!(if self.stop.load(Ordering::Acquire) {
+      "stopping"
+    } else if !online {
+      "waiting"
+    } else if self.worker.quarantined {
+      "quarantined"
+    } else {
+      "running"
+    });
+    report["online"] = json!(online && !self.stop.load(Ordering::Acquire));
+    report["last_error"] = if online {
+      Value::Null
+    } else {
+      json!("server_unavailable")
+    };
+    report["updated_at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+    report
   }
 
   fn reconcile(&mut self, mut attempt: AttemptSummary) -> Result<()> {
@@ -351,6 +456,9 @@ impl Daemon {
   }
 
   fn claim(&mut self) -> Result<()> {
+    if self.stop.load(Ordering::Acquire) {
+      return Ok(());
+    }
     let claim_path = self.directory.join("claim.json");
     // A claim ID is durable before the request, so lost replies never create a
     // second allocation on the next attempt.
@@ -394,6 +502,9 @@ impl Daemon {
     }
     journal.save(&directory)?;
     fs::remove_file(claim_path)?;
+    if self.stop.load(Ordering::Acquire) {
+      return Ok(());
+    }
     if !self
       .options
       .worker
@@ -422,6 +533,11 @@ impl Daemon {
     }
     let dispatch = self.dispatch(&mut journal, &directory);
     if let Err(error) = dispatch {
+      if self.stop.load(Ordering::Acquire) {
+        // Preserve launch intent and any still-held reservation for recovery.
+        // Service stop is not a request to cancel or fail the submitted job.
+        return Ok(());
+      }
       // A failed download/prepare has not launched any worker. Once launch intent
       // is persisted, a failure can be ambiguous and must retain its allocation.
       if matches!(journal.stage, Stage::Claimed | Stage::Prepared) {
@@ -448,6 +564,7 @@ impl Daemon {
     self
       .client
       .download_source(&journal.attempt.identity(), expected, &archive)?;
+    self.check_stopping()?;
     let (digest, size) = crate::archive::sha256_file(&archive)?;
     if digest != expected.sha256 || size != expected.size {
       return Err(message(
@@ -456,6 +573,7 @@ impl Daemon {
     }
     let repo_root = directory.join("source");
     source::unpack_source(&archive, &repo_root)?;
+    self.check_stopping()?;
     private_directory(&repo_root)?;
     journal.repo_root = Some(repo_root.clone());
     journal.save(directory)?;
@@ -476,6 +594,7 @@ impl Daemon {
       ));
     }
     journal.attempt = current;
+    self.check_stopping()?;
     if journal.attempt.cancel_requested {
       self.finish(
         journal,
@@ -492,6 +611,7 @@ impl Daemon {
     journal.run_dir = Some(prepared.snapshot.run_dir.clone());
     journal.stage = Stage::Prepared;
     journal.save(directory)?;
+    self.check_stopping()?;
     journal.stage = Stage::LaunchPending;
     journal.save(directory)?;
     let QueueResponse::Attempt { attempt } = self.client.request(&QueueRequest::Start {
@@ -503,6 +623,7 @@ impl Daemon {
     };
     journal.attempt = attempt;
     journal.save(directory)?;
+    self.check_stopping()?;
     if journal.attempt.cancel_requested {
       // No subprocess has launched yet; a definitive cancellation can release.
       crate::node::run::abort_prepared(prepared, true, "cancelled before launch")?;
@@ -518,6 +639,14 @@ impl Daemon {
     crate::node::run::start_prepared(&request, prepared)?;
     journal.stage = Stage::Active;
     journal.save(directory)
+  }
+
+  fn check_stopping(&self) -> Result<()> {
+    if self.stop.load(Ordering::Acquire) {
+      Err(ExpriError::DownloadCancelled)
+    } else {
+      Ok(())
+    }
   }
 }
 
@@ -749,7 +878,10 @@ fn register(
   worker: &QueueWorkerConfig,
   session: &Arc<Mutex<String>>,
   path: &std::path::Path,
-) -> Result<(bool, Vec<AttemptSummary>)> {
+) -> Result<(
+  expri_core::resource_queue::WorkerSummary,
+  Vec<AttemptSummary>,
+)> {
   let register_request = || QueueRequest::RegisterWorker {
     worker_id: worker.worker_id.clone(),
     session_id: session.lock().expect("queue session lock").clone(),
@@ -769,7 +901,7 @@ fn register(
       "server did not acknowledge queue worker registration",
     ));
   };
-  Ok((worker.quarantined, attempts))
+  Ok((worker, attempts))
 }
 
 struct Heartbeats {
@@ -778,18 +910,18 @@ struct Heartbeats {
 }
 impl Heartbeats {
   fn start(
-    config: PathBuf,
+    client: ResourceQueueClient,
     worker_id: String,
     directory: PathBuf,
     session: Arc<Mutex<String>>,
+    service_stop: Arc<AtomicBool>,
   ) -> Result<Self> {
-    let client = ResourceQueueClient::new(&config)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let stop = stopped.clone();
     let thread = thread::Builder::new()
       .name("queue-heartbeat".into())
       .spawn(move || {
-        while !stop.load(Ordering::Acquire) {
+        while !stop.load(Ordering::Acquire) && !service_stop.load(Ordering::Acquire) {
           let session_id = session.lock().expect("queue session lock").clone();
           let response = client.request(&QueueRequest::Heartbeat {
             worker_id: worker_id.clone(),
@@ -802,7 +934,7 @@ impl Heartbeats {
             }
           }
           for _ in 0..10 {
-            if stop.load(Ordering::Acquire) {
+            if stop.load(Ordering::Acquire) || service_stop.load(Ordering::Acquire) {
               return;
             }
             thread::sleep(Duration::from_secs(1));

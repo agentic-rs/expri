@@ -214,8 +214,11 @@ pub struct JobSummary {
   pub project_id: String,
   pub task: String,
   pub resources: ResourceRequest,
-  /// Optional placement pin from the submission; actual placement is in the attempt.
+  /// Optional placement pin from the submission.
   pub worker_id: Option<String>,
+  /// The server's chosen executor, before or after the worker accepts its offer.
+  #[serde(default)]
+  pub assigned_worker_id: Option<String>,
   pub status: JobStatus,
   pub pending_reason: Option<String>,
   pub submitted_at_ms: i64,
@@ -229,10 +232,16 @@ pub struct WorkerSummary {
   pub session_id: String,
   pub project_ids: Vec<String>,
   pub capacity: WorkerCapacity,
+  /// Capacity remaining after both planned offers and accepted attempts.
+  pub available: ResourceAllocation,
+  pub reserved: ResourceAllocation,
+  pub online: bool,
   pub last_seen_at_ms: i64,
   pub lease_expires_at_ms: i64,
   pub quarantined: bool,
   pub outstanding_attempts: u32,
+  /// Scheduled jobs that the worker has not yet accepted.
+  pub assigned_jobs: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -674,6 +683,12 @@ impl JobSummary {
     if let Some(worker_id) = &self.worker_id {
       validate_component(worker_id)?;
     }
+    if let Some(worker_id) = &self.assigned_worker_id {
+      validate_component(worker_id)?;
+      if self.worker_id.as_ref().is_some_and(|pin| pin != worker_id) {
+        return Err(invalid("queue assignment differs from the worker pin"));
+      }
+    }
     if self.submitted_at_ms < 0 || self.updated_at_ms < self.submitted_at_ms {
       return Err(invalid("queue job timestamps are invalid"));
     }
@@ -685,6 +700,10 @@ impl JobSummary {
       if attempt.job_id != self.job_id
         || self
           .worker_id
+          .as_ref()
+          .is_some_and(|id| id != &attempt.worker_id)
+        || self
+          .assigned_worker_id
           .as_ref()
           .is_some_and(|id| id != &attempt.worker_id)
       {
@@ -744,8 +763,31 @@ impl WorkerSummary {
     if self.last_seen_at_ms < 0
       || self.lease_expires_at_ms < self.last_seen_at_ms
       || self.outstanding_attempts as usize > MAX_OUTSTANDING_ATTEMPTS
+      || self.outstanding_attempts as usize + self.assigned_jobs as usize > MAX_OUTSTANDING_ATTEMPTS
     {
       return Err(invalid("queue worker lease or attempt count is invalid"));
+    }
+    if self.available.cpus.checked_add(self.reserved.cpus) != Some(self.capacity.cpus)
+      || self
+        .available
+        .memory_bytes
+        .checked_add(self.reserved.memory_bytes)
+        != Some(self.capacity.memory_bytes)
+    {
+      return Err(invalid(
+        "queue worker availability differs from its capacity",
+      ));
+    }
+    let mut devices = BTreeSet::new();
+    for gpu in self.available.gpus.iter().chain(&self.reserved.gpus) {
+      if !self.capacity.gpus.contains(gpu) || !devices.insert(&gpu.device_id) {
+        return Err(invalid(
+          "queue worker availability contains invalid GPU devices",
+        ));
+      }
+    }
+    if devices.len() != self.capacity.gpus.len() {
+      return Err(invalid("queue worker availability omits GPU devices"));
     }
     Ok(())
   }
@@ -1051,5 +1093,51 @@ mod tests {
     assert!(capacity.validate().is_err());
     capacity.gpus[1].selector = Some("1".into());
     capacity.validate().unwrap();
+  }
+
+  #[test]
+  fn worker_availability_accepts_zero_free_slots_and_rejects_inconsistent_totals() {
+    let gpu = WorkerGpu {
+      device_id: "GPU-one".into(),
+      model: "NVIDIA A100".into(),
+      memory_bytes: Some(80_000),
+      vendor: GpuVendor::Nvidia,
+      selector: Some("0".into()),
+    };
+    let mut worker = WorkerSummary {
+      worker_id: "worker-one".into(),
+      session_id: "session-one".into(),
+      project_ids: vec!["project".into()],
+      capacity: WorkerCapacity {
+        cpus: 4,
+        memory_bytes: 8_000,
+        gpus: vec![gpu.clone()],
+      },
+      available: ResourceAllocation {
+        cpus: 0,
+        memory_bytes: 0,
+        gpus: Vec::new(),
+      },
+      reserved: ResourceAllocation {
+        cpus: 4,
+        memory_bytes: 8_000,
+        gpus: vec![gpu.clone()],
+      },
+      online: true,
+      last_seen_at_ms: 1_000,
+      lease_expires_at_ms: 61_000,
+      quarantined: false,
+      outstanding_attempts: 0,
+      assigned_jobs: 1,
+    };
+    worker.validate().unwrap();
+    worker.available.cpus = 1;
+    assert!(worker.validate().is_err());
+    worker.available.cpus = 0;
+    worker.available.gpus.push(gpu);
+    assert!(worker.validate().is_err());
+    worker.available.gpus.clear();
+    worker.assigned_jobs = MAX_OUTSTANDING_ATTEMPTS as u32 + 1;
+    assert!(worker.validate().is_err());
   }
 }

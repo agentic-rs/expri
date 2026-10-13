@@ -75,13 +75,23 @@ fn register_at(
   session_id: &str,
   now: i64,
 ) -> (WorkerSummary, Vec<AttemptSummary>) {
+  register_capacity_at(store, worker_id, session_id, capacity(), now)
+}
+
+fn register_capacity_at(
+  store: &Store<MockStorage>,
+  worker_id: &str,
+  session_id: &str,
+  capacity: WorkerCapacity,
+  now: i64,
+) -> (WorkerSummary, Vec<AttemptSummary>) {
   let QueueResponse::Worker { worker, attempts } = store
     .resource_queue_at(
       QueueRequest::RegisterWorker {
         worker_id: worker_id.into(),
         session_id: session_id.into(),
         project_ids: vec!["project".into()],
-        capacity: capacity(),
+        capacity,
       },
       now,
     )
@@ -204,6 +214,272 @@ fn oldest_fitting_job_obeys_cpu_memory_gpu_and_worker_pins() {
   assert_eq!(
     job(&db, &another_gpu.job_id, 1_009).unwrap().status,
     JobStatus::Queued
+  );
+}
+
+#[test]
+fn coordinator_places_cpu_and_gpu_jobs_before_the_gpu_worker_polls_first() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "a-gpu-worker", "gpu-session", 1_000);
+  let mut cpu_capacity = capacity();
+  cpu_capacity.gpus.clear();
+  register_capacity_at(&store, "z-cpu-worker", "cpu-session", cpu_capacity, 1_000);
+  let cpu = submit_at(&store, submission("cpu", resources(4, 8_000, 0)), 1_001);
+  let gpu = submit_at(&store, submission("gpu", resources(4, 8_000, 1)), 1_002);
+  assert_eq!(cpu.assigned_worker_id.as_deref(), Some("z-cpu-worker"));
+  assert_eq!(gpu.assigned_worker_id.as_deref(), Some("a-gpu-worker"));
+  assert_eq!(cpu.status, JobStatus::Queued);
+  assert!(cpu.attempt.is_none());
+  assert!(
+    cpu.worker_id.is_none(),
+    "the optional user pin remains distinct"
+  );
+  let heartbeat = QueueRequest::Heartbeat {
+    worker_id: "z-cpu-worker".into(),
+    session_id: "cpu-session".into(),
+  };
+  let response = store.resource_queue_at(heartbeat.clone(), 1_003).unwrap();
+  response.validate_for(&heartbeat).unwrap();
+  let QueueResponse::Worker {
+    worker: reported,
+    attempts,
+  } = response
+  else {
+    panic!("expected worker")
+  };
+  assert!(
+    attempts.is_empty(),
+    "an offer has no accepted execution journal"
+  );
+  assert_eq!(reported.assigned_jobs, 1);
+  assert_eq!(reported.outstanding_attempts, 0);
+  assert_eq!(reported.available.cpus, 0);
+  assert_eq!(reported.available.memory_bytes, 0);
+  assert_eq!(reported.reserved.cpus, 4);
+  assert!(reported.online);
+  assert_eq!(
+    claim_at(&store, "a-gpu-worker", "gpu-session", "gpu-claim", 1_004)
+      .unwrap()
+      .job
+      .job_id,
+    gpu.job_id
+  );
+  let accepted = claim_at(&store, "z-cpu-worker", "cpu-session", "cpu-claim", 1_005).unwrap();
+  assert_eq!(accepted.job.job_id, cpu.job_id);
+  let accepted_worker = worker(&store.db().unwrap(), "z-cpu-worker", 1_005).unwrap();
+  accepted_worker.validate().unwrap();
+  assert_eq!(accepted_worker.assigned_jobs, 0);
+  assert_eq!(accepted_worker.outstanding_attempts, 1);
+  assert_eq!(accepted_worker.available.cpus, 0);
+  store
+    .resource_queue_at(
+      QueueRequest::Finish {
+        attempt: accepted.attempt.identity(),
+        status: AttemptTerminalStatus::Completed,
+        exit_code: Some(0),
+        message: None,
+      },
+      1_006,
+    )
+    .unwrap();
+  let worker = worker(&store.db().unwrap(), "z-cpu-worker", 1_006).unwrap();
+  assert_eq!(worker.available.cpus, 4);
+  assert_eq!(worker.reserved.cpus, 0);
+}
+
+#[test]
+fn expiration_reassigns_only_unaccepted_offers_and_retains_unknown_execution() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "worker-one", "session-one", 1_000);
+  register_at(&store, "worker-two", "session-two", 2_000);
+  submit_at(
+    &store,
+    submission("accepted", resources(2, 4_000, 1)),
+    2_001,
+  );
+  let accepted = claim_at(&store, "worker-one", "session-one", "claim", 2_002).unwrap();
+  let offered = submit_at(&store, submission("offered", resources(2, 4_000, 0)), 2_003);
+  assert_eq!(offered.assigned_worker_id.as_deref(), Some("worker-one"));
+  let after = 1_000 + QUEUE_LEASE_MS + 1;
+  let response = store
+    .resource_queue_at(
+      QueueRequest::GetJob {
+        job_id: offered.job_id.clone(),
+      },
+      after,
+    )
+    .unwrap();
+  let QueueResponse::Job { job: offered } = response else {
+    panic!("expected offered job")
+  };
+  assert_eq!(offered.assigned_worker_id.as_deref(), Some("worker-two"));
+  assert_eq!(offered.status, JobStatus::Queued);
+  assert!(offered.attempt.is_none());
+  let db = store.db().unwrap();
+  let expired = worker(&db, "worker-one", after).unwrap();
+  expired.validate().unwrap();
+  assert!(!expired.online);
+  assert!(expired.quarantined);
+  assert_eq!(expired.assigned_jobs, 0);
+  assert_eq!(expired.outstanding_attempts, 1);
+  assert_eq!(expired.reserved.cpus, 2);
+  assert_eq!(expired.available.cpus, 2);
+  assert!(expired.available.gpus.is_empty());
+  assert_eq!(
+    attempt(&db, &accepted.attempt.attempt_id).unwrap().status,
+    AttemptStatus::Unknown
+  );
+  drop(db);
+  let heartbeat = QueueRequest::Heartbeat {
+    worker_id: "worker-two".into(),
+    session_id: "session-two".into(),
+  };
+  let response = store.resource_queue_at(heartbeat.clone(), after).unwrap();
+  response.validate_for(&heartbeat).unwrap();
+  let QueueResponse::Worker { worker, attempts } = response else {
+    panic!("expected worker")
+  };
+  assert!(attempts.is_empty());
+  assert_eq!(worker.assigned_jobs, 1);
+  let claimed = claim_at(&store, "worker-two", "session-two", "claim-two", after + 1).unwrap();
+  assert_eq!(claimed.job.job_id, offered.job_id);
+}
+
+#[test]
+fn cancelling_a_planned_offer_releases_capacity_for_the_next_queued_job() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "worker-one", "session-one", 1_000);
+  let offered = submit_at(&store, submission("offered", resources(4, 8_000, 1)), 1_001);
+  let next = submit_at(&store, submission("next", resources(4, 8_000, 1)), 1_002);
+  assert!(next.assigned_worker_id.is_none());
+  let QueueResponse::Job { job: cancelled } = store
+    .resource_queue_at(
+      QueueRequest::Cancel {
+        job_id: offered.job_id,
+      },
+      1_003,
+    )
+    .unwrap()
+  else {
+    panic!("expected cancelled job")
+  };
+  assert_eq!(cancelled.status, JobStatus::Cancelled);
+  assert!(cancelled.assigned_worker_id.is_none());
+  assert!(cancelled.attempt.is_none());
+  assert_eq!(
+    claim_at(&store, "worker-one", "session-one", "claim", 1_004)
+      .unwrap()
+      .job
+      .job_id,
+    next.job_id
+  );
+}
+
+#[test]
+fn concurrent_acceptance_retries_convert_one_offer_to_one_attempt() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "worker-one", "session-one", 1_000);
+  submit_at(&store, submission("offered", resources(4, 8_000, 1)), 1_001);
+  std::thread::scope(|scope| {
+    let first =
+      scope.spawn(|| claim_at(&store, "worker-one", "session-one", "same-claim", 1_002).unwrap());
+    let second =
+      scope.spawn(|| claim_at(&store, "worker-one", "session-one", "same-claim", 1_002).unwrap());
+    assert_eq!(
+      first.join().unwrap().attempt,
+      second.join().unwrap().attempt
+    );
+  });
+  let db = store.db().unwrap();
+  assert_eq!(outstanding(&db, "worker-one").unwrap().len(), 1);
+  assert_eq!(
+    db.query_row("SELECT COUNT(*) FROM queue_offers", [], |row| row
+      .get::<_, usize>(0))
+      .unwrap(),
+    0
+  );
+}
+
+#[test]
+fn planned_offers_survive_restart_without_becoming_accepted_attempts() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "worker-one", "session-one", 1_000);
+  let offered = submit_at(&store, submission("offered", resources(4, 8_000, 1)), 1_001);
+  drop(store);
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let before = worker(&store.db().unwrap(), "worker-one", 1_002).unwrap();
+  assert_eq!(before.assigned_jobs, 1);
+  assert_eq!(before.outstanding_attempts, 0);
+  assert_eq!(before.available.cpus, 0);
+  assert_eq!(
+    claim_at(&store, "worker-one", "session-one", "claim", 1_003)
+      .unwrap()
+      .job
+      .job_id,
+    offered.job_id
+  );
+}
+
+#[test]
+fn outstanding_limit_counts_both_offers_and_accepted_attempts() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let capacity = WorkerCapacity {
+    cpus: MAX_OUTSTANDING_ATTEMPTS as u32 + 1,
+    memory_bytes: MAX_OUTSTANDING_ATTEMPTS as u64 + 1,
+    gpus: Vec::new(),
+  };
+  register_capacity_at(&store, "worker-one", "session-one", capacity, 1_000);
+  let mut last = None;
+  for index in 0..=MAX_OUTSTANDING_ATTEMPTS {
+    last = Some(submit_at(
+      &store,
+      submission(&format!("job-{index}"), resources(1, 1, 0)),
+      1_001 + index as i64,
+    ));
+  }
+  let last = last.unwrap();
+  assert!(last.assigned_worker_id.is_none());
+  assert_eq!(
+    last.pending_reason.as_deref(),
+    Some("resources_unavailable")
+  );
+  let reported = worker(&store.db().unwrap(), "worker-one", 2_000).unwrap();
+  assert_eq!(reported.assigned_jobs as usize, MAX_OUTSTANDING_ATTEMPTS);
+  assert_eq!(reported.available.cpus, 1);
+  let accepted = claim_at(&store, "worker-one", "session-one", "claim", 2_001).unwrap();
+  let reported = worker(&store.db().unwrap(), "worker-one", 2_001).unwrap();
+  reported.validate().unwrap();
+  assert_eq!(
+    reported.assigned_jobs as usize,
+    MAX_OUTSTANDING_ATTEMPTS - 1
+  );
+  assert_eq!(reported.outstanding_attempts, 1);
+  store
+    .resource_queue_at(
+      QueueRequest::Finish {
+        attempt: accepted.attempt.identity(),
+        status: AttemptTerminalStatus::Completed,
+        exit_code: Some(0),
+        message: None,
+      },
+      2_002,
+    )
+    .unwrap();
+  let reported = worker(&store.db().unwrap(), "worker-one", 2_002).unwrap();
+  assert_eq!(reported.assigned_jobs as usize, MAX_OUTSTANDING_ATTEMPTS);
+  assert_eq!(reported.outstanding_attempts, 0);
+  assert_eq!(
+    job(&store.db().unwrap(), &last.job_id, 2_003)
+      .unwrap()
+      .assigned_worker_id
+      .as_deref(),
+    Some("worker-one")
   );
 }
 
@@ -418,7 +694,7 @@ fn current_session_can_reconcile_only_its_already_linked_supervisor() {
     )
     .unwrap();
   assert!(
-    worker(&store.db().unwrap(), "worker-one")
+    worker(&store.db().unwrap(), "worker-one", 1_004)
       .unwrap()
       .quarantined
   );
@@ -472,7 +748,7 @@ fn current_session_can_reconcile_only_its_already_linked_supervisor() {
   };
   assert_eq!(retry.fencing_token, adopted.fencing_token);
   assert!(
-    !worker(&store.db().unwrap(), "worker-one")
+    !worker(&store.db().unwrap(), "worker-one", 1_008)
       .unwrap()
       .quarantined
   );

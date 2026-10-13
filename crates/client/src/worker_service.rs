@@ -26,6 +26,7 @@ pub struct ServiceContext {
   stop: Arc<AtomicBool>,
   rescan: Arc<AtomicBool>,
   state: Arc<Mutex<CollectionState>>,
+  execution: Arc<Mutex<Value>>,
   wake: Arc<(Mutex<()>, Condvar)>,
 }
 
@@ -44,6 +45,7 @@ impl ServiceContext {
         ready: false,
         detail: json!({"status": "starting"}),
       })),
+      execution: Arc::new(Mutex::new(json!({"status": "disabled"}))),
       wake: Arc::new((Mutex::new(()), Condvar::new())),
     }
   }
@@ -112,6 +114,36 @@ impl ServiceContext {
   fn request_scan(&self) {
     self.rescan.store(true, Ordering::Release);
     self.wake.1.notify_all();
+  }
+
+  /// Queue execution has independent readiness and never changes collection readiness.
+  /// Callers supply public resource status only, without credentials or task arguments.
+  pub fn execution_status(&self, detail: Value) {
+    if let Some(fields) = detail.as_object() {
+      let mut execution = self
+        .execution
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+      for (key, value) in fields {
+        if matches!(
+          key.as_str(),
+          "status"
+            | "worker_id"
+            | "online"
+            | "quarantined"
+            | "capacity"
+            | "available"
+            | "reserved"
+            | "assigned_jobs"
+            | "outstanding_attempts"
+            | "last_seen_at_ms"
+            | "updated_at_ms"
+            | "last_error"
+        ) {
+          execution[key] = value.clone();
+        }
+      }
+    }
   }
 
   fn request_stop(&self) {

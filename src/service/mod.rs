@@ -23,9 +23,9 @@ pub struct ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceSubcommand {
-  /// Start the shared worker service, or reuse it when already running.
+  /// Start collection, publishing, and configured queue execution, or reuse the service.
   Start {
-    /// Collect and publish in this terminal; Ctrl-C stops the service.
+    /// Run the shared worker service in this terminal; Ctrl-C stops the service.
     #[arg(long)]
     foreground: bool,
     /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri storage.
@@ -37,7 +37,7 @@ enum ServiceSubcommand {
     #[arg(long)]
     storage_dir: Option<PathBuf>,
   },
-  /// Stop collection and publishing; training continues and queued work is retained.
+  /// Stop collection, publishing, and queue polling; training continues and saved work remains.
   Stop {
     #[arg(long)]
     storage_dir: Option<PathBuf>,
