@@ -383,6 +383,37 @@ def visible_chart_coordinates(browser, metric, run_index):
       .map(node => node.dataset.xValue);''', 'args': [metric, run_index]})
 
 
+def chart_sample_drag(coordinates, domain, pixel_width):
+  start, end = chart_sample_window(coordinates, domain)
+  assert pixel_width > 24, 'native chart drag needs a visible plot wider than 24 pixels'
+  if (end - start) * pixel_width >= 12:
+    return start, end, True
+  # Native charts require a six-pixel drag. A short run can occupy only a few
+  # pixels beside a long run, so first zoom into a wider region containing it.
+  span = max(.1, 24 / pixel_width)
+  left = max(0, min((start + end - span) / 2, 1 - span))
+  return left, left + span, False
+
+
+def zoom_recorded_chart(browser, metric, run_index):
+  selector = f'//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="{metric}"]'
+  def geometry():
+    return browser.call('POST', '/execute/sync', {'script': '''const card = [...document.querySelector('#chart-preview').querySelectorAll('[data-interactive-chart]')]
+      .find(node => node.dataset.chartMetric === arguments[0]);
+      const range = card.querySelector('[data-chart-range]');
+      return {range: [range.dataset.startX, range.dataset.endX], width: card.querySelector('[data-chart-hit]').getBoundingClientRect().width};''', 'args': [metric]})
+  for _ in range(8):
+    before = geometry()
+    start, end, exact = chart_sample_drag(visible_chart_coordinates(browser, metric, run_index), before['range'], before['width'])
+    browser.pointer(selector + '//*[@data-chart-hit]', start, end, using='xpath')
+    after = geometry()
+    assert after['range'] != before['range'], 'native sample drag did not narrow the range: ' + json.dumps({
+      'before': before, 'after': after, 'start_fraction': start, 'end_fraction': end})
+    if exact:
+      return
+  raise AssertionError('native staged zoom did not reach a recorded sample window')
+
+
 def time_axes(browser, run_ids, prefix='workspace'):
   def evaluate(script, *args):
     return browser.call('POST', '/execute/sync', {'script': script, 'args': list(args)})
@@ -497,8 +528,7 @@ def time_axes(browser, run_ids, prefix='workspace'):
       assert row['x'] == '0', 'elapsed axis did not anchor the first metric event at zero'
     # Wall-clock gaps between runs include collection/recovery/transfer delays.
     # Drag within the visible run's recorded samples rather than that empty gap.
-    start_fraction, end_fraction = chart_sample_window(visible_coordinates(), full['domain'])
-    browser.pointer(loss + '//*[@data-chart-hit]', start_fraction, end_fraction, using='xpath')
+    zoom_recorded_chart(browser, 'loss', 1)
     zoomed = state()
     assert int(full['domain'][0]) < int(zoomed['range'][0]) < int(zoomed['range'][1]) < int(full['domain'][1]), 'native drag did not narrow the time domain'
     assert visible_coordinates(), 'native time zoom excluded every visible first-run sample'
@@ -1502,8 +1532,7 @@ def automatic_refresh(run_id, updated_run_id):
     chart_context(browser)
     loss_prefix = '//*[@id="chart-preview"]//section[@data-interactive-chart][@data-chart-metric="loss"]'
     browser.click(loss_prefix + '//button[code="' + run_id + '"]', using='xpath')
-    start_fraction, end_fraction = chart_sample_window(visible_chart_coordinates(browser, 'loss', 2), loss_state()['domain'])
-    browser.pointer(loss_prefix + '//*[@data-chart-hit]', start_fraction, end_fraction, using='xpath')
+    zoom_recorded_chart(browser, 'loss', 2)
     before = loss_state()
     assert before['hidden'] == [run_id], 'fixture did not hide the requested actual run'
     assert 0 < int(before['range'][0]) < int(before['range'][1]) < int(before['domain'][1]), 'fixture did not establish an absolute elapsed-time zoom'
@@ -1565,8 +1594,7 @@ def automatic_refresh(run_id, updated_run_id):
     wait_for(lambda: (loss_state() or {}).get('time_zone') == 'utc', 'pause/resume fixture did not choose UTC')
     assert loss_state()['hidden'] == [run_id], 'time-axis switch forgot the hidden run'
     chart_context(browser)
-    start_fraction, end_fraction = chart_sample_window(visible_chart_coordinates(browser, 'loss', 2), loss_state()['domain'])
-    browser.pointer(loss_prefix + '//*[@data-chart-hit]', start_fraction, end_fraction, using='xpath')
+    zoom_recorded_chart(browser, 'loss', 2)
     before = loss_state()
     assert int(before['domain'][0]) < int(before['range'][0]) < int(before['range'][1]) < int(before['domain'][1]), 'pause/resume fixture did not lock a wall-clock range'
     assert visible_chart_coordinates(browser, 'loss', 2), 'wall-clock refresh zoom excluded every visible updated-run sample'

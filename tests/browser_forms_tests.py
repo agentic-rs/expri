@@ -30,6 +30,28 @@ class ChartGestureTests(unittest.TestCase):
     self.assertGreaterEqual((end - start) * 864, 6, 'recorded window must exceed the native drag threshold')
     self.assertFalse(any(.2 <= forms.chart_x_fraction(point, domain) <= .65 for point in samples))
 
+  def test_short_run_beside_a_long_run_uses_native_staged_zoom_at_actual_card_width(self):
+    points = [str(step * 100_000_000) for step in range(80)]
+    domain = ['0', '303000000000']
+    width = 394
+    original_start, original_end = forms.chart_sample_window(points, domain)
+    self.assertLess((original_end - original_start) * width, 6)
+    start, end, exact = forms.chart_sample_drag(points, domain, width)
+    self.assertFalse(exact)
+    self.assertGreaterEqual((end - start) * width, 24)
+    self.assertLessEqual(start, original_start)
+    self.assertGreaterEqual(end, original_end)
+    # The real pointer stays a pixel inside the hit rectangle and uses integer
+    # screen coordinates. Keep those bounds while proving the next drag works.
+    span = int(domain[1]) - int(domain[0])
+    narrowed = [str(int(span * max(1, int(start * width)) / width)),
+      str(int(span * int(end * width) / width))]
+    visible = [point for point in points if int(narrowed[0]) <= int(point) <= int(narrowed[1])]
+    start, end, exact = forms.chart_sample_drag(visible, narrowed, width)
+    self.assertTrue(exact)
+    self.assertGreaterEqual((end - start) * width, 12)
+    self.assertTrue(any(start < forms.chart_x_fraction(point, narrowed) < end for point in visible))
+
   def test_exact_large_epoch_coordinates_do_not_collapse_before_subtraction(self):
     epoch = 1_800_000_000_000_000_000
     domain = [str(epoch), str(epoch + 79)]
