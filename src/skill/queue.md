@@ -35,7 +35,7 @@ convert it to this table before adding resources.
 
 `--gpu-id` selects an exact device and can be repeated. `--gpu-model` matches a
 model substring; `--gpu-memory 24GiB` requires dedicated memory per GPU.
-`--worker gpu-1` pins placement. `-T gpu-1` uses that target's environment and
+`--worker clouds-modu` pins placement. `-T gpu-1` uses that target's environment and
 pins the target name, without SSH pushing. CUDA-required environments need a
 GPU request and an NVIDIA worker. CPU and memory are reservations among queued
 jobs, with driver hints rather than hard OS limits. Whole GPUs are exclusively
@@ -50,7 +50,14 @@ Preserve its `[server]` in `~/.tokn/expri/config.toml` and add:
 
 ```toml
 [queue_worker]
-worker_id = "gpu-1"
+worker_id = "clouds-modu"
+```
+
+`worker_id` must be unique. `project_ids` is optional: omitting it or setting `[]`
+accepts any project permitted by the worker's server credentials. For an explicit
+whitelist, add this field under `[queue_worker]`:
+
+```toml
 project_ids = ["vision"]
 ```
 
@@ -77,9 +84,22 @@ selectors; Apple GPUs use a cooperative whole-device reservation with dedicated
 memory omitted. Defaults use host inventory; use explicit limits for constrained
 containers or shared machines. GPU devices without verified selectors, including
 partitioned GPUs or unavailable partition status, are omitted from automatic whole-GPU capacity.
-Capacity is a reservation budget, not current system utilization.
+Capacity is a reservation budget, not current system utilization. GPU availability
+is checked separately on registration and heartbeats (at least every 10 seconds).
+NVIDIA devices are busy when any compute process uses more than 64 MiB by default.
+Processes at or below the threshold are tolerated independently; their memory is
+not summed. Unknown memory usage remains unverified. The same policy applies to
+reports and launch checks. Set `gpu_busy_memory_threshold_bytes` under
+`[queue_worker]` to change this; `0` blocks on any compute context, even with zero or
+unknown memory. A device is offered automatically once no process blocks it.
+Checks require full NVIDIA UUID selectors. AMD, Apple, numeric/abbreviated selectors,
+partitioned devices, and failed probes remain `unverified` and cannot receive GPU
+jobs. CPU jobs can still run. The server also blocks GPUs after 30 seconds without
+a fresh availability report. `queue workers` shows busy/unverified devices; JSON
+includes `unavailable_gpus` and `gpu_availability_observed_at_ms`.
+Upgrade the server, worker, and querying CLI together for live GPU scheduling.
 Execution workers require native Linux or macOS.
-The project allowlist enables execution in the shared worker service:
+The `[queue_worker]` declaration enables execution in the shared worker service:
 
 ```sh
 expri service start --foreground

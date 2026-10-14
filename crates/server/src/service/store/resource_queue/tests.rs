@@ -85,13 +85,52 @@ fn register_capacity_at(
   capacity: WorkerCapacity,
   now: i64,
 ) -> (WorkerSummary, Vec<AttemptSummary>) {
+  register_projects_at(
+    store,
+    worker_id,
+    session_id,
+    vec!["project".into()],
+    capacity,
+    now,
+  )
+}
+
+fn register_projects_at(
+  store: &Store<MockStorage>,
+  worker_id: &str,
+  session_id: &str,
+  project_ids: Vec<String>,
+  capacity: WorkerCapacity,
+  now: i64,
+) -> (WorkerSummary, Vec<AttemptSummary>) {
+  register_report_at(
+    store,
+    worker_id,
+    session_id,
+    project_ids,
+    capacity,
+    Some(GpuAvailabilityReport::default()),
+    now,
+  )
+}
+
+fn register_report_at(
+  store: &Store<MockStorage>,
+  worker_id: &str,
+  session_id: &str,
+  project_ids: Vec<String>,
+  capacity: WorkerCapacity,
+  gpu_availability: Option<GpuAvailabilityReport>,
+  now: i64,
+) -> (WorkerSummary, Vec<AttemptSummary>) {
   let QueueResponse::Worker { worker, attempts } = store
     .resource_queue_at(
       QueueRequest::RegisterWorker {
         worker_id: worker_id.into(),
         session_id: session_id.into(),
-        project_ids: vec!["project".into()],
+        project_ids,
         capacity,
+        gpu_availability,
       },
       now,
     )
@@ -100,6 +139,43 @@ fn register_capacity_at(
     panic!("expected worker")
   };
   (worker, attempts)
+}
+
+fn heartbeat_report_at(
+  store: &Store<MockStorage>,
+  gpu_availability: Option<GpuAvailabilityReport>,
+  now: i64,
+) -> WorkerSummary {
+  let request = QueueRequest::Heartbeat {
+    worker_id: "worker".into(),
+    session_id: "session".into(),
+    gpu_availability,
+  };
+  let response = store.resource_queue_at(request.clone(), now).unwrap();
+  response.validate_for(&request).unwrap();
+  let QueueResponse::Worker { worker, .. } = response else {
+    panic!("expected worker")
+  };
+  worker
+}
+
+fn unavailable(device_id: &str, reason: GpuUnavailableReason) -> GpuAvailabilityReport {
+  GpuAvailabilityReport {
+    unavailable_gpus: vec![UnavailableGpu {
+      device_id: device_id.into(),
+      reason,
+    }],
+  }
+}
+
+fn two_gpu_capacity() -> WorkerCapacity {
+  let mut capacity = capacity();
+  capacity.gpus.push(WorkerGpu {
+    device_id: "GPU-two".into(),
+    selector: Some("1".into()),
+    ..capacity.gpus[0].clone()
+  });
+  capacity
 }
 
 fn submit_at(store: &Store<MockStorage>, submission: JobSubmission, now: i64) -> JobSummary {
@@ -218,6 +294,221 @@ fn oldest_fitting_job_obeys_cpu_memory_gpu_and_worker_pins() {
 }
 
 #[test]
+fn unrestricted_workers_accept_cross_project_jobs_while_explicit_lists_restrict() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "restricted", "restricted-session", 1_000);
+  let mut other = submission("other-project", resources(4, 8_000, 1));
+  other.project_id = "another-project".into();
+  let queued = submit_at(&store, other, 1_001);
+  assert_eq!(queued.pending_reason.as_deref(), Some("no_eligible_worker"));
+  assert!(queued.assigned_worker_id.is_none());
+  let (registered, attempts) = register_projects_at(
+    &store,
+    "unrestricted",
+    "unrestricted-session",
+    Vec::new(),
+    capacity(),
+    1_002,
+  );
+  assert!(registered.project_ids.is_empty());
+  assert!(attempts.is_empty());
+  assert_eq!(registered.assigned_jobs, 1);
+  assert_eq!(registered.available.cpus, 0);
+  assert!(
+    claim_at(
+      &store,
+      "restricted",
+      "restricted-session",
+      "restricted-claim",
+      1_003
+    )
+    .is_none()
+  );
+  let accepted = claim_at(
+    &store,
+    "unrestricted",
+    "unrestricted-session",
+    "claim",
+    1_004,
+  )
+  .unwrap();
+  assert_eq!(accepted.job.job_id, queued.job_id);
+  assert_eq!(accepted.job.project_id, "another-project");
+}
+
+#[test]
+fn worker_pins_respect_optional_project_restrictions() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_at(&store, "restricted", "restricted-session", 1_000);
+  register_projects_at(
+    &store,
+    "unrestricted",
+    "unrestricted-session",
+    Vec::new(),
+    capacity(),
+    1_000,
+  );
+  let mut restricted = submission("restricted-pin", resources(4, 8_000, 1));
+  restricted.project_id = "another-project".into();
+  restricted.worker_id = Some("restricted".into());
+  let restricted = submit_at(&store, restricted, 1_001);
+  assert_eq!(
+    restricted.pending_reason.as_deref(),
+    Some("no_eligible_worker")
+  );
+  assert!(restricted.assigned_worker_id.is_none());
+  let mut unrestricted = submission("unrestricted-pin", resources(4, 8_000, 1));
+  unrestricted.project_id = "another-project".into();
+  unrestricted.worker_id = Some("unrestricted".into());
+  let unrestricted = submit_at(&store, unrestricted, 1_002);
+  assert_eq!(
+    unrestricted.assigned_worker_id.as_deref(),
+    Some("unrestricted")
+  );
+  // A valid empty-list offer must survive the next operation's pruning pass.
+  let heartbeat = store
+    .resource_queue_at(
+      QueueRequest::Heartbeat {
+        worker_id: "unrestricted".into(),
+        session_id: "unrestricted-session".into(),
+        gpu_availability: Some(GpuAvailabilityReport::default()),
+      },
+      1_003,
+    )
+    .unwrap();
+  let QueueResponse::Worker { worker, attempts } = heartbeat else {
+    panic!("expected worker")
+  };
+  assert_eq!(worker.assigned_jobs, 1);
+  assert!(attempts.is_empty());
+  assert_eq!(
+    claim_at(
+      &store,
+      "unrestricted",
+      "unrestricted-session",
+      "claim",
+      1_004
+    )
+    .unwrap()
+    .job
+    .job_id,
+    unrestricted.job_id
+  );
+}
+
+#[test]
+fn unrestricted_worker_pending_reasons_distinguish_capacity_and_offline_status() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_projects_at(
+    &store,
+    "unrestricted",
+    "session",
+    Vec::new(),
+    capacity(),
+    1_000,
+  );
+  let mut oversized = submission("too-large", resources(5, 8_000, 1));
+  oversized.project_id = "another-project".into();
+  let oversized = submit_at(&store, oversized, 1_001);
+  assert_eq!(
+    oversized.pending_reason.as_deref(),
+    Some("resources_unavailable")
+  );
+  let QueueResponse::Job { job: offline } = store
+    .resource_queue_at(
+      QueueRequest::GetJob {
+        job_id: oversized.job_id,
+      },
+      1_000 + QUEUE_LEASE_MS + 1,
+    )
+    .unwrap()
+  else {
+    panic!("expected job")
+  };
+  assert_eq!(
+    offline.pending_reason.as_deref(),
+    Some("eligible_workers_offline")
+  );
+}
+
+#[test]
+fn changing_project_restrictions_replans_offers_but_preserves_accepted_reservations() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_projects_at(&store, "worker", "session", Vec::new(), capacity(), 1_000);
+  let mut other = submission("other-project", resources(4, 8_000, 1));
+  other.project_id = "another-project".into();
+  let offered = submit_at(&store, other, 1_001);
+  assert_eq!(offered.assigned_worker_id.as_deref(), Some("worker"));
+  let (restricted, attempts) = register_projects_at(
+    &store,
+    "worker",
+    "session",
+    vec!["project".into()],
+    capacity(),
+    1_002,
+  );
+  assert_eq!(restricted.assigned_jobs, 0);
+  assert_eq!(restricted.available.cpus, 4);
+  assert!(attempts.is_empty());
+  let pending = job(&store.db().unwrap(), &offered.job_id, 1_002).unwrap();
+  assert!(pending.assigned_worker_id.is_none());
+  assert_eq!(
+    pending.pending_reason.as_deref(),
+    Some("no_eligible_worker")
+  );
+  let (unrestricted, _) =
+    register_projects_at(&store, "worker", "session", Vec::new(), capacity(), 1_003);
+  assert_eq!(unrestricted.assigned_jobs, 1);
+  let accepted = claim_at(&store, "worker", "session", "claim", 1_004).unwrap();
+  assert_eq!(accepted.job.job_id, offered.job_id);
+  assert_eq!(
+    store
+      .resource_queue_at(
+        QueueRequest::RegisterWorker {
+          worker_id: "worker".into(),
+          session_id: "session".into(),
+          project_ids: vec!["project".into()],
+          capacity: capacity(),
+          gpu_availability: Some(GpuAvailabilityReport::default()),
+        },
+        1_005
+      )
+      .unwrap_err()
+      .status,
+    409
+  );
+  let registered = worker(&store.db().unwrap(), "worker", 1_005).unwrap();
+  assert!(registered.project_ids.is_empty());
+  assert_eq!(registered.outstanding_attempts, 1);
+  assert_eq!(registered.reserved.cpus, 4);
+  store
+    .resource_queue_at(
+      QueueRequest::Finish {
+        attempt: accepted.attempt.identity(),
+        status: AttemptTerminalStatus::Completed,
+        exit_code: Some(0),
+        message: None,
+      },
+      1_006,
+    )
+    .unwrap();
+  let (restricted, _) = register_projects_at(
+    &store,
+    "worker",
+    "session",
+    vec!["project".into()],
+    capacity(),
+    1_007,
+  );
+  assert_eq!(restricted.project_ids, vec!["project"]);
+  assert_eq!(restricted.reserved.cpus, 0);
+}
+
+#[test]
 fn coordinator_places_cpu_and_gpu_jobs_before_the_gpu_worker_polls_first() {
   let directory = tempfile::tempdir().unwrap();
   let store = Store::open(directory.path(), MockStorage::default()).unwrap();
@@ -238,6 +529,7 @@ fn coordinator_places_cpu_and_gpu_jobs_before_the_gpu_worker_polls_first() {
   let heartbeat = QueueRequest::Heartbeat {
     worker_id: "z-cpu-worker".into(),
     session_id: "cpu-session".into(),
+    gpu_availability: Some(GpuAvailabilityReport::default()),
   };
   let response = store.resource_queue_at(heartbeat.clone(), 1_003).unwrap();
   response.validate_for(&heartbeat).unwrap();
@@ -335,6 +627,7 @@ fn expiration_reassigns_only_unaccepted_offers_and_retains_unknown_execution() {
   let heartbeat = QueueRequest::Heartbeat {
     worker_id: "worker-two".into(),
     session_id: "session-two".into(),
+    gpu_availability: Some(GpuAvailabilityReport::default()),
   };
   let response = store.resource_queue_at(heartbeat.clone(), after).unwrap();
   response.validate_for(&heartbeat).unwrap();
@@ -497,7 +790,8 @@ fn lease_loss_survives_restart_and_requires_recovery_before_new_claims() {
       .resource_queue_at(
         QueueRequest::Heartbeat {
           worker_id: "worker-one".into(),
-          session_id: "session-one".into()
+          session_id: "session-one".into(),
+          gpu_availability: Some(GpuAvailabilityReport::default()),
         },
         expired
       )
@@ -759,10 +1053,367 @@ fn cuda_placement_requires_nvidia_even_when_another_vendor_matches_the_model() {
   let request = resources(1, 1_000, 1);
   let mut capacity = capacity();
   capacity.gpus[0].vendor = GpuVendor::Amd;
-  assert!(allocate(&capacity, &request, &[], true).is_none());
-  assert!(allocate(&capacity, &request, &[], false).is_some());
+  assert!(allocate(&capacity, &request, &[], true, &[]).is_none());
+  assert!(allocate(&capacity, &request, &[], false, &[]).is_some());
   capacity.gpus[0].vendor = GpuVendor::Nvidia;
-  assert!(allocate(&capacity, &request, &[], true).is_some());
+  assert!(allocate(&capacity, &request, &[], true, &[]).is_some());
+}
+
+#[test]
+fn missing_or_unverified_gpu_reports_block_gpu_jobs_while_cpu_jobs_run() {
+  for report in [
+    None,
+    Some(unavailable("GPU-one", GpuUnavailableReason::Unverified)),
+  ] {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let (registered, _) = register_report_at(
+      &store,
+      "worker",
+      "session",
+      Vec::new(),
+      capacity(),
+      report.clone(),
+      1_000,
+    );
+    registered.validate().unwrap();
+    assert!(registered.available.gpus.is_empty());
+    assert_eq!(
+      registered.unavailable_gpus,
+      unavailable("GPU-one", GpuUnavailableReason::Unverified).unavailable_gpus
+    );
+    assert_eq!(
+      registered.gpu_availability_observed_at_ms,
+      report.map(|_| 1_000)
+    );
+    let gpu = submit_at(&store, submission("gpu", resources(2, 4_000, 1)), 1_001);
+    assert!(gpu.assigned_worker_id.is_none());
+    let cpu = submit_at(&store, submission("cpu", resources(2, 4_000, 0)), 1_002);
+    let accepted = claim_at(&store, "worker", "session", "cpu-claim", 1_003).unwrap();
+    assert_eq!(accepted.job.job_id, cpu.job_id);
+    let verified = heartbeat_report_at(&store, Some(GpuAvailabilityReport::default()), 1_004);
+    assert!(verified.unavailable_gpus.is_empty());
+    assert_eq!(verified.gpu_availability_observed_at_ms, Some(1_004));
+    assert_eq!(verified.assigned_jobs, 1);
+    assert_eq!(
+      claim_at(&store, "worker", "session", "gpu-claim", 1_005)
+        .unwrap()
+        .job
+        .job_id,
+      gpu.job_id
+    );
+  }
+}
+
+#[test]
+fn busy_devices_are_excluded_individually_until_a_fresh_free_report() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let busy = unavailable("GPU-one", GpuUnavailableReason::Busy);
+  let (registered, _) = register_report_at(
+    &store,
+    "worker",
+    "session",
+    Vec::new(),
+    two_gpu_capacity(),
+    Some(busy.clone()),
+    1_000,
+  );
+  registered.validate().unwrap();
+  assert_eq!(registered.available.gpus[0].device_id, "GPU-two");
+  assert_eq!(registered.unavailable_gpus, busy.unavailable_gpus);
+  let free_device = submit_at(
+    &store,
+    submission("free-device", resources(2, 4_000, 1)),
+    1_001,
+  );
+  let mut pinned = submission("busy-device", resources(2, 4_000, 1));
+  pinned.resources.gpu_ids = vec!["GPU-one".into()];
+  let busy_device = submit_at(&store, pinned, 1_002);
+  assert!(busy_device.assigned_worker_id.is_none());
+  let still_busy = heartbeat_report_at(&store, Some(busy), 1_003);
+  assert_eq!(still_busy.assigned_jobs, 1);
+  assert_eq!(still_busy.reserved.gpus[0].device_id, "GPU-two");
+  let freed = heartbeat_report_at(&store, Some(GpuAvailabilityReport::default()), 1_004);
+  assert_eq!(freed.assigned_jobs, 2);
+  assert!(freed.unavailable_gpus.is_empty());
+  let first = claim_at(&store, "worker", "session", "free-claim", 1_005).unwrap();
+  assert_eq!(first.job.job_id, free_device.job_id);
+  assert_eq!(first.attempt.allocation.gpus[0].device_id, "GPU-two");
+  let second = claim_at(&store, "worker", "session", "pinned-claim", 1_006).unwrap();
+  assert_eq!(second.job.job_id, busy_device.job_id);
+  assert_eq!(second.attempt.allocation.gpus[0].device_id, "GPU-one");
+}
+
+#[test]
+fn stale_gpu_observations_revoke_only_unaccepted_gpu_offers() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_projects_at(&store, "worker", "session", Vec::new(), capacity(), 1_000);
+  let gpu = submit_at(&store, submission("gpu", resources(2, 4_000, 1)), 1_001);
+  let cpu = submit_at(&store, submission("cpu", resources(1, 1_000, 0)), 1_002);
+  assert!(gpu.assigned_worker_id.is_some());
+  let stale_at = 1_000 + GPU_AVAILABILITY_MAX_AGE_MS;
+  let QueueResponse::Job { job: waiting } = store
+    .resource_queue_at(
+      QueueRequest::GetJob {
+        job_id: gpu.job_id.clone(),
+      },
+      stale_at,
+    )
+    .unwrap()
+  else {
+    panic!("expected job")
+  };
+  assert!(waiting.assigned_worker_id.is_none());
+  assert_eq!(waiting.status, JobStatus::Queued);
+  let reported = worker(&store.db().unwrap(), "worker", stale_at).unwrap();
+  reported.validate().unwrap();
+  assert!(reported.online);
+  assert_eq!(reported.assigned_jobs, 1);
+  assert!(reported.reserved.gpus.is_empty());
+  assert_eq!(
+    reported.unavailable_gpus[0].reason,
+    GpuUnavailableReason::Unverified
+  );
+  assert_eq!(reported.gpu_availability_observed_at_ms, Some(1_000));
+  assert_eq!(
+    claim_at(&store, "worker", "session", "cpu-claim", stale_at + 1)
+      .unwrap()
+      .job
+      .job_id,
+    cpu.job_id
+  );
+  heartbeat_report_at(&store, Some(GpuAvailabilityReport::default()), stale_at + 2);
+  assert_eq!(
+    claim_at(&store, "worker", "session", "gpu-claim", stale_at + 3)
+      .unwrap()
+      .job
+      .job_id,
+    gpu.job_id
+  );
+}
+
+#[test]
+fn fresh_busy_reports_revoke_offers_without_releasing_accepted_gpu_reservations() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_projects_at(
+    &store,
+    "worker",
+    "session",
+    Vec::new(),
+    two_gpu_capacity(),
+    1_000,
+  );
+  let first = submit_at(
+    &store,
+    submission("accepted", resources(1, 1_000, 1)),
+    1_001,
+  );
+  let accepted = claim_at(&store, "worker", "session", "accepted-claim", 1_002).unwrap();
+  assert_eq!(accepted.job.job_id, first.job_id);
+  assert_eq!(accepted.attempt.allocation.gpus[0].device_id, "GPU-one");
+  let offered = submit_at(&store, submission("offered", resources(1, 1_000, 1)), 1_003);
+  assert!(offered.assigned_worker_id.is_some());
+  let both_busy = GpuAvailabilityReport {
+    unavailable_gpus: vec![
+      UnavailableGpu {
+        device_id: "GPU-one".into(),
+        reason: GpuUnavailableReason::Busy,
+      },
+      UnavailableGpu {
+        device_id: "GPU-two".into(),
+        reason: GpuUnavailableReason::Busy,
+      },
+    ],
+  };
+  let busy = heartbeat_report_at(&store, Some(both_busy), 1_004);
+  assert_eq!(busy.outstanding_attempts, 1);
+  assert_eq!(busy.assigned_jobs, 0);
+  assert_eq!(busy.reserved.gpus[0].device_id, "GPU-one");
+  assert_eq!(
+    busy.unavailable_gpus,
+    unavailable("GPU-two", GpuUnavailableReason::Busy).unavailable_gpus
+  );
+  assert!(
+    job(&store.db().unwrap(), &offered.job_id, 1_004)
+      .unwrap()
+      .assigned_worker_id
+      .is_none()
+  );
+  let failed_detection = heartbeat_report_at(&store, None, 1_005);
+  assert_eq!(failed_detection.gpu_availability_observed_at_ms, None);
+  assert_eq!(failed_detection.reserved.gpus[0].device_id, "GPU-one");
+  assert_eq!(
+    failed_detection.unavailable_gpus[0].reason,
+    GpuUnavailableReason::Unverified
+  );
+  store
+    .resource_queue_at(
+      QueueRequest::Finish {
+        attempt: accepted.attempt.identity(),
+        status: AttemptTerminalStatus::Completed,
+        exit_code: Some(0),
+        message: None,
+      },
+      1_006,
+    )
+    .unwrap();
+  let freed = worker(&store.db().unwrap(), "worker", 1_006).unwrap();
+  assert!(freed.reserved.gpus.is_empty());
+  assert!(freed.available.gpus.is_empty());
+  assert_eq!(freed.unavailable_gpus.len(), 2);
+  heartbeat_report_at(&store, Some(GpuAvailabilityReport::default()), 1_007);
+  assert_eq!(
+    claim_at(&store, "worker", "session", "offered-claim", 1_008)
+      .unwrap()
+      .job
+      .job_id,
+    offered.job_id
+  );
+}
+
+#[test]
+fn invalid_gpu_heartbeat_reports_do_not_replace_observations_or_renew_the_lease() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_projects_at(&store, "worker", "session", Vec::new(), capacity(), 1_000);
+  let offered = submit_at(&store, submission("offered", resources(4, 8_000, 1)), 1_001);
+  assert_eq!(
+    store
+      .resource_queue_at(
+        QueueRequest::Heartbeat {
+          worker_id: "worker".into(),
+          session_id: "session".into(),
+          gpu_availability: Some(unavailable("GPU-unknown", GpuUnavailableReason::Busy)),
+        },
+        1_002
+      )
+      .unwrap_err()
+      .status,
+    400
+  );
+  let unchanged = worker(&store.db().unwrap(), "worker", 1_002).unwrap();
+  assert_eq!(unchanged.last_seen_at_ms, 1_000);
+  assert_eq!(unchanged.gpu_availability_observed_at_ms, Some(1_000));
+  assert_eq!(unchanged.assigned_jobs, 1);
+  let duplicate = GpuAvailabilityReport {
+    unavailable_gpus: vec![
+      UnavailableGpu {
+        device_id: "GPU-one".into(),
+        reason: GpuUnavailableReason::Busy,
+      },
+      UnavailableGpu {
+        device_id: "GPU-one".into(),
+        reason: GpuUnavailableReason::Unverified,
+      },
+    ],
+  };
+  assert_eq!(
+    store
+      .resource_queue_at(
+        QueueRequest::Heartbeat {
+          worker_id: "worker".into(),
+          session_id: "session".into(),
+          gpu_availability: Some(duplicate),
+        },
+        1_003
+      )
+      .unwrap_err()
+      .status,
+    400
+  );
+  assert_eq!(
+    claim_at(&store, "worker", "session", "claim", 1_004)
+      .unwrap()
+      .job
+      .job_id,
+    offered.job_id
+  );
+}
+
+#[test]
+fn schema_eight_upgrade_keeps_accepted_allocations_and_requires_new_gpu_observations() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_projects_at(
+    &store,
+    "worker",
+    "session",
+    Vec::new(),
+    two_gpu_capacity(),
+    1_000,
+  );
+  submit_at(
+    &store,
+    submission("accepted", resources(1, 1_000, 1)),
+    1_001,
+  );
+  let accepted = claim_at(&store, "worker", "session", "accepted-claim", 1_002).unwrap();
+  let offered = submit_at(&store, submission("offered", resources(1, 1_000, 1)), 1_003);
+  assert!(offered.assigned_worker_id.is_some());
+  drop(store);
+  let database_path = directory.path().join("metadata.sqlite3");
+  let db = Connection::open(&database_path).unwrap();
+  db.execute_batch(
+    "ALTER TABLE queue_workers DROP COLUMN gpu_availability;
+    ALTER TABLE queue_workers DROP COLUMN gpu_availability_observed_at_ms;
+    CREATE TABLE preservation_marker(value TEXT);
+    INSERT INTO preservation_marker VALUES('retained'); PRAGMA user_version=8;",
+  )
+  .unwrap();
+  drop(db);
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  assert_eq!(
+    store
+      .db()
+      .unwrap()
+      .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+      .unwrap(),
+    9
+  );
+  assert_eq!(
+    store
+      .db()
+      .unwrap()
+      .query_row("SELECT value FROM preservation_marker", [], |row| row
+        .get::<_, String>(0))
+      .unwrap(),
+    "retained"
+  );
+  let QueueResponse::Job { job: requeued } = store
+    .resource_queue_at(
+      QueueRequest::GetJob {
+        job_id: offered.job_id.clone(),
+      },
+      1_004,
+    )
+    .unwrap()
+  else {
+    panic!("expected job")
+  };
+  assert_eq!(requeued.status, JobStatus::Queued);
+  assert!(requeued.assigned_worker_id.is_none());
+  let migrated = worker(&store.db().unwrap(), "worker", 1_004).unwrap();
+  migrated.validate().unwrap();
+  assert!(migrated.project_ids.is_empty());
+  assert_eq!(migrated.gpu_availability_observed_at_ms, None);
+  assert_eq!(migrated.outstanding_attempts, 1);
+  assert_eq!(migrated.reserved.gpus[0].device_id, "GPU-one");
+  assert_eq!(
+    migrated.unavailable_gpus,
+    unavailable("GPU-two", GpuUnavailableReason::Unverified).unavailable_gpus
+  );
+  let replayed = claim_at(&store, "worker", "session", "accepted-claim", 1_005).unwrap();
+  assert_eq!(replayed.attempt, accepted.attempt);
+  heartbeat_report_at(&store, Some(GpuAvailabilityReport::default()), 1_006);
+  let newly_accepted = claim_at(&store, "worker", "session", "new-claim", 1_007).unwrap();
+  assert_eq!(newly_accepted.job.job_id, offered.job_id);
+  assert_eq!(
+    newly_accepted.attempt.allocation.gpus[0].device_id,
+    "GPU-two"
+  );
 }
 
 #[test]
@@ -1142,6 +1793,7 @@ fn large_job_and_worker_pages_fit_the_transport_and_do_not_skip_entries() {
           session_id: "s".repeat(96),
           project_ids: project_ids.clone(),
           capacity: large_capacity.clone(),
+          gpu_availability: Some(GpuAvailabilityReport::default()),
         },
         1_000,
       )
@@ -1301,7 +1953,7 @@ fn source_mismatch_rolls_back_and_schema_seven_upgrade_preserves_records() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    8
+    9
   );
   assert_eq!(
     store

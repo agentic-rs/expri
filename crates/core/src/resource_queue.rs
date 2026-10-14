@@ -9,7 +9,9 @@ use crate::error::{ExpriError, Result};
 use crate::identifiers::validate_component;
 
 pub const RESOURCE_QUEUE_CAPABILITY: &str = "resource-queue-v1";
+pub const RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY: &str = "resource-queue-gpu-availability-v1";
 pub const QUEUE_LEASE_MS: i64 = 60_000;
+pub const GPU_AVAILABILITY_MAX_AGE_MS: i64 = 30_000;
 pub const MAX_QUEUE_PAGE: usize = 100;
 pub const MAX_OUTSTANDING_ATTEMPTS: usize = 128;
 pub const MAX_QUEUE_SPEC_BYTES: usize = 768 * 1024;
@@ -57,6 +59,27 @@ pub struct WorkerCapacity {
   pub memory_bytes: u64,
   #[serde(default)]
   pub gpus: Vec<WorkerGpu>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuUnavailableReason {
+  Busy,
+  Unverified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnavailableGpu {
+  pub device_id: String,
+  pub reason: GpuUnavailableReason,
+}
+
+/// GPUs whose occupancy is observed outside the server's reservation ledger.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuAvailabilityReport {
+  pub unavailable_gpus: Vec<UnavailableGpu>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,11 +253,17 @@ pub struct JobSummary {
 pub struct WorkerSummary {
   pub worker_id: String,
   pub session_id: String,
+  /// An empty list accepts any project permitted by the worker's credentials.
   pub project_ids: Vec<String>,
   pub capacity: WorkerCapacity,
   /// Capacity remaining after both planned offers and accepted attempts.
   pub available: ResourceAllocation,
   pub reserved: ResourceAllocation,
+  #[serde(default)]
+  pub unavailable_gpus: Vec<UnavailableGpu>,
+  /// Server receive time of the most recent GPU availability report.
+  #[serde(default)]
+  pub gpu_availability_observed_at_ms: Option<i64>,
   pub online: bool,
   pub last_seen_at_ms: i64,
   pub lease_expires_at_ms: i64,
@@ -276,12 +305,18 @@ pub enum QueueRequest {
   RegisterWorker {
     worker_id: String,
     session_id: String,
+    /// An omitted or empty list accepts any project permitted by the credentials.
+    #[serde(default)]
     project_ids: Vec<String>,
     capacity: WorkerCapacity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_availability: Option<GpuAvailabilityReport>,
   },
   Heartbeat {
     worker_id: String,
     session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu_availability: Option<GpuAvailabilityReport>,
   },
   Claim {
     worker_id: String,
@@ -456,6 +491,36 @@ impl WorkerCapacity {
   }
 }
 
+impl GpuAvailabilityReport {
+  pub fn validate(&self) -> Result<()> {
+    if self.unavailable_gpus.len() > 64 {
+      return Err(invalid("GPU availability may report at most 64 devices"));
+    }
+    let mut devices = BTreeSet::new();
+    for gpu in &self.unavailable_gpus {
+      text(&gpu.device_id, 256, false)?;
+      if !devices.insert(&gpu.device_id) {
+        return Err(invalid("GPU availability device IDs must be unique"));
+      }
+    }
+    Ok(())
+  }
+
+  pub fn validate_capacity(&self, capacity: &WorkerCapacity) -> Result<()> {
+    self.validate()?;
+    capacity.validate()?;
+    if self.unavailable_gpus.iter().any(|gpu| {
+      !capacity
+        .gpus
+        .iter()
+        .any(|device| device.device_id == gpu.device_id)
+    }) {
+      return Err(invalid("GPU availability contains an unregistered device"));
+    }
+    Ok(())
+  }
+}
+
 impl SourceRef {
   pub fn validate(&self) -> Result<()> {
     validate_component(&self.input_id)?;
@@ -583,12 +648,13 @@ impl QueueRequest {
         session_id,
         project_ids,
         capacity,
+        gpu_availability,
       } => {
         validate_component(worker_id)?;
         validate_component(session_id)?;
-        if project_ids.is_empty() || project_ids.len() > 100 {
+        if project_ids.len() > 100 {
           return Err(invalid(
-            "queue workers require between 1 and 100 eligible project IDs",
+            "queue workers allow at most 100 eligible project IDs",
           ));
         }
         let mut unique = BTreeSet::new();
@@ -598,14 +664,23 @@ impl QueueRequest {
             return Err(invalid("worker eligible projects must be unique"));
           }
         }
-        capacity.validate()
+        capacity.validate()?;
+        if let Some(report) = gpu_availability {
+          report.validate_capacity(capacity)?;
+        }
+        Ok(())
       }
       Self::Heartbeat {
         worker_id,
         session_id,
+        gpu_availability,
       } => {
         validate_component(worker_id)?;
-        validate_component(session_id)
+        validate_component(session_id)?;
+        if let Some(report) = gpu_availability {
+          report.validate()?;
+        }
+        Ok(())
       }
       Self::Claim {
         worker_id,
@@ -758,12 +833,18 @@ impl WorkerSummary {
       session_id: self.session_id.clone(),
       project_ids: self.project_ids.clone(),
       capacity: self.capacity.clone(),
+      gpu_availability: Some(GpuAvailabilityReport {
+        unavailable_gpus: self.unavailable_gpus.clone(),
+      }),
     }
     .validate()?;
     if self.last_seen_at_ms < 0
       || self.lease_expires_at_ms < self.last_seen_at_ms
       || self.outstanding_attempts as usize > MAX_OUTSTANDING_ATTEMPTS
       || self.outstanding_attempts as usize + self.assigned_jobs as usize > MAX_OUTSTANDING_ATTEMPTS
+      || self
+        .gpu_availability_observed_at_ms
+        .is_some_and(|observed| observed < 0 || observed > self.last_seen_at_ms)
     {
       return Err(invalid("queue worker lease or attempt count is invalid"));
     }
@@ -784,6 +865,11 @@ impl WorkerSummary {
         return Err(invalid(
           "queue worker availability contains invalid GPU devices",
         ));
+      }
+    }
+    for gpu in &self.unavailable_gpus {
+      if !devices.insert(&gpu.device_id) {
+        return Err(invalid("queue worker GPU availability partitions overlap"));
       }
     }
     if devices.len() != self.capacity.gpus.len() {
@@ -883,6 +969,7 @@ impl QueueResponse {
         | QueueRequest::Heartbeat {
           worker_id,
           session_id,
+          ..
         },
         Self::Worker { worker, attempts },
       ) => {
@@ -1008,6 +1095,228 @@ impl QueueResponse {
 mod tests {
   use super::*;
 
+  fn gpu(id: &str) -> WorkerGpu {
+    WorkerGpu {
+      device_id: id.into(),
+      model: "NVIDIA GPU".into(),
+      memory_bytes: Some(8192),
+      vendor: GpuVendor::Nvidia,
+      selector: Some(id.into()),
+    }
+  }
+
+  #[test]
+  fn gpu_availability_reports_are_bounded_unique_and_registered() {
+    let capacity = WorkerCapacity {
+      cpus: 4,
+      memory_bytes: 8192,
+      gpus: vec![gpu("GPU-a")],
+    };
+    GpuAvailabilityReport::default()
+      .validate_capacity(&capacity)
+      .unwrap();
+    let unavailable = UnavailableGpu {
+      device_id: "GPU-a".into(),
+      reason: GpuUnavailableReason::Busy,
+    };
+    let mut report = GpuAvailabilityReport {
+      unavailable_gpus: vec![unavailable.clone()],
+    };
+    report.validate_capacity(&capacity).unwrap();
+    report.unavailable_gpus.push(unavailable);
+    assert!(report.validate().is_err());
+    report.unavailable_gpus.pop();
+    for id in ["", "bad\nID", &"x".repeat(257)] {
+      report.unavailable_gpus[0].device_id = id.into();
+      assert!(report.validate().is_err());
+    }
+    report.unavailable_gpus[0].device_id = "GPU-other".into();
+    report.validate().unwrap();
+    assert!(report.validate_capacity(&capacity).is_err());
+    report.unavailable_gpus = (0..64)
+      .map(|number| UnavailableGpu {
+        device_id: format!("GPU-{number}"),
+        reason: GpuUnavailableReason::Unverified,
+      })
+      .collect();
+    report.validate().unwrap();
+    report.unavailable_gpus.push(UnavailableGpu {
+      device_id: "GPU-64".into(),
+      reason: GpuUnavailableReason::Busy,
+    });
+    assert!(report.validate().is_err());
+  }
+
+  #[test]
+  fn gpu_availability_wire_reports_preserve_legacy_and_explicit_idle_states() {
+    let mut registration = serde_json::json!({
+      "operation": "register_worker", "worker_id": "worker-a", "session_id": "session-a",
+      "capacity": {"cpus": 4, "memory_bytes": 8192, "gpus": [gpu("GPU-a")]}
+    });
+    let legacy: QueueRequest = serde_json::from_value(registration.clone()).unwrap();
+    legacy.validate().unwrap();
+    assert!(
+      serde_json::to_value(&legacy)
+        .unwrap()
+        .get("gpu_availability")
+        .is_none()
+    );
+    let QueueRequest::RegisterWorker {
+      gpu_availability, ..
+    } = legacy
+    else {
+      panic!("expected registration");
+    };
+    assert!(gpu_availability.is_none());
+    registration["gpu_availability"] = serde_json::json!({"unavailable_gpus": []});
+    let explicit: QueueRequest = serde_json::from_value(registration.clone()).unwrap();
+    explicit.validate().unwrap();
+    let QueueRequest::RegisterWorker {
+      gpu_availability, ..
+    } = explicit
+    else {
+      panic!("expected registration");
+    };
+    assert_eq!(gpu_availability, Some(GpuAvailabilityReport::default()));
+    registration["gpu_availability"] = serde_json::json!({"unavailable_gpus": [{
+      "device_id": "GPU-other", "reason": "unverified"
+    }]});
+    let foreign: QueueRequest = serde_json::from_value(registration.clone()).unwrap();
+    assert!(foreign.validate().is_err());
+    registration["gpu_availability"]["unavailable_gpus"][0]["device_id"] =
+      serde_json::json!("GPU-a");
+    let verified: QueueRequest = serde_json::from_value(registration.clone()).unwrap();
+    verified.validate().unwrap();
+    registration["gpu_availability"]["unavailable_gpus"][0]["reason"] =
+      serde_json::json!("unknown");
+    assert!(serde_json::from_value::<QueueRequest>(registration).is_err());
+
+    let mut heartbeat = serde_json::json!({
+      "operation": "heartbeat", "worker_id": "worker-a", "session_id": "session-a"
+    });
+    let legacy: QueueRequest = serde_json::from_value(heartbeat.clone()).unwrap();
+    legacy.validate().unwrap();
+    assert!(
+      serde_json::to_value(&legacy)
+        .unwrap()
+        .get("gpu_availability")
+        .is_none()
+    );
+    heartbeat["gpu_availability"] = serde_json::json!({"unavailable_gpus": [
+      {"device_id": "GPU-a", "reason": "busy"},
+      {"device_id": "GPU-a", "reason": "unverified"}
+    ]});
+    let duplicate: QueueRequest = serde_json::from_value(heartbeat).unwrap();
+    assert!(duplicate.validate().is_err());
+  }
+
+  #[test]
+  fn worker_gpu_availability_partitions_cover_capacity_without_overlap() {
+    let gpus = ["GPU-a", "GPU-b", "GPU-c", "GPU-d"].map(gpu);
+    let mut worker = WorkerSummary {
+      worker_id: "worker-a".into(),
+      session_id: "session-a".into(),
+      project_ids: vec![],
+      capacity: WorkerCapacity {
+        cpus: 4,
+        memory_bytes: 8192,
+        gpus: gpus.clone().into(),
+      },
+      available: ResourceAllocation {
+        cpus: 2,
+        memory_bytes: 4096,
+        gpus: vec![gpus[0].clone()],
+      },
+      reserved: ResourceAllocation {
+        cpus: 2,
+        memory_bytes: 4096,
+        gpus: vec![gpus[1].clone()],
+      },
+      unavailable_gpus: vec![
+        UnavailableGpu {
+          device_id: gpus[2].device_id.clone(),
+          reason: GpuUnavailableReason::Busy,
+        },
+        UnavailableGpu {
+          device_id: gpus[3].device_id.clone(),
+          reason: GpuUnavailableReason::Unverified,
+        },
+      ],
+      gpu_availability_observed_at_ms: Some(1000),
+      online: true,
+      last_seen_at_ms: 1000,
+      lease_expires_at_ms: 61_000,
+      quarantined: false,
+      outstanding_attempts: 1,
+      assigned_jobs: 0,
+    };
+    worker.validate().unwrap();
+    let original = worker.clone();
+    for device_id in ["GPU-a", "GPU-b", "GPU-d", "GPU-foreign"] {
+      worker.unavailable_gpus[0].device_id = device_id.into();
+      assert!(worker.validate().is_err());
+    }
+    worker = original.clone();
+    worker.unavailable_gpus.pop();
+    assert!(worker.validate().is_err());
+    worker = original.clone();
+    worker.available.gpus[0].selector = Some("GPU-foreign".into());
+    assert!(worker.validate().is_err());
+    worker = original.clone();
+    for timestamp in [-1, 1001] {
+      worker.gpu_availability_observed_at_ms = Some(timestamp);
+      assert!(worker.validate().is_err());
+    }
+    worker.gpu_availability_observed_at_ms = None;
+    worker.validate().unwrap();
+
+    // A legacy summary can deserialize before the server capability check.
+    worker.available.gpus = gpus.into();
+    worker.reserved.gpus.clear();
+    worker.unavailable_gpus.clear();
+    let mut legacy = serde_json::to_value(&worker).unwrap();
+    legacy.as_object_mut().unwrap().remove("unavailable_gpus");
+    legacy
+      .as_object_mut()
+      .unwrap()
+      .remove("gpu_availability_observed_at_ms");
+    let decoded: WorkerSummary = serde_json::from_value(legacy).unwrap();
+    decoded.validate().unwrap();
+    assert!(decoded.unavailable_gpus.is_empty());
+    assert!(decoded.gpu_availability_observed_at_ms.is_none());
+  }
+
+  #[test]
+  fn worker_registration_defaults_omitted_projects_to_unrestricted() {
+    let mut registration = serde_json::json!({
+      "operation": "register_worker", "worker_id": "worker-a", "session_id": "session-a",
+      "capacity": {"cpus": 4, "memory_bytes": 8192, "gpus": []}
+    });
+    for project_ids in [None, Some(serde_json::json!([]))] {
+      if let Some(project_ids) = project_ids {
+        registration["project_ids"] = project_ids;
+      }
+      let request: QueueRequest = serde_json::from_value(registration.clone()).unwrap();
+      request.validate().unwrap();
+      let QueueRequest::RegisterWorker { project_ids, .. } = request else {
+        panic!("expected worker registration");
+      };
+      assert!(project_ids.is_empty());
+    }
+    for project_ids in [
+      vec!["project-a".to_owned(), "project-a".to_owned()],
+      vec!["../project-a".to_owned()],
+      (0..101).map(|number| format!("project-{number}")).collect(),
+    ] {
+      registration["project_ids"] = serde_json::json!(project_ids);
+      let request: QueueRequest = serde_json::from_value(registration.clone()).unwrap();
+      assert!(request.validate().is_err());
+    }
+    registration["project_ids"] = serde_json::json!(["project-a"]);
+    let request: QueueRequest = serde_json::from_value(registration).unwrap();
+    request.validate().unwrap();
+  }
+
   #[test]
   fn cuda_environment_requires_a_gpu_reservation_in_direct_api_submissions() {
     let sha256 = "a".repeat(64);
@@ -1123,6 +1432,8 @@ mod tests {
         memory_bytes: 8_000,
         gpus: vec![gpu.clone()],
       },
+      unavailable_gpus: vec![],
+      gpu_availability_observed_at_ms: None,
       online: true,
       last_seen_at_ms: 1_000,
       lease_expires_at_ms: 61_000,

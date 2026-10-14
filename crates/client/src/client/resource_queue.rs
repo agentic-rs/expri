@@ -15,6 +15,7 @@ use crate::types::{Request, Response};
 #[derive(Clone)]
 pub struct ResourceQueueClient {
   api: Api,
+  gpu_availability: bool,
 }
 
 impl ResourceQueueClient {
@@ -43,7 +44,24 @@ impl ResourceQueueClient {
         "service does not support resource-queue-v1; upgrade the server",
       ));
     }
-    Ok(Self { api })
+    let gpu_availability = features
+      .iter()
+      .any(|feature| feature == RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY);
+    Ok(Self {
+      api,
+      gpu_availability,
+    })
+  }
+
+  /// GPU workers require availability-aware scheduling before registering any
+  /// devices. An older server must never silently treat a busy GPU as free.
+  pub fn require_gpu_availability(&self) -> Result<()> {
+    if !self.gpu_availability {
+      return Err(fs::message(
+        "service does not support resource-queue-gpu-availability-v1; upgrade the server before enabling GPU workers",
+      ));
+    }
+    Ok(())
   }
 
   pub fn request(&self, request: &QueueRequest) -> Result<QueueResponse> {
