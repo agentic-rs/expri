@@ -28,6 +28,8 @@ pub struct GlobalConfig {
 #[serde(deny_unknown_fields)]
 pub struct QueueWorkerConfig {
   pub worker_id: String,
+  /// An omitted or empty list accepts any project permitted by the credentials.
+  #[serde(default)]
   pub project_ids: Vec<String>,
   #[serde(default)]
   pub capacity: QueueWorkerCapacityConfig,
@@ -50,6 +52,7 @@ pub struct QueueWorkerCapacityConfig {
 #[derive(Clone, Debug)]
 pub struct ResolvedQueueWorkerConfig {
   pub worker_id: String,
+  /// An empty list accepts any project permitted by the credentials.
   pub project_ids: Vec<String>,
   pub capacity: crate::resource_queue::WorkerCapacity,
 }
@@ -98,9 +101,9 @@ impl ResolvedQueueWorkerConfig {
 
 fn validate_worker_identity(worker_id: &str, project_ids: &[String]) -> Result<()> {
   crate::identifiers::validate_component(worker_id)?;
-  if project_ids.is_empty() || project_ids.len() > 64 {
+  if project_ids.len() > 64 {
     return Err(invalid(
-      "queue_worker.project_ids requires an explicit nonempty project allowlist",
+      "queue_worker.project_ids allows at most 64 projects",
     ));
   }
   let mut projects = std::collections::BTreeSet::new();
@@ -464,14 +467,31 @@ mod tests {
   }
 
   #[test]
-  fn automatic_capacity_still_requires_explicit_valid_worker_identity_and_projects() {
+  fn automatic_capacity_still_requires_valid_worker_identity_and_project_restrictions() {
     for identity in [
-      "worker_id='worker-a'\nproject_ids=[]\n",
       "worker_id='worker-a'\nproject_ids=['vision', 'vision']\n",
       "worker_id='../worker-a'\nproject_ids=['vision']\n",
+      "worker_id='worker-a'\nproject_ids=['../vision']\n",
     ] {
       let config: GlobalConfig = toml::from_str(&format!("[queue_worker]\n{identity}")).unwrap();
       assert!(config.validate().is_err());
+    }
+    let mut worker = worker_config("");
+    worker.project_ids = (0..65).map(|number| format!("project-{number}")).collect();
+    assert!(worker.validate().is_err());
+  }
+
+  #[test]
+  fn omitted_and_empty_worker_projects_roundtrip_as_unrestricted() {
+    for projects in ["", "project_ids=[]\n"] {
+      let config: GlobalConfig =
+        toml::from_str(&format!("[queue_worker]\nworker_id='worker-a'\n{projects}")).unwrap();
+      config.validate().unwrap();
+      let roundtrip: GlobalConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+      let worker = roundtrip.queue_worker.unwrap();
+      assert!(worker.project_ids.is_empty());
+      let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+      assert!(resolved.project_ids.is_empty());
     }
   }
 

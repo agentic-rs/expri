@@ -31,7 +31,8 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
     CREATE TABLE IF NOT EXISTS queue_workers (
     worker_id TEXT PRIMARY KEY,session_id TEXT NOT NULL,project_ids TEXT NOT NULL,
     capacity TEXT NOT NULL,last_seen_at_ms INTEGER NOT NULL,lease_expires_at_ms INTEGER NOT NULL,
-    quarantined INTEGER NOT NULL DEFAULT 0);
+    quarantined INTEGER NOT NULL DEFAULT 0,gpu_availability TEXT,
+    gpu_availability_observed_at_ms INTEGER);
     CREATE TABLE IF NOT EXISTS queue_attempts (
     attempt_id TEXT PRIMARY KEY,job_id TEXT NOT NULL UNIQUE,worker_id TEXT NOT NULL,
     session_id TEXT NOT NULL,claim_id TEXT NOT NULL,record TEXT NOT NULL,
@@ -48,6 +49,34 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
     worker_id TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(worker_id,session_id));",
   )
   .map_err(|_| crate::error::ExpriError::Message("cannot initialize execution queue".into()))?;
+  // Schema eight workers retain their reservations. Missing observations make
+  // their unreserved GPUs unavailable until the updated worker reports them.
+  let columns = {
+    let mut statement = db
+      .prepare("PRAGMA table_info(queue_workers)")
+      .map_err(|_| {
+        crate::error::ExpriError::Message("cannot read execution worker schema".into())
+      })?;
+    statement
+      .query_map([], |row| row.get::<_, String>(1))
+      .and_then(|rows| rows.collect::<rusqlite::Result<BTreeSet<_>>>())
+      .map_err(|_| {
+        crate::error::ExpriError::Message("cannot read execution worker schema".into())
+      })?
+  };
+  for (column, kind) in [
+    ("gpu_availability", "TEXT"),
+    ("gpu_availability_observed_at_ms", "INTEGER"),
+  ] {
+    if !columns.contains(column) {
+      db.execute_batch(&format!(
+        "ALTER TABLE queue_workers ADD COLUMN {column} {kind}"
+      ))
+      .map_err(|_| {
+        crate::error::ExpriError::Message("cannot upgrade execution worker schema".into())
+      })?;
+    }
+  }
   for event in ["INSERT", "UPDATE", "DELETE"] {
     let row = if event == "DELETE" { "OLD" } else { "NEW" };
     db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS project_revision_queue_jobs_{event} AFTER {event} ON queue_jobs BEGIN
@@ -223,13 +252,66 @@ fn availability(
   ))
 }
 
+fn unavailable_gpus(
+  capacity: &WorkerCapacity,
+  report: Option<&GpuAvailabilityReport>,
+  observed_at_ms: Option<i64>,
+  now: i64,
+) -> Vec<UnavailableGpu> {
+  if let Some(report) = report
+    && observed_at_ms.is_some_and(|observed| {
+      now
+        .checked_sub(observed)
+        .is_some_and(|age| (0..GPU_AVAILABILITY_MAX_AGE_MS).contains(&age))
+    })
+  {
+    return report.unavailable_gpus.clone();
+  }
+  capacity
+    .gpus
+    .iter()
+    .map(|gpu| UnavailableGpu {
+      device_id: gpu.device_id.clone(),
+      reason: GpuUnavailableReason::Unverified,
+    })
+    .collect()
+}
+
+struct WorkerRecord {
+  session_id: String,
+  project_ids: String,
+  capacity: String,
+  last_seen_at_ms: i64,
+  lease_expires_at_ms: i64,
+  quarantined: bool,
+  gpu_availability: Option<String>,
+  gpu_availability_observed_at_ms: Option<i64>,
+}
+
 fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary> {
-  let row: Option<(String, String, String, i64, i64, bool)> = db.query_row(
-    "SELECT session_id,project_ids,capacity,last_seen_at_ms,lease_expires_at_ms,quarantined FROM queue_workers WHERE worker_id=?1",
-    [worker_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+  let row: Option<WorkerRecord> = db.query_row(
+    "SELECT session_id,project_ids,capacity,last_seen_at_ms,lease_expires_at_ms,quarantined,gpu_availability,gpu_availability_observed_at_ms FROM queue_workers WHERE worker_id=?1",
+    [worker_id], |row| Ok(WorkerRecord {
+      session_id: row.get(0)?,
+      project_ids: row.get(1)?,
+      capacity: row.get(2)?,
+      last_seen_at_ms: row.get(3)?,
+      lease_expires_at_ms: row.get(4)?,
+      quarantined: row.get(5)?,
+      gpu_availability: row.get(6)?,
+      gpu_availability_observed_at_ms: row.get(7)?,
+    }),
   ).optional().map_err(database)?;
-  let (session_id, project_ids, capacity, last_seen_at_ms, lease_expires_at_ms, quarantined) =
-    row.ok_or_else(|| ApiError::new(404, "queue worker is not registered"))?;
+  let WorkerRecord {
+    session_id,
+    project_ids,
+    capacity,
+    last_seen_at_ms,
+    lease_expires_at_ms,
+    quarantined,
+    gpu_availability: report,
+    gpu_availability_observed_at_ms,
+  } = row.ok_or_else(|| ApiError::new(404, "queue worker is not registered"))?;
   let outstanding_attempts = db
     .query_row(
       "SELECT COUNT(*) FROM queue_attempts WHERE worker_id=?1 AND released=0",
@@ -240,7 +322,29 @@ fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary
   let capacity = decode(&capacity)?;
   let allocations = reservations(db, worker_id)?;
   let assigned_jobs = allocations.len() as u32 - outstanding_attempts;
-  let (available, reserved) = availability(&capacity, &allocations)?;
+  let (mut available, reserved) = availability(&capacity, &allocations)?;
+  let report = report
+    .map(|value| decode::<GpuAvailabilityReport>(&value))
+    .transpose()?;
+  let unavailable_gpus = unavailable_gpus(
+    &capacity,
+    report.as_ref(),
+    gpu_availability_observed_at_ms,
+    now,
+  )
+  .into_iter()
+  .filter(|gpu| {
+    !reserved
+      .gpus
+      .iter()
+      .any(|reserved| reserved.device_id == gpu.device_id)
+  })
+  .collect::<Vec<_>>();
+  available.gpus.retain(|gpu| {
+    !unavailable_gpus
+      .iter()
+      .any(|unavailable| unavailable.device_id == gpu.device_id)
+  });
   Ok(WorkerSummary {
     worker_id: worker_id.into(),
     session_id,
@@ -248,6 +352,8 @@ fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary
     capacity,
     available,
     reserved,
+    unavailable_gpus,
+    gpu_availability_observed_at_ms,
     online: lease_expires_at_ms > now,
     last_seen_at_ms,
     lease_expires_at_ms,
@@ -341,6 +447,7 @@ fn allocate(
   request: &ResourceRequest,
   used: &[ResourceAllocation],
   require_cuda: bool,
+  unavailable: &[UnavailableGpu],
 ) -> Option<ResourceAllocation> {
   let cpus = used.iter().try_fold(0u64, |total, allocation| {
     total.checked_add(allocation.cpus as u64)
@@ -366,6 +473,9 @@ fn allocate(
     .iter()
     .filter(|gpu| {
       !reserved.contains(gpu.device_id.as_str())
+        && !unavailable
+          .iter()
+          .any(|unavailable| unavailable.device_id == gpu.device_id)
         && (!require_cuda || gpu.vendor == GpuVendor::Nvidia)
         && (request.gpu_ids.is_empty() || request.gpu_ids.contains(&gpu.device_id))
         && model
@@ -397,8 +507,13 @@ fn prune_offers(db: &Connection, now: i64) -> ApiResult<()> {
     WHERE j.job_id=queue_offers.job_id AND j.status='queued'
     AND w.session_id=queue_offers.session_id AND w.lease_expires_at_ms>?1 AND w.quarantined=0
     AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id)
-    AND EXISTS(SELECT 1 FROM json_each(w.project_ids) WHERE value=j.project_id)
-    AND (json_extract(j.record,'$.worker_id') IS NULL OR json_extract(j.record,'$.worker_id')=w.worker_id))", [now]).map_err(database)?;
+    AND (json_array_length(w.project_ids)=0 OR EXISTS(SELECT 1 FROM json_each(w.project_ids) WHERE value=j.project_id))
+    AND NOT EXISTS(SELECT 1 FROM json_each(queue_offers.allocation,'$.gpus') gpu
+      WHERE w.gpu_availability IS NULL OR w.gpu_availability_observed_at_ms IS NULL
+      OR w.gpu_availability_observed_at_ms<=?2 OR w.gpu_availability_observed_at_ms>?1
+      OR EXISTS(SELECT 1 FROM json_each(w.gpu_availability,'$.unavailable_gpus') unavailable
+        WHERE json_extract(unavailable.value,'$.device_id')=json_extract(gpu.value,'$.device_id')))
+    AND (json_extract(j.record,'$.worker_id') IS NULL OR json_extract(j.record,'$.worker_id')=w.worker_id))", params![now, now.saturating_sub(GPU_AVAILABILITY_MAX_AGE_MS)]).map_err(database)?;
   Ok(())
 }
 
@@ -462,7 +577,7 @@ fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
     let summary: JobSummary = decode(&record)?;
     for (worker, used) in &mut workers {
       if used.len() >= MAX_OUTSTANDING_ATTEMPTS
-        || !worker.project_ids.contains(&summary.project_id)
+        || (!worker.project_ids.is_empty() && !worker.project_ids.contains(&summary.project_id))
         || summary
           .worker_id
           .as_ref()
@@ -470,7 +585,13 @@ fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
       {
         continue;
       }
-      if let Some(allocation) = allocate(&worker.capacity, &summary.resources, used, require_cuda) {
+      if let Some(allocation) = allocate(
+        &worker.capacity,
+        &summary.resources,
+        used,
+        require_cuda,
+        &worker.unavailable_gpus,
+      ) {
         db.execute("INSERT INTO queue_offers(job_id,worker_id,session_id,allocation,created_at_ms) VALUES(?1,?2,?3,?4,?5)", params![job_id, worker.worker_id, worker.session_id, encode(&allocation)?, now]).map_err(database)?;
         used.push(allocation);
         break;
@@ -488,7 +609,7 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
       |row| row.get(0),
     )
     .map_err(database)?;
-  let mut statement = db.prepare("SELECT worker_id FROM queue_workers WHERE (?1 IS NULL OR worker_id=?1) AND EXISTS(SELECT 1 FROM json_each(project_ids) WHERE value=?2) ORDER BY worker_id LIMIT ?3").map_err(database)?;
+  let mut statement = db.prepare("SELECT worker_id FROM queue_workers WHERE (?1 IS NULL OR worker_id=?1) AND (json_array_length(project_ids)=0 OR EXISTS(SELECT 1 FROM json_each(project_ids) WHERE value=?2)) ORDER BY worker_id LIMIT ?3").map_err(database)?;
   let ids = statement
     .query_map(params![job.worker_id, job.project_id, MAX_WORKERS], |row| {
       row.get::<_, String>(0)
@@ -515,7 +636,15 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
     if reserved.len() >= MAX_OUTSTANDING_ATTEMPTS {
       continue;
     }
-    if allocate(&worker.capacity, &job.resources, &reserved, require_cuda).is_some() {
+    if allocate(
+      &worker.capacity,
+      &job.resources,
+      &reserved,
+      require_cuda,
+      &worker.unavailable_gpus,
+    )
+    .is_some()
+    {
       return Ok("waiting_for_worker_claim".into());
     }
   }
@@ -663,7 +792,7 @@ impl<S: ObjectStorage> Store<S> {
     transaction.commit().map_err(database)?;
     drop(db);
     match response {
-      OperationResult::Response(response) => Ok(response),
+      OperationResult::Response(response) => Ok(*response),
       OperationResult::Source {
         key,
         size,
@@ -744,15 +873,32 @@ impl<S: ObjectStorage> Store<S> {
         session_id,
         mut project_ids,
         capacity,
+        gpu_availability,
       } => {
         project_ids.sort();
-        register(db, &worker_id, &session_id, project_ids, capacity, now)?
+        register(
+          db,
+          &worker_id,
+          &session_id,
+          project_ids,
+          capacity,
+          gpu_availability,
+          now,
+        )?
       }
       QueueRequest::Heartbeat {
         worker_id,
         session_id,
+        gpu_availability,
       } => {
-        current_worker(db, &worker_id, &session_id, now)?;
+        let current = current_worker(db, &worker_id, &session_id, now)?;
+        observe_gpus(
+          db,
+          &worker_id,
+          &current.capacity,
+          gpu_availability.as_ref(),
+          now,
+        )?;
         renew(db, &worker_id, now)?;
         QueueResponse::Worker {
           worker: worker(db, &worker_id, now)?,
@@ -845,12 +991,12 @@ impl<S: ObjectStorage> Store<S> {
       },
       response => response,
     };
-    Ok(OperationResult::Response(response))
+    Ok(OperationResult::Response(Box::new(response)))
   }
 }
 
 enum OperationResult {
-  Response(QueueResponse),
+  Response(Box<QueueResponse>),
   Source {
     key: String,
     project_id: String,
@@ -980,8 +1126,12 @@ fn register(
   session_id: &str,
   project_ids: Vec<String>,
   capacity: WorkerCapacity,
+  gpu_availability: Option<GpuAvailabilityReport>,
   now: i64,
 ) -> ApiResult<QueueResponse> {
+  if let Some(report) = &gpu_availability {
+    report.validate_capacity(&capacity).map_err(bad)?;
+  }
   let existing: bool = db
     .query_row(
       "SELECT EXISTS(SELECT 1 FROM queue_workers WHERE worker_id=?1)",
@@ -1058,11 +1208,26 @@ fn register(
   )
   .map_err(database)?;
   renew(db, worker_id, now)?;
+  observe_gpus(db, worker_id, &capacity, gpu_availability.as_ref(), now)?;
   refresh_quarantine(db, worker_id)?;
   Ok(QueueResponse::Worker {
     worker: worker(db, worker_id, now)?,
     attempts: outstanding(db, worker_id)?,
   })
+}
+
+fn observe_gpus(
+  db: &Connection,
+  worker_id: &str,
+  capacity: &WorkerCapacity,
+  report: Option<&GpuAvailabilityReport>,
+  now: i64,
+) -> ApiResult<()> {
+  if let Some(report) = report {
+    report.validate_capacity(capacity).map_err(bad)?;
+  }
+  db.execute("UPDATE queue_workers SET gpu_availability=?2,gpu_availability_observed_at_ms=?3 WHERE worker_id=?1", params![worker_id, report.map(encode).transpose()?, report.map(|_| now)]).map_err(database)?;
+  Ok(())
 }
 
 fn claim(

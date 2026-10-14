@@ -86,7 +86,7 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 8. Older binaries
+Opening this version upgrades the SQLite schema to version 9. Older binaries
 refuse that directory because they cannot preserve durable queue allocations,
 worker fencing, smoke archival, asset provenance, and run retention. Back up the entire
 service directory before upgrading; restoring that backup is required for a
@@ -602,7 +602,7 @@ CPU defaults to one logical slot and GPUs to zero. Task-level
 and `gpu_memory`; CLI values override the corresponding defaults. These apply
 only to queued runs. Memory sizes accept positive integers with binary units
 such as `GiB` or decimal units such as `GB`. `--project-id` can default from the
-selected project's `[service]`. `--worker gpu-1` pins placement; `-T gpu-1` also
+selected project's `[service]`. `--worker clouds-modu` pins placement; `-T gpu-1` also
 uses that target's environment and pins its name, without an SSH source push.
 
 Each submission uploads a verified source ZIP through the existing private-input
@@ -621,7 +621,15 @@ in `~/.tokn/expri/config.toml`:
 
 ```toml
 [queue_worker]
-worker_id = "gpu-1"
+worker_id = "clouds-modu"
+```
+
+The unique `worker_id` opts the machine into queue execution. `project_ids` is an
+optional whitelist: omitting it or using `[]` accepts any project permitted by
+the worker's server credentials. To restrict execution, add this field under
+`[queue_worker]`:
+
+```toml
 project_ids = ["vision"]
 ```
 
@@ -650,9 +658,19 @@ a verified accessible KFD compute device, and Apple GPUs use shared-memory slots
 Unknown GPU selectors, partitioned GPUs, and unavailable partition status are omitted from the
 automatic whole-GPU budget. Defaults describe host resources; explicit budgets
 can constrain containers or shared machines. The resolved budget stays fixed while
-the executor runs. `worker_id` must be unique, and `project_ids` is an explicit execution
-allowlist. Capacity is a schedulable budget, not free memory or CPU
-utilization from system monitoring. Start the native Linux or macOS shared worker service:
+the executor runs. Capacity is a schedulable budget, not free memory or CPU
+utilization from system monitoring. GPU availability is a separate live report:
+registration and heartbeats check compute occupancy, with a background check every
+10 seconds even while staging a task. A busy NVIDIA GPU becomes schedulable when
+its compute processes finish. Graphics-only contexts do not block GPU work.
+The server stamps reports on receipt and treats GPUs as unverified after 30 seconds
+without a fresh report. Missing reports, driver errors, unsupported devices, and
+uncertain selectors also keep GPUs unavailable. CPU and memory placement continues.
+Live detection currently supports whole NVIDIA devices with full UUID selectors;
+AMD, Apple, numeric/abbreviated selectors, and partitioned devices remain unverified.
+Upgrade the server, worker, and querying CLI together. GPU workers require the
+server's `resource-queue-gpu-availability-v1` capability before enrolling.
+Start the native Linux or macOS shared worker service:
 
 ```sh
 expri service start --foreground
@@ -671,7 +689,9 @@ keep collecting or uploading. Restart this component to reload worker enrollment
 or re-detect inferred capacity with `service restart --component queue-execution`;
 its resolved budget stays fixed per generation.
 An accepted task interrupted before launch retains its journal and allocation
-for confirmed recovery; service restart does not automatically relaunch it.
+for confirmed recovery. A task specifically parked before launch while waiting
+for its assigned GPUs resumes when they are verified free; it can also be cancelled.
+Other uncertain prelaunch interruptions do not automatically relaunch.
 CPU and memory reservations govern these queued jobs and do not
 install operating-system limits. GPUs are reserved as whole devices and exposed
 with driver selectors: NVIDIA uses `CUDA_VISIBLE_DEVICES`, AMD uses HIP/ROCR
@@ -681,6 +701,10 @@ the machine budget; omit GPU `memory_bytes`. Multi-CPU and multi-GPU workers are
 supported. GPU model matching is case-insensitive substring matching; `--gpu-memory`
 requires that amount of dedicated memory on every assigned device. A CUDA-required
 environment needs a GPU request and is placed only on NVIDIA devices.
+Availability checks do not prevent unrelated processes from starting between
+observations. Workers recheck assigned GPUs before launch and retain accepted
+reservations while waiting. Busy reports never release an active job's resources;
+they revoke only offers that have not yet been accepted.
 
 Queued supervisors clean up their owned process groups before acknowledging a
 terminal run. Workloads must keep children in these groups; processes that
@@ -691,8 +715,11 @@ The server places queued jobs across all live eligible workers, reserving resour
 atomically before offering an assignment. CPU-only jobs prefer CPU-only workers.
 Workers accept their assigned tasks, holding all resources during source download,
 environment preparation, and execution. `queue workers` reports available/total
-resources, assigned jobs and active attempts; JSON includes reserved resources
-and exact available GPU identities. `queue list` shows the assigned worker.
+resources, assigned jobs and active attempts, plus busy/unverified GPU identities.
+JSON includes reserved resources, exact available GPU identities,
+`unavailable_gpus` with reasons, and `gpu_availability_observed_at_ms` (server receipt
+time). Reserved GPUs appear in the reserved partition even when their own compute
+processes are observed. `queue list` shows the assigned worker.
 A job that does not fit
 remains queued with a reason in `queue list`; smaller fitting jobs may pass it.
 There is no preemption, multi-machine job, or automatic execution retry in this

@@ -449,7 +449,11 @@ fn print_response(response: QueueResponse, json_output: bool) -> Result<()> {
         .map(|worker| {
           vec![
             worker.worker_id.clone(),
-            worker.project_ids.join(", "),
+            if worker.project_ids.is_empty() {
+              "All".into()
+            } else {
+              worker.project_ids.join(", ")
+            },
             format!("{}/{}", worker.available.cpus, worker.capacity.cpus),
             format!(
               "{}/{}",
@@ -505,6 +509,26 @@ fn print_response(response: QueueResponse, json_output: bool) -> Result<()> {
                 .gpus
                 .iter()
                 .map(|gpu| gpu.device_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+            )
+          );
+        }
+        if !worker.unavailable_gpus.is_empty() {
+          println!(
+            "{} unavailable GPUs: {}",
+            crate::output::text(&worker.worker_id),
+            crate::output::text(
+              &worker
+                .unavailable_gpus
+                .iter()
+                .map(|gpu| {
+                  let reason = match gpu.reason {
+                    expri_core::resource_queue::GpuUnavailableReason::Busy => "busy",
+                    expri_core::resource_queue::GpuUnavailableReason::Unverified => "unverified",
+                  };
+                  format!("{} ({reason})", gpu.device_id)
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
             )

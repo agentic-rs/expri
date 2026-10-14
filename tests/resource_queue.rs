@@ -695,6 +695,7 @@ impl Fixture {
       "session_id": session_id,
       "project_ids": ["queue-project"],
       "capacity": capacity,
+      "gpu_availability": {"unavailable_gpus": []},
     }))
   }
 }
@@ -817,13 +818,17 @@ fn identity(attempt: &Value) -> Value {
 }
 
 #[test]
-fn worker_with_no_capacity_section_registers_detected_budget_and_executes_queued_work() {
+fn worker_with_no_capacity_or_project_list_registers_detected_budget_and_executes_queued_work() {
   let fixture = Fixture::new();
   let expected = expri_system::detect_worker_capacity().unwrap();
-  fs::write(fixture.worker_storage.join("config.toml"), format!(
-    "[server]\nurl={:?}\ntoken={OWNER:?}\n[queue_worker]\nworker_id='worker-a'\nproject_ids=['queue-project']\n",
-    fixture.endpoint,
-  )).unwrap();
+  fs::write(
+    fixture.worker_storage.join("config.toml"),
+    format!(
+      "[server]\nurl={:?}\ntoken={OWNER:?}\n[queue_worker]\nworker_id='worker-a'\n",
+      fixture.endpoint,
+    ),
+  )
+  .unwrap();
   let gate = fixture.gate("inferred-worker");
   let job = fixture.submit(&gate, &["--cpus", "1", "--memory", "1MiB"]);
   let _service = fixture.start_service();
@@ -835,6 +840,7 @@ fn worker_with_no_capacity_section_registers_detected_budget_and_executes_queued
     serde_json::to_value(expected).unwrap()
   );
   assert_eq!(workers["workers"][0]["reserved"]["cpus"], 1);
+  assert_eq!(workers["workers"][0]["project_ids"], json!([]));
   fs::write(gate, b"release").unwrap();
   fixture.await_status(job["job_id"].as_str().unwrap(), &["completed"]);
 }
@@ -1228,7 +1234,7 @@ fn queue_rejects_missing_memory_and_invalid_resources_before_uploading_source() 
 }
 
 #[test]
-fn whole_gpu_cpu_and_memory_reservations_delay_the_second_job_until_first_finishes() {
+fn cpu_and_memory_reservations_delay_the_second_job_until_first_finishes() {
   for (worker_cpus, worker_memory, gpu, requested) in [
     (
       1,
@@ -1241,12 +1247,6 @@ fn whole_gpu_cpu_and_memory_reservations_delay_the_second_job_until_first_finish
       16 * 1024 * 1024,
       false,
       vec!["--cpus", "1", "--memory", "16MiB"],
-    ),
-    (
-      2,
-      32 * 1024 * 1024,
-      true,
-      vec!["--cpus", "1", "--memory", "16MiB", "--gpus", "1"],
     ),
   ] {
     let fixture = Fixture::new();
@@ -1272,16 +1272,6 @@ fn whole_gpu_cpu_and_memory_reservations_delay_the_second_job_until_first_finish
     }
     let worker = &fixture.json(&["queue", "workers", "--json"])["workers"][0];
     assert_eq!(worker["outstanding_attempts"], 1);
-    if gpu {
-      assert_eq!(
-        first_running["attempt"]["allocation"]["gpus"][0]["device_id"],
-        "GPU-fixture"
-      );
-      assert_eq!(
-        fs::read_to_string(fixture.output_path("gpus.txt")).unwrap(),
-        "GPU-fixture\n"
-      );
-    }
     if worker_cpus == 1 {
       assert_eq!(
         fixture.json(&["queue", "cancel", first_id, "--json"])["status"],
@@ -1302,6 +1292,48 @@ fn whole_gpu_cpu_and_memory_reservations_delay_the_second_job_until_first_finish
     fixture.await_status(second_id, &["completed"]);
     assert_eq!(fixture.starts().len(), 2);
   }
+}
+
+#[test]
+fn unverified_gpu_blocks_gpu_work_while_the_same_worker_executes_cpu_work() {
+  let fixture = Fixture::new();
+  let gpu_job = fixture.submit(
+    &fixture.gate("unverified-gpu"),
+    &["--cpus", "1", "--memory", "16MiB", "--gpus", "1"],
+  );
+  let cpu_gate = fixture.gate("cpu-with-unverified-gpu");
+  let cpu_job = fixture.submit(&cpu_gate, &["--cpus", "1", "--memory", "16MiB"]);
+  let _service = fixture.daemon(2, 32 * 1024 * 1024, true);
+  fixture.await_status(cpu_job["job_id"].as_str().unwrap(), &["running"]);
+  fixture.await_starts(1);
+  let pending = fixture.show(gpu_job["job_id"].as_str().unwrap());
+  assert_eq!(pending["status"], "queued");
+  assert!(pending["attempt"].is_null());
+  let workers = fixture.json(&["queue", "workers", "--json"]);
+  let worker = &workers["workers"][0];
+  assert_eq!(worker["available"]["gpus"], json!([]));
+  assert_eq!(worker["reserved"]["cpus"], 1);
+  assert_eq!(
+    worker["unavailable_gpus"],
+    json!([
+      {"device_id": "GPU-fixture", "reason": "unverified"}
+    ])
+  );
+  assert!(worker["gpu_availability_observed_at_ms"].is_i64());
+  let table = fixture
+    .command()
+    .args(["queue", "workers"])
+    .output()
+    .unwrap();
+  assert_success(&table);
+  assert!(
+    String::from_utf8(table.stdout)
+      .unwrap()
+      .contains("GPU-fixture (unverified)")
+  );
+  fs::write(cpu_gate, b"release").unwrap();
+  fixture.await_status(cpu_job["job_id"].as_str().unwrap(), &["completed"]);
+  assert_eq!(fixture.starts().len(), 1);
 }
 
 #[test]

@@ -1,9 +1,160 @@
 use super::*;
 use expri_core::resource_queue::{
-  AttemptIdentity, JobAssignment, JobStatus, JobSubmission, JobSummary, ResourceRequest, SourceRef,
-  WorkerCapacity, WorkerGpu,
+  AttemptIdentity, JobAssignment, JobStatus, JobSubmission, JobSummary, RESOURCE_QUEUE_CAPABILITY,
+  RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY, ResourceRequest, SourceRef, WorkerCapacity,
+  WorkerGpu, WorkerSummary,
 };
+use expri_core::service::{Request as ServiceRequest, Response as ServiceResponse};
 use serde_json::json;
+
+fn control_mock(
+  request_count: usize,
+  mut handler: impl FnMut(ServiceRequest) -> Option<ServiceResponse> + Send + 'static,
+) -> (String, thread::JoinHandle<()>) {
+  use std::io::{BufRead, Read, Write};
+
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  listener.set_nonblocking(true).unwrap();
+  let url = format!("http://{}", listener.local_addr().unwrap());
+  let server = thread::spawn(move || {
+    for _ in 0..request_count {
+      let deadline = Instant::now() + Duration::from_secs(5);
+      let mut stream = loop {
+        match listener.accept() {
+          Ok((stream, _)) => break stream,
+          Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            assert!(
+              Instant::now() < deadline,
+              "queue control client did not connect"
+            );
+            thread::sleep(Duration::from_millis(5));
+          }
+          Err(error) => panic!("queue control accept: {error}"),
+        }
+      };
+      stream.set_nonblocking(false).unwrap();
+      stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+      stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+      let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+      let mut first = String::new();
+      reader.read_line(&mut first).unwrap();
+      assert!(first.starts_with("POST "));
+      let mut length = None;
+      loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "incomplete queue control request");
+        if line == "\r\n" {
+          break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+          && name.eq_ignore_ascii_case("content-length")
+        {
+          length = Some(value.trim().parse::<usize>().unwrap());
+        }
+      }
+      let length = length.expect("queue control request requires content length");
+      assert!(length <= 4096);
+      let mut body = vec![0; length];
+      reader.read_exact(&mut body).unwrap();
+      let request = serde_json::from_slice(&body).unwrap();
+      let Some(response) = handler(request) else {
+        // Simulate a response lost after the control operation was committed.
+        continue;
+      };
+      let body = serde_json::to_vec(&response).unwrap();
+      write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+      )
+      .unwrap();
+      stream.write_all(&body).unwrap();
+    }
+  });
+  (url, server)
+}
+
+fn capabilities() -> ServiceResponse {
+  ServiceResponse::Capabilities {
+    features: vec![
+      RESOURCE_QUEUE_CAPABILITY.into(),
+      RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY.into(),
+    ],
+  }
+}
+
+fn apple_assignment() -> JobAssignment {
+  let mut assignment = assignment();
+  assignment.attempt.allocation.gpus[0] = WorkerGpu {
+    device_id: "apple-fixture".into(),
+    model: "Apple GPU".into(),
+    memory_bytes: None,
+    vendor: GpuVendor::Apple,
+    selector: None,
+  };
+  assignment.job.attempt = Some(assignment.attempt.clone());
+  assignment
+}
+
+fn executor_fixture(root: &std::path::Path, url: &str) -> Executor {
+  let client_config = root.join("client.toml");
+  fs::write(
+    &client_config,
+    format!("url='{url}'\ntoken='fixture-token'\n"),
+  )
+  .unwrap();
+  let directory = root.join("worker-a");
+  private_directory(&directory).unwrap();
+  private_directory(&directory.join("attempts")).unwrap();
+  let capacity = WorkerCapacity {
+    cpus: 4,
+    memory_bytes: 8192,
+    gpus: apple_assignment().attempt.allocation.gpus,
+  };
+  Executor {
+    options: ExecutorOptions {
+      storage: StoragePaths::from_root(root.join("storage")).unwrap(),
+      worker: ResolvedQueueWorkerConfig {
+        worker_id: "worker-a".into(),
+        project_ids: vec![],
+        capacity: capacity.clone(),
+      },
+      client_config: client_config.clone(),
+      poll_interval: Duration::from_secs(2),
+    },
+    client: ResourceQueueClient::new(&client_config).unwrap(),
+    client_config,
+    directory,
+    session: Arc::new(Mutex::new("session-a".into())),
+    attempts: vec![apple_assignment().attempt],
+    stop: Arc::new(AtomicBool::new(false)),
+    worker: WorkerSummary {
+      worker_id: "worker-a".into(),
+      session_id: "session-a".into(),
+      project_ids: vec![],
+      capacity,
+      available: ResourceAllocation {
+        cpus: 2,
+        memory_bytes: 4096,
+        gpus: vec![],
+      },
+      reserved: apple_assignment().attempt.allocation,
+      unavailable_gpus: vec![],
+      gpu_availability_observed_at_ms: Some(1),
+      online: true,
+      last_seen_at_ms: 1,
+      lease_expires_at_ms: 60_001,
+      quarantined: false,
+      outstanding_attempts: 1,
+      assigned_jobs: 0,
+    },
+  }
+}
 
 fn allocation() -> ResourceAllocation {
   ResourceAllocation {
@@ -172,6 +323,250 @@ fn launch_journal_survives_restart_and_rejects_foreign_run_paths() {
 }
 
 #[test]
+fn repeated_unverified_gpu_probes_park_the_same_durable_attempt_without_download() {
+  let temporary = tempfile::tempdir().unwrap();
+  let root = temporary.path().canonicalize().unwrap();
+  let (url, server) = control_mock(1, |request| {
+    assert!(matches!(request, ServiceRequest::Capabilities));
+    Some(capabilities())
+  });
+  let mut executor = executor_fixture(&root, &url);
+  let directory = executor.directory.join("attempts/attempt-a");
+  private_directory(&directory).unwrap();
+  let source = directory.join("source");
+  private_directory(&source).unwrap();
+  fs::write(source.join("frozen.txt"), "submitted source").unwrap();
+  let mut journal = Journal::claimed(apple_assignment());
+  journal.repo_root = Some(source.clone());
+  journal.save(&directory).unwrap();
+  let attempt = journal.attempt.clone();
+  executor
+    .dispatch_or_finish(&mut journal, &directory)
+    .unwrap();
+  for _ in 0..2 {
+    let persisted = Journal::load(&directory).unwrap();
+    assert_eq!(persisted.stage, Stage::WaitingForGpu);
+    assert_eq!(persisted.attempt, attempt);
+    assert_eq!(persisted.repo_root.as_ref(), Some(&source));
+    assert!(persisted.run_dir.is_none());
+    assert!(prelaunch_without_supervisor(&persisted));
+    assert!(!directory.join("source.zip").exists());
+    assert!(!source.join(".expri/runs").exists());
+    executor.reconcile(attempt.clone()).unwrap();
+  }
+  assert_eq!(executor.worker.reserved, attempt.allocation);
+  assert_eq!(
+    fs::read_to_string(source.join("frozen.txt")).unwrap(),
+    "submitted source"
+  );
+  server.join().unwrap();
+}
+
+#[test]
+fn prelaunch_terminal_confirmation_requires_no_launch_intent_or_run_identity() {
+  let mut journal = Journal::claimed(apple_assignment());
+  for stage in [Stage::Claimed, Stage::WaitingForGpu] {
+    journal.stage = stage;
+    assert!(prelaunch_without_supervisor(&journal));
+  }
+  for stage in [
+    Stage::Prepared,
+    Stage::LaunchPending,
+    Stage::Active,
+    Stage::Quarantined,
+    Stage::Terminal,
+  ] {
+    journal.stage = stage;
+    assert!(!prelaunch_without_supervisor(&journal));
+  }
+  journal.stage = Stage::WaitingForGpu;
+  journal.attempt.run_id = Some("run-a".into());
+  assert!(!prelaunch_without_supervisor(&journal));
+  journal.attempt.run_id = None;
+  journal.run_dir = Some(PathBuf::from("source/.expri/runs/run-a"));
+  assert!(!prelaunch_without_supervisor(&journal));
+}
+
+#[test]
+fn cancelling_a_gpu_wait_finishes_without_launching_or_releasing_it_locally() {
+  let temporary = tempfile::tempdir().unwrap();
+  let root = temporary.path().canonicalize().unwrap();
+  let identity = apple_assignment().attempt.identity();
+  let mut cancelled = apple_assignment().attempt;
+  cancelled.status = AttemptStatus::Cancelled;
+  cancelled.cancel_requested = true;
+  cancelled.exit_code = Some(130);
+  cancelled.updated_at_ms = 1;
+  let expected = cancelled.clone();
+  let (url, server) = control_mock(2, move |request| {
+    let response = match request {
+      ServiceRequest::Capabilities => capabilities(),
+      ServiceRequest::Queue {
+        request:
+          QueueRequest::Finish {
+            attempt,
+            status,
+            exit_code,
+            ..
+          },
+      } => {
+        assert_eq!(attempt, identity);
+        assert_eq!(status, AttemptTerminalStatus::Cancelled);
+        assert_eq!(exit_code, Some(130));
+        ServiceResponse::Queue {
+          response: QueueResponse::Attempt {
+            attempt: cancelled.clone(),
+          },
+        }
+      }
+      other => panic!("unexpected GPU wait control request: {other:?}"),
+    };
+    Some(response)
+  });
+  let mut executor = executor_fixture(&root, &url);
+  let directory = executor.directory.join("attempts/attempt-a");
+  private_directory(&directory).unwrap();
+  let mut journal = Journal::claimed(apple_assignment());
+  journal.stage = Stage::WaitingForGpu;
+  journal.save(&directory).unwrap();
+  let mut attempt = journal.attempt.clone();
+  attempt.cancel_requested = true;
+  executor.reconcile(attempt).unwrap();
+  let persisted = Journal::load(&directory).unwrap();
+  assert_eq!(persisted.stage, Stage::Terminal);
+  assert_eq!(persisted.attempt, expected);
+  assert!(persisted.run_dir.is_none());
+  assert!(!directory.join("source").exists());
+  server.join().unwrap();
+}
+
+#[test]
+fn lost_gpu_wait_finish_reply_is_settled_from_server_confirmation_on_next_tick() {
+  use expri_core::resource_queue::{GpuUnavailableReason, UnavailableGpu};
+
+  let temporary = tempfile::tempdir().unwrap();
+  let root = temporary.path().canonicalize().unwrap();
+  let mut cancelled = apple_assignment().attempt;
+  cancelled.status = AttemptStatus::Cancelled;
+  cancelled.cancel_requested = true;
+  cancelled.exit_code = Some(130);
+  cancelled.updated_at_ms = 1;
+  let mut job = apple_assignment().job;
+  job.status = JobStatus::Cancelled;
+  job.updated_at_ms = 1;
+  job.attempt = Some(cancelled.clone());
+  let capacity = WorkerCapacity {
+    cpus: 4,
+    memory_bytes: 8192,
+    gpus: cancelled.allocation.gpus.clone(),
+  };
+  let released_worker = WorkerSummary {
+    worker_id: "worker-a".into(),
+    session_id: "session-a".into(),
+    project_ids: vec![],
+    capacity,
+    available: ResourceAllocation {
+      cpus: 4,
+      memory_bytes: 8192,
+      gpus: vec![],
+    },
+    reserved: ResourceAllocation {
+      cpus: 0,
+      memory_bytes: 0,
+      gpus: vec![],
+    },
+    unavailable_gpus: vec![UnavailableGpu {
+      device_id: "apple-fixture".into(),
+      reason: GpuUnavailableReason::Unverified,
+    }],
+    gpu_availability_observed_at_ms: Some(1),
+    online: true,
+    last_seen_at_ms: 1,
+    lease_expires_at_ms: 60_001,
+    quarantined: false,
+    outstanding_attempts: 0,
+    assigned_jobs: 0,
+  };
+  let identity = cancelled.identity();
+  let mut finish_committed = false;
+  let (url, server) = control_mock(5, move |request| {
+    Some(match request {
+      ServiceRequest::Capabilities => capabilities(),
+      ServiceRequest::Queue {
+        request: QueueRequest::Finish {
+          attempt, status, ..
+        },
+      } => {
+        assert!(!finish_committed);
+        assert_eq!(attempt, identity);
+        assert_eq!(status, AttemptTerminalStatus::Cancelled);
+        finish_committed = true;
+        return None;
+      }
+      ServiceRequest::Queue {
+        request: QueueRequest::Heartbeat { .. },
+      } => {
+        assert!(finish_committed);
+        ServiceResponse::Queue {
+          response: QueueResponse::Worker {
+            worker: released_worker.clone(),
+            attempts: vec![],
+          },
+        }
+      }
+      ServiceRequest::Queue {
+        request: QueueRequest::GetJob { job_id },
+      } => {
+        assert_eq!(job_id, "job-a");
+        ServiceResponse::Queue {
+          response: QueueResponse::Job {
+            job: Box::new(job.clone()),
+          },
+        }
+      }
+      ServiceRequest::Queue {
+        request: QueueRequest::Claim { worker_id, .. },
+      } => {
+        assert_eq!(worker_id, "worker-a");
+        ServiceResponse::Queue {
+          response: QueueResponse::Claimed { assignment: None },
+        }
+      }
+      other => panic!("unexpected GPU wait control request: {other:?}"),
+    })
+  });
+  let mut executor = executor_fixture(&root, &url);
+  let directory = executor.directory.join("attempts/attempt-a");
+  private_directory(&directory).unwrap();
+  let mut journal = Journal::claimed(apple_assignment());
+  journal.stage = Stage::WaitingForGpu;
+  journal.save(&directory).unwrap();
+  assert!(
+    executor
+      .finish(
+        &mut journal,
+        &directory,
+        AttemptTerminalStatus::Cancelled,
+        Some(130),
+        None
+      )
+      .is_err()
+  );
+  assert_eq!(
+    Journal::load(&directory).unwrap().stage,
+    Stage::WaitingForGpu
+  );
+  executor.tick().unwrap();
+  let persisted = Journal::load(&directory).unwrap();
+  assert_eq!(persisted.stage, Stage::Terminal);
+  assert_eq!(persisted.attempt, cancelled);
+  assert!(!executor.worker.quarantined);
+  assert!(persisted.run_dir.is_none());
+  assert!(!directory.join("source").exists());
+  server.join().unwrap();
+}
+
+#[test]
 fn an_unlocked_running_record_is_lost_and_cannot_release_resources() {
   let temporary = tempfile::tempdir().unwrap();
   let directory = temporary.path().canonicalize().unwrap().join("attempt-a");
@@ -225,6 +620,30 @@ fn allocations_cannot_inject_an_unregistered_gpu_selector() {
   let mut foreign = allocation();
   foreign.gpus[0].selector = Some("GPU-foreign".into());
   assert!(validate_allocation(&foreign, &worker, &assignment.submission.resources).is_err());
+}
+
+#[test]
+fn project_restrictions_are_optional_and_do_not_change_worker_assignment_identity() {
+  let mut journal = Journal::claimed(assignment());
+  let mut worker = ResolvedQueueWorkerConfig {
+    worker_id: "worker-a".into(),
+    project_ids: vec![],
+    capacity: WorkerCapacity {
+      cpus: 4,
+      memory_bytes: 8192,
+      gpus: allocation().gpus,
+    },
+  };
+  validate_worker_assignment(&journal, &worker).unwrap();
+  journal.assignment.submission.project_id = "project-b".into();
+  validate_worker_assignment(&journal, &worker).unwrap();
+  worker.project_ids.push("project-a".into());
+  assert!(validate_worker_assignment(&journal, &worker).is_err());
+  journal.assignment.submission.project_id = "project-a".into();
+  validate_worker_assignment(&journal, &worker).unwrap();
+  worker.project_ids.clear();
+  journal.attempt.worker_id = "other-worker".into();
+  assert!(validate_worker_assignment(&journal, &worker).is_err());
 }
 
 #[test]
