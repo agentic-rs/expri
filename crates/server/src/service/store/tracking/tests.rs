@@ -517,6 +517,27 @@ fn completed_tail_is_indexed_once_and_duplicate_seal_is_revision_stable() {
 }
 
 #[test]
+fn waiting_cannot_seal_tracking_and_logs_remain_appendable() {
+  let dir = tempfile::tempdir().unwrap();
+  let store = Store::open(dir.path(), MockStorage::default()).unwrap();
+  put(
+    &store,
+    "run-state.json",
+    1,
+    br#"{"status":"waiting","finished_at":"2026-10-14T00:00:00Z"}"#,
+  );
+  append(&store, "logs/stdout.log", 0, b"first").unwrap();
+  let rejected = seal(&store, false).unwrap_err();
+  assert_eq!(rejected.status, 409);
+  assert_eq!(rejected.message, "run is not terminal");
+  append(&store, "logs/stdout.log", 5, b" second").unwrap();
+  assert!(matches!(
+    store.file(&run_target("logs/stdout.log")).unwrap().storage,
+    FileStorage::Tracking { sealed: false, .. }
+  ));
+}
+
+#[test]
 fn partial_archive_keeps_stream_live_and_normal_archive_requires_terminal_state() {
   let dir = tempfile::tempdir().unwrap();
   let store = Store::open(dir.path(), MockStorage::default()).unwrap();

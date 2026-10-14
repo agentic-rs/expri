@@ -33,6 +33,8 @@ import {
   dateText,
   hasRunningDuration,
   runInProgress,
+  RUN_STATUSES,
+  runStatusClass,
   formatNumber,
   formatValue,
   jsonObject,
@@ -601,7 +603,7 @@ function RunFilterPanel({ snapshot: s, actions: a }: { snapshot: DashboardSnapsh
         disabled={s.controls_disabled}
         options={[
           { id: "status-any", value: "", label: "Any" },
-          ...["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].map(
+          ...RUN_STATUSES.map(
             (status) => ({
               id: `status-${status}`,
               value: status,
@@ -810,7 +812,7 @@ function RunBrowser({
                   </td>
                   <td className="status-column">
                     <span
-                      className={`status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(run.status) ? run.status : ""}`}
+                      className={`status ${runStatusClass(run.status)}`}
                     >
                       {run.status}
                     </span>
@@ -1260,7 +1262,7 @@ function ReviewWorkspace({
                 : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
             {review_run && <div className="inspector-meta">
-              <span aria-live="polite" className={`status inspector-status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(review_run.status) ? review_run.status : ""}`}>
+              <span aria-live="polite" className={`status inspector-status ${runStatusClass(review_run.status)}`}>
                 {review_run.status}
               </span>
               {runNickname(review_run) && <code className="run-identifier">{review_run.run_id}</code>}

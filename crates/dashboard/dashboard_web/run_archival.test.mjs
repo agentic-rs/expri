@@ -13,7 +13,7 @@ function run(status = "completed", archival = record()) {
 
 test("only known finished training states can archive an active run", () => {
   for (const status of ["completed", "failed", "cancelled", "lost"]) assert.equal(canArchiveRun(run(status)), true);
-  for (const status of ["preparing", "running", "unknown", "invented"]) assert.equal(canArchiveRun(run(status)), false);
+  for (const status of ["preparing", "running", "waiting", "unknown", "invented"]) assert.equal(canArchiveRun(run(status)), false);
   assert.equal(canArchiveRun(run("completed", record("archived"))), false);
   assert.equal(canArchiveRun(run("completed", null)), false);
 });

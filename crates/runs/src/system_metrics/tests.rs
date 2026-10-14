@@ -5,7 +5,7 @@ use std::io::Cursor;
 
 fn state(status: &str) -> Value {
   let mut state = json!({"schema_version":1,"run_id":"run-test","machine_id":"machine-test","system_capture_id":"capture-test","status":status,"started_at":"1970-01-01T00:00:10Z"});
-  if status != "running" {
+  if is_terminal_status(status) {
     state["finished_at"] = json!("1970-01-01T00:00:20Z");
   }
   state
@@ -106,6 +106,31 @@ fn project(
     cursor,
     limit,
   )
+}
+
+#[test]
+fn active_windows_keep_waiting_samples_and_ignore_nonterminal_finish_timestamps() {
+  let data = bytes(&[header(), inventory(), sample(1, 25_000, 1000, 2.0)]);
+  for status in ["preparing", "running", "waiting"] {
+    let mut state = state(status);
+    state["finished_at"] = json!("1970-01-01T00:00:20Z");
+    let window = RunSystemWindow::from_state("run-test", &state).unwrap();
+    assert!(!window.terminal, "{status}");
+    assert_eq!(window.end_ms, None, "{status}");
+    let result = read(
+      Cursor::new(&data),
+      || Ok(Cursor::new(&data)),
+      "run-test",
+      &window,
+      None,
+      10,
+    )
+    .unwrap();
+    assert_eq!(result.status, "recording", "{status}");
+    assert_eq!(result.samples.len(), 1, "{status}");
+    assert_eq!(result.samples[0].observed_at_ms, 25_000);
+  }
+  assert!(RunSystemWindow::from_state("run-test", &state("unknown")).is_none());
 }
 
 #[test]

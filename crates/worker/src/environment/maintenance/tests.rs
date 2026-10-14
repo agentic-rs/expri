@@ -176,7 +176,7 @@ fn preview_is_read_only_and_apply_keeps_newest_existing_environment() {
 fn unknown_stale_or_unowned_states_are_preserved() {
   let (_temporary, root) = fixture_root();
   let mut directories = Vec::new();
-  for status in ["preparing", "running", "lost", "unknown"] {
+  for status in ["preparing", "running", "waiting", "lost", "unknown"] {
     directories.push(run(
       &root,
       &format!("run-{status}"),

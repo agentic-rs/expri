@@ -78,7 +78,7 @@ class RunLifecycleTests(unittest.TestCase):
     if self.run is not None:
       try:
         state = self.state()
-        if state["status"] in ("preparing", "running"):
+        if state["status"] in ("preparing", "running", "waiting"):
           (self.run / ".cancel-request").touch()
           self.wait_terminal()
       except (OSError, ValueError, AssertionError):
@@ -371,7 +371,7 @@ class RunLifecycleTests(unittest.TestCase):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
       state = self.state()
-      if state["status"] not in ("preparing", "running"):
+      if state["status"] not in ("preparing", "running", "waiting"):
         return state
       time.sleep(0.02)
     self.fail("worker did not publish terminal state")
@@ -455,6 +455,84 @@ class RunLifecycleTests(unittest.TestCase):
     self.assertEqual(state["exit_code"], 130)
     self.assertEqual(state["task_exit_code"], 143)
     self.assertEqual((self.run / "logs/stdout.log").read_bytes(), b"running\n")
+
+  def start_waiting_task(self, continuation):
+    helper = SOURCE_DIR.parent / "python/expri_run.py"
+    (self.repo / "expri_run.py").write_bytes(helper.read_bytes())
+    with (self.repo / ".expri/checkout.manifest").open("a") as manifest:
+      manifest.write("expri_run.py\n")
+    return self.start(
+      "import json, os, pathlib, time\n"
+      "from expri_run import set_run_status\n"
+      "run = pathlib.Path(os.environ['EXPRI_RUN_DIR'])\n"
+      "outputs = pathlib.Path(os.environ['EXPRI_OUTPUT_DIR'])\n"
+      "set_run_status('waiting')\n"
+      "outputs.joinpath('waiting-state.json').write_text(run.joinpath('run-state.json').read_text())\n"
+      "print('waiting', flush=True)\n"
+      + continuation,
+    )
+
+  def test_waiting_task_resumes_running_and_preserves_start_until_completion(self):
+    gate = self.repo / "waiting-gate"
+    self.start_waiting_task(
+      "gate = pathlib.Path(" + repr(str(gate)) + ")\n"
+      "deadline = time.monotonic() + 5\n"
+      "while not gate.exists():\n"
+      "  if time.monotonic() > deadline: raise RuntimeError('gate timeout')\n"
+      "  time.sleep(0.01)\n"
+      "set_run_status('running')\n"
+      "outputs.joinpath('resumed-state.json').write_text(run.joinpath('run-state.json').read_text())\n"
+      "print('resumed', flush=True)\n"
+    )
+    self.wait_file(self.run / "outputs/waiting-state.json")
+    waiting = json.loads((self.run / "outputs/waiting-state.json").read_text())
+    self.assertEqual(waiting["status"], "waiting")
+    live = jobs.execute_job(self.repo, {"operation": "status", "run_id": self.run.name})
+    self.assertEqual(live["status"], "waiting")
+    self.assertTrue(live["alive"])
+    gate.touch()
+    state = self.wait_terminal()
+    resumed = json.loads((self.run / "outputs/resumed-state.json").read_text())
+    self.assertEqual(resumed["status"], "running")
+    self.assertEqual(state["status"], "completed")
+    self.assertEqual(state["exit_code"], 0)
+    self.assertEqual(state["started_at"], waiting["started_at"])
+    self.assertEqual(resumed["started_at"], waiting["started_at"])
+    self.assertEqual((self.run / "logs/stdout.log").read_bytes(), b"waiting\nresumed\n")
+
+  def test_waiting_task_can_finish_without_reporting_running_again(self):
+    self.start_waiting_task("print('completed while waiting', flush=True)\n")
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "completed")
+    self.assertEqual(state["exit_code"], 0)
+    self.assertEqual(state["task_exit_code"], 0)
+    waiting = json.loads((self.run / "outputs/waiting-state.json").read_text())
+    self.assertEqual(state["started_at"], waiting["started_at"])
+
+  def test_waiting_task_remains_cancellable(self):
+    self.start_waiting_task("time.sleep(20)\n")
+    self.wait_file(self.run / "outputs/waiting-state.json")
+    report = jobs.execute_job(self.repo, {"operation": "cancel", "run_id": self.run.name})
+    self.assertEqual(report["status"], "waiting")
+    self.assertTrue(report["cancel_requested"])
+    state = self.wait_terminal()
+    self.assertEqual(state["status"], "cancelled", state)
+    self.assertEqual(state["exit_code"], 130)
+    self.assertEqual(state["task_exit_code"], 143)
+    self.assertEqual((self.run / "logs/stdout.log").read_bytes(), b"waiting\n")
+
+  def test_supervisor_write_preserves_new_metadata_and_rejects_terminal_restoration(self):
+    path = self.repo / "run-state.json"
+    original = {"status": "running", "started_at": "2026-10-14T01:00:00Z"}
+    run_lifecycle._lifecycle_write_json(path, original)
+    run_lifecycle._lifecycle_write_json(path, {"status": "waiting", "extra": "preserved"})
+    run_lifecycle._lifecycle_write_json(path, {**original, "status": "completed", "exit_code": 0})
+    final = json.loads(path.read_text())
+    self.assertEqual(final["extra"], "preserved")
+    self.assertEqual(final["started_at"], original["started_at"])
+    with self.assertRaisesRegex(ValueError, "finished"):
+      run_lifecycle._lifecycle_write_json(path, original)
+    self.assertEqual(json.loads(path.read_text()), final)
 
   def test_failed_task_keeps_exit_code_and_logs(self):
     self.start("import os, sys; os.write(2, b'failed\\xff\\x00'); sys.exit(7)")

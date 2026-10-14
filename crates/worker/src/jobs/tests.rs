@@ -52,6 +52,25 @@ fn live_status_reports_lost_without_mutating_records_or_creating_leases() {
 }
 
 #[test]
+fn waiting_runs_remain_live_cancellable_and_become_lost_only_after_lease_release() {
+  let (_temporary, root, directory) = fixture("waiting", true);
+  let before = fs::read(directory.join("run-state.json")).unwrap();
+  let lease = lock::run_lock(&directory).unwrap();
+  let live = status_at(&root, "run-test").unwrap();
+  assert_eq!(live["status"], "waiting");
+  assert_eq!(live["alive"], true);
+  assert_eq!(
+    query_at(&cancel(), &root).unwrap()["cancel_requested"],
+    true
+  );
+  assert_eq!(fs::read(directory.join("run-state.json")).unwrap(), before);
+  drop(lease);
+  let lost = status_at(&root, "run-test").unwrap();
+  assert_eq!(lost["status"], "lost");
+  assert_eq!(lost["recorded_status"], "waiting");
+}
+
+#[test]
 fn cancellation_is_idempotent_and_terminal_runs_are_read_only() {
   let (_temporary, root, directory) = fixture("preparing", true);
   let lease = lock::run_lock(&directory).unwrap();
@@ -127,7 +146,7 @@ fn log_tail_preserves_binary_bytes_and_handles_line_boundaries() {
 
 #[test]
 fn log_follow_with_zero_tail_waits_for_creation_and_drains_terminal_bytes() {
-  let (_temporary, root, directory) = fixture("preparing", true);
+  let (_temporary, root, directory) = fixture("waiting", true);
   let lease = lock::run_lock(&directory).unwrap();
   let worker_directory = directory.clone();
   let worker = thread::spawn(move || {

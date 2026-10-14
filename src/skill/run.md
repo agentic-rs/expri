@@ -45,6 +45,7 @@ Inside a managed task:
 
 | Variable | Meaning |
 | --- | --- |
+| `EXPRI_BIN` | Current executable on the native worker |
 | `EXPRI_RUN_ID` | Actual run identifier |
 | `EXPRI_RUN_DIR` | Absolute path to this run's directory |
 | `EXPRI_OUTPUT_DIR` | Absolute path to this run's outputs directory |
@@ -53,6 +54,23 @@ The task's working directory is its code snapshot. Write checkpoints and other
 generated results to `EXPRI_OUTPUT_DIR`; a relative `outputs/` path otherwise
 lands inside the code snapshot. Metrics use `expri skill metrics`, and finalized
 checkpoint registration uses `expri skill artifacts`.
+
+## Task-reported phase
+
+Inside a managed task, use the local executable to report waiting and resume:
+
+```sh
+"$EXPRI_BIN" runs set-status waiting
+"$EXPRI_BIN" runs set-status running
+```
+
+These operations use `EXPRI_RUN_DIR` without loading project or server settings.
+They require a live running/waiting task and are idempotent. Waiting retains
+elapsed time, publication, system capture, and cancellation; the supervisor
+publishes preparation and final states. Tasks cannot change finished runs.
+The dependency-free `crates/worker/python/expri_run.py` helper provides
+`set_run_status("waiting")` and `set_run_status("running")` on both worker paths;
+copy it into task source before importing it.
 
 ## Detached execution
 

@@ -52,7 +52,7 @@ pub fn status_at(repo_root: &Path, run_id: &str) -> Result<Value> {
   };
   let recorded_status = state["status"].as_str().expect("validated status");
   let detached = state["detached"].as_bool().unwrap_or(false);
-  let active = matches!(recorded_status, "preparing" | "running");
+  let active = expri_core::run_state::is_active_status(recorded_status);
   let status = if detached && active && !busy {
     "lost"
   } else {
@@ -167,7 +167,10 @@ fn stream_to(
       output.flush()?;
     }
     let status = status_at(repo_root, run_id)?;
-    if !matches!(status["status"].as_str(), Some("preparing" | "running")) {
+    if !status["status"]
+      .as_str()
+      .is_some_and(expri_core::run_state::is_active_status)
+    {
       // Terminal state is published only after log draining, so one final copy
       // catches bytes appended between our last read and the status check.
       if file.is_none() {
@@ -260,10 +263,10 @@ fn read_state(run_dir: &Path, run_id: &str) -> Result<Value> {
   {
     return Err(message("run state uses an unsupported schema_version"));
   }
-  if !matches!(
-    state["status"].as_str(),
-    Some("preparing" | "running" | "completed" | "failed" | "cancelled" | "lost")
-  ) {
+  if !state["status"]
+    .as_str()
+    .is_some_and(|status| expri_core::run_state::STATUSES.contains(&status))
+  {
     return Err(message("run state has an invalid status"));
   }
   if state

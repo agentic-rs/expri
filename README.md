@@ -344,6 +344,7 @@ Each configured-environment run receives these variables:
 
 | Variable | Meaning |
 | --- | --- |
+| `EXPRI_BIN` | Path to the executable when launched by the native worker |
 | `EXPRI_RUN_ID` | The run's identifier |
 | `EXPRI_RUN_DIR` | Absolute path to the run directory |
 | `EXPRI_OUTPUT_DIR` | Absolute path to the run's output directory |
@@ -360,6 +361,24 @@ to the terminal. Environment-preparation diagnostics also go to the stderr log;
 the helper's private JSON response stays out of task stdout. Run records include
 the command, timestamps, status, exit code, and log paths. Older run directories
 remain readable when optional records or logs are missing.
+
+Tasks can report an active `waiting` phase and return to `running`:
+
+```sh
+"$EXPRI_BIN" runs set-status waiting
+# Wait for the next batch or external work.
+"$EXPRI_BIN" runs set-status running
+```
+
+These commands run on the training machine, use `EXPRI_RUN_DIR`, and need no
+project or server configuration. Add `--run-dir` for an explicit live run and
+`--json` for a structured response. Repeated requests are idempotent. The
+supervisor owns preparation and final states; tasks cannot change a finished run.
+Waiting preserves the original start time, system capture, publication, and
+cancellation, so elapsed time includes the wait. The optional dependency-free
+[`expri_run.py`](crates/worker/python/expri_run.py) helper exposes
+`set_run_status("waiting")` and `set_run_status("running")`, including on the
+Python worker fallback; copy it into the task's source before importing it.
 
 Execution stays in the foreground by default. On Unix, `run --detach <task>`
 starts a separate supervisor session and prints a start table; add `--json`
@@ -410,7 +429,7 @@ expri -T runpod runs show run-abc123 --json
 ```
 
 `list` defaults to the 20 newest records. Its status filters are `preparing`,
-`running`, `completed`, `failed`, `cancelled`, and `unknown`. `show` includes the run state,
+`running`, `waiting`, `completed`, `failed`, `cancelled`, `lost`, and `unknown`. `show` includes the run state,
 source snapshot provenance, and recorded Python environment when available.
 Missing, malformed, or unsupported records produce warnings; incomplete runs
 can still be inspected. These commands read fixed records rather than scanning

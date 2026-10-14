@@ -140,6 +140,7 @@ fn explicit_smoke_runs_archive_only_when_terminal() {
   for status in [
     "preparing",
     "running",
+    "waiting",
     "completed",
     "failed",
     "cancelled",
@@ -544,6 +545,7 @@ fn only_authoritative_finished_states_can_be_archived() {
   for status in [
     "preparing",
     "running",
+    "waiting",
     "completed",
     "failed",
     "cancelled",

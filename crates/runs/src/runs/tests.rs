@@ -809,10 +809,10 @@ fn inspection_does_not_require_a_lease_or_mutate_active_records() {
 }
 
 #[test]
-fn catalogs_accept_cancelled_and_lost_without_live_probes_in_cached_queries() {
+fn catalogs_accept_waiting_cancelled_and_lost_without_live_probes_in_cached_queries() {
   let (_directory, root) = fixture();
   let cached = root.join("results/gpu/runs");
-  for status in ["cancelled", "lost", "running"] {
+  for status in ["cancelled", "lost", "running", "waiting"] {
     let id = format!("run-{status}");
     let mut saved = state(&id, status, "2026-10-03T00:00:00Z");
     saved["detached"] = json!(true);
@@ -835,6 +835,37 @@ fn catalogs_accept_cancelled_and_lost_without_live_probes_in_cached_queries() {
     assert!(report["warnings"].as_array().unwrap().is_empty());
     assert!(!cached.join(id).join(".run.lock").exists());
   }
+}
+
+#[test]
+fn local_catalog_filters_waiting_without_terminal_metadata_or_live_probes() {
+  let (_directory, root) = fixture();
+  let runs = root.join(".expri/runs");
+  run(
+    &runs,
+    "run-waiting",
+    Some(&state("run-waiting", "waiting", "2026-10-14T00:00:00Z")),
+  );
+  run(
+    &runs,
+    "run-running",
+    Some(&state("run-running", "running", "2026-10-14T00:00:00Z")),
+  );
+  let report = parity(
+    &root,
+    &RunQueryRequest::List {
+      task: None,
+      status: Some("waiting".into()),
+      limit: None,
+    },
+    false,
+  );
+  assert_eq!(report["runs"].as_array().unwrap().len(), 1);
+  assert_eq!(report["runs"][0]["run_id"], "run-waiting");
+  assert!(report["runs"][0]["finished_at"].is_null());
+  assert!(report["runs"][0]["exit_code"].is_null());
+  assert!(report["warnings"].as_array().unwrap().is_empty());
+  assert!(!runs.join("run-waiting/.run.lock").exists());
 }
 
 #[cfg(unix)]

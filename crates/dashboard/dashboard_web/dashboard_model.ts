@@ -4,6 +4,13 @@ import type { EventSourceFactory } from "./live_updates";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string };
+export const RUN_STATUSES: readonly string[] = [
+  "preparing", "running", "waiting", "completed", "failed", "cancelled", "lost", "unknown",
+];
+
+export function runStatusClass(status: string): string {
+  return RUN_STATUSES.includes(status) ? status : "";
+}
 export type Source = {
   source_id: string;
   label: string;
@@ -270,7 +277,7 @@ export function formatNumber(value: number): string {
 }
 
 export function runInProgress(run: Pick<Run, "status" | "finished_at">): boolean {
-  return (run.status === "preparing" || run.status === "running") && run.finished_at == null;
+  return ["preparing", "running", "waiting"].includes(run.status) && run.finished_at == null;
 }
 
 export function hasRunningDuration(run: Run): boolean {

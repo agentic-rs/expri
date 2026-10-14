@@ -28,3 +28,4 @@ pub fn run_lifecycle_script() -> String {
 pub const SNAPSHOT_SCRIPT: &str = include_str!("environment/snapshot.py");
 pub const MAINTENANCE_SCRIPT: &str = include_str!("environment/maintenance.py");
 pub const METRICS_PRODUCER_SCRIPT: &str = include_str!("../python/expri_metrics.py");
+pub const RUN_STATUS_HELPER_SCRIPT: &str = include_str!("../python/expri_run.py");

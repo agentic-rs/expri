@@ -355,7 +355,6 @@ fn execute_snapshot(
     }
   }
   state["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
-  expri_system::store::run_capture::close_state(&snapshot.run_dir, &mut state);
   state["status"] = json!(if cancelled {
     "cancelled"
   } else if result.is_ok() {
@@ -363,6 +362,7 @@ fn execute_snapshot(
   } else {
     "failed"
   });
+  expri_system::store::run_capture::close_state(&snapshot.run_dir, &mut state);
   if cancelled {
     state["error"] = json!("run cancellation requested");
     state["exit_code"] = json!(130);
@@ -444,10 +444,7 @@ fn write_state(path: &Path, state: &serde_json::Value) -> Result<()> {
       "run-state.json exceeds the 256 KiB metadata size limit; reduce command or asset source metadata".into(),
     ));
   }
-  let mut temporary = tempfile::NamedTempFile::new_in(path.parent().expect("state directory"))?;
-  temporary.write_all(&bytes)?;
-  temporary.persist(path).map_err(|error| error.error)?;
-  Ok(())
+  expri_core::run_state::write_state(path, state)
 }
 
 #[cfg(unix)]

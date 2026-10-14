@@ -376,7 +376,7 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .status::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .status.completed { color: var(--success-ink); }
 .status.running { color: var(--info-ink); }
-.status.preparing { color: var(--warning-ink); }
+.status.preparing, .status.waiting { color: var(--warning-ink); }
 .status.failed { color: var(--error-ink); }
 .status.cancelled, .status.lost { color: var(--inactive-ink); }
 .pagination { display: flex; align-items: center; justify-content: space-between; gap: 7px; border-top: 1px solid var(--line); padding: 4px 9px; font-size: 10px; color: var(--muted); flex-shrink: 0; }

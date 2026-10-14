@@ -43,6 +43,12 @@ Existing trainers can write the same files directly. Flush complete JSONL rows
 for live inspection; in distributed training write from rank 0 and create the
 logger within that process.
 
+Task phases are independent of scalar metrics. Copy the optional
+`crates/worker/python/expri_run.py` helper into task source and use
+`from expri_run import set_run_status` to switch between `waiting` and `running`.
+Waiting is an active phase: elapsed time and system readings continue, and the
+supervisor still owns completion and cancellation.
+
 ## Inspect and compare
 
 ```sh

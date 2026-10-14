@@ -20,6 +20,7 @@ use super::types::validate_component;
 use crate::config::RunServiceConfig;
 use crate::error::{ExpriError, Result};
 use crate::lock::{FileLock, LockAttempt, try_lock_file};
+use expri_core::run_state::{is_active_status, is_terminal_status, update_state};
 
 const REQUEST: &str = "publishing-request.json";
 const STATE: &str = "publishing-state.json";
@@ -342,33 +343,51 @@ fn mark_abandoned(directory: &Path) -> Result<()> {
   let LockAttempt::Acquired(_lease) = try_lock_file(&directory.join(".run.lock"), false)? else {
     return Ok(());
   };
-  // Re-read after acquiring the run lease so normal terminal publication wins.
+  // Lock order is the run lease, then the short state lock shared with task updates.
+  let run_id = run_id(directory)?;
   let path = directory.join("run-state.json");
-  let mut state: Value = serde_json::from_slice(&fs::read_bounded(&path, 16 * 1024 * 1024)?)?;
-  if state.get("run_id").and_then(Value::as_str) != Some(run_id(directory)?.as_str()) {
-    return Err(error("publisher run state has a different identity"));
-  }
-  if matches!(
-    state.get("status").and_then(Value::as_str),
-    Some("preparing" | "running")
-  ) {
-    state["status"] = json!("lost");
-    let known_end = expri_system::store::run_capture::known_end_ms(directory, &state)
-      .and_then(chrono::DateTime::from_timestamp_millis)
-      .map(|time| time.to_rfc3339());
-    state["finished_at"] = json!(known_end.unwrap_or_else(now));
-    state["error"] = json!("Run supervisor exited before publishing a terminal state");
-    expri_system::store::run_capture::finalize_state(directory, &mut state);
-    fs::atomic_json(&path, &state)?;
-  } else if matches!(
-    state["status"].as_str(),
-    Some("completed" | "failed" | "cancelled" | "lost")
-  ) && state["system_capture_status"] == "capturing"
-  {
-    expri_system::store::run_capture::finalize_state(directory, &mut state);
-    fs::atomic_json(&path, &state)?;
-  }
-  Ok(())
+  let pending = update_state(&path, |state| {
+    if state.get("run_id").and_then(Value::as_str) != Some(run_id.as_str()) {
+      return Err(error("publisher run state has a different identity"));
+    }
+    if state["status"].as_str().is_some_and(is_active_status) {
+      state["status"] = json!("lost");
+      let known_end = expri_system::store::run_capture::known_end_ms(directory, state)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|time| time.to_rfc3339());
+      state["finished_at"] = json!(known_end.unwrap_or_else(now));
+      state["error"] = json!("Run supervisor exited before publishing a terminal state");
+    }
+    Ok(
+      (state["status"].as_str().is_some_and(is_terminal_status)
+        && state["system_capture_status"] == "capturing")
+        .then(|| state.clone()),
+    )
+  })?;
+  let Some(mut pending) = pending else {
+    return Ok(());
+  };
+  // Collector acknowledgement can take time; never wait while holding the state lock.
+  expri_system::store::run_capture::finalize_state(directory, &mut pending);
+  update_state(&path, |state| {
+    if state["run_id"] == run_id
+      && state["status"].as_str().is_some_and(is_terminal_status)
+      && state["system_capture_id"] == pending["system_capture_id"]
+      && state["system_capture_status"] == "capturing"
+    {
+      let fields = state
+        .as_object_mut()
+        .expect("state updates require an object");
+      for key in ["system_capture_status", "system_capture_error"] {
+        if let Some(value) = pending.get(key) {
+          fields.insert(key.into(), value.clone());
+        } else {
+          fields.remove(key);
+        }
+      }
+    }
+    Ok(())
+  })
 }
 
 pub fn worker(run_dir: &Path) -> Result<()> {
@@ -612,21 +631,33 @@ mod tests {
 
   #[test]
   fn released_run_lease_marks_only_abandoned_active_state_lost() {
-    let (_temporary, _repo, run, _config) = fixture();
-    let lease = crate::lock::run_lock(&run).unwrap();
-    mark_abandoned(&run).unwrap();
-    let state = || {
-      serde_json::from_slice::<Value>(&std::fs::read(run.join("run-state.json")).unwrap()).unwrap()
-    };
-    assert_eq!(state()["status"], "preparing");
-    drop(lease);
-    mark_abandoned(&run).unwrap();
-    assert_eq!(state()["status"], "lost");
-    assert!(state()["finished_at"].is_string());
-    let terminal = json!({"run_id": "run-fixture", "status": "completed", "exit_code": 0});
-    fs::atomic_json(&run.join("run-state.json"), &terminal).unwrap();
-    mark_abandoned(&run).unwrap();
-    assert_eq!(state(), terminal);
+    for status in ["preparing", "running", "waiting"] {
+      let (_temporary, _repo, run, _config) = fixture();
+      let original = json!({"run_id": "run-fixture", "status": status,
+        "nickname": "batch one", "tags": ["nightly"], "task_metadata": {"attempt": 2}});
+      fs::atomic_json(&run.join("run-state.json"), &original).unwrap();
+      let state = || {
+        serde_json::from_slice::<Value>(&std::fs::read(run.join("run-state.json")).unwrap())
+          .unwrap()
+      };
+      let lease = crate::lock::run_lock(&run).unwrap();
+      mark_abandoned(&run).unwrap();
+      assert_eq!(state(), original, "{status}");
+      drop(lease);
+      mark_abandoned(&run).unwrap();
+      let abandoned = state();
+      assert_eq!(abandoned["status"], "lost", "{status}");
+      assert!(abandoned["finished_at"].is_string());
+      assert_eq!(abandoned["nickname"], original["nickname"]);
+      assert_eq!(abandoned["tags"], original["tags"]);
+      assert_eq!(abandoned["task_metadata"], original["task_metadata"]);
+      for status in ["completed", "failed", "cancelled", "lost"] {
+        let terminal = json!({"run_id": "run-fixture", "status": status, "exit_code": 0});
+        fs::atomic_json(&run.join("run-state.json"), &terminal).unwrap();
+        mark_abandoned(&run).unwrap();
+        assert_eq!(state(), terminal);
+      }
+    }
   }
 
   #[test]

@@ -131,10 +131,9 @@ pub(super) fn archive_smoke_document(
       .get("schema_version")
       .map_or(Some(0), serde_json::Value::as_u64)
       .is_some_and(|schema| schema <= 1)
-    || !matches!(
-      value["status"].as_str(),
-      Some("completed" | "failed" | "cancelled" | "lost")
-    )
+    || !value["status"]
+      .as_str()
+      .is_some_and(expri_core::run_state::is_terminal_status)
   {
     return Ok(());
   }
@@ -318,10 +317,10 @@ impl<S: ObjectStorage> Store<S> {
     {
       return Err(ApiError::new(409, "run state belongs to another run"));
     }
-    if !matches!(
-      state["status"].as_str(),
-      Some("completed" | "failed" | "cancelled" | "lost")
-    ) {
+    if !state["status"]
+      .as_str()
+      .is_some_and(expri_core::run_state::is_terminal_status)
+    {
       return Err(ApiError::new(409, "only finished runs can be archived"));
     }
     Ok(())

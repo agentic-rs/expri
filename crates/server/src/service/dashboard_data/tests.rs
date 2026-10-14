@@ -926,7 +926,7 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
   let state = json!({
     "schema_version": 1, "run_id": scope.run_id, "machine_id": "machine-physical",
     "smoke": true,
-    "task": "train", "status": "running", "started_at": "2026-10-03T01:00:00Z",
+    "task": "train", "status": "waiting", "started_at": "2026-10-03T01:00:00Z",
   });
   fixture.run_file(
     &scope.run_id,
@@ -941,8 +941,9 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
   let version = record.sha256.clone().unwrap();
   fixture.store.dashboard_cache_overview(&scope, &version, &json!({
     "overview_schema": OVERVIEW_SCHEMA_VERSION - 1,
-    "run": {"run_id": scope.run_id, "task": "train", "status": "running", "started_at": state["started_at"]},
-    "task_filter": "train", "metadata_truncated": false, "warnings": [],
+    "run": {"run_id": scope.run_id, "task": "train", "status": "unknown", "started_at": state["started_at"]},
+    "task_filter": "train", "metadata_truncated": false,
+    "warnings": [{"run_id": scope.run_id, "message": "run-state.json has invalid or missing status"}],
   })).unwrap();
   assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
   let dashboard = HostedDashboard::new(&fixture.store).unwrap();
@@ -951,6 +952,21 @@ fn hosted_overview_reparses_old_normalized_schema_with_an_unchanged_state_digest
     .unwrap();
   assert_eq!(rows["runs"][0]["machine_id"], "machine-physical");
   assert_eq!(rows["runs"][0]["smoke"], true);
+  assert_eq!(rows["runs"][0]["status"], "waiting");
+  assert_eq!(rows["runs"][0]["archival"]["status"], "active");
+  assert!(rows["warnings"].as_array().unwrap().is_empty());
+  let waiting = dashboard
+    .list(
+      "hosted:project:worker",
+      None,
+      Some("train"),
+      Some("waiting"),
+      20,
+      0,
+    )
+    .unwrap();
+  assert_eq!(waiting["total_count"], 1);
+  assert_eq!(waiting["runs"][0]["run_id"], scope.run_id);
   assert_eq!(
     fixture.backend.objects.lock().unwrap().requests.len(),
     1,

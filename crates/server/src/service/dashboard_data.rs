@@ -34,8 +34,8 @@ const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Version normalized run metadata independently of the unchanged artifact digest.
-// Schema 3 also preserves validated capture identity and completion metadata.
-const OVERVIEW_SCHEMA_VERSION: u64 = 4;
+// Schema 5 recognizes waiting as an active run state.
+const OVERVIEW_SCHEMA_VERSION: u64 = 5;
 
 struct MetricReadMode {
   minimum: usize,
@@ -435,18 +435,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     {
       return Err(message("invalid hosted run filter"));
     }
-    if status.is_some_and(|value| {
-      ![
-        "preparing",
-        "running",
-        "completed",
-        "failed",
-        "cancelled",
-        "lost",
-        "unknown",
-      ]
-      .contains(&value)
-    }) {
+    if status.is_some_and(|value| !expri_core::run_state::STATUSES.contains(&value)) {
       return Err(message("invalid run status"));
     }
     let source = parse_source(source_id)?;

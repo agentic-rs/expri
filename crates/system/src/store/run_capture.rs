@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use expri_core::lock::{self, LockAttempt};
+use expri_core::run_state::{is_terminal_status, update_state};
 use expri_core::run_system::{RUN_SYSTEM_PATH, RUN_SYSTEM_SCHEMA_VERSION, RunSystemRecord};
 use expri_core::storage::StoragePaths;
 use serde::{Deserialize, Serialize};
@@ -345,10 +346,7 @@ pub fn begin_state(run_dir: &Path, state: &mut Value) {
 }
 
 fn terminal(state: &Value) -> bool {
-  matches!(
-    state["status"].as_str(),
-    Some("completed" | "failed" | "cancelled" | "lost")
-  )
+  state["status"].as_str().is_some_and(is_terminal_status)
 }
 
 fn read_state(path: &Path) -> Result<Value> {
@@ -383,21 +381,21 @@ fn publish_capture_metadata(connection: &Connection, row: &Capture) -> Result<()
     LockAttempt::Acquired(lease) => lease,
     _ => return Ok(()),
   };
-  let path = row.run_dir.join("run-state.json");
-  let mut state = read_state(&path)?;
-  if state["system_capture_id"] != row.capture_id
-    || state["run_id"] != row.run_id
-    || !terminal(&state)
-  {
+  // Acquire the short state lock only after the supervisor's run lease.
+  let saved = update_state(&row.run_dir.join("run-state.json"), |state| {
+    if state["system_capture_id"] != row.capture_id
+      || state["run_id"] != row.run_id
+      || !terminal(state)
+    {
+      return Ok(false);
+    }
+    if state["system_capture_status"] == "capturing" {
+      set_status(state, row.complete);
+    }
+    Ok(true)
+  })?;
+  if !saved {
     return Ok(());
-  }
-  if state["system_capture_status"] == "capturing" {
-    set_status(&mut state, row.complete);
-    let mut temporary = tempfile::NamedTempFile::new_in(&row.run_dir)?;
-    serde_json::to_writer_pretty(&mut temporary, &state)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    File::open(&row.run_dir)?.sync_all()?;
   }
   sql(connection.execute(
     "UPDATE system_run_captures SET metadata_saved=1 WHERE capture_id=?1",
@@ -409,6 +407,9 @@ fn publish_capture_metadata(connection: &Connection, row: &Capture) -> Result<()
 /// Normal task completion never waits for the next collection interval. The
 /// collector or independently running publisher finishes the recorded close.
 pub fn close_state(run_dir: &Path, state: &mut Value) {
+  if !terminal(state) {
+    return;
+  }
   let Some(id) = state["system_capture_id"].as_str().map(str::to_owned) else {
     return;
   };
@@ -477,6 +478,9 @@ fn time(value: &Value) -> Result<i64> {
 /// It never rewrites task status/exit code. Storage errors retain the capture
 /// for later recovery rather than sealing a stream with stranded observations.
 pub fn finalize_state(run_dir: &Path, state: &mut Value) {
+  if !terminal(state) {
+    return;
+  }
   let Some(capture_id) = state["system_capture_id"].as_str().map(str::to_owned) else {
     return;
   };

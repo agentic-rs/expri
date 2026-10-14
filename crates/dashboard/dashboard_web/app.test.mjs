@@ -61,6 +61,8 @@ test("duration formatting uses the current time only for unfinished active runs 
   const now_ms = Date.parse("2026-10-14T01:02:05Z"), run = { status: "running", started_at: "2026-10-14T01:01:00Z", finished_at: null };
   assert.equal(formatDuration(run, now_ms), "1m 5s");
   assert.equal(formatDuration({ ...run, status: "preparing" }, now_ms), "1m 5s");
+  assert.equal(formatDuration({ ...run, status: "waiting" }, now_ms), "1m 5s", "waiting counts toward elapsed wall time");
+  assert.equal(formatDuration({ ...run, status: "waiting", finished_at: "2026-10-14T01:01:30Z" }, now_ms), "30s", "waiting with a recorded finish does not keep ticking");
   assert.equal(formatDuration(run, now_ms + 999), "1m 5s", "elapsed time displays complete seconds");
   assert.equal(formatDuration({ ...run, finished_at: "2026-10-14T01:01:30Z" }, now_ms), "30s", "a recorded finish takes precedence over the live clock");
   for (const record of [
@@ -280,6 +282,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     if (parsed.pathname === "/api/runs") {
       if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
       const visible = runs.filter(run => (!query.get("search") || run.run_id.includes(query.get("search"))) && (!query.get("origin") || run.origin === query.get("origin")) &&
+        (!query.get("task") || run.task === query.get("task")) && (!query.get("status") || run.status === query.get("status")) &&
         (!hosted || (!!run.archival?.status && run.archival.status !== "active") === (query.get("archival") === "archived")));
       const offset = Number(query.get("offset"));
       const limit = Number(query.get("limit"));
@@ -1395,7 +1398,7 @@ class RefreshClock {
   }
 }
 async function autoFixture(t, fields = {}) {
-  const clock = new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [], time_zones: [], disposals: 0 };
+  const clock = fields.refresh_clock ?? new RefreshClock(), chart = { interacting: false, ready: true, status: "ready", previews: [], time_zones: [], disposals: 0 };
   const controller = { dispose() { chart.disposals++; }, setTimeZone: value => chart.time_zones.push(value), isInteracting: () => chart.interacting, previewStatus: () => chart.status, clear() { chart.status = "invalid"; }, replacePreview: data => { if (!chart.ready) return false; chart.status = "ready"; chart.previews.push(data.warnings[0]?.message ?? "chart"); return true; } };
   const model = await reviewFixture(t, { hosted: true, updates: true, ...fields, refresh_clock: clock, chart_controller: controller });
   return { ...model, model, clock, chart, page_document: globalThis.document };
@@ -1421,6 +1424,7 @@ test("running durations tick with automatic refresh off without requests or repl
     { ...publishedRun("run-live"), started_at: new Date(clock.time - 65_000).toISOString() },
     { ...publishedRun("run-completed"), status: "completed", started_at: new Date(clock.time - 40_000).toISOString(), finished_at: new Date(clock.time - 10_000).toISOString(), exit_code: 0 },
     { ...publishedRun("run-preparing"), status: "preparing", started_at: new Date(clock.time - 2_000).toISOString() },
+    { ...publishedRun("run-waiting"), status: "waiting", started_at: new Date(clock.time - 45_000).toISOString() },
   ];
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); assert.equal(nodes.get("auto-refresh-toggle").checked, false);
@@ -1428,13 +1432,13 @@ test("running durations tick with automatic refresh off without requests or repl
   const rows = [...nodes.get("run-rows").children], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
   const header = nodes.document.querySelector(".inspector-meta .run-duration"), overview = overviewDuration(nodes), checked_at = nodes.get("updated-at").textContent;
   const durations = () => rows.map(row => row.querySelector(".status-column .run-duration").textContent);
-  assert.deepEqual(durations(), ["1m 5s", "30s", "2s"]);
+  assert.deepEqual(durations(), ["1m 5s", "30s", "2s", "45s"]);
   assert.equal(header.textContent, "1m 5s"); assert.equal(overview.textContent, "1m 5s");
   assert.equal(clock.timers.size, 1, "all live run displays share one display timer");
   await act(async () => { runCheckbox(nodes, 0).focus(); });
   const requests = requestCounts(model.requests);
   await clock.advance(2000);
-  assert.deepEqual(durations(), ["1m 7s", "30s", "4s"]);
+  assert.deepEqual(durations(), ["1m 7s", "30s", "4s", "47s"]);
   assert.equal(header.textContent, "1m 7s"); assert.equal(overview.textContent, "1m 7s");
   assert.deepEqual(requestCounts(model.requests), requests, "display ticks never poll the API");
   assert.deepEqual([...nodes.get("run-rows").children], rows); assert.equal(nodes.get("chart-preview"), preview);
@@ -1444,9 +1448,9 @@ test("running durations tick with automatic refresh off without requests or repl
   for (const element of nodes.document.querySelectorAll(".run-duration")) assert.equal(element.getAttribute("aria-live"), "off", "second-by-second timing does not announce repeatedly");
 });
 
-test("running durations freeze at the recorded finish and stop scheduling after completion", async t => {
+for (const status of ["running", "waiting"]) test(`${status} durations freeze at the recorded finish and stop scheduling after completion`, async t => {
   const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
-  const run = { ...publishedRun("run-finishes"), started_at: new Date(clock.time - 10_000).toISOString() };
+  const run = { ...publishedRun("run-finishes"), status, started_at: new Date(clock.time - 10_000).toISOString() };
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: [run] }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
   await clock.advance(2000); assert.equal(overviewDuration(nodes).textContent, "12s");
@@ -1461,9 +1465,9 @@ test("running durations freeze at the recorded finish and stop scheduling after 
   assert.deepEqual(requestCounts(model.requests), requests); assert.equal(nodes.get("run-rows").children[0], row);
 });
 
-test("running durations keep missing invalid and future starts explicitly unavailable", async t => {
+for (const status of ["running", "waiting"]) test(`${status} durations keep missing invalid and future starts explicitly unavailable`, async t => {
   const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
-  const runs = [null, "invalid", new Date(clock.time + 60_000).toISOString()].map((started_at, index) => ({ ...publishedRun(`run-unknown-${index}`), started_at }));
+  const runs = [null, "invalid", new Date(clock.time + 60_000).toISOString()].map((started_at, index) => ({ ...publishedRun(`run-unknown-${index}`), status, started_at }));
   runs.push({ ...publishedRun("run-terminal-unknown"), status: "completed", started_at: null });
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
@@ -1477,6 +1481,70 @@ test("running durations keep missing invalid and future starts explicitly unavai
   assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—");
   const requests = requestCounts(model.requests); await clock.advance(2000);
   assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—"); assert.deepEqual(requestCounts(model.requests), requests);
+});
+
+test("running and waiting metadata changes retain focused runs, filters and chart settings", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:02:05Z");
+  const run = { ...archivalRun("sample-progress", { status: "running" }), started_at: new Date(clock.time - 65_000).toISOString() };
+  const model = await autoFixture(t, { projects: true, project_runs: [run], refresh_clock: clock }), { nodes } = model;
+  await settledTable(nodes);
+  await openRunControl(nodes, "run-filters");
+  setValue(nodes.get("task-input"), "train"); await emit(nodes.get("task-input"), "input"); await settledTable(nodes);
+  await click(nodes.get("machine-gpu-a")); await settledTable(nodes);
+  await emit(nodes.document, "keydown", { key: "Escape" });
+  await inspect(model); await chooseAxis(nodes, "wall_clock"); await chooseTimeZone(nodes, "utc");
+  await clock.advance(5000);
+  const row = nodes.get("run-rows").children[0], focused = runCheckbox(nodes, 0), preview = nodes.get("chart-preview");
+  const chart_url = chartSource(nodes), mounts = previewMounts(nodes), start = run.started_at;
+  await act(async () => focused.focus());
+  for (const status of ["waiting", "running"]) {
+    run.status = status; model.model.list_revision = `list-${status}`; model.model.metadata_revision = `metadata-${status}`;
+    await clock.advance(5000);
+    assert.equal(nodes.get("run-rows").children[0], row);
+    assert.equal(row.querySelector(".status").textContent, status);
+    assert.equal(row.querySelector(".status").classList.contains(status), true);
+    assert.equal(nodes.document.querySelector(".inspector-status").textContent, status);
+    assert.equal(nodes.document.querySelector(".inspector-status").classList.contains(status), true);
+    assert.equal(row.querySelector(".run-duration").textContent, nodes.document.querySelector(".inspector-meta .run-duration").textContent);
+    assert.equal(nodes.document.activeElement, focused);
+    assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
+    assert.equal(chartSource(nodes), chart_url); assert.equal(selectedAxis(nodes), "wall_clock"); assert.equal(nodes.get("time-zone-utc").checked, true);
+    assert.equal(latestRunQuery(model).get("task"), "train"); assert.equal(latestRunQuery(model).get("origin"), "gpu-a");
+    assert.equal(run.started_at, start, "progress transitions never restart elapsed time");
+    assert.equal(nodes.document.getElementById("archive-run-button"), null, "unfinished runs cannot be archived");
+    assert.equal(nodes.get("review-error").hidden, true);
+  }
+  assert.equal(row.querySelector(".run-duration").textContent, "1m 20s", "waiting remains part of elapsed wall time");
+});
+
+test("waiting filters track resumed and waiting runs without losing an off-list inspector", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:02:05Z");
+  const running = { ...archivalRun("sample-running", { status: "running" }), started_at: new Date(clock.time - 65_000).toISOString() };
+  const waiting = { ...archivalRun("sample-waiting", { status: "waiting" }), started_at: running.started_at };
+  const model = await autoFixture(t, { projects: true, project_runs: [running, waiting, archivalRun("sample-finished")], refresh_clock: clock }), { nodes } = model;
+  await settledTable(nodes); await clock.advance(5000);
+  await openRunControl(nodes, "run-filters"); await click(nodes.get("status-waiting")); await settledTable(nodes);
+  assert.equal(nodes.get("status-waiting").type, "radio"); assert.equal(nodes.get("status-waiting").checked, true);
+  assert.equal(nodes.document.activeElement, nodes.get("status-waiting")); assert.equal(latestRunQuery(model).get("status"), "waiting");
+  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-waiting");
+  await emit(nodes.document, "keydown", { key: "Escape" });
+  await click(runButton(nodes, 0)); await settled(() => chartQuery(nodes).get("run_id") === runIdentity(waiting));
+  const preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
+  assert.equal(nodes.document.getElementById("archive-run-button"), null);
+  await clock.advance(5000);
+  waiting.status = "running"; model.model.list_revision = "resumed-list"; model.model.metadata_revision = "resumed-metadata";
+  await clock.advance(5000);
+  assert.equal(nodes.get("run-rows").children.length, 0); assert.equal(nodes.get("list-empty").hidden, false);
+  assert.equal(nodes.get("review-section").hidden, false); assert.equal(nodes.document.querySelector(".inspector-status").textContent, "running");
+  assert.equal(nodes.get("status-waiting").checked, true); assert.equal(latestRunQuery(model).get("status"), "waiting");
+  assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
+  assert.equal(nodes.get("review-error").hidden, true);
+  running.status = "waiting"; model.model.list_revision = "waiting-list"; model.model.metadata_revision = "waiting-metadata";
+  await clock.advance(5000);
+  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-running");
+  assert.equal(nodes.document.querySelector(".inspector-status").textContent, "running", "the inspector keeps its original run when a different run enters the filter");
+  assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(model.requests.some(url => url === "/api/runs/archive"), false);
 });
 
 test("running duration display pauses while hidden resumes immediately and disposes its single timer", async t => {
@@ -3378,7 +3446,7 @@ test("cleanup needing attention renders an actionable cause and recovers after r
 function archivalRun(run_id, { origin = "gpu-a", status = "completed", archived = false } = {}) {
   return {
     run_id, run_key: `${origin}:${run_id}`, origin, task: "train", status,
-    started_at: "2026-10-03T01:00:00Z", finished_at: status === "running" ? null : "2026-10-03T01:00:03Z", exit_code: 0,
+    started_at: "2026-10-03T01:00:00Z", finished_at: ["preparing", "running", "waiting"].includes(status) ? null : "2026-10-03T01:00:03Z", exit_code: ["preparing", "running", "waiting"].includes(status) ? null : 0,
     archival: {
       scope: { project_id: "vision", origin, run_id }, status: archived ? "archived" : "active",
       archived_at: archived ? new Date().toISOString() : null,
