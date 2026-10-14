@@ -8,7 +8,7 @@ use crate::config::EnvironmentConfig;
 use crate::error::{ExpriError, Result};
 use crate::identifiers::validate_component;
 
-pub const RESOURCE_QUEUE_CAPABILITY: &str = "resource-queue-v1";
+pub const RESOURCE_QUEUE_CAPABILITY: &str = "resource-queue-v2";
 pub const RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY: &str = "resource-queue-gpu-availability-v1";
 pub const QUEUE_LEASE_MS: i64 = 60_000;
 pub const GPU_AVAILABILITY_MAX_AGE_MS: i64 = 30_000;
@@ -120,7 +120,8 @@ fn publish_default() -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
-  Queued,
+  #[serde(alias = "queued")]
+  Pending,
   Starting,
   Running,
   CancelRequested,
@@ -134,7 +135,7 @@ pub enum JobStatus {
 impl JobStatus {
   pub fn as_str(self) -> &'static str {
     match self {
-      Self::Queued => "queued",
+      Self::Pending => "pending",
       Self::Starting => "starting",
       Self::Running => "running",
       Self::CancelRequested => "cancel_requested",
@@ -212,6 +213,9 @@ pub struct AttemptSummary {
   pub fencing_token: String,
   pub allocation: ResourceAllocation,
   pub run_id: Option<String>,
+  /// Server receipt time for the worker's durable process-start confirmation.
+  #[serde(default)]
+  pub started_at_ms: Option<i64>,
   pub status: AttemptStatus,
   pub cancel_requested: bool,
   pub created_at_ms: i64,
@@ -247,6 +251,53 @@ pub struct JobSummary {
   pub submitted_at_ms: i64,
   pub updated_at_ms: i64,
   pub attempt: Option<AttemptSummary>,
+}
+
+/// Public scheduling context for dashboard history. Worker fencing identities,
+/// source objects, commands, and credentials never cross this boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueJobContext {
+  pub job_id: String,
+  pub project_id: String,
+  pub task: String,
+  pub status: JobStatus,
+  pub resources: ResourceRequest,
+  pub pending_reason: Option<String>,
+  pub submitted_at_ms: i64,
+  pub updated_at_ms: i64,
+  pub worker_id: Option<String>,
+  pub run_id: Option<String>,
+  pub started_at_ms: Option<i64>,
+}
+
+impl From<&JobSummary> for QueueJobContext {
+  fn from(job: &JobSummary) -> Self {
+    Self {
+      job_id: job.job_id.clone(),
+      project_id: job.project_id.clone(),
+      task: job.task.clone(),
+      status: job.status,
+      resources: job.resources.clone(),
+      pending_reason: job.pending_reason.clone(),
+      submitted_at_ms: job.submitted_at_ms,
+      updated_at_ms: job.updated_at_ms,
+      worker_id: job
+        .attempt
+        .as_ref()
+        .map(|attempt| attempt.worker_id.clone())
+        .or_else(|| job.assigned_worker_id.clone())
+        .or_else(|| job.worker_id.clone()),
+      run_id: job
+        .attempt
+        .as_ref()
+        .and_then(|attempt| attempt.run_id.clone()),
+      started_at_ms: job
+        .attempt
+        .as_ref()
+        .and_then(|attempt| attempt.started_at_ms),
+    }
+  }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,12 +369,20 @@ pub enum QueueRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gpu_availability: Option<GpuAvailabilityReport>,
   },
+  // Version the claim operation as well as capability discovery: services may
+  // be upgraded while an older worker retains its authenticated client.
+  #[serde(rename = "claim_v2")]
   Claim {
     worker_id: String,
     session_id: String,
     claim_id: String,
   },
   Start {
+    attempt: AttemptIdentity,
+    run_id: String,
+  },
+  /// Confirm that the worker observed its durable native command-start marker.
+  MarkStarted {
     attempt: AttemptIdentity,
     run_id: String,
   },
@@ -612,7 +671,7 @@ impl std::str::FromStr for JobStatus {
 
   fn from_str(value: &str) -> Result<Self> {
     match value {
-      "queued" => Ok(Self::Queued),
+      "pending" | "queued" => Ok(Self::Pending),
       "starting" => Ok(Self::Starting),
       "running" => Ok(Self::Running),
       "cancel_requested" => Ok(Self::CancelRequested),
@@ -691,7 +750,7 @@ impl QueueRequest {
         validate_component(session_id)?;
         validate_component(claim_id)
       }
-      Self::Start { attempt, run_id } => {
+      Self::Start { attempt, run_id } | Self::MarkStarted { attempt, run_id } => {
         attempt.validate()?;
         validate_component(run_id)
       }
@@ -741,6 +800,11 @@ impl AttemptSummary {
     .validate()?;
     if self.created_at_ms < 0 || self.updated_at_ms < self.created_at_ms {
       return Err(invalid("queue attempt timestamps are invalid"));
+    }
+    if self.started_at_ms.is_some_and(|started| {
+      self.run_id.is_none() || started < self.created_at_ms || started > self.updated_at_ms
+    }) {
+      return Err(invalid("queue startup confirmation is invalid"));
     }
     if let Some(message) = &self.message {
       text(message, 2048, true)?;
@@ -1034,6 +1098,21 @@ impl QueueResponse {
         }
       }
       (
+        QueueRequest::MarkStarted {
+          attempt: identity,
+          run_id,
+        },
+        Self::Attempt { attempt },
+      ) => {
+        attempt.validate()?;
+        if attempt.identity() != *identity
+          || attempt.run_id.as_ref() != Some(run_id)
+          || attempt.started_at_ms.is_none()
+        {
+          return Err(wrong());
+        }
+      }
+      (
         QueueRequest::Finish {
           attempt: identity,
           status,
@@ -1315,6 +1394,37 @@ mod tests {
     registration["project_ids"] = serde_json::json!(["project-a"]);
     let request: QueueRequest = serde_json::from_value(registration).unwrap();
     request.validate().unwrap();
+  }
+
+  #[test]
+  fn legacy_cached_worker_claims_are_rejected_before_reserving_resources() {
+    let legacy = serde_json::json!({"operation":"claim", "worker_id":"worker",
+      "session_id":"session", "claim_id":"claim"});
+    assert!(serde_json::from_value::<QueueRequest>(legacy).is_err());
+    let claim = QueueRequest::Claim {
+      worker_id: "worker".into(),
+      session_id: "session".into(),
+      claim_id: "claim".into(),
+    };
+    let current = serde_json::to_value(&claim).unwrap();
+    assert_eq!(current["operation"], "claim_v2");
+    serde_json::from_value::<QueueRequest>(current)
+      .unwrap()
+      .validate()
+      .unwrap();
+  }
+
+  #[test]
+  fn pending_is_canonical_and_legacy_queued_records_remain_readable() {
+    assert_eq!(serde_json::to_value(JobStatus::Pending).unwrap(), "pending");
+    for spelling in ["pending", "queued"] {
+      assert_eq!(spelling.parse::<JobStatus>().unwrap(), JobStatus::Pending);
+      assert_eq!(
+        serde_json::from_value::<JobStatus>(serde_json::json!(spelling)).unwrap(),
+        JobStatus::Pending
+      );
+    }
+    assert_eq!(JobStatus::Pending.as_str(), "pending");
   }
 
   #[test]

@@ -150,8 +150,10 @@ jobs:
           python3 -B crates/worker/src/jobs_tests.py
           python3 -B crates/worker/src/run_lifecycle_tests.py
 
-      - name: Run metrics producer tests
-        run: python3 -B crates/worker/python/expri_metrics_tests.py
+      - name: Run producer API tests
+        run: |
+          python3 -B crates/worker/python/expri_metrics_tests.py
+          python3 -B crates/worker/python/expri_run_tests.py
 
       - name: Verify installed-package fixture wheels
         run: python3 -B tests/containers/fixtures_tests.py

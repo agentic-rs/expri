@@ -1,6 +1,7 @@
 """Foreground and detached run supervision for the standard-library fallback."""
 
 import datetime as _lifecycle_datetime
+import fcntl as _lifecycle_fcntl
 import json as _lifecycle_json
 import os as _lifecycle_os
 import pathlib as _lifecycle_pathlib
@@ -20,16 +21,65 @@ def _lifecycle_now():
 
 
 def _lifecycle_write_json(path, value):
-  temporary = None
+  """Serialize task updates and supervisor publication through the same lease."""
+  path = _lifecycle_pathlib.Path(path)
+  if not isinstance(value, dict):
+    raise ValueError("run state must be an object")
+  if not _lifecycle_stat.S_ISDIR(path.parent.lstat().st_mode):
+    raise ValueError("run directory must be a real directory")
+  lock_path = path.parent / ".run-state.lock"
+  flags = _lifecycle_os.O_RDWR | _lifecycle_os.O_CREAT | _lifecycle_os.O_NONBLOCK
+  flags |= _lifecycle_os.O_NOFOLLOW | _lifecycle_os.O_CLOEXEC
+  descriptor = _lifecycle_os.open(lock_path, flags, 0o600)
   try:
-    with _lifecycle_tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-      temporary = _lifecycle_pathlib.Path(handle.name)
-      _lifecycle_json.dump(value, handle, indent=2, sort_keys=True)
-      handle.write("\n")
-    temporary.replace(path)
+    if not _lifecycle_stat.S_ISREG(_lifecycle_os.fstat(descriptor).st_mode):
+      raise ValueError("run state lease must be a regular file")
+    _lifecycle_fcntl.flock(descriptor, _lifecycle_fcntl.LOCK_EX)
+    try:
+      current = {}
+      try:
+        state_fd = _lifecycle_os.open(path, _lifecycle_os.O_RDONLY | _lifecycle_os.O_NOFOLLOW |
+                                     _lifecycle_os.O_CLOEXEC | _lifecycle_os.O_NONBLOCK)
+      except FileNotFoundError:
+        pass
+      else:
+        with _lifecycle_os.fdopen(state_fd, "rb") as handle:
+          if not _lifecycle_stat.S_ISREG(_lifecycle_os.fstat(handle.fileno()).st_mode):
+            raise ValueError("run state must be a regular file")
+          raw = handle.read(256 * 1024 + 1)
+        if len(raw) > 256 * 1024:
+          raise ValueError("run state exceeds metadata limit")
+        current = _lifecycle_json.loads(raw)
+        if not isinstance(current, dict):
+          raise ValueError("run state must be an object")
+      terminal = {"completed", "failed", "cancelled", "lost"}
+      if current.get("status") in terminal and value.get("status") is not None and value["status"] not in terminal:
+        raise ValueError("cannot restore an active status after the run has finished")
+      current.update(value)
+      raw = (_lifecycle_json.dumps(current, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+      if len(raw) > 256 * 1024:
+        raise ValueError("run state exceeds metadata limit")
+      temporary = None
+      try:
+        with _lifecycle_tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as handle:
+          temporary = _lifecycle_pathlib.Path(handle.name)
+          handle.write(raw)
+          handle.flush()
+          _lifecycle_os.fsync(handle.fileno())
+        temporary.replace(path)
+        directory_fd = _lifecycle_os.open(path.parent, _lifecycle_os.O_RDONLY | _lifecycle_os.O_DIRECTORY |
+                                         _lifecycle_os.O_NOFOLLOW | _lifecycle_os.O_CLOEXEC)
+        try:
+          _lifecycle_os.fsync(directory_fd)
+        finally:
+          _lifecycle_os.close(directory_fd)
+      finally:
+        if temporary is not None:
+          temporary.unlink(missing_ok=True)
+    finally:
+      _lifecycle_fcntl.flock(descriptor, _lifecycle_fcntl.LOCK_UN)
   finally:
-    if temporary is not None:
-      temporary.unlink(missing_ok=True)
+    _lifecycle_os.close(descriptor)
 
 
 def _lifecycle_create_file(path, raw=b""):
@@ -226,7 +276,8 @@ def execute_worker(payload, context):
                          EXPRI_RUN_ID=snapshot["run_id"], EXPRI_RUN_DIR=str(run_dir),
                          EXPRI_OUTPUT_DIR=str(run_dir / "outputs"))
         result = logs.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
-                          cwd=snapshot["code_dir"], env=child_env)
+                          cwd=snapshot["code_dir"], env=child_env,
+                          on_started=lambda: _lifecycle_write_json(state_path, {"task_started_at": _lifecycle_now()}))
         exit_code = result.returncode if result.returncode >= 0 else 128 - result.returncode
         if result.started:
           state["task_exit_code"] = exit_code

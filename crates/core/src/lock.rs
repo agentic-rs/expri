@@ -23,11 +23,36 @@ pub enum LockAttempt {
 
 /// Hold this lease from run preparation until its terminal state is published.
 pub fn run_lock(run_dir: &Path) -> Result<FileLock> {
-  let file = open_lock_file(&run_dir.join(".run.lock"), true, true)?
-    .expect("creating a lock file returns a file");
+  exclusive_lock(&run_dir.join(".run.lock"), "lock run")
+}
+
+/// Serialize short state updates separately from the supervisor's lifetime lease.
+pub fn run_state_lock(run_dir: &Path) -> Result<FileLock> {
+  let path = run_dir.join(".run-state.lock");
+  let file = open_lock_file(&path, true, true)?.expect("creating a lock file returns a file");
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+  loop {
+    match file.try_lock() {
+      Ok(()) => return Ok(FileLock { file }),
+      Err(std::fs::TryLockError::WouldBlock) => {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+          return Err(ExpriError::Message("run state is busy; try again".into()));
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+      }
+      Err(std::fs::TryLockError::Error(source)) => {
+        return Err(io_context("lock run state", &path, source));
+      }
+    }
+  }
+}
+
+fn exclusive_lock(path: &Path, action: &'static str) -> Result<FileLock> {
+  let file = open_lock_file(path, true, true)?.expect("creating a lock file returns a file");
   file
     .lock()
-    .map_err(|source| io_context("lock run", run_dir, source))?;
+    .map_err(|source| io_context(action, path, source))?;
   Ok(FileLock { file })
 }
 
@@ -71,15 +96,17 @@ fn open_lock_file(path: &Path, create: bool, writable: bool) -> Result<Option<Fi
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
     Err(source) => return Err(io_context("inspect", path, source)),
   };
+  let mut options = OpenOptions::new();
+  options.read(true).write(writable);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+  }
   let file = if initial.is_some() {
-    OpenOptions::new().read(true).write(writable).open(path)
+    options.open(path)
   } else if create {
-    match OpenOptions::new()
-      .read(true)
-      .write(true)
-      .create_new(true)
-      .open(path)
-    {
+    match options.write(true).create_new(true).open(path) {
       Ok(file) => Ok(file),
       Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
         return open_lock_file(path, create, writable);

@@ -40,3 +40,39 @@ booleans, and nulls. Object keys must be strings, integers must fit i64 or u64,
 and NaN, infinity, tuples, and arbitrary Python objects are rejected.
 Parameters may contain at most 64 nested object or array levels, including the
 parameter root, so the stored file remains readable by expri.
+
+
+Copy `expri_run.py` into your experiment's source directory when a managed task
+needs to report that it is waiting for input or a resource. This independent
+helper uses the Python standard library on Linux and macOS and does not require
+the native expri binary to be installed or on `PATH`.
+
+```python
+from expri_run import set_run_status
+
+set_run_status("waiting")
+resource = wait_for_resource()
+set_run_status("running")
+train(resource)
+```
+
+The default directory is `EXPRI_RUN_DIR`, which expri sets for each managed run.
+Pass `run_dir` explicitly only to select an existing managed run directory.
+`waiting` is an active status: the task stays alive and cancellable, and logs,
+system capture, publishing, and total elapsed time continue. It does not suspend
+the process or impose a timeout. The helper preserves the original start time,
+capture information, and all other run metadata.
+
+`set_run_status()` returns a dictionary with `run_id`, `previous_status`,
+`status`, and `changed`. Repeating the current status returns `changed: False`
+without rewriting `run-state.json`. Only live, unfinished `running` or `waiting`
+runs with valid schema and start metadata can change status; preparing, finished,
+or lost runs are rejected. A status request cannot revive a completed run.
+
+The helper and supervisor serialize state changes with the short
+`.run-state.lock`, separate from the supervisor's continuously held `.run.lock`.
+The lock wait is bounded to five seconds; a busy state lock raises `TimeoutError`
+and can be retried. Invalid metadata raises `ValueError`, and filesystem failures
+raise `OSError`. Run directories, parent components, metadata files, lock files,
+and owned code/output directories must be real paths without symlinks. State
+metadata is limited to 256 KiB and updates use a flushed atomic replacement.

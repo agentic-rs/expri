@@ -214,17 +214,7 @@ pub fn validate_catalog_warnings(warnings: &[String]) -> Result<()> {
 
 pub fn validate_run_entry(run: &RunListEntry) -> Result<()> {
   validate_scope(&run.scope)?;
-  if ![
-    "preparing",
-    "running",
-    "completed",
-    "failed",
-    "cancelled",
-    "lost",
-    "unknown",
-  ]
-  .contains(&run.status.as_str())
-  {
+  if !crate::run_state::STATUSES.contains(&run.status.as_str()) {
     return Err(invalid("invalid published run status"));
   }
   if let Some(task) = &run.task {
@@ -469,6 +459,27 @@ pub fn compare_run_scopes(left: &RunScope, right: &RunScope) -> Ordering {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn published_run_entries_accept_waiting_and_reject_unknown_phases() {
+    let mut run = RunListEntry {
+      scope: RunScope {
+        project_id: "project".into(),
+        origin: "worker".into(),
+        run_id: "run-one".into(),
+      },
+      task: Some("train".into()),
+      status: "waiting".into(),
+      started_at: Some("2026-10-14T00:00:00Z".into()),
+      finished_at: None,
+      exit_code: None,
+      archived: false,
+      warnings: Vec::new(),
+    };
+    validate_run_entry(&run).unwrap();
+    run.status = "paused".into();
+    assert!(validate_run_entry(&run).is_err());
+  }
 
   #[test]
   fn partial_run_selectors_validate_each_supplied_component() {

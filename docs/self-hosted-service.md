@@ -605,11 +605,20 @@ such as `GiB` or decimal units such as `GB`. `--project-id` can default from the
 selected project's `[service]`. `--worker clouds-modu` pins placement; `-T gpu-1` also
 uses that target's environment and pins its name, without an SSH source push.
 
+The server and execution workers must both support `resource-queue-v2`, which
+confirms actual task startup. Mismatched versions cannot claim new jobs. Update
+both components for queued submission; existing reservation records remain readable.
+
 Each submission uploads a verified source ZIP through the existing private-input
 path before creating a durable job. The compressed and extracted source are each
 limited to 512 MiB and 100,000 entries. Large datasets and models should use managed
 assets. The job pins the uploaded object and SHA256 rather than reading later
-checkout changes. Once submission returns, the laptop may disconnect. Retrying an
+checkout changes. `run --queue` waits until the worker confirms the task has
+started, then returns without waiting for completion. `--queue --detach` returns
+the durable job receipt immediately. While resources are unavailable, the server
+reports `pending` and a wait reason. Ctrl-C ends CLI waiting while preserving the
+job; `queue cancel <job_id>` cancels it. Once submission returns, the laptop may
+disconnect. Retrying an
 uncertain response with the same `--submission-id` and identical source/specification
 returns the same job; changing that submission is rejected.
 Source selection includes `push.include_ignored` files, like ordinary managed

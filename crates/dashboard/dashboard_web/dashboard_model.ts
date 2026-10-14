@@ -1,9 +1,17 @@
 import type { ChartController } from "./interactive_charts";
 import type { RefreshClock } from "./auto_refresh";
 import type { EventSourceFactory } from "./live_updates";
+import type { RunQueue, RunRedirect } from "./run_queue";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string };
+export const RUN_STATUSES: readonly string[] = [
+  "pending", "preparing", "running", "waiting", "completed", "failed", "cancelled", "lost", "unknown",
+];
+
+export function runStatusClass(status: string): string {
+  return RUN_STATUSES.includes(status) ? status : "";
+}
 export type Source = {
   source_id: string;
   label: string;
@@ -34,6 +42,10 @@ export function parseRunDeepLink(search: string): RunDeepLink | null {
 export type Run = {
   run_id: string;
   run_key?: string;
+  queue?: RunQueue | null;
+  queue_only?: boolean;
+  queue_message?: string | null;
+  submitted_at?: string | null;
   origin?: string;
   machine_id?: string;
   smoke?: boolean;
@@ -100,6 +112,7 @@ export type RunList = {
 };
 export type Detail = {
   source: Source;
+  redirect?: RunRedirect | null;
   run: Run;
   state: Json;
   snapshot: Json;
@@ -225,6 +238,8 @@ export type Review = {
 export type LogView = { run_id: string; stream: string; loaded: boolean; pending: boolean };
 export type RunRevision = {
   run_id: string;
+  queue?: RunQueue | null;
+  redirect?: RunRedirect | null;
   metadata_revision: string | null;
   metrics_revision: string | null;
   stdout_revision: string | null;
@@ -236,6 +251,7 @@ export type Updates = {
   catalog_revision: string | null;
   source_revision: string | null;
   storage_revision?: string | null;
+  queue_revision?: string | null;
   runs: RunRevision[];
 };
 export type ChartRefreshOutcome = "applied" | "deferred" | "cancelled";
@@ -269,8 +285,8 @@ export function formatNumber(value: number): string {
     : "—";
 }
 
-export function runInProgress(run: Pick<Run, "status" | "finished_at">): boolean {
-  return (run.status === "preparing" || run.status === "running") && run.finished_at == null;
+export function runInProgress(run: Pick<Run, "status" | "finished_at" | "queue_only">): boolean {
+  return run.queue_only !== true && ["preparing", "running", "waiting"].includes(run.status) && run.finished_at == null;
 }
 
 export function hasRunningDuration(run: Run): boolean {

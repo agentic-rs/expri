@@ -105,6 +105,15 @@ impl RunLogs {
   }
 
   pub fn task(&self, command: &mut Command) -> io::Result<LoggedOutput> {
+    self.task_with_started(command, || Ok(()))
+  }
+
+  /// Publish launch evidence only after the operating system accepted the child.
+  pub fn task_with_started(
+    &self,
+    command: &mut Command,
+    on_started: impl FnOnce() -> io::Result<()>,
+  ) -> io::Result<LoggedOutput> {
     execute_controlled(
       command,
       Some(self.stdout.try_clone()?),
@@ -114,6 +123,7 @@ impl RunLogs {
         .then(|| Box::new(io::stdout()) as Box<dyn Write + Send>),
       self.stderr_terminal(),
       self.process_control(),
+      Some(Box::new(on_started)),
     )
   }
 
@@ -126,6 +136,7 @@ impl RunLogs {
       None,
       self.stderr_terminal(),
       self.process_control(),
+      None,
     )
   }
 
@@ -191,6 +202,7 @@ fn execute(
     stdout_terminal,
     stderr_terminal,
     ProcessControl::default(),
+    None,
   )
 }
 
@@ -201,6 +213,7 @@ fn execute_controlled(
   stdout_terminal: Option<Box<dyn Write + Send>>,
   stderr_terminal: Box<dyn Write + Send>,
   control: ProcessControl<'_>,
+  on_started: Option<Box<dyn FnOnce() -> io::Result<()> + '_>>,
 ) -> io::Result<LoggedOutput> {
   let ProcessControl {
     cancel_path,
@@ -230,6 +243,12 @@ fn execute_controlled(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()?;
+  if let Some(on_started) = on_started
+    && let Err(error) = on_started()
+  {
+    stop_after_error(&mut child, cleanup_groups, cleanup_uncertain);
+    return Err(error);
+  }
   let stdout = child.stdout.take().expect("piped stdout");
   let stderr = child.stderr.take().expect("piped stderr");
   if let Err(error) = nonblocking(&stdout).and_then(|()| nonblocking(&stderr)) {

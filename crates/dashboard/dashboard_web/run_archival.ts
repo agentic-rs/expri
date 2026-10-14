@@ -36,7 +36,7 @@ export function runIsArchived(run: Run): boolean {
 }
 
 export function canArchiveRun(run: Run): boolean {
-  return run.archival?.status === "active" &&
+  return run.queue_only !== true && run.archival?.status === "active" &&
     ["completed", "failed", "cancelled", "lost"].includes(run.status);
 }
 

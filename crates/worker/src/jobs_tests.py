@@ -66,6 +66,20 @@ class JobTests(unittest.TestCase):
     lease.close()
     self.assertEqual(self.request("status")["status"], "lost")
 
+  def test_waiting_is_live_cancellable_and_becomes_lost_after_lease_release(self):
+    self.state["status"] = "waiting"
+    self.save_state()
+    lease = self.hold_lease()
+    before = (self.run / "run-state.json").read_bytes()
+    report = self.request("status")
+    self.assertEqual(report["status"], "waiting")
+    self.assertTrue(report["alive"])
+    self.assertTrue(self.request("cancel")["cancel_requested"])
+    self.assertEqual((self.run / "run-state.json").read_bytes(), before)
+    lease.close()
+    self.assertEqual(self.request("status")["status"], "lost")
+    self.assertEqual(self.request("status")["recorded_status"], "waiting")
+
   def test_cancel_refuses_lost_and_foreground_runs(self):
     with self.assertRaisesRegex(ValueError, "lost"):
       self.request("cancel")
@@ -134,6 +148,8 @@ class JobTests(unittest.TestCase):
       self.assertEqual(output.getvalue(), expected)
 
   def test_follow_waits_for_log_creation_and_drains_final_bytes(self):
+    self.state["status"] = "waiting"
+    self.save_state()
     self.hold_lease()
     output = io.BytesIO()
     failures = []

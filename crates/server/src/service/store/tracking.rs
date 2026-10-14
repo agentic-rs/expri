@@ -432,10 +432,10 @@ impl<S: ObjectStorage> Store<S> {
       let mut file = open_raw(&self.directory, &state.target, revision, false)?;
       let state: Value = serde_json::from_reader((&mut file).take(state.size))
         .map_err(|_| ApiError::new(409, "run state is invalid"))?;
-      if !matches!(
-        state["status"].as_str(),
-        Some("completed" | "failed" | "cancelled" | "lost")
-      ) {
+      if !state["status"]
+        .as_str()
+        .is_some_and(expri_core::run_state::is_terminal_status)
+      {
         return Err(ApiError::new(409, "run is not terminal"));
       }
       if state["system_capture_id"].is_string() && state["system_capture_status"] == "capturing" {

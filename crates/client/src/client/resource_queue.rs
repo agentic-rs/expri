@@ -41,7 +41,7 @@ impl ResourceQueueClient {
       .any(|feature| feature == RESOURCE_QUEUE_CAPABILITY)
     {
       return Err(fs::message(
-        "service does not support resource-queue-v1; upgrade the server",
+        "service does not support resource-queue-v2 task start confirmation; upgrade the server",
       ));
     }
     let gpu_availability = features

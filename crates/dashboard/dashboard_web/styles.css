@@ -360,6 +360,11 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .run-diagnostics li + li, .run-diagnostics-detail li + li { margin-top: 3px; }
 .run-diagnostics-detail strong { font-size: 11px; }
 .run-task { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-context-note { margin-top: 12px; font-size: 11px; }
+.queue-resource-list { margin: 0; padding-left: 18px; }
+.queue-resource-list li + li { margin-top: 5px; }
+.queue-pending-reason { margin-top: 12px; overflow-wrap: anywhere; }
+.queue-overview .facts dd { overflow-wrap: anywhere; }
 .run-duration { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .run-meta { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .started-column { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -376,7 +381,7 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .status::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 .status.completed { color: var(--success-ink); }
 .status.running { color: var(--info-ink); }
-.status.preparing { color: var(--warning-ink); }
+.status.pending, .status.preparing, .status.waiting { color: var(--warning-ink); }
 .status.failed { color: var(--error-ink); }
 .status.cancelled, .status.lost { color: var(--inactive-ink); }
 .pagination { display: flex; align-items: center; justify-content: space-between; gap: 7px; border-top: 1px solid var(--line); padding: 4px 9px; font-size: 10px; color: var(--muted); flex-shrink: 0; }

@@ -293,7 +293,7 @@ worker run files remain available. The dashboard shows a **Smoke** badge.
 
 ### Shared resource queue
 
-With an updated server and an explicitly configured execution worker, queue a
+With a `resource-queue-v2` server and an updated execution worker, queue a
 managed task instead of choosing when to start it:
 
 ```sh
@@ -304,8 +304,13 @@ expri queue cancel job-abc123
 expri queue workers
 ```
 
-Submission freezes and uploads the source before returning a job ID, so the
-laptop can disconnect. Workers report their budget and heartbeat to the server,
+Submission freezes and uploads source, then blocks while the server holds the
+job in `pending` for resources. It returns a job receipt when the worker confirms
+the task has started; it does not wait for completion. Use `--queue --detach`
+to return the durable job receipt immediately. Progress and the pending reason
+appear on stderr; `--json` emits one final receipt on stdout. Ctrl-C stops waiting
+and leaves the server job intact; use `expri queue cancel <job_id>` to cancel it.
+Workers report their budget and heartbeat to the server,
 which assigns fitting jobs across online workers and reserves their resources.
 CPU-only jobs prefer CPU-only workers. CPU counts are logical slots and memory is a reservation
 among queued jobs; whole GPUs are assigned exclusively among these jobs.
@@ -359,13 +364,16 @@ Live detection currently requires full NVIDIA UUID selectors. Unsupported device
 or failed checks remain unavailable; CPU jobs can continue. `queue workers`
 reports free/total resources, busy or unverified GPUs, and pending assignments. Read
 [worker setup and recovery](docs/self-hosted-service.md#shared-resource-queue)
-or `expri skill queue`. The job receives a run ID only after dispatch; published
-runs then appear in the existing dashboard.
+or `expri skill queue`. The dashboard includes pending jobs and their resource
+requests before dispatch, then follows the worker run when its metadata arrives.
+Only task execution has a run ID and measured elapsed time. Task-controlled
+`waiting` keeps its allocation; server-controlled `pending` has not started.
 
 Each configured-environment run receives these variables:
 
 | Variable | Meaning |
 | --- | --- |
+| `EXPRI_BIN` | Path to the executable when launched by the native worker |
 | `EXPRI_RUN_ID` | The run's identifier |
 | `EXPRI_RUN_DIR` | Absolute path to the run directory |
 | `EXPRI_OUTPUT_DIR` | Absolute path to the run's output directory |
@@ -382,6 +390,24 @@ to the terminal. Environment-preparation diagnostics also go to the stderr log;
 the helper's private JSON response stays out of task stdout. Run records include
 the command, timestamps, status, exit code, and log paths. Older run directories
 remain readable when optional records or logs are missing.
+
+Tasks can report an active `waiting` phase and return to `running`:
+
+```sh
+"$EXPRI_BIN" runs set-status waiting
+# Wait for the next batch or external work.
+"$EXPRI_BIN" runs set-status running
+```
+
+These commands run on the training machine, use `EXPRI_RUN_DIR`, and need no
+project or server configuration. Add `--run-dir` for an explicit live run and
+`--json` for a structured response. Repeated requests are idempotent. The
+supervisor owns preparation and final states; tasks cannot change a finished run.
+Waiting preserves the original start time, system capture, publication, and
+cancellation, so elapsed time includes the wait. The optional dependency-free
+[`expri_run.py`](crates/worker/python/expri_run.py) helper exposes
+`set_run_status("waiting")` and `set_run_status("running")`, including on the
+Python worker fallback; copy it into the task's source before importing it.
 
 Execution stays in the foreground by default. On Unix, `run --detach <task>`
 starts a separate supervisor session and prints a start table; add `--json`
@@ -431,8 +457,8 @@ expri -T runpod runs list --task train --status failed --limit 5
 expri -T runpod runs show run-abc123 --json
 ```
 
-`list` defaults to the 20 newest records. Its status filters are `preparing`,
-`running`, `completed`, `failed`, `cancelled`, and `unknown`. `show` includes the run state,
+`list` defaults to the 20 newest records. Its status filters are `pending`, `preparing`,
+`running`, `waiting`, `completed`, `failed`, `cancelled`, `lost`, and `unknown`. `show` includes the run state,
 source snapshot provenance, and recorded Python environment when available.
 Missing, malformed, or unsupported records produce warnings; incomplete runs
 can still be inspected. These commands read fixed records rather than scanning

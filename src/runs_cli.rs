@@ -22,7 +22,9 @@ enum RunsSubcommand {
   Fetch(RunsFetchCommand),
   /// Check recorded status and detached supervisor liveness.
   Status(RunsJobCommand),
-  /// Read saved stdout or stderr, optionally following a running task.
+  /// Set the current task phase on this training machine.
+  SetStatus(RunsSetStatusCommand),
+  /// Read saved stdout or stderr, optionally following an active task.
   Logs(RunsLogsCommand),
   /// Request graceful cancellation of a detached run.
   Cancel(RunsJobCommand),
@@ -60,6 +62,17 @@ struct RunsJobCommand {
 }
 
 #[derive(Debug, Args)]
+struct RunsSetStatusCommand {
+  #[arg(value_parser = clap::builder::PossibleValuesParser::new(expri_core::run_state::TASK_STATUSES.iter().copied()))]
+  status: String,
+  /// Defaults to EXPRI_RUN_DIR inside an expri task.
+  #[arg(long)]
+  run_dir: Option<PathBuf>,
+  #[arg(long)]
+  json: bool,
+}
+
+#[derive(Debug, Args)]
 struct RunsLogsCommand {
   #[command(flatten)]
   connection: ConnectionArgs,
@@ -82,7 +95,7 @@ struct RunsListCommand {
   cached: bool,
   #[arg(long)]
   task: Option<String>,
-  #[arg(long, value_parser = ["preparing", "running", "completed", "failed", "cancelled", "unknown"])]
+  #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(expri_core::run_state::STATUSES.iter().copied()))]
   status: Option<String>,
   #[arg(long, default_value_t = 20)]
   limit: usize,
@@ -118,6 +131,26 @@ struct RunsFetchCommand {
 
 pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let (options, cached, request, dry_run) = match command.command {
+    RunsSubcommand::SetStatus(command) => {
+      if target.is_some() {
+        return Err(ExpriError::Message(
+          "task status is set on the training machine; omit -T".into(),
+        ));
+      }
+      let run_dir = command
+        .run_dir
+        .or_else(|| std::env::var_os("EXPRI_RUN_DIR").map(PathBuf::from))
+        .ok_or_else(|| {
+          ExpriError::Message(
+            "specify --run-dir or run inside an expri task with EXPRI_RUN_DIR".into(),
+          )
+        })?;
+      let report = expri_core::run_state::set_task_status(&run_dir, &command.status)?;
+      if command.json || !quiet {
+        crate::output::print_report(&report, command.json)?;
+      }
+      return Ok(());
+    }
     RunsSubcommand::Metrics(command) => {
       return crate::metrics_cli::run_metrics(command, target, verbosity, quiet);
     }

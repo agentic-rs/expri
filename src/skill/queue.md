@@ -10,11 +10,17 @@ expri queue cancel job-abc123 --json
 expri queue workers --json
 ```
 
-Put run options before the task name. Submission freezes and uploads source
-before returning a job ID, so the laptop can disconnect. The source ZIP and
-extracted contents each have a 512 MiB limit; use managed assets for large inputs.
-Only execution links an actual run ID. Use that run ID for published dashboard
-results, `query files`, and worker run inspection.
+Put run options before the task name. Submission freezes and uploads source,
+then waits while the server holds the job in `pending` for resources. The CLI
+returns once the worker confirms the task started, without waiting for completion.
+Add `--queue --detach` for an immediate durable job receipt. Progress includes the
+job ID and pending reason on stderr; `--json` emits one final receipt on stdout.
+Ctrl-C stops waiting while the server retains the job. Cancel it explicitly with
+`expri queue cancel <job_id>` if needed.
+
+The source ZIP and extracted contents each have a 512 MiB limit; use managed
+assets for large inputs. Only execution links an actual run ID. Use that run ID
+for published dashboard results, `query files`, and worker run inspection.
 
 Memory must be supplied with `--memory` or task defaults. CPU defaults to one
 logical slot and GPU count to zero. Task defaults use:
@@ -166,4 +172,7 @@ expri queue recover attempt-abc123 --confirmed-stopped --json
 Recovery releases the allocation and marks the attempt lost without rerunning it.
 Active cancellation retains resources until the worker confirms completion.
 `--no-publish` disables run publishing; otherwise ordinary publishing and smoke
-archival apply. The queue itself is currently inspected through the CLI.
+archival apply. The dashboard shows pending jobs, resource requests, assigned
+workers, and wait reasons before following their published native runs. Pending
+jobs have no execution elapsed time, metrics, files, or system capture. A task may
+report `waiting` after starting; it keeps its reserved resources until termination.

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 use clap::Parser;
 use serde_json::{Value, json};
@@ -93,6 +93,8 @@ elif arguments[:4] == ["run", "--no-sync", "--no-env-file", "hf"]:
   setup_event(observation("hf", arguments))
 elif arguments[:5] == ["run", "--no-sync", "--no-env-file", "--", "bash"]:
   sys.exit(subprocess.run(arguments[4:]).returncode)
+elif arguments[:6] == ["run", "--no-sync", "--no-env-file", "--", "python", "waiting_task.py"]:
+  sys.exit(subprocess.run(arguments[4:]).returncode)
 elif arguments[:4] == ["run", "--no-sync", "--no-env-file", "--"]:
   run_dir = Path(os.environ["EXPRI_RUN_DIR"])
   result = {
@@ -136,6 +138,24 @@ event = {
 with Path(".expri/setup-events.jsonl").open("a") as handle:
   handle.write(json.dumps(event) + "\n")
 PY
+"#;
+
+const WAITING_TASK: &str = r#"import json, os, pathlib, time
+from expri_run import set_run_status
+run = pathlib.Path(os.environ['EXPRI_RUN_DIR'])
+outputs = pathlib.Path(os.environ['EXPRI_OUTPUT_DIR'])
+set_run_status('waiting')
+outputs.joinpath('waiting-state.json').write_text(run.joinpath('run-state.json').read_text())
+print('waiting', flush=True)
+gate = pathlib.Path(os.environ['EXPRI_TEST_SOURCE_ROOT']) / 'waiting-release'
+deadline = time.monotonic() + 10
+while not gate.exists():
+  if time.monotonic() > deadline: raise RuntimeError('waiting test release timed out')
+  time.sleep(0.01)
+if os.environ.get('EXPRI_TEST_RESUME_WAITING') == '1':
+  set_run_status('running')
+  outputs.joinpath('resumed-state.json').write_text(run.joinpath('run-state.json').read_text())
+  print('resumed', flush=True)
 "#;
 
 #[derive(Clone, Copy, Debug)]
@@ -302,6 +322,64 @@ impl Fixture {
     assert_eq!(paths.len(), 1, "expected exactly one run");
     paths.into_iter().next().expect("run directory")
   }
+
+  fn waiting_task(detached: bool) -> Self {
+    let mut fixture = Self::new();
+    fs::write(
+      fixture.repo_root.join("expri_run.py"),
+      expri_worker::RUN_STATUS_HELPER_SCRIPT,
+    )
+    .unwrap();
+    fs::write(fixture.repo_root.join("waiting_task.py"), WAITING_TASK).unwrap();
+    fs::write(
+      fixture.repo_root.join(".expri/checkout.manifest"),
+      "train.py\npyproject.toml\nexpri_run.py\nwaiting_task.py\n",
+    )
+    .unwrap();
+    fixture.request.command = vec!["python".into(), "waiting_task.py".into()];
+    fixture.request.detach = detached;
+    fs::write(
+      &fixture.request_path,
+      serde_json::to_vec(&fixture.request).unwrap(),
+    )
+    .unwrap();
+    fixture
+  }
+
+  fn wait_waiting(&self) -> PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+      if let Ok(entries) = fs::read_dir(self.repo_root.join(".expri/runs")) {
+        for entry in entries.flatten() {
+          if entry.path().join("outputs/waiting-state.json").is_file() {
+            return entry.path();
+          }
+        }
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "task did not acknowledge waiting"
+      );
+      std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+  }
+}
+
+struct RunProcess(Option<Child>);
+
+impl RunProcess {
+  fn wait(mut self) -> Output {
+    self.0.take().unwrap().wait_with_output().unwrap()
+  }
+}
+
+impl Drop for RunProcess {
+  fn drop(&mut self) {
+    if let Some(child) = self.0.as_mut() {
+      let _ = child.kill();
+      let _ = child.wait();
+    }
+  }
 }
 
 fn read_json(path: &Path) -> Value {
@@ -387,6 +465,9 @@ fn native_run_child() {
       panic!("expected run command");
     };
     crate::run_task(command, cli.target.as_deref(), cli.verbose, cli.quiet)
+  } else if std::env::var_os("EXPRI_TEST_DETACHED_WORKER").is_some() {
+    let prepared = crate::node::run::prepare_request_at(&request, &repo_root).unwrap();
+    crate::node::run::worker(&prepared.snapshot.run_dir)
   } else {
     crate::node::run::apply_request_at(&request, &repo_root)
   };
@@ -857,6 +938,98 @@ fn native_and_python_runs_preserve_snapshot_request_environment_and_outputs() {
       assert!(env[key].is_null(), "{backend:?} leaked {key}");
     }
   }
+}
+
+#[test]
+fn native_and_python_waiting_tasks_resume_or_finish_without_resetting_the_run_period() {
+  for backend in [Backend::Native, Backend::Python] {
+    for resume in [false, true] {
+      let fixture = Fixture::waiting_task(false);
+      let child = fixture
+        .command(backend, false)
+        .env("EXPRI_TEST_RESUME_WAITING", if resume { "1" } else { "0" })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+      let process = RunProcess(Some(child));
+      let run = fixture.wait_waiting();
+      let waiting = read_json(&run.join("outputs/waiting-state.json"));
+      assert_eq!(waiting["status"], "waiting");
+      let report = crate::jobs::status_at(
+        &fixture.repo_root,
+        run.file_name().unwrap().to_str().unwrap(),
+      )
+      .unwrap();
+      assert_eq!(report["status"], "waiting");
+      assert_eq!(report["alive"], true);
+      fs::write(fixture.repo_root.join("waiting-release"), "").unwrap();
+      let output = process.wait();
+      assert!(
+        output.status.success(),
+        "{backend:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+      );
+      let state = read_json(&run.join("run-state.json"));
+      assert_eq!(state["status"], "completed");
+      assert_eq!(state["exit_code"], 0);
+      assert_eq!(state["started_at"], waiting["started_at"]);
+      assert!(
+        state["task_started_at"]
+          .as_str()
+          .is_some_and(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok())
+      );
+      if resume {
+        let resumed = read_json(&run.join("outputs/resumed-state.json"));
+        assert_eq!(resumed["status"], "running");
+        assert_eq!(resumed["started_at"], waiting["started_at"]);
+      }
+      assert_eq!(
+        fs::read(run.join("logs/stdout.log")).unwrap(),
+        if resume {
+          b"waiting\nresumed\n".as_slice()
+        } else {
+          b"waiting\n".as_slice()
+        }
+      );
+    }
+  }
+}
+
+#[test]
+fn native_waiting_task_cancellation_keeps_the_real_child_exit_code_and_launch_marker() {
+  let fixture = Fixture::waiting_task(true);
+  let child = fixture
+    .command(Backend::Native, false)
+    .env("EXPRI_TEST_DETACHED_WORKER", "1")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let process = RunProcess(Some(child));
+  let run = fixture.wait_waiting();
+  let run_id = run.file_name().unwrap().to_str().unwrap();
+  let report = crate::jobs::query_at(
+    &crate::protocol::JobRequest::Cancel {
+      run_id: run_id.into(),
+    },
+    &fixture.repo_root,
+  )
+  .unwrap();
+  assert_eq!(report["status"], "waiting");
+  assert_eq!(report["cancel_requested"], true);
+  let output = process.wait();
+  assert!(
+    output.status.success(),
+    "native supervisor fixture: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let state = read_json(&run.join("run-state.json"));
+  assert_eq!(state["status"], "cancelled");
+  assert_eq!(state["exit_code"], 130);
+  assert_eq!(state["task_exit_code"], 143);
+  assert!(state["task_started_at"].is_string());
+  assert_eq!(fs::read(run.join("logs/stdout.log")).unwrap(), b"waiting\n");
 }
 
 #[test]

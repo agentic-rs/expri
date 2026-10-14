@@ -67,6 +67,71 @@ fn state(store: &LocalStore, id: &str) -> Value {
 }
 
 #[test]
+fn waiting_keeps_capture_open_and_records_observations_after_a_stale_finish() {
+  let (_directory, mut store, run) = fixture();
+  let id = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  let mut waiting = state(&store, &id);
+  waiting["status"] = "waiting".into();
+  let before = waiting.clone();
+  close_state(&run, &mut waiting);
+  finalize_state(&run, &mut waiting);
+  assert_eq!(waiting, before);
+  assert!(!terminal(&waiting));
+  assert!(!terminal_capture(&waiting));
+  let row = capture(&store.connection, &id).unwrap();
+  assert!(!row.closed);
+  assert_eq!(row.end_ms, None);
+  record(&mut store, 2500);
+  store.export_run_capture(&id).unwrap();
+  assert!(records(&run).iter().any(|record| matches!(
+    record,
+    RunSystemRecord::Sample { sample } if sample.observed_at_ms == 2500
+  )));
+  assert!(
+    !records(&run)
+      .iter()
+      .any(|record| matches!(record, RunSystemRecord::End { .. }))
+  );
+}
+
+#[test]
+fn collector_metadata_leaves_waiting_intact_and_preserves_fields_when_terminal() {
+  let (_directory, mut store, run) = fixture();
+  let id = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  drop(lock::run_lock(&run).unwrap());
+  let mut waiting = state(&store, &id);
+  waiting["status"] = "waiting".into();
+  waiting["nickname"] = "experiment one".into();
+  waiting["tags"] = serde_json::json!(["batch"]);
+  waiting["task_metadata"] = serde_json::json!({"attempt": 2});
+  let path = run.join("run-state.json");
+  fs::write(&path, serde_json::to_vec(&waiting).unwrap()).unwrap();
+  store.close_run_capture(&id, 2000).unwrap();
+  store.finish_capture(&id, true, Vec::new()).unwrap();
+  let row = capture(&store.connection, &id).unwrap();
+  publish_capture_metadata(&store.connection, &row).unwrap();
+  assert_eq!(read_state(&path).unwrap(), waiting);
+  assert!(
+    !sql::<bool>(store.connection.query_row(
+      "SELECT metadata_saved FROM system_run_captures WHERE capture_id=?1",
+      [&id],
+      |row| row.get(0),
+    ))
+    .unwrap()
+  );
+  waiting["status"] = "completed".into();
+  fs::write(&path, serde_json::to_vec(&waiting).unwrap()).unwrap();
+  publish_capture_metadata(&store.connection, &row).unwrap();
+  let published = read_state(&path).unwrap();
+  assert_eq!(published["status"], "completed");
+  assert_eq!(published["exit_code"], waiting["exit_code"]);
+  assert_eq!(published["system_capture_status"], "complete");
+  assert_eq!(published["nickname"], waiting["nickname"]);
+  assert_eq!(published["tags"], waiting["tags"]);
+  assert_eq!(published["task_metadata"], waiting["task_metadata"]);
+}
+
+#[test]
 fn outbox_retains_exact_period_samples_after_raw_expiry() {
   let (_directory, mut store, run) = fixture();
   let id = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();

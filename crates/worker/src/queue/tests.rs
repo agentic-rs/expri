@@ -190,6 +190,7 @@ fn assignment() -> JobAssignment {
     fencing_token: "fence-a".into(),
     allocation: allocation(),
     run_id: None,
+    started_at_ms: None,
     status: AttemptStatus::Claimed,
     cancel_requested: false,
     created_at_ms: 0,
@@ -689,7 +690,34 @@ fn preparing_a_run_records_its_path_without_launching_and_can_cancel_before_laun
   let state: serde_json::Value = read_json(&run.join("run-state.json")).unwrap();
   assert_eq!(state["status"], "cancelled");
   assert_eq!(state["exit_code"], 130);
+  assert!(state["task_started_at"].is_null());
   assert!(!marker.exists());
+}
+
+#[test]
+fn allocated_run_identity_is_not_task_start_evidence_but_fast_terminal_marker_is() {
+  let mut attempt = assignment().attempt;
+  attempt.run_id = Some("run-a".into());
+  let prepared = json!({"status":"preparing","state":{"run_id":"run-a"}});
+  assert!(task_start_request(&attempt, &prepared).unwrap().is_none());
+  let aborted = json!({"status":"cancelled","state":{"run_id":"run-a","exit_code":130}});
+  assert!(task_start_request(&attempt, &aborted).unwrap().is_none());
+  let completed = json!({"status":"completed","state":{"run_id":"run-a",
+    "task_started_at":"2026-10-14T01:00:00Z","exit_code":0}});
+  let request = task_start_request(&attempt, &completed).unwrap().unwrap();
+  assert!(matches!(request, QueueRequest::MarkStarted { run_id, .. } if run_id == "run-a"));
+  attempt.started_at_ms = Some(1);
+  assert!(task_start_request(&attempt, &completed).unwrap().is_none());
+}
+
+#[test]
+fn task_start_evidence_rejects_unlinked_runs_and_invalid_timestamps() {
+  let mut attempt = assignment().attempt;
+  attempt.run_id = Some("run-a".into());
+  for (run_id, marker) in [("run-other", "2026-10-14T01:00:00Z"), ("run-a", "invalid")] {
+    let status = json!({"state":{"run_id":run_id,"task_started_at":marker}});
+    assert!(task_start_request(&attempt, &status).is_err());
+  }
 }
 
 #[test]

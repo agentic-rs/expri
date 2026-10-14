@@ -58,6 +58,32 @@ fn control(request: Request, origin: &str, source: &SourceRef) -> Response {
 }
 
 #[test]
+fn legacy_queue_servers_are_refused_before_submission_or_worker_registration() {
+  let (url, server) = mock(1, |request, _| {
+    assert!(matches!(
+      serde_json::from_slice::<Request>(&request.body).unwrap(),
+      Request::Capabilities
+    ));
+    (
+      200,
+      Vec::new(),
+      serde_json::to_vec(&Response::Capabilities {
+        features: vec!["resource-queue-v1".into()],
+      })
+      .unwrap(),
+    )
+  });
+  let root = tempfile::tempdir().unwrap();
+  let error = ResourceQueueClient::new(&config(root.path(), &url))
+    .err()
+    .unwrap()
+    .to_string();
+  assert!(error.contains("upgrade the server"));
+  assert!(error.contains("resource-queue-v2"));
+  server.join().unwrap();
+}
+
+#[test]
 fn pinned_sources_keep_integrity_and_private_permissions_in_both_transports() {
   for cooperative in [false, true] {
     let bytes = b"pinned source bytes";

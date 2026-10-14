@@ -429,6 +429,11 @@ impl Executor {
       journal.save(&directory)?;
     }
     if let Some(status) = status {
+      if let Some(started) = acknowledge_started(&self.client, &attempt, &status)? {
+        attempt = started;
+        journal.attempt = attempt.clone();
+        journal.save(&directory)?;
+      }
       if terminal_status(&status) {
         let terminal = match status["status"].as_str() {
           Some("completed") => AttemptTerminalStatus::Completed,
@@ -781,6 +786,47 @@ fn local_status(journal: &Journal) -> Result<Option<serde_json::Value>> {
   crate::jobs::status_at(repo, run_id).map(Some)
 }
 
+/// Local spawn evidence is durable even when a fast task finishes between polls.
+fn acknowledge_started(
+  client: &ResourceQueueClient,
+  attempt: &AttemptSummary,
+  status: &serde_json::Value,
+) -> Result<Option<AttemptSummary>> {
+  let Some(request) = task_start_request(attempt, status)? else {
+    return Ok(None);
+  };
+  let QueueResponse::Attempt { attempt } = client.request(&request)? else {
+    return Err(message("server did not acknowledge the task start"));
+  };
+  Ok(Some(attempt))
+}
+
+fn task_start_request(
+  attempt: &AttemptSummary,
+  status: &serde_json::Value,
+) -> Result<Option<QueueRequest>> {
+  if attempt.started_at_ms.is_some() || status["state"]["task_started_at"].is_null() {
+    return Ok(None);
+  }
+  let run_id = attempt
+    .run_id
+    .as_deref()
+    .ok_or_else(|| message("task start evidence has no server run identity"))?;
+  if status["state"]["run_id"].as_str() != Some(run_id)
+    || status["state"]["task_started_at"]
+      .as_str()
+      .is_none_or(|value| chrono::DateTime::parse_from_rfc3339(value).is_err())
+  {
+    return Err(message(
+      "task start evidence does not match the server allocation",
+    ));
+  }
+  Ok(Some(QueueRequest::MarkStarted {
+    attempt: attempt.identity(),
+    run_id: run_id.into(),
+  }))
+}
+
 fn queued_run_request(
   journal: &Journal,
   worker_id: &str,
@@ -882,7 +928,7 @@ fn cancel_known_attempt(
   Ok(())
 }
 
-fn acknowledge_known_terminal(
+fn acknowledge_known_progress(
   client: &ResourceQueueClient,
   worker_directory: &std::path::Path,
   attempt: &AttemptSummary,
@@ -910,6 +956,7 @@ fn acknowledge_known_terminal(
   let Some(status) = local_status(&journal)? else {
     return Ok(());
   };
+  acknowledge_started(client, attempt, &status)?;
   if !terminal_status(&status) {
     return Ok(());
   }
@@ -1083,7 +1130,7 @@ impl Heartbeats {
           if let Ok(QueueResponse::Worker { attempts, .. }) = response {
             for attempt in attempts {
               let _ = cancel_known_attempt(&directory, &attempt);
-              let _ = acknowledge_known_terminal(&client, &directory, &attempt);
+              let _ = acknowledge_known_progress(&client, &directory, &attempt);
             }
           }
           for _ in 0..10 {

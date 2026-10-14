@@ -36,6 +36,17 @@ Logs default to stdout and its last 100 lines. Following ends when the run
 finishes or its supervisor is lost. Interrupting the log reader leaves training
 running. For bounded agent inspection, start with a tail rather than a follow.
 
+## Task-controlled waiting
+
+Run `"$EXPRI_BIN" runs set-status waiting` from a live task to report that it is
+waiting for external work, then use `running` when work resumes. The operation
+uses `EXPRI_RUN_DIR`; `--run-dir` selects an explicit local live run, and `--json`
+prints the old/new status plus whether it changed. Omit `-T`: this operation
+runs on the training machine and bypasses project/server configuration.
+Only `running` and `waiting` can be requested. A waiting task remains alive,
+keeps its original start time, and continues publishing and collecting system
+readings. Repeated requests are idempotent; final states cannot be rewritten.
+
 ## Cancellation
 
 ```sh

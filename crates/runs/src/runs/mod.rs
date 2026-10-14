@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, FixedOffset, Utc};
+use expri_core::run_state::STATUSES;
 use serde_json::{Value, json};
 
 use crate::error::{ExpriError, Result};
@@ -14,15 +15,6 @@ const METADATA_LIMIT: u64 = 256 * 1024;
 const DETAIL_LIMIT: u64 = 16 * 1024 * 1024;
 const EXCLUDED_COMPONENTS: [&str; 6] =
   [".venv", ".expri", ".git", ".cache", "cache", "__pycache__"];
-const STATUSES: [&str; 7] = [
-  "preparing",
-  "running",
-  "completed",
-  "failed",
-  "cancelled",
-  "lost",
-  "unknown",
-];
 const METADATA_FILES: [&str; 4] = [
   crate::run_artifacts::INVENTORY_PATH,
   "run-state.json",

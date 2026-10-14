@@ -55,6 +55,7 @@ import {
 import { LiveUpdates, type LiveUpdatesState } from "./live_updates";
 import { SystemMonitor } from "./system_monitor";
 import { RunSystemMonitor, runSystemItem } from "./run_system";
+import { parseRunQueue, parseRunRedirect, queueContext, queuePlaceholder } from "./run_queue";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import {
   DashboardView,
@@ -77,6 +78,8 @@ export * from "./run_annotations";
 export * from "./dashboard_theme";
 export * from "./system_monitor";
 export * from "./run_system";
+export * from "./run_queue";
+export * from "./run_queue_view";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -426,6 +429,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       }
     },
     select_run: (id, checked) => {
+      if (runs.some(run => runIdentity(run) === id && queuePlaceholder(run))) return;
       discardDeepLink();
       if (checked && selected.size >= 8) return;
       checked ? selected.add(id) : selected.delete(id);
@@ -522,7 +526,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         (value === "storage" && currentSource()?.kind !== "hosted_project")) return;
       workspace_view = value;
       cancelQuietRefresh();
-      system_run_aligned = value === "system" && run_system_supported && review?.kind === "run";
+      system_run_aligned = value === "system" && run_system_supported && review?.kind === "run" && !reviewingQueueJob();
       syncRunSystemMode();
       system_monitor.setActive(value === "system" && !system_run_aligned);
       if (value !== "storage") {
@@ -676,8 +680,45 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function currentSource(): Source | undefined {
     return sources.find((source) => source.source_id === source_id);
   }
+  function reviewedRun(): Run | undefined {
+    const id = review?.kind === "run" ? review.run_ids[0] : undefined;
+    if (!id) return undefined;
+    return rendered_detail && runIdentity(rendered_detail.run) === id ? rendered_detail.run : runs.find(run => runIdentity(run) === id);
+  }
+  function reviewingQueueJob(): boolean {
+    const run = reviewedRun();
+    return run !== undefined && queuePlaceholder(run);
+  }
+  function adoptQueueRedirect(value: unknown, queue_record?: Run["queue"]): boolean {
+    if (value == null || review?.kind !== "run") return false;
+    const run = reviewedRun(), redirect = parseRunRedirect(value);
+    const previous_queue = run ? queueContext(run) : null;
+    const queue = queue_record === undefined ? previous_queue : parseRunQueue(queue_record);
+    const selected_id = review.run_ids[0];
+    const source_parts = source_id.split(":");
+    if (!queue || selected_id !== `queue::${queue.job_id}` || source_parts[1] !== queue.project_id ||
+      (previous_queue && (previous_queue.job_id !== queue.job_id || previous_queue.project_id !== queue.project_id)))
+      throw new Error("The queue update does not match its scheduling record.");
+    const target = redirect?.run_id.split(":");
+    const worker = target?.length === 2 ? target[0] : source_parts[2];
+    const native_id = target?.length === 2 ? target[1] : target?.[0];
+    if (!redirect || redirect.source_id !== source_id || worker !== queue.worker_id || native_id !== queue.run_id)
+      throw new Error("The queue job returned a different run. Refresh its scheduling record before continuing.");
+    const previous_id = review.run_ids[0];
+    review.run_ids = [redirect.run_id];
+    review_version++;
+    if (previous_id) { detail_cache.delete(previous_id); selected.delete(previous_id); }
+    rendered_detail = null;
+    log_view = null;
+    resetArtifacts(); resetAnnotationsAction(); resetArchivalAction();
+    detail_revisions.clear(); chart_revisions.clear(); log_revisions.clear();
+    comparison_revision = null; missing_review = null;
+    syncRunSystemMode();
+    publish();
+    return true;
+  }
   function runSystemActive(): boolean {
-    return run_system_supported && !!review && ((workspace_view === "workspace" && review.tab === "system") || (workspace_view === "system" && system_run_aligned));
+    return !reviewingQueueJob() && run_system_supported && !!review && ((workspace_view === "workspace" && review.tab === "system") || (workspace_view === "system" && system_run_aligned));
   }
   function syncRunSystemMode(): void {
     run_system_monitor.setContext(source_id, review?.run_ids ?? [], runSystemActive());
@@ -912,6 +953,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       void loadRunColumns(true);
     }
     if (quiet && unchanged && was_ready) return;
+    const focused = document.activeElement as HTMLElement | null;
+    const focused_key = focused?.closest<HTMLElement>("[data-run-key]")?.dataset.runKey;
+    const focused_job = runs.find(run => runIdentity(run) === focused_key && queuePlaceholder(run));
+    const replacement = focused_job ? result.runs.find(run => !queuePlaceholder(run) && run.queue?.job_id === focused_job.queue?.job_id) : undefined;
     runs = result.runs;
     reconcileArchivedSelection(runs);
     offset = result.offset;
@@ -927,6 +972,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       list_empty: null,
       list_busy: false,
     });
+    if (replacement && focused?.classList.contains("run-link")) {
+      const row = [...document.querySelectorAll<HTMLElement>("[data-run-key]")].find(node => node.dataset.runKey === runIdentity(replacement));
+      row?.querySelector<HTMLElement>(".run-link")?.focus({ preventScroll: true });
+    }
     if (!runs.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status || ui.origin), result.source);
     announce(`${result.total_count} matching runs`);
   }
@@ -1084,6 +1133,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     publish();
   }
   function selectReviewTab(tab: ReviewTab): void {
+    if (reviewingQueueJob() && tab !== "overview") return;
     if (!review || (tab === "system" && !run_system_supported) || (review.kind === "compare" && tab !== "charts" && tab !== "system")) return;
     cancelQuietRefresh();
     review.tab = tab;
@@ -1112,7 +1162,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     return data;
   }
   function updateChart(): void {
-    if (!review) return;
+    if (!review || reviewingQueueJob()) return;
     const url = chartUrl();
     chartControls();
     if (chart_context === url && (chart_lane.pending || cached_chart?.context === url)) return;
@@ -1249,6 +1299,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     }
   }
   function ensureLog(): void {
+    if (reviewingQueueJob()) return;
     if (
       review?.kind === "run" &&
       review !== missing_review &&
@@ -1274,6 +1325,15 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (review && !review.metric_selection_set) {
       review.metric_names = names.slice(0, 4);
       review.metric_selection_set = true;
+    }
+    if (queuePlaceholder(detail.run) && review) {
+      review.tab = "overview";
+      system_run_aligned = false;
+      log_view = null;
+      chart_lane.cancel(); chart_context = null; cached_chart = null;
+      updateUi({ chart_busy: false, chart_visible: false, chart_error: null });
+      syncRunSystemMode();
+      return true;
     }
     publish();
     if (preserve && log_view?.run_id === runIdentity(detail.run)) return true;
@@ -1408,6 +1468,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     previous?: Review,
     tab: ReviewTab = "charts",
   ): Promise<void> {
+    const record = runs.find(run => runIdentity(run) === id) ?? detail_cache.get(id)?.run;
+    if (record && queuePlaceholder(record)) tab = "overview";
     beginReview("run", [id], origin, tab);
     if (previous && review) {
       review.metric_names = [...previous.metric_names];
@@ -1479,6 +1541,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
         apiUrl("/api/run", { source: source_id, run_id: id }),
       );
       if (!detail) return false;
+      if (detail.redirect) {
+        if (!adoptQueueRedirect(detail.redirect, detail.run.queue)) throw new Error("The queue job could not resolve its worker run.");
+        id = detail.redirect.run_id;
+      }
       if (runIdentity(detail.run) !== id || detail.source.source_id !== source_id)
         throw new Error("The run details do not match the selected run.");
       cacheDetail(detail);
@@ -1716,6 +1782,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     ui.artifacts_error = null;
   }
   function ensureArtifacts(): void {
+    if (reviewingQueueJob()) return;
     if (
       review?.kind === "run" &&
       review !== missing_review &&
@@ -1943,6 +2010,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
           if (!current()) return "cancelled";
         }
       }
+      if (!source_changed && review?.kind === "run") {
+        const queue_update = updates?.runs.find(item => item.run_id === review?.run_ids[0]);
+        if (queue_update?.redirect) adoptQueueRedirect(queue_update.redirect, queue_update.queue);
+      }
       const current_review = review;
       if (current_review && !source_changed) {
         const revisions = current_review.run_ids.map((id) =>
@@ -1992,6 +2063,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
             ) {
               const detail = await quiet_lanes.detail.run<Detail>(context);
               if (!detail || !current() || review !== current_review) return "cancelled";
+              if (detail.redirect) adoptQueueRedirect(detail.redirect, detail.run.queue);
+              if (runIdentity(detail.run) !== review?.run_ids[0] || detail.source.source_id !== source_id)
+                throw new Error("The run details do not match the selected run.");
               const warnings_changed =
                 JSON.stringify(rendered_detail?.warnings) !== JSON.stringify(detail.warnings);
               if (!renderDetail(detail, true)) return "cancelled";

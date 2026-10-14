@@ -6,6 +6,7 @@ use std::io::{BufRead, BufReader, Read};
 use chrono::DateTime;
 use expri_core::error::{ExpriError, Result};
 use expri_core::identifiers::validate_component;
+use expri_core::run_state::{is_active_status, is_terminal_status};
 use expri_core::run_system::RunSystemRecord;
 use expri_core::system_profile::{InventoryRevision, MetricKind, SystemSample};
 use serde::{Deserialize, Serialize};
@@ -89,12 +90,10 @@ pub struct RunSystemWindow {
 
 impl RunSystemWindow {
   pub fn from_state(run_id: &str, state: &Value) -> Option<Self> {
+    let status = state["status"].as_str()?;
     if state["run_id"].as_str()? != run_id
       || state["schema_version"].as_u64()? != 1
-      || !matches!(
-        state["status"].as_str()?,
-        "preparing" | "running" | "completed" | "failed" | "cancelled" | "lost"
-      )
+      || !(is_active_status(status) || is_terminal_status(status))
     {
       return None;
     }
@@ -105,14 +104,15 @@ impl RunSystemWindow {
     let start_ms = DateTime::parse_from_rfc3339(state["started_at"].as_str()?)
       .ok()?
       .timestamp_millis();
-    let terminal = matches!(
-      state["status"].as_str()?,
-      "completed" | "failed" | "cancelled" | "lost"
-    );
-    let end_ms = state["finished_at"]
-      .as_str()
-      .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-      .map(|value| value.timestamp_millis());
+    let terminal = is_terminal_status(status);
+    let end_ms = if terminal {
+      state["finished_at"]
+        .as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+    } else {
+      None
+    };
     if start_ms < 0 || end_ms.is_some_and(|end| end < start_ms) || terminal && end_ms.is_none() {
       return None;
     }
