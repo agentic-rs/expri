@@ -10,7 +10,7 @@ Each machine stores this new data under `~/.tokn/expri`:
   collector.lock    # Live collector lease
   collector.json   # Local collection status
   publishing.json   # Last publisher status and error
-  worker-service/  # Service lease, status and private durable run jobs
+  worker-service/  # Service lease, status, saved component choices and private durable run jobs
 ```
 
 Existing project configuration, assets, uv caches, runs, and experiment
@@ -42,7 +42,29 @@ training alive. Ctrl-C stops a foreground service. After reboot, the next run,
 publication, or explicit start recovers saved jobs; expri does not install an OS
 service. Commands execute on the current machine and reject `-T`; invoke them on
 the worker itself. `service status` creates no files and reports collection,
-machine publishing and run jobs separately.
+machine publishing, capture export, run publishing, and queue execution separately.
+The three public components are `collection`, `publishing`, and `queue-execution`.
+Collection supervises sampling and capture export; publishing supervises machine
+history and run uploads. Each group supervises its own threads; stopping or
+failing one does not stop the others. Control the relevant component with:
+
+```sh
+expri service stop --component collection
+expri service start --component collection
+expri service status --component publishing
+expri service stop --component publishing
+expri service start --component publishing
+```
+
+Component choices are saved across process restarts. Automatic startup and a
+whole-service start respect paused choices. Paused collection leaves gaps in
+observations and retains committed capture readings in the durable outbox.
+Terminal run supervisors can still finalize their own captures. A component
+start reloads its settings after its preceding threads have stopped; use stop then
+start to apply changes to a running component. Control requests return before
+draining completes; inspect status while it is stopping. `--foreground` starts
+the whole shared process and cannot be combined with `--component`.
+See [all component names and stop behavior](self-hosted-service.md#independent-worker-components).
 
 The old `expri system daemon` command is a deprecated foreground compatibility
 alias for the shared worker service. Its `--no-publish` disables only machine
@@ -116,8 +138,15 @@ expri service start
 expri system publish --client-config /path/to/machine-client.toml
 ```
 
-Restart an already running service after changing its collection or publishing
-configuration. Machine publishing requires the explicit saved setting above;
+Restart the affected component after changing its configuration:
+
+```sh
+expri service stop --component publishing
+expri service start --component publishing
+```
+
+Use `collection` instead to apply a changed sampling interval. These restarts
+leave other component threads running. Machine publishing requires the explicit saved setting above;
 a general `[server]` connection alone leaves it `unconfigured` in service status.
 Run publication and machine history use their own scoped credentials.
 

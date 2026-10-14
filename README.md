@@ -59,8 +59,14 @@ New machine configuration and profile history live in `~/.tokn/expri`.
 Native runs start one shared worker service lazily and reuse it across runs.
 It samples every ten seconds and stays running until `expri service stop` or a
 worker restart. Use `expri service start --foreground` to run it in a terminal.
-Optional machine-scoped
-publishing runs independently, so server outages do not delay collection.
+Collection, publishing, and queue execution have independently supervised threads.
+Collection includes capture export; publishing handles machine history and run
+uploads. Pause one with `expri service stop --component publishing`, resume it
+with `expri service start --component publishing`, and inspect it with
+`expri service status --component publishing`. Saved component choices
+survive process restarts and automatic startup. Component failures and server
+outages do not stop the other parts. See
+[component controls](docs/self-hosted-service.md#independent-worker-components).
 Both local and server stores keep 72 hours of machine detail and retain historical
 hourly summaries indefinitely. New runs also preserve their exact system observations
 for as long as the run is retained. Existing project configuration, caches, and run
@@ -321,6 +327,9 @@ These defaults apply to `run --queue`. Memory must be supplied in the task or
 CLI; CPU defaults to one slot and GPUs to zero. Each worker needs a local
 `[queue_worker]` declaration and the shared `expri service start` runtime; use
 `--foreground` to run it in a terminal.
+`service stop --component queue-execution` pauses task polling without stopping
+collection, uploads, or existing training. Resume with
+`service start --component queue-execution` to reconcile held attempts.
 Capacity defaults to detected logical CPUs, 90% of RAM, and selectable whole GPUs.
 Optional capacity fields override these defaults; `gpus = []` disables GPU allocation.
 `queue workers` reports available/total resources and pending assignments. Read

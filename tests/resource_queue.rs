@@ -668,12 +668,18 @@ impl Fixture {
   }
 
   fn service_report(&self, action: &str) -> Value {
-    let output = self
-      .command()
+    self.component_report(action, None)
+  }
+
+  fn component_report(&self, action: &str, component: Option<&str>) -> Value {
+    let mut command = self.command();
+    command
       .args(["service", action, "--json", "--storage-dir"])
-      .arg(&self.worker_storage)
-      .output()
-      .unwrap();
+      .arg(&self.worker_storage);
+    if let Some(component) = component {
+      command.args(["--component", component]);
+    }
+    let output = command.output().unwrap();
     assert_success(&output);
     serde_json::from_slice(&output.stdout).unwrap()
   }
@@ -874,6 +880,86 @@ fn shared_service_reports_queue_capacity_and_stop_preserves_training_for_restart
   assert_eq!(fixture.starts().len(), 1);
   let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
   assert_eq!(workers["workers"][0]["available"]["cpus"], 2);
+}
+
+#[test]
+fn queue_execution_can_pause_and_resume_while_training_and_other_components_continue() {
+  let fixture = Fixture::new();
+  let gate = fixture.gate("component-active");
+  let job = fixture.submit(&gate, &["--cpus", "2", "--memory", "2GiB"]);
+  let job_id = job["job_id"].as_str().unwrap();
+  let _service = fixture.daemon(2, 2 << 30, false);
+  fixture.await_status(job_id, &["running"]);
+  fixture.await_starts(1);
+  let initial = fixture.service_report("status");
+  fixture.component_report("stop", Some("queue-execution"));
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    let status = fixture.service_report("status");
+    if status["components"]["queue_execution"]["phase"] == "stopped" {
+      assert_eq!(status["pid"], initial["pid"]);
+      assert_eq!(status["components"]["collection"]["phase"], "running");
+      assert_eq!(status["components"]["publishing"]["phase"], "running");
+      assert_eq!(
+        status["components"]["queue_execution"]["desired_running"],
+        false
+      );
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "executor did not pause: {status}"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  assert_eq!(fixture.show(job_id)["status"], "running");
+  assert_eq!(fixture.starts().len(), 1);
+  let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
+  assert_eq!(workers["workers"][0]["reserved"]["cpus"], 2);
+  fs::write(&gate, b"release").unwrap();
+  fixture.component_report("start", Some("queue-execution"));
+  fixture.await_status(job_id, &["completed"]);
+  assert_eq!(fixture.service_report("status")["pid"], initial["pid"]);
+  assert_eq!(fixture.starts().len(), 1);
+  let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
+  assert_eq!(workers["workers"][0]["available"]["cpus"], 2);
+}
+
+#[test]
+fn queued_runs_can_execute_with_collection_paused_without_claiming_a_complete_capture() {
+  let fixture = Fixture::new();
+  let _service = fixture.daemon(2, 2 << 30, false);
+  // This also handles a pause racing with initial collection startup.
+  fixture.component_report("stop", Some("collection"));
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    let status = fixture.service_report("status");
+    if status["components"]["collection"]["phase"] == "stopped" {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "collection did not pause: {status}"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  let gate = fixture.gate("paused-collection");
+  let job = fixture.submit(&gate, &["--cpus", "1", "--memory", "1GiB"]);
+  let job_id = job["job_id"].as_str().unwrap();
+  fixture.await_status(job_id, &["running"]);
+  fixture.await_starts(1);
+  let output = fixture.output_path("frozen.txt");
+  let run = output.parent().unwrap().parent().unwrap();
+  let state: Value =
+    serde_json::from_slice(&fs::read(run.join("run-state.json")).unwrap()).unwrap();
+  assert!(state["system_capture_id"].is_null(), "{state}");
+  assert!(state["system_capture_error"].as_str().is_some(), "{state}");
+  assert_eq!(
+    fixture.service_report("status")["components"]["collection"]["desired_running"],
+    false
+  );
+  fs::write(&gate, b"release").unwrap();
+  fixture.await_status(job_id, &["completed"]);
 }
 
 #[test]

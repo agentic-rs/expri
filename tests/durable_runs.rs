@@ -306,9 +306,19 @@ fn first_native_run_starts_collection_and_later_runs_reuse_it() {
     old,
     "stopping service must leave training alive"
   );
-  let restarted: Value =
+  let mut restarted: Value =
     serde_json::from_slice(&fixture.run(&["service", "start", "--json"]).stdout).unwrap();
   assert_ne!(restarted["pid"], initial["pid"]);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while restarted["collection_ready"] != true {
+    assert!(
+      Instant::now() < deadline,
+      "restarted collection was not ready: {restarted}"
+    );
+    thread::sleep(Duration::from_millis(25));
+    restarted =
+      serde_json::from_slice(&fixture.run(&["service", "status", "--json"]).stdout).unwrap();
+  }
   assert_eq!(restarted["collection"]["machine_id"], state["machine_id"]);
   let id = first["run_id"].as_str().unwrap();
   fixture.run(&["runs", "cancel", id, "--json"]);
@@ -325,6 +335,26 @@ fn service_startup_failure_is_recorded_without_preventing_training() {
   assert_eq!(state["status"], "completed");
   assert_eq!(state["exit_code"], 0);
   assert!(state["worker_service_error"].as_str().is_some());
+}
+
+#[test]
+fn native_runs_respect_paused_collection_and_keep_training_available() {
+  let fixture = Fixture::new();
+  fixture.run(&["service", "stop", "--component", "collection", "--json"]);
+  let output = fixture.run(&["run", "train", "success"]);
+  assert!(String::from_utf8_lossy(&output.stderr).contains("training will continue locally"));
+  let state = record(&only_run(&fixture), "run-state.json");
+  assert_eq!(state["status"], "completed");
+  assert_eq!(state["exit_code"], 0);
+  assert!(state["worker_service_error"].as_str().is_some());
+  assert!(state["system_capture_id"].is_null());
+  assert!(state["system_capture_error"].as_str().is_some());
+  let status: Value =
+    serde_json::from_slice(&fixture.run(&["service", "status", "--json"]).stdout).unwrap();
+  assert_eq!(status["running"], true);
+  assert_eq!(status["collection_ready"], false);
+  assert_eq!(status["components"]["collection"]["phase"], "stopped");
+  assert_eq!(status["components"]["collection"]["desired_running"], false);
 }
 
 #[test]

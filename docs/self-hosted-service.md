@@ -11,7 +11,10 @@ run can start.
 
 Native runs lazily start one shared worker service for the current user and
 storage root. It collects system observations and schedules each run's durable
-publication job with isolated credentials. Explicit
+publication job with isolated credentials. Collection, publishing, and queue
+execution run as independently controlled components within that process.
+Collection includes capture export, while publishing includes machine history
+and run uploads. Explicit
 service commands remain available for existing runs and selected checkpoints.
 The optional shared resource queue schedules frozen submissions across explicitly
 configured execution workers. Existing direct runs and publishing remain available.
@@ -305,7 +308,8 @@ The queue lives at the original checkout's
 `.expri/publish`; keep it and the original run files until publication is
 acknowledged. The shared service survives terminal closure and task completion.
 After reboot, the next run, publication, or `service start` recovers saved jobs;
-expri does not install an OS startup service. For new tracking runs, `published` means all
+saved component pauses remain in effect. Expri does not install an OS startup
+service. For new tracking runs, `published` means all
 terminal tracking bytes and registered checkpoints were acknowledged and the server upload job was accepted;
 it does not mean the independent result ZIP upload has finished. Upload
 failures retain tracking data and retry without restarting training. For legacy
@@ -335,10 +339,55 @@ expri service stop
 `start` is idempotent in background mode; `--foreground` refuses a duplicate.
 `status` never starts the service or creates files. `stop` leaves training alive
 and preserves queued work. The next run or publishing request starts it again.
-The process stays running while idle until explicitly stopped. Collection,
-machine-history publication and run publication have separate status and loops.
+The process stays running while idle until explicitly stopped.
 Machine publishing needs its own configuration and scoped token; run tokens
 alone do not enable it. See [system profiles](system-profiles.md).
+
+### Independent worker components
+
+Start the service once. Each component owns its supervised threads and can be
+started, stopped, or inspected while the other components continue:
+
+| Component name | Work | Effect of stopping |
+| --- | --- | --- |
+| `collection` | Sample the machine and export committed readings into run captures | Finish the in-flight observation, release the collector lease, and preserve the capture outbox; terminal supervisors can finalize captures |
+| `publishing` | Upload machine profiles, run metadata, streams, and registered checkpoints | Drain cancelled uploads and preserve pending batches, jobs, and transfer receipts |
+| `queue-execution` | Report execution resources and accept server assignments | Stop polling and heartbeats; keep training, launch journals, and accepted allocations for reconciliation |
+
+```sh
+expri service stop --component publishing
+expri service status --component publishing
+expri service start --component publishing
+expri service status --component queue-execution --json
+```
+
+Manual component choices are saved privately in
+`~/.tokn/expri/worker-service/components.json`. They survive whole-service restart,
+and automatic startup from a run or publishing request respects paused choices.
+Stopping the whole service does not change those choices. Component start reuses
+the same process, starting it if needed with the saved enabled components.
+`--foreground` starts the supervisor in the terminal and cannot be combined with
+`--component`; use another terminal to control its components.
+
+Starting a stopped or failed component loads its configuration afresh. Starting
+an already healthy running component is idempotent; a start request retries a
+group with failed or paused internal parts. Apply changed settings with stop
+then start; the new generation waits until all preceding threads join and owned
+transfers drain. Existing run jobs retain their pinned destination and credentials;
+restarting publishing reloads machine-profile settings without rebinding those jobs.
+Use stop then start when enabling machine publishing that was previously unconfigured.
+Requests acknowledge the requested state immediately, so status
+may show stopping or starting before the transition completes. Status reports
+the requested state, phase, generation, and safe details for each internal part;
+JSON uses snake_case component and part keys. Process readiness is independent
+of collection readiness. A failed internal thread leaves other parts running
+and makes the component degraded; repair its configuration or resources, then
+stop and start that component. Failure does not stop the other components.
+
+Pausing publishing does not cancel runs. New registrations remain durable,
+and `publish --wait`/`--watch` reports the pause rather than waiting indefinitely.
+Pausing collection prevents automatic startup from overriding that choice;
+runs continue with a collection warning and retain already recorded capture data.
 
 For existing runs, publication can also be queued explicitly:
 
@@ -353,7 +402,7 @@ then returns a durable receipt. Add `--wait` to wait quietly or `--watch` to sho
 progress until completion. Ctrl-C stops observation while the shared service
 continues uploading. Add `--json` for a structured receipt or final report.
 Waiting exits unsuccessfully if a job is rejected or the service stops before
-publication completes; the report preserves its saved status.
+publication completes, or publishing is paused; saved work is preserved.
 
 The uploader checks every five seconds and forwards metadata snapshots,
 parameters, complete metric rows, and stdout/stderr bytes. It sends appended
@@ -596,6 +645,10 @@ in the background. Without `[queue_worker]`, collection and publishing
 continue without enabling task execution. A queue server outage does not stop
 local collection. `service stop` stops queue polling while training continues;
 the next start reconciles existing supervisors and held reservations.
+Use `service stop --component queue-execution` to pause only execution, and
+`service start --component queue-execution` to resume it. Other component threads
+keep collecting or uploading. Restart this component to reload worker enrollment
+or re-detect inferred capacity; its resolved budget stays fixed per generation.
 An accepted task interrupted before launch retains its journal and allocation
 for confirmed recovery; service restart does not automatically relaunch it.
 CPU and memory reservations govern these queued jobs and do not
@@ -632,7 +685,7 @@ Use queue commands for waiting work, and the existing dashboard/query commands f
 published runs. Queue jobs themselves are currently visible through the CLI.
 
 Worker state, claim receipts, and launch journals live under
-`~/.tokn/expri/queue/`; existing project storage is not moved. A daemon restart
+`~/.tokn/expri/queue/`; existing project storage is not moved. An executor restart
 reconciles known runs without launching them again. Losing a 60-second worker lease
 releases only assignments the worker has not accepted. Accepted attempts become
 uncertain and keep their reservations, because a disconnected

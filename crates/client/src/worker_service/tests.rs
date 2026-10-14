@@ -47,7 +47,7 @@ fn independent_job_with_same_id(job: &PreparedJob, copy_root: &std::path::Path) 
 fn wait_ready(paths: &StoragePaths) {
   let deadline = Instant::now() + Duration::from_secs(3);
   loop {
-    if status(paths).unwrap()["ready"] == true {
+    if status(paths).unwrap()["collection_ready"] == true {
       return;
     }
     assert!(Instant::now() < deadline, "service never became ready");
@@ -59,6 +59,423 @@ fn collector(context: ServiceContext) -> Result<()> {
   context.collection_ready("machine-fixture".into(), 1);
   while !context.wait(Duration::from_secs(60)) {}
   Ok(())
+}
+
+fn wait_component(paths: &StoragePaths, component: ServiceComponent, phase: &str) -> Value {
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let report = status(paths).unwrap();
+    if report["components"][component.as_str()]["phase"] == phase {
+      return report;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "component never became {phase}: {report}"
+    );
+    thread::sleep(Duration::from_millis(10));
+  }
+}
+
+fn simple_components() -> ComponentRunners {
+  let mut runners = ComponentRunners::new();
+  for component in ServiceComponent::ALL {
+    if component == ServiceComponent::Publishing {
+      continue;
+    }
+    runners.insert(
+      component,
+      Arc::new(move |context| {
+        if component == ServiceComponent::Collection {
+          context.collection_ready("machine-fixture".into(), 1);
+        } else {
+          context.component_status(json!({"status": "running"}));
+        }
+        while !context.wait(Duration::from_secs(60)) {}
+        Ok(())
+      }),
+    );
+  }
+  runners
+}
+
+#[test]
+fn component_names_accept_cli_spelling_and_serialize_wire_spelling() {
+  for component in ServiceComponent::ALL {
+    assert_eq!(
+      component.to_string().parse::<ServiceComponent>().unwrap(),
+      component
+    );
+    assert_eq!(
+      component.as_str().parse::<ServiceComponent>().unwrap(),
+      component
+    );
+    assert_eq!(serde_json::to_value(component).unwrap(), component.as_str());
+  }
+  assert!("publisher".parse::<ServiceComponent>().is_err());
+}
+
+#[test]
+fn manual_pause_is_durable_and_lazy_registration_does_not_resume_components() {
+  let (_temporary, paths, job) = fixture();
+  let service_paths = paths.clone();
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(true),
+  );
+  let first_runner = runner.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(&service_paths, simple_components(), first_runner, false)
+  });
+  wait_ready(&paths);
+  let pid = status(&paths).unwrap()["pid"].clone();
+  stop_component(&paths, ServiceComponent::Publishing).unwrap();
+  wait_component(&paths, ServiceComponent::Publishing, "stopped");
+  stop_component(&paths, ServiceComponent::Collection).unwrap();
+  wait_component(&paths, ServiceComponent::Collection, "stopped");
+  assert_eq!(status(&paths).unwrap()["pid"], pid);
+  assert!(
+    ensure_collection_ready(&paths)
+      .unwrap_err()
+      .to_string()
+      .contains("paused")
+  );
+  let receipt = register(&paths, job).unwrap();
+  let id = receipt["job_id"].as_str().unwrap();
+  assert!(receipt["warning"].as_str().unwrap().contains("paused"));
+  assert_eq!(observe(&paths, id, false).unwrap()["status"], "paused");
+  assert_eq!(job_status(&paths, id).unwrap()["status"], "queued");
+  assert_eq!(
+    ensure_started(&paths).unwrap()["components"]["publishing"]["desired_running"],
+    false
+  );
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+
+  let service_paths = paths.clone();
+  let service =
+    thread::spawn(move || unix::run_components(&service_paths, simple_components(), runner, false));
+  wait_component(&paths, ServiceComponent::QueueExecution, "running");
+  let current = status(&paths).unwrap();
+  for component in ["collection", "publishing"] {
+    assert_eq!(current["components"][component]["desired_running"], false);
+    assert_eq!(current["components"][component]["generation"], 0);
+  }
+  start_component(&paths, ServiceComponent::Collection).unwrap();
+  ensure_collection_ready(&paths).unwrap();
+  assert_eq!(
+    status(&paths).unwrap()["components"]["publishing"]["desired_running"],
+    false
+  );
+  assert_eq!(job_status(&paths, id).unwrap()["status"], "queued");
+  start_component(&paths, ServiceComponent::Publishing).unwrap();
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while job_status(&paths, id).unwrap()["status"] != "published" {
+    assert!(Instant::now() < deadline);
+    thread::sleep(Duration::from_millis(10));
+  }
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn restarting_component_waits_for_old_generation_while_control_stays_responsive() {
+  let (_temporary, paths, _) = fixture();
+  let release = Arc::new(AtomicBool::new(false));
+  let (entered, started) = mpsc::channel();
+  let mut runners = simple_components();
+  let release_worker = release.clone();
+  runners.insert(
+    ServiceComponent::QueueExecution,
+    Arc::new(move |context| {
+      context.component_status(
+        json!({"status": "running", "token": "secret-token", "command": ["private-argument"]}),
+      );
+      entered.send(context.stop_flag()).unwrap();
+      while !context.wait(Duration::from_secs(60)) {}
+      while !release_worker.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+      }
+      Ok(())
+    }),
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      runners,
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  wait_ready(&paths);
+  let first = started.recv_timeout(Duration::from_secs(2)).unwrap();
+  stop_component(&paths, ServiceComponent::QueueExecution).unwrap();
+  wait_component(&paths, ServiceComponent::QueueExecution, "stopping");
+  start_component(&paths, ServiceComponent::QueueExecution).unwrap();
+  let current = status(&paths).unwrap();
+  assert_eq!(current["components"]["queue_execution"]["generation"], 1);
+  assert_eq!(
+    current["components"]["queue_execution"]["desired_running"],
+    true
+  );
+  assert_eq!(current["components"]["collection"]["phase"], "running");
+  assert!(started.recv_timeout(Duration::from_millis(100)).is_err());
+  assert!(!current.to_string().contains("secret-token"));
+  assert!(!current.to_string().contains("private-argument"));
+  release.store(true, Ordering::Release);
+  let second = started.recv_timeout(Duration::from_secs(2)).unwrap();
+  wait_component(&paths, ServiceComponent::QueueExecution, "running");
+  assert!(first.load(Ordering::Acquire));
+  assert!(!second.load(Ordering::Acquire));
+  assert!(!Arc::ptr_eq(&first, &second));
+  assert_eq!(
+    status(&paths).unwrap()["components"]["queue_execution"]["generation"],
+    2
+  );
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+  assert!(second.load(Ordering::Acquire));
+}
+
+#[test]
+fn failed_component_can_restart_without_stopping_its_peers() {
+  let (_temporary, paths, _) = fixture();
+  let attempts = Arc::new(AtomicUsize::new(0));
+  let attempt_worker = attempts.clone();
+  let mut runners = simple_components();
+  runners.insert(
+    ServiceComponent::QueueExecution,
+    Arc::new(move |context| {
+      if attempt_worker.fetch_add(1, Ordering::SeqCst) == 0 {
+        return Err(error("private-credential must never enter status"));
+      }
+      context.execution_status(json!({"status": "waiting", "online": false}));
+      while !context.wait(Duration::from_secs(60)) {}
+      Ok(())
+    }),
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      runners,
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  let failed = wait_component(&paths, ServiceComponent::QueueExecution, "failed");
+  assert_eq!(failed["ready"], true);
+  assert!(!failed.to_string().contains("private-credential"));
+  wait_ready(&paths);
+  start_component(&paths, ServiceComponent::QueueExecution).unwrap();
+  wait_component(&paths, ServiceComponent::QueueExecution, "running");
+  assert_eq!(attempts.load(Ordering::SeqCst), 2);
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn all_components_can_stop_without_removing_the_control_process() {
+  let (_temporary, paths, _) = fixture();
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      simple_components(),
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  wait_ready(&paths);
+  for component in ServiceComponent::ALL {
+    stop_component(&paths, component).unwrap();
+    wait_component(&paths, component, "stopped");
+  }
+  let current = ensure_started(&paths).unwrap();
+  assert_eq!(current["running"], true);
+  assert_eq!(current["ready"], true);
+  assert_eq!(current["collection_ready"], false);
+  start_component(&paths, ServiceComponent::Collection).unwrap();
+  wait_ready(&paths);
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn offline_pause_saves_only_control_preferences_without_launching_a_process() {
+  let (_temporary, paths, _) = fixture();
+  let report = stop_component(&paths, ServiceComponent::QueueExecution).unwrap();
+  assert_eq!(report["running"], false);
+  assert_eq!(
+    report["components"]["queue_execution"]["desired_running"],
+    false
+  );
+  let directory = files::existing(&paths).unwrap().unwrap();
+  assert!(!directory.join("service.lock").exists());
+  assert!(!directory.join("service.log").exists());
+  assert!(!directory.join("jobs").exists());
+}
+
+#[test]
+fn inactive_profile_does_not_disable_or_restart_a_healthy_publishing_group() {
+  let (_temporary, paths, job) = fixture();
+  let receipt = registry::register(&paths, job).unwrap();
+  let id = receipt["job_id"].as_str().unwrap();
+  let mut runners = simple_components();
+  runners.insert(
+    ServiceComponent::Publishing,
+    Arc::new(|context| {
+      context.component_status(json!({"status": "unconfigured"}));
+      Ok(())
+    }),
+  );
+  let (entered, started) = mpsc::channel();
+  let runner = Arc::new(
+    move |_: &PreparedJob, stop: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| {
+      entered.send(stop.clone()).unwrap();
+      while !stop.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+      }
+      Ok(false)
+    },
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || unix::run_components(&service_paths, runners, runner, false));
+  let token = started.recv_timeout(Duration::from_secs(3)).unwrap();
+  wait_component(&paths, ServiceComponent::Publishing, "running");
+  let report = start_component(&paths, ServiceComponent::Publishing).unwrap();
+  assert_eq!(report["components"]["publishing"]["generation"], 1);
+  assert_eq!(
+    report["components"]["publishing"]["parts"]["publishing"]["phase"],
+    "unconfigured"
+  );
+  assert!(!token.load(Ordering::Acquire));
+  stop_component(&paths, ServiceComponent::Publishing).unwrap();
+  wait_component(&paths, ServiceComponent::Publishing, "stopped");
+  assert!(token.load(Ordering::Acquire));
+  assert_eq!(job_status(&paths, id).unwrap()["status"], "queued");
+  assert_eq!(status(&paths).unwrap()["collection_ready"], true);
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn failed_publishing_part_preserves_peers_and_explicit_start_retries_the_group() {
+  let (_temporary, paths, _) = fixture();
+  let attempts = Arc::new(AtomicUsize::new(0));
+  let observed = attempts.clone();
+  let mut runners = simple_components();
+  runners.insert(
+    ServiceComponent::Publishing,
+    Arc::new(move |context| {
+      if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+        return Err(error("private token"));
+      }
+      context.component_status(json!({"status": "running"}));
+      while !context.wait(Duration::from_secs(60)) {}
+      Ok(())
+    }),
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      runners,
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  let degraded = wait_component(&paths, ServiceComponent::Publishing, "degraded");
+  assert_eq!(
+    degraded["components"]["publishing"]["parts"]["run_publishing"]["phase"],
+    "running"
+  );
+  assert!(!degraded.to_string().contains("private token"));
+  start_component(&paths, ServiceComponent::Publishing).unwrap();
+  let running = wait_component(&paths, ServiceComponent::Publishing, "running");
+  assert_eq!(running["components"]["publishing"]["generation"], 2);
+  assert_eq!(attempts.load(Ordering::SeqCst), 2);
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn collection_control_cancels_and_restarts_both_sampler_and_export_threads() {
+  let (_temporary, paths, _) = fixture();
+  let mut runners = simple_components();
+  let (entered, started) = mpsc::channel();
+  runners.add(
+    ServiceComponent::Collection,
+    "capture_export",
+    Arc::new(move |context| {
+      context.component_status(json!({"status": "running"}));
+      entered.send(context.stop_flag()).unwrap();
+      while !context.wait(Duration::from_secs(60)) {}
+      Ok(())
+    }),
+  );
+  // Replacing the sampler must preserve the named exporter hook.
+  runners.insert(ServiceComponent::Collection, Arc::new(collector));
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      runners,
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  wait_ready(&paths);
+  let first = started.recv_timeout(Duration::from_secs(3)).unwrap();
+  stop_component(&paths, ServiceComponent::Collection).unwrap();
+  let stopped = wait_component(&paths, ServiceComponent::Collection, "stopped");
+  for part in ["collection", "capture_export"] {
+    assert_eq!(
+      stopped["components"]["collection"]["parts"][part]["phase"],
+      "stopped"
+    );
+  }
+  assert!(first.load(Ordering::Acquire));
+  assert_eq!(stopped["collection_ready"], false);
+  assert_eq!(stopped["components"]["publishing"]["phase"], "running");
+  start_component(&paths, ServiceComponent::Collection).unwrap();
+  let second = started.recv_timeout(Duration::from_secs(3)).unwrap();
+  ensure_collection_ready(&paths).unwrap();
+  assert!(!Arc::ptr_eq(&first, &second));
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn offline_pause_racing_foreground_bootstrap_is_never_lost() {
+  for _ in 0..8 {
+    let (_temporary, paths, _) = fixture();
+    files::ensure(&paths).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let boot = barrier.clone();
+    let service_paths = paths.clone();
+    let service = thread::spawn(move || {
+      boot.wait();
+      unix::run_components(
+        &service_paths,
+        simple_components(),
+        Arc::new(|_, _, _| Ok(false)),
+        false,
+      )
+    });
+    barrier.wait();
+    stop_component(&paths, ServiceComponent::Collection).unwrap();
+    wait_component(&paths, ServiceComponent::QueueExecution, "running");
+    let paused = wait_component(&paths, ServiceComponent::Collection, "stopped");
+    assert_eq!(paused["components"]["collection"]["desired_running"], false);
+    assert!(
+      ensure_collection_ready(&paths)
+        .unwrap_err()
+        .to_string()
+        .contains("paused")
+    );
+    stop(&paths).unwrap();
+    service.join().unwrap().unwrap();
+  }
 }
 
 #[test]
@@ -91,6 +508,71 @@ fn status_is_readonly_and_does_not_create_storage() {
   assert_eq!(status(&paths).unwrap()["running"], false);
   assert_eq!(stop(&paths).unwrap()["already_stopped"], true);
   assert!(!paths.root().exists());
+}
+
+#[test]
+fn crashed_process_snapshot_cannot_report_running_or_ready_component_parts() {
+  let (_temporary, paths, _) = fixture();
+  let directory = files::ensure(&paths).unwrap();
+  let snapshot = json!({
+    "running": true, "ready": true, "collection_ready": true, "status": "running",
+    "collection": {"status": "collecting", "machine_id": "machine-fixture"},
+    "execution": {"status": "waiting", "online": true},
+    "components": {
+      "collection": {"generation": 3, "phase": "running", "ready": true, "parts": {
+        "collection": {"phase": "running", "status": "collecting", "ready": true},
+        "capture_export": {"phase": "failed", "status": "failed", "last_error": "saved export error"}
+      }},
+      "publishing": {"generation": 2, "phase": "starting", "parts": {
+        "publishing": {"phase": "unconfigured", "status": "unconfigured", "ready": false},
+        "run_publishing": {"phase": "starting", "status": "starting", "ready": true}
+      }},
+      "queue_execution": {"generation": 1, "phase": "stopping", "parts": {
+        "queue_execution": {"phase": "stopping", "status": "waiting", "ready": true, "online": true}
+      }}
+    }
+  });
+  let status_path = directory.join("status.json");
+  files::write(&status_path, &snapshot).unwrap();
+  let before = fs::read(&status_path).unwrap();
+  let report = status(&paths).unwrap();
+  assert_eq!(report["running"], false);
+  assert_eq!(report["ready"], false);
+  assert_eq!(report["collection_ready"], false);
+  assert_eq!(report["collection"]["status"], "stopped");
+  assert_eq!(report["execution"]["online"], false);
+  for component in ServiceComponent::ALL {
+    assert_eq!(report["components"][component.as_str()]["phase"], "stopped");
+    for part in report["components"][component.as_str()]["parts"]
+      .as_object()
+      .unwrap()
+      .values()
+    {
+      assert_eq!(part["ready"], false);
+      assert!(!matches!(
+        part["phase"].as_str(),
+        Some("starting" | "running" | "stopping")
+      ));
+    }
+  }
+  assert_eq!(
+    report["components"]["collection"]["parts"]["capture_export"]["phase"],
+    "failed"
+  );
+  assert_eq!(
+    report["components"]["collection"]["parts"]["capture_export"]["last_error"],
+    "saved export error"
+  );
+  assert_eq!(
+    report["components"]["publishing"]["parts"]["publishing"]["phase"],
+    "unconfigured"
+  );
+  assert_eq!(
+    report["components"]["queue_execution"]["parts"]["queue_execution"]["online"],
+    false
+  );
+  assert_eq!(fs::read(status_path).unwrap(), before);
+  assert!(!directory.join("service.lock").exists());
 }
 
 #[test]
@@ -445,28 +927,38 @@ fn stopped_status_exposes_bounded_jobs_and_errors_without_reading_secret_request
 }
 
 #[test]
-fn collection_failure_is_preserved_after_cooperative_service_shutdown() {
+fn collection_failure_is_isolated_and_preserved_after_service_shutdown() {
   let (_temporary, paths, _) = fixture();
   let runner = Arc::new(
     |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
   );
-  let result = unix::run_runtime(
-    &paths,
-    |context| {
-      context.collection_status(
-        json!({"status": "failed", "last_error": "Local profile store is unavailable"}),
-      );
-      context.stop_flag().store(true, Ordering::Release);
-      Err(error("local profile store failure"))
-    },
-    runner,
-    false,
-  );
-  assert!(result.is_err());
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_runtime(
+      &service_paths,
+      |context| {
+        context.collection_status(
+          json!({"status": "failed", "last_error": "Local profile store is unavailable"}),
+        );
+        context.stop_flag().store(true, Ordering::Release);
+        Err(error("local profile store failure"))
+      },
+      runner,
+      false,
+    )
+  });
+  wait_component(&paths, ServiceComponent::Collection, "failed");
+  let running = status(&paths).unwrap();
+  assert_eq!(running["running"], true);
+  assert_eq!(running["ready"], true);
+  assert_eq!(running["collection_ready"], false);
+  wait_component(&paths, ServiceComponent::Publishing, "running");
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
   let report = status(&paths).unwrap();
   assert_eq!(report["running"], false);
   assert_eq!(report["ready"], false);
-  assert_eq!(report["status"], "collection_failed");
+  assert_eq!(report["status"], "stopped");
   assert_eq!(
     report["collection"]["last_error"],
     "Local profile store is unavailable"

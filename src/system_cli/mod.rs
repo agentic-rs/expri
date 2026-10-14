@@ -3,12 +3,11 @@ mod daemon;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
+use expri_client::worker_service::{ComponentRunners, ServiceComponent, ServiceContext};
 use expri_client::{SystemProfileClient, resolve_client_config};
 use expri_core::lock::{self, LockAttempt};
 use expri_core::storage::StoragePaths;
@@ -169,15 +168,15 @@ pub fn run(command: SystemCommand, target: Option<&str>, quiet: bool) -> Result<
       client_config,
       no_publish,
     } => {
-      let config = CollectionConfig::load(&paths, interval_seconds, client_config, no_publish)?;
+      CollectionConfig::load(&paths, interval_seconds, client_config.clone(), no_publish)?;
       let paths = writable_paths(&paths)?;
       eprintln!(
         "expri system daemon is deprecated; use expri service start --foreground. Running the shared worker service."
       );
-      let collection_paths = paths.clone();
-      expri_client::worker_service::run_foreground(&paths, move |context| {
-        collect_with_config(collection_paths, config, context)
-      })
+      expri_client::worker_service::run_foreground_components(
+        &paths,
+        components_with_options(paths.clone(), interval_seconds, client_config, no_publish),
+      )
     }
     SystemSubcommand::Status => status(&paths, command.json, quiet),
     SystemSubcommand::History(options) => {
@@ -206,39 +205,47 @@ pub fn run(command: SystemCommand, target: Option<&str>, quiet: bool) -> Result<
   }
 }
 
-/// The worker runtime calls this hook in its collection thread. Local readiness
-/// is independent of machine-profile credentials and network availability.
-pub(crate) fn collect_for_service(
+/// The application supplies independent local workers; the client supervises
+/// their threads without depending on the system or execution crates.
+pub(crate) fn service_components(paths: StoragePaths) -> ComponentRunners {
+  components_with_options(paths, None, None, false)
+}
+
+fn components_with_options(
   paths: StoragePaths,
-  context: expri_client::worker_service::ServiceContext,
-) -> Result<()> {
-  let config = CollectionConfig::load(&paths, None, None, false)?;
-  collect_with_config(writable_paths(&paths)?, config, context)
-}
-
-fn collect_with_config(
-  paths: StoragePaths,
-  config: CollectionConfig,
-  context: expri_client::worker_service::ServiceContext,
-) -> Result<()> {
-  // The application composes execution with collection; the client runtime has
-  // no dependency on the worker crate. Local collection readiness stays separate.
-  let _executor = start_executor(&paths, &context);
-  daemon::run(paths, config, context)
-}
-
-struct ExecutorLane {
-  stop: Arc<AtomicBool>,
-  thread: Option<JoinHandle<()>>,
-}
-
-impl Drop for ExecutorLane {
-  fn drop(&mut self) {
-    self.stop.store(true, Ordering::Release);
-    if let Some(thread) = self.thread.take() {
-      let _ = thread.join();
-    }
-  }
+  interval_seconds: Option<u64>,
+  client_config: Option<PathBuf>,
+  no_publish: bool,
+) -> ComponentRunners {
+  let mut runners = ComponentRunners::new();
+  let collection_paths = paths.clone();
+  runners.insert(
+    ServiceComponent::Collection,
+    Arc::new(move |context| {
+      let config = CollectionConfig::load_collection(&collection_paths, interval_seconds)?;
+      daemon::run(writable_paths(&collection_paths)?, config, context)
+    }),
+  );
+  let capture_paths = paths.clone();
+  runners.add(
+    ServiceComponent::Collection,
+    "capture_export",
+    Arc::new(move |context| daemon::run_capture_export(writable_paths(&capture_paths)?, context)),
+  );
+  let publishing_paths = paths.clone();
+  runners.insert(
+    ServiceComponent::Publishing,
+    Arc::new(move |context| {
+      let publishing =
+        CollectionConfig::load_publishing(&publishing_paths, client_config.clone(), no_publish)?;
+      daemon::run_publishing(writable_paths(&publishing_paths)?, publishing, context)
+    }),
+  );
+  runners.insert(
+    ServiceComponent::QueueExecution,
+    Arc::new(move |context| run_executor(&paths, context)),
+  );
+  runners
 }
 
 fn configured_executor(
@@ -284,59 +291,33 @@ fn resolve_executor_capacity(
   worker.resolve_capacity(capacity)
 }
 
-fn start_executor(
-  paths: &StoragePaths,
-  context: &expri_client::worker_service::ServiceContext,
-) -> Option<ExecutorLane> {
+fn run_executor(paths: &StoragePaths, context: ServiceContext) -> Result<()> {
   let worker = match configured_executor(paths) {
     Ok(Some(worker)) => worker,
     Ok(None) => {
       context.execution_status(json!({"status": "disabled", "online": false}));
-      return None;
+      return Ok(());
     }
     Err(_) => {
       context.execution_status(json!({"status": "failed", "online": false,
         "last_error": "worker_configuration_invalid"}));
-      return None;
+      return Err(ExpriError::Message("worker_configuration_invalid".into()));
     }
   };
   context.execution_status(json!({"status": "detecting", "worker_id": worker.worker_id,
     "online": false, "last_error": null}));
-  let stop = context.stop_flag();
-  let executor_context = context.clone();
-  let executor_stop = stop.clone();
-  let execution_paths = paths.clone();
-  let task = thread::Builder::new()
-    .name("expri-queue-executor".into())
-    .spawn(move || {
-      let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let worker = resolve_executor_capacity(&worker, expri_system::detect_worker_capacity)?;
-        let options = expri_worker::queue::ExecutorOptions {
-          storage: execution_paths.clone(),
-          worker,
-          client_config: execution_paths.config_file(),
-          poll_interval: Duration::from_secs(2),
-        };
-        expri_worker::queue::run_executor(options, executor_stop, |report| {
-          executor_context.execution_status(report);
-        })
-      }));
-      if !matches!(outcome, Ok(Ok(()))) {
-        executor_context.execution_status(json!({"status": "failed", "online": false,
-          "last_error": "execution_unavailable"}));
-      }
-    });
-  match task {
-    Ok(thread) => Some(ExecutorLane {
-      stop,
-      thread: Some(thread),
-    }),
-    Err(_) => {
-      context.execution_status(json!({"status": "failed", "online": false,
-        "last_error": "execution_thread_unavailable"}));
-      None
-    }
-  }
+  let worker = resolve_executor_capacity(&worker, expri_system::detect_worker_capacity)
+    .map_err(|_| ExpriError::Message("execution_capacity_unavailable".into()))?;
+  let options = expri_worker::queue::ExecutorOptions {
+    storage: paths.clone(),
+    worker,
+    client_config: paths.config_file(),
+    poll_interval: Duration::from_secs(2),
+  };
+  expri_worker::queue::run_executor(options, context.stop_flag(), |report| {
+    context.execution_status(report);
+  })
+  .map_err(|_| ExpriError::Message("execution_unavailable".into()))
 }
 
 // An explicit publishing request may use [server]. Continuous collection still

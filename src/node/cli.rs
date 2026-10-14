@@ -114,7 +114,7 @@ pub fn run(command: NodeCommand) -> Result<()> {
 
 pub(crate) fn initialize_worker_service() -> Result<()> {
   let paths = expri_core::storage::StoragePaths::resolve(None)?;
-  expri_client::worker_service::ensure_started(&paths)?;
+  expri_client::worker_service::ensure_collection_ready(&paths)?;
   Ok(())
 }
 

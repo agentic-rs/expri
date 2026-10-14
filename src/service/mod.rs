@@ -26,8 +26,11 @@ enum ServiceSubcommand {
   /// Start collection, publishing, and configured queue execution, or reuse the service.
   Start {
     /// Run the shared worker service in this terminal; Ctrl-C stops the service.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "component")]
     foreground: bool,
+    /// Start one component in the shared service, preserving other component choices.
+    #[arg(long, value_parser = parse_component)]
+    component: Option<expri_client::worker_service::ServiceComponent>,
     /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri storage.
     #[arg(long)]
     storage_dir: Option<PathBuf>,
@@ -36,11 +39,17 @@ enum ServiceSubcommand {
   Status {
     #[arg(long)]
     storage_dir: Option<PathBuf>,
+    /// Inspect one component of the shared service.
+    #[arg(long, value_parser = parse_component)]
+    component: Option<expri_client::worker_service::ServiceComponent>,
   },
   /// Stop collection, publishing, and queue polling; training continues and saved work remains.
   Stop {
     #[arg(long)]
     storage_dir: Option<PathBuf>,
+    /// Stop one component while keeping the shared process and other parts running.
+    #[arg(long, value_parser = parse_component)]
+    component: Option<expri_client::worker_service::ServiceComponent>,
   },
   /// Inspect machine inventories and system-profile history.
   System(crate::system_cli::ServiceSystemCommand),
@@ -323,23 +332,46 @@ pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result
     ServiceSubcommand::Start {
       foreground,
       storage_dir,
+      component,
     } => {
       let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
       if foreground {
-        let collection_paths = paths.clone();
-        return expri_client::worker_service::run_foreground(&paths, move |context| {
-          crate::system_cli::collect_for_service(collection_paths, context)
-        });
+        return expri_client::worker_service::run_foreground_components(
+          &paths,
+          crate::system_cli::service_components(paths.clone()),
+        );
       }
-      expri_client::worker_service::ensure_started(&paths)?
+      if let Some(component) = component {
+        expri_client::worker_service::start_component(&paths, component)?
+      } else {
+        expri_client::worker_service::ensure_started(&paths)?
+      }
     }
-    ServiceSubcommand::Status { storage_dir } => {
+    ServiceSubcommand::Status {
+      storage_dir,
+      component,
+    } => {
       let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
-      expri_client::worker_service::status(&paths)?
+      let report = expri_client::worker_service::status(&paths)?;
+      if let Some(component) = component {
+        serde_json::json!({
+          "running": report["running"], "pid": report["pid"],
+          "component": component.as_str(), "state": report["components"][component.as_str()],
+        })
+      } else {
+        report
+      }
     }
-    ServiceSubcommand::Stop { storage_dir } => {
+    ServiceSubcommand::Stop {
+      storage_dir,
+      component,
+    } => {
       let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
-      expri_client::worker_service::stop(&paths)?
+      if let Some(component) = component {
+        expri_client::worker_service::stop_component(&paths, component)?
+      } else {
+        expri_client::worker_service::stop(&paths)?
+      }
     }
     ServiceSubcommand::System(system) => {
       return crate::system_cli::run_service(system, command.json, quiet);
@@ -465,6 +497,14 @@ pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result
     print_report(&report, command.json)?;
   }
   Ok(())
+}
+
+fn parse_component(
+  value: &str,
+) -> std::result::Result<expri_client::worker_service::ServiceComponent, String> {
+  value
+    .parse()
+    .map_err(|_| "expected collection, publishing, or queue-execution".into())
 }
 
 impl TryFrom<PublishOptions> for expri_client::PublishOptions {
@@ -844,6 +884,26 @@ mod tests {
       assert!(Cli::try_parse_from(["expri", "input", name]).is_err());
     }
     assert!(!help.contains("archive"));
+  }
+
+  #[test]
+  fn component_controls_accept_named_parts_and_keep_foreground_process_control_separate() {
+    for component in ["collection", "publishing", "queue-execution"] {
+      for action in ["start", "stop", "status"] {
+        assert!(Cli::try_parse_from(["expri", action, "--component", component, "--json"]).is_ok());
+      }
+    }
+    assert!(
+      Cli::try_parse_from([
+        "expri",
+        "start",
+        "--foreground",
+        "--component",
+        "collection"
+      ])
+      .is_err()
+    );
+    assert!(Cli::try_parse_from(["expri", "stop", "--component", "unknown"]).is_err());
   }
 
   #[test]

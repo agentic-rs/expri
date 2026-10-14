@@ -606,7 +606,10 @@ impl Executor {
       return Ok(());
     }
     let request = queued_run_request(journal, &self.options.worker.worker_id, &self.client_config);
-    let mut prepared = crate::node::run::prepare_request_at(&request, &repo_root)?;
+    let mut prepared =
+      crate::node::run::prepare_request_at_with_initializer(&request, &repo_root, || {
+        expri_client::worker_service::ensure_collection_ready(&self.options.storage).map(|_| ())
+      })?;
     crate::node::run::enable_queue_cleanup(&mut prepared)?;
     journal.run_dir = Some(prepared.snapshot.run_dir.clone());
     journal.stage = Stage::Prepared;

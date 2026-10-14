@@ -295,8 +295,9 @@ impl LocalStore {
     save_checkpoint(&row)
   }
 
-  /// The collector also materializes after each commit, so run supervision or
-  /// network failures cannot stop durable local copies of recorded observations.
+  /// The independent exporter materializes committed observations. Supervisors
+  /// can also finalize terminal captures while this component is paused, and
+  /// network failures leave the durable outbox available for local recovery.
   pub fn export_run_captures(&mut self) -> Result<()> {
     let ids = {
       let mut statement = sql(self.connection.prepare("SELECT capture_id FROM system_run_captures WHERE closed=0 OR metadata_saved=0 ORDER BY capture_id"))?;

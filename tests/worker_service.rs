@@ -134,6 +134,45 @@ impl Fixture {
         .unwrap(),
     )
   }
+
+  fn control(&self, action: &str, component: Option<&str>) -> Value {
+    let mut command = self.command();
+    command.args(["service", action, "--json"]);
+    if let Some(component) = component {
+      command.args(["--component", component]);
+    }
+    json_report(command.output().unwrap())
+  }
+
+  fn await_component(&self, component: &str, phase: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+      let report = self.status();
+      if report["components"][component]["phase"] == phase {
+        return report;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "{component} did not reach {phase}: {report}"
+      );
+      thread::sleep(Duration::from_millis(25));
+    }
+  }
+
+  fn await_collection_ready(&self) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+      let report = self.status();
+      if report["collection_ready"] == true {
+        return report;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "collection did not become ready: {report}"
+      );
+      thread::sleep(Duration::from_millis(25));
+    }
+  }
 }
 
 impl Drop for Fixture {
@@ -216,4 +255,109 @@ fn wait_reports_permanent_rejection_and_exits_unsuccessfully() {
   assert!(!String::from_utf8_lossy(&output.stdout).contains("private-fixture-token"));
   assert!(String::from_utf8_lossy(&output.stderr).contains("publication has not completed"));
   assert_eq!(fixture.status()["running"], true);
+}
+
+#[test]
+fn collection_can_pause_and_restart_without_restarting_the_service_or_publishers() {
+  let fixture = Fixture::new(503);
+  fs::create_dir_all(&fixture.storage).unwrap();
+  fs::write(
+    fixture.storage.join("config.toml"),
+    "[system_profile]\ninterval_seconds=1\n",
+  )
+  .unwrap();
+  fixture.control("start", None);
+  let initial = fixture.await_collection_ready();
+  let pid = initial["pid"].clone();
+  let generation = initial["components"]["collection"]["generation"]
+    .as_u64()
+    .unwrap();
+  fixture.await_component("publishing", "running");
+
+  fixture.control("stop", Some("collection"));
+  let stopped = fixture.await_component("collection", "stopped");
+  assert_eq!(stopped["pid"], pid);
+  assert_eq!(stopped["collection_ready"], false);
+  assert_eq!(
+    stopped["components"]["collection"]["desired_running"],
+    false
+  );
+  assert_eq!(stopped["components"]["publishing"]["phase"], "running");
+  let sequence = stopped["collection"]["sample_sequence"].clone();
+  thread::sleep(Duration::from_millis(1200));
+  assert_eq!(fixture.status()["collection"]["sample_sequence"], sequence);
+
+  fixture.control("start", Some("collection"));
+  let resumed = fixture.await_collection_ready();
+  assert_eq!(resumed["pid"], pid);
+  assert!(
+    resumed["components"]["collection"]["generation"]
+      .as_u64()
+      .unwrap()
+      > generation
+  );
+  assert_eq!(resumed["components"]["collection"]["desired_running"], true);
+}
+
+#[test]
+fn paused_publication_keeps_jobs_and_saved_choices_survive_process_restart() {
+  let fixture = Fixture::new(503);
+  // Pausing an offline component saves the choice without starting a process.
+  let paused = fixture.control("stop", Some("publishing"));
+  assert_eq!(paused["running"], false);
+  let receipt = json_report(fixture.publish().output().unwrap());
+  assert_eq!(receipt["accepted"], true);
+  let initial = fixture.await_component("publishing", "stopped");
+  let pid = initial["pid"].clone();
+  assert_eq!(
+    initial["components"]["publishing"]["desired_running"],
+    false
+  );
+  assert_eq!(initial["jobs_total"], 1);
+
+  let mut observer = fixture
+    .publish()
+    .arg("--wait")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while observer.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      observer.kill().unwrap();
+      let _ = observer.wait();
+      panic!("waiting for paused publication did not return promptly");
+    }
+    thread::sleep(Duration::from_millis(25));
+  }
+  let output = observer.wait_with_output().unwrap();
+  assert!(!output.status.success());
+  let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+  assert_eq!(report["status"], "paused");
+  assert_eq!(fixture.status()["pid"], pid);
+
+  fixture.control("stop", Some("collection"));
+  fixture.await_component("collection", "stopped");
+  support::stop_worker_service(&fixture.storage);
+  fixture.control("start", None);
+  let restarted = fixture.await_component("publishing", "stopped");
+  assert_ne!(restarted["pid"], pid);
+  assert_eq!(
+    restarted["components"]["collection"]["desired_running"],
+    false
+  );
+  assert_eq!(
+    restarted["components"]["publishing"]["desired_running"],
+    false
+  );
+  assert_eq!(restarted["jobs_total"], 1);
+  fixture.control("start", Some("publishing"));
+  let resumed = fixture.await_component("publishing", "running");
+  assert_eq!(resumed["pid"], restarted["pid"]);
+  assert_eq!(resumed["components"]["collection"]["phase"], "stopped");
+  assert_eq!(
+    resumed["components"]["collection"]["desired_running"],
+    false
+  );
 }

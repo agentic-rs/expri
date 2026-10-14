@@ -90,6 +90,21 @@ expri service status --json
 Without `[queue_worker]`, the service collects and publishes without executing
 server jobs. `service stop` stops queue polling while existing training continues;
 its reservations remain held until the next start reconciles completion.
+Execution has its own supervised thread. Pause or resume it independently:
+
+```sh
+expri service stop --component queue-execution
+expri service status --component queue-execution --json
+expri service start --component queue-execution
+```
+
+Other collection and publishing components keep running. Paused execution stops
+heartbeats; accepted attempts retain allocations even after the worker lease
+expires. Its saved enabled/paused choice survives process restart and automatic
+startup. Start reloads worker settings and inferred capacity after the old thread
+has joined; use stop then start to apply changes to a running executor. Component
+failure does not stop peers. `--foreground` starts the whole supervisor and cannot
+be combined with `--component`.
 If shutdown interrupts an accepted task before launch, its journal stays held
 for confirmed stopped-workload recovery rather than being relaunched automatically.
 
@@ -110,7 +125,7 @@ attempts. JSON also includes device identities and reserved resources.
 
 If a submission response is lost, repeat an identical submission with the
 reported `--submission-id`. Source or specification changes require a new ID.
-Restarting the daemon reconciles durable journals without relaunching a job.
+Restarting queue execution reconciles durable journals without relaunching a job.
 There is no automatic execution retry or preemption.
 
 An assignment that has not been accepted is released when its worker lease expires
