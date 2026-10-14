@@ -293,7 +293,7 @@ worker run files remain available. The dashboard shows a **Smoke** badge.
 
 ### Shared resource queue
 
-With an updated server and an explicitly configured execution worker, queue a
+With a `resource-queue-v2` server and an updated execution worker, queue a
 managed task instead of choosing when to start it:
 
 ```sh
@@ -304,8 +304,13 @@ expri queue cancel job-abc123
 expri queue workers
 ```
 
-Submission freezes and uploads the source before returning a job ID, so the
-laptop can disconnect. Workers report their budget and heartbeat to the server,
+Submission freezes and uploads source, then blocks while the server holds the
+job in `pending` for resources. It returns a job receipt when the worker confirms
+the task has started; it does not wait for completion. Use `--queue --detach`
+to return the durable job receipt immediately. Progress and the pending reason
+appear on stderr; `--json` emits one final receipt on stdout. Ctrl-C stops waiting
+and leaves the server job intact; use `expri queue cancel <job_id>` to cancel it.
+Workers report their budget and heartbeat to the server,
 which assigns fitting jobs across online workers and reserves their resources.
 CPU-only jobs prefer CPU-only workers. CPU counts are logical slots and memory is a reservation
 among queued jobs; whole GPUs are assigned exclusively among these jobs.
@@ -337,8 +342,10 @@ Capacity defaults to detected logical CPUs, 90% of RAM, and selectable whole GPU
 Optional capacity fields override these defaults; `gpus = []` disables GPU allocation.
 `queue workers` reports available/total resources and pending assignments. Read
 [worker setup and recovery](docs/self-hosted-service.md#shared-resource-queue)
-or `expri skill queue`. The job receives a run ID only after dispatch; published
-runs then appear in the existing dashboard.
+or `expri skill queue`. The dashboard includes pending jobs and their resource
+requests before dispatch, then follows the worker run when its metadata arrives.
+Only task execution has a run ID and measured elapsed time. Task-controlled
+`waiting` keeps its allocation; server-controlled `pending` has not started.
 
 Each configured-environment run receives these variables:
 
@@ -428,7 +435,7 @@ expri -T runpod runs list --task train --status failed --limit 5
 expri -T runpod runs show run-abc123 --json
 ```
 
-`list` defaults to the 20 newest records. Its status filters are `preparing`,
+`list` defaults to the 20 newest records. Its status filters are `pending`, `preparing`,
 `running`, `waiting`, `completed`, `failed`, `cancelled`, `lost`, and `unknown`. `show` includes the run state,
 source snapshot provenance, and recorded Python environment when available.
 Missing, malformed, or unsupported records produce warnings; incomplete runs

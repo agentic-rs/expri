@@ -1,3 +1,4 @@
+mod queue;
 mod reader;
 mod source;
 mod table_data;
@@ -61,6 +62,14 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
     cursor: Option<u64>,
     limit: usize,
   ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
+    if let Some((_, context)) = self.queue_selection(source, run_id)?
+      && self.queue_native_scope(&context)?.is_none()
+    {
+      return Ok(expri_runs::system_metrics::RunSystemMetrics::unavailable(
+        run_id,
+        "System observations are available after worker run metadata is published.",
+      ));
+    }
     let (_, scope) = self.scope(source, run_id)?;
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let state = self
@@ -254,11 +263,20 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       .store
       .dashboard_sources(SOURCE_LIMIT, 0)
       .map_err(api_error)?;
-    let sources: Vec<_> = page
+    let mut sources: Vec<_> = page
       .items
       .into_iter()
       .map(|source| source_record(&source.project_id, &source.origin))
       .collect();
+    for project_id in self
+      .store
+      .dashboard_queue_projects(SOURCE_LIMIT)
+      .map_err(api_error)?
+    {
+      if sources.len() < SOURCE_LIMIT {
+        sources.push(source::project_record(&project_id, None));
+      }
+    }
     let mut warnings = Vec::new();
     if page.total_count > SOURCE_LIMIT {
       warnings.push(
@@ -363,6 +381,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   pub fn updates(&self, source_id: &str, run_ids: &[String]) -> Result<Value> {
+    self.queue_updates(source_id, run_ids)
+  }
+
+  fn artifact_updates(&self, source_id: &str, run_ids: &[String]) -> Result<Value> {
     crate::dashboard::updates::validate_selection(source_id, run_ids)?;
     let source = if source_id.is_empty() {
       None
@@ -425,9 +447,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       offset,
       table,
     } = *query;
-    if !(1..=100).contains(&limit) || offset > OVERVIEW_LIMIT {
+    if !(1..=100).contains(&limit) || offset > OVERVIEW_LIMIT * 2 {
       return Err(message(
-        "hosted list pages support 1 to 100 rows and offsets up to 500",
+        "hosted list pages support 1 to 100 rows and offsets up to 1000",
       ));
     }
     if task.is_some_and(|value| value.trim().is_empty())
@@ -459,7 +481,17 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         archived,
       )
       .map_err(api_error)?;
+    let queue_page = self
+      .store
+      .dashboard_queue_jobs(
+        &source.project_id,
+        origin.or(source.origin.as_deref()),
+        OVERVIEW_LIMIT,
+        0,
+      )
+      .map_err(api_error)?;
     if page.total_count == 0
+      && queue_page.total_count == 0
       && self
         .store
         .dashboard_project_runs(&source.project_id, source.origin.as_deref(), 1, 0)
@@ -474,16 +506,43 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     {
       return Err(message(format!("unknown source: {source_id}")));
     }
+    // Use one readiness decision throughout this response. Logs may be published
+    // before the initial state document; keep their job placeholder until then.
+    let queue_history = queue_page
+      .items
+      .iter()
+      .map(|context| Ok((context, self.queue_native_scope(context)?)))
+      .collect::<Result<Vec<_>>>()?;
+    let unpublished_runs: BTreeSet<_> = queue_history
+      .iter()
+      .filter_map(|(context, ready)| {
+        if ready.is_some() {
+          return None;
+        }
+        context
+          .worker_id
+          .as_ref()
+          .zip(context.run_id.as_ref())
+          .map(|(origin, run_id)| (origin.clone(), run_id.clone()))
+      })
+      .collect();
+    let native_items: Vec<_> = page
+      .items
+      .iter()
+      .filter(|scope| !unpublished_runs.contains(&(scope.origin.clone(), scope.run_id.clone())))
+      .cloned()
+      .collect();
+    let hidden_native_count = page.items.len() - native_items.len();
     let deadline = Instant::now() + REQUEST_TIMEOUT;
-    let mut reports = Vec::with_capacity(page.items.len());
+    let mut reports = Vec::with_capacity(native_items.len());
     let mut warnings = Vec::new();
     if page.total_count > OVERVIEW_LIMIT {
       warnings.push(json!({"message": "Hosted browsing and filters cover the 500 runs most recently updated in this service; use expri service fetch with a known run ID to inspect other runs."}));
     }
-    if page.legacy_order {
+    if page.legacy_order && !native_items.is_empty() {
       warnings.push(json!({"message": "Some legacy runs have reconstructed catalog order; their historical service update times are unknown. New uploads or stream bytes establish their current service update order."}));
     }
-    for group in page.items.chunks(4) {
+    for group in native_items.chunks(4) {
       let next = std::thread::scope(|threads| {
         let handles: Vec<_> = group
           .iter()
@@ -510,6 +569,24 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           source.decorate_warnings(warnings, scope);
         }
         reports.push(report);
+      }
+    }
+    if queue_page.total_count > OVERVIEW_LIMIT {
+      warnings.push(json!({"message":"Queue history covers the 500 most recent server jobs; older jobs remain available by their job IDs."}));
+    }
+    let mut queue_only_count = 0;
+    for (context, native_scope) in queue_history {
+      if let Some(scope) = native_scope {
+        for report in &mut reports {
+          if report["run"]["run_id"] == scope.run_id
+            && (source.origin.is_some() || report["run"]["origin"] == scope.origin)
+          {
+            report["run"]["queue"] = serde_json::to_value(context)?;
+          }
+        }
+      } else if !archived {
+        queue_only_count += 1;
+        reports.push(json!({"run":queue::queue_run(&source, context),"task_filter":context.task,"metadata_truncated":false,"warnings":[]}));
       }
     }
     let search = search.unwrap_or_default().to_lowercase();
@@ -561,15 +638,22 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
           let handles: Vec<_> = group
             .iter()
             .map(|run| {
-              let scope = source
-                .resolve(&source.reference(run))
-                .expect("validated run scope");
+              let scope = (run["queue_only"] != true).then(|| {
+                source
+                  .resolve(&source.reference(run))
+                  .expect("validated run scope")
+              });
               threads.spawn(move || {
-                let (data, warnings) = self.table_data(
-                  &scope,
-                  options.needs_params(),
-                  options.needs_metrics(),
-                  deadline,
+                let (data, warnings) = scope.as_ref().map_or_else(
+                  || (table::ScalarData::default(), Vec::new()),
+                  |scope| {
+                    self.table_data(
+                      scope,
+                      options.needs_params(),
+                      options.needs_metrics(),
+                      deadline,
+                    )
+                  },
                 );
                 (table::TableRow::new(run.clone(), data), warnings)
               })
@@ -585,8 +669,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
             .collect::<Vec<_>>()
         });
         for (row, mut next_warnings) in next {
-          let scope = source.resolve(&source.reference(&row.run))?;
-          source.decorate_warnings(&mut next_warnings, &scope);
+          if row.run["queue_only"] != true {
+            let scope = source.resolve(&source.reference(&row.run))?;
+            source.decorate_warnings(&mut next_warnings, &scope);
+          }
           table_rows.push(row);
           warnings.extend(next_warnings);
         }
@@ -606,7 +692,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let total_count = rows.len();
     let mut metadata_truncated = overview_truncated;
-    let mut result = json!({"source": source, "runs": [], "warnings": bounded_warnings(&warnings), "total_count": total_count, "catalog_total_count": page.total_count, "limit": limit, "offset": offset, "next_offset": null, "metadata_truncated": metadata_truncated});
+    let mut result = json!({"source": source, "runs": [], "warnings": bounded_warnings(&warnings), "total_count": total_count, "catalog_total_count": page.total_count - hidden_native_count + queue_only_count, "limit": limit, "offset": offset, "next_offset": null, "metadata_truncated": metadata_truncated});
     let mut budget = LIST_RESPONSE_LIMIT
       .checked_sub(serde_json::to_vec(&result)?.len())
       .ok_or_else(|| message("hosted list metadata exceeds the response size limit"))?;
@@ -650,6 +736,12 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       )
       .map_err(api_error)?;
     if page.total_count == 0
+      && self
+        .store
+        .dashboard_queue_jobs(&source.project_id, source.origin.as_deref(), 1, 0)
+        .map_err(api_error)?
+        .total_count
+        == 0
       && (source.origin.is_some()
         || !self
           .store
@@ -697,6 +789,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   pub fn detail(&self, source_id: &str, run_id: &str) -> Result<Value> {
+    if let Some((source, context)) = self.queue_selection(source_id, run_id)? {
+      return self.queue_detail(&source, &context);
+    }
     let (source, scope) = self.scope(source_id, run_id)?;
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let state = self.json_artifact(&scope, "run-state.json", STATE_LIMIT, deadline);
@@ -824,6 +919,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       return Err(message(
         "stream must be stdout or stderr and tail must be at most 1000",
       ));
+    }
+    if let Some((_, context)) = self.queue_selection(source_id, run_id)?
+      && self.queue_native_scope(&context)?.is_none()
+    {
+      return Ok(
+        json!({"content":"","stream":stream,"missing":true,"truncated":false,"queue":context}),
+      );
     }
     let (_, scope) = self.scope(source_id, run_id)?;
     let path = format!("logs/{stream}.log");
@@ -955,6 +1057,12 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   fn scope(&self, source_id: &str, run_id: &str) -> Result<(Source, RunScope)> {
+    if let Some((source, context)) = self.queue_selection(source_id, run_id)? {
+      let scope = self
+        .queue_native_scope(&context)?
+        .ok_or_else(|| message("This server job has no published worker run yet"))?;
+      return Ok((source, scope));
+    }
     let source = parse_source(source_id)?;
     let scope = source.resolve(run_id)?;
     if !self.store.dashboard_run_exists(&scope).map_err(api_error)? {
@@ -964,6 +1072,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   pub fn artifacts(&self, source_id: &str, run_id: &str) -> Result<Value> {
+    if let Some((source, context)) = self.queue_selection(source_id, run_id)?
+      && self.queue_native_scope(&context)?.is_none()
+    {
+      return Ok(
+        json!({"source":source,"run_id":context.job_id,"run_key":run_id,"files":[],
+        "truncated":false,"warnings":[],"pull_scope":null,"inventory_recorded_at":null,"queue":context}),
+      );
+    }
     use crate::dashboard::artifacts::{ArtifactRow, bound_rows, download_url, parse_inventory};
     let (source, scope) = self.scope(source_id, run_id)?;
     let mut rows = BTreeMap::new();
@@ -1148,6 +1264,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   fn decorate_run_metadata(&self, run: &mut Value, scope: &RunScope) -> ApiResult<()> {
+    if let Some(context) = self.store.dashboard_run_queue_context(scope)? {
+      run["queue"] = serde_json::to_value(context)
+        .map_err(|_| ApiError::new(500, "cannot encode scheduling context"))?;
+    }
     run["archival"] = serde_json::to_value(self.run_archival(scope)?)
       .map_err(|_| ApiError::new(500, "cannot encode run archival"))?;
     let annotations = self.store.dashboard_run_annotations(scope)?;
@@ -1307,6 +1427,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
 fn started_at(run: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
   run["started_at"]
     .as_str()
+    .or_else(|| run["submitted_at"].as_str())
     .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
 }
 
@@ -1314,7 +1435,15 @@ fn run_preview(run: &Value, truncated: &mut bool) -> Value {
   let mut result = preview(run, truncated);
   // Editor values are independently bounded, so keep the full replacement
   // even if other state fields consume the ordinary preview budget.
-  for field in ["nickname", "tags", "annotations"] {
+  for field in [
+    "nickname",
+    "tags",
+    "annotations",
+    "queue",
+    "run_key",
+    "queue_message",
+    "queue_only",
+  ] {
     if let Some(value) = run.get(field) {
       result[field] = value.clone();
     }

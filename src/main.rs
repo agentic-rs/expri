@@ -229,13 +229,13 @@ struct DownloadCommand {
 }
 
 #[derive(Debug, Args)]
-#[command(group(clap::ArgGroup::new("receipt_mode").args(["queue", "detach"]).multiple(false)))]
+#[command(group(clap::ArgGroup::new("receipt_mode").args(["queue", "detach"]).multiple(true)))]
 struct RunCommand {
   /// Print the queued or detached start receipt as JSON.
   #[arg(long, requires = "receipt_mode")]
   json: bool,
-  /// Freeze source and enqueue the run on the configured shared server.
-  #[arg(long, conflicts_with_all = ["detach", "no_push", "control_path", "control_persist"])]
+  /// Freeze source, enqueue on the shared server, and wait until the task starts.
+  #[arg(long, conflicts_with_all = ["no_push", "control_path", "control_persist"])]
   queue: bool,
   #[command(flatten)]
   resources: queue_cli::RunResources,
@@ -266,7 +266,7 @@ struct RunCommand {
   #[arg(long)]
   smoke: bool,
 
-  /// Start an isolated run in the background and return its run identifier.
+  /// Return immediately: a queued job receipt with --queue, or a background run ID.
   #[arg(long)]
   detach: bool,
 
@@ -714,7 +714,6 @@ mod tests {
     for args in [
       vec!["expri", "run", "--json", "train"],
       vec!["expri", "run", "--cpus", "4", "train"],
-      vec!["expri", "run", "--queue", "--detach", "train"],
       vec!["expri", "run", "--queue", "--no-push", "train"],
       vec![
         "expri",
@@ -747,6 +746,17 @@ mod tests {
     assert!(command.resources.cpus.is_none());
     assert_eq!(command.task, ["train", "--cpus", "2"]);
     assert!(Cli::try_parse_from(["expri", "run", "--detach", "--json", "train"]).is_ok());
+    let cli =
+      Cli::try_parse_from(["expri", "run", "--queue", "--detach", "--json", "train"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Command::Run(RunCommand {
+        queue: true,
+        detach: true,
+        json: true,
+        ..
+      })
+    ));
     assert!(
       Cli::try_parse_from([
         "expri",

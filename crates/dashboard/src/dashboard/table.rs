@@ -320,6 +320,11 @@ fn scalar(value: &Value) -> bool {
 fn timestamp(run: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
   run["started_at"]
     .as_str()
+    .or_else(|| {
+      (run["queue_only"] == true)
+        .then(|| run["submitted_at"].as_str())
+        .flatten()
+    })
     .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
 }
 

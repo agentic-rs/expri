@@ -22,7 +22,8 @@ pub(super) fn now_ms() -> i64 {
 
 pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
   db.execute_batch(
-    "CREATE TABLE IF NOT EXISTS queue_jobs (
+    "CREATE TABLE IF NOT EXISTS queue_change_revisions(project_id TEXT PRIMARY KEY,revision INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS queue_jobs (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL UNIQUE,
     submission_id TEXT NOT NULL UNIQUE,project_id TEXT NOT NULL,spec TEXT NOT NULL,
     record TEXT NOT NULL,status TEXT NOT NULL,source_key TEXT NOT NULL,attempt_id TEXT);
@@ -48,8 +49,18 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
     worker_id TEXT NOT NULL,session_id TEXT NOT NULL,PRIMARY KEY(worker_id,session_id));",
   )
   .map_err(|_| crate::error::ExpriError::Message("cannot initialize execution queue".into()))?;
+  db.execute_batch("INSERT OR IGNORE INTO queue_change_revisions(project_id,revision) SELECT DISTINCT project_id,1 FROM queue_jobs;")
+    .map_err(|_| crate::error::ExpriError::Message("cannot initialize queue history revisions".into()))?;
   for event in ["INSERT", "UPDATE", "DELETE"] {
     let row = if event == "DELETE" { "OLD" } else { "NEW" };
+    db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS dashboard_queue_jobs_{event} AFTER {event} ON queue_jobs BEGIN
+      INSERT INTO queue_change_revisions(project_id,revision) VALUES({row}.project_id,1)
+      ON CONFLICT(project_id) DO UPDATE SET revision=revision+1; END;
+      CREATE TRIGGER IF NOT EXISTS dashboard_queue_offers_{event} AFTER {event} ON queue_offers BEGIN
+      INSERT INTO queue_change_revisions(project_id,revision)
+      SELECT project_id,1 FROM queue_jobs WHERE job_id={row}.job_id
+      ON CONFLICT(project_id) DO UPDATE SET revision=revision+1; END;"))
+      .map_err(|_| crate::error::ExpriError::Message("cannot initialize queue history triggers".into()))?;
     db.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS project_revision_queue_jobs_{event} AFTER {event} ON queue_jobs BEGIN
       INSERT INTO project_change_revisions(project_id,revision) VALUES({row}.project_id,1)
       ON CONFLICT(project_id) DO UPDATE SET revision=revision+1; END;"))
@@ -291,6 +302,15 @@ fn save_attempt(db: &Connection, attempt: &AttemptSummary, released: bool) -> Ap
   )
   .map_err(database)?;
   Ok(())
+}
+
+// Keep the existing indexed reservation ledger stable while public JSON uses pending.
+fn stored_job_status(status: JobStatus) -> &'static str {
+  if status == JobStatus::Pending {
+    "queued"
+  } else {
+    status.as_str()
+  }
 }
 
 fn set_job_status(db: &Connection, job_id: &str, status: &str, now: i64) -> ApiResult<()> {
@@ -554,7 +574,7 @@ fn job(db: &Connection, job_id: &str, now: i64) -> ApiResult<JobSummary> {
     .optional()
     .map_err(database)?
   };
-  job.pending_reason = if job.status == JobStatus::Queued {
+  job.pending_reason = if job.status == JobStatus::Pending {
     Some(if job.assigned_worker_id.is_some() {
       "waiting_for_worker_claim".into()
     } else {
@@ -636,6 +656,166 @@ pub(super) fn cancel_project(db: &Connection, project_id: &str, now: i64) -> Api
 }
 
 impl<S: ObjectStorage> Store<S> {
+  /// Bounded, read-only scheduling history without worker launch credentials.
+  pub(in crate::service) fn dashboard_queue_jobs(
+    &self,
+    project_id: &str,
+    origin: Option<&str>,
+    limit: usize,
+    offset: usize,
+  ) -> ApiResult<DashboardPage<QueueJobContext>> {
+    validate_component(project_id).map_err(bad)?;
+    if let Some(origin) = origin {
+      validate_component(origin).map_err(bad)?;
+    }
+    dashboard_page_bounds(limit, offset)?;
+    let db = self.db()?;
+    let selection = "FROM queue_jobs j LEFT JOIN queue_attempts a ON a.attempt_id=j.attempt_id LEFT JOIN queue_offers o ON o.job_id=j.job_id WHERE j.project_id=?1 AND (?2 IS NULL OR COALESCE(json_extract(a.record,'$.worker_id'),o.worker_id,json_extract(j.record,'$.worker_id'))=?2) AND NOT EXISTS(SELECT 1 FROM project_deletions d WHERE d.project_id=j.project_id)";
+    let total_count = db
+      .query_row(
+        &format!("SELECT COUNT(*) {selection}"),
+        params![project_id, origin],
+        |row| row.get(0),
+      )
+      .map_err(database)?;
+    let mut statement = db
+      .prepare(&format!(
+        "SELECT j.job_id {selection} ORDER BY j.sequence DESC LIMIT ?3 OFFSET ?4"
+      ))
+      .map_err(database)?;
+    let ids = statement
+      .query_map(params![project_id, origin, limit, offset], |row| {
+        row.get::<_, String>(0)
+      })
+      .map_err(database)?
+      .collect::<rusqlite::Result<Vec<_>>>()
+      .map_err(database)?;
+    let now = now_ms();
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+      let summary = job(&db, &id, now)?;
+      summary.validate().map_err(bad)?;
+      items.push(QueueJobContext::from(&summary));
+    }
+    Ok(DashboardPage {
+      items,
+      total_count,
+      legacy_order: false,
+    })
+  }
+
+  pub(in crate::service) fn dashboard_run_queue_context(
+    &self,
+    scope: &RunScope,
+  ) -> ApiResult<Option<QueueJobContext>> {
+    validate_scope(scope).map_err(bad)?;
+    let db = self.db()?;
+    let id: Option<String> = db.query_row("SELECT j.job_id FROM queue_jobs j JOIN queue_attempts a ON a.attempt_id=j.attempt_id WHERE j.project_id=?1 AND json_extract(a.record,'$.worker_id')=?2 AND json_extract(a.record,'$.run_id')=?3 AND NOT EXISTS(SELECT 1 FROM project_deletions d WHERE d.project_id=j.project_id) LIMIT 1",params![scope.project_id,scope.origin,scope.run_id],|row|row.get(0)).optional().map_err(database)?;
+    id.map(|id| job(&db, &id, now_ms()).map(|summary| QueueJobContext::from(&summary)))
+      .transpose()
+  }
+
+  pub(in crate::service) fn dashboard_queue_projects(
+    &self,
+    limit: usize,
+  ) -> ApiResult<Vec<String>> {
+    dashboard_page_bounds(limit, 0)?;
+    let db = self.db()?;
+    let mut statement = db.prepare("SELECT DISTINCT project_id FROM queue_jobs j WHERE NOT EXISTS(SELECT 1 FROM project_deletions d WHERE d.project_id=j.project_id) ORDER BY project_id LIMIT ?1").map_err(database)?;
+    statement
+      .query_map([limit], |row| row.get(0))
+      .map_err(database)?
+      .collect::<rusqlite::Result<Vec<_>>>()
+      .map_err(database)
+  }
+
+  /// A scoped, cheap change hint also reflects eligibility after a worker lease expires.
+  pub(in crate::service) fn dashboard_queue_revision(
+    &self,
+    project_id: Option<&str>,
+    origin: Option<&str>,
+  ) -> ApiResult<Option<String>> {
+    use sha2::{Digest, Sha256};
+    if let Some(project_id) = project_id {
+      validate_component(project_id).map_err(bad)?;
+    }
+    if let Some(origin) = origin {
+      validate_component(origin).map_err(bad)?;
+    }
+    let db = self.db()?;
+    let present: bool = db
+      .query_row(
+        "SELECT EXISTS(SELECT 1 FROM queue_jobs WHERE (?1 IS NULL OR project_id=?1))",
+        [project_id],
+        |row| row.get(0),
+      )
+      .map_err(database)?;
+    if !present {
+      return Ok(None);
+    }
+    let revision: i64 = db.query_row("SELECT COALESCE(SUM(revision),0) FROM queue_change_revisions WHERE (?1 IS NULL OR project_id=?1)",[project_id],|row|row.get(0)).map_err(database)?;
+    let mut statement = db.prepare("SELECT worker_id FROM queue_workers WHERE (?1 IS NULL OR EXISTS(SELECT 1 FROM json_each(project_ids) WHERE value=?1)) AND (?2 IS NULL OR worker_id=?2) ORDER BY worker_id LIMIT ?3").map_err(database)?;
+    let ids = statement
+      .query_map(params![project_id, origin, MAX_WORKERS], |row| {
+        row.get::<_, String>(0)
+      })
+      .map_err(database)?
+      .collect::<rusqlite::Result<Vec<_>>>()
+      .map_err(database)?;
+    let now = now_ms();
+    let mut resources = Vec::with_capacity(ids.len());
+    for id in ids {
+      let worker = worker(&db, &id, now)?;
+      // Shared reservations may change in another project. Hash only public
+      // resource totals, never the other jobs, projects, or fencing identities.
+      resources.push((
+        worker.worker_id,
+        worker.capacity,
+        worker.available,
+        worker.reserved,
+        worker.online,
+        worker.quarantined,
+        worker.outstanding_attempts,
+        worker.assigned_jobs,
+      ));
+    }
+    let bytes = encode(&(revision, resources))?;
+    Ok(Some(
+      Sha256::digest(bytes.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect(),
+    ))
+  }
+
+  pub(in crate::service) fn dashboard_queue_job(
+    &self,
+    project_id: &str,
+    origin: Option<&str>,
+    job_id: &str,
+  ) -> ApiResult<QueueJobContext> {
+    validate_component(project_id).map_err(bad)?;
+    validate_component(job_id).map_err(bad)?;
+    if let Some(origin) = origin {
+      validate_component(origin).map_err(bad)?;
+    }
+    let db = self.db()?;
+    let available: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM queue_jobs j WHERE j.job_id=?1 AND j.project_id=?2 AND NOT EXISTS(SELECT 1 FROM project_deletions d WHERE d.project_id=j.project_id))",params![job_id,project_id],|row|row.get(0)).map_err(database)?;
+    if !available {
+      return Err(ApiError::new(404, "queue job is missing"));
+    }
+    let summary = job(&db, job_id, now_ms())?;
+    summary.validate().map_err(bad)?;
+    let context = QueueJobContext::from(&summary);
+    if origin.is_some_and(|origin| context.worker_id.as_deref() != Some(origin)) {
+      return Err(ApiError::new(
+        404,
+        "queue job is outside the dashboard source",
+      ));
+    }
+    Ok(context)
+  }
+
   pub(super) fn resource_queue(&self, request: QueueRequest) -> ApiResult<QueueResponse> {
     self.resource_queue_with_clock(request, None)
   }
@@ -704,7 +884,7 @@ impl<S: ObjectStorage> Store<S> {
           .query_map(
             params![
               project_id,
-              status.map(JobStatus::as_str),
+              status.map(stored_job_status),
               cursor.unwrap_or_default(),
               limit + 1
             ],
@@ -765,6 +945,7 @@ impl<S: ObjectStorage> Store<S> {
         claim_id,
       } => claim(db, &worker_id, &session_id, &claim_id, now)?,
       QueueRequest::Start { attempt, run_id } => start(db, &attempt, &run_id, now)?,
+      QueueRequest::MarkStarted { attempt, run_id } => mark_started(db, &attempt, &run_id, now)?,
       QueueRequest::Finish {
         attempt,
         status,
@@ -934,7 +1115,7 @@ fn submit(db: &Connection, submission: JobSubmission, now: i64) -> ApiResult<Que
     resources: submission.resources.clone(),
     worker_id: submission.worker_id.clone(),
     assigned_worker_id: None,
-    status: JobStatus::Queued,
+    status: JobStatus::Pending,
     pending_reason: None,
     submitted_at_ms: now,
     updated_at_ms: now,
@@ -948,7 +1129,7 @@ fn submit(db: &Connection, submission: JobSubmission, now: i64) -> ApiResult<Que
 
 fn cancel(db: &Connection, job_id: &str, now: i64) -> ApiResult<QueueResponse> {
   let current = job(db, job_id, now)?;
-  if current.status == JobStatus::Queued {
+  if current.status == JobStatus::Pending {
     set_job_status(db, job_id, "cancelled", now)?;
     db.execute("DELETE FROM queue_offers WHERE job_id=?1", [job_id])
       .map_err(database)?;
@@ -1125,6 +1306,7 @@ fn claim(
       fencing_token: identifier("fence-")?,
       allocation: decode(&allocation)?,
       run_id: None,
+      started_at_ms: None,
       status: AttemptStatus::Claimed,
       cancel_requested: false,
       created_at_ms: now,
@@ -1273,6 +1455,42 @@ fn start(
     now,
   )?;
   refresh_quarantine(db, &attempt.worker_id)?;
+  Ok(QueueResponse::Attempt { attempt })
+}
+
+fn mark_started(
+  db: &Connection,
+  identity: &AttemptIdentity,
+  run_id: &str,
+  now: i64,
+) -> ApiResult<QueueResponse> {
+  let mut attempt = fenced_attempt(db, identity, now)?;
+  if attempt.run_id.as_deref() != Some(run_id) {
+    return Err(ApiError::new(
+      409,
+      "startup confirmation requires the linked run identity",
+    ));
+  }
+  // A fast task may finish before its startup confirmation is retried. Its
+  // terminal phase and allocation release remain authoritative.
+  if attempt.started_at_ms.is_none() {
+    let confirmed = now.max(attempt.created_at_ms).max(attempt.updated_at_ms);
+    attempt.started_at_ms = Some(confirmed);
+    attempt.updated_at_ms = confirmed;
+    let released: bool = db
+      .query_row(
+        "SELECT released FROM queue_attempts WHERE attempt_id=?1",
+        [&attempt.attempt_id],
+        |row| row.get(0),
+      )
+      .map_err(database)?;
+    save_attempt(db, &attempt, released)?;
+    db.execute(
+      "UPDATE queue_jobs SET record=json_set(record,'$.updated_at_ms',?2) WHERE job_id=?1",
+      params![attempt.job_id, confirmed],
+    )
+    .map_err(database)?;
+  }
   Ok(QueueResponse::Attempt { attempt })
 }
 

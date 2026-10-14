@@ -73,7 +73,14 @@ fn tasks_reject_nonlive_preparing_terminal_and_invalid_records_without_mutation(
     assert!(set_task_status(&directory, "waiting").is_err(), "{invalid}");
     assert_eq!(fs::read(&path).unwrap(), original);
   }
-  for phase in ["preparing", "completed", "unknown", "Waiting", ""] {
+  for phase in [
+    "pending",
+    "preparing",
+    "completed",
+    "unknown",
+    "Waiting",
+    "",
+  ] {
     assert!(set_task_status(&directory, phase).is_err());
   }
 }

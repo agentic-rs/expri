@@ -21,12 +21,15 @@ Remote runs push source first unless `--no-push` is selected. Local runs execute
 locally even if the project defines a single target. `--dry-run` previews the
 workflow instead of launching the task.
 
-`--queue` freezes and uploads source, then returns a job receipt before execution.
+`--queue` freezes and uploads source, then waits for a confirmed task start before
+returning a job receipt. While resources are unavailable, its state is `pending`.
 It requires a configured environment and an explicit memory reservation in the
 CLI or task defaults. CPU defaults to one logical slot and GPUs to zero.
 Queued runs use an explicitly enrolled foreground execution worker, with automatic
 placement or `--worker`. Read `expri skill queue` for setup and recovery. The job
-ID and eventual run ID are separate; queue and detach are mutually exclusive.
+ID and eventual run ID are separate. Use `--queue --detach` to return a job
+receipt immediately. Ctrl-C stops waiting without cancelling the durable job;
+use `expri queue cancel <job_id>` for cancellation.
 
 ## Managed runs and outputs
 

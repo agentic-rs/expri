@@ -38,8 +38,9 @@ prints an embedded Markdown guide and works without project configuration.
 - A configured `[environment]` enables isolated, recorded runs. Detached runs,
   automatic publishing, and runs using managed assets require it. An empty
   table selects ordinary uv isolation.
-- `run --queue` uploads frozen source and returns a job ID; execution workers
-  start it when its CPU, memory, and GPU reservations fit. Read `expri skill queue`
+- `run --queue` uploads frozen source and waits for a confirmed task start after
+  CPU, memory, and GPU reservations fit. `--queue --detach` returns immediately.
+  Read `expri skill queue`
   for explicit worker setup, job/run IDs, cancellation, and uncertain recovery.
 - Write run outputs to `EXPRI_OUTPUT_DIR`. Capture the returned run ID for
   detached runs and use `runs status --json` to check task and publisher status.

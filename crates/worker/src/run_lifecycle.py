@@ -276,7 +276,8 @@ def execute_worker(payload, context):
                          EXPRI_RUN_ID=snapshot["run_id"], EXPRI_RUN_DIR=str(run_dir),
                          EXPRI_OUTPUT_DIR=str(run_dir / "outputs"))
         result = logs.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
-                          cwd=snapshot["code_dir"], env=child_env)
+                          cwd=snapshot["code_dir"], env=child_env,
+                          on_started=lambda: _lifecycle_write_json(state_path, {"task_started_at": _lifecycle_now()}))
         exit_code = result.returncode if result.returncode >= 0 else 128 - result.returncode
         if result.started:
           state["task_exit_code"] = exit_code

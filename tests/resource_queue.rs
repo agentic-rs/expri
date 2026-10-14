@@ -528,7 +528,14 @@ impl Fixture {
   fn submit(&self, gate: &Path, resources: &[&str]) -> Value {
     let output = self
       .command()
-      .args(["run", "--queue", "--json", "--project-id", "queue-project"])
+      .args([
+        "run",
+        "--queue",
+        "--detach",
+        "--json",
+        "--project-id",
+        "queue-project",
+      ])
       .args(resources)
       .args([
         "train",
@@ -800,7 +807,7 @@ fn capacity(cpus: u32, memory_bytes: u64, gpu_id: Option<&str>) -> Value {
 
 fn claim(worker_id: &str, session_id: &str, claim_id: &str) -> Value {
   json!({
-    "operation": "claim",
+    "operation": "claim_v2",
     "worker_id": worker_id,
     "session_id": session_id,
     "claim_id": claim_id,
@@ -1023,6 +1030,157 @@ fn shared_service_stop_interrupts_source_download_without_cancelling_running_tra
 }
 
 #[test]
+fn queued_cli_blocks_for_confirmed_task_start_and_returns_before_completion() {
+  let fixture = Fixture::new();
+  let gate = fixture.gate("blocking");
+  let mut submitter = ChildGuard(
+    fixture
+      .command()
+      .args([
+        "run",
+        "--queue",
+        "--json",
+        "--project-id",
+        "queue-project",
+        "--memory",
+        "16MiB",
+        "train",
+      ])
+      .args([gate.to_str().unwrap(), fixture.starts.to_str().unwrap()])
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  let deadline = Instant::now() + Duration::from_secs(10);
+  let job_id = loop {
+    let list = fixture.json(&["queue", "list", "--json"]);
+    if let Some(id) = list["jobs"][0]["job_id"].as_str() {
+      break id.to_owned();
+    }
+    assert!(
+      Instant::now() < deadline,
+      "submission did not reach the server"
+    );
+    thread::sleep(Duration::from_millis(25));
+  };
+  assert_eq!(fixture.show(&job_id)["status"], "pending");
+  thread::sleep(Duration::from_millis(1100));
+  assert!(
+    submitter.0.try_wait().unwrap().is_none(),
+    "pending submission returned early"
+  );
+  let _daemon = fixture.daemon(1, 16 * 1024 * 1024, false);
+  fixture.await_starts(1);
+  let deadline = Instant::now() + Duration::from_secs(15);
+  loop {
+    if let Some(status) = submitter.0.try_wait().unwrap() {
+      assert!(status.success());
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "CLI did not acknowledge the started task: {}",
+      fixture.show(&job_id)
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  let mut stdout = String::new();
+  submitter
+    .0
+    .stdout
+    .take()
+    .unwrap()
+    .read_to_string(&mut stdout)
+    .unwrap();
+  let receipt: Value = serde_json::from_str(&stdout).unwrap();
+  assert_eq!(receipt["job_id"], job_id);
+  assert!(receipt["attempt"]["started_at_ms"].is_number());
+  assert_eq!(receipt["attempt"]["run_id"], fixture.starts()[0]);
+  assert_eq!(fixture.show(&job_id)["status"], "running");
+  let mut stderr = String::new();
+  submitter
+    .0
+    .stderr
+    .take()
+    .unwrap()
+    .read_to_string(&mut stderr)
+    .unwrap();
+  assert!(stderr.contains(&job_id));
+  assert!(stderr.contains("pending"));
+  fs::write(gate, "release").unwrap();
+  fixture.await_status(&job_id, &["completed"]);
+}
+
+#[test]
+fn quiet_queued_cli_reports_cancellation_without_stdout_or_progress() {
+  let fixture = Fixture::new();
+  let gate = fixture.gate("cancel-blocking");
+  let mut submitter = ChildGuard(
+    fixture
+      .command()
+      .args([
+        "--quiet",
+        "run",
+        "--queue",
+        "--json",
+        "--project-id",
+        "queue-project",
+        "--memory",
+        "16MiB",
+        "train",
+      ])
+      .args([gate.to_str().unwrap(), fixture.starts.to_str().unwrap()])
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  let deadline = Instant::now() + Duration::from_secs(10);
+  let job_id = loop {
+    let list = fixture.json(&["queue", "list", "--json"]);
+    if let Some(id) = list["jobs"][0]["job_id"].as_str() {
+      break id.to_owned();
+    }
+    assert!(
+      Instant::now() < deadline,
+      "submission did not reach the server"
+    );
+    thread::sleep(Duration::from_millis(25));
+  };
+  fixture.json(&["queue", "cancel", &job_id, "--json"]);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    if let Some(status) = submitter.0.try_wait().unwrap() {
+      assert!(!status.success());
+      break;
+    }
+    assert!(Instant::now() < deadline, "CLI did not report cancellation");
+    thread::sleep(Duration::from_millis(25));
+  }
+  let mut stdout = String::new();
+  submitter
+    .0
+    .stdout
+    .take()
+    .unwrap()
+    .read_to_string(&mut stdout)
+    .unwrap();
+  assert!(stdout.is_empty());
+  let mut stderr = String::new();
+  submitter
+    .0
+    .stderr
+    .take()
+    .unwrap()
+    .read_to_string(&mut stderr)
+    .unwrap();
+  assert!(stderr.contains("before a task start was confirmed"));
+  assert!(!stderr.contains(" — "));
+  assert!(fixture.starts().is_empty());
+}
+
+#[test]
 fn queued_submission_freezes_uploaded_source_and_daemon_restart_does_not_duplicate_it() {
   let fixture = Fixture::new();
   fs::remove_file(fixture.project.join(".expri/checkout.manifest")).unwrap();
@@ -1045,7 +1203,7 @@ fn queued_submission_freezes_uploaded_source_and_daemon_restart_does_not_duplica
   let gate = fixture.gate("frozen");
   let receipt = fixture.submit(&gate, &["--cpus", "1", "--memory", "16MiB"]);
   let job_id = receipt["job_id"].as_str().unwrap();
-  assert_eq!(receipt["status"], "queued");
+  assert_eq!(receipt["status"], "pending");
   assert!(
     !fixture.s3.objects.lock().unwrap().is_empty(),
     "submission did not upload source"
@@ -1114,6 +1272,7 @@ fn queued_receipts_and_catalog_are_human_by_default_and_cancel_before_launch_is_
     .args([
       "run",
       "--queue",
+      "--detach",
       "--project-id",
       "queue-project",
       "--cpus",
@@ -1128,7 +1287,7 @@ fn queued_receipts_and_catalog_are_human_by_default_and_cancel_before_launch_is_
   assert_success(&output);
   let text = String::from_utf8(output.stdout).unwrap();
   assert!(text.contains("FIELD"));
-  assert!(text.contains("queued"));
+  assert!(text.contains("pending"));
   assert!(serde_json::from_str::<Value>(&text).is_err());
   let list = fixture.json(&["queue", "list", "--project-id", "queue-project", "--json"]);
   let jobs = list["jobs"].as_array().unwrap();
@@ -1224,7 +1383,7 @@ fn queue_rejects_missing_memory_and_invalid_resources_before_uploading_source() 
   let valid = fixture.submit(&fixture.gate("default-cpu"), &["--memory", "16MiB"]);
   assert_eq!(valid["resources"]["cpus"], 1);
   assert_eq!(valid["resources"]["memory_bytes"], 16 * 1024 * 1024);
-  assert_eq!(valid["status"], "queued");
+  assert_eq!(valid["status"], "pending");
 }
 
 #[test]
@@ -1261,7 +1420,7 @@ fn whole_gpu_cpu_and_memory_reservations_delay_the_second_job_until_first_finish
     let first_running = fixture.await_status(first_id, &["running"]);
     for _ in 0..20 {
       let second_pending = fixture.show(second_id);
-      assert_eq!(second_pending["status"], "queued");
+      assert_eq!(second_pending["status"], "pending");
       assert!(second_pending["attempt"].is_null());
       assert_eq!(
         fixture.starts().len(),
@@ -1305,6 +1464,27 @@ fn whole_gpu_cpu_and_memory_reservations_delay_the_second_job_until_first_finish
 }
 
 #[test]
+fn cached_legacy_worker_cannot_claim_a_job_without_start_confirmation_support() {
+  let fixture = Fixture::new();
+  let receipt = fixture.submit(&fixture.gate("legacy-claim"), &["--memory", "16MiB"]);
+  let job_id = receipt["job_id"].as_str().unwrap();
+  fixture.register("worker-a", "session-a", capacity(1, 16 * 1024 * 1024, None));
+  let mut legacy = claim("worker-a", "session-a", "legacy-claim");
+  legacy["operation"] = json!("claim");
+  let (status, _) = queue_http(&fixture.endpoint, legacy);
+  assert_eq!(status, 400);
+  let job = fixture.show(job_id);
+  assert_eq!(job["status"], "pending");
+  assert!(job["attempt"].is_null());
+  let workers = fixture.json(&["queue", "workers", "--json"]);
+  assert_eq!(workers["workers"][0]["outstanding_attempts"], 0);
+  let modern = fixture.queue(claim("worker-a", "session-a", "modern-claim"));
+  assert_eq!(modern["assignment"]["job"]["job_id"], job_id);
+  assert!(modern["assignment"]["attempt"]["started_at_ms"].is_null());
+  assert_eq!(fixture.show(job_id)["status"], "starting");
+}
+
+#[test]
 fn concurrent_repeated_claims_reserve_one_attempt_and_cannot_overallocate_the_worker() {
   let fixture = Fixture::new();
   let first = fixture.submit(
@@ -1343,7 +1523,7 @@ fn concurrent_repeated_claims_reserve_one_attempt_and_cannot_overallocate_the_wo
   assert!(fixture.queue(claim("worker-a", "session-a", "next-claim"))["assignment"].is_null());
   assert_eq!(
     fixture.show(second["job_id"].as_str().unwrap())["status"],
-    "queued"
+    "pending"
   );
   let repeated_submission =
     fixture.queue(json!({"operation": "submit", "submission": assignment["submission"]}));
@@ -1395,7 +1575,7 @@ fn automatic_placement_claims_available_workers_and_a_worker_pin_waits_for_its_w
     fixture.queue(claim("worker-a", "session-a", "wrong-worker-claim"))["assignment"].is_null()
   );
   let waiting = fixture.show(pinned["job_id"].as_str().unwrap());
-  assert_eq!(waiting["status"], "queued");
+  assert_eq!(waiting["status"], "pending");
   assert!(waiting["attempt"].is_null());
   fixture.register("worker-b", "session-b", capacity(1, 16 * 1024 * 1024, None));
   let placed = fixture.queue(claim("worker-b", "session-b", "pinned-claim"));
@@ -1412,7 +1592,7 @@ fn configured_task_reservations_are_used_when_queue_flags_are_omitted() {
   )
   .unwrap();
   let receipt = fixture.submit(&fixture.gate("configured"), &[]);
-  assert_eq!(receipt["status"], "queued");
+  assert_eq!(receipt["status"], "pending");
   assert_eq!(receipt["resources"]["cpus"], 2);
   assert_eq!(receipt["resources"]["memory_bytes"], 32 * 1024 * 1024);
   assert_eq!(receipt["resources"]["gpus"], 0);
@@ -1462,7 +1642,7 @@ fn uncertain_worker_holds_its_reservation_until_stopped_is_explicitly_confirmed(
   );
   assert_eq!(
     fixture.show(second["job_id"].as_str().unwrap())["status"],
-    "queued"
+    "pending"
   );
 
   let (status, rejected) = queue_http(

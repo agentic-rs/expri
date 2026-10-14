@@ -102,11 +102,16 @@ class RunStatusTests(unittest.TestCase):
     self.assertEqual((after.st_ino, after.st_mtime_ns), (metadata.st_ino, metadata.st_mtime_ns))
 
   def test_invalid_requested_status_does_not_create_state_lock(self):
-    for status in ("preparing", "completed", "lost", "WAITING", "", None, 1, True, []):
+    for status in ("pending", "preparing", "completed", "lost", "WAITING", "", None, 1, True, []):
       with self.subTest(status=status), self.assertRaisesRegex(ValueError, "running or waiting"):
         set_run_status(status, self.run)
     self.assertFalse((self.run / ".run-state.lock").exists())
     self.assertEqual(self.read_state(), self.state)
+
+  def test_run_directory_name_obeys_the_shared_identifier_length_limit(self):
+    with self.assertRaisesRegex(ValueError, "invalid run directory name"):
+      set_run_status("waiting", self.root / ("r" * 97))
+    self.assertFalse((self.root / ("r" * 97)).exists())
 
   def test_only_running_and_waiting_records_can_change(self):
     for status in ("preparing", "completed", "failed", "cancelled", "lost", "unknown", None, []):

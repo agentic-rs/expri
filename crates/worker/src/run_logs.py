@@ -216,7 +216,7 @@ class RunLogs:
     poller.register(pipe, _run_logs_select.POLLHUP)
     return any(events & _run_logs_select.POLLHUP for _, events in poller.poll(0))
 
-  def run(self, argv, *, cwd=None, env=None, capture_stdout=False):
+  def run(self, argv, *, cwd=None, env=None, capture_stdout=False, on_started=None):
     """Return the real child status, capturing only private helper stdout on request."""
     if self._closed:
       raise ValueError("run logs are closed")
@@ -236,6 +236,8 @@ class RunLogs:
     deadline = None
     cancel_deadline = None
     try:
+      if on_started is not None:
+        on_started()
       observer = _RunChildExit(child, self._cancel_path is not None)
       selector = _run_logs_selectors.DefaultSelector()
       for name, pipe in (("stdout", child.stdout), ("stderr", child.stderr)):

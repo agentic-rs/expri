@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use expri_client::{ResourceQueueClient, resolve_client_config};
 use expri_core::identifiers::validate_component;
 use expri_core::resource_queue::{
-  JobStatus, JobSubmission, QueueRequest, QueueResponse, ResourceRequest, SourceRef,
+  JobStatus, JobSubmission, JobSummary, QueueRequest, QueueResponse, ResourceRequest, SourceRef,
 };
 use expri_core::storage::StoragePaths;
 use serde::Deserialize;
@@ -246,10 +246,95 @@ pub(crate) fn submit(
         "{error}; retry this identical queued submission with --submission-id {submission_id}"
       ))
     })?;
+  let job = job_response(response)?;
+  let job = if command.detach {
+    job
+  } else {
+    wait_for_start(
+      job,
+      |job_id| {
+        job_response(client.request(&QueueRequest::GetJob {
+          job_id: job_id.into(),
+        })?)
+      },
+      |job| {
+        if !quiet {
+          let reason = job
+            .pending_reason
+            .as_deref()
+            .unwrap_or("waiting for task startup");
+          eprintln!(
+            "{}: {} — {}",
+            crate::output::text(&job.job_id),
+            job.status.as_str(),
+            crate::output::text(reason)
+          );
+        }
+      },
+      || std::thread::sleep(std::time::Duration::from_secs(1)),
+    )?
+  };
   if command.json || !quiet {
-    print_response(response, command.json)?;
+    print_response(QueueResponse::Job { job: Box::new(job) }, command.json)?;
   }
   Ok(())
+}
+
+fn job_response(response: QueueResponse) -> Result<JobSummary> {
+  match response {
+    QueueResponse::Job { job } => Ok(*job),
+    _ => Err(invalid("server returned an unexpected queued job response")),
+  }
+}
+
+fn wait_for_start(
+  mut job: JobSummary,
+  mut refresh: impl FnMut(&str) -> Result<JobSummary>,
+  mut observe: impl FnMut(&JobSummary),
+  mut pause: impl FnMut(),
+) -> Result<JobSummary> {
+  let job_id = job.job_id.clone();
+  let mut progress = None;
+  loop {
+    if job
+      .attempt
+      .as_ref()
+      .is_some_and(|attempt| attempt.started_at_ms.is_some())
+    {
+      return Ok(job);
+    }
+    if matches!(
+      job.status,
+      JobStatus::Completed
+        | JobStatus::Failed
+        | JobStatus::Cancelled
+        | JobStatus::Lost
+        | JobStatus::Unknown
+    ) {
+      return Err(invalid(format!(
+        "job {job_id} became {} before a task start was confirmed; inspect it with expri queue show {job_id}",
+        job.status.as_str()
+      )));
+    }
+    let current = (
+      job.status,
+      job.pending_reason.clone(),
+      job.assigned_worker_id.clone(),
+    );
+    if progress.as_ref() != Some(&current) {
+      observe(&job);
+      progress = Some(current);
+    }
+    pause();
+    job = refresh(&job_id).map_err(|error| invalid(format!(
+      "stopped waiting for job {job_id}: {error}; the server retains the job, inspect it with expri queue show {job_id}"
+    )))?;
+    if job.job_id != job_id {
+      return Err(invalid(
+        "server returned a different job while waiting for task startup",
+      ));
+    }
+  }
 }
 
 #[derive(Debug, Args)]
@@ -264,7 +349,7 @@ enum QueueSubcommand {
   List(ListOptions),
   /// Inspect one job and its current resource allocation.
   Show(JobOptions),
-  /// Cancel a waiting job or request cancellation of its running attempt.
+  /// Cancel a pending job or request cancellation of its active attempt.
   Cancel(JobOptions),
   /// List worker status, reservations, and available execution resources.
   Workers(WorkerListOptions),
@@ -533,6 +618,99 @@ fn invalid(message: impl Into<String>) -> ExpriError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn job(status: JobStatus, run_id: bool, started: bool) -> JobSummary {
+    serde_json::from_value(json!({
+      "job_id":"job-one", "project_id":"project", "task":"train",
+      "resources":{"cpus":1,"memory_bytes":1024}, "worker_id":null,
+      "assigned_worker_id":null, "status":status, "pending_reason":"no capacity",
+      "submitted_at_ms":1, "updated_at_ms":2,
+      "attempt": if run_id { json!({
+        "attempt_id":"attempt-one", "job_id":"job-one", "worker_id":"worker",
+        "session_id":"session", "claim_id":"claim", "fencing_token":"fence",
+        "allocation":{"cpus":1,"memory_bytes":1024,"gpus":[]}, "run_id":"run-one",
+        "status":"running", "cancel_requested":false, "created_at_ms":1,
+        "updated_at_ms":2, "exit_code":null, "message":null,
+        "started_at_ms": if started { Some(2) } else { None }
+      }) } else { serde_json::Value::Null }
+    }))
+    .unwrap()
+  }
+
+  #[test]
+  fn blocking_submission_requires_confirmed_start_and_deduplicates_progress() {
+    let pending = job(JobStatus::Pending, false, false);
+    let mut updates = [
+      pending.clone(),
+      job(JobStatus::Running, true, false),
+      job(JobStatus::Completed, true, true),
+    ]
+    .into_iter();
+    let mut progress = Vec::new();
+    let mut pauses = 0;
+    let started = wait_for_start(
+      pending,
+      |id| {
+        assert_eq!(id, "job-one");
+        Ok(updates.next().unwrap())
+      },
+      |job| progress.push(job.status),
+      || pauses += 1,
+    )
+    .unwrap();
+    assert_eq!(started.status, JobStatus::Completed);
+    assert_eq!(pauses, 3);
+    assert_eq!(progress, [JobStatus::Pending, JobStatus::Running]);
+  }
+
+  #[test]
+  fn terminal_or_uncertain_job_without_confirmed_start_is_an_error() {
+    for status in [
+      JobStatus::Failed,
+      JobStatus::Cancelled,
+      JobStatus::Lost,
+      JobStatus::Completed,
+      JobStatus::Unknown,
+    ] {
+      let error = wait_for_start(
+        job(status, true, false),
+        |_| panic!("no refresh"),
+        |_| panic!("no progress"),
+        || panic!("no pause"),
+      )
+      .unwrap_err()
+      .to_string();
+      assert!(error.contains("job-one"));
+      assert!(error.contains("before a task start was confirmed"));
+    }
+  }
+
+  #[test]
+  fn interrupted_poll_keeps_the_durable_job_identifiable() {
+    let error = wait_for_start(
+      job(JobStatus::Pending, false, false),
+      |_| Err(invalid("connection lost")),
+      |_| {},
+      || {},
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("server retains the job"));
+    assert!(error.contains("expri queue show job-one"));
+    let error = wait_for_start(
+      job(JobStatus::Pending, false, false),
+      |_| {
+        let mut other = job(JobStatus::Running, true, true);
+        other.job_id = "job-other".into();
+        Ok(other)
+      },
+      |_| {},
+      || {},
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("different job"));
+  }
 
   #[test]
   fn memory_units_are_explicit_checked_and_allow_decimal_or_binary_sizes() {

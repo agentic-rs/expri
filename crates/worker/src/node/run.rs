@@ -322,7 +322,13 @@ fn execute_snapshot(
       .env("EXPRI_RUN_DIR", &snapshot.run_dir)
       .env("EXPRI_OUTPUT_DIR", snapshot.run_dir.join("outputs"));
     command.env_remove("EXPRI_INPUT_DIR");
-    let output = logs.task(&mut command)?;
+    let output = logs.task_with_started(&mut command, || {
+      expri_core::run_state::update_state(&state_path, |current| {
+        current["task_started_at"] = json!(chrono::Utc::now().to_rfc3339());
+        Ok(())
+      })
+      .map_err(std::io::Error::other)
+    })?;
     state["task_exit_code"] = json!(command_exit_code(&output.status));
     if let Some(error) = &output.log_error {
       state["logging_error"] = json!(error.to_string());

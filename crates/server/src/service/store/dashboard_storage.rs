@@ -11,7 +11,7 @@ impl<S: ObjectStorage> Store<S> {
   ) -> ApiResult<bool> {
     validate_component(project_id).map_err(bad)?;
     self.db()?.query_row(
-      "SELECT EXISTS(SELECT 1 FROM files WHERE json_extract(target,'$.kind')='input' AND json_extract(target,'$.project_id')=?1 AND json_extract(record,'$.storage')='object' UNION ALL SELECT 1 FROM run_cleanup_tasks WHERE project_id=?1 AND done=0 UNION ALL SELECT 1 FROM run_retention WHERE project_id=?1 AND status<>'deleted')",
+      "SELECT EXISTS(SELECT 1 FROM files WHERE json_extract(target,'$.kind')='input' AND json_extract(target,'$.project_id')=?1 AND json_extract(record,'$.storage')='object' UNION ALL SELECT 1 FROM run_cleanup_tasks WHERE project_id=?1 AND done=0 UNION ALL SELECT 1 FROM run_retention WHERE project_id=?1 AND status<>'deleted' UNION ALL SELECT 1 FROM queue_jobs WHERE project_id=?1 AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=?1))",
       [project_id],
       |row| row.get(0),
     ).map_err(database)
@@ -34,7 +34,8 @@ impl<S: ObjectStorage> Store<S> {
       UNION ALL SELECT json_extract(target,'$.project_id'),NULL FROM files \
         WHERE json_extract(target,'$.kind')='input' \
           AND json_extract(record,'$.storage')='object' \
-      UNION ALL SELECT project_id,NULL FROM run_cleanup_tasks WHERE done=0)";
+      UNION ALL SELECT project_id,NULL FROM run_cleanup_tasks WHERE done=0 \
+      UNION ALL SELECT project_id,NULL FROM queue_jobs j WHERE NOT EXISTS(SELECT 1 FROM project_deletions d WHERE d.project_id=j.project_id))";
     let total_count = db
       .query_row(&format!("SELECT COUNT(*) FROM ({selection})"), [], |row| {
         row.get(0)

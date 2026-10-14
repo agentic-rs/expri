@@ -51,14 +51,11 @@ impl Source {
   }
 
   pub(super) fn reference(&self, run: &Value) -> String {
-    run[if self.origin.is_none() {
-      "run_key"
-    } else {
-      "run_id"
-    }]
-    .as_str()
-    .unwrap()
-    .into()
+    run["run_key"]
+      .as_str()
+      .or_else(|| run["run_id"].as_str())
+      .unwrap()
+      .into()
   }
 }
 

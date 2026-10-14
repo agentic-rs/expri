@@ -3965,3 +3965,159 @@ test("stale deletion previews clear secrets and require another reviewed preview
   assert.equal(nodes.get("delete-project-confirmation").value, "");
   assert.equal(posts.length, 1);
 });
+
+async function pendingFixture(t, { updates = true, initial_detail = null, native_origin = "gpu-a" } = {}) {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:02:05Z");
+  const source = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] };
+  let queue = { job_id: "job-mock-pending", project_id: "vision", task: "mock-training", status: "pending",
+    resources: { cpus: 4, memory_bytes: 8 * 1024 ** 3, gpus: 1, gpu_ids: [], gpu_model: "A100", gpu_memory_bytes: 40 * 1024 ** 3 },
+    pending_reason: "Requested GPU capacity is reserved by another job", submitted_at_ms: clock.time - 60_000, updated_at_ms: clock.time, worker_id: null, run_id: null };
+  const placeholder = { run_id: queue.job_id, run_key: `queue::${queue.job_id}`, task: queue.task, status: "pending", started_at: null,
+    submitted_at: new Date(queue.submitted_at_ms).toISOString(), finished_at: null, exit_code: null, queue_only: true, queue_message: null,
+    queue, archival: { status: "active" }, warnings: [] };
+  const records = [placeholder]; let native = null, redirect_override = undefined, version = 1, initial_requested = false, model;
+  const detail = run => ({ ...detailRecord(source, run), ...(run.queue_only ? { state: null, params: null, metrics: {}, metric_count: 0 } : {}), warnings: [], result_upload: null });
+  const redirect = () => redirect_override !== undefined ? redirect_override : native ? { source_id: source.source_id, run_id: runIdentity(native) } : null;
+  model = await autoFixture(t, { projects: true, refresh_clock: clock, project_runs: records, override: request => {
+    if (request.pathname === "/api/updates") return updates ? response({ catalog_revision: "queue-catalog", source_revision: `queue-${version}`, queue_revision: `queue-${version}`,
+      runs: request.searchParams.getAll("run_id").map(run_id => ({ run_id, metadata_revision: `queue-metadata-${version}`, metrics_revision: native ? "native-metrics" : null,
+        stdout_revision: native ? "native-stdout" : null, stderr_revision: native ? "native-stderr" : null,
+        queue, redirect: run_id === placeholder.run_key ? redirect() : null, missing: false })) }) : response({ error: "Unknown endpoint" }, 404);
+    if (request.pathname === "/api/run" && request.searchParams.get("run_id") === placeholder.run_key) {
+      if (initial_detail && !initial_requested) { initial_requested = true; return initial_detail.promise; }
+      return response({ ...detail(native ?? placeholder), redirect: redirect() });
+    }
+    return null;
+  } });
+  return { ...model, phase(status, { acknowledged = false } = {}) {
+    queue = { ...queue, status, updated_at_ms: clock.time, worker_id: acknowledged ? native_origin : null, run_id: acknowledged ? "run-mock-native" : null };
+    placeholder.queue = queue; placeholder.origin = queue.worker_id;
+    placeholder.status = ["starting", "running", "cancel_requested"].includes(status) ? "preparing" : status;
+    placeholder.queue_message = status === "pending" ? null : ["starting", "running", "cancel_requested"].includes(status) ? "Awaiting worker run metadata" : "No published worker run metadata is available";
+    version++;
+  }, publishNative() {
+    queue = { ...queue, status: "running", worker_id: native_origin, run_id: "run-mock-native", updated_at_ms: clock.time };
+    native = { ...archivalRun(queue.run_id, { status: "running", origin: native_origin }), task: queue.task, nickname: "MOCK published worker run",
+      started_at: new Date(clock.time - 10_000).toISOString(), queue, queue_only: false };
+    records.splice(0, records.length, native); version++;
+  }, unsafeRedirect(value) { redirect_override = value; version++; },
+  resolveInitial() { initial_detail?.resolve(response({ ...detail(native ?? placeholder), redirect: redirect() })); } };
+
+}
+
+function nativeRequestCount(model) {
+  return model.requests.filter(url => ["/api/chart-data", "/api/chart", "/api/log", "/api/artifacts", "/api/compare", "/api/run-system"].includes(new URL(url, "http://localhost").pathname)).length;
+}
+
+test("server pending jobs expose scheduling evidence without claiming worker run data", async t => {
+  const model = await pendingFixture(t), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0));
+  await settled(() => nodes.document.getElementById("queue-overview"));
+  assert.equal(nodes.get("review-eyebrow").textContent, "Job"); assert.equal(nodes.get("review-title").textContent, "job-mock-pending");
+  assert.equal(nodes.get("review-tab-overview").getAttribute("aria-selected"), "true");
+  assert.deepEqual([...nodes.document.querySelectorAll('.review-tabs [role="tab"]')].map(node => node.textContent), ["Overview"]);
+  assert.equal(nodes.get("run-rows").querySelector(".run-task").textContent, "mock-training");
+  assert.equal(runCheckbox(nodes, 0).disabled, true); assert.equal(nodes.get("run-rows").querySelector(".run-duration"), null);
+  assert.match(nodes.get("queue-overview").textContent, /Job IDjob-mock-pending.*Submitted.*4 CPU slots.*8 GiB memory.*1 GPU.*Requested GPU capacity/s);
+  assert.doesNotMatch(nodes.get("queue-overview").textContent, /Started|Duration|Metric summaries|outputs\/metrics.jsonl/);
+  assert.equal(nodes.document.getElementById("run-annotations-panel"), null); assert.equal(nodes.document.getElementById("archive-run-button"), null);
+  assert.equal(nodes.get("review-run-errors").hidden, true); assert.equal(nativeRequestCount(model), 0);
+  await model.clock.advance(5000); assert.equal(nativeRequestCount(model), 0);
+  model.phase("starting"); await model.clock.advance(5000);
+  assert.equal(nodes.document.querySelector(".inspector-status").textContent, "preparing");
+  assert.match(nodes.get("queue-overview").textContent, /Awaiting worker run metadata/);
+  model.phase("running", { acknowledged: true }); await model.clock.advance(5000);
+  assert.match(nodes.get("queue-overview").textContent, /Acknowledged run IDrun-mock-native/);
+  assert.equal(nodes.document.querySelector(".inspector-meta .run-duration"), null); assert.equal(nativeRequestCount(model), 0);
+  model.phase("completed", { acknowledged: true }); await model.clock.advance(5000);
+  assert.equal(nodes.document.querySelector(".inspector-status").textContent, "completed");
+  assert.match(nodes.get("queue-overview").textContent, /No worker run publication/);
+  assert.equal(nodes.document.getElementById("archive-run-button"), null); assert.equal(nodes.get("review-run-errors").hidden, true);
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.equal(nativeRequestCount(model), 0, "neither refresh nor a terminal queue phase invents native evidence");
+});
+
+test("queue publication follows the native run once while preserving history focus and inspector context", async t => {
+  const model = await pendingFixture(t), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
+  await model.clock.advance(5000);
+  const preview = nodes.get("chart-preview"), mounts = previewMounts(nodes);
+  await act(async () => runButton(nodes, 0).focus());
+  model.phase("running", { acknowledged: true }); await model.clock.advance(5000);
+  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "job-mock-pending"); assert.equal(nativeRequestCount(model), 0);
+  model.publishNative(); await model.clock.advance(5000);
+  await settled(() => nodes.get("review-title").textContent === "MOCK published worker run");
+  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-a:run-mock-native");
+  assert.equal(nodes.document.activeElement, runButton(nodes, 0)); assert.equal(nodes.get("review-eyebrow").textContent, "Run");
+  assert.equal(nodes.get("review-tab-overview").getAttribute("aria-selected"), "true"); assert.equal(nodes.document.getElementById("queue-overview"), null);
+  assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
+  assert.equal(nodes.get("review-error").hidden, true); assert.equal(runCheckbox(nodes, 0).disabled, false);
+  assert.equal(nodes.document.querySelector(".inspector-meta .run-duration").textContent, "15s");
+  assert.ok(nativeRequestCount(model) > 0, "real worker metadata unlocks native inspection");
+  for (const url of model.requests.filter(url => url.startsWith("/api/chart-data"))) assert.equal(new URL(url, "http://localhost").searchParams.get("run_id"), "gpu-a:run-mock-native");
+  await model.clock.advance(5000); assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("review-title").textContent, "MOCK published worker run");
+});
+
+test("the Pending filter retains a followed native inspector after the job leaves the scheduling list", async t => {
+  const model = await pendingFixture(t), { nodes } = model;
+  await settledTable(nodes); await openRunControl(nodes, "run-filters"); await click(nodes.get("status-pending")); await settledTable(nodes);
+  assert.equal(nodes.get("status-pending").type, "radio"); assert.equal(nodes.get("status-pending").checked, true);
+  assert.equal(latestRunQuery(model).get("status"), "pending"); assert.equal(nodes.get("run-rows").children.length, 1);
+  await emit(nodes.document, "keydown", { key: "Escape" }); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
+  await model.clock.advance(5000); model.publishNative(); await model.clock.advance(5000);
+  await settled(() => nodes.get("review-title").textContent === "MOCK published worker run");
+  assert.equal(nodes.get("run-rows").children.length, 0); assert.equal(nodes.get("status-pending").checked, true); assert.equal(nodes.get("list-empty").hidden, false);
+  assert.equal(nodes.get("review-section").hidden, false); assert.equal(nodes.get("review-error").hidden, true);
+  assert.equal(chartQuery(nodes).get("run_id"), "gpu-a:run-mock-native");
+  await click(nodes.get("clear-filter-status")); await settledTable(nodes);
+  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-a:run-mock-native");
+});
+
+test("explicit refresh follows a queue detail redirect when update hints are unavailable", async t => {
+  const model = await pendingFixture(t, { updates: false }), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
+  assert.equal(nativeRequestCount(model), 0); model.publishNative();
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.get("review-error").hidden, true); assert.equal(nodes.document.getElementById("queue-overview"), null);
+});
+
+for (const redirect of [
+  { source_id: "hosted-project:other-project", run_id: "gpu-a:run-mock-native" },
+  { source_id: "hosted-project:vision", run_id: "gpu-b:run-mock-native" },
+]) test(`queue redirects cannot select a different project or worker (${redirect.source_id}/${redirect.run_id})`, async t => {
+  const model = await pendingFixture(t), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
+  await model.clock.advance(5000); model.phase("running", { acknowledged: true });
+  model.unsafeRedirect(redirect);
+  await model.clock.advance(5000);
+  assert.equal(nodes.get("review-title").textContent, "job-mock-pending"); assert.equal(nativeRequestCount(model), 0);
+  assert.equal(model.requests.some(url => url.includes("other-project")), false);
+  assert.match(nodes.get("updated-at").textContent, /Updates unavailable.*retrying/, "invalid redirects retain the last successful scheduling preview for recovery");
+});
+
+test("explicit Refresh during the first queue detail load follows the valid native receipt after the placeholder disappears", async t => {
+  const first = deferred(), model = await pendingFixture(t, { initial_detail: first, native_origin: "queue" }), { nodes } = model;
+  await settledTable(nodes); await click(runButton(nodes, 0));
+  assert.equal(nodes.get("review-loading").hidden, false);
+  assert.equal(nodes.document.getElementById("queue-overview"), null, "the first scheduling detail has not arrived");
+  const preview = nodes.get("chart-preview");
+  model.publishNative(); await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "queue:run-mock-native");
+  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(nodes.get("review-error").hidden, true);
+  assert.equal(nodes.get("review-eyebrow").textContent, "Run"); assert.equal(nodes.get("chart-preview"), preview);
+  model.resolveInitial(); await flush();
+  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run", "the superseded initial detail cannot rewind native inspection");
+  assert.equal(nodes.get("review-error").hidden, true);
+  for (const url of model.requests.filter(url => url.startsWith("/api/chart-data"))) assert.equal(new URL(url, "http://localhost").searchParams.get("run_id"), "queue:run-mock-native");
+});
+
+test("native deep links for a worker named queue remain ordinary run inspections", async t => {
+  const run = { ...archivalRun("run-mock-native", { origin: "queue", status: "running" }), nickname: "MOCK native queue worker" };
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run], url: "http://localhost/?project_id=vision&origin=queue&run_id=run-mock-native" }), { nodes } = model;
+  await settled(() => nodes.get("review-title").textContent === "MOCK native queue worker");
+  assert.equal(nodes.get("review-eyebrow").textContent, "Run"); assert.equal(nodes.get("review-error").hidden, true);
+  assert.equal(nodes.document.getElementById("queue-overview"), null);
+  await click(nodes.get("review-tab-overview")); assert.match(nodes.get("run-detail").textContent, /Started|Duration/);
+  assert.equal(model.requests.some(url => url.includes("queue%3A%3A")), false, "a native worker name never becomes a synthetic job key");
+});

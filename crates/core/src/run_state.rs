@@ -11,6 +11,7 @@ use crate::error::{ExpriError, Result};
 use crate::lock::{self, LockAttempt};
 
 pub const STATUSES: &[&str] = &[
+  "pending",
   "preparing",
   "running",
   "waiting",

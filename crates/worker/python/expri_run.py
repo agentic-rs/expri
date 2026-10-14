@@ -245,7 +245,7 @@ def set_run_status(status, run_dir=None):
   if ".." in run_dir.parts:
     raise ValueError("run_dir must not contain parent-directory traversal")
   run_dir = run_dir.absolute()
-  if _RUN_ID.fullmatch(run_dir.name) is None:
+  if len(run_dir.name.encode("utf-8")) > 96 or _RUN_ID.fullmatch(run_dir.name) is None:
     raise ValueError("invalid run directory name")
   directory = _open_directory(run_dir)
   lock = None

@@ -10,6 +10,8 @@ import { RunDetailDiagnostics, RunRowDiagnostics, runWarnings, warningsOutsideRu
 import { Icon } from "./dashboard_icons";
 import { RunControlPopover } from "./run_control_popover";
 import { RunDuration, RunDurationProvider, RunStatusTiming } from "./run_duration";
+import { queueContext, queueMessage, queuePlaceholder } from "./run_queue";
+import { QueueOverview } from "./run_queue_view";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -768,7 +770,7 @@ function RunBrowser({
                     <input
                       type="checkbox"
                       checked={selected}
-                      disabled={s.list_busy || (s.selected.length >= 8 && !selected)}
+                      disabled={s.list_busy || queuePlaceholder(run) || (s.selected.length >= 8 && !selected)}
                       aria-label={`Select ${runLabel(run)} for comparison`}
                       onChange={(event) => {
                         const checked = event.currentTarget.checked;
@@ -813,10 +815,11 @@ function RunBrowser({
                   <td className="status-column">
                     <span
                       className={`status ${runStatusClass(run.status)}`}
+                      title={queueContext(run)?.pending_reason ?? queueMessage(run) ?? undefined}
                     >
                       {run.status}
                     </span>
-                    <RunStatusTiming run={run} />
+                    {!queuePlaceholder(run) && <RunStatusTiming run={run} />}
                   </td>
                   {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
                   <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
@@ -966,7 +969,7 @@ function Overview({ detail }: { detail: Detail | null }) {
   const names = detail ? Object.keys(detail.metrics).sort() : [];
   return (
     <div id="run-detail" hidden={!detail}>
-      {detail && (
+      {detail && (queuePlaceholder(detail.run) ? <QueueOverview run={detail.run} /> : (
         <>
           <div className="detail-grid">
             <section className="card">
@@ -1066,7 +1069,7 @@ function Overview({ detail }: { detail: Detail | null }) {
             )}
           </section>
         </>
-      )}
+      ))}
     </div>
   );
 }
@@ -1234,13 +1237,14 @@ function ReviewWorkspace({
   actions: DashboardActions;
 }) {
   const tabs: ReviewTab[] = ["charts", "system", "overview", "logs", "files"];
-  const available: ReviewTab[] = s.review?.kind === "compare"
-    ? s.run_system_supported ? ["charts", "system"] : ["charts"]
-    : tabs.filter(tab => tab !== "system" || s.run_system_supported);
   const review_run = s.review?.kind === "run" ? (
     s.detail && runIdentity(s.detail.run) === s.review.run_ids[0] ? s.detail.run :
       s.runs.find((run) => runIdentity(run) === s.review?.run_ids[0])
   ) : null;
+  const queue_only = review_run != null && queuePlaceholder(review_run);
+  const available: ReviewTab[] = queue_only ? ["overview"] : s.review?.kind === "compare"
+    ? s.run_system_supported ? ["charts", "system"] : ["charts"]
+    : tabs.filter(tab => tab !== "system" || s.run_system_supported);
   return (
     <div className="review-content">
       <section id="review-empty" className="review-empty" hidden={!s.review_empty}>
@@ -1254,12 +1258,12 @@ function ReviewWorkspace({
         <header className="inspector-header review-heading">
           <div className="inspector-identity">
             <p id="review-eyebrow" className="eyebrow">
-              {s.review?.kind === "compare" ? "Comparison" : "Run"}
+              {s.review?.kind === "compare" ? "Comparison" : queue_only ? "Job" : "Run"}
             </p>
             <h2 id="review-title" tabIndex={-1} className={`inspector-title${review_run && runNickname(review_run) ? " has-nickname" : ""}`}>
               {s.review?.kind === "compare"
                 ? `${s.review.run_ids.length} runs`
-                : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
+                : queue_only && review_run ? review_run.run_id : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
             {review_run && <div className="inspector-meta">
               <span aria-live="polite" className={`status inspector-status ${runStatusClass(review_run.status)}`}>
@@ -1269,7 +1273,7 @@ function ReviewWorkspace({
               {review_run.task && <span title="Task"><span className="sr-only">Task: </span>{review_run.task}</span>}
               {review_run.origin && runNickname(review_run) && <span title="Machine"><span className="sr-only">Machine: </span>{review_run.origin}</span>}
               {review_run.started_at && <time dateTime={review_run.started_at} title="Started"><span className="sr-only">Started: </span>{dateText(review_run.started_at)}</time>}
-              <RunDuration run={review_run} show_unknown={runInProgress(review_run)} />
+              {!queue_only && <RunDuration run={review_run} show_unknown={runInProgress(review_run)} />}
               <RunSmokeMark run={review_run} />
               <RunTags run={review_run} />
             </div>}
@@ -1288,7 +1292,7 @@ function ReviewWorkspace({
           </button>
         </header>
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
-          {tabs.map((tab) => (
+          {(queue_only ? available : tabs).map((tab) => (
             <button
               key={tab}
               id={`review-tab-${tab}`}
@@ -1306,7 +1310,7 @@ function ReviewWorkspace({
             </button>
           ))}
         </div>
-        {s.access_mode === "hosted" && s.review?.kind === "run" && (
+        {!queue_only && s.access_mode === "hosted" && s.review?.kind === "run" && (
           <div className="inspector-toolbar review-management">
             <RunAnnotationsPanel snapshot={s} actions={a} />
             <RunArchivalPanel snapshot={s} actions={a} />
@@ -1608,6 +1612,8 @@ export function DashboardView({ store, actions, duration_clock }: {
   const active_source = s.sources.find((source) => source.source_id === s.source_id);
   const project_id = active_source?.kind === "hosted_project" ? active_source.project_id : null;
   const storage_visible = s.workspace_view === "storage";
+  const inspected_run = s.review?.kind === "run" ? s.detail?.run ?? s.runs.find(run => runIdentity(run) === s.review?.run_ids[0]) : null;
+  const queue_only = inspected_run != null && queuePlaceholder(inspected_run);
   const duration_active = s.runs.some(hasRunningDuration) ||
     Boolean(s.review?.kind === "run" && s.detail && hasRunningDuration(s.detail.run));
   return (
@@ -1635,7 +1641,7 @@ export function DashboardView({ store, actions, duration_clock }: {
             </div>
             <div id="system-workspace" hidden={s.workspace_view !== "system"}>
               <div className="workspace-heading"><div><h1 id="system-heading" tabIndex={-1}>System monitor</h1><p className="muted">Whole-machine readings, recorded independently of runs.</p></div></div>
-              {s.run_system_supported && s.review?.kind === "run" && <RadioTags
+              {!queue_only && s.run_system_supported && s.review?.kind === "run" && <RadioTags
                 name="system_context" legend="Period scope" value={s.system_run_aligned ? "run" : "machine"}
                 options={[{ id: "system-context-run", value: "run", label: "Run period" }, { id: "system-context-machine", value: "machine", label: "All machines" }]}
                 on_change={value => actions.system_alignment(value === "run")}

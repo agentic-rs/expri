@@ -204,3 +204,39 @@ fn full_selected_column_page_obeys_the_json_response_budget() {
     .is_err()
   );
 }
+
+#[test]
+fn queued_submission_sorting_keeps_native_start_times_and_unknown_records_honest() {
+  let mut rows = vec![
+    row("missing", json!(1)),
+    row("native", json!(1)),
+    row("pending", json!(1)),
+    row("legacy", json!(1)),
+  ];
+  rows[1].run["started_at"] = json!("2026-10-14T01:00:00Z");
+  rows[2].run["queue_only"] = json!(true);
+  rows[2].run["started_at"] = Value::Null;
+  rows[2].run["submitted_at"] = json!("2026-10-14T02:00:00Z");
+  rows[3].run["submitted_at"] = json!("2026-10-14T03:00:00Z");
+  options("started_at", "desc").sort_rows(&mut rows);
+  assert_eq!(
+    rows
+      .iter()
+      .map(|row| row.run["run_id"].as_str().unwrap())
+      .collect::<Vec<_>>(),
+    ["pending", "native", "legacy", "missing"]
+  );
+  assert!(rows[0].run["started_at"].is_null());
+  options("started_at", "asc").sort_rows(&mut rows);
+  assert_eq!(
+    rows
+      .iter()
+      .map(|row| row.run["run_id"].as_str().unwrap())
+      .collect::<Vec<_>>(),
+    ["native", "pending", "legacy", "missing"]
+  );
+  assert!(
+    rows[1].run["started_at"].is_null(),
+    "submission sorting never invents a worker run start"
+  );
+}
