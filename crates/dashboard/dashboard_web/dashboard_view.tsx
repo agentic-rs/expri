@@ -1,4 +1,4 @@
-import { Fragment, useSyncExternalStore, useState, type KeyboardEvent } from "react";
+import { Fragment, useSyncExternalStore, useState, useEffect, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
@@ -6,7 +6,11 @@ import { ProjectStorageManagement } from "./storage_management_view";
 import { RunArchivalPanel } from "./run_archival_view";
 import { RunAnnotationsPanel, RunTags } from "./run_annotations_view";
 import { RunAssets } from "./dashboard_assets";
+import { RunDetailDiagnostics, RunRowDiagnostics, runWarnings, warningsOutsideRuns } from "./run_diagnostics";
 import { Icon } from "./dashboard_icons";
+import { RunControlPopover } from "./run_control_popover";
+import { RunDuration, RunDurationProvider, RunStatusTiming } from "./run_duration";
+import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
@@ -27,7 +31,8 @@ import { RunSystemPanel, type RunSystemActions } from "./run_system_view";
 import {
   apiUrl,
   dateText,
-  formatDuration,
+  hasRunningDuration,
+  runInProgress,
   formatNumber,
   formatValue,
   jsonObject,
@@ -262,7 +267,7 @@ function Warnings({ id, items }: { id: string; items: Warning[] }) {
       {items.length > 0 && (
         <div className="notice">
           <ul>
-            {items.slice(0, 100).map((item, index) => (
+            {items.map((item, index) => (
               <li key={index}>
                 {item.run_id ? `${item.run_id}: ` : ""}
                 {item.message}
@@ -343,9 +348,13 @@ function MetricPicker({
 function RunColumnPicker({
   snapshot: s,
   actions: a,
+  open,
+  on_change,
 }: {
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
+  open: boolean;
+  on_change: (open: boolean) => void;
 }) {
   const [search, setSearch] = useState("");
   const choices = runColumnChoices(s.available_run_columns, s.run_columns);
@@ -360,21 +369,12 @@ function RunColumnPicker({
   const disabled =
     s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported;
   return (
-    <details
-      id="run-columns"
-      className="run-columns-panel"
-      onToggle={(event) => {
-        if (event.currentTarget.open) a.refresh_run_columns();
-      }}
-    >
-      <summary>
-        Columns <span className="muted">{s.run_columns.length} / {MAX_RUN_COLUMNS}</span>
-      </summary>
+    <RunControlPopover id="run-columns" label="Columns" icon="columns" count={s.run_columns.length}
+      open={open} disabled={s.controls_disabled} on_change={(value) => { on_change(value); if (value) a.refresh_run_columns(); }}>
       <p id="run-columns-hint" className="muted">
-        Run, task, status, and start time stay visible. Add up to eight parameter or metric columns.
+        Runs include task names. Status and start time stay visible. Add up to eight parameter or metric columns.
       </p>
       {s.run_columns_loading && <p role="status">Finding recorded columns…</p>}
-      <Warnings id="run-columns-warnings" items={s.run_columns_warnings} />
       {choices.length > 0 && (
         <label className="field">
           Find a column
@@ -433,7 +433,55 @@ function RunColumnPicker({
         </p>
       )}
       {chosen.size >= MAX_RUN_COLUMNS && <p className="muted">Remove a column to choose another.</p>}
-    </details>
+      {(!s.run_columns_supported || s.run_columns_error) && (
+        <div
+          id="run-columns-feedback"
+          className={`notice run-columns-feedback${s.run_columns_supported ? " error" : ""}`}
+          role={s.run_columns_supported ? "alert" : "status"}
+        >
+          <p>{s.run_columns_error ?? "Table columns require an updated expri backend."}</p>
+          <button
+            type="button"
+            className="text-button"
+            disabled={s.run_columns_loading || s.controls_disabled}
+            onClick={a.refresh_run_columns}
+          >
+            Retry column discovery
+          </button>
+        </div>
+      )}
+      <div className="run-column-settings">
+        <RadioTags
+          id="run-reduction-options"
+          name="run_reduction"
+          legend="Metric summary"
+          value={s.run_reduction}
+          hidden={!s.run_columns.some((column) => column.kind === "metric")}
+          disabled={
+            s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported
+          }
+          options={[
+            { id: "run-reduction-last", value: "last", label: "Last" },
+            { id: "run-reduction-min", value: "min", label: "Min" },
+            { id: "run-reduction-max", value: "max", label: "Max" },
+          ]}
+          on_change={a.run_reduction}
+        />
+        <button
+          id="reset-run-sort"
+          className="text-button"
+          type="button"
+          aria-pressed={runSortIsDefault(s.run_sort)}
+          disabled={s.controls_disabled || s.list_busy || runSortIsDefault(s.run_sort)}
+          onClick={a.reset_run_sort}
+        >
+          Newest first
+        </button>
+        <p id="run-sort-description" className="muted">
+          {runSortLabel(s.run_sort, s.run_columns)} · Missing values last
+        </p>
+      </div>
+    </RunControlPopover>
   );
 }
 function RunSortHeader({
@@ -510,6 +558,73 @@ function MachineFilter({ source, snapshot: s, actions: a }: {
     </div>
   );
 }
+function RunFilterPanel({ snapshot: s, actions: a }: { snapshot: DashboardSnapshot; actions: DashboardActions }) {
+  const project = s.sources.find((source) => source.source_id === s.source_id && source.kind === "hosted_project");
+  const tasks = [...new Set(s.runs.map((run) => run.task).filter((task): task is string => task !== null))].sort();
+  return (
+    <div className="run-filter-panel">
+      <label className="field">
+        Task
+        <input
+          id="task-input"
+          type="search"
+          list="task-options"
+          placeholder="Any task"
+          autoComplete="off"
+          disabled={s.controls_disabled}
+          value={s.task}
+          onChange={(event) => a.filter("task", event.currentTarget.value)}
+        />
+        <datalist id="task-options">
+          {tasks.map((task) => (
+            <option key={task} value={task} />
+          ))}
+        </datalist>
+      </label>
+      {s.access_mode === "hosted" && <RadioTags
+        id="archival-options"
+        name="archival"
+        legend="Run history"
+        value={s.archival}
+        disabled={s.controls_disabled}
+        options={[
+          { id: "archival-active", value: "active", label: "Active" },
+          { id: "archival-archived", value: "archived", label: "Archived" },
+        ]}
+        on_change={a.archival}
+      />}
+      <RadioTags
+        id="status-options"
+        name="status"
+        legend="Status"
+        value={s.status}
+        disabled={s.controls_disabled}
+        options={[
+          { id: "status-any", value: "", label: "Any" },
+          ...["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].map(
+            (status) => ({
+              id: `status-${status}`,
+              value: status,
+              label: `${status[0]?.toUpperCase()}${status.slice(1)}`,
+            }),
+          ),
+        ]}
+        on_change={(value) => a.filter("status", value)}
+      />
+      {project && <MachineFilter key={project.source_id} source={project} snapshot={s} actions={a} />}
+      <button
+        id="clear-filters"
+        className="text-button"
+        type="button"
+        disabled={s.controls_disabled}
+        onClick={a.clear_filters}
+      >
+        Clear filters
+      </button>
+      <p className="filter-hint sr-only">Changing filters clears the selection.</p>
+    </div>
+  );
+}
 function RunBrowser({
   snapshot: s,
   actions: a,
@@ -517,146 +632,82 @@ function RunBrowser({
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
 }) {
+  const [open_control, setOpenControl] = useState<"filters" | "columns" | "issues" | null>(null);
+  useEffect(() => setOpenControl(null), [s.source_id]);
+  function changeControl(control: "filters" | "columns" | "issues", open: boolean): void {
+    setOpenControl((current) => open ? control : current === control ? null : current);
+  }
+  const active_filters = [
+    ...(s.task ? [{ key: "task", name: "task", label: `Task: ${s.task}`, clear: () => a.filter("task", "") }] : []),
+    ...(s.status ? [{ key: "status", name: "status", label: `Status: ${s.status}`, clear: () => a.filter("status", "") }] : []),
+    ...(s.origin ? [{ key: "origin", name: "machine", label: `Machine: ${s.origin}`, clear: () => a.filter("origin", "") }] : []),
+    ...(s.archival === "archived" ? [{ key: "archival", name: "archive", label: "Archived", clear: () => a.archival("active") }] : []),
+  ];
+  const filter_count = active_filters.length;
+  const seen_issues = new Set<string>();
+  const issue_groups = [
+    { id: "catalog-warnings", label: "Workspace", items: s.catalog_warnings },
+    { id: "list-warnings", label: "Other run records", items: warningsOutsideRuns(s.list_warnings, s.runs) },
+    { id: "run-columns-warnings", label: "Column discovery", items: [
+      ...warningsOutsideRuns(s.run_columns_warnings, s.runs),
+      ...(s.run_columns_error ? [{ message: s.run_columns_error }] : []),
+    ] },
+  ].map((group) => ({ ...group, items: group.items.filter((item) => {
+    const key = JSON.stringify([item.run_id ?? null, item.message]);
+    if (seen_issues.has(key)) return false;
+    seen_issues.add(key);
+    return true;
+  }) }));
+  const issue_count = issue_groups.reduce((count, group) => count + group.items.length, 0) + Number(s.project_catalog_note !== null);
+  useEffect(() => {
+    if (!issue_count) setOpenControl((current) => current === "issues" ? null : current);
+  }, [issue_count]);
   const project = s.sources.find((source) => source.source_id === s.source_id && source.kind === "hosted_project");
-  const tasks = [
-    ...new Set(s.runs.map((run) => run.task).filter((task): task is string => task !== null)),
-  ].sort();
   return (
     <aside className="runs-card run-history" aria-labelledby="runs-heading">
       <div className="section-heading run-history-header">
-        <div>
-          <h2 id="runs-heading" tabIndex={-1}>Run history</h2>
-          <p id="run-count" className="muted">
-            {s.run_count}
-          </p>
+        <div><h2 id="runs-heading" tabIndex={-1}>Run history</h2><p id="run-count" className="muted">{s.run_count}</p></div>
+        <div className="run-history-actions">
+          <RunControlPopover id="run-filters" label="Filters" icon="filter" count={filter_count}
+            open={open_control === "filters"} disabled={s.controls_disabled} on_change={(open) => changeControl("filters", open)}>
+            <RunFilterPanel snapshot={s} actions={a} />
+          </RunControlPopover>
+          <RunColumnPicker key={s.source_id} snapshot={s} actions={a} open={open_control === "columns"} on_change={(open) => changeControl("columns", open)} />
+          <RunControlPopover id="run-issues" label="Issues" icon="issue" count={issue_count}
+            open={open_control === "issues"} hidden={!issue_count} on_change={(open) => changeControl("issues", open)}>
+            {issue_groups.map((group) => <section className="run-issue-group" key={group.id}>
+              {group.items.length > 0 && <h4>{group.label}</h4>}
+              <Warnings id={group.id} items={group.items} />
+            </section>)}
+            <p id="project-catalog-note" className="muted" hidden={s.project_catalog_note === null}>{s.project_catalog_note}</p>
+          </RunControlPopover>
         </div>
       </div>
-      <div className="filters">
-        <label className="field search-field">
-          Search
+      <div className="run-search-row">
+        <div className="field search-field">
+          <label className="sr-only" htmlFor="search-input">Search runs</label>
           <span className="search-control">
             <Icon name="search" />
             <input
               id="search-input"
               type="search"
-              placeholder="Name, tag, run ID, or task"
+              placeholder="Search runs, tags, or tasks"
               autoComplete="off"
               disabled={s.controls_disabled}
               value={s.search}
               onChange={(event) => a.filter("search", event.currentTarget.value)}
             />
+            {s.search && <button type="button" className="search-clear" aria-label="Clear search" disabled={s.controls_disabled} onClick={() => { a.filter("search", ""); document.getElementById("search-input")?.focus(); }}><Icon name="close" /></button>}
           </span>
-        </label>
-        <label className="field">
-          Task
-          <input
-            id="task-input"
-            type="search"
-            list="task-options"
-            placeholder="Any task"
-            autoComplete="off"
-            disabled={s.controls_disabled}
-            value={s.task}
-            onChange={(event) => a.filter("task", event.currentTarget.value)}
-          />
-          <datalist id="task-options">
-            {tasks.map((task) => (
-              <option key={task} value={task} />
-            ))}
-          </datalist>
-        </label>
-        {s.access_mode === "hosted" && <RadioTags
-          id="archival-options"
-          name="archival"
-          legend="Run history"
-          value={s.archival}
-          disabled={s.controls_disabled}
-          options={[
-            { id: "archival-active", value: "active", label: "Active" },
-            { id: "archival-archived", value: "archived", label: "Archived" },
-          ]}
-          on_change={a.archival}
-        />}
-        <RadioTags
-          id="status-options"
-          name="status"
-          legend="Status"
-          value={s.status}
-          disabled={s.controls_disabled}
-          options={[
-            { id: "status-any", value: "", label: "Any" },
-            ...["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].map(
-              (status) => ({
-                id: `status-${status}`,
-                value: status,
-                label: `${status[0]?.toUpperCase()}${status.slice(1)}`,
-              }),
-            ),
-          ]}
-          on_change={(value) => a.filter("status", value)}
-        />
-        {project && <MachineFilter key={project.source_id} source={project} snapshot={s} actions={a} />}
-        <button
-          id="clear-filters"
-          className="text-button"
-          type="button"
-          disabled={s.controls_disabled}
-          onClick={a.clear_filters}
-        >
-          Clear filters
-        </button>
-        <p className="filter-hint sr-only">Changing filters clears the selection.</p>
-      </div>
-      <div className="run-table-toolbar">
-        <RunColumnPicker key={s.source_id} snapshot={s} actions={a} />
-        <RadioTags
-          id="run-reduction-options"
-          name="run_reduction"
-          legend="Metric summary"
-          value={s.run_reduction}
-          hidden={!s.run_columns.some((column) => column.kind === "metric")}
-          disabled={
-            s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported
-          }
-          options={[
-            { id: "run-reduction-last", value: "last", label: "Last" },
-            { id: "run-reduction-min", value: "min", label: "Min" },
-            { id: "run-reduction-max", value: "max", label: "Max" },
-          ]}
-          on_change={a.run_reduction}
-        />
-        <button
-          id="reset-run-sort"
-          className="text-button"
-          type="button"
-          aria-pressed={runSortIsDefault(s.run_sort)}
-          disabled={s.controls_disabled || s.list_busy || runSortIsDefault(s.run_sort)}
-          onClick={a.reset_run_sort}
-        >
-          Newest first
-        </button>
-        <p id="run-sort-description" className="muted">
-          {runSortLabel(s.run_sort, s.run_columns)} · Missing values last
-        </p>
-      </div>
-      {(!s.run_columns_supported || s.run_columns_error) && (
-        <div
-          id="run-columns-feedback"
-          className={`notice run-columns-feedback${s.run_columns_supported ? " error" : ""}`}
-          role={s.run_columns_supported ? "alert" : "status"}
-        >
-          <p>{s.run_columns_error ?? "Table columns require an updated expri backend."}</p>
-          <button
-            type="button"
-            className="text-button"
-            disabled={s.run_columns_loading || s.controls_disabled}
-            onClick={a.refresh_run_columns}
-          >
-            Retry column discovery
-          </button>
         </div>
-      )}
-      <Warnings id="list-warnings" items={s.list_warnings} />
+      </div>
+      <div className="active-run-filters" aria-label="Active run filters" hidden={!filter_count}>
+        {active_filters.map((filter) => <button key={filter.key} id={`clear-filter-${filter.key}`} type="button" className="run-filter-chip"
+          title={filter.label} aria-label={`Clear ${filter.name} filter`} disabled={s.controls_disabled} onClick={filter.clear}>
+          <span>{filter.label}</span><Icon name="close" />
+        </button>)}
+        <button id="clear-all-run-filters" type="button" className="text-button" disabled={s.controls_disabled} onClick={a.clear_filters}>Clear all</button>
+      </div>
       <div className="table-scroll runs-scroll" id="runs-region" aria-busy={s.list_busy}>
         <table
           className={`runs-table${(s.run_columns.length || s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project")) ? " has-custom-columns" : ""}`}
@@ -682,7 +733,6 @@ function RunBrowser({
                 actions={a}
               />
               {project && <RunSortHeader label="Machine" sort_key="origin" class_name="machine-column" snapshot={s} actions={a} />}
-              <th scope="col" className="task-column">Task</th>
               <RunSortHeader label="Started" sort_key="started_at" class_name="started-column" snapshot={s} actions={a} />
               {s.run_columns.map((column) => (
                 <RunSortHeader
@@ -699,11 +749,6 @@ function RunBrowser({
           </thead>
           <tbody id="run-rows">
             {s.runs.map((run) => {
-              const metadata = [formatDuration(run)].filter(
-                (value) => value !== "—",
-              );
-              if (run.exit_code !== null && run.exit_code !== 0)
-                metadata.push(`exit ${run.exit_code}`);
               const identity = runIdentity(run);
               const selected = s.selected.includes(identity);
               return (
@@ -743,6 +788,7 @@ function RunBrowser({
                     >
                       {runNickname(run) ?? run.run_id}
                     </button>
+                    <div className="run-task" title={run.task ?? undefined}>{run.task ?? "—"}</div>
                     <div className="run-summary-meta">
                       {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
                       <RunSmokeMark run={run} />
@@ -752,6 +798,7 @@ function RunBrowser({
                       {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` :
                         run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
                     </div>}
+                    <RunRowDiagnostics run={run} items={runWarnings(run, s.list_warnings, s.run_columns_warnings)} />
                     {run.table_values_truncated && (
                       <div
                         className="run-value-warning"
@@ -767,10 +814,9 @@ function RunBrowser({
                     >
                       {run.status}
                     </span>
-                    {metadata.length > 0 && <div className="run-meta">{metadata.join(" · ")}</div>}
+                    <RunStatusTiming run={run} />
                   </td>
                   {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
-                  <td className="task-column"><span className="run-task">{run.task ?? "—"}</span></td>
                   <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
                   {s.run_columns.map((column) => {
                     const value = formatRunTableValue(runColumnValue(run, column));
@@ -892,7 +938,7 @@ function RunBrowser({
     </aside>
   );
 }
-function Facts({ values }: { values: [string, string][] }) {
+function Facts({ values }: { values: [string, ReactNode][] }) {
   return (
     <dl className="facts">
       {values.map(([label, value]) => (
@@ -929,7 +975,7 @@ function Overview({ detail }: { detail: Detail | null }) {
                   ["Status", detail.run.status],
                   ["Started", dateText(detail.run.started_at)],
                   ["Finished", dateText(detail.run.finished_at)],
-                  ["Duration", formatDuration(detail.run)],
+                  ["Duration", <RunDuration run={detail.run} />],
                   ["Exit code", formatValue(detail.run.exit_code)],
                 ]}
               />
@@ -1202,7 +1248,7 @@ function ReviewWorkspace({
           <p>Open a run from the history to inspect its metrics, parameters, logs, and files. Select two to eight runs to compare.</p>
         </div>
       </section>
-      <section id="review-section" aria-live="polite" hidden={!s.review}>
+      <section id="review-section" hidden={!s.review}>
         <header className="inspector-header review-heading">
           <div className="inspector-identity">
             <p id="review-eyebrow" className="eyebrow">
@@ -1214,14 +1260,14 @@ function ReviewWorkspace({
                 : (review_run && runNickname(review_run)) ?? runKeyLabel(s.review?.run_ids[0] ?? "")}
             </h2>
             {review_run && <div className="inspector-meta">
-              <span className={`status inspector-status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(review_run.status) ? review_run.status : ""}`}>
+              <span aria-live="polite" className={`status inspector-status ${["preparing", "running", "completed", "failed", "cancelled", "lost", "unknown"].includes(review_run.status) ? review_run.status : ""}`}>
                 {review_run.status}
               </span>
               {runNickname(review_run) && <code className="run-identifier">{review_run.run_id}</code>}
               {review_run.task && <span title="Task"><span className="sr-only">Task: </span>{review_run.task}</span>}
               {review_run.origin && runNickname(review_run) && <span title="Machine"><span className="sr-only">Machine: </span>{review_run.origin}</span>}
               {review_run.started_at && <time dateTime={review_run.started_at} title="Started"><span className="sr-only">Started: </span>{dateText(review_run.started_at)}</time>}
-              {review_run.finished_at && <span title="Duration"><span className="sr-only">Duration: </span>{formatDuration(review_run)}</span>}
+              <RunDuration run={review_run} show_unknown={runInProgress(review_run)} />
               <RunSmokeMark run={review_run} />
               <RunTags run={review_run} />
             </div>}
@@ -1269,7 +1315,11 @@ function ReviewWorkspace({
           Loading run details…
         </div>
         <ErrorNotice id="review-error" message={s.review_error} />
-        <Warnings id="review-warnings" items={s.review_warnings} />
+        {s.review?.kind === "run" && <RunDetailDiagnostics
+          id="review-run-errors"
+          items={review_run ? runWarnings(review_run, s.review_warnings, s.list_warnings, s.run_columns_warnings) : s.review_warnings.filter((item) => item.run_id === s.review?.run_ids[0])}
+        />}
+        <Warnings id="review-warnings" items={s.review?.kind === "run" ? s.review_warnings.filter((item) => !item.run_id) : s.review_warnings} />
         <div
           id="review-panel-charts"
           role="tabpanel"
@@ -1541,9 +1591,10 @@ function RefreshControls({ snapshot: s, actions }: {
     </div>
   );
 }
-export function DashboardView({ store, actions }: {
+export function DashboardView({ store, actions, duration_clock }: {
   store: DashboardStore;
   actions: DashboardActions;
+  duration_clock: RefreshClock;
 }) {
   const s = useSyncExternalStore(store.subscribe, store.get_snapshot);
   const source_controls = document.getElementById("source-controls-root");
@@ -1555,8 +1606,10 @@ export function DashboardView({ store, actions }: {
   const active_source = s.sources.find((source) => source.source_id === s.source_id);
   const project_id = active_source?.kind === "hosted_project" ? active_source.project_id : null;
   const storage_visible = s.workspace_view === "storage";
+  const duration_active = s.runs.some(hasRunningDuration) ||
+    Boolean(s.review?.kind === "run" && s.detail && hasRunningDuration(s.detail.run));
   return (
-    <>
+    <RunDurationProvider clock={duration_clock} active={duration_active}>
       {project && createPortal(s.project_name, project)}
       {kind && createPortal(s.access_mode === "hosted" ? "Hosted workspace" : "Local workspace", kind)}
       {source_controls && createPortal(<SourceControls snapshot={s} actions={actions} />, source_controls)}
@@ -1564,11 +1617,7 @@ export function DashboardView({ store, actions }: {
       {navigation && createPortal(<WorkspaceNavigation snapshot={s} actions={actions} storage_enabled={!!project_id} />, navigation)}
       {theme_controls && createPortal(<ThemeControl compact />, theme_controls)}
       {!navigation && <WorkspaceNavigation snapshot={s} actions={actions} storage_enabled={!!project_id} />}
-      <div id="project-catalog-note" className="notice" role="status" hidden={s.project_catalog_note === null}>
-        {s.project_catalog_note}
-      </div>
       <ErrorNotice id="global-error" message={s.global_error} />
-      <Warnings id="catalog-warnings" items={s.catalog_warnings} />
       <div id="workspace-page">
         <div className={`workspace-grid history-grid${(s.run_columns.length || project_id) ? " has-wide-table" : ""}${s.review ? " has-review" : ""}`}>
           <RunBrowser snapshot={s} actions={actions} />
@@ -1621,6 +1670,6 @@ export function DashboardView({ store, actions }: {
         </div>
       </div>
       <div id="live-status" className="sr-only" role="status" aria-live="polite">{s.live_status}</div>
-    </>
+    </RunDurationProvider>
   );
 }

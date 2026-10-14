@@ -19,7 +19,7 @@ use super::types::{
   RunAnnotations, RunArchival, RunScope, STREAM_BATCH, validate_component,
 };
 use crate::dashboard::artifacts::Download;
-use crate::dashboard::preview::{bounded_warnings, preview, run_metadata};
+use crate::dashboard::preview::{bounded_warnings, preview, run_metadata, run_warnings};
 use crate::dashboard::table::{self, ListQuery};
 use crate::error::{ExpriError, Result};
 use crate::metric_charts::{ChartData, ChartXAxis};
@@ -624,7 +624,9 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let mut retained = Vec::new();
     for row in rows.into_iter().skip(offset).take(limit) {
       let mut row_truncated = false;
-      let row = run_preview(&row, &mut row_truncated);
+      let run_id = source.reference(&row);
+      let mut row = run_preview(&row, &mut row_truncated);
+      row["warnings"] = json!(run_warnings(&warnings, &run_id));
       // Reserve each comma too. The empty envelope already reserves [] and
       // null, which is at least as large as any supported next-offset value.
       let bytes = serde_json::to_vec(&row)?.len() + usize::from(!retained.is_empty());

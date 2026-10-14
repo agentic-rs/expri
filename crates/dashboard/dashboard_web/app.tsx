@@ -4,6 +4,7 @@ import { createChartController, type ChartAxis, type ChartTimeZone } from "./int
 import { parseChartData, type ChartData } from "./chart_data";
 import {
   AutoRefresh,
+  type RefreshClock,
   type RefreshAvailability,
   type RefreshOutcome,
   type RefreshState,
@@ -133,6 +134,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     run_system_lane,
   ];
   const now = options.refresh_clock?.now ?? (() => Date.now());
+  const duration_clock: RefreshClock = options.refresh_clock ?? {
+    now,
+    set_timeout: (callback, delay_ms) => page_window!.setTimeout(callback, delay_ms),
+    clear_timeout: (timer) => page_window!.clearTimeout(timer),
+  };
   let auto_refresh: AutoRefresh | null = null;
   let live_updates: LiveUpdates | null = null;
   let live_updates_state: LiveUpdatesState = "unavailable";
@@ -608,7 +614,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     },
   };
   const react_root = createRoot(required("dashboard-root"));
-  flushSync(() => react_root.render(<DashboardView store={store} actions={actions} />));
+  flushSync(() => react_root.render(<DashboardView store={store} actions={actions} duration_clock={duration_clock} />));
   const chart_controller =
     options.chart_controller ?? createChartController(required("chart-preview"));
   chart_controller.setTimeZone(time_zone);
@@ -899,6 +905,12 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     last_run_list = result;
     last_run_list_context = context;
     last_list_snapshot = now();
+    // Discovery diagnostics describe saved files too. Recheck them after a fresh
+    // list read, even when repairing an unselected column leaves the rows equal.
+    if (run_columns_source === source_id && ui.run_columns_warnings.some((item) => item.run_id)) {
+      ui.run_columns_warnings = ui.run_columns_warnings.filter((item) => !item.run_id);
+      void loadRunColumns(true);
+    }
     if (quiet && unchanged && was_ready) return;
     runs = result.runs;
     reconcileArchivedSelection(runs);

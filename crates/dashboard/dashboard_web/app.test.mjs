@@ -50,11 +50,25 @@ test("formatters handle absent and invalid records without invented live duratio
   assert.equal(formatDuration(run), "1h 1m");
   assert.equal(formatDuration({ ...run, finished_at: null }), "—");
   assert.equal(formatDuration({ ...run, started_at: "invalid" }), "—");
-  assert.equal(formatDuration({ ...run, finished_at: "2026-10-03T00:00:00Z" }), "0s");
+  assert.equal(formatDuration({ ...run, finished_at: "2026-10-03T00:00:00Z" }), "—");
   assert.equal(formatValue(null), "—");
   assert.equal(formatValue({ learning_rate: 0.1 }), '{"learning_rate":0.1}');
   assert.equal(formatValue("<script>alert(1)</script>"), "<script>alert(1)</script>");
   assert.equal(formatNumber(Infinity), "—");
+});
+
+test("duration formatting uses the current time only for unfinished active runs and preserves unknown periods", () => {
+  const now_ms = Date.parse("2026-10-14T01:02:05Z"), run = { status: "running", started_at: "2026-10-14T01:01:00Z", finished_at: null };
+  assert.equal(formatDuration(run, now_ms), "1m 5s");
+  assert.equal(formatDuration({ ...run, status: "preparing" }, now_ms), "1m 5s");
+  assert.equal(formatDuration(run, now_ms + 999), "1m 5s", "elapsed time displays complete seconds");
+  assert.equal(formatDuration({ ...run, finished_at: "2026-10-14T01:01:30Z" }, now_ms), "30s", "a recorded finish takes precedence over the live clock");
+  for (const record of [
+    { ...run, status: "completed" }, { ...run, status: "lost" },
+    { ...run, started_at: null }, { ...run, started_at: "invalid" },
+    { ...run, finished_at: "invalid" }, { ...run, started_at: "2026-10-14T01:03:00Z" },
+    { ...run, finished_at: "2026-10-14T01:00:00Z" },
+  ]) assert.equal(formatDuration(record, now_ms), "—");
 });
 
 test("new requests abort old work and ignore late successes", async t => {
@@ -122,6 +136,14 @@ function dashboard(t, url = "http://localhost/") {
   const original_fetch = globalThis.fetch;
   const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
   const dom = new JSDOM(html, { url, pretendToBeVisual: true });
+  const measure = dom.window.HTMLElement.prototype.getBoundingClientRect;
+  dom.window.HTMLElement.prototype.getBoundingClientRect = function () {
+    // JSDOM has no layout. Give anchored run controls a visible native rectangle;
+    // geometry regressions override individual anchors explicitly below.
+    return this.classList.contains("run-control-trigger")
+      ? new dom.window.DOMRect(10, 80, 32, 30)
+      : measure.call(this);
+  };
   const restore = installWindow(dom.window);
   let navigation_count = 0;
   const record = records => { navigation_count += records.filter(item => item.type === "childList" && [...item.addedNodes].some(node => node.id === "chart-preview")).length; };
@@ -192,7 +214,7 @@ function chartData(label, query) {
   })), warnings: [{ run_index: 1, message: label }], warnings_truncated: false, parameter_rows: [], parameters_truncated: false };
 }
 
-async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null, system_metrics = false } = {}) {
+async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_clock, updates = false, chart_controller, event_source, catalog_failure = false, url, override = null, projects = false, project_runs = null, system_metrics = false, catalog_warnings = [], list_warnings = [], column_warnings = [], detail_warnings = [] } = {}) {
   const nodes = dashboard(t, url);
   sources ??= [{ source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null }];
   const runs = project_runs ?? Array.from({ length: count }, (_, index) => ({
@@ -200,7 +222,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
     started_at: "2026-10-03T01:00:00Z", finished_at: "2026-10-03T01:00:03Z", exit_code: 0,
   }));
   const project_sources = [{ source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] }];
-  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_label: "chart-1", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [] };
+  const model = { nodes, sources, runs, project_sources, projects_status: projects ? 200 : 404, run_management_enabled: hosted, requests: [], override, failed_list: false, failed_catalog: catalog_failure, missing_run_ids: new Set(), catalog_revision: "catalog-1", list_revision: "list-1", metadata_revision: "metadata-1", metrics_revision: "metrics-1", stdout_revision: "stdout-1", stderr_revision: "stderr-1", storage_revision: "storage-1", storage_inputs: [], storage_outputs: [], metric_value: 0.5, chart_label: "chart-1", logs: {}, artifact_files: [], artifact_truncated: false, artifact_warnings: [], catalog_warnings, list_warnings, column_warnings, detail_warnings };
   globalThis.fetch = async (url, options) => {
     model.requests.push(url);
     const parsed = new URL(url, "http://localhost");
@@ -211,8 +233,8 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
       const missing = model.missing_run_ids.has(run_id) || !runs.some(run => runIdentity(run) === run_id);
       return { run_id, metadata_revision: missing ? null : model.metadata_revision, metrics_revision: missing ? null : model.metrics_revision, stdout_revision: missing ? null : model.stdout_revision, stderr_revision: missing ? null : model.stderr_revision, ...(system_metrics ? { system_revision: model.system_revision ?? "system-1" } : {}), missing };
     }) }) : response({ error: "Unknown endpoint" }, 404);
-    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: [], access_mode: hosted ? "hosted" : "local", run_management_enabled: model.run_management_enabled, ...(system_metrics ? { capabilities: ["run-system-metrics-v1"] } : {}) });
-    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: [], run_management_enabled: model.run_management_enabled, ...(system_metrics ? { capabilities: ["run-system-metrics-v1"] } : {}) }) : response({ error: "Project browsing unavailable" }, model.projects_status);
+    if (parsed.pathname === "/api/catalog") return model.failed_catalog ? response({ error: "Catalog temporarily unavailable" }, 503) : response({ project_name: "Experiments", sources, initial_source: sources[0]?.source_id ?? "", warnings: model.catalog_warnings, access_mode: hosted ? "hosted" : "local", run_management_enabled: model.run_management_enabled, ...(system_metrics ? { capabilities: ["run-system-metrics-v1"] } : {}) });
+    if (parsed.pathname === "/api/projects") return model.projects_status === 200 ? response({ project_name: "Hosted experiments", sources: project_sources, initial_source: project_sources[0]?.source_id ?? "", access_mode: "hosted", warnings: model.catalog_warnings, run_management_enabled: model.run_management_enabled, ...(system_metrics ? { capabilities: ["run-system-metrics-v1"] } : {}) }) : response({ error: "Project browsing unavailable" }, model.projects_status);
     if (parsed.pathname === "/api/runs/archive" || parsed.pathname === "/api/runs/restore") {
       assert.equal(options.method, "POST");
       assert.equal(options.credentials, "same-origin");
@@ -253,7 +275,7 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
         params: [{ key: "/learning_rate", label: "learning_rate" }, { key: "/batch_size", label: "batch_size" }],
         metrics: [{ key: "accuracy", label: "accuracy" }, { key: "loss", label: "loss" }],
         truncated: false,
-      }, warnings: [],
+      }, warnings: model.column_warnings,
     });
     if (parsed.pathname === "/api/runs") {
       if (model.failed_list) return response({ error: "Results are unavailable. Try Refresh." }, 500);
@@ -267,14 +289,14 @@ async function reviewFixture(t, { count = 3, hosted = false, sources, refresh_cl
           metrics: Object.fromEntries(query.getAll("metric").map(key => [key, model.metric_value])),
         } } : {}),
       }));
-      return response({ source, runs: rows, warnings: [], total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
+      return response({ source, runs: rows, warnings: model.list_warnings, total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null });
     }
     const metric = { count: 2, last: { step: 1, value: model.metric_value }, min: { step: 1, value: model.metric_value }, max: { step: 0, value: 1 } };
     if (parsed.pathname === "/api/run") {
       if (model.missing_run_ids.has(query.get("run_id"))) return response({ error: "Run not found" }, 404);
       const run = runs.find(item => runIdentity(item) === query.get("run_id"));
       if (!run) return response({ error: "Run not found" }, 404);
-      return response({ ...detailRecord(source, run, model.metric_value), result_upload: model.result_upload });
+      return response({ ...detailRecord(source, run, model.metric_value), warnings: model.detail_warnings, result_upload: model.result_upload });
     }
     if (parsed.pathname === "/api/artifacts") {
       const selected_run = runs.find(run => runIdentity(run) === query.get("run_id"));
@@ -300,15 +322,18 @@ async function selectRow(nodes, index, checked = true) {
 function runCheckbox(nodes, index) { return nodes.get("run-rows").children[index].querySelector('input[type="checkbox"]'); }
 function runButton(nodes, index) { return nodes.get("run-rows").children[index].querySelector("button"); }
 function columnCheckbox(nodes, name) {
-  const input = [...nodes.get("run-columns").querySelectorAll('input[type="checkbox"]')]
+  const input = [...nodes.get("run-columns-panel").querySelectorAll('input[type="checkbox"]')]
     .find(node => node.getAttribute("aria-label") === name);
   assert.ok(input, `Missing column choice: ${name}`);
   return input;
 }
 async function openColumns(nodes) {
-  nodes.get("run-columns").open = true;
-  await emit(nodes.get("run-columns"), "toggle");
-  await settled(() => [...nodes.get("run-columns").querySelectorAll('input[type="checkbox"]')].some(node => !node.disabled));
+  await openRunControl(nodes, "run-columns");
+  await settled(() => [...nodes.get("run-columns-panel").querySelectorAll('input[type="checkbox"]')].some(node => !node.disabled));
+}
+async function openRunControl(nodes, id) {
+  if (nodes.get(`${id}-panel`).hidden) await click(nodes.get(`${id}-trigger`));
+  await settled(() => !nodes.get(`${id}-panel`).hidden);
 }
 async function settledTable(nodes) {
   await settled(() => nodes.get("runs-region").getAttribute("aria-busy") === "false");
@@ -760,6 +785,155 @@ test("project switching stays in the header while history and inspection retain 
   assert.deepEqual(requestCounts(model.requests), request_counts, "changing appearance never reloads results");
 });
 
+test("compact run controls open one accessible portal at a time and restore focus without replacing history or charts", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true, list_warnings: [{ message: "Run preview is limited." }] }), { nodes } = model;
+  await inspect(model);
+  const history = nodes.get("run-rows"), preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), counts = requestCounts(model.requests);
+  assert.equal(nodes.get("search-input").closest("[hidden]"), null, "search remains available when secondary controls are collapsed");
+  for (const id of ["run-filters", "run-columns", "run-issues"]) {
+    const trigger = nodes.get(`${id}-trigger`), panel = nodes.get(`${id}-panel`);
+    assert.equal(nodes.get(id).tagName, "DETAILS"); assert.equal(nodes.get(id).open, false);
+    assert.equal(panel.hidden, true); assert.equal(trigger.getAttribute("aria-expanded"), "false");
+    assert.equal(trigger.getAttribute("aria-controls"), panel.id);
+    assert.equal(panel.getAttribute("role"), "dialog"); assert.equal(panel.getAttribute("aria-labelledby"), trigger.id);
+    assert.equal(panel.parentNode, nodes.document.body, "panels sit outside the history scrolling boundary");
+  }
+  await openRunControl(nodes, "run-filters");
+  assert.equal(nodes.document.activeElement, nodes.get("run-filters-panel"));
+  assert.equal(nodes.get("run-filters-trigger").getAttribute("aria-expanded"), "true");
+  assert.equal(nodes.get("status-completed").type, "radio");
+  await openColumns(nodes);
+  assert.equal(nodes.get("run-filters-panel").hidden, true); assert.equal(nodes.get("run-filters").open, false);
+  await openRunControl(nodes, "run-issues");
+  assert.equal(nodes.get("run-columns-panel").hidden, true); assert.equal(nodes.get("run-columns").open, false);
+  await emit(nodes.get("run-issues-panel"), "keydown", { key: "Escape" });
+  assert.equal(nodes.get("run-issues-panel").hidden, true);
+  assert.equal(nodes.document.activeElement, nodes.get("run-issues-trigger"));
+  await openRunControl(nodes, "run-filters");
+  await click(nodes.get("run-filters-panel").querySelector('button[aria-label="Close Filters"]'));
+  assert.equal(nodes.get("run-filters-panel").hidden, true);
+  assert.equal(nodes.document.activeElement, nodes.get("run-filters-trigger"));
+  await openRunControl(nodes, "run-filters"); await click(nodes.get("search-input"));
+  assert.equal(nodes.get("run-filters-panel").hidden, true, "focusing a control outside the panel closes it");
+  assert.equal(nodes.document.activeElement, nodes.get("search-input"));
+  assert.equal(nodes.get("run-rows"), history); assert.equal(nodes.get("chart-preview"), preview); assert.equal(chartSource(nodes), chart_url);
+  for (const path of ["/api/runs", "/api/run", "/api/chart-data", "/api/compare"]) assert.equal(requestCounts(model.requests)[path], counts[path], path);
+});
+
+test("compact run filter chips remove individual choices while Clear all and search clear keep their native behavior", async t => {
+  const model = await reviewFixture(t, { hosted: true, projects: true,
+    project_runs: [archivalRun("same-active"), archivalRun("same-archived", { archived: true })] }), { nodes } = model;
+  await settledTable(nodes); await openRunControl(nodes, "run-filters");
+  setValue(nodes.get("task-input"), "train"); await emit(nodes.get("task-input"), "input");
+  await click(nodes.get("status-completed")); await settledTable(nodes);
+  await click(nodes.get("machine-gpu-a")); await settledTable(nodes);
+  await click(nodes.get("archival-archived")); await settledTable(nodes);
+  await click(nodes.get("search-input"));
+  setValue(nodes.get("search-input"), "same"); await emit(nodes.get("search-input"), "input");
+  await settled(() => latestRunQuery(model).get("search") === "same");
+  assert.equal(nodes.get("run-filters-trigger").getAttribute("aria-label"), "Filters (4)");
+  assert.equal(nodes.get("run-filters-panel").hidden, true, "search closes secondary controls without losing the filters");
+  const choices = [["task", "task", "train"], ["status", "status", "completed"], ["origin", "machine", "gpu-a"], ["archival", "archive", "archived"]];
+  for (const [index, [key, name]] of choices.entries()) {
+    const chip = nodes.get(`clear-filter-${key}`);
+    assert.equal(chip.getAttribute("aria-label"), `Clear ${name} filter`);
+    await click(chip); await settledTable(nodes);
+    assert.equal(nodes.document.getElementById(`clear-filter-${key}`), null);
+    assert.equal(latestRunQuery(model).get(key), key === "archival" ? "active" : null);
+    assert.equal(latestRunQuery(model).get("search"), "same", "clearing a chip preserves search");
+    for (const [remaining, , value] of choices.slice(index + 1)) assert.equal(latestRunQuery(model).get(remaining), value);
+  }
+  assert.equal(nodes.document.querySelector(".active-run-filters").hidden, true);
+  const search_clear = nodes.document.querySelector('button[aria-label="Clear search"]');
+  assert.equal(search_clear.closest("label"), null, "clearing search does not activate the input's label");
+  assert.equal(nodes.get("search-input").labels[0].htmlFor, "search-input");
+  await click(search_clear);
+  await settled(() => !latestRunQuery(model).has("search"));
+  assert.equal(nodes.get("search-input").value, "");
+  await openRunControl(nodes, "run-filters");
+  setValue(nodes.get("task-input"), "train"); await emit(nodes.get("task-input"), "input");
+  await click(nodes.get("status-completed")); await settledTable(nodes);
+  await click(nodes.get("search-input"));
+  setValue(nodes.get("search-input"), "same"); await emit(nodes.get("search-input"), "input");
+  await settled(() => latestRunQuery(model).get("search") === "same");
+  await click(nodes.get("clear-all-run-filters")); await settledTable(nodes);
+  for (const key of ["search", "task", "status", "origin"]) assert.equal(latestRunQuery(model).has(key), false, key);
+  assert.equal(nodes.get("search-input").value, ""); assert.equal(nodes.get("archival-active").checked, true);
+});
+
+test("compact run Issues deduplicate global notes and preserve exact row errors without expanding history", async t => {
+  const run = { ...projectRuns()[0], warnings: [{ message: "run-state.json has invalid or missing started_at" }] };
+  const common = { message: "Saved-file preview is limited." }, unsafe = { message: "Invalid <img src=x onerror=alert(1)> record" };
+  const excluded = { run_id: "gpu-b:same-run", message: "run-state.json cannot be read" };
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run],
+    catalog_warnings: [common, unsafe], list_warnings: [common, excluded, { run_id: run.run_key, message: run.warnings[0].message }],
+    column_warnings: [common, excluded, { message: "Column discovery is limited." }],
+  }), { nodes } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  assert.equal(nodes.get("run-issues-trigger").getAttribute("aria-label"), "Issues (4)");
+  assert.equal(nodes.get("run-issues-panel").hidden, true);
+  const history = nodes.get("run-rows"), row_error = history.querySelector(".run-diagnostics");
+  assert.equal(row_error.closest("[hidden]"), null, "an affected run's error remains directly visible");
+  await openRunControl(nodes, "run-issues");
+  const panel = nodes.get("run-issues-panel");
+  assert.equal(panel.querySelectorAll("li").length, 4);
+  assert.deepEqual([...panel.querySelectorAll("li")].map(item => item.textContent), [common.message, unsafe.message, `${excluded.run_id}: ${excluded.message}`, "Column discovery is limited."]);
+  assert.doesNotMatch(panel.textContent, /invalid or missing started_at/, "row-associated errors stay on their run");
+  assert.equal(panel.querySelector("img"), null); assert.equal(nodes.get("run-rows"), history);
+  model.catalog_warnings = []; model.list_warnings = []; model.column_warnings = [];
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  await settled(() => nodes.get("run-issues").hidden);
+  assert.equal(nodes.get("run-issues-panel").hidden, true);
+  assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics").textContent, row_error.textContent);
+});
+
+test("compact run controls close when the selected source changes without an outside click", async t => {
+  const sources = ["worker-a", "worker-b"].map(source_id => ({ source_id, label: source_id, kind: "service", target_name: null }));
+  const model = await reviewFixture(t, { hosted: true, sources }), { nodes } = model;
+  await settledTable(nodes); await openRunControl(nodes, "run-filters");
+  const history = nodes.get("run-rows");
+  assert.equal(nodes.document.activeElement, nodes.get("run-filters-panel"));
+  setValue(nodes.get("source-select"), "worker-b"); await emit(nodes.get("source-select"), "change");
+  await settled(() => latestRunQuery(model).get("source") === "worker-b");
+  assert.equal(nodes.get("run-filters-panel").hidden, true); assert.equal(nodes.get("run-filters").open, false);
+  assert.equal(nodes.get("run-filters-trigger").getAttribute("aria-expanded"), "false");
+  assert.equal(nodes.get("run-rows"), history);
+});
+
+test("compact run controls stay within a short viewport and close when their anchor scrolls or resizes offscreen", async t => {
+  const model = await reviewFixture(t), { nodes } = model, window = nodes.document.defaultView;
+  await settledTable(nodes);
+  const trigger = nodes.get("run-filters-trigger"), panel = nodes.get("run-filters-panel"), history = nodes.get("run-rows");
+  const counts = requestCounts(model.requests);
+  Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 150 });
+  await openRunControl(nodes, "run-filters");
+  const top = Number.parseFloat(panel.style.top), height = Number.parseFloat(panel.style.maxHeight);
+  assert.ok(height > 0 && height < 120, "short viewports do not force a 120px panel beyond the available space");
+  assert.ok(top >= 12 && top + height <= window.innerHeight - 12, "the complete panel fits between viewport margins");
+  trigger.getBoundingClientRect = () => new window.DOMRect(10, -40, 32, 30);
+  await emit(window, "scroll");
+  assert.equal(panel.hidden, true); assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  trigger.getBoundingClientRect = () => new window.DOMRect(10, 80, 32, 30);
+  window.innerHeight = 768; await openRunControl(nodes, "run-filters");
+  window.innerHeight = 50; await emit(window, "resize");
+  assert.equal(panel.hidden, true, "a resized viewport closes a panel whose anchor is no longer visible");
+  assert.equal(nodes.get("run-rows"), history); assert.deepEqual(requestCounts(model.requests), counts);
+});
+
+test("compact run Issues preserve the API omission notice after one hundred bounded warnings", async t => {
+  const omission = "Additional warnings omitted; inspect the saved records with expri runs show.";
+  const model = await reviewFixture(t, { catalog_warnings: [
+    ...Array.from({ length: 100 }, (_, index) => ({ message: `Saved record issue ${index}` })),
+    { message: omission },
+  ] }), { nodes } = model;
+  await settledTable(nodes);
+  assert.equal(nodes.get("run-issues-trigger").getAttribute("aria-label"), "Issues (101)");
+  await openRunControl(nodes, "run-issues");
+  const items = nodes.get("run-issues-panel").querySelectorAll("li");
+  assert.equal(items.length, 101, "the frontend preserves every item in the API-bounded preview");
+  assert.equal(items[100].textContent, omission, "the overflow notice is not cut off a second time");
+});
+
 test("compact explicit inspection moves to review while refresh preserves position and reduced motion", async t => {
   const { nodes } = await reviewFixture(t);
   nodes.document.defaultView.matchMedia = query => ({
@@ -853,7 +1027,7 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 7);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 6);
   assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
   await click(nodes.get("next-page")); await settledTable(nodes);
   assert.equal(nodes.get("page-label").textContent, "Page 2");
@@ -865,6 +1039,7 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(loss_header().getAttribute("aria-sort"), "ascending");
   await click(loss_header().querySelector("button")); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("direction"), "desc");
+  await openColumns(nodes);
   await click(nodes.get("run-reduction-min")); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("reduction"), "min");
   assert.equal(runCheckbox(nodes, 0).checked, true);
@@ -887,16 +1062,20 @@ test("column discovery failure leaves the dashboard usable and retries after an 
   await settled(() => nodes.document.getElementById("run-columns-feedback")?.textContent.includes("Upgrade the expri server"));
   const feedback = nodes.document.getElementById("run-columns-feedback");
   assert.equal(nodes.get("run-columns").open, false);
-  assert.equal(feedback.closest("details"), null, "a header-sort failure stays visible when Columns is closed");
+  assert.equal(nodes.get("run-columns-panel").hidden, true);
+  assert.equal(nodes.get("run-issues").hidden, false, "a header-sort failure exposes Issues when Columns is closed");
+  await openRunControl(nodes, "run-issues");
+  assert.match(nodes.get("run-issues-panel").textContent, /Upgrade the expri server/);
   assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.has("sort")), false);
   assert.equal(nodes.get("run-rows").children.length, 3);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
+  await openRunControl(nodes, "run-columns");
+  const retry = nodes.get("run-columns-feedback").querySelector("button");
+  await settled(() => !retry.disabled);
   upgraded = true;
-  const retry = feedback.querySelector("button");
-  assert.equal(retry.disabled, false);
   await click(retry);
-  await settled(() => [...nodes.get("run-columns").querySelectorAll('input[type="checkbox"]')].some(node => !node.disabled));
+  await settled(() => [...nodes.get("run-columns-panel").querySelectorAll('input[type="checkbox"]')].some(node => !node.disabled));
   assert.equal(nodes.document.getElementById("run-columns-feedback"), null);
   await openColumns(nodes);
   await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
@@ -926,8 +1105,8 @@ test("automatic list updates keep table choices and sorting while refreshing onl
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = await reviewFixture(t);
   await settled(() => nodes.get("run-rows").children.length === 3);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
-  assert.equal(nodes.get("run-rows").children[0].querySelector(".task-column").textContent, "train");
+  assert.equal(nodes.get("run-rows").children[0].children.length, 4);
+  assert.equal(nodes.get("run-rows").children[0].querySelector(".run-cell .run-task").textContent, "train");
   assert.match(text(nodes.get("run-rows").children[0].querySelector(".status-column")), /3s/);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
@@ -1151,6 +1330,7 @@ test("empty hosted catalog refreshes into published runs with opaque source IDs 
   await settled(() => nodes.get("page-label").textContent === "Page 1");
   setValue(nodes.get("search-input"), "accuracy");
   await emit(nodes.get("search-input"), "input");
+  await openRunControl(nodes, "run-filters");
   setValue(nodes.get("task-input"), "train");
   await emit(nodes.get("task-input"), "input");
   await click(nodes.get("status-completed"));
@@ -1228,6 +1408,91 @@ async function inspect(model, index = 0) {
 function requestCounts(requests) {
   return requests.reduce((counts, url) => { const path = new URL(url, "http://localhost").pathname; counts[path] = (counts[path] ?? 0) + 1; return counts; }, {});
 }
+
+function overviewDuration(nodes) {
+  const label = [...nodes.get("run-detail").querySelectorAll("dt")].find(node => node.textContent === "Duration");
+  assert.ok(label, "the Overview exposes its duration fact");
+  return label.nextElementSibling.querySelector(".run-duration");
+}
+
+test("running durations tick with automatic refresh off without requests or replacing rows and charts", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:02:05Z");
+  const runs = [
+    { ...publishedRun("run-live"), started_at: new Date(clock.time - 65_000).toISOString() },
+    { ...publishedRun("run-completed"), status: "completed", started_at: new Date(clock.time - 40_000).toISOString(), finished_at: new Date(clock.time - 10_000).toISOString(), exit_code: 0 },
+    { ...publishedRun("run-preparing"), status: "preparing", started_at: new Date(clock.time - 2_000).toISOString() },
+  ];
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); assert.equal(nodes.get("auto-refresh-toggle").checked, false);
+  await inspect(model); await click(nodes.get("review-tab-overview"));
+  const rows = [...nodes.get("run-rows").children], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
+  const header = nodes.document.querySelector(".inspector-meta .run-duration"), overview = overviewDuration(nodes), checked_at = nodes.get("updated-at").textContent;
+  const durations = () => rows.map(row => row.querySelector(".status-column .run-duration").textContent);
+  assert.deepEqual(durations(), ["1m 5s", "30s", "2s"]);
+  assert.equal(header.textContent, "1m 5s"); assert.equal(overview.textContent, "1m 5s");
+  assert.equal(clock.timers.size, 1, "all live run displays share one display timer");
+  await act(async () => { runCheckbox(nodes, 0).focus(); });
+  const requests = requestCounts(model.requests);
+  await clock.advance(2000);
+  assert.deepEqual(durations(), ["1m 7s", "30s", "4s"]);
+  assert.equal(header.textContent, "1m 7s"); assert.equal(overview.textContent, "1m 7s");
+  assert.deepEqual(requestCounts(model.requests), requests, "display ticks never poll the API");
+  assert.deepEqual([...nodes.get("run-rows").children], rows); assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(chartSource(nodes), chart_url); assert.equal(previewMounts(nodes), mounts);
+  assert.equal(nodes.document.activeElement, runCheckbox(nodes, 0)); assert.equal(nodes.get("updated-at").textContent, checked_at);
+  assert.equal(overviewDuration(nodes), overview);
+  for (const element of nodes.document.querySelectorAll(".run-duration")) assert.equal(element.getAttribute("aria-live"), "off", "second-by-second timing does not announce repeatedly");
+});
+
+test("running durations freeze at the recorded finish and stop scheduling after completion", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
+  const run = { ...publishedRun("run-finishes"), started_at: new Date(clock.time - 10_000).toISOString() };
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: [run] }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
+  await clock.advance(2000); assert.equal(overviewDuration(nodes).textContent, "12s");
+  run.status = "completed"; run.finished_at = new Date(clock.time - 1000).toISOString(); run.exit_code = 0;
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  const row = nodes.get("run-rows").children[0], duration = row.querySelector(".run-duration"), header = nodes.document.querySelector(".inspector-meta .run-duration");
+  assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
+  assert.equal(duration.dataset.live, "false"); assert.equal(clock.timers.size, 0, "terminal records need no display timer");
+  const requests = requestCounts(model.requests);
+  await clock.advance(60_000);
+  assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
+  assert.deepEqual(requestCounts(model.requests), requests); assert.equal(nodes.get("run-rows").children[0], row);
+});
+
+test("running durations keep missing invalid and future starts explicitly unavailable", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
+  const runs = [null, "invalid", new Date(clock.time + 60_000).toISOString()].map((started_at, index) => ({ ...publishedRun(`run-unknown-${index}`), started_at }));
+  runs.push({ ...publishedRun("run-terminal-unknown"), status: "completed", started_at: null });
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
+  for (const row of [...nodes.get("run-rows").children].slice(0, 3)) {
+    const duration = row.querySelector(".run-duration");
+    assert.equal(duration.textContent, "—"); assert.equal(duration.title, "Elapsed time unavailable");
+    assert.equal(duration.getAttribute("aria-label"), "Elapsed time: unavailable");
+  }
+  assert.equal(nodes.get("run-rows").children[3].querySelector(".run-duration"), null, "unknown terminal timing does not invent elapsed time");
+  const header = nodes.document.querySelector(".inspector-meta .run-duration");
+  assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—");
+  const requests = requestCounts(model.requests); await clock.advance(2000);
+  assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—"); assert.deepEqual(requestCounts(model.requests), requests);
+});
+
+test("running duration display pauses while hidden resumes immediately and disposes its single timer", async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-14T01:00:00Z");
+  const run = { ...publishedRun("run-visible"), started_at: new Date(clock.time - 10_000).toISOString() };
+  const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: [run] }), { nodes } = model;
+  await click(nodes.get("auto-refresh-toggle")); await settledTable(nodes);
+  const duration = nodes.get("run-rows").querySelector(".run-duration"), requests = requestCounts(model.requests);
+  assert.equal(clock.timers.size, 1);
+  Object.defineProperty(nodes.document, "visibilityState", { configurable: true, value: "hidden" }); await emit(nodes.document, "visibilitychange");
+  assert.equal(clock.timers.size, 0); await clock.advance(5000); assert.equal(duration.textContent, "10s");
+  Object.defineProperty(nodes.document, "visibilityState", { configurable: true, value: "visible" }); await emit(nodes.document, "visibilitychange");
+  assert.equal(duration.textContent, "15s"); assert.equal(clock.timers.size, 1); assert.deepEqual(requestCounts(model.requests), requests);
+  await act(async () => { nodes.cleanup(); await microtasks(); }); nodes.cleanup = null;
+  assert.equal(clock.timers.size, 0); await clock.advance(30_000); assert.deepEqual(requestCounts(model.requests), requests);
+});
 
 test("React retains the actual chart container across reviews, tags, tabs and refresh", async t => {
   const model = await autoFixture(t), { nodes } = model;
@@ -2363,6 +2628,128 @@ function projectRuns() {
   return ["gpu-a", "gpu-b"].map(origin => ({ ...publishedRun("same-run"), origin, run_key: `${origin}:same-run` }));
 }
 
+test("run data errors stay on the exact worker row and deduplicate list and column diagnostics", async t => {
+  const runs = projectRuns(), message = "run-state.json has invalid or missing started_at";
+  const issue = { run_id: "gpu-a:same-run", message };
+  const unsafe_message = 'environment.json contains <img src=x onerror="alert(1)">';
+  runs[0] = { ...runs[0], status: "completed", started_at: null, exit_code: 0, warnings: [issue] };
+  const model = await reviewFixture(t, {
+    hosted: true, projects: true, project_runs: runs,
+    list_warnings: [issue, { message: "Run preview is limited." }],
+    column_warnings: [issue, { ...issue, message: unsafe_message }, { message: "Column discovery is limited." }],
+  });
+  const { nodes } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  const [affected, healthy] = nodes.get("run-rows").children;
+  const diagnostic = affected.querySelector("details.run-diagnostics");
+  assert.ok(diagnostic, "the affected row exposes its data errors");
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-label").textContent, "Data issues (2)");
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-message").textContent, message, "the first error is visible without expanding the row");
+  assert.equal(diagnostic.querySelectorAll("li").length, 1, "duplicate messages across the row, list, and columns appear once");
+  assert.equal(diagnostic.querySelector("li").textContent, unsafe_message);
+  assert.equal(diagnostic.querySelector("img"), null, "diagnostic text never creates HTML elements");
+  assert.equal(healthy.querySelector(".run-diagnostics"), null, "a duplicate run ID on a different worker stays healthy");
+  assert.doesNotMatch(healthy.textContent, /started_at|environment\.json/);
+  assert.equal(affected.querySelector(".status").textContent, "completed", "record validation preserves the recorded execution status");
+  await openRunControl(nodes, "run-issues");
+  assert.equal(nodes.get("list-warnings").textContent, "Run preview is limited.");
+  assert.equal(nodes.get("run-columns-warnings").textContent, "Column discovery is limited.");
+  await click(diagnostic.querySelector("summary"));
+  assert.equal(diagnostic.open, true, "remaining errors use a native expandable control");
+});
+
+test("run data errors appear in the inspector uniformly and disappear after a repaired refresh", async t => {
+  const run = { ...publishedRun("imported-paired-scale-20h-v1"), status: "completed", started_at: null, exit_code: 0 };
+  const issue = { run_id: run.run_id, message: "run-state.json has invalid or missing started_at" };
+  const detail_issue = { run_id: run.run_id, message: "environment.json is missing" };
+  const column_issue = { run_id: run.run_id, message: "snapshot.json is invalid" };
+  run.warnings = [issue];
+  const model = await reviewFixture(t, {
+    project_runs: [run], list_warnings: [issue],
+    column_warnings: [issue, column_issue],
+    detail_warnings: [issue, detail_issue, { message: "Metric preview is limited." }],
+  });
+  const { nodes } = model;
+  await openColumns(nodes); await inspect(model);
+  const errors = nodes.get("review-run-errors");
+  assert.equal(errors.hidden, false);
+  assert.equal(errors.classList.contains("error"), true);
+  assert.deepEqual([...errors.querySelectorAll("li")].map(item => item.textContent), [issue.message, detail_issue.message, column_issue.message]);
+  assert.equal(nodes.get("review-warnings").textContent, "Metric preview is limited.", "unscoped notices remain global");
+  assert.doesNotMatch(nodes.get("review-section").textContent, /Partial import|Start time unknown/, "historical names receive the same validation errors as other runs");
+  await click(nodes.get("review-tab-overview"));
+  assert.equal(errors.hidden, false, "data errors remain visible while changing inspector tabs");
+  run.started_at = "2026-10-07T01:00:00Z"; run.warnings = [];
+  model.list_warnings = []; model.column_warnings = []; model.detail_warnings = [{ message: "Metric preview is limited." }];
+  const counts = requestCounts(model.requests);
+  await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  await settled(() => !columnCheckbox(nodes, "Parameter learning_rate").disabled);
+  await settled(() => nodes.get("run-rows").querySelector(".run-diagnostics") === null);
+  assert.ok(requestCounts(model.requests)["/api/run-columns"] > counts["/api/run-columns"], "repair rechecks the opened column diagnostics");
+  assert.ok(requestCounts(model.requests)["/api/run"] > counts["/api/run"], "repair reloads the inspected record");
+  assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics"), null);
+  assert.equal(nodes.get("review-run-errors").hidden, true);
+  assert.doesNotMatch(nodes.get("review-run-errors").textContent, /started_at|environment\.json|snapshot\.json/);
+  assert.equal(nodes.get("review-warnings").textContent, "Metric preview is limited.");
+});
+
+test("run data errors without a displayable matching worker row remain visible globally", async t => {
+  const runs = projectRuns().slice(0, 1);
+  const visible_issue = { run_id: "gpu-a:same-run", message: "run-state.json has invalid or missing started_at" };
+  const excluded_issue = { run_id: "gpu-b:same-run", message: "run-state.json cannot be read" };
+  const excluded_column_issue = { run_id: "gpu-b:same-run", message: "params.json cannot be read" };
+  const model = await reviewFixture(t, {
+    hosted: true, projects: true, project_runs: runs,
+    list_warnings: [visible_issue, excluded_issue], column_warnings: [excluded_column_issue],
+  });
+  const { nodes } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  await openRunControl(nodes, "run-issues");
+  assert.equal(nodes.get("list-warnings").hidden, false);
+  assert.equal(nodes.get("list-warnings").textContent, `${excluded_issue.run_id}: ${excluded_issue.message}`);
+  assert.equal(nodes.get("run-columns-warnings").textContent, `${excluded_column_issue.run_id}: ${excluded_column_issue.message}`);
+  const diagnostic = nodes.get("run-rows").querySelector(".run-diagnostics");
+  assert.match(diagnostic.textContent, /Data issues \(1\)/);
+  assert.match(diagnostic.textContent, /invalid or missing started_at/);
+  assert.doesNotMatch(diagnostic.textContent, /cannot be read/, "a missing worker row's errors cannot attach to a different worker with the same run ID");
+});
+
+test("run data errors show an explicit omission notice when the row preview reaches its limit", async t => {
+  const run = { ...publishedRun("run-many-errors"), warnings: Array.from({ length: 105 }, (_, index) => ({ message: `Invalid recorded field ${index}` })) };
+  const model = await reviewFixture(t, { project_runs: [run] }), { nodes } = model;
+  await settledTable(nodes);
+  const diagnostic = nodes.get("run-rows").querySelector(".run-diagnostics");
+  assert.equal(diagnostic.querySelectorAll("li").length, 100, "the first issue stays in the summary, with a bounded remaining list");
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-message").textContent, "Invalid recorded field 0");
+  assert.match(diagnostic.textContent, /Additional data issues omitted; inspect records with expri runs show\./);
+  assert.equal([...diagnostic.querySelectorAll("li")].some(item => item.textContent === "Invalid recorded field 100"), false);
+  await inspect(model);
+  assert.equal(nodes.get("review-run-errors").querySelectorAll("li").length, 101);
+  assert.match(nodes.get("review-run-errors").textContent, /Additional data issues omitted; inspect records with expri runs show\./);
+});
+
+test("run data errors from column discovery clear after an automatic unchanged-row refresh", async t => {
+  const issue = { run_id: "run-0", message: "outputs/metrics.jsonl has an invalid record" };
+  const model = await autoFixture(t, { column_warnings: [issue] }), { nodes, clock } = model;
+  await settledTable(nodes); await openColumns(nodes);
+  await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
+  const choice = columnCheckbox(nodes, "Parameter learning_rate"), row = nodes.get("run-rows").children[0];
+  assert.match(row.querySelector(".run-diagnostics").textContent, /invalid record/);
+  await clock.advance(5000);
+  const counts = requestCounts(model.requests);
+  model.model.column_warnings = [];
+  model.model.list_revision = "repaired-column-file";
+  await clock.advance(5000);
+  await settled(() => !columnCheckbox(nodes, "Parameter learning_rate").disabled);
+  await settled(() => nodes.get("run-rows").querySelector(".run-diagnostics") === null);
+  assert.ok(requestCounts(model.requests)["/api/runs"] > counts["/api/runs"]);
+  assert.ok(requestCounts(model.requests)["/api/run-columns"] > counts["/api/run-columns"], "an unchanged run-list body still rechecks saved-file diagnostics");
+  assert.equal(nodes.get("run-rows").children[0], row, "quiet repair preserves the row DOM");
+  assert.equal(columnCheckbox(nodes, "Parameter learning_rate"), choice);
+  assert.equal(choice.checked, true, "column discovery refresh keeps the selected table column");
+  assert.equal(nodes.document.querySelector(".runs-table").dataset.columnCount, "1");
+});
+
 test("project tables retain separate run and review panes before and after optional columns", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
   await settledTable(nodes);
@@ -2444,7 +2831,7 @@ test("full run history remains interactive beside Storage and opening a run retu
   const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs }), { nodes } = model;
   await settledTable(nodes);
   const history = nodes.get("run-rows"), panes = workspacePanes(nodes), preview = nodes.get("chart-preview");
-  assert.deepEqual([...history.querySelectorAll(".status-column")].map(node => node.textContent), ["completed", "running"]);
+  assert.deepEqual([...history.querySelectorAll(".status-column .status")].map(node => node.textContent), ["completed", "running"]);
   await click(nodes.get("workspace-view-storage"));
   await settled(() => nodes.document.getElementById("storage-rows") !== null);
   assert.equal(nodes.get("workspace-page").hidden, false);
@@ -2731,6 +3118,7 @@ test("project inspection, logs, result ZIPs and CLI files bind machine identity 
 test("machine filters operate within projects, clear run selection and use one-click sortable machine headers", async t => {
   const model = await autoFixture(t, { projects: true, project_runs: projectRuns() }), { nodes } = model;
   await settledTable(nodes); await selectRow(nodes, 0);
+  await openRunControl(nodes, "run-filters");
   await click(nodes.get("machine-gpu-b")); await settledTable(nodes);
   assert.equal(nodes.get("run-rows").children.length, 1);
   assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-b:same-run");
@@ -3283,6 +3671,7 @@ test("hosted archive tags filter in one click without replacing training statuse
   assert.equal(runButton(nodes, 0).textContent, "active");
   await selectRow(nodes, 0);
   await settled(() => nodes.get("selected-runs").textContent.includes("active"));
+  await openRunControl(nodes, "run-filters");
   await click(nodes.get("archival-archived")); await settledTable(nodes);
   assert.equal(nodes.get("archival-archived").checked, true);
   assert.equal(nodes.get("archival-options").querySelector("legend").textContent, "Run history");
@@ -3345,6 +3734,7 @@ test("archived direct links open from the active list and restoration leaves the
   assert.equal(latestRunQuery(model).get("archival"), "active");
   assert.equal(runButton(nodes, 0).textContent, "active");
   assert.match(nodes.get("review-title").textContent, /old/);
+  await openRunControl(nodes, "run-filters");
   await click(nodes.get("archival-archived")); await settledTable(nodes);
   await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("restore-run-button"));
   await click(nodes.get("restore-run-button")); await settledTable(nodes);
@@ -3362,6 +3752,7 @@ test("running runs and read-only previews cannot archive but archived runs remai
   assert.match(nodes.get("run-archival-panel").textContent, /Only finished runs/);
   model.run_management_enabled = false;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
+  await openRunControl(nodes, "run-filters");
   await click(nodes.get("archival-archived")); await settledTable(nodes); await click(runButton(nodes, 0));
   await settled(() => nodes.document.getElementById("run-archival-summary"));
   assert.equal(nodes.document.getElementById("restore-run-button"), null);

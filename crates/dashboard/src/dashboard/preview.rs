@@ -148,6 +148,22 @@ pub fn bounded_warnings(warnings: &[Value]) -> Vec<Value> {
   output
 }
 
+/// Retain diagnostics for one visible run independently of the list-wide limit.
+pub fn run_warnings(warnings: &[Value], run_id: &str) -> Vec<Value> {
+  let mut unique = Vec::new();
+  for warning in warnings {
+    if warning["run_id"].as_str() == Some(run_id) && !unique.contains(warning) {
+      unique.push(warning.clone());
+    }
+  }
+  let mut output = bounded_warnings(&unique);
+  // The truncation notice belongs to this run too.
+  for warning in &mut output {
+    warning["run_id"] = json!(run_id);
+  }
+  output
+}
+
 /// Small previews keep browser responses bounded even for unusually large params.
 pub fn preview(value: &Value, truncated: &mut bool) -> Value {
   preview_inner(value, 0, &mut (16 * 1024), truncated).unwrap_or(Value::Null)
