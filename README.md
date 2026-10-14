@@ -351,8 +351,10 @@ collection, uploads, or existing training. Resume with
 `service start --component queue-execution` to reconcile held attempts.
 Capacity defaults to detected logical CPUs, 90% of RAM, and selectable whole GPUs.
 Optional capacity fields override these defaults; `gpus = []` disables GPU allocation.
-The worker refreshes GPU availability while running: busy NVIDIA compute devices
-become schedulable when their processes finish, without a service restart.
+The worker refreshes GPU availability while running: NVIDIA devices are busy when
+any compute process uses more than 64 MiB by default, and become schedulable as its
+usage drops or the process finishes. Configure the per-process threshold with
+`gpu_busy_memory_threshold_bytes` under `[queue_worker]`; `0` blocks on any context.
 Live detection currently requires full NVIDIA UUID selectors. Unsupported devices
 or failed checks remain unavailable; CPU jobs can continue. `queue workers`
 reports free/total resources, busy or unverified GPUs, and pending assignments. Read

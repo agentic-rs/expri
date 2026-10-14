@@ -5,24 +5,31 @@ use std::collections::BTreeMap;
 use expri_core::resource_queue::{
   GpuAvailabilityReport, GpuUnavailableReason, GpuVendor, UnavailableGpu, WorkerCapacity, WorkerGpu,
 };
-use nvml_wrapper::{Nvml, error::NvmlError};
+use nvml_wrapper::{Nvml, enums::device::UsedGpuMemory, error::NvmlError};
 
 /// Check configured GPU execution selectors without inspecting process names or owners.
 ///
 /// A successful NVIDIA compute-process query includes active CUDA contexts, including
 /// the MPS server that owns its clients' context. Graphics-only contexts are omitted.
+/// A device is busy when any process individually exceeds `threshold_bytes`; memory
+/// is never summed across processes. Zero means any compute context blocks, regardless
+/// of its memory. With a positive threshold, unknown memory leaves the device unverified
+/// unless another process proves it busy. Process identifiers are never inspected.
 /// Unsupported providers, missing drivers, partitioned devices, query errors, and
 /// selectors that cannot be mapped reliably are reported as unverified, never free.
 /// Numeric selectors are unverified because NVML and CUDA indices can differ.
 /// Callers must pass a validated capacity and treat this as a point-in-time observation.
-pub fn probe_gpu_availability(capacity: &WorkerCapacity) -> GpuAvailabilityReport {
+pub fn probe_gpu_availability(
+  capacity: &WorkerCapacity,
+  threshold_bytes: u64,
+) -> GpuAvailabilityReport {
   let nvml = capacity
     .gpus
     .iter()
     .any(|gpu| gpu.vendor == GpuVendor::Nvidia)
     .then(Nvml::init)
     .and_then(std::result::Result::ok);
-  probe_with(&capacity.gpus, |selector| {
+  probe_with(&capacity.gpus, threshold_bytes, |selector| {
     read_nvidia(nvml.as_ref()?, selector)
   })
 }
@@ -30,7 +37,7 @@ pub fn probe_gpu_availability(capacity: &WorkerCapacity) -> GpuAvailabilityRepor
 struct NvidiaObservation {
   uuid: uuid::Uuid,
   partitioned: Option<bool>,
-  compute_process_count: Option<u32>,
+  compute_process_memory: Option<Vec<UsedGpuMemory>>,
 }
 
 fn read_nvidia(nvml: &Nvml, selector: &str) -> Option<NvidiaObservation> {
@@ -48,8 +55,14 @@ fn read_nvidia(nvml: &Nvml, selector: &str) -> Option<NvidiaObservation> {
   Some(NvidiaObservation {
     uuid,
     partitioned,
-    // The count avoids copying any PIDs or GPU-memory values and needs no allocation.
-    compute_process_count: device.running_compute_processes_count().ok(),
+    // Retain only the memory values needed by the policy; names, owners and PIDs
+    // are never inspected, transmitted, or retained in the availability report.
+    compute_process_memory: device.running_compute_processes().ok().map(|processes| {
+      processes
+        .into_iter()
+        .map(|process| process.used_gpu_memory)
+        .collect()
+    }),
   })
 }
 
@@ -59,6 +72,7 @@ fn full_nvidia_uuid(selector: &str) -> Option<uuid::Uuid> {
 
 fn probe_with(
   gpus: &[WorkerGpu],
+  threshold_bytes: u64,
   mut probe: impl FnMut(&str) -> Option<NvidiaObservation>,
 ) -> GpuAvailabilityReport {
   let observations: Vec<_> = gpus
@@ -87,11 +101,10 @@ fn probe_with(
           Some(observation)
             if observation.partitioned == Some(false) && identities[&observation.uuid] == 1 =>
           {
-            match observation.compute_process_count {
-              Some(0) => return None,
-              Some(_) => GpuUnavailableReason::Busy,
-              None => GpuUnavailableReason::Unverified,
-            }
+            process_memory_reason(
+              observation.compute_process_memory.as_deref(),
+              threshold_bytes,
+            )?
           }
           _ => GpuUnavailableReason::Unverified,
         };
@@ -104,12 +117,33 @@ fn probe_with(
   }
 }
 
+fn process_memory_reason(
+  processes: Option<&[UsedGpuMemory]>,
+  threshold_bytes: u64,
+) -> Option<GpuUnavailableReason> {
+  let Some(processes) = processes else {
+    return Some(GpuUnavailableReason::Unverified);
+  };
+  if threshold_bytes == 0 && !processes.is_empty()
+    || processes
+      .iter()
+      .any(|memory| matches!(memory, UsedGpuMemory::Used(bytes) if *bytes > threshold_bytes))
+  {
+    return Some(GpuUnavailableReason::Busy);
+  }
+  processes
+    .iter()
+    .any(|memory| matches!(memory, UsedGpuMemory::Unavailable))
+    .then_some(GpuUnavailableReason::Unverified)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
 
   const FIRST: &str = "GPU-01234567-89ab-cdef-0123-456789abcdef";
   const SECOND: &str = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const THRESHOLD: u64 = 64 * 1024 * 1024;
 
   fn gpu(id: &str, vendor: GpuVendor, selector: Option<&str>) -> WorkerGpu {
     WorkerGpu {
@@ -121,11 +155,11 @@ mod tests {
     }
   }
 
-  fn observation(uuid: &str, processes: u32) -> NvidiaObservation {
+  fn observation(uuid: &str, processes: Vec<UsedGpuMemory>) -> NvidiaObservation {
     NvidiaObservation {
       uuid: full_nvidia_uuid(uuid).unwrap(),
       partitioned: Some(false),
-      compute_process_count: Some(processes),
+      compute_process_memory: Some(processes),
     }
   }
 
@@ -139,9 +173,9 @@ mod tests {
         gpu("spare-gpu", GpuVendor::Nvidia, Some(SECOND)),
       ],
     };
-    let report = probe_with(&capacity.gpus, |selector| match selector {
-      FIRST => Some(observation(FIRST, 3)),
-      SECOND => Some(observation(SECOND, 0)),
+    let report = probe_with(&capacity.gpus, THRESHOLD, |selector| match selector {
+      FIRST => Some(observation(FIRST, vec![UsedGpuMemory::Used(THRESHOLD + 1)])),
+      SECOND => Some(observation(SECOND, vec![UsedGpuMemory::Used(THRESHOLD)])),
       _ => panic!("unexpected selector"),
     });
     assert_eq!(
@@ -168,7 +202,9 @@ mod tests {
       ),
       gpu("missing-selector", GpuVendor::Nvidia, None),
     ];
-    let report = probe_with(&gpus, |_| panic!("unreliable selector must not be probed"));
+    let report = probe_with(&gpus, THRESHOLD, |_| {
+      panic!("unreliable selector must not be probed")
+    });
     assert_eq!(report.unavailable_gpus.len(), gpus.len());
     assert!(
       report
@@ -184,21 +220,21 @@ mod tests {
     for value in [
       None,
       Some(NvidiaObservation {
-        compute_process_count: None,
-        ..observation(FIRST, 0)
+        compute_process_memory: None,
+        ..observation(FIRST, vec![])
       }),
       Some(NvidiaObservation {
         partitioned: None,
-        ..observation(FIRST, 0)
+        ..observation(FIRST, vec![])
       }),
       Some(NvidiaObservation {
         partitioned: Some(true),
-        ..observation(FIRST, 0)
+        ..observation(FIRST, vec![])
       }),
-      Some(observation(SECOND, 0)),
+      Some(observation(SECOND, vec![])),
     ] {
       let mut value = value;
-      let report = probe_with(&gpus, |_| value.take());
+      let report = probe_with(&gpus, THRESHOLD, |_| value.take());
       assert_eq!(
         report.unavailable_gpus[0].reason,
         GpuUnavailableReason::Unverified
@@ -216,7 +252,7 @@ mod tests {
         Some("GPU-AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"),
       ),
     ];
-    let report = probe_with(&gpus, |_| Some(observation(SECOND, 0)));
+    let report = probe_with(&gpus, THRESHOLD, |_| Some(observation(SECOND, vec![])));
     assert_eq!(report.unavailable_gpus.len(), 2);
     assert!(
       report
@@ -234,14 +270,105 @@ mod tests {
       gpus: vec![],
     };
     assert!(
-      probe_gpu_availability(&capacity)
+      probe_gpu_availability(&capacity, THRESHOLD)
         .unavailable_gpus
         .is_empty()
     );
     capacity.gpus.push(gpu("apple", GpuVendor::Apple, None));
     assert_eq!(
-      probe_gpu_availability(&capacity).unavailable_gpus[0].reason,
+      probe_gpu_availability(&capacity, THRESHOLD).unavailable_gpus[0].reason,
       GpuUnavailableReason::Unverified
+    );
+  }
+
+  #[test]
+  fn positive_threshold_is_per_process_and_tolerates_equal_or_lower_memory() {
+    for bytes in [0, 18 * 1024 * 1024, THRESHOLD - 1, THRESHOLD] {
+      assert_eq!(
+        process_memory_reason(Some(&[UsedGpuMemory::Used(bytes)]), THRESHOLD),
+        None
+      );
+    }
+    // The combined footprint exceeds 64 MiB, but no individual process does.
+    let small = vec![UsedGpuMemory::Used(THRESHOLD); 100];
+    assert_eq!(process_memory_reason(Some(&small), THRESHOLD), None);
+    assert_eq!(
+      process_memory_reason(Some(&[UsedGpuMemory::Used(THRESHOLD + 1)]), THRESHOLD),
+      Some(GpuUnavailableReason::Busy)
+    );
+  }
+
+  #[test]
+  fn unknown_memory_is_unverified_unless_any_process_proves_busy() {
+    for processes in [
+      vec![UsedGpuMemory::Unavailable],
+      vec![UsedGpuMemory::Used(THRESHOLD), UsedGpuMemory::Unavailable],
+    ] {
+      assert_eq!(
+        process_memory_reason(Some(&processes), THRESHOLD),
+        Some(GpuUnavailableReason::Unverified)
+      );
+    }
+    for processes in [
+      vec![
+        UsedGpuMemory::Used(THRESHOLD + 1),
+        UsedGpuMemory::Unavailable,
+      ],
+      vec![
+        UsedGpuMemory::Unavailable,
+        UsedGpuMemory::Used(THRESHOLD + 1),
+      ],
+    ] {
+      assert_eq!(
+        process_memory_reason(Some(&processes), THRESHOLD),
+        Some(GpuUnavailableReason::Busy)
+      );
+    }
+    assert_eq!(
+      process_memory_reason(None, THRESHOLD),
+      Some(GpuUnavailableReason::Unverified)
+    );
+  }
+
+  #[test]
+  fn zero_threshold_blocks_any_context_without_requiring_memory_information() {
+    assert_eq!(process_memory_reason(Some(&[]), 0), None);
+    for memory in [
+      UsedGpuMemory::Used(0),
+      UsedGpuMemory::Used(1),
+      UsedGpuMemory::Unavailable,
+    ] {
+      assert_eq!(
+        process_memory_reason(Some(&[memory]), 0),
+        Some(GpuUnavailableReason::Busy)
+      );
+    }
+    assert_eq!(
+      process_memory_reason(None, 0),
+      Some(GpuUnavailableReason::Unverified)
+    );
+  }
+
+  #[test]
+  fn memory_comparison_handles_large_unsigned_byte_values_without_sum_or_overflow() {
+    assert_eq!(
+      process_memory_reason(Some(&[UsedGpuMemory::Used(u64::MAX - 1)]), u64::MAX - 2),
+      Some(GpuUnavailableReason::Busy)
+    );
+    assert_eq!(
+      process_memory_reason(
+        Some(&[
+          UsedGpuMemory::Used(u64::MAX - 1),
+          UsedGpuMemory::Used(u64::MAX - 1),
+        ]),
+        u64::MAX,
+      ),
+      None
+    );
+    // The driver sentinel is unknown memory, never an enormous known allocation.
+    assert_eq!(
+      process_memory_reason(Some(&[UsedGpuMemory::from(u64::MAX)]), THRESHOLD),
+      Some(GpuUnavailableReason::Unverified)
     );
   }
 }

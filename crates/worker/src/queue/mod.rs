@@ -53,7 +53,9 @@ pub fn run_executor(
   let worker_id = options.worker.worker_id.clone();
   let waiting = || {
     json!({"status": "waiting", "worker_id": worker_id, "online": false,
-      "capacity": options.worker.capacity, "last_error": "server_unavailable",
+      "capacity": options.worker.capacity,
+      "gpu_busy_memory_threshold_bytes": options.worker.gpu_busy_memory_threshold_bytes,
+      "last_error": "server_unavailable",
       "updated_at_ms": chrono::Utc::now().timestamp_millis()})
   };
   if stop.load(Ordering::Acquire) {
@@ -99,7 +101,9 @@ pub fn run_executor(
       Ok(_) => {
         report(
           json!({"status": "waiting", "worker_id": worker_id, "online": false,
-          "capacity": options.worker.capacity, "last_error": "server_gpu_availability_unsupported",
+          "capacity": options.worker.capacity,
+          "gpu_busy_memory_threshold_bytes": options.worker.gpu_busy_memory_threshold_bytes,
+          "last_error": "server_gpu_availability_unsupported",
           "updated_at_ms": chrono::Utc::now().timestamp_millis()}),
         );
         wait_until_stopped(&stop, options.poll_interval);
@@ -130,6 +134,7 @@ pub fn run_executor(
     session.clone(),
     stop.clone(),
     options.worker.capacity.clone(),
+    options.worker.gpu_busy_memory_threshold_bytes,
   )?;
   eprintln!(
     "queue worker: {} (CPU and memory reservations are advisory)",
@@ -187,7 +192,7 @@ impl Executor {
     let heartbeat = self.client.request(&QueueRequest::Heartbeat {
       worker_id: self.options.worker.worker_id.clone(),
       session_id: self.session_id(),
-      gpu_availability: gpu_report(&self.options.worker.capacity),
+      gpu_availability: gpu_report(&self.options.worker),
     });
     let (worker, attempts) = match heartbeat {
       Ok(QueueResponse::Worker { worker, attempts }) => (worker, attempts),
@@ -300,6 +305,7 @@ impl Executor {
     let mut report = json!({
       "worker_id": self.worker.worker_id,
       "capacity": self.worker.capacity,
+      "gpu_busy_memory_threshold_bytes": self.options.worker.gpu_busy_memory_threshold_bytes,
       "available": self.worker.available,
       "reserved": self.worker.reserved,
       "unavailable_gpus": self.worker.unavailable_gpus,
@@ -624,7 +630,7 @@ impl Executor {
     let QueueResponse::Worker { attempts, .. } = self.client.request(&QueueRequest::Heartbeat {
       worker_id: self.options.worker.worker_id.clone(),
       session_id: self.session_id(),
-      gpu_availability: gpu_report(&self.options.worker.capacity),
+      gpu_availability: gpu_report(&self.options.worker),
     })?
     else {
       return Err(message("invalid queue heartbeat before launch"));
@@ -663,7 +669,10 @@ impl Executor {
     // Staging may take long enough for an unrelated process to acquire a GPU.
     // This run has no launch intent yet, so abort its unstarted snapshot and
     // retry the same queue attempt without releasing its reservation.
-    if allocation_gpus_unavailable(&journal.attempt.allocation) {
+    if allocation_gpus_unavailable(
+      &journal.attempt.allocation,
+      self.options.worker.gpu_busy_memory_threshold_bytes,
+    ) {
       crate::node::run::abort_prepared(
         prepared,
         false,
@@ -717,7 +726,10 @@ impl Executor {
     journal: &mut Journal,
     directory: &std::path::Path,
   ) -> Result<bool> {
-    if allocation_gpus_unavailable(&journal.attempt.allocation) {
+    if allocation_gpus_unavailable(
+      &journal.attempt.allocation,
+      self.options.worker.gpu_busy_memory_threshold_bytes,
+    ) {
       journal.stage = Stage::WaitingForGpu;
       journal.message = Some("waiting for assigned GPUs to become available".into());
       journal.save(directory)?;
@@ -730,17 +742,26 @@ impl Executor {
   }
 }
 
-fn gpu_report(capacity: &WorkerCapacity) -> Option<GpuAvailabilityReport> {
-  (!capacity.gpus.is_empty()).then(|| expri_system::probe_gpu_availability(capacity))
+fn gpu_report(worker: &ResolvedQueueWorkerConfig) -> Option<GpuAvailabilityReport> {
+  (!worker.capacity.gpus.is_empty()).then(|| {
+    expri_system::probe_gpu_availability(&worker.capacity, worker.gpu_busy_memory_threshold_bytes)
+  })
 }
 
-fn allocation_gpus_unavailable(allocation: &ResourceAllocation) -> bool {
-  gpu_report(&WorkerCapacity {
-    cpus: allocation.cpus,
-    memory_bytes: allocation.memory_bytes,
-    gpus: allocation.gpus.clone(),
-  })
-  .is_some_and(|report| !report.unavailable_gpus.is_empty())
+fn allocation_gpus_unavailable(allocation: &ResourceAllocation, threshold_bytes: u64) -> bool {
+  if allocation.gpus.is_empty() {
+    return false;
+  }
+  !expri_system::probe_gpu_availability(
+    &WorkerCapacity {
+      cpus: allocation.cpus,
+      memory_bytes: allocation.memory_bytes,
+      gpus: allocation.gpus.clone(),
+    },
+    threshold_bytes,
+  )
+  .unavailable_gpus
+  .is_empty()
 }
 
 fn prelaunch_without_supervisor(journal: &Journal) -> bool {
@@ -1013,7 +1034,7 @@ fn register(
     session_id: session.lock().expect("queue session lock").clone(),
     project_ids: worker.project_ids.clone(),
     capacity: worker.capacity.clone(),
-    gpu_availability: gpu_report(&worker.capacity),
+    gpu_availability: gpu_report(worker),
   };
   let response = match client.request(&register_request()) {
     Err(error) if expired_session(&error) => {
@@ -1043,6 +1064,7 @@ impl Heartbeats {
     session: Arc<Mutex<String>>,
     service_stop: Arc<AtomicBool>,
     capacity: WorkerCapacity,
+    gpu_busy_memory_threshold_bytes: u64,
   ) -> Result<Self> {
     let stopped = Arc::new(AtomicBool::new(false));
     let stop = stopped.clone();
@@ -1054,7 +1076,9 @@ impl Heartbeats {
           let response = client.request(&QueueRequest::Heartbeat {
             worker_id: worker_id.clone(),
             session_id,
-            gpu_availability: gpu_report(&capacity),
+            gpu_availability: (!capacity.gpus.is_empty()).then(|| {
+              expri_system::probe_gpu_availability(&capacity, gpu_busy_memory_threshold_bytes)
+            }),
           });
           if let Ok(QueueResponse::Worker { attempts, .. }) = response {
             for attempt in attempts {

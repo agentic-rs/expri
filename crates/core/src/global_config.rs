@@ -11,6 +11,7 @@ use crate::error::{ExpriError, Result};
 use crate::service::ClientConfig;
 
 pub const MAX_CONFIG_BYTES: u64 = 32 * 1024;
+pub const DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +32,9 @@ pub struct QueueWorkerConfig {
   /// An omitted or empty list accepts any project permitted by the credentials.
   #[serde(default)]
   pub project_ids: Vec<String>,
+  /// Per-process GPU memory threshold; zero treats any compute context as busy.
+  #[serde(default = "default_gpu_busy_memory_threshold_bytes")]
+  pub gpu_busy_memory_threshold_bytes: u64,
   #[serde(default)]
   pub capacity: QueueWorkerCapacityConfig,
 }
@@ -54,7 +58,12 @@ pub struct ResolvedQueueWorkerConfig {
   pub worker_id: String,
   /// An empty list accepts any project permitted by the credentials.
   pub project_ids: Vec<String>,
+  pub gpu_busy_memory_threshold_bytes: u64,
   pub capacity: crate::resource_queue::WorkerCapacity,
+}
+
+fn default_gpu_busy_memory_threshold_bytes() -> u64 {
+  DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES
 }
 
 impl QueueWorkerConfig {
@@ -81,6 +90,7 @@ impl QueueWorkerConfig {
     let resolved = ResolvedQueueWorkerConfig {
       worker_id: self.worker_id.clone(),
       project_ids: self.project_ids.clone(),
+      gpu_busy_memory_threshold_bytes: self.gpu_busy_memory_threshold_bytes,
       capacity: crate::resource_queue::WorkerCapacity {
         cpus: self.capacity.cpus.unwrap_or(inferred.cpus),
         memory_bytes: self.capacity.memory_bytes.unwrap_or(inferred.memory_bytes),
@@ -335,6 +345,35 @@ mod tests {
     ))
     .unwrap();
     config.queue_worker.unwrap()
+  }
+
+  #[test]
+  fn gpu_busy_memory_threshold_defaults_and_explicit_values_survive_resolution_and_roundtrip() {
+    for (setting, expected) in [
+      (None, DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES),
+      (Some(1024), 1024),
+      (Some(0), 0),
+    ] {
+      let setting = setting
+        .map(|bytes| format!("gpu_busy_memory_threshold_bytes={bytes}\n"))
+        .unwrap_or_default();
+      let worker = worker_config(&setting);
+      worker.validate().unwrap();
+      assert_eq!(worker.gpu_busy_memory_threshold_bytes, expected);
+      let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+      assert_eq!(resolved.gpu_busy_memory_threshold_bytes, expected);
+      assert_eq!(resolved.capacity, detected_capacity());
+      let roundtrip: QueueWorkerConfig =
+        toml::from_str(&toml::to_string(&worker).unwrap()).unwrap();
+      assert_eq!(roundtrip.gpu_busy_memory_threshold_bytes, expected);
+      assert_eq!(
+        roundtrip
+          .resolve_capacity(detected_capacity())
+          .unwrap()
+          .gpu_busy_memory_threshold_bytes,
+        expected
+      );
+    }
   }
 
   #[test]

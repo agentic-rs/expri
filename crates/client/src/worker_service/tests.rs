@@ -745,6 +745,9 @@ fn executor_status_is_independent_of_collection_and_excludes_credentials() {
   context.collection_ready("machine-fixture".into(), 1);
   context.execution_status(json!({
     "status": "waiting", "worker_id": "worker-fixture", "online": false,
+    "gpu_busy_memory_threshold_bytes": 67108864,
+    "unavailable_gpus": [{"device_id": "GPU-fixture", "reason": "busy"}],
+    "gpu_availability_observed_at_ms": 123,
     "last_error": "server_unavailable", "token": "private-token",
     "client_config": "/private/config.toml", "command": ["private-task-argument"],
   }));
@@ -753,6 +756,18 @@ fn executor_status_is_independent_of_collection_and_excludes_credentials() {
   assert_eq!(snapshot["collection"]["machine_id"], "machine-fixture");
   assert_eq!(snapshot["execution"]["status"], "waiting");
   assert_eq!(snapshot["execution"]["online"], false);
+  assert_eq!(
+    snapshot["execution"]["gpu_busy_memory_threshold_bytes"],
+    67108864
+  );
+  assert_eq!(
+    snapshot["execution"]["unavailable_gpus"][0]["device_id"],
+    "GPU-fixture"
+  );
+  assert_eq!(
+    snapshot["execution"]["gpu_availability_observed_at_ms"],
+    123
+  );
   let encoded = snapshot.to_string();
   for secret in [
     "private-token",

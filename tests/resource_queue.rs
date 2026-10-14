@@ -862,6 +862,10 @@ fn shared_service_reports_queue_capacity_and_stop_preserves_training_for_restart
       assert_eq!(status["execution"]["capacity"]["cpus"], 2);
       assert_eq!(status["execution"]["available"]["cpus"], 0);
       assert_eq!(status["execution"]["reserved"]["cpus"], 2);
+      assert_eq!(
+        status["execution"]["gpu_busy_memory_threshold_bytes"],
+        64 * 1024 * 1024
+      );
       break;
     }
     assert!(

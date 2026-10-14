@@ -661,8 +661,26 @@ can constrain containers or shared machines. The resolved budget stays fixed whi
 the executor runs. Capacity is a schedulable budget, not free memory or CPU
 utilization from system monitoring. GPU availability is a separate live report:
 registration and heartbeats check compute occupancy, with a background check every
-10 seconds even while staging a task. A busy NVIDIA GPU becomes schedulable when
-its compute processes finish. Graphics-only contexts do not block GPU work.
+10 seconds even while staging a task. By default, an NVIDIA GPU is busy if any
+compute process uses more than 64 MiB. A process at or below that threshold is
+tolerated independently; memory across processes is not summed. A busy GPU becomes
+schedulable when usage drops or the blocking processes finish. Graphics-only
+contexts do not block GPU work. Unknown per-process memory makes the device
+unverified unless another process already proves it busy. MPS uses the driver's
+memory attribution to its server process.
+
+Configure the threshold in bytes under `[queue_worker]` (default 64 MiB):
+
+```toml
+[queue_worker]
+worker_id = "clouds-modu"
+gpu_busy_memory_threshold_bytes = 67108864
+```
+
+Set the threshold to `0` to block on any compute context, including one with zero
+or unknown memory usage. Threshold changes take effect with
+`expri service restart --component queue-execution`; the executor's local launch
+checks and heartbeat reports use the same configured value.
 The server stamps reports on receipt and treats GPUs as unverified after 30 seconds
 without a fresh report. Missing reports, driver errors, unsupported devices, and
 uncertain selectors also keep GPUs unavailable. CPU and memory placement continues.

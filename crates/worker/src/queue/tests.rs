@@ -1,4 +1,5 @@
 use super::*;
+use expri_core::global_config::DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES;
 use expri_core::resource_queue::{
   AttemptIdentity, JobAssignment, JobStatus, JobSubmission, JobSummary, RESOURCE_QUEUE_CAPABILITY,
   RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY, ResourceRequest, SourceRef, WorkerCapacity,
@@ -122,6 +123,7 @@ fn executor_fixture(root: &std::path::Path, url: &str) -> Executor {
       worker: ResolvedQueueWorkerConfig {
         worker_id: "worker-a".into(),
         project_ids: vec![],
+        gpu_busy_memory_threshold_bytes: DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES,
         capacity: capacity.clone(),
       },
       client_config: client_config.clone(),
@@ -610,6 +612,7 @@ fn allocations_cannot_inject_an_unregistered_gpu_selector() {
   let worker = ResolvedQueueWorkerConfig {
     worker_id: "worker-a".into(),
     project_ids: vec!["project-a".into()],
+    gpu_busy_memory_threshold_bytes: DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES,
     capacity: WorkerCapacity {
       cpus: 4,
       memory_bytes: 8192,
@@ -628,6 +631,7 @@ fn project_restrictions_are_optional_and_do_not_change_worker_assignment_identit
   let mut worker = ResolvedQueueWorkerConfig {
     worker_id: "worker-a".into(),
     project_ids: vec![],
+    gpu_busy_memory_threshold_bytes: DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES,
     capacity: WorkerCapacity {
       cpus: 4,
       memory_bytes: 8192,
@@ -778,6 +782,7 @@ fn a_stopped_executor_does_not_create_storage_or_contact_the_server() {
     worker: ResolvedQueueWorkerConfig {
       worker_id: "worker-stopped".into(),
       project_ids: vec!["project-a".into()],
+      gpu_busy_memory_threshold_bytes: DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES,
       capacity: WorkerCapacity {
         cpus: 1,
         memory_bytes: 4096,
@@ -816,6 +821,7 @@ fn an_offline_executor_retries_and_stops_without_waiting_for_its_poll_interval()
     worker: ResolvedQueueWorkerConfig {
       worker_id: "worker-offline".into(),
       project_ids: vec!["project-a".into()],
+      gpu_busy_memory_threshold_bytes: DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES,
       capacity: WorkerCapacity {
         cpus: 1,
         memory_bytes: 4096,

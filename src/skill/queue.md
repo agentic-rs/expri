@@ -86,7 +86,12 @@ containers or shared machines. GPU devices without verified selectors, including
 partitioned GPUs or unavailable partition status, are omitted from automatic whole-GPU capacity.
 Capacity is a reservation budget, not current system utilization. GPU availability
 is checked separately on registration and heartbeats (at least every 10 seconds).
-NVIDIA compute contexts make a device busy; it is offered automatically once free.
+NVIDIA devices are busy when any compute process uses more than 64 MiB by default.
+Processes at or below the threshold are tolerated independently; their memory is
+not summed. Unknown memory usage remains unverified. The same policy applies to
+reports and launch checks. Set `gpu_busy_memory_threshold_bytes` under
+`[queue_worker]` to change this; `0` blocks on any compute context, even with zero or
+unknown memory. A device is offered automatically once no process blocks it.
 Checks require full NVIDIA UUID selectors. AMD, Apple, numeric/abbreviated selectors,
 partitioned devices, and failed probes remain `unverified` and cannot receive GPU
 jobs. CPU jobs can still run. The server also blocks GPUs after 30 seconds without
