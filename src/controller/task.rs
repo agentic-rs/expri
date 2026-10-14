@@ -441,7 +441,7 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let options = LocalTaskOptions {
       repo_root: root.path().into(), project_name: None, name: "train".into(),
-      task: TaskConfig { command: vec!["python".into(), "train.py".into()], uv: false },
+      task: TaskConfig { command: vec!["python".into(), "train.py".into()], uv: false, resources: None },
       args: Vec::new(), dry_run: true, detach: false, smoke: false, json: false, verbosity: 0, quiet: true,
       environment: None,
       service: Some(toml::from_str(

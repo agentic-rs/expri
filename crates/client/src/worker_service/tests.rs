@@ -62,6 +62,30 @@ fn collector(context: ServiceContext) -> Result<()> {
 }
 
 #[test]
+fn executor_status_is_independent_of_collection_and_excludes_credentials() {
+  let context = ServiceContext::new();
+  context.collection_ready("machine-fixture".into(), 1);
+  context.execution_status(json!({
+    "status": "waiting", "worker_id": "worker-fixture", "online": false,
+    "last_error": "server_unavailable", "token": "private-token",
+    "client_config": "/private/config.toml", "command": ["private-task-argument"],
+  }));
+  let snapshot = unix::snapshot(&context, 0, 0);
+  assert_eq!(snapshot["ready"], true);
+  assert_eq!(snapshot["collection"]["machine_id"], "machine-fixture");
+  assert_eq!(snapshot["execution"]["status"], "waiting");
+  assert_eq!(snapshot["execution"]["online"], false);
+  let encoded = snapshot.to_string();
+  for secret in [
+    "private-token",
+    "/private/config.toml",
+    "private-task-argument",
+  ] {
+    assert!(!encoded.contains(secret));
+  }
+}
+
+#[test]
 fn status_is_readonly_and_does_not_create_storage() {
   let (_temporary, paths, _) = fixture();
   assert_eq!(status(&paths).unwrap()["running"], false);

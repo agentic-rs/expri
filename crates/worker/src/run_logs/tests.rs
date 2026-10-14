@@ -113,6 +113,54 @@ fn helper_stdout_is_private_and_preparation_stderr_is_saved() {
   assert_eq!(*stderr.0.lock().expect("stderr sink"), b"prepare\x00\xff");
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn queued_tasks_stop_background_descendants_before_returning_terminal_output() {
+  let root = tempfile::tempdir().expect("run directory");
+  let logs = RunLogs::create_queued_detached(root.path()).expect("queued logs");
+  let marker = root.path().join("descendant-finished");
+  let descendant = format!(
+    "import time,pathlib; time.sleep(1); pathlib.Path({:?}).write_text('escaped')",
+    marker.to_string_lossy()
+  );
+  let script = format!(
+    "import subprocess,sys; subprocess.Popen([sys.executable,'-I','-c',{:?}],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print('parent complete')",
+    descendant
+  );
+  let output = logs
+    .task(&mut python(&script))
+    .expect("queued task cleanup");
+  assert!(output.status.success());
+  assert!(!logs.cleanup_uncertain());
+  thread::sleep(Duration::from_millis(1200));
+  assert!(
+    !marker.exists(),
+    "a closed-pipe background descendant must not outlive queued completion"
+  );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn queued_preparation_helpers_stop_descendants_that_keep_pipes_open() {
+  let root = tempfile::tempdir().expect("run directory");
+  let logs = RunLogs::create_queued_detached(root.path()).expect("queued logs");
+  let script = "import subprocess,sys; subprocess.Popen([sys.executable,'-I','-c','import time; time.sleep(60)']); print('{\"prepared\":true}')";
+  let output = logs
+    .helper(&mut python(script))
+    .expect("queued helper cleanup");
+  assert!(output.status.success());
+  assert!(!logs.cleanup_uncertain());
+  assert!(
+    output.log_error.is_none(),
+    "owned descendant pipes close after group cleanup"
+  );
+  assert!(
+    std::str::from_utf8(&output.stdout)
+      .unwrap()
+      .contains("prepared")
+  );
+}
+
 struct GateSink {
   path: std::path::PathBuf,
   output: Sink,

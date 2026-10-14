@@ -105,7 +105,7 @@ pub(crate) struct Api {
   token: String,
   control: Client,
   pub(super) objects: Client,
-  async_objects: Option<reqwest::Client>,
+  pub(super) async_objects: Option<reqwest::Client>,
   stop: Option<Arc<AtomicBool>>,
   pub(super) stream_budget: Option<u64>,
   stream_backlog: Arc<AtomicBool>,

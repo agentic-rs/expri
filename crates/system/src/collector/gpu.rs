@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
+use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor, error::NvmlError};
 
 use super::{Warnings, clean_text, fill_metadata, gauge};
 use crate::{DeviceInventory, DeviceKind, MetricReading};
@@ -157,6 +157,7 @@ impl GpuCollector {
         model.as_deref(),
         memory.as_ref().map(|value| value.total),
       );
+      record_partition_mode(inventory, device.mig_mode().map(|mode| mode.current));
       devices.push(inventory.clone());
       let readings = GpuReadings {
         usage_percent: usage.as_ref().map(|value| f64::from(value.gpu)),
@@ -193,6 +194,33 @@ impl GpuCollector {
     }
     retain_inventory(&mut self.nvidia_inventory, &devices);
     devices
+  }
+}
+
+fn record_partition_mode(inventory: &mut DeviceInventory, mode: Result<u32, NvmlError>) {
+  match mode {
+    Ok(0) | Err(NvmlError::NotSupported) => {
+      inventory.attributes.remove("partition_mode");
+    }
+    Ok(1) => {
+      // A partitioned physical UUID is not a selectable whole CUDA device.
+      inventory
+        .attributes
+        .insert("partition_mode".into(), "mig".into());
+    }
+    _ => {
+      // A failed query cannot certify a whole GPU or erase known partitioning.
+      if inventory
+        .attributes
+        .get("partition_mode")
+        .map(String::as_str)
+        != Some("mig")
+      {
+        inventory
+          .attributes
+          .insert("partition_mode".into(), "unknown".into());
+      }
+    }
   }
 }
 
@@ -294,6 +322,29 @@ impl GpuReadings {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn partition_query_errors_never_certify_whole_gpus_or_erase_known_mig() {
+    let mut inventory = DeviceInventory {
+      device_id: "GPU-fixture".into(),
+      kind: DeviceKind::Gpu,
+      name: "fixture".into(),
+      total_bytes: None,
+      attributes: BTreeMap::new(),
+    };
+    record_partition_mode(&mut inventory, Err(NvmlError::NoPermission));
+    assert_eq!(inventory.attributes["partition_mode"], "unknown");
+    record_partition_mode(&mut inventory, Ok(1));
+    assert_eq!(inventory.attributes["partition_mode"], "mig");
+    record_partition_mode(&mut inventory, Err(NvmlError::GpuLost));
+    assert_eq!(inventory.attributes["partition_mode"], "mig");
+    record_partition_mode(&mut inventory, Ok(0));
+    assert!(!inventory.attributes.contains_key("partition_mode"));
+    record_partition_mode(&mut inventory, Ok(99));
+    assert_eq!(inventory.attributes["partition_mode"], "unknown");
+    record_partition_mode(&mut inventory, Err(NvmlError::NotSupported));
+    assert!(!inventory.attributes.contains_key("partition_mode"));
+  }
 
   #[test]
   fn absent_gpu_sensors_do_not_become_zero_readings() {

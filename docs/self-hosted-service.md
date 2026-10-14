@@ -13,13 +13,15 @@ Native runs lazily start one shared worker service for the current user and
 storage root. It collects system observations and schedules each run's durable
 publication job with isolated credentials. Explicit
 service commands remain available for existing runs and selected checkpoints.
-The service does not schedule experiments.
+The optional shared resource queue schedules frozen submissions across explicitly
+configured execution workers. Existing direct runs and publishing remain available.
 
 Each transfer has a direction and a named action:
 
 | Data | Direction | Action |
 | --- | --- | --- |
 | Source and config | Laptop → worker checkout | `expri -T gpu-1 push` |
+| Frozen queued source | Laptop → S3 → execution worker | `expri run --queue TASK` |
 | Live tracking and registered checkpoints | Worker → server/S3 | Shared worker service, or `expri service publish` |
 | Completed private input files | Owner → S3 | `expri service input upload` |
 | Required private input files | S3 → worker asset cache | `expri assets add`/`download` and automatic run preparation |
@@ -81,9 +83,9 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 6. Older binaries
-refuse that directory because they cannot preserve asset provenance and usage
-relationships and run nicknames and tags alongside run retention and project deletion. Back up the entire
+Opening this version upgrades the SQLite schema to version 8. Older binaries
+refuse that directory because they cannot preserve durable queue allocations,
+worker fencing, smoke archival, asset provenance, and run retention. Back up the entire
 service directory before upgrading; restoring that backup is required for a
 backend downgrade. Existing S3 runs remain readable after the upgrade.
 
@@ -507,12 +509,145 @@ Reports are bounded and watch summaries stay compact.
 ## CLI report formats
 
 User-facing reports use tables by default. Add `--json` to query, service,
-system, config, login/logout, asset, artifact, and fetch commands for structured
+system, queue, config, login/logout, asset, artifact, and fetch commands for structured
 output. Existing runs and metrics commands also support `--json`. Scripts
 that parse command output must select this flag explicitly. For a detached
 start receipt, use `expri run --detach --json TASK`; put these options before
 the task name. `--quiet` suppresses human reports, while explicit JSON remains
 available. Foreground task output and logs continue to stream normally.
+
+## Shared resource queue
+
+Queue a task with an explicit memory budget and a configured environment:
+
+```sh
+expri run --queue --project-id vision --cpus 4 --memory 16GiB --gpus 1 train
+expri queue list --project-id vision
+expri queue show job-abc123 --json
+expri queue cancel job-abc123
+expri queue workers --json
+```
+
+CPU defaults to one logical slot and GPUs to zero. Task-level
+`[tasks.train.resources]` accepts `cpus`, `memory`, `gpus`, `gpu_ids`, `gpu_model`,
+and `gpu_memory`; CLI values override the corresponding defaults. These apply
+only to queued runs. Memory sizes accept positive integers with binary units
+such as `GiB` or decimal units such as `GB`. `--project-id` can default from the
+selected project's `[service]`. `--worker gpu-1` pins placement; `-T gpu-1` also
+uses that target's environment and pins its name, without an SSH source push.
+
+Each submission uploads a verified source ZIP through the existing private-input
+path before creating a durable job. The compressed and extracted source are each
+limited to 512 MiB and 100,000 entries. Large datasets and models should use managed
+assets. The job pins the uploaded object and SHA256 rather than reading later
+checkout changes. Once submission returns, the laptop may disconnect. Retrying an
+uncertain response with the same `--submission-id` and identical source/specification
+returns the same job; changing that submission is rejected.
+Source selection includes `push.include_ignored` files, like ordinary managed
+local snapshots. `--no-push` and SSH control options cannot be combined with
+`--queue`, which always submits its own frozen source.
+
+On each execution machine, authenticate with `expri login` and enable execution
+in `~/.tokn/expri/config.toml`:
+
+```toml
+[queue_worker]
+worker_id = "gpu-1"
+project_ids = ["vision"]
+```
+
+The executor detects its initial budget: all logical CPU cores, 90% of installed
+RAM with 10% headroom, and usable whole GPUs. `[queue_worker.capacity]` is optional,
+and each explicit field overrides just that detected value. To dedicate part of
+the machine or choose particular GPUs, add overrides such as:
+
+```toml
+[queue_worker.capacity]
+cpus = 16
+memory_bytes = 68719476736
+
+[[queue_worker.capacity.gpus]]
+device_id = "GPU-your-device-uuid"
+model = "NVIDIA A100"
+memory_bytes = 42949672960
+vendor = "nvidia"
+selector = "GPU-your-device-uuid"
+```
+
+Keep the existing `[server]` URL/token in this file. Omitted GPU entries infer the
+device list; `gpus = []` in the capacity table explicitly disables GPU allocation.
+Declared GPU entries replace the detected list. NVIDIA uses GPU UUIDs, AMD requires
+a verified accessible KFD compute device, and Apple GPUs use shared-memory slots.
+Unknown GPU selectors, partitioned GPUs, and unavailable partition status are omitted from the
+automatic whole-GPU budget. Defaults describe host resources; explicit budgets
+can constrain containers or shared machines. The resolved budget stays fixed while
+the executor runs. `worker_id` must be unique, and `project_ids` is an explicit execution
+allowlist. Capacity is a schedulable budget, not free memory or CPU
+utilization from system monitoring. Start the native Linux or macOS shared worker service:
+
+```sh
+expri service start --foreground
+expri service status --json
+```
+
+The shared service enrolls explicitly configured executors, reports their budget
+and heartbeat, and accepts assignments from the server. `service start` can run
+in the background. Without `[queue_worker]`, collection and publishing
+continue without enabling task execution. A queue server outage does not stop
+local collection. `service stop` stops queue polling while training continues;
+the next start reconciles existing supervisors and held reservations.
+An accepted task interrupted before launch retains its journal and allocation
+for confirmed recovery; service restart does not automatically relaunch it.
+CPU and memory reservations govern these queued jobs and do not
+install operating-system limits. GPUs are reserved as whole devices and exposed
+with driver selectors: NVIDIA uses `CUDA_VISIBLE_DEVICES`, AMD uses HIP/ROCR
+selectors, and Apple GPUs use a cooperative whole-device reservation. Declare
+NVIDIA UUIDs or AMD driver selectors accurately. Apple shared memory is part of
+the machine budget; omit GPU `memory_bytes`. Multi-CPU and multi-GPU workers are
+supported. GPU model matching is case-insensitive substring matching; `--gpu-memory`
+requires that amount of dedicated memory on every assigned device. A CUDA-required
+environment needs a GPU request and is placed only on NVIDIA devices.
+
+Queued supervisors clean up their owned process groups before acknowledging a
+terminal run. Workloads must keep children in these groups; processes that
+deliberately escape with a new session/group are outside this cooperative
+boundary. An unverified cleanup keeps the allocation uncertain.
+
+The server places queued jobs across all live eligible workers, reserving resources
+atomically before offering an assignment. CPU-only jobs prefer CPU-only workers.
+Workers accept their assigned tasks, holding all resources during source download,
+environment preparation, and execution. `queue workers` reports available/total
+resources, assigned jobs and active attempts; JSON includes reserved resources
+and exact available GPU identities. `queue list` shows the assigned worker.
+A job that does not fit
+remains queued with a reason in `queue list`; smaller fitting jobs may pass it.
+There is no preemption, multi-machine job, or automatic execution retry in this
+version. Queue operations require unrestricted configured or issued login tokens;
+existing scoped publishing and machine-profile tokens cannot enroll an executor.
+
+The receipt contains a job ID. An actual run ID is linked after worker preparation,
+and its normal run files, publishing, and smoke archival rules apply. Publishing
+defaults on unless disabled by `--no-publish` or the selected service configuration.
+Use queue commands for waiting work, and the existing dashboard/query commands for
+published runs. Queue jobs themselves are currently visible through the CLI.
+
+Worker state, claim receipts, and launch journals live under
+`~/.tokn/expri/queue/`; existing project storage is not moved. A daemon restart
+reconciles known runs without launching them again. Losing a 60-second worker lease
+releases only assignments the worker has not accepted. Accepted attempts become
+uncertain and keep their reservations, because a disconnected
+process may still run. Known supervisors can reconcile their linked run. If a
+supervisor or journal is lost, independently stop and verify the workload before:
+
+```sh
+expri queue recover attempt-abc123 --confirmed-stopped
+```
+
+Recovery marks the attempt lost and releases its reservation; it does not rerun the
+job. Cancelling an active job requests cooperative termination and retains its
+reservation until the worker acknowledges completion. Deleting a project cancels
+waiting jobs and requests cancellation of active ones, retaining active allocation
+records until completion or confirmed recovery.
 
 ## Configure the CLI's server connection
 

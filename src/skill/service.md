@@ -101,7 +101,9 @@ the checkout, so a shared service never swaps process environment credentials.
 
 `service start` starts the background process or reuses it. `--foreground` runs
 in the terminal and rejects a duplicate. `service status` is read-only and never
-starts it. `service stop` stops collection/uploads, retains jobs and leaves
+starts it. With `[queue_worker]`, the same service reports its execution budget
+and accepts server-assigned queue tasks; `service status` includes an independent
+`execution` report. `service stop` stops collection/uploads and queue polling, retains jobs and leaves
 training alive. The next run or publication starts it again. It does not start
 automatically at boot; the next start recovers saved jobs.
 Deploy the updated server before upgrading workers to automatic collection;

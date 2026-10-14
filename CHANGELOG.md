@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `run --queue` freezes source and submits managed tasks to a shared server queue.
+  Configured executors in the shared worker service report explicit CPU, memory,
+  and whole-GPU budgets; the server assigns jobs across live workers and holds
+  reservations, with optional worker/device pins. Worker reports show available,
+  reserved and total resources.
+  Worker capacity defaults to detected logical CPUs, 90% of RAM, and selectable
+  whole GPUs, with optional per-field overrides and `gpus = []` for CPU-only workers.
+  `queue list`, `show`, `workers`, and `cancel` report tables or `--json`.
+  Durable claims and launch journals prevent duplicate execution on retries;
+  uncertain attempts retain reservations until reconciliation or confirmed recovery.
+  Back up the service data directory before upgrading to SQLite schema 8.
 - Native runs now start one shared worker service lazily for collection and run
   publication. `service start` runs in the background or reuses it;
   `--foreground` runs in the terminal. `service status` is read-only, and

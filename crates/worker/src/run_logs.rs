@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod groups;
+
 pub const STDOUT_LOG: &str = "logs/stdout.log";
 pub const STDERR_LOG: &str = "logs/stderr.log";
 
@@ -16,6 +18,8 @@ pub struct RunLogs {
   cancel_path: Option<PathBuf>,
   mirror: bool,
   cancelled: Arc<AtomicBool>,
+  cleanup_groups: bool,
+  cleanup_uncertain: Arc<AtomicBool>,
 }
 
 pub struct LoggedOutput {
@@ -32,6 +36,14 @@ struct Drained {
 enum StopSignal {
   Terminate,
   Kill,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ProcessControl<'a> {
+  cancel_path: Option<&'a Path>,
+  cancelled: Option<&'a AtomicBool>,
+  cleanup_groups: bool,
+  cleanup_uncertain: Option<&'a AtomicBool>,
 }
 
 trait PipeRead: Read {
@@ -51,14 +63,19 @@ impl PipeRead for ChildStderr {
 }
 impl RunLogs {
   pub fn create(run_dir: &Path) -> io::Result<Self> {
-    Self::create_mode(run_dir, false)
+    Self::create_mode(run_dir, false, false)
   }
 
   pub fn create_detached(run_dir: &Path) -> io::Result<Self> {
-    Self::create_mode(run_dir, true)
+    Self::create_mode(run_dir, true, false)
   }
 
-  fn create_mode(run_dir: &Path, detached: bool) -> io::Result<Self> {
+  pub fn create_queued_detached(run_dir: &Path) -> io::Result<Self> {
+    groups::verify_parent()?;
+    Self::create_mode(run_dir, true, true)
+  }
+
+  fn create_mode(run_dir: &Path, detached: bool, cleanup_groups: bool) -> io::Result<Self> {
     let mut directory = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -82,6 +99,8 @@ impl RunLogs {
       cancel_path: detached.then(|| run_dir.join(".cancel-request")),
       mirror: !detached,
       cancelled: Arc::new(AtomicBool::new(false)),
+      cleanup_groups,
+      cleanup_uncertain: Arc::new(AtomicBool::new(false)),
     })
   }
 
@@ -94,8 +113,7 @@ impl RunLogs {
         .mirror
         .then(|| Box::new(io::stdout()) as Box<dyn Write + Send>),
       self.stderr_terminal(),
-      self.cancel_path.as_deref(),
-      Some(&self.cancelled),
+      self.process_control(),
     )
   }
 
@@ -107,8 +125,7 @@ impl RunLogs {
       self.stderr.try_clone()?,
       None,
       self.stderr_terminal(),
-      self.cancel_path.as_deref(),
-      Some(&self.cancelled),
+      self.process_control(),
     )
   }
 
@@ -123,6 +140,19 @@ impl RunLogs {
 
   pub fn was_cancelled(&self) -> bool {
     self.cancelled.load(Ordering::Acquire)
+  }
+
+  pub fn cleanup_uncertain(&self) -> bool {
+    self.cleanup_uncertain.load(Ordering::Acquire)
+  }
+
+  fn process_control(&self) -> ProcessControl<'_> {
+    ProcessControl {
+      cancel_path: self.cancel_path.as_deref(),
+      cancelled: Some(&self.cancelled),
+      cleanup_groups: self.cleanup_groups,
+      cleanup_uncertain: Some(&self.cleanup_uncertain),
+    }
   }
 
   fn stderr_terminal(&self) -> Box<dyn Write + Send> {
@@ -160,8 +190,7 @@ fn execute(
     stderr_log,
     stdout_terminal,
     stderr_terminal,
-    None,
-    None,
+    ProcessControl::default(),
   )
 }
 
@@ -171,9 +200,14 @@ fn execute_controlled(
   stderr_log: File,
   stdout_terminal: Option<Box<dyn Write + Send>>,
   stderr_terminal: Box<dyn Write + Send>,
-  cancel_path: Option<&Path>,
-  cancelled: Option<&AtomicBool>,
+  control: ProcessControl<'_>,
 ) -> io::Result<LoggedOutput> {
+  let ProcessControl {
+    cancel_path,
+    cancelled,
+    cleanup_groups,
+    cleanup_uncertain,
+  } = control;
   if let Some(path) = cancel_path {
     if cancel_requested(path)? {
       if let Some(cancelled) = cancelled {
@@ -199,8 +233,7 @@ fn execute_controlled(
   let stdout = child.stdout.take().expect("piped stdout");
   let stderr = child.stderr.take().expect("piped stderr");
   if let Err(error) = nonblocking(&stdout).and_then(|()| nonblocking(&stderr)) {
-    let _ = child.kill();
-    let _ = child.wait();
+    stop_after_error(&mut child, cleanup_groups, cleanup_uncertain);
     return Err(error);
   }
   let finished = Arc::new(AtomicBool::new(false));
@@ -215,8 +248,7 @@ fn execute_controlled(
   let stdout_reader = match stdout_reader {
     Ok(reader) => reader,
     Err(error) => {
-      let _ = child.kill();
-      let _ = child.wait();
+      stop_after_error(&mut child, cleanup_groups, cleanup_uncertain);
       return Err(error);
     }
   };
@@ -231,8 +263,7 @@ fn execute_controlled(
   let stderr_reader = match stderr_reader {
     Ok(reader) => reader,
     Err(error) => {
-      let _ = child.kill();
-      let _ = child.wait();
+      stop_after_error(&mut child, cleanup_groups, cleanup_uncertain);
       finished.store(true, Ordering::Release);
       stdout_reader.thread().unpark();
       let _ = stdout_reader.join();
@@ -241,18 +272,21 @@ fn execute_controlled(
   };
   let status = wait_child(
     &mut child,
-    cancel_path,
-    cancelled,
+    control,
     &finished,
     &stdout_reader,
     &stderr_reader,
   );
   if status.is_err() {
-    if cancel_path.is_some() {
-      let _ = signal_group(&mut child, StopSignal::Kill);
+    if cleanup_groups {
+      stop_after_error(&mut child, true, cleanup_uncertain);
+    } else {
+      if cancel_path.is_some() {
+        let _ = signal_group(&mut child, StopSignal::Kill);
+      }
+      let _ = child.kill();
+      let _ = child.wait();
     }
-    let _ = child.kill();
-    let _ = child.wait();
   }
   finished.store(true, Ordering::Release);
   stdout_reader.thread().unpark();
@@ -284,17 +318,23 @@ fn cancel_requested(path: &Path) -> io::Result<bool> {
 
 fn wait_child(
   child: &mut Child,
-  cancel_path: Option<&Path>,
-  cancelled: Option<&AtomicBool>,
+  control: ProcessControl<'_>,
   finished: &AtomicBool,
   stdout: &JoinHandle<Drained>,
   stderr: &JoinHandle<Drained>,
 ) -> io::Result<ExitStatus> {
+  let ProcessControl {
+    cancel_path,
+    cancelled,
+    cleanup_groups,
+    cleanup_uncertain,
+  } = control;
   let Some(cancel_path) = cancel_path else {
     return child.wait();
   };
   let mut deadline = None;
   let mut cancellation_started = false;
+  let mut group_cleaned = false;
   loop {
     if !cancellation_started && cancel_requested(cancel_path)? {
       cancellation_started = true;
@@ -314,6 +354,15 @@ fn wait_child(
       deadline = None;
     }
     if deadline.is_none() && child_exit_pending(child)? {
+      if cleanup_groups && !group_cleaned {
+        if let Err(error) = groups::stop(child) {
+          if let Some(uncertain) = cleanup_uncertain {
+            uncertain.store(true, Ordering::Release);
+          }
+          return Err(error);
+        }
+        group_cleaned = true;
+      }
       finished.store(true, Ordering::Release);
       stdout.thread().unpark();
       stderr.thread().unpark();
@@ -325,6 +374,24 @@ fn wait_child(
     }
     thread::sleep(Duration::from_millis(25));
   }
+}
+
+fn stop_after_error(
+  child: &mut Child,
+  cleanup_groups: bool,
+  cleanup_uncertain: Option<&AtomicBool>,
+) {
+  if cleanup_groups {
+    if groups::stop(child).is_err() {
+      if let Some(uncertain) = cleanup_uncertain {
+        uncertain.store(true, Ordering::Release);
+      }
+      return;
+    }
+  } else {
+    let _ = child.kill();
+  }
+  let _ = child.wait();
 }
 
 #[cfg(unix)]

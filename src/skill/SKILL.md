@@ -17,6 +17,7 @@ prints an embedded Markdown guide and works without project configuration.
 | `expri skill config` | Configure the global server, define tasks, or select a target |
 | `expri skill push` | Transfer source and config to a worker |
 | `expri skill run` | Launch a task, including a detached experiment |
+| `expri skill queue` | Submit frozen tasks, reserve resources, and inspect queued jobs/workers |
 | `expri skill runs` | Inspect status/logs, cancel, or retrieve worker results |
 | `expri skill metrics` | Instrument training or compare recorded metrics |
 | `expri skill artifacts` | Hand finalized checkpoints to background publishing |
@@ -37,6 +38,9 @@ prints an embedded Markdown guide and works without project configuration.
 - A configured `[environment]` enables isolated, recorded runs. Detached runs,
   automatic publishing, and runs using managed assets require it. An empty
   table selects ordinary uv isolation.
+- `run --queue` uploads frozen source and returns a job ID; execution workers
+  start it when its CPU, memory, and GPU reservations fit. Read `expri skill queue`
+  for explicit worker setup, job/run IDs, cancellation, and uncertain recovery.
 - Write run outputs to `EXPRI_OUTPUT_DIR`. Capture the returned run ID for
   detached runs and use `runs status --json` to check task and publisher status.
 - `push` sends source to a worker; `runs fetch` retrieves a worker run over

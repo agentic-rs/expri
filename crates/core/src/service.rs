@@ -178,6 +178,10 @@ pub struct AssetProvenance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  /// Shared execution queue. All operations require an owner credential.
+  Queue {
+    request: crate::resource_queue::QueueRequest,
+  },
   /// Paginated run discovery across the scopes visible to the authenticated caller.
   BrowseRuns {
     query: RunListQuery,
@@ -325,6 +329,9 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  Queue {
+    response: crate::resource_queue::QueueResponse,
+  },
   RunPage {
     page: RunListPage,
   },

@@ -68,6 +68,16 @@ impl StoragePaths {
   pub fn profile_database(&self) -> PathBuf {
     self.root.join("profiles.sqlite3")
   }
+  pub fn queue_directory(&self) -> PathBuf {
+    self.root.join("queue")
+  }
+  pub fn queue_workers_directory(&self) -> PathBuf {
+    self.queue_directory().join("workers")
+  }
+  pub fn queue_worker_directory(&self, worker_id: &str) -> Result<PathBuf> {
+    crate::identifiers::validate_component(worker_id)?;
+    Ok(self.queue_workers_directory().join(worker_id))
+  }
 
   /// Inspect owned boundaries without creating directories or changing modes.
   /// Aliases above the boundary (such as a linked HOME) remain supported.

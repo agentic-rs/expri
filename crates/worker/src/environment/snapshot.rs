@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -106,39 +106,7 @@ pub fn create_expected_with_smoke(
   fs::create_dir(&outputs_dir)
     .map_err(|error| io_context("create directory", &outputs_dir, error))?;
 
-  let mut files = Vec::new();
-  let mut missing = Vec::new();
-  for relative_path in &source.paths {
-    ensure_safe_parents(&repo_root, relative_path)?;
-    match copy_source_file(&repo_root, &code_dir, relative_path)? {
-      Some(file) => files.push(file),
-      None
-        if source.kind == SourceKind::Git || is_remote_managed(relative_path, remote_managed) =>
-      {
-        missing.push(relative_path);
-      }
-      None => return Err(source_changed(relative_path)),
-    }
-  }
-
-  for copied in &files {
-    ensure_safe_parents(&repo_root, &copied.path)?;
-    if inspect_source_file(&repo_root, &copied.path)?.as_ref() != Some(copied) {
-      return Err(source_changed(&copied.path));
-    }
-  }
-  for relative_path in missing {
-    ensure_safe_parents(&repo_root, relative_path)?;
-    if inspect_source_file(&repo_root, relative_path)?.is_some() {
-      return Err(source_changed(relative_path));
-    }
-  }
-  if select_source(&repo_root, remote_managed)? != source {
-    return Err(ExpriError::Message(
-      "checkout changed while preparing the run snapshot; retry after edits or source pushing finish"
-        .to_string(),
-    ));
-  }
+  let files = copy_verified_source(&repo_root, &code_dir, &source, remote_managed, None)?;
 
   let manifest = SnapshotManifest {
     run_id: &run_id,
@@ -159,6 +127,95 @@ pub fn create_expected_with_smoke(
     code_dir,
     assets,
   })
+}
+
+/// Freeze the same verified source selection without allocating a run record.
+pub(crate) fn freeze_source_at(
+  repo_root: &Path,
+  remote_managed: &[String],
+  destination: &Path,
+  max_bytes: u64,
+) -> Result<()> {
+  let repo_root = fs::canonicalize(repo_root)?;
+  let state_dir = repo_root.join(".expri");
+  create_private_directory(&state_dir)?;
+  let _checkout_lock = crate::lock::worktree_lock(&state_dir)?;
+  let source = select_source(&repo_root, remote_managed)?;
+  copy_verified_source(
+    &repo_root,
+    destination,
+    &source,
+    remote_managed,
+    Some(max_bytes),
+  )?;
+  Ok(())
+}
+
+fn copy_verified_source(
+  repo_root: &Path,
+  code_dir: &Path,
+  source: &SourceSelection,
+  remote_managed: &[String],
+  max_bytes: Option<u64>,
+) -> Result<Vec<SourceFile>> {
+  let mut files = Vec::new();
+  let mut missing = Vec::new();
+  let mut total = 0_u64;
+  for relative_path in &source.paths {
+    ensure_safe_parents(repo_root, relative_path)?;
+    let remaining = max_bytes.map(|limit| limit.saturating_sub(total));
+    if let Some(limit) = max_bytes
+      && let Some(metadata) = source_metadata(&repo_root.join(relative_path))?
+    {
+      total = total
+        .checked_add(metadata.len())
+        .ok_or_else(|| source_changed(relative_path))?;
+      if total > limit {
+        return Err(ExpriError::Message(
+          "queued source exceeds the 512 MiB uncompressed limit".into(),
+        ));
+      }
+    }
+    match copy_source_file(repo_root, code_dir, relative_path, remaining)? {
+      Some(file) => {
+        if let Some(limit) = max_bytes
+          && file.size.is_some_and(|size| size > limit)
+        {
+          return Err(ExpriError::Message(
+            "queued source exceeds the 512 MiB uncompressed limit".into(),
+          ));
+        }
+        files.push(file);
+      }
+      None
+        if source.kind == SourceKind::Git || is_remote_managed(relative_path, remote_managed) =>
+      {
+        missing.push(relative_path);
+      }
+      None => return Err(source_changed(relative_path)),
+    }
+  }
+
+  for copied in &files {
+    ensure_safe_parents(repo_root, &copied.path)?;
+    if inspect_source_file(repo_root, &copied.path)?.as_ref() != Some(copied) {
+      return Err(source_changed(&copied.path));
+    }
+  }
+  for relative_path in missing {
+    ensure_safe_parents(repo_root, relative_path)?;
+    if inspect_source_file(repo_root, relative_path)?.is_some() {
+      return Err(source_changed(relative_path));
+    }
+  }
+  if select_source(repo_root, remote_managed)? != *source {
+    return Err(ExpriError::Message(
+      "checkout changed while preparing the run snapshot; retry after edits or source pushing finish"
+        .to_string(),
+    ));
+  }
+
+  Ok(files)
 }
 
 fn is_false(value: &bool) -> bool {
@@ -355,6 +412,7 @@ fn copy_source_file(
   root: &Path,
   code_dir: &Path,
   relative_path: &Path,
+  max_bytes: Option<u64>,
 ) -> Result<Option<SourceFile>> {
   let source_path = root.join(relative_path);
   let Some(metadata) = source_metadata(&source_path)? else {
@@ -391,7 +449,17 @@ fn copy_source_file(
   }
   let mut output =
     File::create(&destination).map_err(|error| io_context("create", &destination, error))?;
-  io::copy(&mut source, &mut output).map_err(|error| io_context("copy", &source_path, error))?;
+  if let Some(limit) = max_bytes {
+    let copied = io::copy(&mut source.take(limit.saturating_add(1)), &mut output)
+      .map_err(|error| io_context("copy", &source_path, error))?;
+    if copied > limit {
+      return Err(ExpriError::Message(
+        "queued source exceeds the 512 MiB uncompressed limit".into(),
+      ));
+    }
+  } else {
+    io::copy(&mut source, &mut output).map_err(|error| io_context("copy", &source_path, error))?;
+  }
   output
     .set_permissions(metadata.permissions())
     .map_err(|error| io_context("set permissions on", &destination, error))?;

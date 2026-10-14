@@ -6,6 +6,7 @@ pub(crate) mod http;
 mod inventory;
 mod login;
 mod queue;
+mod resource_queue;
 mod system_profile;
 #[cfg(test)]
 pub(super) mod tests;
@@ -36,6 +37,7 @@ pub use catalog::ServiceCatalogClient;
 pub use download::{fetch, input_download, input_download_prepared};
 pub use http::ResolvedClient;
 pub use login::{login, logout, revoke_login, validate_login_url};
+pub use resource_queue::ResourceQueueClient;
 pub use system_profile::SystemProfileClient;
 pub use watch::{fetch as fetch_files, fetch_with_reporter as fetch_files_with_reporter};
 

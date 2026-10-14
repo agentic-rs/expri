@@ -9,6 +9,7 @@ pub mod environment;
 pub mod git;
 pub mod jobs;
 pub mod node;
+pub mod queue;
 pub mod run_logs;
 pub mod runs;
 pub mod shell;

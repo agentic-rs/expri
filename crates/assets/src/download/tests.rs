@@ -544,6 +544,61 @@ fn frozen_private_input_rejects_changed_server_record_before_asset_cache_publica
 }
 
 #[test]
+fn scoped_private_assets_use_job_project_with_a_shared_global_login() {
+  for configured_project in [None, Some("different-default-project")] {
+    let (_temporary, repo) = fixture();
+    let mut mock = Mock::start(private_steps(b"queued private asset"));
+    let config = repo.join("global.toml");
+    let mut contents = format!(
+      "[server]\nurl={:?}\ntoken='stored-asset-download-test-token'\n",
+      mock.url
+    );
+    if let Some(project) = configured_project {
+      contents.push_str(&format!("project_id={project:?}\n"));
+    }
+    std::fs::write(&config, &contents).unwrap();
+    if configured_project.is_none() {
+      assert!(
+        matching_client(Some(&config))
+          .unwrap_err()
+          .to_string()
+          .contains("project_id")
+      );
+    } else {
+      assert_eq!(
+        matching_client(Some(&config)).unwrap().1,
+        "different-default-project"
+      );
+    }
+    let expected = descriptor(
+      Source::Expri {
+        input_id: "input".into(),
+      },
+      b"queued private asset",
+    );
+    let cache = ensure_scoped(
+      &repo,
+      &expected,
+      Some(&config),
+      Some("example-project"),
+      &mut || Ok(false),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(cache).unwrap(), b"queued private asset");
+    let requests = mock.finish();
+    for request in &requests[..2] {
+      assert!(request.contains("\"project_id\":\"example-project\""));
+      assert!(!request.contains("different-default-project"));
+    }
+    assert_eq!(
+      std::fs::read_to_string(&config).unwrap(),
+      contents,
+      "project scoping must never rewrite shared credentials"
+    );
+  }
+}
+
+#[test]
 fn private_response_details_are_redacted_at_the_asset_boundary() {
   let (_temporary, repo) = fixture();
   let mut mock = Mock::start(vec![Box::new(|_| {

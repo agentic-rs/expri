@@ -2,6 +2,10 @@ mod config;
 mod daemon;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
@@ -172,7 +176,7 @@ pub fn run(command: SystemCommand, target: Option<&str>, quiet: bool) -> Result<
       );
       let collection_paths = paths.clone();
       expri_client::worker_service::run_foreground(&paths, move |context| {
-        daemon::run(collection_paths, config, context)
+        collect_with_config(collection_paths, config, context)
       })
     }
     SystemSubcommand::Status => status(&paths, command.json, quiet),
@@ -209,7 +213,130 @@ pub(crate) fn collect_for_service(
   context: expri_client::worker_service::ServiceContext,
 ) -> Result<()> {
   let config = CollectionConfig::load(&paths, None, None, false)?;
-  daemon::run(writable_paths(&paths)?, config, context)
+  collect_with_config(writable_paths(&paths)?, config, context)
+}
+
+fn collect_with_config(
+  paths: StoragePaths,
+  config: CollectionConfig,
+  context: expri_client::worker_service::ServiceContext,
+) -> Result<()> {
+  // The application composes execution with collection; the client runtime has
+  // no dependency on the worker crate. Local collection readiness stays separate.
+  let _executor = start_executor(&paths, &context);
+  daemon::run(paths, config, context)
+}
+
+struct ExecutorLane {
+  stop: Arc<AtomicBool>,
+  thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for ExecutorLane {
+  fn drop(&mut self) {
+    self.stop.store(true, Ordering::Release);
+    if let Some(thread) = self.thread.take() {
+      let _ = thread.join();
+    }
+  }
+}
+
+fn configured_executor(
+  paths: &StoragePaths,
+) -> Result<Option<expri_core::global_config::QueueWorkerConfig>> {
+  use expri_core::global_config::{QueueWorkerConfig, read_config_text};
+
+  let Some(text) = read_config_text(&paths.config_file())? else {
+    return Ok(None);
+  };
+  let mut config: toml::Value = toml::from_str(&text)
+    .map_err(|_| ExpriError::Message("global expri configuration is invalid".into()))?;
+  let Some(worker) = config
+    .as_table_mut()
+    .and_then(|table| table.remove("queue_worker"))
+  else {
+    return Ok(None);
+  };
+  let worker: QueueWorkerConfig = worker
+    .try_into()
+    .map_err(|_| ExpriError::Message("queue worker configuration is invalid".into()))?;
+  worker.validate()?;
+  Ok(Some(worker))
+}
+
+fn resolve_executor_capacity(
+  worker: &expri_core::global_config::QueueWorkerConfig,
+  detect: impl FnOnce() -> Result<expri_core::resource_queue::WorkerCapacity>,
+) -> Result<expri_core::global_config::ResolvedQueueWorkerConfig> {
+  use expri_core::resource_queue::WorkerCapacity;
+  let capacity = match (
+    worker.capacity.cpus,
+    worker.capacity.memory_bytes,
+    &worker.capacity.gpus,
+  ) {
+    (Some(cpus), Some(memory_bytes), Some(gpus)) => WorkerCapacity {
+      cpus,
+      memory_bytes,
+      gpus: gpus.clone(),
+    },
+    _ => detect()?,
+  };
+  worker.resolve_capacity(capacity)
+}
+
+fn start_executor(
+  paths: &StoragePaths,
+  context: &expri_client::worker_service::ServiceContext,
+) -> Option<ExecutorLane> {
+  let worker = match configured_executor(paths) {
+    Ok(Some(worker)) => worker,
+    Ok(None) => {
+      context.execution_status(json!({"status": "disabled", "online": false}));
+      return None;
+    }
+    Err(_) => {
+      context.execution_status(json!({"status": "failed", "online": false,
+        "last_error": "worker_configuration_invalid"}));
+      return None;
+    }
+  };
+  context.execution_status(json!({"status": "detecting", "worker_id": worker.worker_id,
+    "online": false, "last_error": null}));
+  let stop = context.stop_flag();
+  let executor_context = context.clone();
+  let executor_stop = stop.clone();
+  let execution_paths = paths.clone();
+  let task = thread::Builder::new()
+    .name("expri-queue-executor".into())
+    .spawn(move || {
+      let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let worker = resolve_executor_capacity(&worker, expri_system::detect_worker_capacity)?;
+        let options = expri_worker::queue::ExecutorOptions {
+          storage: execution_paths.clone(),
+          worker,
+          client_config: execution_paths.config_file(),
+          poll_interval: Duration::from_secs(2),
+        };
+        expri_worker::queue::run_executor(options, executor_stop, |report| {
+          executor_context.execution_status(report);
+        })
+      }));
+      if !matches!(outcome, Ok(Ok(()))) {
+        executor_context.execution_status(json!({"status": "failed", "online": false,
+          "last_error": "execution_unavailable"}));
+      }
+    });
+  match task {
+    Ok(thread) => Some(ExecutorLane {
+      stop,
+      thread: Some(thread),
+    }),
+    Err(_) => {
+      context.execution_status(json!({"status": "failed", "online": false,
+        "last_error": "execution_thread_unavailable"}));
+      None
+    }
+  }
 }
 
 // An explicit publishing request may use [server]. Continuous collection still
@@ -332,6 +459,67 @@ mod tests {
   use super::*;
   use crate::{Cli, Command};
   use clap::Parser;
+
+  #[test]
+  fn collection_machines_do_not_execute_server_tasks_without_explicit_enrollment() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::from_root(directory.path().canonicalize().unwrap()).unwrap();
+    assert!(configured_executor(&paths).unwrap().is_none());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    std::fs::write(
+      paths.config_file(),
+      "[server]\nurl='https://server.example.invalid'\ntoken='private-fixture-token'\n",
+    )
+    .unwrap();
+    assert!(configured_executor(&paths).unwrap().is_none());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+  }
+
+  #[test]
+  fn executor_enrollment_loads_budget_and_project_allowlist_without_server_contact() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::from_root(directory.path().canonicalize().unwrap()).unwrap();
+    std::fs::write(
+      paths.config_file(),
+      "[queue_worker]\nworker_id='worker-a'\nproject_ids=['vision']\n[queue_worker.capacity]\ncpus=2\nmemory_bytes=8192\n",
+    )
+    .unwrap();
+    let worker = configured_executor(&paths).unwrap().unwrap();
+    assert_eq!(worker.worker_id, "worker-a");
+    assert_eq!(worker.project_ids, ["vision"]);
+    assert_eq!(worker.capacity.cpus, Some(2));
+    assert_eq!(worker.capacity.gpus, None);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+
+    // Broken executor configuration is isolated from collection readiness.
+    std::fs::write(paths.config_file(), "[queue_worker]\nworker_id=42\n").unwrap();
+    assert!(configured_executor(&paths).is_err());
+    assert!(CollectionConfig::load(&paths, None, None, false).is_ok());
+  }
+
+  #[test]
+  fn executor_capacity_infers_missing_fields_and_skips_detection_for_explicit_budgets() {
+    use expri_core::resource_queue::WorkerCapacity;
+    let worker =
+      toml::from_str("worker_id='worker-a'\nproject_ids=['vision']\n[capacity]\ncpus=2\ngpus=[]\n")
+        .unwrap();
+    let resolved = resolve_executor_capacity(&worker, || {
+      Ok(WorkerCapacity {
+        cpus: 8,
+        memory_bytes: 8192,
+        gpus: vec![],
+      })
+    })
+    .unwrap();
+    assert_eq!(resolved.capacity.cpus, 2);
+    assert_eq!(resolved.capacity.memory_bytes, 8192);
+    let worker = toml::from_str("worker_id='worker-a'\nproject_ids=['vision']\n[capacity]\ncpus=2\nmemory_bytes=4096\ngpus=[]\n").unwrap();
+    let resolved = resolve_executor_capacity(&worker, || {
+      panic!("explicit budget must not probe hardware")
+    })
+    .unwrap();
+    assert_eq!(resolved.capacity.memory_bytes, 4096);
+  }
 
   #[test]
   fn report_json_flags_work_before_and_after_nested_commands() {

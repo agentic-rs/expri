@@ -9,7 +9,9 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use expri_core::global_config::{GlobalConfig, PublishingConfig, SystemProfileConfig};
+use expri_core::global_config::{
+  GlobalConfig, PublishingConfig, QueueWorkerConfig, SystemProfileConfig,
+};
 use expri_core::service::{ClientConfig, Request, Response};
 use expri_core::service_auth::{CLI_TOKEN_PREFIX, LoginRequest, LoginResponse};
 use expri_core::service_catalog::{RunListPage, SERVICE_CATALOG_CAPABILITY};
@@ -110,11 +112,24 @@ fn write_config(root: &Path, url: &str, credential: Option<String>, interval: u6
         client_config: root.parent().unwrap().join("machine.toml"),
       }),
     },
+    queue_worker: Some(queue_worker()),
   };
   config.validate().unwrap();
   let bytes = toml::to_string(&config).unwrap().into_bytes();
   fs::write(root.join("config.toml"), &bytes).unwrap();
   bytes
+}
+
+fn queue_worker() -> QueueWorkerConfig {
+  QueueWorkerConfig {
+    worker_id: "cpu-worker".into(),
+    project_ids: vec!["vision".into()],
+    capacity: expri_core::global_config::QueueWorkerCapacityConfig {
+      cpus: Some(4),
+      memory_bytes: Some(16 * 1024_u64.pow(3)),
+      gpus: Some(vec![]),
+    },
+  }
 }
 
 fn assert_secret_safe(output: &Output) {
@@ -328,6 +343,10 @@ fn login_persists_private_credentials_for_queries_and_logout_retains_the_default
   assert_eq!(logged_in["logged_in"], true);
   assert!(logged_in["expires_at_ms"].is_null());
   let saved = fixture.saved();
+  assert_eq!(
+    serde_json::to_value(saved.queue_worker.as_ref().unwrap()).unwrap(),
+    serde_json::to_value(queue_worker()).unwrap()
+  );
   let connection = saved.server.unwrap();
   assert_eq!(connection.token.as_deref(), Some(token('A').as_str()));
   assert_eq!(connection.project_id.as_deref(), Some("vision"));
@@ -360,7 +379,12 @@ fn login_persists_private_credentials_for_queries_and_logout_retains_the_default
   );
   assert_eq!(fs::read(fixture.config()).unwrap(), before_query);
   assert_eq!(success(fixture.run(&["logout"], None))["logged_in"], false);
-  let connection = fixture.saved().server.unwrap();
+  let saved = fixture.saved();
+  assert_eq!(
+    serde_json::to_value(saved.queue_worker.as_ref().unwrap()).unwrap(),
+    serde_json::to_value(queue_worker()).unwrap()
+  );
+  let connection = saved.server.unwrap();
   assert_eq!(connection.url, url);
   assert!(connection.token.is_none() && connection.token_env.is_none());
   assert_eq!(connection.project_id.as_deref(), Some("vision"));

@@ -28,12 +28,20 @@ impl CollectionConfig {
   ) -> Result<Self> {
     // Collection uses the machine settings only. Run publication validates its
     // own server binding; unrelated server credentials cannot block readiness.
-    let mut config: GlobalConfig = match read_config_text(&paths.config_file())? {
-      Some(text) => toml::from_str(&text)
-        .map_err(|_| ExpriError::Message("global expri configuration is invalid".into()))?,
+    let config: GlobalConfig = match read_config_text(&paths.config_file())? {
+      Some(text) => {
+        let mut machine: toml::Value = toml::from_str(&text)
+          .map_err(|_| ExpriError::Message("global expri configuration is invalid".into()))?;
+        if let Some(table) = machine.as_table_mut() {
+          table.remove("server");
+          table.remove("queue_worker");
+        }
+        machine
+          .try_into()
+          .map_err(|_| ExpriError::Message("global expri configuration is invalid".into()))?
+      }
       None => GlobalConfig::default(),
     };
-    config.server = None;
     config.validate()?;
     let publishing = if no_publish {
       PublishingMode::Disabled
@@ -125,6 +133,20 @@ mod tests {
       collection.publishing,
       PublishingMode::Unconfigured
     ));
+  }
+
+  #[test]
+  fn invalid_executor_configuration_does_not_prevent_collection() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = StoragePaths::from_root(directory.path().canonicalize().unwrap()).unwrap();
+    std::fs::write(
+      paths.config_file(),
+      "[queue_worker]\nworker_id='gpu-1'\nproject_ids=[]\ncapacity='invalid'\n[system_profile]\ninterval_seconds=3\n",
+    )
+    .unwrap();
+    assert!(GlobalConfig::load(&paths.config_file()).is_err());
+    let collection = CollectionConfig::load(&paths, None, None, false).unwrap();
+    assert_eq!(collection.interval, Duration::from_secs(3));
   }
 
   #[test]
