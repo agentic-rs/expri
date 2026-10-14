@@ -243,7 +243,7 @@ impl Drop for ExecutorLane {
 
 fn configured_executor(
   paths: &StoragePaths,
-) -> Result<Option<expri_worker::queue::ExecutorOptions>> {
+) -> Result<Option<expri_core::global_config::QueueWorkerConfig>> {
   use expri_core::global_config::{QueueWorkerConfig, read_config_text};
 
   let Some(text) = read_config_text(&paths.config_file())? else {
@@ -261,20 +261,35 @@ fn configured_executor(
     .try_into()
     .map_err(|_| ExpriError::Message("queue worker configuration is invalid".into()))?;
   worker.validate()?;
-  Ok(Some(expri_worker::queue::ExecutorOptions {
-    storage: paths.clone(),
-    worker,
-    client_config: paths.config_file(),
-    poll_interval: Duration::from_secs(2),
-  }))
+  Ok(Some(worker))
+}
+
+fn resolve_executor_capacity(
+  worker: &expri_core::global_config::QueueWorkerConfig,
+  detect: impl FnOnce() -> Result<expri_core::resource_queue::WorkerCapacity>,
+) -> Result<expri_core::global_config::ResolvedQueueWorkerConfig> {
+  use expri_core::resource_queue::WorkerCapacity;
+  let capacity = match (
+    worker.capacity.cpus,
+    worker.capacity.memory_bytes,
+    &worker.capacity.gpus,
+  ) {
+    (Some(cpus), Some(memory_bytes), Some(gpus)) => WorkerCapacity {
+      cpus,
+      memory_bytes,
+      gpus: gpus.clone(),
+    },
+    _ => detect()?,
+  };
+  worker.resolve_capacity(capacity)
 }
 
 fn start_executor(
   paths: &StoragePaths,
   context: &expri_client::worker_service::ServiceContext,
 ) -> Option<ExecutorLane> {
-  let options = match configured_executor(paths) {
-    Ok(Some(options)) => options,
+  let worker = match configured_executor(paths) {
+    Ok(Some(worker)) => worker,
     Ok(None) => {
       context.execution_status(json!({"status": "disabled", "online": false}));
       return None;
@@ -285,17 +300,23 @@ fn start_executor(
       return None;
     }
   };
-  context.execution_status(
-    json!({"status": "connecting", "worker_id": options.worker.worker_id,
-    "online": false, "last_error": null}),
-  );
+  context.execution_status(json!({"status": "detecting", "worker_id": worker.worker_id,
+    "online": false, "last_error": null}));
   let stop = context.stop_flag();
   let executor_context = context.clone();
   let executor_stop = stop.clone();
+  let execution_paths = paths.clone();
   let task = thread::Builder::new()
     .name("expri-queue-executor".into())
     .spawn(move || {
       let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let worker = resolve_executor_capacity(&worker, expri_system::detect_worker_capacity)?;
+        let options = expri_worker::queue::ExecutorOptions {
+          storage: execution_paths.clone(),
+          worker,
+          client_config: execution_paths.config_file(),
+          poll_interval: Duration::from_secs(2),
+        };
         expri_worker::queue::run_executor(options, executor_stop, |report| {
           executor_context.execution_status(report);
         })
@@ -463,17 +484,41 @@ mod tests {
       "[queue_worker]\nworker_id='worker-a'\nproject_ids=['vision']\n[queue_worker.capacity]\ncpus=2\nmemory_bytes=8192\n",
     )
     .unwrap();
-    let options = configured_executor(&paths).unwrap().unwrap();
-    assert_eq!(options.worker.worker_id, "worker-a");
-    assert_eq!(options.worker.project_ids, ["vision"]);
-    assert_eq!(options.worker.capacity.cpus, 2);
-    assert_eq!(options.client_config, paths.config_file());
+    let worker = configured_executor(&paths).unwrap().unwrap();
+    assert_eq!(worker.worker_id, "worker-a");
+    assert_eq!(worker.project_ids, ["vision"]);
+    assert_eq!(worker.capacity.cpus, Some(2));
+    assert_eq!(worker.capacity.gpus, None);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 
     // Broken executor configuration is isolated from collection readiness.
     std::fs::write(paths.config_file(), "[queue_worker]\nworker_id=42\n").unwrap();
     assert!(configured_executor(&paths).is_err());
     assert!(CollectionConfig::load(&paths, None, None, false).is_ok());
+  }
+
+  #[test]
+  fn executor_capacity_infers_missing_fields_and_skips_detection_for_explicit_budgets() {
+    use expri_core::resource_queue::WorkerCapacity;
+    let worker =
+      toml::from_str("worker_id='worker-a'\nproject_ids=['vision']\n[capacity]\ncpus=2\ngpus=[]\n")
+        .unwrap();
+    let resolved = resolve_executor_capacity(&worker, || {
+      Ok(WorkerCapacity {
+        cpus: 8,
+        memory_bytes: 8192,
+        gpus: vec![],
+      })
+    })
+    .unwrap();
+    assert_eq!(resolved.capacity.cpus, 2);
+    assert_eq!(resolved.capacity.memory_bytes, 8192);
+    let worker = toml::from_str("worker_id='worker-a'\nproject_ids=['vision']\n[capacity]\ncpus=2\nmemory_bytes=4096\ngpus=[]\n").unwrap();
+    let resolved = resolve_executor_capacity(&worker, || {
+      panic!("explicit budget must not probe hardware")
+    })
+    .unwrap();
+    assert_eq!(resolved.capacity.memory_bytes, 4096);
   }
 
   #[test]

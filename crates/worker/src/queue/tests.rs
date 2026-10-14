@@ -94,9 +94,55 @@ fn allocation_hints_hide_unallocated_devices_and_use_assigned_driver_selectors()
   assert_eq!(env["OMP_NUM_THREADS"], "2");
   assert_eq!(env["CUDA_VISIBLE_DEVICES"], "GPU-a");
   assert_eq!(env["HIP_VISIBLE_DEVICES"], "");
+  assert_eq!(env["ROCR_VISIBLE_DEVICES"], "");
   assert_eq!(env["EXPRI_ALLOCATED_MEMORY_BYTES"], "4096");
   allocated.gpus.clear();
-  assert_eq!(allocation_env(&allocated)["CUDA_VISIBLE_DEVICES"], "");
+  let env = allocation_env(&allocated);
+  for key in [
+    "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+  ] {
+    assert_eq!(env[key], "");
+  }
+}
+
+#[test]
+fn amd_uuid_allocations_use_rocr_selectors_and_relative_hip_ordinals() {
+  let mut allocated = allocation();
+  allocated.gpus = ["GPU-000000000000000a", "GPU-000000000000000b"]
+    .map(|selector| WorkerGpu {
+      device_id: selector.into(),
+      model: "AMD GPU".into(),
+      memory_bytes: Some(8192),
+      vendor: GpuVendor::Amd,
+      selector: Some(selector.into()),
+    })
+    .into();
+  let env = allocation_env(&allocated);
+  assert_eq!(env["CUDA_VISIBLE_DEVICES"], "");
+  assert_eq!(
+    env["ROCR_VISIBLE_DEVICES"],
+    "GPU-000000000000000a,GPU-000000000000000b"
+  );
+  assert_eq!(env["HIP_VISIBLE_DEVICES"], "0,1");
+  assert_eq!(env["OMP_NUM_THREADS"], "2");
+}
+
+#[test]
+fn mixed_vendor_allocations_keep_nonzero_amd_selector_out_of_hip_mask() {
+  let mut allocated = allocation();
+  allocated.gpus.push(WorkerGpu {
+    device_id: "amd-a".into(),
+    model: "AMD GPU".into(),
+    memory_bytes: Some(8192),
+    vendor: GpuVendor::Amd,
+    selector: Some("4".into()),
+  });
+  let env = allocation_env(&allocated);
+  assert_eq!(env["CUDA_VISIBLE_DEVICES"], "GPU-a");
+  assert_eq!(env["ROCR_VISIBLE_DEVICES"], "4");
+  assert_eq!(env["HIP_VISIBLE_DEVICES"], "0");
 }
 
 #[test]
@@ -166,7 +212,7 @@ fn queue_storage_rejects_symlink_journals_and_directory_aliases() {
 #[test]
 fn allocations_cannot_inject_an_unregistered_gpu_selector() {
   let assignment = assignment();
-  let worker = QueueWorkerConfig {
+  let worker = ResolvedQueueWorkerConfig {
     worker_id: "worker-a".into(),
     project_ids: vec!["project-a".into()],
     capacity: WorkerCapacity {
@@ -310,7 +356,7 @@ fn a_stopped_executor_does_not_create_storage_or_contact_the_server() {
     StoragePaths::from_root(temporary.path().canonicalize().unwrap().join("storage")).unwrap();
   let options = ExecutorOptions {
     storage: paths.clone(),
-    worker: QueueWorkerConfig {
+    worker: ResolvedQueueWorkerConfig {
       worker_id: "worker-stopped".into(),
       project_ids: vec!["project-a".into()],
       capacity: WorkerCapacity {
@@ -348,7 +394,7 @@ fn an_offline_executor_retries_and_stops_without_waiting_for_its_poll_interval()
   .unwrap();
   let options = ExecutorOptions {
     storage: StoragePaths::from_root(root.join("storage")).unwrap(),
-    worker: QueueWorkerConfig {
+    worker: ResolvedQueueWorkerConfig {
       worker_id: "worker-offline".into(),
       project_ids: vec!["project-a".into()],
       capacity: WorkerCapacity {

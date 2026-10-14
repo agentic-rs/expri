@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 use expri_core::global_config::{
   GlobalConfig, PublishingConfig, QueueWorkerConfig, SystemProfileConfig,
 };
-use expri_core::resource_queue::WorkerCapacity;
 use expri_core::service::{ClientConfig, Request, Response};
 use expri_core::service_auth::{CLI_TOKEN_PREFIX, LoginRequest, LoginResponse};
 use expri_core::service_catalog::{RunListPage, SERVICE_CATALOG_CAPABILITY};
@@ -125,10 +124,10 @@ fn queue_worker() -> QueueWorkerConfig {
   QueueWorkerConfig {
     worker_id: "cpu-worker".into(),
     project_ids: vec!["vision".into()],
-    capacity: WorkerCapacity {
-      cpus: 4,
-      memory_bytes: 16 * 1024_u64.pow(3),
-      gpus: vec![],
+    capacity: expri_core::global_config::QueueWorkerCapacityConfig {
+      cpus: Some(4),
+      memory_bytes: Some(16 * 1024_u64.pow(3)),
+      gpus: Some(vec![]),
     },
   }
 }

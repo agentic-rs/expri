@@ -547,14 +547,21 @@ Source selection includes `push.include_ignored` files, like ordinary managed
 local snapshots. `--no-push` and SSH control options cannot be combined with
 `--queue`, which always submits its own frozen source.
 
-On each execution machine, authenticate with `expri login` and add its explicit
-budget to `~/.tokn/expri/config.toml`:
+On each execution machine, authenticate with `expri login` and enable execution
+in `~/.tokn/expri/config.toml`:
 
 ```toml
 [queue_worker]
 worker_id = "gpu-1"
 project_ids = ["vision"]
+```
 
+The executor detects its initial budget: all logical CPU cores, 90% of installed
+RAM with 10% headroom, and usable whole GPUs. `[queue_worker.capacity]` is optional,
+and each explicit field overrides just that detected value. To dedicate part of
+the machine or choose particular GPUs, add overrides such as:
+
+```toml
 [queue_worker.capacity]
 cpus = 16
 memory_bytes = 68719476736
@@ -567,9 +574,15 @@ vendor = "nvidia"
 selector = "GPU-your-device-uuid"
 ```
 
-Keep the existing `[server]` URL/token in this file. CPU-only workers can omit the
-GPU entries. `worker_id` must be unique, and `project_ids` is an explicit execution
-allowlist. Capacity is the operator's schedulable budget, not free memory or CPU
+Keep the existing `[server]` URL/token in this file. Omitted GPU entries infer the
+device list; `gpus = []` in the capacity table explicitly disables GPU allocation.
+Declared GPU entries replace the detected list. NVIDIA uses GPU UUIDs, AMD requires
+a verified accessible KFD compute device, and Apple GPUs use shared-memory slots.
+Unknown GPU selectors, partitioned GPUs, and unavailable partition status are omitted from the
+automatic whole-GPU budget. Defaults describe host resources; explicit budgets
+can constrain containers or shared machines. The resolved budget stays fixed while
+the executor runs. `worker_id` must be unique, and `project_ids` is an explicit execution
+allowlist. Capacity is a schedulable budget, not free memory or CPU
 utilization from system monitoring. Start the native Linux or macOS shared worker service:
 
 ```sh

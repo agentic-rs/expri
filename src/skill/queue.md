@@ -52,7 +52,13 @@ Preserve its `[server]` in `~/.tokn/expri/config.toml` and add:
 [queue_worker]
 worker_id = "gpu-1"
 project_ids = ["vision"]
+```
 
+Capacity is detected when the executor starts: all logical CPUs, 90% of installed
+RAM (10% reserved as headroom), and selectable whole GPUs. Each field below is an
+optional override; omitted fields remain inferred:
+
+```toml
 [queue_worker.capacity]
 cpus = 16
 memory_bytes = 68719476736
@@ -65,9 +71,13 @@ vendor = "nvidia"
 selector = "GPU-your-device-uuid"
 ```
 
-CPU-only workers omit GPU entries. Supply real NVIDIA UUIDs or AMD HIP/ROCR
+Use `gpus = []` under `[queue_worker.capacity]` to make a worker CPU-only.
+Explicit GPU entries replace the inferred GPU list. Supply real NVIDIA UUIDs or AMD ROCr
 selectors; Apple GPUs use a cooperative whole-device reservation with dedicated
-memory omitted. Capacity is an explicit budget, not current system utilization.
+memory omitted. Defaults use host inventory; use explicit limits for constrained
+containers or shared machines. GPU devices without verified selectors, including
+partitioned GPUs or unavailable partition status, are omitted from automatic whole-GPU capacity.
+Capacity is a reservation budget, not current system utilization.
 Execution workers require native Linux or macOS.
 The project allowlist enables execution in the shared worker service:
 

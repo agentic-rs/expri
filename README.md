@@ -321,6 +321,8 @@ These defaults apply to `run --queue`. Memory must be supplied in the task or
 CLI; CPU defaults to one slot and GPUs to zero. Each worker needs a local
 `[queue_worker]` declaration and the shared `expri service start` runtime; use
 `--foreground` to run it in a terminal.
+Capacity defaults to detected logical CPUs, 90% of RAM, and selectable whole GPUs.
+Optional capacity fields override these defaults; `gpus = []` disables GPU allocation.
 `queue workers` reports available/total resources and pending assignments. Read
 [worker setup and recovery](docs/self-hosted-service.md#shared-resource-queue)
 or `expri skill queue`. The job receives a run ID only after dispatch; published

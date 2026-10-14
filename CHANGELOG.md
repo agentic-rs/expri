@@ -7,6 +7,8 @@
   and whole-GPU budgets; the server assigns jobs across live workers and holds
   reservations, with optional worker/device pins. Worker reports show available,
   reserved and total resources.
+  Worker capacity defaults to detected logical CPUs, 90% of RAM, and selectable
+  whole GPUs, with optional per-field overrides and `gpus = []` for CPU-only workers.
   `queue list`, `show`, `workers`, and `cancel` report tables or `--json`.
   Durable claims and launch journals prevent duplicate execution on retries;
   uncertain attempts retain reservations until reconciliation or confirmed recovery.

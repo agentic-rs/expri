@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use expri_client::ResourceQueueClient;
 use expri_core::config::RunServiceConfig;
-use expri_core::global_config::QueueWorkerConfig;
+use expri_core::global_config::ResolvedQueueWorkerConfig;
 use expri_core::resource_queue::{
   AttemptStatus, AttemptSummary, AttemptTerminalStatus, GpuVendor, QueueRequest, QueueResponse,
   ResourceAllocation,
@@ -27,7 +27,7 @@ use journal::{Journal, Stage, private_directory, read_json, write_json};
 
 pub struct ExecutorOptions {
   pub storage: StoragePaths,
-  pub worker: QueueWorkerConfig,
+  pub worker: ResolvedQueueWorkerConfig,
   pub client_config: PathBuf,
   pub poll_interval: Duration,
 }
@@ -837,15 +837,26 @@ fn allocation_env(allocation: &ResourceAllocation) -> BTreeMap<String, String> {
       .join(",")
   };
   env.insert("CUDA_VISIBLE_DEVICES".into(), selectors(GpuVendor::Nvidia));
-  let amd = selectors(GpuVendor::Amd);
-  env.insert("HIP_VISIBLE_DEVICES".into(), amd.clone());
-  env.insert("ROCR_VISIBLE_DEVICES".into(), amd);
+  env.insert("ROCR_VISIBLE_DEVICES".into(), selectors(GpuVendor::Amd));
+  // ROCr filters physical devices before HIP enumerates their relative indices.
+  // HIP ordinals also prevent its CUDA alias from hiding AMD allocations on
+  // mixed-vendor workers, and override any inherited HIP visibility mask.
+  // https://github.com/ROCm/clr/blob/rocm-6.1.x/rocclr/device/rocm/rocdevice.cpp
+  let hip = allocation
+    .gpus
+    .iter()
+    .filter(|gpu| gpu.vendor == GpuVendor::Amd)
+    .enumerate()
+    .map(|(index, _)| index.to_string())
+    .collect::<Vec<_>>()
+    .join(",");
+  env.insert("HIP_VISIBLE_DEVICES".into(), hip);
   env
 }
 
 fn validate_allocation(
   allocation: &ResourceAllocation,
-  worker: &QueueWorkerConfig,
+  worker: &ResolvedQueueWorkerConfig,
   request: &expri_core::resource_queue::ResourceRequest,
 ) -> Result<()> {
   if allocation.cpus != request.cpus
@@ -875,7 +886,7 @@ fn validate_allocation(
 
 fn register(
   client: &ResourceQueueClient,
-  worker: &QueueWorkerConfig,
+  worker: &ResolvedQueueWorkerConfig,
   session: &Arc<Mutex<String>>,
   path: &std::path::Path,
 ) -> Result<(

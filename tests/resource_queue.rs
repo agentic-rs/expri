@@ -618,8 +618,14 @@ impl Fixture {
     ));
     if gpus {
       config.push_str("[[queue_worker.capacity.gpus]]\ndevice_id='GPU-fixture'\nmodel='fixture GPU'\nvendor='nvidia'\nselector='GPU-fixture'\nmemory_bytes=8589934592\n");
+    } else {
+      config.push_str("gpus=[]\n");
     }
     fs::write(self.worker_storage.join("config.toml"), config).unwrap();
+    self.start_service()
+  }
+
+  fn start_service(&self) -> ChildGuard {
     let path = format!(
       "{}:{}",
       native_uv().bin.display(),
@@ -802,6 +808,29 @@ fn identity(attempt: &Value) -> Value {
     "session_id": attempt["session_id"],
     "fencing_token": attempt["fencing_token"],
   })
+}
+
+#[test]
+fn worker_with_no_capacity_section_registers_detected_budget_and_executes_queued_work() {
+  let fixture = Fixture::new();
+  let expected = expri_system::detect_worker_capacity().unwrap();
+  fs::write(fixture.worker_storage.join("config.toml"), format!(
+    "[server]\nurl={:?}\ntoken={OWNER:?}\n[queue_worker]\nworker_id='worker-a'\nproject_ids=['queue-project']\n",
+    fixture.endpoint,
+  )).unwrap();
+  let gate = fixture.gate("inferred-worker");
+  let job = fixture.submit(&gate, &["--cpus", "1", "--memory", "1MiB"]);
+  let _service = fixture.start_service();
+  fixture.await_status(job["job_id"].as_str().unwrap(), &["running"]);
+  fixture.await_starts(1);
+  let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
+  assert_eq!(
+    workers["workers"][0]["capacity"],
+    serde_json::to_value(expected).unwrap()
+  );
+  assert_eq!(workers["workers"][0]["reserved"]["cpus"], 1);
+  fs::write(gate, b"release").unwrap();
+  fixture.await_status(job["job_id"].as_str().unwrap(), &["completed"]);
 }
 
 #[test]

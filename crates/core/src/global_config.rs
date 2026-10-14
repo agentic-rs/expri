@@ -29,37 +29,103 @@ pub struct GlobalConfig {
 pub struct QueueWorkerConfig {
   pub worker_id: String,
   pub project_ids: Vec<String>,
+  #[serde(default)]
+  pub capacity: QueueWorkerCapacityConfig,
+}
+
+/// Omitted fields use the machine's detected execution budget.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueWorkerCapacityConfig {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cpus: Option<u32>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub memory_bytes: Option<u64>,
+  /// An explicit empty list opts out of GPU execution on this machine.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub gpus: Option<Vec<crate::resource_queue::WorkerGpu>>,
+}
+
+/// Fully resolved machine-local execution settings, ready for registration.
+#[derive(Clone, Debug)]
+pub struct ResolvedQueueWorkerConfig {
+  pub worker_id: String,
+  pub project_ids: Vec<String>,
   pub capacity: crate::resource_queue::WorkerCapacity,
 }
 
 impl QueueWorkerConfig {
   pub fn validate(&self) -> Result<()> {
-    use crate::resource_queue::GpuVendor;
-    self.capacity.validate()?;
-    crate::identifiers::validate_component(&self.worker_id)?;
-    if self.project_ids.is_empty() || self.project_ids.len() > 64 {
+    validate_worker_identity(&self.worker_id, &self.project_ids)?;
+    validate_worker_capacity(&crate::resource_queue::WorkerCapacity {
+      cpus: self.capacity.cpus.unwrap_or(1),
+      memory_bytes: self.capacity.memory_bytes.unwrap_or(1),
+      gpus: self.capacity.gpus.clone().unwrap_or_default(),
+    })
+  }
+
+  pub fn needs_detection(&self) -> bool {
+    self.capacity.cpus.is_none()
+      || self.capacity.memory_bytes.is_none()
+      || self.capacity.gpus.is_none()
+  }
+
+  pub fn resolve_capacity(
+    &self,
+    inferred: crate::resource_queue::WorkerCapacity,
+  ) -> Result<ResolvedQueueWorkerConfig> {
+    self.validate()?;
+    let resolved = ResolvedQueueWorkerConfig {
+      worker_id: self.worker_id.clone(),
+      project_ids: self.project_ids.clone(),
+      capacity: crate::resource_queue::WorkerCapacity {
+        cpus: self.capacity.cpus.unwrap_or(inferred.cpus),
+        memory_bytes: self.capacity.memory_bytes.unwrap_or(inferred.memory_bytes),
+        gpus: self.capacity.gpus.clone().unwrap_or(inferred.gpus),
+      },
+    };
+    resolved.validate()?;
+    Ok(resolved)
+  }
+}
+
+impl ResolvedQueueWorkerConfig {
+  pub fn validate(&self) -> Result<()> {
+    validate_worker_identity(&self.worker_id, &self.project_ids)?;
+    validate_worker_capacity(&self.capacity)
+  }
+}
+
+fn validate_worker_identity(worker_id: &str, project_ids: &[String]) -> Result<()> {
+  crate::identifiers::validate_component(worker_id)?;
+  if project_ids.is_empty() || project_ids.len() > 64 {
+    return Err(invalid(
+      "queue_worker.project_ids requires an explicit nonempty project allowlist",
+    ));
+  }
+  let mut projects = std::collections::BTreeSet::new();
+  for project in project_ids {
+    crate::identifiers::validate_component(project)?;
+    if !projects.insert(project) {
       return Err(invalid(
-        "queue_worker.project_ids requires an explicit nonempty project allowlist",
+        "queue_worker.project_ids contains a duplicate project",
       ));
     }
-    let mut projects = std::collections::BTreeSet::new();
-    for project in &self.project_ids {
-      crate::identifiers::validate_component(project)?;
-      if !projects.insert(project) {
-        return Err(invalid(
-          "queue_worker.project_ids contains a duplicate project",
-        ));
-      }
-    }
-    for gpu in &self.capacity.gpus {
-      if gpu.vendor == GpuVendor::Apple && gpu.memory_bytes.is_some() {
-        return Err(invalid(
-          "queue_worker Apple GPU memory is shared; omit dedicated memory_bytes",
-        ));
-      }
-    }
-    Ok(())
   }
+  Ok(())
+}
+
+fn validate_worker_capacity(capacity: &crate::resource_queue::WorkerCapacity) -> Result<()> {
+  use crate::resource_queue::GpuVendor;
+  capacity.validate()?;
+  for gpu in &capacity.gpus {
+    if gpu.vendor == GpuVendor::Apple && gpu.memory_bytes.is_some() {
+      return Err(invalid(
+        "queue_worker Apple GPU memory is shared; omit dedicated memory_bytes",
+      ));
+    }
+  }
+  Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,6 +310,170 @@ fn invalid(message: &str) -> ExpriError {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::resource_queue::{GpuVendor, WorkerCapacity, WorkerGpu};
+
+  fn detected_capacity() -> WorkerCapacity {
+    WorkerCapacity {
+      cpus: 8,
+      memory_bytes: 16 * 1024_u64.pow(3),
+      gpus: vec![WorkerGpu {
+        device_id: "GPU-a".into(),
+        model: "NVIDIA GPU".into(),
+        memory_bytes: Some(8 * 1024_u64.pow(3)),
+        vendor: GpuVendor::Nvidia,
+        selector: Some("GPU-a".into()),
+      }],
+    }
+  }
+
+  fn worker_config(capacity: &str) -> QueueWorkerConfig {
+    let config: GlobalConfig = toml::from_str(&format!(
+      "[queue_worker]\nworker_id='worker-a'\nproject_ids=['vision']\n{capacity}"
+    ))
+    .unwrap();
+    config.queue_worker.unwrap()
+  }
+
+  #[test]
+  fn worker_capacity_can_be_omitted_and_resolves_only_when_requested() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let contents = "[queue_worker]\nworker_id='worker-a'\nproject_ids=['vision']\n";
+    fs::write(&path, contents).unwrap();
+    let config = GlobalConfig::load(&path).unwrap();
+    let worker = config.queue_worker.unwrap();
+    assert!(worker.needs_detection());
+    assert!(worker.capacity.cpus.is_none());
+    assert!(worker.capacity.memory_bytes.is_none());
+    assert!(worker.capacity.gpus.is_none());
+    let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+    assert_eq!(resolved.worker_id, "worker-a");
+    assert_eq!(resolved.project_ids, ["vision"]);
+    assert_eq!(resolved.capacity, detected_capacity());
+    assert_eq!(fs::read_to_string(path).unwrap(), contents);
+  }
+
+  #[test]
+  fn worker_partial_overrides_replace_only_explicit_fields() {
+    let worker = worker_config("[queue_worker.capacity]\ncpus=32\n");
+    worker.validate().unwrap();
+    assert!(worker.needs_detection());
+    let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+    assert_eq!(resolved.capacity.cpus, 32);
+    assert_eq!(
+      resolved.capacity.memory_bytes,
+      detected_capacity().memory_bytes
+    );
+    assert_eq!(resolved.capacity.gpus, detected_capacity().gpus);
+
+    let worker = worker_config("[queue_worker.capacity]\nmemory_bytes=4096\n");
+    let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+    assert_eq!(resolved.capacity.cpus, 8);
+    assert_eq!(resolved.capacity.memory_bytes, 4096);
+    assert_eq!(resolved.capacity.gpus, detected_capacity().gpus);
+  }
+
+  #[test]
+  fn worker_explicit_empty_gpus_disable_gpu_inference_and_survive_roundtrip() {
+    let worker = worker_config("[queue_worker.capacity]\ncpus=4\nmemory_bytes=4096\ngpus=[]\n");
+    assert!(!worker.needs_detection());
+    let roundtrip: QueueWorkerConfig = toml::from_str(&toml::to_string(&worker).unwrap()).unwrap();
+    assert_eq!(roundtrip.capacity.gpus, Some(vec![]));
+    assert!(!roundtrip.needs_detection());
+    let resolved = roundtrip.resolve_capacity(detected_capacity()).unwrap();
+    assert_eq!(resolved.capacity.cpus, 4);
+    assert_eq!(resolved.capacity.memory_bytes, 4096);
+    assert!(resolved.capacity.gpus.is_empty());
+
+    let omitted = worker_config("[queue_worker.capacity]\ncpus=4\nmemory_bytes=4096\n");
+    let roundtrip: QueueWorkerConfig = toml::from_str(&toml::to_string(&omitted).unwrap()).unwrap();
+    assert!(roundtrip.capacity.gpus.is_none());
+    assert!(roundtrip.needs_detection());
+    assert_eq!(
+      roundtrip
+        .resolve_capacity(detected_capacity())
+        .unwrap()
+        .capacity
+        .gpus,
+      detected_capacity().gpus
+    );
+  }
+
+  #[test]
+  fn legacy_worker_capacity_with_gpu_tables_keeps_its_explicit_budget() {
+    let worker = worker_config(
+      "[queue_worker.capacity]\ncpus=4\nmemory_bytes=4096\n\
+      [[queue_worker.capacity.gpus]]\ndevice_id='GPU-b'\nmodel='NVIDIA GPU'\n\
+      vendor='nvidia'\nselector='GPU-b'\nmemory_bytes=8192\n",
+    );
+    worker.validate().unwrap();
+    assert!(!worker.needs_detection());
+    let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+    assert_eq!(resolved.capacity.cpus, 4);
+    assert_eq!(resolved.capacity.memory_bytes, 4096);
+    assert_eq!(resolved.capacity.gpus[0].device_id, "GPU-b");
+    assert_eq!(resolved.capacity.gpus[0].memory_bytes, Some(8192));
+    let roundtrip: QueueWorkerConfig = toml::from_str(&toml::to_string(&worker).unwrap()).unwrap();
+    assert_eq!(
+      roundtrip
+        .resolve_capacity(detected_capacity())
+        .unwrap()
+        .capacity,
+      resolved.capacity
+    );
+  }
+
+  #[test]
+  fn worker_invalid_overrides_fail_even_without_detection() {
+    for capacity in [
+      "[queue_worker.capacity]\ncpus=0\n",
+      "[queue_worker.capacity]\ncpus=1000001\n",
+      "[queue_worker.capacity]\nmemory_bytes=0\n",
+      "[queue_worker.capacity]\n[[queue_worker.capacity.gpus]]\n\
+       device_id='GPU-a'\nmodel='NVIDIA GPU'\nvendor='nvidia'\n",
+      "[queue_worker.capacity]\n[[queue_worker.capacity.gpus]]\n\
+       device_id='GPU-a'\nmodel='Apple GPU'\nvendor='apple'\nmemory_bytes=8192\n",
+    ] {
+      let worker = worker_config(capacity);
+      assert!(worker.validate().is_err(), "accepted {capacity}");
+      assert!(worker.resolve_capacity(detected_capacity()).is_err());
+    }
+  }
+
+  #[test]
+  fn worker_resolved_budget_must_be_valid_but_overridden_detection_is_ignored() {
+    let omitted = worker_config("");
+    let mut inferred = detected_capacity();
+    inferred.cpus = 0;
+    assert!(omitted.resolve_capacity(inferred.clone()).is_err());
+    inferred.cpus = 8;
+    inferred.memory_bytes = 0;
+    assert!(omitted.resolve_capacity(inferred.clone()).is_err());
+    inferred.memory_bytes = 8192;
+    inferred.gpus[0].selector = None;
+    assert!(omitted.resolve_capacity(inferred).is_err());
+
+    let explicit = worker_config("[queue_worker.capacity]\ncpus=4\nmemory_bytes=4096\ngpus=[]\n");
+    explicit
+      .resolve_capacity(WorkerCapacity {
+        cpus: 0,
+        memory_bytes: 0,
+        gpus: vec![],
+      })
+      .unwrap();
+  }
+
+  #[test]
+  fn automatic_capacity_still_requires_explicit_valid_worker_identity_and_projects() {
+    for identity in [
+      "worker_id='worker-a'\nproject_ids=[]\n",
+      "worker_id='worker-a'\nproject_ids=['vision', 'vision']\n",
+      "worker_id='../worker-a'\nproject_ids=['vision']\n",
+    ] {
+      let config: GlobalConfig = toml::from_str(&format!("[queue_worker]\n{identity}")).unwrap();
+      assert!(config.validate().is_err());
+    }
+  }
 
   #[test]
   fn missing_configuration_keeps_defaults_without_creating_files() {
