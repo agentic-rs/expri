@@ -905,7 +905,7 @@ def workspace_layout(browser, width, wide=False):
     const headers = [...table.querySelectorAll('thead th')];
     const column_classes = ['selection-column', 'run-column', 'status-column',
       ...(table.querySelector('.machine-column') ? ['machine-column'] : []),
-      'task-column', 'started-column'];
+      'started-column'];
     return {viewport_width: innerWidth, viewport_height: innerHeight, page_width: document.documentElement.scrollWidth,
       client_width: document.documentElement.clientWidth, grid: bounds('.workspace-grid'),
       runs: bounds('.runs-card'), review: bounds('.review-workspace'),
@@ -914,6 +914,11 @@ def workspace_layout(browser, width, wide=False):
       columns: {builtins_match: column_classes.every((name, index) => headers[index]?.classList.contains(name)),
         header_count: headers.length, builtin_count: column_classes.length,
         custom_count: Number(table.querySelector('table').dataset.columnCount),
+        tasks_below_names: [...table.querySelectorAll('tbody .run-cell')].every(cell => {
+          const name = cell.querySelector('.run-link'), task = cell.querySelector('.run-task');
+          return !!name && !!task && name.nextElementSibling === task
+            && task.getBoundingClientRect().top >= name.getBoundingClientRect().bottom - 1;
+        }),
         run: bounds('#run-rows .run-cell'), selection: bounds('#run-rows .selection-column'),
         status: bounds('#run-rows .status-column'), region: bounds('#runs-region'),
         row_counts: [...table.querySelectorAll('tbody tr')].map(row => row.children.length)},
@@ -936,7 +941,8 @@ def workspace_layout(browser, width, wide=False):
     assert abs(runs['width'] - geometry['grid']['width']) <= 1, f'{width}px Runs does not use the full workspace'
     assert abs(review['width'] - geometry['grid']['width']) <= 1, f'{width}px stacked Review does not use the full workspace'
   columns = geometry['columns']
-  assert columns['builtins_match'], 'run table lost Run, adjacent Status, Machine, Task, or Started columns'
+  assert columns['builtins_match'], 'run table lost Run, adjacent Status, Machine, or Started columns'
+  assert columns['tasks_below_names'], 'run table lost the task name on the second line of the Run column'
   expected_columns = columns['builtin_count'] + columns['custom_count']
   assert columns['header_count'] == expected_columns, 'run table omitted built-in or selected column headings'
   assert all(count == expected_columns for count in columns['row_counts']), 'run rows do not align with their column headings'
@@ -1098,7 +1104,7 @@ def run_table_columns(browser, run_ids):
   chart_context(browser)
   browser.click(loss_prefix + '//button[code="' + run_ids[0] + '"]', using='xpath')
   browser.keys(loss_prefix + '//*[@class="plot-scroll"]', '\ue00c', using='xpath')
-  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, Run/Status/Task/Started columns, review/selection/zoom/visibility preserved, 1440/1024/1001px persistent history beside inspection, 1000/320/360px stacked panels, and contained table scroll with pinned run identity.', flush=True)
+  print('Firefox run columns passed: parameter/metric checkbox tags, exact Last/Min/Max values, native header click/keyboard sorting, Run/Status/Started columns with task names below run names, review/selection/zoom/visibility preserved, 1440/1024/1001px persistent history beside inspection, 1000/320/360px stacked panels, and contained table scroll with pinned run identity.', flush=True)
 
 
 def workspace(run_id, second_run_id):

@@ -326,7 +326,6 @@ tbody tr:last-child > * { border-bottom: 0; }
 .run-summary-meta .run-tag:last-child { flex: 0 1 auto; }
 .runs-table .run-cell { position: sticky; left: 28px; z-index: 1; background: var(--paper); }
 .runs-table thead .run-column { position: sticky; left: 28px; z-index: 3; background: var(--surface-soft); }
-.runs-table .task-column { min-width: 100px; max-width: 180px; }
 .runs-table .machine-column { min-width: 90px; max-width: 150px; }
 .runs-table .status-column { min-width: 92px; width: 92px; }
 .runs-table .started-column { min-width: 132px; width: 132px; }
@@ -360,7 +359,7 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .run-diagnostics ul, .run-diagnostics-detail ul { margin: 4px 0 0; padding-left: 15px; }
 .run-diagnostics li + li, .run-diagnostics-detail li + li { margin-top: 3px; }
 .run-diagnostics-detail strong { font-size: 11px; }
-.run-task { color: var(--ink); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-task { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-duration { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .run-meta { color: var(--muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .started-column { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }

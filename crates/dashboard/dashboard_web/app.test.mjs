@@ -1027,7 +1027,7 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 7);
+  assert.equal(nodes.get("run-rows").children[0].children.length, 6);
   assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
   await click(nodes.get("next-page")); await settledTable(nodes);
   assert.equal(nodes.get("page-label").textContent, "Page 2");
@@ -1105,8 +1105,8 @@ test("automatic list updates keep table choices and sorting while refreshing onl
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = await reviewFixture(t);
   await settled(() => nodes.get("run-rows").children.length === 3);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 5);
-  assert.equal(nodes.get("run-rows").children[0].querySelector(".task-column").textContent, "train");
+  assert.equal(nodes.get("run-rows").children[0].children.length, 4);
+  assert.equal(nodes.get("run-rows").children[0].querySelector(".run-cell .run-task").textContent, "train");
   assert.match(text(nodes.get("run-rows").children[0].querySelector(".status-column")), /3s/);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");

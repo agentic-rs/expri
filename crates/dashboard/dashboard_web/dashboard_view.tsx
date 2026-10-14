@@ -372,7 +372,7 @@ function RunColumnPicker({
     <RunControlPopover id="run-columns" label="Columns" icon="columns" count={s.run_columns.length}
       open={open} disabled={s.controls_disabled} on_change={(value) => { on_change(value); if (value) a.refresh_run_columns(); }}>
       <p id="run-columns-hint" className="muted">
-        Run, task, status, and start time stay visible. Add up to eight parameter or metric columns.
+        Runs include task names. Status and start time stay visible. Add up to eight parameter or metric columns.
       </p>
       {s.run_columns_loading && <p role="status">Finding recorded columns…</p>}
       {choices.length > 0 && (
@@ -733,7 +733,6 @@ function RunBrowser({
                 actions={a}
               />
               {project && <RunSortHeader label="Machine" sort_key="origin" class_name="machine-column" snapshot={s} actions={a} />}
-              <th scope="col" className="task-column">Task</th>
               <RunSortHeader label="Started" sort_key="started_at" class_name="started-column" snapshot={s} actions={a} />
               {s.run_columns.map((column) => (
                 <RunSortHeader
@@ -789,6 +788,7 @@ function RunBrowser({
                     >
                       {runNickname(run) ?? run.run_id}
                     </button>
+                    <div className="run-task" title={run.task ?? undefined}>{run.task ?? "—"}</div>
                     <div className="run-summary-meta">
                       {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
                       <RunSmokeMark run={run} />
@@ -817,7 +817,6 @@ function RunBrowser({
                     <RunStatusTiming run={run} />
                   </td>
                   {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
-                  <td className="task-column"><span className="run-task">{run.task ?? "—"}</span></td>
                   <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
                   {s.run_columns.map((column) => {
                     const value = formatRunTableValue(runColumnValue(run, column));
