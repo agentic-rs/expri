@@ -33,6 +33,32 @@ a foreground service. Commands run on the current machine and reject `-T`.
 is a deprecated foreground alias; its `--no-publish` disables machine publishing
 only. `run --no-publish` disables only that run's publication.
 
+The three public components are `collection`, `publishing`, and `queue-execution`.
+Collection supervises sampling and capture export; publishing supervises machine
+history and run uploads. Use:
+
+```sh
+expri service stop --component collection
+expri service start --component collection
+expri service status --component collection
+expri service stop --component publishing
+expri service start --component publishing
+expri service restart --component collection
+```
+
+Saved enable/disable choices live in `~/.tokn/expri/service.json`, for example
+`{"components":{"publishing":"disable"}}`. Missing components default to enabled.
+Choices survive whole-service restart and automatic startup. Manual file edits
+apply on whole-process startup or `service restart`. Collection pause creates
+observation gaps and keeps unexported samples in the durable outbox,
+and terminal supervisors can still finalize their run captures. Component
+failures do not stop peers. Restart only the affected component to load changed
+settings with `service restart --component NAME`; it enables the selected group
+and waits internally for its old threads to finish while peers stay live. Status
+can show stopping or starting while it completes. `--component` is available on
+start/stop/restart/status and cannot accompany `start --foreground`. Whole
+`service restart` preserves component choices, training, and queued work.
+
 ## Publishing configuration
 
 Deploy the updated server before upgrading run workers; complete system captures
@@ -62,8 +88,9 @@ error and timestamp. `expri system publish` sends one pending batch without
 starting collection. This explicit command can use the global `[server]` connection
 when no client override is selected. Configuring `[server]` alone does not enable
 the worker service's background machine publishing; select machine credentials
-through the profile publishing settings. Restart the service after changing
-them. Removing the profile database creates a new machine ID;
+through the profile publishing settings. Use `service restart --component publishing`
+after changing those settings, or `collection` after changing the interval.
+Removing the profile database creates a new machine ID;
 do not clone it onto another independently collecting machine.
 
 ## Read retention correctly

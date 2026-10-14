@@ -131,7 +131,13 @@ pub fn prepare_request_at_with_initializer(
   if let Some(machine_id) = existing_machine_id() {
     state["machine_id"] = json!(machine_id);
   }
-  expri_system::store::run_capture::begin_state(&snapshot.run_dir, &mut state);
+  if service_unavailable {
+    // An older observation can identify the machine, but it cannot certify
+    // collection for this run when the collector is paused or unavailable.
+    state["system_capture_error"] = json!("System collection was unavailable when the run started");
+  } else {
+    expri_system::store::run_capture::begin_state(&snapshot.run_dir, &mut state);
+  }
   write_state(&state_path, &state)?;
   let _ = writeln!(std::io::stderr(), "run: {}", snapshot.run_id);
   let _ = writeln!(
@@ -704,6 +710,84 @@ mod tests {
       b"not a SQLite database"
     );
     assert_eq!(fs::read_dir(paths.root()).unwrap().count(), 1);
+  }
+
+  #[test]
+  fn failed_collection_initialization_preserves_identity_without_certifying_an_empty_capture() {
+    const CHILD: &str = "EXPRI_NODE_CAPTURE_TEST_CHILD";
+    const MACHINE: &str = "EXPRI_NODE_CAPTURE_TEST_MACHINE";
+    if std::env::var_os(CHILD).is_none() {
+      // A separate test process pins its profile store without mutating the
+      // environment shared by concurrently running Rust tests.
+      let directory = tempfile::tempdir().unwrap();
+      let paths = StoragePaths::from_root(directory.path().join("profiles")).unwrap();
+      let store = LocalStore::open(&paths.profile_database()).unwrap();
+      let machine_id = store.machine_id().to_owned();
+      drop(store);
+      let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+          "--exact",
+          "node::run::tests::failed_collection_initialization_preserves_identity_without_certifying_an_empty_capture",
+          "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env(MACHINE, machine_id)
+        .env("EXPRI_STORAGE_DIR", paths.root())
+        .output()
+        .unwrap();
+      assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      );
+      return;
+    }
+
+    let root = asset_repository();
+    fs::write(root.path().join("train.sh"), "exit 0\n").unwrap();
+    let request = RunRequest {
+      name: "train".into(),
+      command: vec!["/bin/sh".into(), "train.sh".into()],
+      environment: expri_core::config::EnvironmentConfig {
+        base_python: None,
+        reuse_packages: vec![],
+        require_cuda: false,
+        env: Default::default(),
+      },
+      service: None,
+      detach: true,
+      smoke: false,
+      remote_managed: vec![],
+      extras: vec![],
+      sync_args: vec![],
+      expected_sync: None,
+    };
+    let prepared = prepare_request_at_with_initializer(&request, root.path(), || {
+      Err(ExpriError::Message("private-initializer-secret".into()))
+    })
+    .unwrap();
+    let run = prepared.snapshot.run_dir.clone();
+    let state: serde_json::Value =
+      serde_json::from_slice(&fs::read(run.join("run-state.json")).unwrap()).unwrap();
+    assert_eq!(state["machine_id"], std::env::var(MACHINE).unwrap());
+    assert!(state["system_capture_id"].is_null());
+    assert!(state["system_capture_status"].is_null());
+    assert!(
+      state["system_capture_error"]
+        .as_str()
+        .unwrap()
+        .contains("unavailable")
+    );
+    assert!(!state.to_string().contains("private-initializer-secret"));
+    assert!(!run.join("outputs/system-profile.jsonl").exists());
+    abort_prepared(prepared, false, "prelaunch failure").unwrap();
+    let terminal: serde_json::Value =
+      serde_json::from_slice(&fs::read(run.join("run-state.json")).unwrap()).unwrap();
+    assert_eq!(terminal["status"], "failed");
+    assert!(terminal["system_capture_id"].is_null());
+    assert!(terminal["system_capture_status"].is_null());
+    assert!(!run.join("outputs/system-profile.jsonl").exists());
   }
 
   #[cfg(unix)]

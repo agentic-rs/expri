@@ -1,8 +1,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use expri_client::SystemProfileClient;
@@ -21,28 +20,6 @@ use super::config::{CollectionConfig, PublishingMode};
 use super::now_ms;
 
 const STOP_POLL: Duration = Duration::from_millis(100);
-// HTTP control requests have a thirty-second timeout. Release the collector
-// lease first, so an unavailable publisher cannot delay a terminal run fence.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(35);
-
-enum BackgroundKind {
-  Exporter,
-  Publisher,
-}
-
-impl BackgroundKind {
-  fn name(&self) -> &'static str {
-    match self {
-      Self::Exporter => "expri-run-capture-exporter",
-      Self::Publisher => "expri-system-publisher",
-    }
-  }
-}
-
-struct BackgroundTask {
-  kind: BackgroundKind,
-  handle: JoinHandle<()>,
-}
 
 trait CollectionControl: Clone + Send + 'static {
   fn stop_flag(&self) -> Arc<AtomicBool>;
@@ -50,6 +27,7 @@ trait CollectionControl: Clone + Send + 'static {
   fn wait(&self, duration: Duration) -> bool;
   fn collection_ready(&self, machine_id: String, sample_sequence: u64);
   fn collection_status(&self, detail: Value);
+  fn component_status(&self, detail: Value);
 }
 
 impl CollectionControl for ServiceContext {
@@ -67,6 +45,9 @@ impl CollectionControl for ServiceContext {
   }
   fn collection_status(&self, detail: Value) {
     ServiceContext::collection_status(self, detail);
+  }
+  fn component_status(&self, detail: Value) {
+    ServiceContext::component_status(self, detail);
   }
 }
 
@@ -88,31 +69,6 @@ fn collect<C: CollectionControl>(
   let mut store = LocalStore::open(&paths.profile_database())?;
   let mut collector = Collector::with_interval(config.interval)?;
   let machine_id = store.machine_id().to_owned();
-  let publisher = Publisher::snapshot(config.publishing);
-  let mut children = Vec::new();
-  spawn_background(&mut children, BackgroundKind::Exporter, {
-    let paths = paths.clone();
-    let context = context.clone();
-    move || materialize_loop(paths, context)
-  });
-  match publisher {
-    Publisher::Connected(client) => {
-      save_status(&paths, &context, "starting", None);
-      let publishing_paths = paths.clone();
-      let publishing_context = context.clone();
-      if !spawn_background(&mut children, BackgroundKind::Publisher, move || {
-        publish_loop(publishing_paths, client, publishing_context);
-      }) {
-        save_status(
-          &paths,
-          &context,
-          "paused",
-          Some("system publishing thread could not start; local collection continues".into()),
-        );
-      }
-    }
-    Publisher::Inactive { status, error } => save_status(&paths, &context, status, error),
-  }
   eprintln!(
     "System profile: {} (every {}s, {})",
     machine_id,
@@ -152,9 +108,8 @@ fn collect<C: CollectionControl>(
     }
     Ok(())
   })();
-  context.stop_flag().store(true, Ordering::Release);
   // No collector-owned observation remains in flight. Releasing the lease lets
-  // a terminal run finalize safely while network shutdown drains.
+  // a terminal run finalize safely while independent network components drain.
   drop(collector);
   drop(store);
   drop(lease);
@@ -167,55 +122,7 @@ fn collect<C: CollectionControl>(
       "last_error": outcome.as_ref().err().map(safe_publishing_error),
     }),
   );
-  join_background(children);
   outcome
-}
-
-fn spawn_background(
-  children: &mut Vec<BackgroundTask>,
-  kind: BackgroundKind,
-  work: impl FnOnce() + Send + 'static,
-) -> bool {
-  let name = kind.name();
-  match thread::Builder::new().name(name.into()).spawn(work) {
-    Ok(handle) => {
-      children.push(BackgroundTask { kind, handle });
-      true
-    }
-    Err(_) => {
-      eprintln!(
-        "warning: {name} could not start; durable local observations remain available for recovery"
-      );
-      false
-    }
-  }
-}
-
-fn join_background(children: Vec<BackgroundTask>) {
-  join_background_until(children, Instant::now() + SHUTDOWN_GRACE);
-}
-
-fn join_background_until(children: Vec<BackgroundTask>, deadline: Instant) {
-  for child in children {
-    // A publisher must finish its bounded control request before the hook can
-    // return and the shared runtime can release its service lease. Only durable
-    // local exporters may outlive the grace; they cannot start network transfers.
-    let network_producer = matches!(child.kind, BackgroundKind::Publisher);
-    while !child.handle.is_finished() && (network_producer || Instant::now() < deadline) {
-      thread::sleep(STOP_POLL);
-    }
-    if child.handle.is_finished() {
-      if child.handle.join().is_err() {
-        eprintln!(
-          "warning: a system background task stopped unexpectedly; its durable queue remains available"
-        );
-      }
-    } else {
-      eprintln!(
-        "warning: a system background task exceeded its shutdown grace; committed observations remain available"
-      );
-    }
-  }
 }
 
 fn wait_until(context: &impl CollectionControl, deadline: Instant) -> bool {
@@ -235,12 +142,25 @@ fn wait(context: &impl CollectionControl, duration: Duration) -> bool {
   wait_until(context, Instant::now() + duration)
 }
 
+pub(super) fn run_capture_export(paths: StoragePaths, context: ServiceContext) -> Result<()> {
+  materialize_loop(paths, context);
+  Ok(())
+}
+
 fn materialize_loop(paths: StoragePaths, context: impl CollectionControl) {
+  context.component_status(json!({"status": "waiting", "last_error": null}));
   while !context.is_stopping() {
     if let Ok(Some(mut store)) = LocalStore::open_existing(&paths.profile_database()) {
+      context.component_status(json!({"status": "exporting", "last_error": null}));
       while !context.is_stopping() {
         // Slow output files never share the collector's connection or schedule.
-        if store.export_run_captures().is_err() || wait(&context, Duration::from_millis(250)) {
+        if store.export_run_captures().is_err() {
+          context.component_status(
+            json!({"status": "retrying", "last_error": "capture_export_unavailable"}),
+          );
+          break;
+        }
+        if wait(&context, Duration::from_millis(250)) {
           break;
         }
       }
@@ -249,11 +169,35 @@ fn materialize_loop(paths: StoragePaths, context: impl CollectionControl) {
       break;
     }
   }
-  // The stopped collector has committed any in-flight sample. Try its durable
-  // outbox once; inaccessible destinations stay queued for the next service.
+  // Try the committed outbox once. Collection can continue independently;
+  // subsequent observations remain queued until this component starts again.
   if let Ok(Some(mut store)) = LocalStore::open_existing(&paths.profile_database()) {
     let _ = store.export_run_captures();
   }
+  context.component_status(json!({"status": "stopped", "last_error": null}));
+}
+
+pub(super) fn run_publishing(
+  paths: StoragePaths,
+  publishing: PublishingMode,
+  context: ServiceContext,
+) -> Result<()> {
+  publish(paths, publishing, context)
+}
+
+fn publish(
+  paths: StoragePaths,
+  publishing: PublishingMode,
+  context: impl CollectionControl,
+) -> Result<()> {
+  match Publisher::snapshot(publishing) {
+    Publisher::Connected(client) => {
+      save_status(&paths, &context, "starting", None);
+      publish_loop(paths, client, context);
+    }
+    Publisher::Inactive { status, error } => save_status(&paths, &context, status, error),
+  }
+  Ok(())
 }
 
 enum Publisher {
@@ -412,6 +356,7 @@ fn publishing_status(
   context: &impl CollectionControl,
   status: Value,
 ) -> Result<()> {
+  context.component_status(status.clone());
   context.collection_status(json!({ "publishing": status.clone() }));
   write_status(paths.root(), "publishing.json", &status)
 }

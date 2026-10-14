@@ -5,19 +5,20 @@ Each machine stores this new data under `~/.tokn/expri`:
 
 ```text
 ~/.tokn/expri/
-  config.toml        # Server connection and optional system-profile settings
+  config.toml       # Server connection and optional system-profile settings
+  service.json      # Component enable/disable choices
   profiles.sqlite3  # Stable machine ID, inventories, samples, hourly history, upload receipts
   collector.lock    # Live collector lease
-  collector.json   # Local collection status
+  collector.json    # Local collection status
   publishing.json   # Last publisher status and error
-  worker-service/  # Service lease, status and private durable run jobs
+  worker-service/   # Service lease, status and private durable run jobs
 ```
 
 Existing project configuration, assets, uv caches, runs, and experiment
 publishing queues keep their existing locations. System-profile storage is
 selected by `--storage-dir`, then `EXPRI_STORAGE_DIR`, then the home-directory
-default. Owned directories are private (`0700`) and files are private (`0600`)
-on Unix. Resolving paths and inspecting an empty store creates no files.
+default. Owned directories are private (`0700`) and files written by expri are
+private (`0600`) on Unix. Resolving paths and inspecting an empty store creates no files.
 
 ## Start collection on each machine
 
@@ -26,6 +27,7 @@ expri system sample
 expri system status
 expri service start
 expri service status
+expri service restart
 expri service stop
 ```
 
@@ -42,7 +44,37 @@ training alive. Ctrl-C stops a foreground service. After reboot, the next run,
 publication, or explicit start recovers saved jobs; expri does not install an OS
 service. Commands execute on the current machine and reject `-T`; invoke them on
 the worker itself. `service status` creates no files and reports collection,
-machine publishing and run jobs separately.
+machine publishing, capture export, run publishing, and queue execution separately.
+The three public components are `collection`, `publishing`, and `queue-execution`.
+Collection supervises sampling and capture export; publishing supervises machine
+history and run uploads. Each group supervises its own threads; stopping or
+failing one does not stop the others. Control the relevant component with:
+
+```sh
+expri service stop --component collection
+expri service start --component collection
+expri service status --component publishing
+expri service stop --component publishing
+expri service start --component publishing
+expri service restart --component publishing
+```
+
+Component choices are saved in `~/.tokn/expri/service.json` across process restarts.
+For example, `{"components":{"publishing":"disable"}}` disables background
+publishing; values are `"enable"` or `"disable"`, and omitted components default
+to enabled. Manual file edits take effect on whole-service startup or restart.
+Automatic startup and a whole-service start respect paused choices. Paused
+collection leaves gaps in
+observations and retains committed capture readings in the durable outbox.
+Terminal run supervisors can still finalize their own captures. A component
+start reloads its settings after its preceding threads have stopped. Use
+`service restart --component collection` or `service restart --component publishing`
+to enable that group and reload its settings while other components continue.
+Component requests return before
+draining completes; inspect status while it is stopping. `--foreground` starts
+the whole shared process and cannot be combined with `--component`.
+See [all component names and stop behavior](self-hosted-service.md#independent-worker-components).
+Whole `service restart` preserves saved choices, pending data, and training.
 
 The old `expri system daemon` command is a deprecated foreground compatibility
 alias for the shared worker service. Its `--no-publish` disables only machine
@@ -116,8 +148,14 @@ expri service start
 expri system publish --client-config /path/to/machine-client.toml
 ```
 
-Restart an already running service after changing its collection or publishing
-configuration. Machine publishing requires the explicit saved setting above;
+Restart the affected component after changing its configuration:
+
+```sh
+expri service restart --component publishing
+```
+
+Use `collection` instead to apply a changed sampling interval. These restarts
+leave other component threads running. Machine publishing requires the explicit saved setting above;
 a general `[server]` connection alone leaves it `unconfigured` in service status.
 Run publication and machine history use their own scoped credentials.
 

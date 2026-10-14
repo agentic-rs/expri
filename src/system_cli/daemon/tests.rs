@@ -1,7 +1,9 @@
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
 use super::*;
 
@@ -53,6 +55,9 @@ impl CollectionControl for TestControl {
   fn collection_status(&self, detail: Value) {
     self.statuses.lock().unwrap().push(detail);
   }
+  fn component_status(&self, detail: Value) {
+    self.statuses.lock().unwrap().push(detail);
+  }
 }
 
 fn paths(directory: &tempfile::TempDir) -> StoragePaths {
@@ -61,7 +66,6 @@ fn paths(directory: &tempfile::TempDir) -> StoragePaths {
 
 fn start(
   paths: StoragePaths,
-  publishing: PublishingMode,
   interval: Duration,
 ) -> (TestControl, Receiver<(String, u64)>, JoinHandle<Result<()>>) {
   let (context, ready) = TestControl::new(paths.clone());
@@ -71,12 +75,22 @@ fn start(
       paths,
       CollectionConfig {
         interval,
-        publishing,
+        publishing: PublishingMode::Disabled,
       },
       collecting,
     )
   });
   (context, ready, task)
+}
+
+fn start_publisher(
+  paths: StoragePaths,
+  publishing: PublishingMode,
+) -> (TestControl, JoinHandle<Result<()>>) {
+  let (context, _) = TestControl::new(paths.clone());
+  let publishing_context = context.clone();
+  let task = thread::spawn(move || publish(paths, publishing, publishing_context));
+  (context, task)
 }
 
 #[test]
@@ -95,11 +109,7 @@ fn saved_publisher_errors_never_include_configuration_or_json_snippets() {
 fn readiness_is_a_committed_supported_observation_without_publishing_credentials() {
   let directory = tempfile::tempdir().unwrap();
   let paths = paths(&directory);
-  let (context, ready, task) = start(
-    paths.clone(),
-    PublishingMode::Unconfigured,
-    Duration::from_secs(10),
-  );
+  let (context, ready, task) = start(paths.clone(), Duration::from_secs(10));
   let (machine_id, sequence) = ready.recv_timeout(Duration::from_secs(10)).unwrap();
   assert_eq!(sequence, 1);
   assert!(matches!(
@@ -118,6 +128,14 @@ fn readiness_is_a_committed_supported_observation_without_publishing_credentials
       .is_ok(),
     "readiness includes the capture support marker"
   );
+  assert_eq!(
+    read_status(&paths.root().join("publishing.json")).unwrap(),
+    None,
+    "collection does not initialize another component"
+  );
+  let (publishing, publisher) = start_publisher(paths.clone(), PublishingMode::Unconfigured);
+  publisher.join().unwrap().unwrap();
+  assert!(!publishing.is_stopping());
   assert_eq!(
     read_status(&paths.root().join("publishing.json"))
       .unwrap()
@@ -141,16 +159,14 @@ fn readiness_is_a_committed_supported_observation_without_publishing_credentials
     collector_lease(&paths).is_ok(),
     "the stop releases the collection lease"
   );
-  let (restarted, ready, task) = start(
-    paths.clone(),
-    PublishingMode::Disabled,
-    Duration::from_secs(10),
-  );
+  let (restarted, ready, task) = start(paths.clone(), Duration::from_secs(10));
   let (next_machine, next_sequence) = ready.recv_timeout(Duration::from_secs(10)).unwrap();
   assert_eq!(next_machine, machine_id);
   assert!(next_sequence > sequence);
   restarted.stop.store(true, Ordering::Release);
   task.join().unwrap().unwrap();
+  let (_, publisher) = start_publisher(paths.clone(), PublishingMode::Disabled);
+  publisher.join().unwrap().unwrap();
   assert_eq!(
     read_status(&paths.root().join("publishing.json"))
       .unwrap()
@@ -164,25 +180,26 @@ fn invalid_publisher_configuration_is_explicitly_paused_without_blocking_readine
   let directory = tempfile::tempdir().unwrap();
   let paths = paths(&directory);
   let config = paths.root().join("missing-machine-client.toml");
-  let (context, ready, task) = start(
-    paths.clone(),
-    PublishingMode::Configured(config),
-    Duration::from_secs(10),
-  );
+  let (context, ready, task) = start(paths.clone(), Duration::from_secs(1));
   ready.recv_timeout(Duration::from_secs(10)).unwrap();
+  let (publishing, publisher) = start_publisher(paths.clone(), PublishingMode::Configured(config));
+  publisher.join().unwrap().unwrap();
   let status = read_status(&paths.root().join("publishing.json"))
     .unwrap()
     .unwrap();
   assert_eq!(status["status"], "paused");
   assert!(status["last_error"].is_string());
   assert!(
-    context
+    publishing
       .statuses
       .lock()
       .unwrap()
       .iter()
       .any(|detail| detail["publishing"]["status"] == "paused")
   );
+  assert!(!context.is_stopping());
+  assert!(!publishing.is_stopping());
+  wait_for_sequence(&paths, 2);
   context.stop.store(true, Ordering::Release);
   task.join().unwrap().unwrap();
   assert!(collector_lease(&paths).is_ok());
@@ -247,12 +264,10 @@ fn collection_continues_during_publish_failure_and_retries_keep_the_original_aut
       stream.write_all(body).unwrap();
     }
   });
-  let (context, ready, task) = start(
-    paths.clone(),
-    PublishingMode::Configured(config.clone()),
-    Duration::from_secs(1),
-  );
+  let (context, ready, task) = start(paths.clone(), Duration::from_secs(1));
   ready.recv_timeout(Duration::from_secs(10)).unwrap();
+  let (publishing, publisher) =
+    start_publisher(paths.clone(), PublishingMode::Configured(config.clone()));
   assert!(
     received
       .recv_timeout(Duration::from_secs(10))
@@ -270,26 +285,21 @@ fn collection_continues_during_publish_failure_and_retries_keep_the_original_aut
       .unwrap()
       .contains("Bearer fixture-machine-owner-key")
   );
-  let deadline = Instant::now() + Duration::from_secs(5);
-  loop {
-    let status = LocalStore::open_readonly(&paths.profile_database())
-      .unwrap()
-      .unwrap()
-      .status()
-      .unwrap();
-    if status.sample_sequence >= 3 {
-      break;
-    }
-    assert!(
-      Instant::now() < deadline,
-      "publishing failure stopped local observations"
-    );
-    thread::sleep(Duration::from_millis(20));
-  }
-  let statuses = serde_json::to_string(&*context.statuses.lock().unwrap()).unwrap();
+  wait_for_sequence(&paths, 3);
+  let statuses = serde_json::to_string(&*publishing.statuses.lock().unwrap()).unwrap();
   assert!(statuses.contains("retrying"));
   assert!(!statuses.contains("fixture-machine-owner-key"));
   assert!(!statuses.contains("fixture-other-run-key"));
+  publishing.stop.store(true, Ordering::Release);
+  publisher.join().unwrap().unwrap();
+  assert!(!context.is_stopping());
+  let sequence = LocalStore::open_readonly(&paths.profile_database())
+    .unwrap()
+    .unwrap()
+    .status()
+    .unwrap()
+    .sample_sequence;
+  wait_for_sequence(&paths, sequence + 1);
   context.stop.store(true, Ordering::Release);
   task.join().unwrap().unwrap();
   server.join().unwrap();
@@ -299,6 +309,87 @@ fn collection_continues_during_publish_failure_and_retries_keep_the_original_aut
       .unwrap()["status"],
     "stopped"
   );
+  assert!(collector_lease(&paths).is_ok());
+}
+
+fn wait_for_sequence(paths: &StoragePaths, expected: u64) {
+  let deadline = Instant::now() + Duration::from_secs(5);
+  loop {
+    let status = LocalStore::open_readonly(&paths.profile_database())
+      .unwrap()
+      .unwrap()
+      .status()
+      .unwrap();
+    if status.sample_sequence >= expected {
+      return;
+    }
+    assert!(Instant::now() < deadline, "local observations stopped");
+    thread::sleep(Duration::from_millis(20));
+  }
+}
+
+#[test]
+fn capture_export_can_stop_and_resume_while_collection_keeps_its_durable_outbox() {
+  let directory = tempfile::tempdir().unwrap();
+  let paths = paths(&directory);
+  let (collecting, ready, collection) = start(paths.clone(), Duration::from_secs(1));
+  ready.recv_timeout(Duration::from_secs(10)).unwrap();
+  let mut store = LocalStore::open_existing(&paths.profile_database())
+    .unwrap()
+    .unwrap();
+  let first = store.status().unwrap().first_sample_at_ms.unwrap();
+  let run = paths.root().join("run-export-resume");
+  std::fs::create_dir_all(run.join("outputs")).unwrap();
+  store
+    .begin_run_capture(&run, "run-export-resume", first)
+    .unwrap();
+  drop(store);
+  let output = run.join(expri_core::run_system::RUN_SYSTEM_PATH);
+  let (exporting, _) = TestControl::new(paths.clone());
+  let export_paths = paths.clone();
+  let export_control = exporting.clone();
+  let exporter = thread::spawn(move || materialize_loop(export_paths, export_control));
+  wait_for_sequence(&paths, 2);
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while !std::fs::read_to_string(&output)
+    .unwrap()
+    .contains("\"sequence\":2")
+  {
+    assert!(
+      Instant::now() < deadline,
+      "exporter did not flush the sample"
+    );
+    thread::sleep(Duration::from_millis(20));
+  }
+  exporting.stop.store(true, Ordering::Release);
+  exporter.join().unwrap();
+  let paused = std::fs::read(&output).unwrap();
+  assert!(!collecting.is_stopping());
+  let sequence = LocalStore::open_readonly(&paths.profile_database())
+    .unwrap()
+    .unwrap()
+    .status()
+    .unwrap()
+    .sample_sequence;
+  wait_for_sequence(&paths, sequence + 1);
+  assert_eq!(std::fs::read(&output).unwrap(), paused);
+
+  let (restarted, _) = TestControl::new(paths.clone());
+  let export_paths = paths.clone();
+  let export_control = restarted.clone();
+  let exporter = thread::spawn(move || materialize_loop(export_paths, export_control));
+  let deadline = Instant::now() + Duration::from_secs(3);
+  while std::fs::read(&output).unwrap() == paused {
+    assert!(
+      Instant::now() < deadline,
+      "restart did not flush the outbox"
+    );
+    thread::sleep(Duration::from_millis(20));
+  }
+  restarted.stop.store(true, Ordering::Release);
+  exporter.join().unwrap();
+  collecting.stop.store(true, Ordering::Release);
+  collection.join().unwrap().unwrap();
   assert!(collector_lease(&paths).is_ok());
 }
 
@@ -330,29 +421,22 @@ fn status_files_are_atomic_private_and_reject_nonregular_or_oversized_reads() {
 }
 
 #[test]
-fn shutdown_keeps_a_network_producer_joined_even_after_the_exporter_grace_expires() {
-  let (release, pending) = mpsc::channel();
-  let (finished, done) = mpsc::channel();
-  let mut children = Vec::new();
-  assert!(spawn_background(
-    &mut children,
-    BackgroundKind::Publisher,
-    move || {
-      pending.recv().unwrap();
-    }
-  ));
-  let joining = thread::spawn(move || {
-    join_background_until(children, Instant::now());
-    finished.send(()).unwrap();
-  });
-  assert!(
-    matches!(
-      done.recv_timeout(Duration::from_millis(100)),
-      Err(mpsc::RecvTimeoutError::Timeout)
-    ),
-    "a live network producer must not detach and release the service lease"
+fn a_collector_failure_does_not_cancel_other_component_controls() {
+  let directory = tempfile::tempdir().unwrap();
+  let paths = paths(&directory);
+  let lease = collector_lease(&paths).unwrap();
+  let (collector, _) = TestControl::new(paths.clone());
+  let (exporter, _) = TestControl::new(paths.clone());
+  let outcome = collect(
+    paths,
+    CollectionConfig {
+      interval: Duration::from_secs(1),
+      publishing: PublishingMode::Disabled,
+    },
+    collector.clone(),
   );
-  release.send(()).unwrap();
-  done.recv_timeout(Duration::from_secs(2)).unwrap();
-  joining.join().unwrap();
+  assert!(outcome.is_err());
+  assert!(!collector.is_stopping());
+  assert!(!exporter.is_stopping());
+  drop(lease);
 }
