@@ -24,8 +24,8 @@ mod unix;
 
 #[cfg(unix)]
 pub use unix::{
-  ensure_collection_ready, ensure_started, observe, run_foreground, run_foreground_components,
-  start_component, status, stop, stop_component,
+  ensure_collection_ready, ensure_started, observe, restart, restart_component, run_foreground,
+  run_foreground_components, start_component, status, stop, stop_component,
 };
 
 /// Independent components within the shared service process.
@@ -367,7 +367,7 @@ impl ServiceContext {
     self.shared.wake.1.notify_all();
   }
 
-  fn request_component(&self, component: ServiceComponent, enabled: bool) {
+  fn request_component(&self, component: ServiceComponent, enabled: bool, force_restart: bool) {
     let mut components = self
       .shared
       .components
@@ -383,10 +383,11 @@ impl ServiceContext {
         .is_none_or(|stop| stop.load(Ordering::Acquire))
       {
         state.launch_requested = true;
-      } else if state
-        .parts
-        .values()
-        .any(|part| matches!(part.phase, "failed" | "paused"))
+      } else if force_restart
+        || state
+          .parts
+          .values()
+          .any(|part| matches!(part.phase, "failed" | "paused"))
       {
         state.launch_requested = true;
         state.stop.as_ref().unwrap().store(true, Ordering::Release);
@@ -531,6 +532,14 @@ pub fn ensure_collection_ready(_: &StoragePaths) -> Result<Value> {
 }
 #[cfg(not(unix))]
 pub fn start_component(_: &StoragePaths, _: ServiceComponent) -> Result<Value> {
+  Err(error("shared worker services require Unix"))
+}
+#[cfg(not(unix))]
+pub fn restart_component(_: &StoragePaths, _: ServiceComponent) -> Result<Value> {
+  Err(error("shared worker services require Unix"))
+}
+#[cfg(not(unix))]
+pub fn restart(_: &StoragePaths) -> Result<Value> {
   Err(error("shared worker services require Unix"))
 }
 #[cfg(not(unix))]

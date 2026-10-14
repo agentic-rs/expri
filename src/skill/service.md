@@ -112,22 +112,35 @@ peers:
 expri service stop --component publishing
 expri service status --component publishing --json
 expri service start --component publishing
+expri service restart --component publishing
 ```
 
-Saved component choices survive process restart, including lazy startup from new
-runs or publication. A stopped publisher retains jobs and receipts; waiting or
-watching reports its pause. Start reloads settings for a stopped/failed component;
+Saved choices live in `~/.tokn/expri/service.json`, for example:
+
+```json
+{"components":{"publishing":"disable"}}
+```
+
+Values are `"enable"` or `"disable"`; omitted components default to enabled.
+They survive process restart, including lazy startup from new runs or publication.
+Manual file edits are loaded at whole-process startup; use `service restart` to
+apply them to a running service. Component commands persist their selected choice.
+A stopped publisher retains jobs and receipts; waiting or watching reports its
+pause. Start reloads settings for a stopped/failed component;
 it also retries groups with failed or paused parts. A healthy running group stays
 running, including one with machine publishing unconfigured. Apply changed settings
-with stop then start, including enabling a previously unconfigured machine publisher.
-Its next generation starts
-after preceding threads join and owned transfers drain. Existing run jobs retain their
-pinned destination and credentials. Control requests acknowledge
-before that transition completes; inspect status while stopping or starting.
+with `service restart --component NAME`, including enabling a previously unconfigured
+machine publisher. Restart enables that group and forces a fresh generation while
+peers stay live. Its next generation starts after preceding threads join and
+owned transfers drain. Existing run jobs retain their pinned destination and
+credentials. Control requests acknowledge before that transition completes;
+inspect status while stopping or starting.
 Errors and panics are isolated to the affected component. `--foreground` starts
 the shared supervisor and cannot be combined with `--component`.
 `service stop` stops all component work, retains jobs and leaves training alive.
 The next run or publication starts the process again with saved component choices.
+`service restart` drains and replaces the shared process with those same choices,
+preserving training, jobs, captures, and accepted execution allocations.
 It does not start automatically at boot; the next start recovers enabled work.
 Deploy the updated server before upgrading workers to automatic collection;
 complete system captures require its nine-file tracking archive limit.

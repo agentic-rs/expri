@@ -64,7 +64,10 @@ Collection includes capture export; publishing handles machine history and run
 uploads. Pause one with `expri service stop --component publishing`, resume it
 with `expri service start --component publishing`, and inspect it with
 `expri service status --component publishing`. Saved component choices
-survive process restarts and automatic startup. Component failures and server
+live in `~/.tokn/expri/service.json` and survive process restarts and automatic
+startup. Use `expri service restart --component publishing` to reload that component,
+or `expri service restart` to replace the shared process while preserving component
+choices, jobs, and training. Component failures and server
 outages do not stop the other parts. See
 [component controls](docs/self-hosted-service.md#independent-worker-components).
 Both local and server stores keep 72 hours of machine detail and retain historical

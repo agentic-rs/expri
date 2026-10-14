@@ -19,6 +19,7 @@ use super::{ServiceComponent, ServiceContext, error, files, preferences, registr
 
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const RESTART_TIMEOUT: Duration = Duration::from_secs(45);
 pub(super) const TICK: Duration = Duration::from_millis(50);
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +30,7 @@ enum Request {
   Wake,
   StartComponent { component: ServiceComponent },
   StopComponent { component: ServiceComponent },
+  RestartComponent { component: ServiceComponent },
 }
 
 pub(super) fn socket(directory: &Path) -> Result<PathBuf> {
@@ -76,7 +78,10 @@ fn request(directory: &Path, request: Request) -> Result<Value> {
   // Status is best-effort and may fall back to its durable snapshot. Stop needs
   // time for the runtime to finish a local registry scan before acknowledging.
   let timeout = match request {
-    Request::Stop | Request::StartComponent { .. } | Request::StopComponent { .. } => STOP_TIMEOUT,
+    Request::Stop
+    | Request::StartComponent { .. }
+    | Request::StopComponent { .. }
+    | Request::RestartComponent { .. } => STOP_TIMEOUT,
     _ => Duration::from_millis(200),
   };
   stream.set_read_timeout(Some(timeout))?;
@@ -120,12 +125,13 @@ fn read_frame(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
 /// Inspection never creates storage, leases or configuration.
 fn service_status(paths: &StoragePaths) -> Result<Value> {
   let Some(directory) = files::existing(paths)? else {
+    let choices = preferences::Preferences::load(paths.root())?;
     let components: std::collections::BTreeMap<_, _> = ServiceComponent::ALL
       .into_iter()
       .map(|component| {
         (
           component.as_str(),
-          json!({"desired_running": true, "generation": 0,
+          json!({"desired_running": choices.enabled(component), "generation": 0,
         "phase": "stopped", "status": "stopped", "parts": {}}),
         )
       })
@@ -148,13 +154,18 @@ fn service_status(paths: &StoragePaths) -> Result<Value> {
   if running {
     if let Ok(current) = request(&directory, Request::Status) {
       value = current;
+    } else {
+      // A held lease proves a process exists, not that its control plane or
+      // collector is ready. Cached readiness can belong to a prior generation.
+      value["ready"] = json!(false);
+      value["collection_ready"] = json!(false);
     }
   } else {
     value["ready"] = json!(false);
     value["active_jobs"] = json!(0);
     value["collection_ready"] = json!(false);
     value["status"] = json!("stopped");
-    let choices = preferences::Preferences::load(&directory)?;
+    let choices = preferences::Preferences::load(paths.root())?;
     for component in ServiceComponent::ALL {
       let detail = &mut value["components"][component.as_str()];
       if !detail.is_object() {
@@ -258,6 +269,68 @@ pub fn start_component(paths: &StoragePaths, component: ServiceComponent) -> Res
   let directory =
     files::existing(paths)?.ok_or_else(|| error("worker service storage disappeared"))?;
   request(&directory, Request::StartComponent { component })
+}
+
+/// Enable and restart one component atomically. Its previous generation drains
+/// before a new one starts; other components and training remain running.
+pub fn restart_component(paths: &StoragePaths, component: ServiceComponent) -> Result<Value> {
+  let current = service_status(paths)?;
+  if current["running"] != true {
+    // A fresh worker can already accept an assignment during startup. Enable
+    // and start it once instead of immediately cancelling that new generation.
+    let mut report = start_component(paths, component)?;
+    report["restarting"] = json!(true);
+    return Ok(report);
+  }
+  ensure_started(paths)?;
+  let directory =
+    files::existing(paths)?.ok_or_else(|| error("worker service storage disappeared"))?;
+  request(&directory, Request::RestartComponent { component })
+}
+
+/// Restart the process after all old components and network transfers drain.
+/// Saved enable/disable choices, durable jobs, and training are preserved.
+pub fn restart(paths: &StoragePaths) -> Result<Value> {
+  restart_with_launcher(paths, spawn_service, RESTART_TIMEOUT)
+}
+
+pub(super) fn restart_with_launcher(
+  paths: &StoragePaths,
+  launch: impl FnOnce(&Path, &StoragePaths) -> Result<Option<Child>>,
+  timeout: Duration,
+) -> Result<Value> {
+  let directory = files::ensure(paths)?;
+  let deadline = Instant::now() + timeout;
+  let _lease = start_lock(&directory, deadline)?;
+  stop(paths)?;
+  // Probe only the lease while shutdown drains. The old control listener may
+  // intentionally stop accepting requests, so repeated IPC probes can fill it.
+  while matches!(
+    try_lock_file_readonly(&directory.join("service.lock"))?,
+    LockAttempt::Busy
+  ) {
+    if Instant::now() >= deadline {
+      return Err(error(
+        "worker service restart timed out waiting for shutdown; saved work and training remain preserved; run service status",
+      ));
+    }
+    thread::sleep(TICK);
+  }
+  if Instant::now() >= deadline {
+    return Err(error(
+      "worker service restart timed out before startup; run service start to retry",
+    ));
+  }
+  let mut report = launch_locked(
+    paths,
+    &directory,
+    launch,
+    deadline.min(Instant::now() + START_TIMEOUT),
+  )?;
+  report["restarted"] = json!(true);
+  report["jobs_preserved"] = json!(true);
+  report["training_preserved"] = json!(true);
+  Ok(report)
 }
 
 /// Pause only this component. The choice survives whole-service restart.
@@ -402,9 +475,34 @@ pub(super) fn ensure_with_launcher(
     }
     thread::sleep(TICK);
   };
+  launch_locked(paths, &directory, launch, deadline)
+}
+
+fn start_lock(directory: &Path, deadline: Instant) -> Result<expri_core::lock::FileLock> {
+  let path = directory.join("start.lock");
+  files::private_file(&path)?;
+  loop {
+    if let LockAttempt::Acquired(lease) = try_lock_file(&path, false)? {
+      return Ok(lease);
+    }
+    if Instant::now() >= deadline {
+      return Err(error(
+        "worker service control is busy; retry restart after service startup or shutdown settles",
+      ));
+    }
+    thread::sleep(TICK);
+  }
+}
+
+fn launch_locked(
+  paths: &StoragePaths,
+  directory: &Path,
+  launch: impl FnOnce(&Path, &StoragePaths) -> Result<Option<Child>>,
+  deadline: Instant,
+) -> Result<Value> {
   let mut child = None;
   if service_status(paths)?["running"] != true {
-    child = launch(&directory, paths)?;
+    child = launch(directory, paths)?;
   }
   loop {
     let current = service_status(paths)?;
@@ -547,17 +645,21 @@ fn handle_request(
       context.request_stop();
       json!({"stopping": true, "jobs_preserved": true, "training_preserved": true})
     }
-    Request::StartComponent { component } | Request::StopComponent { component } => {
+    Request::StartComponent { component }
+    | Request::StopComponent { component }
+    | Request::RestartComponent { component } => {
       if context.is_stopping() {
         return Err(error("worker service is stopping"));
       }
-      let enabled = matches!(request, Request::StartComponent { .. });
+      let enabled = !matches!(request, Request::StopComponent { .. });
+      let restarting = matches!(request, Request::RestartComponent { .. });
       let directory = directory.ok_or_else(|| error("component control needs service storage"))?;
       preferences::Preferences::save_choice(directory, component, enabled)?;
-      context.request_component(component, enabled);
+      context.request_component(component, enabled, restarting);
       let mut report = runtime::snapshot(context, active, pending);
       report["component"] = json!(component);
       report["stopping"] = json!(!enabled);
+      report["restarting"] = json!(restarting);
       report["jobs_preserved"] = json!(true);
       report["training_preserved"] = json!(true);
       report

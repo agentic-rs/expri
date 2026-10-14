@@ -98,7 +98,7 @@ pub(in crate::worker_service) fn run_components(
   fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
   let _socket_guard = SocketGuard(socket_path);
   listener.set_nonblocking(true)?;
-  let context = ServiceContext::with_preferences(&preferences::Preferences::load(&directory)?);
+  let context = ServiceContext::with_preferences(&preferences::Preferences::load(paths.root())?);
   let publishing_directory = directory.clone();
   runners.add(
     ServiceComponent::Publishing,

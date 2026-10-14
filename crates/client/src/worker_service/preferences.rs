@@ -8,42 +8,50 @@ use serde::{Deserialize, Serialize};
 
 use super::{ServiceComponent, error, files};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Preferences {
-  schema_version: u32,
-  desired_running: BTreeMap<ServiceComponent, bool>,
+  #[serde(default)]
+  components: BTreeMap<ServiceComponent, ComponentChoice>,
 }
 
-impl Default for Preferences {
-  fn default() -> Self {
-    Self {
-      schema_version: 1,
-      desired_running: BTreeMap::new(),
-    }
-  }
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ComponentChoice {
+  Enable,
+  Disable,
 }
 
 impl Preferences {
   pub(super) fn enabled(&self, component: ServiceComponent) -> bool {
-    self
-      .desired_running
-      .get(&component)
-      .copied()
-      .unwrap_or(true)
+    !matches!(
+      self.components.get(&component),
+      Some(ComponentChoice::Disable)
+    )
   }
 
-  pub(super) fn load(directory: &Path) -> Result<Self> {
-    let path = directory.join("components.json");
-    if !path.try_exists()? {
-      return Ok(Self::default());
+  pub(super) fn load(root: &Path) -> Result<Self> {
+    let path = root.join("service.json");
+    let metadata = match std::fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+      Err(error) => return Err(error.into()),
+    };
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::MetadataExt;
+      if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+        return Err(error(
+          "service settings must be owned by the current user without hardlinks",
+        ));
+      }
     }
-    let value: Self = serde_json::from_slice(&files::read(&path)?)
-      .map_err(|_| error("saved component choices are invalid"))?;
-    if value.schema_version != 1 {
-      return Err(error("saved component choices have an unsupported version"));
-    }
-    Ok(value)
+    #[cfg(not(unix))]
+    let _ = metadata;
+    let Some(text) = expri_core::global_config::read_config_text(&path)? else {
+      return Err(error("service settings changed while reading"));
+    };
+    serde_json::from_str(&text).map_err(|_| error("saved service component choices are invalid"))
   }
 
   pub(super) fn save_choice(
@@ -75,8 +83,24 @@ impl Preferences {
     component: ServiceComponent,
     enabled: bool,
   ) -> Result<()> {
-    let mut preferences = Self::load(directory)?;
-    preferences.desired_running.insert(component, enabled);
-    files::write(&directory.join("components.json"), &preferences)
+    let root = directory
+      .parent()
+      .ok_or_else(|| error("service storage needs a parent"))?;
+    let mut preferences = Self::load(root)?;
+    preferences.components.insert(
+      component,
+      if enabled {
+        ComponentChoice::Enable
+      } else {
+        ComponentChoice::Disable
+      },
+    );
+    let path = root.join("service.json");
+    // Manual nonsecret settings may be 0644. Secure an existing file without
+    // truncation before the private replacement, but never create an empty file.
+    if path.try_exists()? {
+      let _ = files::private_file(&path)?;
+    }
+    files::write(&path, &preferences)
   }
 }

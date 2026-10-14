@@ -333,6 +333,7 @@ Manage the shared worker process on the worker itself:
 expri service start
 expri service start --foreground
 expri service status
+expri service restart
 expri service stop
 ```
 
@@ -346,7 +347,7 @@ alone do not enable it. See [system profiles](system-profiles.md).
 ### Independent worker components
 
 Start the service once. Each component owns its supervised threads and can be
-started, stopped, or inspected while the other components continue:
+started, stopped, restarted, or inspected while the other components continue:
 
 | Component name | Work | Effect of stopping |
 | --- | --- | --- |
@@ -358,31 +359,50 @@ started, stopped, or inspected while the other components continue:
 expri service stop --component publishing
 expri service status --component publishing
 expri service start --component publishing
+expri service restart --component publishing
 expri service status --component queue-execution --json
 ```
 
 Manual component choices are saved privately in
-`~/.tokn/expri/worker-service/components.json`. They survive whole-service restart,
-and automatic startup from a run or publishing request respects paused choices.
+`~/.tokn/expri/service.json`. For example, disable publishing by default with:
+
+```json
+{"components":{"publishing":"disable"}}
+```
+
+Values are `"enable"` or `"disable"`; omitted components are enabled by default.
+JSON component names use snake_case, including `queue_execution`. Saved choices
+survive whole-service restart, and automatic startup from a run or publishing
+request respects paused choices.
 Stopping the whole service does not change those choices. Component start reuses
 the same process, starting it if needed with the saved enabled components.
+Manual file edits take effect at process startup; use `expri service restart`
+to apply them to an already running service. The start/stop/restart component
+commands save their choices and apply the selected change to the live process.
 `--foreground` starts the supervisor in the terminal and cannot be combined with
 `--component`; use another terminal to control its components.
 
 Starting a stopped or failed component loads its configuration afresh. Starting
 an already healthy running component is idempotent; a start request retries a
-group with failed or paused internal parts. Apply changed settings with stop
-then start; the new generation waits until all preceding threads join and owned
-transfers drain. Existing run jobs retain their pinned destination and credentials;
-restarting publishing reloads machine-profile settings without rebinding those jobs.
-Use stop then start when enabling machine publishing that was previously unconfigured.
-Requests acknowledge the requested state immediately, so status
+group with failed or paused internal parts. Use `service restart --component NAME`
+to enable the selected component and force a fresh generation, including after
+changing settings for a healthy or previously unconfigured part. It waits
+internally until all preceding threads join and owned transfers drain, while
+other components stay live. Existing run jobs retain their pinned destination
+and credentials; restarting publishing reloads machine-profile settings without
+rebinding those jobs.
+Component requests acknowledge the requested state immediately, so status
 may show stopping or starting before the transition completes. Status reports
 the requested state, phase, generation, and safe details for each internal part;
 JSON uses snake_case component and part keys. Process readiness is independent
 of collection readiness. A failed internal thread leaves other parts running
 and makes the component degraded; repair its configuration or resources, then
-stop and start that component. Failure does not stop the other components.
+restart that component. Failure does not stop the other components.
+
+`expri service restart` drains the old shared process before starting a replacement
+with the saved component choices. It preserves training, publication jobs,
+capture outboxes, and held execution allocations. It can also start a stopped
+service. Use component restart when only one part needs reloading.
 
 Pausing publishing does not cancel runs. New registrations remain durable,
 and `publish --wait`/`--watch` reports the pause rather than waiting indefinitely.
@@ -648,7 +668,8 @@ the next start reconciles existing supervisors and held reservations.
 Use `service stop --component queue-execution` to pause only execution, and
 `service start --component queue-execution` to resume it. Other component threads
 keep collecting or uploading. Restart this component to reload worker enrollment
-or re-detect inferred capacity; its resolved budget stays fixed per generation.
+or re-detect inferred capacity with `service restart --component queue-execution`;
+its resolved budget stays fixed per generation.
 An accepted task interrupted before launch retains its journal and allocation
 for confirmed recovery; service restart does not automatically relaunch it.
 CPU and memory reservations govern these queued jobs and do not

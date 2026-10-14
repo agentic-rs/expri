@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::{
@@ -305,6 +306,15 @@ fn paused_publication_keeps_jobs_and_saved_choices_survive_process_restart() {
   // Pausing an offline component saves the choice without starting a process.
   let paused = fixture.control("stop", Some("publishing"));
   assert_eq!(paused["running"], false);
+  let choices: Value =
+    serde_json::from_slice(&fs::read(fixture.storage.join("service.json")).unwrap()).unwrap();
+  assert_eq!(choices, json!({"components": {"publishing": "disable"}}));
+  assert!(
+    !fixture
+      .storage
+      .join("worker-service/components.json")
+      .exists()
+  );
   let receipt = json_report(fixture.publish().output().unwrap());
   assert_eq!(receipt["accepted"], true);
   let initial = fixture.await_component("publishing", "stopped");
@@ -339,8 +349,8 @@ fn paused_publication_keeps_jobs_and_saved_choices_survive_process_restart() {
 
   fixture.control("stop", Some("collection"));
   fixture.await_component("collection", "stopped");
-  support::stop_worker_service(&fixture.storage);
-  fixture.control("start", None);
+  let saved_choices = fs::read(fixture.storage.join("service.json")).unwrap();
+  fixture.control("restart", None);
   let restarted = fixture.await_component("publishing", "stopped");
   assert_ne!(restarted["pid"], pid);
   assert_eq!(
@@ -352,7 +362,11 @@ fn paused_publication_keeps_jobs_and_saved_choices_survive_process_restart() {
     false
   );
   assert_eq!(restarted["jobs_total"], 1);
-  fixture.control("start", Some("publishing"));
+  assert_eq!(
+    fs::read(fixture.storage.join("service.json")).unwrap(),
+    saved_choices
+  );
+  fixture.control("restart", Some("publishing"));
   let resumed = fixture.await_component("publishing", "running");
   assert_eq!(resumed["pid"], restarted["pid"]);
   assert_eq!(resumed["components"]["collection"]["phase"], "stopped");
@@ -360,4 +374,85 @@ fn paused_publication_keeps_jobs_and_saved_choices_survive_process_restart() {
     resumed["components"]["collection"]["desired_running"],
     false
   );
+}
+
+#[test]
+fn restarting_a_healthy_component_reloads_configuration_and_keeps_paused_peers() {
+  let fixture = Fixture::new(503);
+  fs::create_dir_all(&fixture.storage).unwrap();
+  let config = fixture.storage.join("config.toml");
+  fs::write(&config, "[system_profile]\ninterval_seconds=1\n").unwrap();
+  fixture.control("stop", Some("publishing"));
+  fixture.control("restart", Some("collection"));
+  let initial = fixture.await_collection_ready();
+  let generation = initial["components"]["collection"]["generation"]
+    .as_u64()
+    .unwrap();
+  assert_eq!(
+    generation, 1,
+    "offline restart must not cancel its freshly started component"
+  );
+  fs::write(&config, "[system_profile]\ninterval_seconds=2\n").unwrap();
+
+  // Idempotent start leaves healthy threads alone; restart reloads settings.
+  let unchanged = fixture.control("start", Some("collection"));
+  assert_eq!(
+    unchanged["components"]["collection"]["generation"],
+    generation
+  );
+  fixture.control("restart", Some("collection"));
+  let deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    let status = fixture.status();
+    if status["collection_ready"] == true
+      && status["components"]["collection"]["generation"]
+        .as_u64()
+        .unwrap()
+        > generation
+    {
+      assert_eq!(status["pid"], initial["pid"]);
+      assert_eq!(status["collection"]["interval_seconds"], 2);
+      assert_eq!(status["components"]["publishing"]["desired_running"], false);
+      assert_eq!(status["components"]["publishing"]["phase"], "stopped");
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "component did not restart: {status}"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  let choices: Value =
+    serde_json::from_slice(&fs::read(fixture.storage.join("service.json")).unwrap()).unwrap();
+  assert_eq!(choices["components"]["collection"], "enable");
+  assert_eq!(choices["components"]["publishing"], "disable");
+}
+
+#[test]
+fn a_manual_service_file_is_read_without_starting_and_applied_by_whole_restart() {
+  let fixture = Fixture::new(503);
+  fs::create_dir_all(&fixture.storage).unwrap();
+  let path = fixture.storage.join("service.json");
+  let contents = br#"{"components":{"publishing":"disable"}}"#;
+  fs::write(&path, contents).unwrap();
+  fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+  let status = fixture.status();
+  assert_eq!(status["running"], false);
+  assert_eq!(status["components"]["publishing"]["desired_running"], false);
+  assert_eq!(status["components"]["collection"]["desired_running"], true);
+  assert!(!fixture.storage.join("worker-service").exists());
+  assert_eq!(fs::read(&path).unwrap(), contents);
+  assert_eq!(
+    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+    0o644
+  );
+
+  fixture.control("restart", None);
+  let restarted = fixture.await_component("publishing", "stopped");
+  assert_eq!(restarted["running"], true);
+  assert_eq!(
+    restarted["components"]["publishing"]["desired_running"],
+    false
+  );
+  assert_eq!(fs::read(path).unwrap(), contents);
 }

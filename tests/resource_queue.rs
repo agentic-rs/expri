@@ -892,6 +892,29 @@ fn queue_execution_can_pause_and_resume_while_training_and_other_components_cont
   fixture.await_status(job_id, &["running"]);
   fixture.await_starts(1);
   let initial = fixture.service_report("status");
+  fixture.component_report("restart", Some("queue-execution"));
+  let restart_deadline = Instant::now() + Duration::from_secs(10);
+  loop {
+    let status = fixture.service_report("status");
+    if status["components"]["queue_execution"]["phase"] == "running"
+      && status["components"]["queue_execution"]["generation"]
+        .as_u64()
+        .unwrap()
+        > initial["components"]["queue_execution"]["generation"]
+          .as_u64()
+          .unwrap()
+      && status["execution"]["outstanding_attempts"] == 1
+    {
+      assert_eq!(status["pid"], initial["pid"]);
+      break;
+    }
+    assert!(
+      Instant::now() < restart_deadline,
+      "executor did not restart: {status}"
+    );
+    thread::sleep(Duration::from_millis(25));
+  }
+  assert_eq!(fixture.starts().len(), 1);
   fixture.component_report("stop", Some("queue-execution"));
   let deadline = Instant::now() + Duration::from_secs(10);
   loop {
@@ -917,7 +940,7 @@ fn queue_execution_can_pause_and_resume_while_training_and_other_components_cont
   let workers = fixture.queue(json!({"operation": "list_workers", "cursor": null, "limit": 20}));
   assert_eq!(workers["workers"][0]["reserved"]["cpus"], 2);
   fs::write(&gate, b"release").unwrap();
-  fixture.component_report("start", Some("queue-execution"));
+  fixture.component_report("restart", Some("queue-execution"));
   fixture.await_status(job_id, &["completed"]);
   assert_eq!(fixture.service_report("status")["pid"], initial["pid"]);
   assert_eq!(fixture.starts().len(), 1);

@@ -51,6 +51,15 @@ enum ServiceSubcommand {
     #[arg(long, value_parser = parse_component)]
     component: Option<expri_client::worker_service::ServiceComponent>,
   },
+  /// Restart the shared service or one component after its previous workers drain.
+  Restart {
+    /// Override EXPRI_STORAGE_DIR and the default ~/.tokn/expri storage.
+    #[arg(long)]
+    storage_dir: Option<PathBuf>,
+    /// Reload one component while keeping the process and other components running.
+    #[arg(long, value_parser = parse_component)]
+    component: Option<expri_client::worker_service::ServiceComponent>,
+  },
   /// Inspect machine inventories and system-profile history.
   System(crate::system_cli::ServiceSystemCommand),
   /// Edit hosted run annotations or manage archival and retention.
@@ -371,6 +380,17 @@ pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result
         expri_client::worker_service::stop_component(&paths, component)?
       } else {
         expri_client::worker_service::stop(&paths)?
+      }
+    }
+    ServiceSubcommand::Restart {
+      storage_dir,
+      component,
+    } => {
+      let paths = expri_core::storage::StoragePaths::resolve(storage_dir.as_deref())?;
+      if let Some(component) = component {
+        expri_client::worker_service::restart_component(&paths, component)?
+      } else {
+        expri_client::worker_service::restart(&paths)?
       }
     }
     ServiceSubcommand::System(system) => {
@@ -845,6 +865,7 @@ mod tests {
       "start",
       "status",
       "stop",
+      "restart",
       "publish",
       "fetch",
       "upload",
@@ -889,7 +910,7 @@ mod tests {
   #[test]
   fn component_controls_accept_named_parts_and_keep_foreground_process_control_separate() {
     for component in ["collection", "publishing", "queue-execution"] {
-      for action in ["start", "stop", "status"] {
+      for action in ["start", "stop", "restart", "status"] {
         assert!(Cli::try_parse_from(["expri", action, "--component", component, "--json"]).is_ok());
       }
     }

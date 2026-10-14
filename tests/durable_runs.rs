@@ -297,17 +297,16 @@ fn first_native_run_starts_collection_and_later_runs_reuse_it() {
     state["machine_id"]
   );
 
-  support::stop_worker_service(&profiles);
   let heartbeat = first_run.join("outputs/heartbeat");
   let old = fs::read(&heartbeat).unwrap();
+  let mut restarted: Value =
+    serde_json::from_slice(&fixture.run(&["service", "restart", "--json"]).stdout).unwrap();
   thread::sleep(Duration::from_millis(100));
   assert_ne!(
     fs::read(&heartbeat).unwrap(),
     old,
-    "stopping service must leave training alive"
+    "restarting service must leave training alive"
   );
-  let mut restarted: Value =
-    serde_json::from_slice(&fixture.run(&["service", "start", "--json"]).stdout).unwrap();
   assert_ne!(restarted["pid"], initial["pid"]);
   let deadline = Instant::now() + Duration::from_secs(10);
   while restarted["collection_ready"] != true {

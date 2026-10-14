@@ -313,6 +313,267 @@ fn offline_pause_saves_only_control_preferences_without_launching_a_process() {
   assert!(!directory.join("service.lock").exists());
   assert!(!directory.join("service.log").exists());
   assert!(!directory.join("jobs").exists());
+  let saved: Value =
+    serde_json::from_slice(&fs::read(paths.root().join("service.json")).unwrap()).unwrap();
+  assert_eq!(saved, json!({"components": {"queue_execution": "disable"}}));
+  assert!(!directory.join("components.json").exists());
+}
+
+#[test]
+fn readonly_status_honors_service_json_without_creating_worker_service_storage() {
+  use std::os::unix::fs::PermissionsExt;
+  let (_temporary, paths, _) = fixture();
+  paths.ensure_private().unwrap();
+  let path = paths.root().join("service.json");
+  fs::write(&path, br#"{"components":{"publishing":"disable"}}"#).unwrap();
+  fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+  let before = fs::read(&path).unwrap();
+  let report = status(&paths).unwrap();
+  assert_eq!(report["components"]["publishing"]["desired_running"], false);
+  assert_eq!(report["components"]["collection"]["desired_running"], true);
+  assert_eq!(
+    report["components"]["queue_execution"]["desired_running"],
+    true
+  );
+  assert!(!paths.root().join("worker-service").exists());
+  assert_eq!(fs::read(&path).unwrap(), before);
+  assert_eq!(fs::read_dir(paths.root()).unwrap().count(), 1);
+  assert_eq!(
+    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+    0o644
+  );
+  stop_component(&paths, ServiceComponent::Collection).unwrap();
+  let updated: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+  assert_eq!(
+    updated,
+    json!({"components": {"collection": "disable", "publishing": "disable"}})
+  );
+  assert_eq!(
+    fs::metadata(path).unwrap().permissions().mode() & 0o777,
+    0o600
+  );
+}
+
+#[test]
+fn saved_service_choices_require_enable_disable_strings_and_known_components() {
+  let (_temporary, paths, _) = fixture();
+  paths.ensure_private().unwrap();
+  for value in [
+    json!({"components": {"publishing": false}}),
+    json!({"components": {"publishing": "disabled"}}),
+    json!({"components": {"invalid": "disable"}}),
+    json!({"schema_version": 1, "components": {}}),
+  ] {
+    files::write(&paths.root().join("service.json"), &value).unwrap();
+    assert!(status(&paths).is_err());
+    assert!(!paths.root().join("worker-service").exists());
+  }
+}
+
+#[test]
+fn explicit_component_restart_forces_healthy_generation_and_enables_a_disabled_group() {
+  let (_temporary, paths, _) = fixture();
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      simple_components(),
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  wait_ready(&paths);
+  stop_component(&paths, ServiceComponent::Publishing).unwrap();
+  wait_component(&paths, ServiceComponent::Publishing, "stopped");
+  let initial = status(&paths).unwrap();
+  let generation = initial["components"]["collection"]["generation"]
+    .as_u64()
+    .unwrap();
+  let report = restart_component(&paths, ServiceComponent::Collection).unwrap();
+  assert_eq!(report["restarting"], true);
+  let deadline = Instant::now() + Duration::from_secs(3);
+  loop {
+    let report = status(&paths).unwrap();
+    if report["components"]["collection"]["generation"] == generation + 1
+      && report["collection_ready"] == true
+    {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "collection did not restart: {report}"
+    );
+    thread::sleep(Duration::from_millis(10));
+  }
+  let current = status(&paths).unwrap();
+  assert_eq!(current["pid"], initial["pid"]);
+  assert_eq!(
+    current["components"]["queue_execution"]["generation"],
+    initial["components"]["queue_execution"]["generation"]
+  );
+  assert_eq!(
+    current["components"]["publishing"]["desired_running"],
+    false
+  );
+  restart_component(&paths, ServiceComponent::Publishing).unwrap();
+  wait_component(&paths, ServiceComponent::Publishing, "running");
+  let saved: Value =
+    serde_json::from_slice(&fs::read(paths.root().join("service.json")).unwrap()).unwrap();
+  assert_eq!(
+    saved,
+    json!({"components": {"collection": "enable", "publishing": "enable"}})
+  );
+  stop(&paths).unwrap();
+  service.join().unwrap().unwrap();
+}
+
+#[test]
+fn whole_restart_waits_for_old_lease_and_preserves_choices_jobs_and_training() {
+  let (temporary, paths, job) = fixture();
+  let receipt = registry::register(&paths, job).unwrap();
+  let id = receipt["job_id"].as_str().unwrap();
+  let release = Arc::new(AtomicBool::new(false));
+  let stopped = Arc::new(AtomicBool::new(false));
+  let mut runners = simple_components();
+  let release_old = release.clone();
+  let stopped_old = stopped.clone();
+  runners.insert(
+    ServiceComponent::Collection,
+    Arc::new(move |context| {
+      context.collection_ready("machine-fixture".into(), 1);
+      while !context.wait(Duration::from_secs(60)) {}
+      while !release_old.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+      }
+      stopped_old.store(true, Ordering::Release);
+      Ok(())
+    }),
+  );
+  let runner = Arc::new(
+    |_: &PreparedJob, _: Arc<AtomicBool>, _: &mut dyn FnMut(Value) -> Result<()>| Ok(false),
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || unix::run_components(&service_paths, runners, runner, false));
+  wait_ready(&paths);
+  stop_component(&paths, ServiceComponent::Publishing).unwrap();
+  wait_component(&paths, ServiceComponent::Publishing, "stopped");
+  let before = fs::read(paths.root().join("service.json")).unwrap();
+  let training_dir = temporary.path().canonicalize().unwrap().join("training");
+  fs::create_dir(&training_dir).unwrap();
+  let _training = expri_core::lock::run_lock(&training_dir).unwrap();
+  let launches = Arc::new(AtomicUsize::new(0));
+  let new_service = Arc::new(std::sync::Mutex::new(None));
+  let restart_paths = paths.clone();
+  let observed_launches = launches.clone();
+  let new_service_handle = new_service.clone();
+  let stopped_old = stopped.clone();
+  let restarting = thread::spawn(move || {
+    unix::restart_with_launcher(
+      &restart_paths,
+      move |_, paths| {
+        assert!(stopped_old.load(Ordering::Acquire));
+        assert!(matches!(
+          expri_core::lock::try_lock_file_readonly(
+            &paths.root().join("worker-service/service.lock")
+          )
+          .unwrap(),
+          expri_core::lock::LockAttempt::Acquired(_)
+        ));
+        observed_launches.fetch_add(1, Ordering::SeqCst);
+        let new_paths = paths.clone();
+        *new_service_handle.lock().unwrap() = Some(thread::spawn(move || {
+          unix::run_components(
+            &new_paths,
+            simple_components(),
+            Arc::new(|_, _, _| Ok(false)),
+            false,
+          )
+        }));
+        Ok(None)
+      },
+      Duration::from_secs(5),
+    )
+  });
+  wait_component(&paths, ServiceComponent::Collection, "stopping");
+  assert_eq!(launches.load(Ordering::SeqCst), 0);
+  let lazy_paths = paths.clone();
+  let lazy = thread::spawn(move || {
+    unix::ensure_with_launcher(&lazy_paths, |_, _| {
+      panic!("restart owns the only permitted launch")
+    })
+  });
+  release.store(true, Ordering::Release);
+  let restarted = restarting.join().unwrap().unwrap();
+  assert_eq!(restarted["restarted"], true);
+  assert_eq!(lazy.join().unwrap().unwrap()["ready"], true);
+  service.join().unwrap().unwrap();
+  assert_eq!(launches.load(Ordering::SeqCst), 1);
+  assert_eq!(fs::read(paths.root().join("service.json")).unwrap(), before);
+  assert_eq!(
+    status(&paths).unwrap()["components"]["publishing"]["desired_running"],
+    false
+  );
+  assert_eq!(job_status(&paths, id).unwrap()["status"], "queued");
+  assert!(matches!(
+    expri_core::lock::try_lock_file_readonly(&training_dir.join(".run.lock")).unwrap(),
+    expri_core::lock::LockAttempt::Busy
+  ));
+  stop(&paths).unwrap();
+  new_service
+    .lock()
+    .unwrap()
+    .take()
+    .unwrap()
+    .join()
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn whole_restart_timeout_does_not_launch_while_old_component_is_still_draining() {
+  let (_temporary, paths, _) = fixture();
+  let release = Arc::new(AtomicBool::new(false));
+  let old_release = release.clone();
+  let mut runners = simple_components();
+  runners.insert(
+    ServiceComponent::Collection,
+    Arc::new(move |context| {
+      context.collection_ready("machine-fixture".into(), 1);
+      while !context.wait(Duration::from_secs(60)) {}
+      while !old_release.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(10));
+      }
+      Ok(())
+    }),
+  );
+  let service_paths = paths.clone();
+  let service = thread::spawn(move || {
+    unix::run_components(
+      &service_paths,
+      runners,
+      Arc::new(|_, _, _| Ok(false)),
+      false,
+    )
+  });
+  wait_ready(&paths);
+  let failure = unix::restart_with_launcher(
+    &paths,
+    |_, _| panic!("a draining process must never be replaced"),
+    Duration::from_millis(100),
+  )
+  .unwrap_err();
+  assert!(
+    failure
+      .to_string()
+      .contains("timed out waiting for shutdown")
+  );
+  assert!(matches!(
+    expri_core::lock::try_lock_file_readonly(&paths.root().join("worker-service/service.lock"))
+      .unwrap(),
+    expri_core::lock::LockAttempt::Busy
+  ));
+  release.store(true, Ordering::Release);
+  service.join().unwrap().unwrap();
 }
 
 #[test]
@@ -573,6 +834,33 @@ fn crashed_process_snapshot_cannot_report_running_or_ready_component_parts() {
   );
   assert_eq!(fs::read(status_path).unwrap(), before);
   assert!(!directory.join("service.lock").exists());
+}
+
+#[test]
+fn held_process_lease_cannot_make_cached_status_ready_without_a_live_handshake() {
+  let (_temporary, paths, _) = fixture();
+  let directory = files::ensure(&paths).unwrap();
+  let lease_path = directory.join("service.lock");
+  files::private_file(&lease_path).unwrap();
+  let expri_core::lock::LockAttempt::Acquired(_lease) =
+    expri_core::lock::try_lock_file(&lease_path, false).unwrap()
+  else {
+    panic!("fixture needs its lease");
+  };
+  let path = directory.join("status.json");
+  files::write(
+    &path,
+    &json!({"pid": 1234567, "running": true, "ready": true,
+    "collection_ready": true, "status": "running", "collection": {"machine_id": "cached-machine"}}),
+  )
+  .unwrap();
+  let before = fs::read(&path).unwrap();
+  let report = status(&paths).unwrap();
+  assert_eq!(report["running"], true);
+  assert_eq!(report["ready"], false);
+  assert_eq!(report["collection_ready"], false);
+  assert_eq!(report["collection"]["machine_id"], "cached-machine");
+  assert_eq!(fs::read(path).unwrap(), before);
 }
 
 #[test]
