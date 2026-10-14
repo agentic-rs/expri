@@ -9,10 +9,14 @@
   reserved and total resources.
   Worker capacity defaults to detected logical CPUs, 90% of RAM, and selectable
   whole GPUs, with optional per-field overrides and `gpus = []` for CPU-only workers.
+  Project restrictions are opt-in: omitted or empty `project_ids` accepts any
+  permitted project. Live NVIDIA GPU reports exclude busy or unverified devices;
+  the configurable per-process memory threshold defaults to 64 MiB. Stale reports
+  block GPU placement after 30 seconds while accepted reservations remain held.
   `queue list`, `show`, `workers`, and `cancel` report tables or `--json`.
   Durable claims and launch journals prevent duplicate execution on retries;
   uncertain attempts retain reservations until reconciliation or confirmed recovery.
-  Back up the service data directory before upgrading to SQLite schema 8.
+  Back up the service data directory before upgrading to SQLite schema 9.
 - Native runs now start one shared worker service lazily for collection and run
   publication. `service start` runs in the background or reuses it;
   `--foreground` runs in the terminal. `service status` is read-only, and

@@ -1057,6 +1057,17 @@ mod tests {
         session_id: "session".into(),
         claim_id: "claim".into(),
       },
+      QueueRequest::RegisterWorker {
+        worker_id: "worker".into(),
+        session_id: "session".into(),
+        project_ids: Vec::new(),
+        capacity: expri_core::resource_queue::WorkerCapacity {
+          cpus: 1,
+          memory_bytes: 1,
+          gpus: Vec::new(),
+        },
+        gpu_availability: None,
+      },
       QueueRequest::Recover {
         attempt_id: "attempt".into(),
         confirmed_stopped: true,

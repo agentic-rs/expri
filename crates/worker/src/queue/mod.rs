@@ -15,8 +15,8 @@ use expri_client::ResourceQueueClient;
 use expri_core::config::RunServiceConfig;
 use expri_core::global_config::ResolvedQueueWorkerConfig;
 use expri_core::resource_queue::{
-  AttemptStatus, AttemptSummary, AttemptTerminalStatus, GpuVendor, QueueRequest, QueueResponse,
-  ResourceAllocation,
+  AttemptStatus, AttemptSummary, AttemptTerminalStatus, GpuAvailabilityReport, GpuVendor,
+  QueueRequest, QueueResponse, ResourceAllocation, WorkerCapacity,
 };
 use expri_core::storage::StoragePaths;
 use serde_json::{Value, json};
@@ -53,7 +53,9 @@ pub fn run_executor(
   let worker_id = options.worker.worker_id.clone();
   let waiting = || {
     json!({"status": "waiting", "worker_id": worker_id, "online": false,
-      "capacity": options.worker.capacity, "last_error": "server_unavailable",
+      "capacity": options.worker.capacity,
+      "gpu_busy_memory_threshold_bytes": options.worker.gpu_busy_memory_threshold_bytes,
+      "last_error": "server_unavailable",
       "updated_at_ms": chrono::Utc::now().timestamp_millis()})
   };
   if stop.load(Ordering::Acquire) {
@@ -94,7 +96,18 @@ pub fn run_executor(
       return Ok(());
     }
     match ResourceQueueClient::with_stop(&client_config, stop.clone()) {
-      Ok(client) => break client,
+      Ok(client) if options.worker.capacity.gpus.is_empty() => break client,
+      Ok(client) if client.require_gpu_availability().is_ok() => break client,
+      Ok(_) => {
+        report(
+          json!({"status": "waiting", "worker_id": worker_id, "online": false,
+          "capacity": options.worker.capacity,
+          "gpu_busy_memory_threshold_bytes": options.worker.gpu_busy_memory_threshold_bytes,
+          "last_error": "server_gpu_availability_unsupported",
+          "updated_at_ms": chrono::Utc::now().timestamp_millis()}),
+        );
+        wait_until_stopped(&stop, options.poll_interval);
+      }
       Err(_) => {
         report(waiting());
         wait_until_stopped(&stop, options.poll_interval);
@@ -120,6 +133,8 @@ pub fn run_executor(
     directory.clone(),
     session.clone(),
     stop.clone(),
+    options.worker.capacity.clone(),
+    options.worker.gpu_busy_memory_threshold_bytes,
   )?;
   eprintln!(
     "queue worker: {} (CPU and memory reservations are advisory)",
@@ -177,6 +192,7 @@ impl Executor {
     let heartbeat = self.client.request(&QueueRequest::Heartbeat {
       worker_id: self.options.worker.worker_id.clone(),
       session_id: self.session_id(),
+      gpu_availability: gpu_report(&self.options.worker),
     });
     let (worker, attempts) = match heartbeat {
       Ok(QueueResponse::Worker { worker, attempts }) => (worker, attempts),
@@ -259,7 +275,8 @@ impl Executor {
           _ => None,
         };
         if let Some(attempt) = confirmed
-          && (local_terminal(&journal)?
+          && (prelaunch_without_supervisor(&journal)
+            || local_terminal(&journal)?
             || attempt.status == AttemptStatus::Lost
               && local_status(&journal)?
                 .as_ref()
@@ -288,8 +305,11 @@ impl Executor {
     let mut report = json!({
       "worker_id": self.worker.worker_id,
       "capacity": self.worker.capacity,
+      "gpu_busy_memory_threshold_bytes": self.options.worker.gpu_busy_memory_threshold_bytes,
       "available": self.worker.available,
       "reserved": self.worker.reserved,
+      "unavailable_gpus": self.worker.unavailable_gpus,
+      "gpu_availability_observed_at_ms": self.worker.gpu_availability_observed_at_ms,
       "quarantined": self.worker.quarantined,
       "outstanding_attempts": self.worker.outstanding_attempts,
       "assigned_jobs": self.worker.assigned_jobs,
@@ -326,7 +346,7 @@ impl Executor {
       return Err(message("queue journal belongs to a different worker"));
     }
     if attempt.status.is_terminal() {
-      if local_terminal(&journal)? {
+      if prelaunch_without_supervisor(&journal) || local_terminal(&journal)? {
         journal.attempt = attempt;
         journal.stage = Stage::Terminal;
         journal.save(&directory)?;
@@ -340,6 +360,23 @@ impl Executor {
     // rotated its fence even when its response was lost.
     journal.attempt = attempt.clone();
     journal.save(&directory)?;
+    if journal.stage == Stage::WaitingForGpu
+      && attempt.status == AttemptStatus::Claimed
+      && attempt.session_id == self.session_id()
+      && journal.run_dir.is_none()
+    {
+      if attempt.cancel_requested {
+        self.finish(
+          &mut journal,
+          &directory,
+          AttemptTerminalStatus::Cancelled,
+          Some(130),
+          Some("cancelled while waiting for GPUs".into()),
+        )?;
+        return Ok(());
+      }
+      return self.dispatch_or_finish(&mut journal, &directory);
+    }
     let status = local_status(&journal)?;
     if let Some(run_id) = &attempt.run_id
       && journal
@@ -510,17 +547,7 @@ impl Executor {
     if self.stop.load(Ordering::Acquire) {
       return Ok(());
     }
-    if !self
-      .options
-      .worker
-      .project_ids
-      .contains(&journal.assignment.submission.project_id)
-      || journal.attempt.worker_id != self.options.worker.worker_id
-    {
-      return Err(message(
-        "server assigned a job outside this worker's project allowlist",
-      ));
-    }
+    validate_worker_assignment(&journal, &self.options.worker)?;
     validate_allocation(
       &journal.attempt.allocation,
       &self.options.worker,
@@ -536,7 +563,15 @@ impl Executor {
       )?;
       return Ok(());
     }
-    let dispatch = self.dispatch(&mut journal, &directory);
+    self.dispatch_or_finish(&mut journal, &directory)
+  }
+
+  fn dispatch_or_finish(
+    &mut self,
+    journal: &mut Journal,
+    directory: &std::path::Path,
+  ) -> Result<()> {
+    let dispatch = self.dispatch(journal, directory);
     if let Err(error) = dispatch {
       if self.stop.load(Ordering::Acquire) {
         // Preserve launch intent and any still-held reservation for recovery.
@@ -545,18 +580,22 @@ impl Executor {
       }
       // A failed download/prepare has not launched any worker. Once launch intent
       // is persisted, a failure can be ambiguous and must retain its allocation.
-      if matches!(journal.stage, Stage::Claimed | Stage::Prepared) {
+      if matches!(
+        journal.stage,
+        Stage::Claimed | Stage::WaitingForGpu | Stage::Prepared
+      ) {
         self.finish(
-          &mut journal,
-          &directory,
+          journal,
+          directory,
           AttemptTerminalStatus::Failed,
           Some(error.exit_code()),
           Some(error.to_string()),
         )?;
+        return Ok(());
       } else {
         journal.stage = Stage::Quarantined;
         journal.message = Some(error.to_string());
-        journal.save(&directory)?;
+        journal.save(directory)?;
       }
       return Err(error);
     }
@@ -564,27 +603,39 @@ impl Executor {
   }
 
   fn dispatch(&mut self, journal: &mut Journal, directory: &std::path::Path) -> Result<()> {
-    let archive = directory.join("source.zip");
-    let expected = &journal.assignment.submission.source;
-    self
-      .client
-      .download_source(&journal.attempt.identity(), expected, &archive)?;
     self.check_stopping()?;
-    let (digest, size) = crate::archive::sha256_file(&archive)?;
-    if digest != expected.sha256 || size != expected.size {
-      return Err(message(
-        "downloaded queued source does not match the submitted snapshot",
-      ));
+    if self.defer_unavailable_gpus(journal, directory)? {
+      return Ok(());
     }
-    let repo_root = directory.join("source");
-    source::unpack_source(&archive, &repo_root)?;
-    self.check_stopping()?;
-    private_directory(&repo_root)?;
-    journal.repo_root = Some(repo_root.clone());
-    journal.save(directory)?;
+    // A parked attempt may already own an integrity-checked extraction. Its
+    // durable path is published only after verification and unpacking succeed.
+    let repo_root = if let Some(repo_root) = &journal.repo_root {
+      repo_root.clone()
+    } else {
+      let archive = directory.join("source.zip");
+      let expected = &journal.assignment.submission.source;
+      self
+        .client
+        .download_source(&journal.attempt.identity(), expected, &archive)?;
+      self.check_stopping()?;
+      let (digest, size) = crate::archive::sha256_file(&archive)?;
+      if digest != expected.sha256 || size != expected.size {
+        return Err(message(
+          "downloaded queued source does not match the submitted snapshot",
+        ));
+      }
+      let repo_root = directory.join("source");
+      source::unpack_source(&archive, &repo_root)?;
+      self.check_stopping()?;
+      private_directory(&repo_root)?;
+      journal.repo_root = Some(repo_root.clone());
+      journal.save(directory)?;
+      repo_root
+    };
     let QueueResponse::Worker { attempts, .. } = self.client.request(&QueueRequest::Heartbeat {
       worker_id: self.options.worker.worker_id.clone(),
       session_id: self.session_id(),
+      gpu_availability: gpu_report(&self.options.worker),
     })?
     else {
       return Err(message("invalid queue heartbeat before launch"));
@@ -620,6 +671,24 @@ impl Executor {
     journal.stage = Stage::Prepared;
     journal.save(directory)?;
     self.check_stopping()?;
+    // Staging may take long enough for an unrelated process to acquire a GPU.
+    // This run has no launch intent yet, so abort its unstarted snapshot and
+    // retry the same queue attempt without releasing its reservation.
+    if allocation_gpus_unavailable(
+      &journal.attempt.allocation,
+      self.options.worker.gpu_busy_memory_threshold_bytes,
+    ) {
+      crate::node::run::abort_prepared(
+        prepared,
+        false,
+        "GPU became unavailable before launch; queued attempt will retry",
+      )?;
+      journal.run_dir = None;
+      journal.stage = Stage::WaitingForGpu;
+      journal.message = Some("waiting for assigned GPUs to become available".into());
+      journal.save(directory)?;
+      return Ok(());
+    }
     journal.stage = Stage::LaunchPending;
     journal.save(directory)?;
     let QueueResponse::Attempt { attempt } = self.client.request(&QueueRequest::Start {
@@ -656,6 +725,54 @@ impl Executor {
       Ok(())
     }
   }
+
+  fn defer_unavailable_gpus(
+    &self,
+    journal: &mut Journal,
+    directory: &std::path::Path,
+  ) -> Result<bool> {
+    if allocation_gpus_unavailable(
+      &journal.attempt.allocation,
+      self.options.worker.gpu_busy_memory_threshold_bytes,
+    ) {
+      journal.stage = Stage::WaitingForGpu;
+      journal.message = Some("waiting for assigned GPUs to become available".into());
+      journal.save(directory)?;
+      return Ok(true);
+    }
+    journal.stage = Stage::Claimed;
+    journal.message = None;
+    journal.save(directory)?;
+    Ok(false)
+  }
+}
+
+fn gpu_report(worker: &ResolvedQueueWorkerConfig) -> Option<GpuAvailabilityReport> {
+  (!worker.capacity.gpus.is_empty()).then(|| {
+    expri_system::probe_gpu_availability(&worker.capacity, worker.gpu_busy_memory_threshold_bytes)
+  })
+}
+
+fn allocation_gpus_unavailable(allocation: &ResourceAllocation, threshold_bytes: u64) -> bool {
+  if allocation.gpus.is_empty() {
+    return false;
+  }
+  !expri_system::probe_gpu_availability(
+    &WorkerCapacity {
+      cpus: allocation.cpus,
+      memory_bytes: allocation.memory_bytes,
+      gpus: allocation.gpus.clone(),
+    },
+    threshold_bytes,
+  )
+  .unavailable_gpus
+  .is_empty()
+}
+
+fn prelaunch_without_supervisor(journal: &Journal) -> bool {
+  matches!(journal.stage, Stage::Claimed | Stage::WaitingForGpu)
+    && journal.run_dir.is_none()
+    && journal.attempt.run_id.is_none()
 }
 
 fn local_status(journal: &Journal) -> Result<Option<serde_json::Value>> {
@@ -904,6 +1021,22 @@ fn allocation_env(allocation: &ResourceAllocation) -> BTreeMap<String, String> {
   env
 }
 
+fn validate_worker_assignment(journal: &Journal, worker: &ResolvedQueueWorkerConfig) -> Result<()> {
+  if journal.attempt.worker_id != worker.worker_id {
+    return Err(message("server assigned a job belonging to another worker"));
+  }
+  if !worker.project_ids.is_empty()
+    && !worker
+      .project_ids
+      .contains(&journal.assignment.submission.project_id)
+  {
+    return Err(message(
+      "server assigned a job outside this worker's project allowlist",
+    ));
+  }
+  Ok(())
+}
+
 fn validate_allocation(
   allocation: &ResourceAllocation,
   worker: &ResolvedQueueWorkerConfig,
@@ -948,6 +1081,7 @@ fn register(
     session_id: session.lock().expect("queue session lock").clone(),
     project_ids: worker.project_ids.clone(),
     capacity: worker.capacity.clone(),
+    gpu_availability: gpu_report(worker),
   };
   let response = match client.request(&register_request()) {
     Err(error) if expired_session(&error) => {
@@ -976,6 +1110,8 @@ impl Heartbeats {
     directory: PathBuf,
     session: Arc<Mutex<String>>,
     service_stop: Arc<AtomicBool>,
+    capacity: WorkerCapacity,
+    gpu_busy_memory_threshold_bytes: u64,
   ) -> Result<Self> {
     let stopped = Arc::new(AtomicBool::new(false));
     let stop = stopped.clone();
@@ -987,6 +1123,9 @@ impl Heartbeats {
           let response = client.request(&QueueRequest::Heartbeat {
             worker_id: worker_id.clone(),
             session_id,
+            gpu_availability: (!capacity.gpus.is_empty()).then(|| {
+              expri_system::probe_gpu_availability(&capacity, gpu_busy_memory_threshold_bytes)
+            }),
           });
           if let Ok(QueueResponse::Worker { attempts, .. }) = response {
             for attempt in attempts {

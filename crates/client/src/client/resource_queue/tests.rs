@@ -138,6 +138,34 @@ fn pinned_sources_keep_integrity_and_private_permissions_in_both_transports() {
 }
 
 #[test]
+fn gpu_workers_require_the_availability_capability_but_cpu_clients_accept_older_servers() {
+  for advertised in [false, true] {
+    let (url, server) = mock(1, move |request, _| {
+      assert!(matches!(
+        serde_json::from_slice::<Request>(&request.body).unwrap(),
+        Request::Capabilities
+      ));
+      let mut features = vec![RESOURCE_QUEUE_CAPABILITY.into()];
+      if advertised {
+        features.push(RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY.into());
+      }
+      (
+        200,
+        Vec::new(),
+        serde_json::to_vec(&Response::Capabilities { features }).unwrap(),
+      )
+    });
+    let temporary = tempfile::tempdir().unwrap();
+    let client = ResourceQueueClient::new(&config(temporary.path(), &url)).unwrap();
+    assert_eq!(
+      client.clone().require_gpu_availability().is_ok(),
+      advertised
+    );
+    server.join().unwrap();
+  }
+}
+
+#[test]
 fn service_stop_cancels_source_waiting_for_headers() {
   cancel_stalled_source(false);
 }

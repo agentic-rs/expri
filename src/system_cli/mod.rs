@@ -470,6 +470,7 @@ mod tests {
     assert_eq!(worker.project_ids, ["vision"]);
     assert_eq!(worker.capacity.cpus, Some(2));
     assert_eq!(worker.capacity.gpus, None);
+    assert_eq!(worker.gpu_busy_memory_threshold_bytes, 64 * 1024 * 1024);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 
     // Broken executor configuration is isolated from collection readiness.
@@ -494,12 +495,13 @@ mod tests {
     .unwrap();
     assert_eq!(resolved.capacity.cpus, 2);
     assert_eq!(resolved.capacity.memory_bytes, 8192);
-    let worker = toml::from_str("worker_id='worker-a'\nproject_ids=['vision']\n[capacity]\ncpus=2\nmemory_bytes=4096\ngpus=[]\n").unwrap();
+    let worker = toml::from_str("worker_id='worker-a'\nproject_ids=['vision']\ngpu_busy_memory_threshold_bytes=0\n[capacity]\ncpus=2\nmemory_bytes=4096\ngpus=[]\n").unwrap();
     let resolved = resolve_executor_capacity(&worker, || {
       panic!("explicit budget must not probe hardware")
     })
     .unwrap();
     assert_eq!(resolved.capacity.memory_bytes, 4096);
+    assert_eq!(resolved.gpu_busy_memory_threshold_bytes, 0);
   }
 
   #[test]

@@ -11,6 +11,7 @@ use crate::error::{ExpriError, Result};
 use crate::service::ClientConfig;
 
 pub const MAX_CONFIG_BYTES: u64 = 32 * 1024;
+pub const DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +29,12 @@ pub struct GlobalConfig {
 #[serde(deny_unknown_fields)]
 pub struct QueueWorkerConfig {
   pub worker_id: String,
+  /// An omitted or empty list accepts any project permitted by the credentials.
+  #[serde(default)]
   pub project_ids: Vec<String>,
+  /// Per-process GPU memory threshold; zero treats any compute context as busy.
+  #[serde(default = "default_gpu_busy_memory_threshold_bytes")]
+  pub gpu_busy_memory_threshold_bytes: u64,
   #[serde(default)]
   pub capacity: QueueWorkerCapacityConfig,
 }
@@ -50,8 +56,14 @@ pub struct QueueWorkerCapacityConfig {
 #[derive(Clone, Debug)]
 pub struct ResolvedQueueWorkerConfig {
   pub worker_id: String,
+  /// An empty list accepts any project permitted by the credentials.
   pub project_ids: Vec<String>,
+  pub gpu_busy_memory_threshold_bytes: u64,
   pub capacity: crate::resource_queue::WorkerCapacity,
+}
+
+fn default_gpu_busy_memory_threshold_bytes() -> u64 {
+  DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES
 }
 
 impl QueueWorkerConfig {
@@ -78,6 +90,7 @@ impl QueueWorkerConfig {
     let resolved = ResolvedQueueWorkerConfig {
       worker_id: self.worker_id.clone(),
       project_ids: self.project_ids.clone(),
+      gpu_busy_memory_threshold_bytes: self.gpu_busy_memory_threshold_bytes,
       capacity: crate::resource_queue::WorkerCapacity {
         cpus: self.capacity.cpus.unwrap_or(inferred.cpus),
         memory_bytes: self.capacity.memory_bytes.unwrap_or(inferred.memory_bytes),
@@ -98,9 +111,9 @@ impl ResolvedQueueWorkerConfig {
 
 fn validate_worker_identity(worker_id: &str, project_ids: &[String]) -> Result<()> {
   crate::identifiers::validate_component(worker_id)?;
-  if project_ids.is_empty() || project_ids.len() > 64 {
+  if project_ids.len() > 64 {
     return Err(invalid(
-      "queue_worker.project_ids requires an explicit nonempty project allowlist",
+      "queue_worker.project_ids allows at most 64 projects",
     ));
   }
   let mut projects = std::collections::BTreeSet::new();
@@ -335,6 +348,35 @@ mod tests {
   }
 
   #[test]
+  fn gpu_busy_memory_threshold_defaults_and_explicit_values_survive_resolution_and_roundtrip() {
+    for (setting, expected) in [
+      (None, DEFAULT_GPU_BUSY_MEMORY_THRESHOLD_BYTES),
+      (Some(1024), 1024),
+      (Some(0), 0),
+    ] {
+      let setting = setting
+        .map(|bytes| format!("gpu_busy_memory_threshold_bytes={bytes}\n"))
+        .unwrap_or_default();
+      let worker = worker_config(&setting);
+      worker.validate().unwrap();
+      assert_eq!(worker.gpu_busy_memory_threshold_bytes, expected);
+      let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+      assert_eq!(resolved.gpu_busy_memory_threshold_bytes, expected);
+      assert_eq!(resolved.capacity, detected_capacity());
+      let roundtrip: QueueWorkerConfig =
+        toml::from_str(&toml::to_string(&worker).unwrap()).unwrap();
+      assert_eq!(roundtrip.gpu_busy_memory_threshold_bytes, expected);
+      assert_eq!(
+        roundtrip
+          .resolve_capacity(detected_capacity())
+          .unwrap()
+          .gpu_busy_memory_threshold_bytes,
+        expected
+      );
+    }
+  }
+
+  #[test]
   fn worker_capacity_can_be_omitted_and_resolves_only_when_requested() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
@@ -464,14 +506,31 @@ mod tests {
   }
 
   #[test]
-  fn automatic_capacity_still_requires_explicit_valid_worker_identity_and_projects() {
+  fn automatic_capacity_still_requires_valid_worker_identity_and_project_restrictions() {
     for identity in [
-      "worker_id='worker-a'\nproject_ids=[]\n",
       "worker_id='worker-a'\nproject_ids=['vision', 'vision']\n",
       "worker_id='../worker-a'\nproject_ids=['vision']\n",
+      "worker_id='worker-a'\nproject_ids=['../vision']\n",
     ] {
       let config: GlobalConfig = toml::from_str(&format!("[queue_worker]\n{identity}")).unwrap();
       assert!(config.validate().is_err());
+    }
+    let mut worker = worker_config("");
+    worker.project_ids = (0..65).map(|number| format!("project-{number}")).collect();
+    assert!(worker.validate().is_err());
+  }
+
+  #[test]
+  fn omitted_and_empty_worker_projects_roundtrip_as_unrestricted() {
+    for projects in ["", "project_ids=[]\n"] {
+      let config: GlobalConfig =
+        toml::from_str(&format!("[queue_worker]\nworker_id='worker-a'\n{projects}")).unwrap();
+      config.validate().unwrap();
+      let roundtrip: GlobalConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+      let worker = roundtrip.queue_worker.unwrap();
+      assert!(worker.project_ids.is_empty());
+      let resolved = worker.resolve_capacity(detected_capacity()).unwrap();
+      assert!(resolved.project_ids.is_empty());
     }
   }
 

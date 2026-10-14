@@ -335,12 +335,34 @@ These defaults apply to `run --queue`. Memory must be supplied in the task or
 CLI; CPU defaults to one slot and GPUs to zero. Each worker needs a local
 `[queue_worker]` declaration and the shared `expri service start` runtime; use
 `--foreground` to run it in a terminal.
+
+```toml
+[queue_worker]
+worker_id = "clouds-modu"
+```
+
+The unique worker ID opts this machine into execution. `project_ids` is optional:
+omitting it or using `[]` accepts any project permitted by the worker's server
+credentials. To restrict this worker, add a whitelist under `[queue_worker]`:
+
+```toml
+project_ids = ["vision"]
+```
+
+Execution registration requires unrestricted server or issued login credentials
+and a native Linux/macOS worker.
 `service stop --component queue-execution` pauses task polling without stopping
 collection, uploads, or existing training. Resume with
 `service start --component queue-execution` to reconcile held attempts.
 Capacity defaults to detected logical CPUs, 90% of RAM, and selectable whole GPUs.
 Optional capacity fields override these defaults; `gpus = []` disables GPU allocation.
-`queue workers` reports available/total resources and pending assignments. Read
+The worker refreshes GPU availability while running: NVIDIA devices are busy when
+any compute process uses more than 64 MiB by default, and become schedulable as its
+usage drops or the process finishes. Configure the per-process threshold with
+`gpu_busy_memory_threshold_bytes` under `[queue_worker]`; `0` blocks on any context.
+Live detection currently requires full NVIDIA UUID selectors. Unsupported devices
+or failed checks remain unavailable; CPU jobs can continue. `queue workers`
+reports free/total resources, busy or unverified GPUs, and pending assignments. Read
 [worker setup and recovery](docs/self-hosted-service.md#shared-resource-queue)
 or `expri skill queue`. The dashboard includes pending jobs and their resource
 requests before dispatch, then follows the worker run when its metadata arrives.

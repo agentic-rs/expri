@@ -15,6 +15,8 @@ const MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
 #[serde(rename_all = "snake_case")]
 pub(super) enum Stage {
   Claimed,
+  /// No launch intent or supervisor exists; retry after a fresh GPU probe.
+  WaitingForGpu,
   Prepared,
   LaunchPending,
   Active,

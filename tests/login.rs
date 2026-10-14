@@ -124,6 +124,7 @@ fn queue_worker() -> QueueWorkerConfig {
   QueueWorkerConfig {
     worker_id: "cpu-worker".into(),
     project_ids: vec!["vision".into()],
+    gpu_busy_memory_threshold_bytes: 32 * 1024 * 1024,
     capacity: expri_core::global_config::QueueWorkerCapacityConfig {
       cpus: Some(4),
       memory_bytes: Some(16 * 1024_u64.pow(3)),
