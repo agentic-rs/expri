@@ -5,6 +5,7 @@ use super::*;
 use crate::metrics::RunMetrics;
 use serde_json::json;
 
+mod continuation;
 mod outage;
 
 #[test]

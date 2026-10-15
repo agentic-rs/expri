@@ -5,6 +5,7 @@ use expri_client as service;
 use expri_core::{config, error, filter, lock, protocol};
 
 pub mod archive;
+pub mod continuation;
 pub mod environment;
 pub mod git;
 pub mod jobs;

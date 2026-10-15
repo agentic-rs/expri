@@ -19,6 +19,111 @@ use crate::client::{self, Publisher, ResolvedClient};
 use crate::error::Result;
 use crate::types::{RunScope, validate_scope};
 
+/// Preflight before stopping a task; unsupported services leave it untouched.
+pub fn check_attempt_support(run_dir: &Path) -> Result<()> {
+  let paths = expri_core::storage::StoragePaths::resolve(None)?;
+  let Some(job) = continuation_job(&paths, run_dir)? else {
+    return Ok(());
+  };
+  let api = Api::new_with_resolved(&job.client, None)?;
+  client::check_task_attempt_support(&api, &job.scope)?;
+  let _lease = continuation_lease(run_dir)?;
+  let recovered = client::reconcile_task_attempt(&continuation_options(&job, run_dir), api)?;
+  drop(_lease);
+  if recovered {
+    crate::worker_service::rearm_publishing_job(&paths, job)?;
+  }
+  Ok(())
+}
+
+/// Advance the same immutable publication binding after the previous worker
+/// stopped. The caller owns the run lease until the next supervisor takes over.
+pub fn begin_attempt(
+  run_dir: &Path,
+  request_id: &str,
+  expected_attempt: u64,
+  next_attempt: u64,
+) -> Result<()> {
+  let directory = run_dir.canonicalize()?;
+  let paths = expri_core::storage::StoragePaths::resolve(None)?;
+  let Some(job) = continuation_job(&paths, &directory)? else {
+    crate::registrations::reopen_for_attempt(&directory)?;
+    return Ok(());
+  };
+  let _lease = continuation_lease(&directory)?;
+  job.validate()?;
+  client::begin_task_attempt(
+    &continuation_options(&job, &directory),
+    Api::new_with_resolved(&job.client, None)?,
+    request_id,
+    expected_attempt,
+    next_attempt,
+  )?;
+  crate::registrations::reopen_for_attempt(&directory)?;
+  let mut state = read_existing_state(&directory, &job)?;
+  state.last_error = None;
+  state.retry_after_seconds = None;
+  state.save(&directory, "pending")?;
+  drop(_lease);
+  crate::worker_service::rearm_publishing_job(&paths, job)
+}
+
+fn continuation_options(job: &PreparedJob, run_dir: &Path) -> PublishOptions {
+  PublishOptions {
+    config: PathBuf::new(),
+    run_dir: run_dir.into(),
+    project_id: job.scope.project_id.clone(),
+    origin: job.scope.origin.clone(),
+    artifacts: job.artifacts.clone(),
+    watch: job.watch,
+    queue_dir: job.queue_dir.clone(),
+  }
+}
+
+fn continuation_lease(run_dir: &Path) -> Result<crate::lock::FileLock> {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+  loop {
+    if let Some(lease) = owned_lease(run_dir)? {
+      return Ok(lease);
+    }
+    if std::time::Instant::now() >= deadline {
+      return Err(error("publisher is busy; retry this continuation request"));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(25));
+  }
+}
+
+fn continuation_job(
+  paths: &expri_core::storage::StoragePaths,
+  run_dir: &Path,
+) -> Result<Option<PreparedJob>> {
+  if let Some(job) = crate::worker_service::saved_publishing_job(paths, run_dir)? {
+    return Ok(Some(job));
+  }
+  if fs::inspect(&run_dir.join(super::REQUEST))?.is_some() {
+    let job = prepare_automatic(&super::read_intent(run_dir)?)?;
+    crate::worker_service::register(paths, job.clone())?;
+    return Ok(Some(job));
+  }
+  if fs::inspect(&run_dir.join("publishing-binding.json"))?.is_some()
+    || fs::inspect(&run_dir.join(super::STATE))?.is_some()
+  {
+    return Err(error(
+      "this run's saved publishing registration is unavailable; restore the worker service registry before continuing",
+    ));
+  }
+  Ok(None)
+}
+
+fn read_existing_state(directory: &Path, job: &PreparedJob) -> Result<PublishingState> {
+  let mut state = super::read_state(directory)?;
+  if state.run_id != job.scope.run_id {
+    return Err(error("publisher identity changed during continuation"));
+  }
+  state.progress = json!({"publication_epoch":serde_json::from_slice::<Value>(&fs::read_bounded(&directory.join("run-state.json"),client::RECORD_LIMIT)?)?["publication_epoch"]});
+  Ok(state)
+}
+
 /// The token is persisted only by the worker service in its private registry.
 /// Neither Debug nor a public secret accessor is provided.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

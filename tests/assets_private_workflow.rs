@@ -66,6 +66,8 @@ impl Service {
               let request: Value = serde_json::from_slice(&body).unwrap();
               catalog.requests.push(request.clone());
               let response = match request["action"].as_str().unwrap() {
+                // This fixture models a legacy service without continuation.
+                "capabilities" => json!({"kind": "capabilities", "features": []}),
                 "begin_upload" => {
                   if catalog.file.is_null() {
                     catalog.file = json!({"target": request["target"], "size": request["size"], "sha256": request["sha256"], "storage": "object"});
@@ -327,6 +329,19 @@ fn local_upload_deferred_add_output_import_and_worker_download_have_distinct_tra
   assert!(!laptop.path().join("models/base.pt").exists());
   assert_eq!(service.catalog.lock().unwrap().object_uploads, 1);
   assert_eq!(service.catalog.lock().unwrap().object_downloads, 1);
+  {
+    let catalog = service.catalog.lock().unwrap();
+    assert!(
+      catalog
+        .requests
+        .iter()
+        .any(|request| request["action"] == "capabilities")
+    );
+    assert!(catalog.requests.iter().all(|request| !matches!(
+      request["action"].as_str(),
+      Some("run_publication" | "at_run_epoch")
+    )));
+  }
   let producing_run_queries = service
     .catalog
     .lock()

@@ -50,7 +50,11 @@ pub(super) fn can_publish(
       |row| row.get(0),
     )
     .map_err(database)?;
-  Ok(latest == Some(job))
+  let epoch: Option<u64> = db.query_row(
+    "SELECT COALESCE(json_extract(snapshot,'$.publication_epoch'),0) FROM result_archives WHERE id=?1",
+    [job], |row| row.get(0),
+  ).optional().map_err(database)?;
+  Ok(latest == Some(job) && epoch == Some(tracking::publication_epoch(db, scope)?))
 }
 
 fn scope_key(scope: &RunScope) -> ApiResult<String> {
@@ -70,7 +74,8 @@ impl<S: ObjectStorage> Store<S> {
   pub(super) fn queue_archive(&self, snapshot: ArchiveSnapshot) -> ApiResult<ArchiveRecord> {
     let scope = scope_key(&snapshot.scope)?;
     if snapshot.files.is_empty()
-      || snapshot.files.len() > TRACKING_DOCUMENT_PATHS.len() + TRACKING_STREAM_PATHS.len()
+      || snapshot.files.len()
+        > expri_core::service::TRACKING_DOCUMENT_LIMIT + TRACKING_STREAM_PATHS.len()
     {
       return Err(ApiError::new(
         400,
@@ -136,7 +141,9 @@ impl<S: ObjectStorage> Store<S> {
       .db()?
       .query_row(
         "SELECT a.status,a.snapshot,a.last_error,f.record FROM result_archives a
-       LEFT JOIN files f ON f.target=?2 WHERE a.scope=?1 ORDER BY a.id DESC LIMIT 1",
+       LEFT JOIN files f ON f.target=?2 WHERE a.scope=?1
+       AND COALESCE(json_extract(a.snapshot,'$.publication_epoch'),0)=COALESCE((SELECT epoch FROM tracking_run_epochs WHERE scope=?1),0)
+       ORDER BY a.id DESC LIMIT 1",
         params![key, target_json(&target)?],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
       )
@@ -176,7 +183,9 @@ impl<S: ObjectStorage> Store<S> {
       .db()?
       .query_row(
         "SELECT id,snapshot FROM result_archives AS candidate WHERE status IN ('pending','uploading','failed')
-        AND retry_at<=?1 AND id=(SELECT MAX(id) FROM result_archives WHERE scope=candidate.scope) ORDER BY id LIMIT 1",
+        AND retry_at<=?1 AND id=(SELECT MAX(id) FROM result_archives WHERE scope=candidate.scope)
+        AND COALESCE(json_extract(snapshot,'$.publication_epoch'),0)=COALESCE((SELECT epoch FROM tracking_run_epochs WHERE scope=candidate.scope),0)
+        ORDER BY id LIMIT 1",
         [now()],
         |row| Ok((row.get(0)?, row.get(1)?)),
       )
@@ -191,6 +200,9 @@ impl<S: ObjectStorage> Store<S> {
     let _project = project_gate
       .read()
       .map_err(|_| ApiError::new(503, "project operation unavailable"))?;
+    if tracking::publication_epoch(&*self.db()?, &snapshot.scope)? != snapshot.publication_epoch {
+      return Ok(false);
+    }
     match projects::ensure_active(&*self.db()?, &snapshot.scope.project_id) {
       Err(error) if error.status == 410 => return Ok(false),
       Err(error) => return Err(error),

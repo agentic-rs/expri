@@ -49,14 +49,20 @@ if mode == 'finish':
   raise SystemExit(7)
 if mode == 'graceful':
   time.sleep(60)
-if mode in ('cancel', 'orphan'):
+if mode in ('cancel', 'orphan', 'orphan-controlled'):
   if mode == 'cancel':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
   script = "import pathlib,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); p=pathlib.Path(sys.argv[1]); exec('while True:\\n  p.write_text(str(time.time_ns()))\\n  time.sleep(0.025)')"
-  subprocess.Popen([sys.executable, '-c', script, str(out / 'heartbeat')])
-  if mode == 'orphan':
+  descendant = subprocess.Popen([sys.executable, '-c', script, str(out / 'heartbeat')])
+  pid_file = out / 'descendant-pid.tmp'
+  pid_file.write_text(str(descendant.pid))
+  pid_file.replace(out / 'descendant-pid')
+  if mode in ('orphan', 'orphan-controlled'):
     while not (out / 'heartbeat').exists():
       time.sleep(0.01)
+    if mode == 'orphan-controlled':
+      while not (out / 'release-parent').exists():
+        time.sleep(0.01)
     (out / 'direct-exit').touch()
     raise SystemExit(0)
   while True:
@@ -730,6 +736,7 @@ fn graceful_cancellation_preserves_child_signal_status() {
 }
 
 #[test]
+#[cfg(not(target_os = "linux"))]
 fn cancellation_during_log_drain_stops_surviving_descendants() {
   let fixture = Fixture::new();
   let receipt = fixture.start("orphan", false);
@@ -742,6 +749,58 @@ fn cancellation_during_log_drain_stops_surviving_descendants() {
   assert_eq!(report["status"], "cancelled");
   assert_eq!(report["state"]["task_exit_code"], 0);
   let heartbeat = run.join("outputs/heartbeat");
+  let before = fs::read(&heartbeat).unwrap();
+  thread::sleep(Duration::from_millis(100));
+  assert_eq!(fs::read(&heartbeat).unwrap(), before);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn cancellation_during_log_drain_stops_surviving_descendants() {
+  let fixture = Fixture::new();
+  let receipt = fixture.start("orphan-controlled", false);
+  let id = receipt["run_id"].as_str().unwrap();
+  let run = Path::new(receipt["run_dir"].as_str().unwrap());
+  let heartbeat = run.join("outputs/heartbeat");
+  await_file(&heartbeat);
+  let deadline = Instant::now() + Duration::from_secs(10);
+  while !record(run, "run-state.json")["task_started_at"].is_string() {
+    assert!(Instant::now() < deadline, "task launch was not recorded");
+    thread::sleep(Duration::from_millis(10));
+  }
+  await_file(&run.join("outputs/descendant-pid"));
+  let descendant = fs::read_to_string(run.join("outputs/descendant-pid")).unwrap();
+  // Keep the supervisor active after its normal descendant cleanup. Waiting
+  // for the descendant's death proves this loop already checked cancellation;
+  // the request below must be observed after cleanup/log draining as well.
+  let state_lease = expri_core::lock::run_state_lock(run).unwrap();
+  fs::write(run.join("outputs/release-parent"), "release").unwrap();
+  await_file(&run.join("outputs/direct-exit"));
+  loop {
+    let exited = match fs::read_to_string(format!("/proc/{}/stat", descendant.trim())) {
+      Ok(stat) => stat.rsplit_once(')').is_some_and(|(_, fields)| {
+        matches!(fields.split_whitespace().next(), Some("Z" | "X" | "x"))
+      }),
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+      Err(error) => panic!("cannot inspect test descendant: {error}"),
+    };
+    if exited {
+      break;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "descendant cleanup did not finish"
+    );
+    thread::sleep(Duration::from_millis(10));
+  }
+  let accepted: Value =
+    serde_json::from_slice(&fixture.run(&["runs", "cancel", id, "--json"]).stdout).unwrap();
+  assert_eq!(accepted["cancel_requested"], true);
+  assert_eq!(accepted["alive"], true);
+  drop(state_lease);
+  let report = terminal(&fixture, id);
+  assert_eq!(report["status"], "cancelled");
+  assert_eq!(report["state"]["task_exit_code"], 0);
   let before = fs::read(&heartbeat).unwrap();
   thread::sleep(Duration::from_millis(100));
   assert_eq!(fs::read(&heartbeat).unwrap(), before);

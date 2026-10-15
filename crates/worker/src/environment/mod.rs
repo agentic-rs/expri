@@ -60,7 +60,7 @@ pub struct EnvironmentRequest {
   pub cache_dir: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PreparedEnvironment {
   pub environment_path: String,
   pub python: String,

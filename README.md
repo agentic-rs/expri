@@ -472,6 +472,45 @@ report failure. This feature does not recover a crashed or killed supervisor or
 restart training from a checkpoint. See [the upgrade guide](docs/self-hosted-service.md#live-run-supervisor-upgrades)
 for failure handling and history limits.
 
+### Continue training from a checkpoint
+
+Continue a direct, detached run on a native Linux worker with updated source or a longer training limit:
+
+```sh
+expri -T runpod runs continue run-abc123 \
+  --checkpoint outputs/checkpoint-1000.pt \
+  --reason "Extend training to 2000 steps" \
+  --request-id extend-2000 --expected-attempt 1 \
+  -- --max-steps 2000
+```
+
+The run keeps its ID, original start time, metrics, logs, and registered artifacts.
+Each task attempt records its checkpoint digest, source snapshot, command, outcome,
+and start/finish times. Running or waiting tasks stop before the replacement starts;
+completed, failed, and cancelled direct runs can also continue. Queued runs are not
+supported by this operation because their resources belong to the server scheduler.
+Active continuation requires a capable native Linux detached supervisor.
+
+The command resolves the recorded task from the current configuration (override
+with `--task`), pushes updated source, and prepares an isolated snapshot/environment
+before stopping the previous task. `--no-push` uses the checkout already on the
+worker. Arguments after `--` append to the configured command. The task must load
+the immutable checkpoint path provided in `EXPRI_RESUME_CHECKPOINT`; expri does not
+guess framework-specific loading arguments. Use a finalized checkpoint beneath
+the run's `outputs/` directory.
+
+Use the updated Python metrics helper in continued tasks. Its first local step
+maps to the previous history's maximum step plus one, and later steps retain their
+relative spacing. Rows retain `local_step` and `attempt` provenance; timestamps
+remain the actual observation times. Parameters can change between attempts and
+are saved separately under `outputs/attempts/<attempt>/params.json`. Direct JSONL
+writers must use global steps themselves; `EXPRI_STEP_OFFSET` provides the next
+global step and `EXPRI_ATTEMPT` identifies the attempt. Checkpoint loading never
+invents missing measurements or fills the time between attempts.
+
+Retry an interrupted request with the same `--request-id` and arguments. The
+recorded attempt guard prevents a stale request from replacing a later task.
+
 ## Run records and selective fetching
 
 List local runs or inspect the configured target directly:
@@ -589,7 +628,8 @@ expri -T runpod runs compare run-abc123 run-def456 --cached --metric train/loss
 ```
 
 `runs fetch --metrics` selects metadata, `outputs/metrics.jsonl`, and
-`outputs/params.json`. Combine it with `--outputs` or `--artifact` when additional
+the current attempt's parameter file (`outputs/params.json` for the first attempt,
+or `outputs/attempts/<attempt>/params.json` after continuation). Combine it with `--outputs` or `--artifact` when additional
 files are needed. Selective fetches retain artifacts downloaded earlier. Online
 inspection ignores retained metric files absent from the current remote
 selection; cached inspection reads the retained files. Recorded status in a

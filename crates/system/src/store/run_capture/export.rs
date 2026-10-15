@@ -9,6 +9,37 @@ impl LocalStore {
     run_id: &str,
     start_ms: i64,
   ) -> Result<String> {
+    self.begin_capture(run_dir, run_id, start_ms, false, None)
+  }
+
+  pub fn begin_run_capture_segment(
+    &mut self,
+    run_dir: &Path,
+    run_id: &str,
+    start_ms: i64,
+  ) -> Result<String> {
+    self.begin_capture(run_dir, run_id, start_ms, true, None)
+  }
+
+  pub fn begin_run_capture_segment_reserved(
+    &mut self,
+    run_dir: &Path,
+    run_id: &str,
+    start_ms: i64,
+    capture_id: &str,
+  ) -> Result<String> {
+    validate_component(capture_id)?;
+    self.begin_capture(run_dir, run_id, start_ms, true, Some(capture_id))
+  }
+
+  fn begin_capture(
+    &mut self,
+    run_dir: &Path,
+    run_id: &str,
+    start_ms: i64,
+    append: bool,
+    reserved: Option<&str>,
+  ) -> Result<String> {
     validate_component(run_id)?;
     if start_ms < 0 {
       return Err(rejection(400, "invalid run capture start"));
@@ -42,52 +73,72 @@ impl LocalStore {
         "run capture directory has a different identity",
       ));
     }
-    let capture_id = format!("capture-{}", uuid::Uuid::new_v4().simple());
+    let capture_id = reserved
+      .map(str::to_owned)
+      .unwrap_or_else(|| format!("capture-{}", uuid::Uuid::new_v4().simple()));
     // Exclusive reservation precedes any registration. Existing user files are
     // never opened for writing or removed, even if they happen to be empty.
-    let mut file = open_stream(&run_dir, true)?;
-    let file_identity = identity(&file)?;
-    line(
-      &mut file,
-      &RunSystemRecord::Capture {
-        schema_version: RUN_SYSTEM_SCHEMA_VERSION,
-        capture_id: capture_id.clone(),
-        machine_id: self.machine_id().into(),
-        start_ms,
-      },
-    )?;
-    file.sync_all()?;
-    File::open(run_dir.join("outputs"))?.sync_all()?;
-    let file_offset = file.metadata()?.len();
-    let mut checkpoint_options = OpenOptions::new();
-    checkpoint_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-      use std::os::unix::fs::OpenOptionsExt;
-      checkpoint_options.mode(0o600);
+    let _stream_lease = match lock::try_lock_file(&run_dir.join(LEASE), true)? {
+      LockAttempt::Acquired(lease) => lease,
+      _ => return Err(rejection(409, "run system exporter is busy")),
+    };
+    let exists = run_dir.join(RUN_SYSTEM_PATH).try_exists()?;
+    if !(append && exists) && fs::symlink_metadata(run_dir.join(CHECKPOINT)).is_ok() {
+      return Err(rejection(409, "run system checkpoint already exists"));
     }
-    let mut checkpoint = checkpoint_options.open(run_dir.join(CHECKPOINT))?;
-    serde_json::to_writer(
-      &mut checkpoint,
-      &Checkpoint {
-        capture_id: capture_id.clone(),
-        file_identity: file_identity.clone(),
-        committed_bytes: file_offset,
-        closed: false,
-      },
-    )?;
-    checkpoint.sync_all()?;
-    File::open(&run_dir)?.sync_all()?;
+    let mut file = open_stream(&run_dir, !(append && exists))?;
+    let file_identity = identity(&file)?;
+    let segment_offset = if append && exists {
+      let checkpoint: Checkpoint =
+        serde_json::from_slice(&bounded_file(&run_dir.join(CHECKPOINT), 16 * 1024)?)?;
+      if !checkpoint.closed
+        || checkpoint.file_identity != file_identity
+        || checkpoint.committed_bytes != file.metadata()?.len()
+      {
+        return Err(rejection(
+          409,
+          "previous run system segment is not fully closed",
+        ));
+      }
+      let old = capture(&self.connection, &checkpoint.capture_id)?;
+      if !old.closed || old.run_dir != run_dir || old.end_ms.is_none_or(|end| end > start_ms) {
+        return Err(rejection(
+          409,
+          "run system continuation overlaps or precedes its previous segment",
+        ));
+      }
+      file.seek(SeekFrom::End(0))?
+    } else {
+      0
+    };
+    let header = RunSystemRecord::Capture {
+      schema_version: RUN_SYSTEM_SCHEMA_VERSION,
+      capture_id: capture_id.clone(),
+      machine_id: self.machine_id().into(),
+      start_ms,
+    };
+    header.validate()?;
+    let file_offset = segment_offset + serde_json::to_vec(&header)?.len() as u64 + 1;
     let machine_id = self.machine_id().to_owned();
     let transaction = sql(
       self
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate),
     )?;
-    sql(transaction.execute("INSERT INTO system_run_captures(capture_id,machine_id,run_id,run_dir,start_ms,file_offset,file_identity) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![capture_id, machine_id, run_id, run_dir.to_string_lossy(), start_ms, file_offset, file_identity]))?;
+    sql(transaction.execute("INSERT INTO system_run_captures(capture_id,machine_id,run_id,run_dir,start_ms,file_offset,file_identity,segment_offset,header_pending) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1)", params![capture_id, machine_id, run_id, run_dir.to_string_lossy(), start_ms, file_offset, file_identity,segment_offset]))?;
+    sql(transaction.execute(
+      "UPDATE system_run_captures SET metadata_saved=1 WHERE run_dir=?1 AND closed=1",
+      [run_dir.to_string_lossy().as_ref()],
+    ))?;
     check_support(&transaction, &machine_id)?;
     backfill(&transaction, &capture_id)?;
     sql(transaction.commit())?;
+    // Registration journals the exact next header before it can become visible
+    // in the canonical stream. A crash or I/O failure can be repaired by any
+    // later exporter without invalidating or guessing an earlier segment.
+    let row = capture(&self.connection, &capture_id)?;
+    let _ = self.materialize_capture_header(&mut file, &row);
+    drop(_stream_lease);
     // Registration is already durable. A transient exporter error must not
     // orphan the capture by withholding its identity from run metadata.
     let _ = self.export_run_capture(&capture_id);
@@ -121,6 +172,11 @@ impl LocalStore {
 
   pub fn export_run_capture(&mut self, capture_id: &str) -> Result<bool> {
     let row = capture(&self.connection, capture_id)?;
+    self.export_capture_from(row)
+  }
+
+  pub(super) fn export_capture_from(&mut self, row: Capture) -> Result<bool> {
+    let capture_id = row.capture_id.clone();
     let lease_path = row.run_dir.join(LEASE);
     let _lease = match lock::try_lock_file(&lease_path, true)? {
       LockAttempt::Acquired(lease) => lease,
@@ -132,7 +188,12 @@ impl LocalStore {
         .connection
         .transaction_with_behavior(TransactionBehavior::Deferred),
     )?;
-    let mut row = capture(&transaction, capture_id)?;
+    let mut row = capture(&transaction, &capture_id)?;
+    // This check must use the fresh row under the stream lease. A cached open
+    // row can become historical while another exporter appends its successor.
+    if row.closed {
+      return Ok(false);
+    }
     let records = {
       let mut statement = sql(transaction.prepare("SELECT sequence,inventory,sample FROM system_run_capture_samples WHERE capture_id=?1 ORDER BY sequence LIMIT ?2"))?;
       let mut query = sql(statement.query(params![capture_id, PAGE]))?;
@@ -156,6 +217,7 @@ impl LocalStore {
     sql(transaction.commit())?;
     let previous = row.clone();
     let mut file = open_stream(&row.run_dir, false)?;
+    self.materialize_capture_header(&mut file, &row)?;
     validate_file(&file, &row)?;
     file.set_len(row.file_offset)?;
     file.seek(SeekFrom::Start(row.file_offset))?;
@@ -183,7 +245,7 @@ impl LocalStore {
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate),
     )?;
-    let current = capture(&transaction, capture_id)?;
+    let current = capture(&transaction, &capture_id)?;
     if current.file_offset != previous.file_offset
       || current.file_identity != previous.file_identity
       || current.end_ms != previous.end_ms
@@ -210,6 +272,48 @@ impl LocalStore {
     sql(transaction.commit())?;
     save_checkpoint(&row)?;
     Ok(last_sequence.is_some())
+  }
+
+  fn materialize_capture_header(&self, file: &mut File, row: &Capture) -> Result<()> {
+    if !row.header_pending {
+      return Ok(());
+    }
+    let mut expected = serde_json::to_vec(&RunSystemRecord::Capture {
+      schema_version: RUN_SYSTEM_SCHEMA_VERSION,
+      capture_id: row.capture_id.clone(),
+      machine_id: row.machine_id.clone(),
+      start_ms: row.start_ms,
+    })?;
+    expected.push(b'\n');
+    let length = file.metadata()?.len();
+    if identity(file)? != row.file_identity
+      || row.file_offset != row.segment_offset + expected.len() as u64
+      || length < row.segment_offset
+      || length > row.file_offset
+    {
+      return Err(rejection(
+        409,
+        "pending capture header no longer matches its reserved stream",
+      ));
+    }
+    file.seek(SeekFrom::Start(row.segment_offset))?;
+    let mut partial = Vec::new();
+    file.read_to_end(&mut partial)?;
+    if !expected.starts_with(&partial) {
+      return Err(rejection(
+        409,
+        "pending capture header has unexpected bytes",
+      ));
+    }
+    file.write_all(&expected[partial.len()..])?;
+    file.sync_all()?;
+    File::open(row.run_dir.join("outputs"))?.sync_all()?;
+    save_checkpoint(row)?;
+    sql(self.connection.execute(
+      "UPDATE system_run_captures SET header_pending=0 WHERE capture_id=?1 AND header_pending=1",
+      [&row.capture_id],
+    ))?;
+    Ok(())
   }
 
   pub(super) fn finish_capture(

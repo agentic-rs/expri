@@ -182,11 +182,42 @@ fn capture(
   db: &Connection,
   scope: &RunScope,
   producer: OutputProducer,
+  file: &FileRecord,
 ) -> ApiResult<AssetProvenance> {
-  let state = tracking::captured_document(directory, db, scope, "run-state.json")?;
-  let snapshot = tracking::captured_document(directory, db, scope, "snapshot.json")?;
-  let environment =
-    tracking::captured_document(directory, db, scope, "environment/environment-state.json")?;
+  let run = tracking::captured_document(directory, db, scope, "run-state.json")?;
+  let inventory =
+    tracking::captured_document(directory, db, scope, crate::run_artifacts::INVENTORY_PATH)?;
+  let attempt = registered_attempt(&inventory, &producer.path, file);
+  let entries = run["task_attempts"]["attempts"].as_array();
+  let continued = run["publication_epoch"]
+    .as_u64()
+    .is_some_and(|epoch| epoch > 0)
+    || run.get("task_attempts").is_some_and(|history| {
+      history["current_attempt"] != 1
+        || entries.is_none_or(|entries| entries.len() != 1 || entries[0]["attempt"] != 1)
+    });
+  let recorded =
+    attempt.and_then(|attempt| entries?.iter().find(|entry| entry["attempt"] == attempt));
+  // An unregistered artifact has no proven relationship to the latest task.
+  // Preserve only its exact run/path identity once multiple attempts exist.
+  let known = recorded.is_some() || (!continued && attempt.is_none_or(|attempt| attempt == 1));
+  let (state, snapshot, environment) = if known {
+    let snapshot_path = attempt
+      .filter(|attempt| *attempt > 1)
+      .map(|attempt| format!("outputs/attempts/{attempt}/snapshot.json"))
+      .unwrap_or_else(|| "snapshot.json".into());
+    let environment_path = attempt
+      .filter(|attempt| *attempt > 1)
+      .map(|attempt| format!("outputs/attempts/{attempt}/environment-state.json"))
+      .unwrap_or_else(|| "environment/environment-state.json".into());
+    (
+      recorded.unwrap_or(&run).clone(),
+      tracking::captured_document(directory, db, scope, &snapshot_path)?,
+      tracking::captured_document(directory, db, scope, &environment_path)?,
+    )
+  } else {
+    (Value::Null, Value::Null, Value::Null)
+  };
   // Never retain command arguments, filesystem paths, inventories, URLs, or arbitrary metadata.
   let mut safe_snapshot = scalar_fields(&snapshot, &["schema_version", "created_at"]);
   if safe_snapshot.is_object() {
@@ -200,21 +231,28 @@ fn capture(
       ],
     );
   }
+  let mut safe_state = scalar_fields(
+    &state,
+    &[
+      "schema_version",
+      "task",
+      "status",
+      "started_at",
+      "finished_at",
+      "exit_code",
+      "task_exit_code",
+    ],
+  );
+  if known
+    && let Some(attempt) = attempt
+    && safe_state.is_object()
+  {
+    safe_state["task_attempt"] = json!(attempt);
+  }
   Ok(AssetProvenance {
     producer,
     captured_at: chrono::Utc::now().to_rfc3339(),
-    state: scalar_fields(
-      &state,
-      &[
-        "schema_version",
-        "task",
-        "status",
-        "started_at",
-        "finished_at",
-        "exit_code",
-        "task_exit_code",
-      ],
-    ),
+    state: safe_state,
     snapshot: safe_snapshot,
     environment: scalar_fields(
       &environment,
@@ -227,6 +265,25 @@ fn capture(
       ],
     ),
   })
+}
+
+fn registered_attempt(inventory: &Value, path: &str, file: &FileRecord) -> Option<u64> {
+  let entries = inventory["files"].as_array()?;
+  if inventory["schema_version"] != 1 || entries.len() > crate::run_artifacts::FILE_LIMIT {
+    return None;
+  }
+  let mut matching = entries.iter().filter(|entry| {
+    entry["path"] == path
+      && entry["size"].as_u64() == Some(file.size)
+      && entry["sha256"].as_str() == file.sha256.as_deref()
+  });
+  let entry = matching.next()?;
+  if matching.next().is_some() {
+    return None;
+  }
+  entry["task_attempt"]
+    .as_u64()
+    .filter(|attempt| *attempt > 0 && *attempt <= expri_core::protocol::MAX_TASK_ATTEMPTS as u64)
 }
 
 impl<S: ObjectStorage> Store<S> {
@@ -360,7 +417,7 @@ impl<S: ObjectStorage> Store<S> {
       return Err(ApiError::new(409, "input has an active transfer"));
     }
     record.target = target;
-    record.provenance = Some(capture(&self.directory, &tx, &scope, producer)?);
+    record.provenance = Some(capture(&self.directory, &tx, &scope, producer, &record)?);
     tx.execute(
       "INSERT INTO files(target,record,object_key,sequence) VALUES(?1,?2,?3,?4)",
       params![

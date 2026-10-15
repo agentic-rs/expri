@@ -3,6 +3,9 @@ use std::path::PathBuf;
 
 use crate::config::{EnvironmentConfig, RunServiceConfig};
 
+/// Bound retained source, checkpoint and capture provenance for a logical run.
+pub const MAX_TASK_ATTEMPTS: usize = 100;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SetupStep {
@@ -34,7 +37,7 @@ pub struct SetupRequest {
   pub environment: Option<EnvironmentConfig>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RunRequest {
   pub name: String,
   pub command: Vec<String>,
@@ -53,6 +56,16 @@ pub struct RunRequest {
   pub sync_args: Vec<String>,
   #[serde(default)]
   pub expected_sync: Option<SyncIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContinueRunRequest {
+  pub request_id: String,
+  pub reason: String,
+  pub expected_attempt: Option<u64>,
+  pub checkpoint: String,
+  pub run: RunRequest,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -88,6 +101,10 @@ pub enum JobRequest {
   RestartSupervisor {
     run_id: String,
     restart: SupervisorRestartRequest,
+  },
+  Continue {
+    run_id: String,
+    continuation: Box<ContinueRunRequest>,
   },
 }
 

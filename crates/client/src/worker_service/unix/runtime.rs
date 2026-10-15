@@ -497,7 +497,7 @@ fn record_local_failure(directory: &Path) {
     state.last_error = Some("Saved publishing registration or local files could not be read or updated; restore access to the run and retry".into());
     state.retry_at_ms = registry::now() + 5_000;
     state.failures = state.failures.saturating_add(1);
-    let _ = state.save(directory);
+    let _ = state.save_if_current(directory);
   }
 }
 
@@ -505,14 +505,20 @@ fn run_slice(directory: &Path, stop: Arc<AtomicBool>, runner: &Runner) -> Result
   let job = registry::read_job(directory)?;
   let mut state = registry::read_state(directory)?;
   state.status = "publishing".into();
-  state.save(directory)?;
+  if !state.save_if_current(directory)? {
+    return Ok(());
+  }
   let mut backlog_remaining = false;
   let result = runner(&job, stop.clone(), &mut |progress| {
     // Only a fresh successful slice may request prompt continuation. Persisted
     // progress can be stale when a legacy publisher currently owns the lease.
     backlog_remaining = progress["backlog_remaining"].as_bool() == Some(true);
     state.progress = redact_value(progress, &job);
-    state.save(directory)
+    if state.save_if_current(directory)? {
+      Ok(())
+    } else {
+      Err(error("publication epoch changed during publishing slice"))
+    }
   });
   match result {
     Ok(true) => {
@@ -555,7 +561,7 @@ fn run_slice(directory: &Path, stop: Arc<AtomicBool>, runner: &Runner) -> Result
       state.failures = state.failures.saturating_add(1);
     }
   }
-  state.save(directory)
+  state.save_if_current(directory).map(|_| ())
 }
 
 fn redact_value(value: Value, job: &PreparedJob) -> Value {

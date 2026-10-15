@@ -4148,3 +4148,40 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} Overvie
   assert.equal(row.dataset.runKey, run.run_id);
   assert.equal(overviewDuration(nodes).textContent, "3s");
 });
+
+for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} checkpoint continuation keeps the selected run, original elapsed origin and previous attempt evidence`, async t => {
+  const clock = new RefreshClock(); clock.time = Date.parse("2026-10-15T01:01:05Z");
+  const source = { source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null };
+  const run = { run_id: "run-continuation", task: "train", status: "completed", started_at: "2026-10-15T01:00:00Z", finished_at: "2026-10-15T01:00:03Z", exit_code: 0 };
+  const original_start = run.started_at;
+  const first = { attempt: 1, request_id: null, reason: null, status: "completed", requested_at: null, started_at: run.started_at, finished_at: run.finished_at, exit_code: 0, previous_worker_stopped_at: null, worker_restarted: false, source: { kind: "git", git_head: "a".repeat(40) }, checkpoint: null, metric_step_offset: "0", first_local_step: null };
+  let history = { protocol_version: 1, current_attempt: 1, attempts: [first], total_count: 1, truncated: false };
+  const model = await reviewFixture(t, { hosted, sources: [source], project_runs: [run], refresh_clock: clock, override: request => request.pathname === "/api/run"
+    ? response({ ...detailRecord(source, run), state: { command: "python train.py", task_attempts: history } }) : null });
+  const { nodes } = model;
+  model.logs.stdout = "Original attempt output\n";
+  await inspect(model); await chooseAxis(nodes, "elapsed");
+  await click(nodes.get("review-tab-overview"));
+  const panel = nodes.get("run-detail").querySelector(".task-attempt-history"), row = nodes.get("run-rows").children[0], preview = nodes.get("chart-preview");
+  assert.ok(panel); assert.equal(overviewDuration(nodes).textContent, "3s");
+  panel.open = true;
+  const next = { ...first, attempt: 2, request_id: "continue-2", reason: "Extend steps", status: "running", requested_at: "2026-10-15T01:01:00Z", started_at: "2026-10-15T01:01:02Z", finished_at: null, exit_code: null, worker_restarted: true, previous_worker_stopped_at: first.finished_at, source: { kind: "git", git_head: "b".repeat(40) }, checkpoint: { name: "checkpoint.pt", relative_path: "outputs/checkpoint.pt", sha256: "c".repeat(64), size: "100" }, metric_step_offset: "101" };
+  history = { ...history, current_attempt: 2, attempts: [first, next], total_count: 2 };
+  Object.assign(run, { status: "running", finished_at: null, exit_code: null });
+  model.logs.stdout += "Continued attempt output\n";
+  await click(nodes.get("refresh-button"));
+  await settled(() => panel.querySelector("summary").textContent.includes("Current 2"));
+  assert.equal(nodes.get("run-detail").querySelector(".task-attempt-history"), panel); assert.equal(panel.open, true);
+  assert.equal(nodes.get("run-rows").children[0], row); assert.equal(row.dataset.runKey, run.run_id);
+  assert.equal(nodes.get("review-title").textContent, run.run_id); assert.equal(nodes.get("chart-preview"), preview);
+  assert.equal(selectedAxis(nodes), "elapsed"); assert.equal(run.started_at, original_start);
+  assert.equal(overviewDuration(nodes).textContent, "1m 5s");
+  assert.ok([...nodes.get("run-detail").querySelectorAll("h3")].some(node => node.textContent === "Parameters · Attempt 2"));
+  const records = panel.querySelectorAll("li");
+  assert.match(records[0].textContent, /Attempt 2 · Current.*running/);
+  assert.match(records[0].textContent, /Worker restarted · Restart gap 59 s/);
+  assert.match(records[1].textContent, /Attempt 1.*completed.*Exit 0/);
+  await click(nodes.get("review-tab-logs"));
+  await settled(() => nodes.get("log-output").textContent.includes("Continued attempt output"));
+  assert.match(nodes.get("log-output").textContent, /Original attempt output\nContinued attempt output/);
+});

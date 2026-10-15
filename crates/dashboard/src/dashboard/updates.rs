@@ -99,6 +99,11 @@ pub fn local_run(runs_dir: &Path, run_id: &str) -> Result<RunUpdate> {
     .map(|path| fixed_revision(&run_dir, path))
     .collect::<Result<Vec<_>>>()?;
   metadata_revision.push(fixed_revision(&run_dir, "pull-state.json")?);
+  if let Ok(current_params) = expri_runs::metrics::parameters_path(runs_dir, run_id)
+    && current_params != "outputs/params.json"
+  {
+    metadata_revision.push(fixed_revision(&run_dir, &current_params)?);
+  }
   // A bounded output inventory detects checkpoint additions/removals and size
   // changes without reading their contents. This is only a refresh hint.
   use std::hash::{Hash, Hasher};

@@ -63,7 +63,10 @@ fn execute_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<Option<serde_json::Value>> {
-  let native = if matches!(request, JobRequest::RestartSupervisor { .. }) {
+  let native = if matches!(request, JobRequest::Continue { .. }) {
+    require_continuation(remote, preference, node_bin)?;
+    true
+  } else if matches!(request, JobRequest::RestartSupervisor { .. }) {
     require_supervisor_restart(remote, preference, node_bin)?;
     true
   } else {
@@ -77,6 +80,54 @@ fn execute_with_preference(
     let bytes = remote.capture_bytes(&with_profile(&command))?;
     Ok(Some(parse_report(&bytes)?))
   }
+}
+
+pub fn check_continuation_target(
+  target: &TargetConfig,
+  control_path: &str,
+  control_persist: &str,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
+  let preference = ProtocolPreference::parse(target.protocol.as_deref())?;
+  let remote = Remote::new(
+    target.clone(),
+    control_path.into(),
+    control_persist.into(),
+    false,
+    verbosity,
+    quiet,
+  )?;
+  remote.connect()?;
+  require_continuation(
+    &remote,
+    preference,
+    target.node_bin.as_deref().unwrap_or("expri"),
+  )
+}
+
+fn require_continuation(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  if preference == ProtocolPreference::Python {
+    return Err(ExpriError::Message(
+      "task continuation requires a native worker; upgrade expri on the target".into(),
+    ));
+  }
+  let capability = crate::node::cli::TASK_CONTINUATION_CAPABILITY;
+  if !remote.execute_success(&format!(
+    "cd {} && {} node capabilities --has {}",
+    remote.quoted_remote_dir(),
+    shell::quote(node_bin),
+    shell::quote(capability),
+  ))? {
+    return Err(ExpriError::Message(format!(
+      "task continuation requires {capability}; upgrade expri on the target before continuing a run"
+    )));
+  }
+  Ok(())
 }
 
 fn select_native(remote: &Remote, preference: ProtocolPreference, node_bin: &str) -> Result<bool> {
@@ -142,9 +193,12 @@ fn job_command(
       shell::quote(node_bin)
     ))
   } else {
-    if matches!(request, JobRequest::RestartSupervisor { .. }) {
+    if matches!(
+      request,
+      JobRequest::RestartSupervisor { .. } | JobRequest::Continue { .. }
+    ) {
       return Err(ExpriError::Message(
-        "supervisor restart cannot use the Python fallback".into(),
+        "supervisor restart and task continuation cannot use the Python fallback".into(),
       ));
     }
     Ok(python_command(remote, &python_jobs_script(request)?))

@@ -275,6 +275,8 @@ def execute_worker(payload, context):
         child_env.update(UV_PROJECT_ENVIRONMENT=prepared["environment_path"], PYTHONNOUSERSITE="1",
                          EXPRI_RUN_ID=snapshot["run_id"], EXPRI_RUN_DIR=str(run_dir),
                          EXPRI_OUTPUT_DIR=str(run_dir / "outputs"))
+        for key in ["EXPRI_ATTEMPT", "EXPRI_STEP_OFFSET", "EXPRI_RESUME_CHECKPOINT"]:
+          child_env.pop(key, None)
         result = logs.run(["uv", "run", "--no-sync", "--no-env-file", "--", *request["command"]],
                           cwd=snapshot["code_dir"], env=child_env,
                           on_started=lambda: _lifecycle_write_json(state_path, {"task_started_at": _lifecycle_now()}))

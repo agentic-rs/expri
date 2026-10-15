@@ -6,6 +6,8 @@ use crate::context::CommandContext;
 use crate::error::{ExpriError, Result};
 use crate::{controller, protocol, runs};
 
+mod continuation;
+
 #[derive(Debug, Args)]
 pub struct RunsCommand {
   #[command(subcommand)]
@@ -30,6 +32,8 @@ enum RunsSubcommand {
   Cancel(RunsJobCommand),
   /// Upgrade a supported detached supervisor while its task keeps running.
   RestartSupervisor(RunsRestartSupervisorCommand),
+  /// Continue a run from a checkpoint with updated source and another task attempt.
+  Continue(continuation::ContinueCommand),
   /// Fetch and inspect a run's scalar metrics and experiment parameters.
   Metrics(crate::metrics_cli::MetricsCommand),
   /// Compare scalar metrics across runs, with an optional local chart.
@@ -152,6 +156,9 @@ struct RunsFetchCommand {
 
 pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let (options, cached, request, dry_run) = match command.command {
+    RunsSubcommand::Continue(command) => {
+      return continuation::run(command, target, verbosity, quiet);
+    }
     RunsSubcommand::SetStatus(command) => {
       if target.is_some() {
         return Err(ExpriError::Message(

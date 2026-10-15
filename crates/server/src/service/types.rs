@@ -49,6 +49,8 @@ pub struct MachineAuth {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct ArchiveSnapshot {
   pub scope: RunScope,
+  #[serde(default)]
+  pub publication_epoch: u64,
   pub files: Vec<FileRecord>,
   pub incomplete: bool,
 }

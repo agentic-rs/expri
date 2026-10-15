@@ -124,6 +124,12 @@ pub fn prepare_request_at_with_initializer(
   if request.smoke {
     state["smoke"] = json!(true);
   }
+  #[cfg(target_os = "linux")]
+  if request.detach {
+    // Before task launch there is no task group to recover. The detached pump
+    // clears this as soon as it owns a spawned child.
+    state["task_process_group_clean"] = json!(true);
+  }
   if service_unavailable {
     state["worker_service_error"] =
       json!("Worker service could not become ready; local training continues");
@@ -326,7 +332,14 @@ fn execute_snapshot(
       .env("EXPRI_RUN_ID", &snapshot.run_id)
       .env("EXPRI_RUN_DIR", &snapshot.run_dir)
       .env("EXPRI_OUTPUT_DIR", snapshot.run_dir.join("outputs"));
-    command.env_remove("EXPRI_INPUT_DIR");
+    for field in [
+      "EXPRI_INPUT_DIR",
+      "EXPRI_ATTEMPT",
+      "EXPRI_STEP_OFFSET",
+      "EXPRI_RESUME_CHECKPOINT",
+    ] {
+      command.env_remove(field);
+    }
     let on_started = || {
       expri_core::run_state::update_state(&state_path, |current| {
         current["task_started_at"] = json!(chrono::Utc::now().to_rfc3339());
@@ -353,7 +366,17 @@ fn execute_snapshot(
     };
     #[cfg(not(target_os = "linux"))]
     let output = logs.task_with_started(&mut command, on_started)?;
-    task_result(output, &mut state, &argv[0])
+    let program = read_record(&state_path, expri_core::run_state::MAX_STATE_BYTES as u64)
+      .ok()
+      .and_then(|current| {
+        current["command"]
+          .as_array()?
+          .first()?
+          .as_str()
+          .map(str::to_owned)
+      })
+      .unwrap_or_else(|| argv[0].clone());
+    task_result(output, &mut state, &program)
   })();
   cancelled |= logs_created.as_ref().is_some_and(RunLogs::was_cancelled);
   cleanup_uncertain |= logs_created
@@ -399,6 +422,18 @@ fn finalize_snapshot(
   cleanup_uncertain: bool,
 ) -> Result<()> {
   let state_path = snapshot.run_dir.join("run-state.json");
+  // A continuation can replace the task and capture while the original
+  // execution frame is still alive. Only carry its final output into the latest
+  // authoritative metadata; its old snapshot must not restore prior attempts.
+  let task_exit_code = state.get("task_exit_code").cloned();
+  let logging_error = state.get("logging_error").cloned();
+  state = read_record(&state_path, 256 * 1024)?;
+  if let Some(exit_code) = task_exit_code {
+    state["task_exit_code"] = exit_code;
+  }
+  if let Some(error) = logging_error {
+    state["logging_error"] = error;
+  }
   // Restart events are updated independently of this execution snapshot.
   state
     .as_object_mut()
@@ -406,6 +441,7 @@ fn finalize_snapshot(
     .remove("supervisor");
   if cleanup_uncertain {
     state["queue_cleanup_uncertain"] = json!(true);
+    state["task_process_group_clean"] = json!(false);
   }
   if worker {
     match regular_cancel_request(&snapshot.run_dir) {
@@ -434,7 +470,75 @@ fn finalize_snapshot(
   } else {
     state["exit_code"] = json!(0);
   }
-  write_state(&state_path, &state)?;
+  expri_core::run_state::update_state(&state_path, |current| {
+    for field in [
+      "status",
+      "finished_at",
+      "exit_code",
+      "error",
+      "task_exit_code",
+      "logging_error",
+      "queue_cleanup_uncertain",
+      "task_process_group_clean",
+      "system_capture_status",
+      "system_capture_error",
+    ] {
+      if let Some(value) = state.get(field) {
+        current[field] = value.clone();
+      }
+    }
+    current["system_capture_finished_at"] = state["finished_at"].clone();
+    if current.get("task_attempts").is_some() {
+      let attempt = expri_core::task_attempts::current_attempt(current)?;
+      let active = current["task_attempts"]["attempts"]
+        .as_array()
+        .and_then(|entries| entries.iter().find(|entry| entry["attempt"] == attempt))
+        .is_some_and(|entry| {
+          matches!(
+            entry["status"].as_str(),
+            Some("preparing" | "running" | "waiting")
+          )
+        });
+      if active {
+        expri_core::task_attempts::finish_attempt(
+          current,
+          attempt,
+          state["status"].as_str().unwrap(),
+          state["finished_at"].as_str().unwrap(),
+          state["exit_code"]
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok()),
+          state["error"].as_str(),
+        )?;
+        let fields: Vec<_> = [
+          "system_capture_id",
+          "machine_id",
+          "system_capture_started_at",
+          "system_capture_finished_at",
+          "system_capture_status",
+        ]
+        .into_iter()
+        .filter_map(|field| current.get(field).map(|value| (field, value.clone())))
+        .collect();
+        if let Some(entry) = current["task_attempts"]["attempts"]
+          .as_array_mut()
+          .and_then(|entries| entries.iter_mut().find(|entry| entry["attempt"] == attempt))
+        {
+          for (field, value) in fields {
+            entry[field] = value;
+          }
+          entry["system_capture_finished_at"] = state["finished_at"].clone();
+        }
+      }
+    }
+    Ok(())
+  })?;
+  if let Err(error) = crate::continuation::sync_attempt_records(&snapshot.run_dir) {
+    let _ = writeln!(
+      std::io::stderr(),
+      "warning: attempt metadata document could not be updated: {error}"
+    );
+  }
   if cancelled {
     return Err(ExpriError::CommandFailed {
       program: "cancelled run".to_string(),
@@ -475,7 +579,7 @@ pub(crate) fn finish_resumed(run_dir: &Path, output: crate::supervisor::TaskOutp
   )
 }
 
-fn prepare_assets(
+pub(crate) fn prepare_assets(
   repo_root: &Path,
   snapshot: &RunSnapshot,
   client_config: Option<&Path>,

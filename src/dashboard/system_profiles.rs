@@ -43,14 +43,33 @@ impl Dashboard {
     use expri_runs::system_metrics::{RunSystemMetrics, RunSystemWindow};
     let (_, runs_dir) = self.source(source)?;
     let summary = expri_runs::runs::summary_directory(&runs_dir, run_id)?;
-    let Some(window) = RunSystemWindow::from_state(run_id, &summary["run"]) else {
+    let run_dir = runs_dir.join(run_id);
+    let state_relative = run_dir
+      .strip_prefix(&self.repo_root)
+      .map_err(|_| ExpriError::Message("run metadata is outside the repository".into()))?
+      .join("run-state.json");
+    use std::io::Read;
+    let state =
+      if let Some(file) = super::artifacts::open_beneath(&self.repo_root, &state_relative)? {
+        let mut bytes = Vec::new();
+        file
+          .take((expri_core::run_state::MAX_STATE_BYTES + 1) as u64)
+          .read_to_end(&mut bytes)?;
+        if bytes.len() > expri_core::run_state::MAX_STATE_BYTES {
+          serde_json::Value::Null
+        } else {
+          serde_json::from_slice(&bytes).unwrap_or_default()
+        }
+      } else {
+        serde_json::Value::Null
+      };
+    let Some(window) = RunSystemWindow::from_state(run_id, &state) else {
       return Ok(RunSystemMetrics::unavailable_for_run(
         run_id,
         &summary["run"],
         "Validated run capture identity and period are unavailable.",
       ));
     };
-    let run_dir = runs_dir.join(run_id);
     let relative = run_dir
       .strip_prefix(&self.repo_root)
       .map_err(|_| ExpriError::Message("run system capture is outside the repository".into()))?
@@ -64,7 +83,6 @@ impl Dashboard {
     };
     let size = file.metadata()?.len();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    use std::io::Read;
     expri_runs::system_metrics::read(
       SystemDeadlineReader {
         reader: file.take(size),

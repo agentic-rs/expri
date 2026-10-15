@@ -114,7 +114,8 @@ pub fn set_task_status(run_dir: &Path, status: &str) -> Result<RunStatusUpdate> 
         "run supervisor is not active; task status was not changed",
       ));
     }
-    let changed = previous_status != status;
+    let attempt_changed = crate::task_attempts::set_current_phase(state, status)?;
+    let changed = previous_status != status || attempt_changed;
     state["status"] = Value::String(status.into());
     Ok(RunStatusUpdate {
       run_id,

@@ -68,6 +68,63 @@ fn summaries_use_logged_order_and_keep_sparse_metrics_and_first_tied_extrema() {
 }
 
 #[test]
+fn continued_attempt_parameters_select_current_without_replacing_original_or_metrics() {
+  let fixture = Fixture::new();
+  let raw=b"{\"step\":10,\"timestamp\":\"2026-10-03T01:00:00Z\",\"metrics\":{\"loss\":1}}\n{\"step\":11,\"local_step\":2,\"attempt\":2,\"metrics\":{\"loss\":0.5}}\n";
+  let directory = fixture.run("run-continued", raw);
+  fs::write(directory.join("outputs/params.json"), br#"{"steps":10}"#).unwrap();
+  let path = directory.join("run-state.json");
+  let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+  expri_core::task_attempts::ensure_initial(&mut state).unwrap();
+  expri_core::task_attempts::begin_attempt(&mut state,json!({"attempt":2,"request_id":"continue-2","reason":"More steps","requested_at":"2026-10-03T02:00:00Z","metric_step_offset":11})).unwrap();
+  expri_core::task_attempts::activate_attempt(&mut state, 2, "2026-10-03T02:00:01Z", 123).unwrap();
+  fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+  assert!(
+    read_parameters(&fixture.runs, "run-continued")
+      .unwrap()
+      .is_none(),
+    "old parameters must not impersonate the current attempt"
+  );
+  fs::create_dir_all(directory.join("outputs/attempts/2")).unwrap();
+  fs::write(
+    directory.join("outputs/attempts/2/params.json"),
+    br#"{"steps":20}"#,
+  )
+  .unwrap();
+  let report = read(&fixture.runs, "run-continued", &[]).unwrap();
+  assert_eq!(report.params, Some(json!({"steps":20})));
+  assert_eq!(report.metrics["loss"].summary.count, 2);
+  assert_eq!(report.metrics["loss"].points[0].step, 10);
+  assert_eq!(report.metrics["loss"].points[1].step, 11);
+  assert_eq!(
+    report.first_metric_timestamp.as_deref(),
+    Some("2026-10-03T01:00:00Z")
+  );
+  assert_eq!(
+    fs::read(directory.join("outputs/params.json")).unwrap(),
+    br#"{"steps":10}"#
+  );
+  assert_eq!(
+    fs::read(directory.join("outputs/metrics.jsonl")).unwrap(),
+    raw
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn continued_attempt_parameter_parents_cannot_redirect_to_private_files() {
+  use std::os::unix::fs::symlink;
+  let fixture = Fixture::new();
+  let directory = fixture.run("run-symlink", b"");
+  let outside = directory.join("private");
+  fs::create_dir(&outside).unwrap();
+  fs::write(outside.join("params.json"), br#"{"secret":true}"#).unwrap();
+  fs::create_dir(directory.join("outputs/attempts")).unwrap();
+  symlink(&outside, directory.join("outputs/attempts/2")).unwrap();
+  assert!(open_output(&directory, "attempts/2/params.json").is_err());
+}
+
+#[test]
 fn malformed_middle_and_partial_final_rows_preserve_valid_events_and_report_lines() {
   let fixture = Fixture::new();
   fixture.run(

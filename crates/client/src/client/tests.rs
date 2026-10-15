@@ -13,6 +13,8 @@ use super::*;
 
 mod asset_imports;
 mod checkpoints;
+mod continuation;
+mod owner_epoch;
 
 pub(crate) struct HttpRequest {
   pub(crate) path: String,
@@ -1738,8 +1740,15 @@ fn explicit_file_upload_reuses_completed_objects_even_without_a_local_queue() {
   );
   let expected = target.clone();
   let hash = digest.clone();
-  let (url, task) = mock(1, move |request, _| {
+  let (url, task) = mock(2, move |request, _| {
     let request: Request = serde_json::from_slice(&request.body).unwrap();
+    if matches!(request, Request::Capabilities) {
+      return (
+        200,
+        vec![],
+        serde_json::to_vec(&Response::Capabilities { features: vec![] }).unwrap(),
+      );
+    }
     assert!(matches!(request, Request::GetFile { target } if target == expected));
     (
       200,
@@ -1788,8 +1797,15 @@ fn explicit_file_upload_rejects_changes_while_checking_for_reuse() {
     );
     let expected = target.clone();
     let changed = path.clone();
-    let (url, task) = mock(1, move |request, _| {
+    let (url, task) = mock(2, move |request, _| {
       let request: Request = serde_json::from_slice(&request.body).unwrap();
+      if matches!(request, Request::Capabilities) {
+        return (
+          200,
+          vec![],
+          serde_json::to_vec(&Response::Capabilities { features: vec![] }).unwrap(),
+        );
+      }
       assert!(matches!(request, Request::GetFile { target } if target == expected));
       if replace {
         let replacement = changed.with_extension("replacement");

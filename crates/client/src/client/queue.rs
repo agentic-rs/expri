@@ -52,6 +52,8 @@ pub(super) struct QueueState {
   pub(super) documents: BTreeMap<String, SavedDocument>,
   #[serde(default)]
   pub(super) archive: Option<ArchiveRecord>,
+  #[serde(default)]
+  pub(super) archive_history: Vec<ArchiveRecord>,
 }
 
 pub(super) struct Queue {
@@ -92,6 +94,7 @@ impl Queue {
         run_system_capture: false,
         documents: BTreeMap::new(),
         archive: None,
+        archive_history: Vec::new(),
       }
     };
     let queue = Self {

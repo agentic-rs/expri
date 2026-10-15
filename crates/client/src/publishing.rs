@@ -1,6 +1,8 @@
 //! Durable run registration and bounded publishing slices for the worker service.
 mod job;
-pub use job::{PreparedJob, prepare, prepare_manual, run_job};
+pub use job::{
+  PreparedJob, begin_attempt, check_attempt_support, prepare, prepare_manual, run_job,
+};
 
 /// Join this service's cancelled object transfers before releasing its lease.
 pub fn drain_jobs(stop: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<()> {

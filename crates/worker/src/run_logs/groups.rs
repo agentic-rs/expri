@@ -1,11 +1,11 @@
-//! Queue-only process-group cleanup. The direct child stays unreaped throughout.
+//! Owned process-group cleanup. The direct child stays unreaped throughout.
 
 use std::io;
 use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(super) fn stop(child: &mut Child) -> io::Result<()> {
+pub(crate) fn stop(child: &mut Child) -> io::Result<()> {
   #[cfg(unix)]
   {
     stop_pid(child.id())
@@ -37,7 +37,7 @@ pub(crate) fn stop_pid(pid: u32) -> io::Result<()> {
     if Instant::now() >= deadline {
       return Err(io::Error::new(
         io::ErrorKind::TimedOut,
-        "queued process-group cleanup could not confirm all members stopped",
+        "task process-group cleanup could not confirm all members stopped",
       ));
     }
     thread::sleep(Duration::from_millis(25));
@@ -89,7 +89,7 @@ pub(crate) fn verify_parent() -> io::Result<()> {
   }
   if disposition.sa_sigaction != libc::SIG_DFL || disposition.sa_flags & libc::SA_NOCLDWAIT != 0 {
     return Err(io::Error::other(
-      "queued cleanup requires default SIGCHLD handling so child IDs remain reserved",
+      "task cleanup requires default SIGCHLD handling so child IDs remain reserved",
     ));
   }
   Ok(())
@@ -99,7 +99,7 @@ pub(crate) fn verify_parent() -> io::Result<()> {
 pub(super) fn verify_parent() -> io::Result<()> {
   Err(io::Error::new(
     io::ErrorKind::Unsupported,
-    "queued process-group verification requires Unix",
+    "task process-group verification requires Unix",
   ))
 }
 
@@ -128,7 +128,7 @@ fn has_live_members(group_id: u32, leader_id: u32) -> io::Result<bool> {
     };
     let Some((state, group)) = linux_group_state(&stat) else {
       return Err(io::Error::other(
-        "cannot inspect queued process-group membership",
+        "cannot inspect task process-group membership",
       ));
     };
     if group == group_id && !matches!(state, "Z" | "X" | "x") {
@@ -200,9 +200,7 @@ fn has_live_members(group_id: u32, leader_id: u32) -> io::Result<bool> {
       if error.raw_os_error() == Some(libc::ESRCH) {
         continue;
       }
-      return Err(io::Error::other(
-        "cannot inspect queued process-group member",
-      ));
+      return Err(io::Error::other("cannot inspect task process-group member"));
     }
     if info.pbi_pgid == group_id && info.pbi_status != libc::SZOMB {
       return Ok(true);
@@ -215,7 +213,7 @@ fn has_live_members(group_id: u32, leader_id: u32) -> io::Result<bool> {
 fn has_live_members(_: u32, _: u32) -> io::Result<bool> {
   Err(io::Error::new(
     io::ErrorKind::Unsupported,
-    "queued process-group verification requires Linux or macOS",
+    "task process-group verification requires Linux or macOS",
   ))
 }
 

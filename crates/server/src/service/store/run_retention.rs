@@ -421,7 +421,13 @@ impl<S: ObjectStorage> Store<S> {
       )
       .map_err(database)?;
     }
-    for table in ["tracking_run_seals", "result_archives"] {
+    for table in [
+      "tracking_run_seals",
+      "tracking_run_epochs",
+      "tracking_attempt_history",
+      "tracking_attempt_aborts",
+      "result_archives",
+    ] {
       tx.execute(&format!("DELETE FROM {table} WHERE scope=?1"), [&encoded])
         .map_err(database)?;
     }

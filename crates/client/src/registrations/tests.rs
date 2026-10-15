@@ -12,6 +12,105 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
   (temporary, root)
 }
 
+fn attempt_state(current: u64, total: u64) -> Value {
+  json!({
+    "run_id":"run-fixture", "status":"running",
+    "task_attempts": {
+      "protocol_version":1, "current_attempt":current,
+      "attempts":(1..=total).map(|attempt| json!({"attempt":attempt})).collect::<Vec<_>>(),
+      "total_count":total, "truncated":false,
+    },
+  })
+}
+
+fn forget_attempt(root: &Path, path: &str) {
+  let mut registry: Registry =
+    serde_json::from_slice(&std::fs::read(root.join(RECORD)).unwrap()).unwrap();
+  registry.files.get_mut(path).unwrap().task_attempt = None;
+  save(root, &registry).unwrap();
+}
+
+#[test]
+fn checkpoint_attempt_is_captured_once_and_survives_later_registrations() {
+  let (_temporary, root) = fixture();
+  std::fs::write(root.join("outputs/old.pt"), "old").unwrap();
+  let old = register(&root, "outputs/old.pt").unwrap();
+  assert_eq!(old["task_attempt"], 1);
+  fs::atomic_json(&root.join("run-state.json"), &attempt_state(2, 2)).unwrap();
+  assert_eq!(register(&root, "outputs/old.pt").unwrap(), old);
+  std::fs::write(root.join("outputs/new.pt"), "new").unwrap();
+  let new = register(&root, "outputs/new.pt").unwrap();
+  assert_eq!(new["task_attempt"], 2);
+  let files = list(&root).unwrap();
+  assert_eq!(files["files"][0]["task_attempt"], 2);
+  assert_eq!(files["files"][1]["task_attempt"], 1);
+}
+
+#[test]
+fn new_registration_waits_for_the_launch_state_lease_before_capturing_attempt() {
+  let (_temporary, root) = fixture();
+  std::fs::write(root.join("outputs/new.pt"), "checkpoint").unwrap();
+  let lease = crate::lock::run_state_lock(&root).unwrap();
+  let child_root = root.clone();
+  let (sender, receiver) = std::sync::mpsc::channel();
+  let child = std::thread::spawn(move || {
+    sender
+      .send(register(&child_root, "outputs/new.pt"))
+      .unwrap();
+  });
+  assert!(matches!(
+    receiver.recv_timeout(Duration::from_millis(50)),
+    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+  ));
+  fs::atomic_json(&root.join("run-state.json"), &attempt_state(2, 2)).unwrap();
+  drop(lease);
+  let registration = receiver
+    .recv_timeout(Duration::from_secs(2))
+    .unwrap()
+    .unwrap();
+  assert_eq!(registration["task_attempt"], 2);
+  child.join().unwrap();
+}
+
+#[test]
+fn only_the_first_explicit_reopen_migrates_legacy_checkpoint_attempts() {
+  let (_temporary, root) = fixture();
+  std::fs::write(root.join("outputs/legacy.pt"), "old").unwrap();
+  register(&root, "outputs/legacy.pt").unwrap();
+  forget_attempt(&root, "outputs/legacy.pt");
+  assert!(register(&root, "outputs/legacy.pt").unwrap()["task_attempt"].is_null());
+  // Failed preflight attempts did not launch a task or change legacy ownership.
+  fs::atomic_json(&root.join("run-state.json"), &attempt_state(1, 3)).unwrap();
+  reopen_for_attempt(&root).unwrap();
+  assert_eq!(list(&root).unwrap()["files"][0]["task_attempt"], 1);
+  fs::atomic_json(&root.join("run-state.json"), &attempt_state(3, 3)).unwrap();
+  std::fs::write(root.join("outputs/unknown.pt"), "unknown").unwrap();
+  register(&root, "outputs/unknown.pt").unwrap();
+  forget_attempt(&root, "outputs/unknown.pt");
+  reopen_for_attempt(&root).unwrap();
+  let files = list(&root).unwrap();
+  assert_eq!(files["files"][0]["task_attempt"], 1);
+  assert!(files["files"][1]["task_attempt"].is_null());
+}
+
+#[test]
+fn already_continued_legacy_registry_keeps_unknown_attempts_unknown() {
+  let (_temporary, root) = fixture();
+  std::fs::write(root.join("outputs/legacy.pt"), "unknown").unwrap();
+  register(&root, "outputs/legacy.pt").unwrap();
+  forget_attempt(&root, "outputs/legacy.pt");
+  fs::atomic_json(&root.join("run-state.json"), &attempt_state(2, 2)).unwrap();
+  reopen_for_attempt(&root).unwrap();
+  assert!(list(&root).unwrap()["files"][0]["task_attempt"].is_null());
+  let registry: Value = serde_json::from_slice(&std::fs::read(root.join(RECORD)).unwrap()).unwrap();
+  assert_eq!(registry["continuation_reopened"], true);
+  assert!(
+    registry["files"]["outputs/legacy.pt"]
+      .get("task_attempt")
+      .is_none()
+  );
+}
+
 #[test]
 fn registration_is_durable_idempotent_and_does_not_read_large_file() {
   let (_temporary, root) = fixture();

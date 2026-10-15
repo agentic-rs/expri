@@ -106,6 +106,20 @@ class RunLifecycleTests(unittest.TestCase):
     state = self.wait_terminal()
     self.assertEqual(state["status"], "completed", state)
 
+  def test_initial_task_does_not_inherit_parent_continuation_environment(self):
+    inherited = {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "900", "EXPRI_RESUME_CHECKPOINT": "/parent/checkpoint"}
+    self.request["environment"]["env"].update(inherited)
+    with patch.dict(os.environ, inherited):
+      self.start(
+        "import json, os, pathlib\n"
+        "keys = ['EXPRI_ATTEMPT', 'EXPRI_STEP_OFFSET', 'EXPRI_RESUME_CHECKPOINT']\n"
+        "pathlib.Path(os.environ['EXPRI_OUTPUT_DIR'], 'inherited.json').write_text(json.dumps({key: os.environ.get(key) for key in keys}))\n"
+      )
+      state = self.wait_terminal()
+    self.assertEqual(state["status"], "completed", state)
+    actual = json.loads((self.run / "outputs/inherited.json").read_text())
+    self.assertEqual(actual, dict.fromkeys(inherited))
+
   def test_smoke_mark_survives_python_supervision_without_local_archival(self):
     self.request["smoke"] = True
     receipt = self.start()

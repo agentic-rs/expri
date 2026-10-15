@@ -17,7 +17,23 @@ run. Outside expri, pass a directory explicitly: `MetricsLogger("outputs")`.
 The helper writes `metrics.jsonl` and `params.json` directly into that directory.
 Use the effective parameters after applying defaults and command-line overrides.
 The first `params()` call saves them; subsequent calls allow identical values and
-reject changes, including when resuming an existing run.
+reject changes within the same task attempt.
+
+For `expri runs continue`, use this version of the helper in the task's source.
+Expri sets `EXPRI_ATTEMPT` and `EXPRI_STEP_OFFSET`: the helper maps the first local
+step to the previous history's maximum global step plus one, then preserves local
+step spacing. Continued rows include `local_step` and `attempt` alongside `step`.
+The step origin is saved under `outputs/attempts/<attempt>/step-origin.json` while
+holding the metrics file lock, so separate logger instances agree on the mapping.
+Steps below that attempt's first local step and global u64 overflow are rejected
+without modifying the metric history. Attempt 1 keeps the original step behavior.
+
+Continued attempts save parameters in `outputs/attempts/<attempt>/params.json`,
+allowing a new training limit or other changed settings without overwriting the
+original parameters. Metric rows still append to the same `metrics.jsonl` file.
+The task loads its checkpoint from `EXPRI_RESUME_CHECKPOINT` using its own training
+framework. System readings and metric timestamps retain real observation times;
+the inactive interval is never backfilled with synthetic values.
 
 Each `log()` call appends one complete JSONL row and flushes it before returning.
 Rows include `schema_version: 1`, a UTC `timestamp`, `step`, and `metrics`.

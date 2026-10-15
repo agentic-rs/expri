@@ -923,6 +923,33 @@ fn registration_is_durable_private_idempotent_and_conflicts_cannot_replace_crede
 }
 
 #[test]
+fn continuation_rearm_keeps_the_job_and_rejects_an_old_slices_final_result() {
+  let (_temporary, paths, job) = fixture();
+  let registered = registry::register(&paths, job.clone()).unwrap();
+  let id = registered["job_id"].as_str().unwrap();
+  let registry = files::existing(&paths).unwrap().unwrap();
+  let directory = registry.join("jobs").join(id);
+  let mut old = registry::read_state(&directory).unwrap();
+  old.status = "publishing".into();
+  old.save(&directory).unwrap();
+  fs::write(
+    job.run_dir().join("run-state.json"),
+    br#"{"run_id":"run-fixture","status":"preparing","publication_epoch":1}"#,
+  )
+  .unwrap();
+  registry::rearm(&paths, &job).unwrap();
+  old.status = "published".into();
+  old.progress = json!({"stale":true});
+  assert!(!old.save_if_current(&directory).unwrap());
+  let new = registry::read_state(&directory).unwrap();
+  assert_eq!(new.status, "queued");
+  assert_eq!(new.publication_epoch, 1);
+  assert!(new.progress.get("stale").is_none());
+  assert!(registry::read_job(&directory).unwrap() == job);
+  assert_eq!(registry::pending(&registry).unwrap(), vec![directory]);
+}
+
+#[test]
 fn credentials_never_enter_a_source_checkout() {
   let (temporary, _, job) = fixture();
   let repo = temporary.path().join("source");
@@ -1359,6 +1386,7 @@ fn resume_uses_saved_credentials_and_rejects_ambiguous_destinations() {
     last_error: None,
     report: alternate.safe_report(),
     progress: json!({}),
+    publication_epoch: 0,
   }
   .save(&alternate_root)
   .unwrap();
@@ -1458,6 +1486,7 @@ fn saved_run_scan_isolates_unrelated_corruption_but_rejects_selected_job_corrupt
     last_error: None,
     report: job.safe_report(),
     progress: json!({}),
+    publication_epoch: 0,
   }
   .save(&selected_root)
   .unwrap();
@@ -1543,6 +1572,7 @@ fn destination_guard_uses_validated_public_binding_and_private_fallback() {
     last_error: None,
     report: job.safe_report(),
     progress: json!({}),
+    publication_epoch: 0,
   }
   .save(&first_path)
   .unwrap();

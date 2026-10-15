@@ -10,7 +10,9 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::super::types::{ClientConfig, MAX_REQUEST, Request, Response, validate_client_token};
+use super::super::types::{
+  ClientConfig, MAX_REQUEST, Request, Response, RunScope, validate_client_token, validate_scope,
+};
 use super::fs::message;
 use crate::error::{ExpriError, Result};
 
@@ -101,6 +103,7 @@ impl ResolvedClient {
 
 #[derive(Clone)]
 pub(crate) struct Api {
+  pub(crate) publication_epoch: u64,
   pub(super) endpoint: String,
   token: String,
   control: Client,
@@ -112,6 +115,43 @@ pub(crate) struct Api {
 }
 
 impl Api {
+  /// Only an explicit owner operation captures a fresh epoch. Background
+  /// publishers retain the generation that prepared their immutable work.
+  pub(super) fn capture_run_epoch(&mut self, scope: &RunScope) -> Result<()> {
+    let Response::Capabilities { features } = self.request(&Request::Capabilities)? else {
+      return Err(message(
+        "service did not return its publication capabilities",
+      ));
+    };
+    self.capture_run_epoch_if_supported(scope, &features)
+  }
+
+  pub(super) fn capture_run_epoch_if_supported(
+    &mut self,
+    scope: &RunScope,
+    features: &[String],
+  ) -> Result<()> {
+    validate_scope(scope)?;
+    if !features
+      .iter()
+      .any(|feature| feature == "run-task-continuation-v1")
+    {
+      return Ok(());
+    }
+    let Response::RunAttempt { epoch } = self.request(&Request::RunPublication {
+      scope: scope.clone(),
+    })?
+    else {
+      return Err(message(
+        "service did not return the selected run's publication epoch",
+      ));
+    };
+    if epoch > i64::MAX as u64 {
+      return Err(message("service returned an invalid run publication epoch"));
+    }
+    self.publication_epoch = epoch;
+    Ok(())
+  }
   pub(super) fn redact(&self, detail: &str) -> String {
     detail
       .replace(&self.token, "[redacted]")
@@ -140,6 +180,7 @@ impl Api {
         .map_err(|_| message("cannot initialize service HTTP client"))
     };
     Ok(Self {
+      publication_epoch: 0,
       endpoint: resolved.endpoint.clone(),
       token: resolved.token.clone(),
       control: build(Duration::from_secs(30))?,
@@ -276,7 +317,14 @@ impl Api {
 
   pub(super) fn request(&self, request: &Request) -> Result<Response> {
     self.check_cancelled()?;
-    let body = serde_json::to_vec(request)?;
+    let value = serde_json::to_value(request)?;
+    let body = if self.publication_epoch > 0 && expri_core::service::run_mutation(request) {
+      serde_json::to_vec(
+        &serde_json::json!({"action":"at_run_epoch","epoch":self.publication_epoch,"request":value}),
+      )?
+    } else {
+      serde_json::to_vec(&value)?
+    };
     if body.len() > MAX_REQUEST {
       return Err(message("service request exceeds its size limit"));
     }

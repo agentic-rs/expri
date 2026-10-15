@@ -13,9 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod pump;
-mod transport;
+pub(crate) mod transport;
 use pump::{LogPipe, pump};
-pub(crate) use pump::{TaskOutput, task};
+pub(crate) use pump::{TaskOutput, resume_task, task};
 use transport::{
   Descriptor, Inheritance, cancel_requested, exec_target, hex_digest, pinned_target, preflight,
   process_start, read_json, sealed_memfd, set_cloexec, validate_named_descriptor, write_json,
@@ -432,7 +432,10 @@ fn acknowledge_handoff(payload: &Handoff, lease: &impl AsRawFd) -> Result<bool> 
       supervisor["generation"] = json!(payload.generation);
       supervisor["target_digest"] = json!(payload.target_digest);
       Ok(())
-    })
+    })?;
+    state["task_continuation_protocol_version"] = json!(1);
+    expri_core::task_attempts::ensure_initial(state)?;
+    Ok(())
   })
   .map(|updated| updated.is_some())
 }
@@ -495,7 +498,7 @@ fn validate_restartable(run_dir: &Path, state: &Value) -> Result<()> {
   Ok(())
 }
 
-fn validate_run_directory(path: &Path) -> Result<PathBuf> {
+pub(crate) fn validate_run_directory(path: &Path) -> Result<PathBuf> {
   let absolute = std::path::absolute(path)?;
   let root = absolute
     .parent()

@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn continued_runs_show_current_attempt_parameters_without_falling_back_to_originals() {
+  let fixture = Fixture::new();
+  let id = "continued-parameters";
+  fixture.run_file(id, "outputs/params.json", br#"{"max_steps":100}"#.to_vec());
+  fixture.run_file(
+    id,
+    "outputs/attempts/2/params.json",
+    br#"{"max_steps":300}"#.to_vec(),
+  );
+  let mut state = json!({"schema_version":1,"run_id":id,"task":"train","status":"running","started_at":"2026-10-15T01:00:00Z",
+    "task_attempts":{"protocol_version":1,"current_attempt":2,"total_count":2,"truncated":false,"attempts":[{"attempt":1},{"attempt":2}]}});
+  fixture.run_file(id, "run-state.json", serde_json::to_vec(&state).unwrap());
+  let dashboard = HostedDashboard::new(&fixture.store).unwrap();
+  let scope = Fixture::scope(id);
+  let deadline = Instant::now() + REQUEST_TIMEOUT;
+  assert_eq!(
+    dashboard
+      .parameters(&scope, None, deadline)
+      .unwrap()
+      .unwrap()["max_steps"],
+    300
+  );
+  assert_eq!(
+    dashboard
+      .table_parameters(&scope, deadline)
+      .unwrap()
+      .unwrap()["max_steps"],
+    300
+  );
+  assert_eq!(
+    dashboard.detail("hosted:project:worker", id).unwrap()["params"]["max_steps"],
+    300
+  );
+  state["task_attempts"]["current_attempt"] = json!(3);
+  state["task_attempts"]["total_count"] = json!(3);
+  state["task_attempts"]["attempts"]
+    .as_array_mut()
+    .unwrap()
+    .push(json!({"attempt":3}));
+  fixture.run_file(id, "run-state.json", serde_json::to_vec(&state).unwrap());
+  assert!(
+    dashboard
+      .parameters(&scope, None, deadline)
+      .unwrap()
+      .is_none()
+  );
+  assert!(
+    dashboard
+      .table_parameters(&scope, deadline)
+      .unwrap()
+      .is_none()
+  );
+}
+
+#[test]
 fn project_run_rows_retain_errors_after_aggregate_truncation_and_separate_origins() {
   let fixture = Fixture::new();
   let put_state = |origin: &str, id: &str, task: Value, started_at: Value| {

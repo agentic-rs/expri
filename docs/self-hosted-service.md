@@ -86,9 +86,9 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 9. Older binaries
-refuse that directory because they cannot preserve durable queue allocations,
-worker fencing, smoke archival, asset provenance, and run retention. Back up the entire
+Opening this version upgrades the SQLite schema to version 10. Older binaries
+refuse that directory because they cannot preserve task-attempt publication fences,
+durable queue allocations, worker fencing, smoke archival, asset provenance, and run retention. Back up the entire
 service directory before upgrading; restoring that backup is required for a
 backend downgrade. Existing S3 runs remain readable after the upgrade.
 

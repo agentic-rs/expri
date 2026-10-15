@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS system_run_captures (
   closed INTEGER NOT NULL DEFAULT 0,
   complete INTEGER NOT NULL DEFAULT 0,
   file_offset INTEGER NOT NULL,
+  segment_offset INTEGER NOT NULL DEFAULT 0,
+  header_pending INTEGER NOT NULL DEFAULT 0,
   file_identity TEXT NOT NULL,
   inventory_revision INTEGER NOT NULL DEFAULT 0,
   exported_sequence INTEGER NOT NULL DEFAULT 0,

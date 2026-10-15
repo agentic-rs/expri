@@ -133,6 +133,153 @@ fn active_windows_keep_waiting_samples_and_ignore_nonterminal_finish_timestamps(
   assert!(RunSystemWindow::from_state("run-test", &state("unknown")).is_none());
 }
 
+fn continued_state(status: &str) -> Value {
+  let mut state = state(status);
+  state["system_capture_id"] = json!("capture-second");
+  state["system_capture_started_at"] = json!("1970-01-01T00:00:30Z");
+  if is_terminal_status(status) {
+    state["finished_at"] = json!("1970-01-01T00:00:40Z");
+  }
+  state["task_attempts"] = json!({"attempts":[
+    {"attempt":1,"system_capture_id":"capture-test","system_capture_started_at":"1970-01-01T00:00:10Z","system_capture_finished_at":"1970-01-01T00:00:20Z"},
+    {"attempt":2,"system_capture_id":"capture-second","system_capture_started_at":"1970-01-01T00:00:30Z"}
+  ]});
+  state
+}
+
+fn second_header() -> RunSystemRecord {
+  RunSystemRecord::Capture {
+    schema_version: 1,
+    capture_id: "capture-second".into(),
+    machine_id: "machine-test".into(),
+    start_ms: 30_000,
+  }
+}
+
+#[test]
+fn continued_captures_preserve_prior_readings_and_leave_inactive_period_empty() {
+  let data = bytes(&[
+    header(),
+    inventory(),
+    sample(1, 11_000, 1000, 2.0),
+    end(true),
+    second_header(),
+    inventory(),
+    sample(9, 25_000, 1000, 99.0),
+    sample(10, 31_000, 1000, 4.0),
+    RunSystemRecord::End {
+      end_ms: 40_000,
+      complete: true,
+      warnings: vec![],
+    },
+  ]);
+  let state = continued_state("completed");
+  let window = RunSystemWindow::from_state("run-test", &state).unwrap();
+  let result = read(
+    Cursor::new(&data),
+    || Ok(Cursor::new(&data)),
+    "run-test",
+    &window,
+    None,
+    10,
+  )
+  .unwrap();
+  assert_eq!(result.start_ms, Some(10_000));
+  assert_eq!(result.end_ms, Some(40_000));
+  assert_eq!(result.status, "complete");
+  assert_eq!(result.sample_count, 3);
+  assert_eq!(
+    result
+      .samples
+      .iter()
+      .map(|sample| sample.observed_at_ms)
+      .collect::<Vec<_>>(),
+    [11_000, 31_000]
+  );
+  assert_eq!(result.metric_summaries["cpu/usage_percent"].count, 2);
+  assert_eq!(result.metric_summaries["cpu/usage_percent"].mean, Some(3.0));
+  assert!(
+    result
+      .warnings
+      .iter()
+      .any(|warning| warning.contains("between attempts"))
+  );
+  let page = read(
+    Cursor::new(&data),
+    || Ok(Cursor::new(&data)),
+    "run-test",
+    &window,
+    Some(1),
+    1,
+  )
+  .unwrap();
+  assert_eq!(page.samples[0].sequence, 10);
+}
+
+#[test]
+fn continued_capture_identity_and_closed_segment_boundaries_are_validated() {
+  let window = RunSystemWindow::from_state("run-test", &continued_state("running")).unwrap();
+  for records in [
+    vec![header(), inventory(), second_header()],
+    vec![header(), inventory(), end(true), header()],
+    vec![
+      header(),
+      inventory(),
+      RunSystemRecord::End {
+        end_ms: 21_000,
+        complete: true,
+        warnings: vec![],
+      },
+      second_header(),
+    ],
+  ] {
+    let data = bytes(&records);
+    assert!(
+      read(
+        Cursor::new(&data),
+        || Ok(Cursor::new(&data)),
+        "run-test",
+        &window,
+        None,
+        10
+      )
+      .is_err()
+    );
+  }
+  let mut state = continued_state("running");
+  state["task_attempts"]["attempts"][0]["system_capture_finished_at"] =
+    json!("1970-01-01T00:00:35Z");
+  assert!(RunSystemWindow::from_state("run-test", &state).is_none());
+}
+
+#[test]
+fn previous_capture_remains_available_if_new_attempt_cannot_capture() {
+  let mut state = continued_state("completed");
+  state.as_object_mut().unwrap().remove("system_capture_id");
+  state["task_attempts"]["attempts"]
+    .as_array_mut()
+    .unwrap()
+    .pop();
+  let window = RunSystemWindow::from_state("run-test", &state).unwrap();
+  let data = bytes(&[
+    header(),
+    inventory(),
+    sample(1, 11_000, 1000, 2.0),
+    end(true),
+  ]);
+  let result = read(
+    Cursor::new(&data),
+    || Ok(Cursor::new(&data)),
+    "run-test",
+    &window,
+    None,
+    10,
+  )
+  .unwrap();
+  assert_eq!(result.samples.len(), 1);
+  assert_eq!(result.status, "incomplete");
+}
+
 #[test]
 fn aligned_raw_samples_keep_original_identity_and_complete_gauge_and_rate_summaries() {
   let records = vec![

@@ -10,6 +10,7 @@ pub(in crate::client) fn api(url: &str) -> Api {
     .build()
     .unwrap();
   Api {
+    publication_epoch: 0,
     endpoint: format!("{url}/v1/request"),
     token: "must-not-leak".into(),
     control: client.clone(),
@@ -19,6 +20,62 @@ pub(in crate::client) fn api(url: &str) -> Api {
     stream_budget: None,
     stream_backlog: Arc::new(AtomicBool::new(false)),
   }
+}
+
+#[test]
+fn explicit_owner_epoch_capture_is_scope_bound_and_does_not_refresh_an_old_api_clone() {
+  let scope = RunScope {
+    project_id: "selected-project".into(),
+    origin: "selected-worker".into(),
+    run_id: "selected-run".into(),
+  };
+  let selected = scope.clone();
+  let (url, server) = mock(4, move |request, _| {
+    let operation: Request = serde_json::from_slice(&request.body).unwrap();
+    let response = match operation {
+      Request::Capabilities => Response::Capabilities {
+        features: vec!["run-task-continuation-v1".into()],
+      },
+      Request::RunPublication { scope } => {
+        assert_eq!(scope, selected);
+        Response::RunAttempt { epoch: 3 }
+      }
+      Request::AtRunEpoch { epoch, request } => {
+        assert_eq!(epoch, 3);
+        let Request::AppendTracking { scope, .. } = *request else {
+          panic!("wrapped run mutation");
+        };
+        assert_eq!(scope, selected);
+        Response::Acknowledged { offset: 1 }
+      }
+      Request::AppendTracking { .. } => {
+        return (
+          409,
+          Vec::new(),
+          br#"{"error":"stale publisher refused"}"#.to_vec(),
+        );
+      }
+      other => panic!("unexpected epoch capture request {other:?}"),
+    };
+    (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+  });
+  let mut explicit = api(&url);
+  let old = explicit.clone();
+  explicit.capture_run_epoch(&scope).unwrap();
+  assert_eq!(explicit.publication_epoch, 3);
+  assert_eq!(old.publication_epoch, 0);
+  let append = Request::AppendTracking {
+    scope,
+    path: "outputs/metrics.jsonl".into(),
+    offset: 0,
+    data_base64: "Cg==".into(),
+  };
+  explicit.request(&append).unwrap();
+  assert!(matches!(
+    old.request(&append).unwrap_err(),
+    ExpriError::ServiceRejected { status: 409, .. }
+  ));
+  server.join().unwrap();
 }
 
 #[test]

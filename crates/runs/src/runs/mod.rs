@@ -31,6 +31,13 @@ struct Record {
 
 /// Read the fixed run summary without loading the source or environment inventory.
 pub fn summary_directory(runs_dir: &Path, run_id: &str) -> Result<Value> {
+  let mut report = summary_state_directory(runs_dir, run_id)?;
+  report.as_object_mut().unwrap().remove("state");
+  Ok(report)
+}
+
+/// Internal readers need the same validated state without loading provenance files.
+pub(crate) fn summary_state_directory(runs_dir: &Path, run_id: &str) -> Result<Value> {
   validate_id(run_id)?;
   let runs_dir = std::path::absolute(runs_dir)?;
   let metadata = fs::symlink_metadata(&runs_dir)?;
@@ -56,7 +63,7 @@ pub fn summary_directory(runs_dir: &Path, run_id: &str) -> Result<Value> {
     return Err(message("run directory must be a real directory"));
   }
   let record = record(&run_dir);
-  Ok(json!({"run": record.summary, "warnings": record.warnings}))
+  Ok(json!({"run": record.summary, "state":record.state,"warnings": record.warnings}))
 }
 
 /// Inspect fixed run records without taking leases or reading package inventories.
@@ -306,6 +313,15 @@ fn record_from_state(run_id: &str, state: Option<Value>) -> Record {
         );
         return;
       }
+      if object.contains_key("task_attempts") {
+        summary["current_attempt"] = match expri_core::task_attempts::current_attempt(state) {
+          Ok(attempt) => json!(attempt),
+          Err(_) => {
+            field_warning(&mut warnings, run_id, "task_attempts");
+            Value::Null
+          }
+        };
+      }
       if let Some(smoke) = object.get("smoke") {
         if let Some(smoke) = smoke.as_bool() {
           summary["smoke"] = json!(smoke);
@@ -547,7 +563,17 @@ fn files(run_dir: &Path, artifacts: &[String], metrics: bool) -> Result<Value> {
     )?;
   }
   if metrics {
-    for relative in ["outputs/metrics.jsonl", "outputs/params.json"] {
+    let mut paths = vec!["outputs/metrics.jsonl".to_owned()];
+    let state = record(run_dir).state.unwrap_or(Value::Null);
+    match expri_core::task_attempts::current_params_path(&state) {
+      Ok(path) => paths.push(path),
+      Err(error) => warn(
+        &mut warnings,
+        &run_dir.file_name().unwrap().to_string_lossy(),
+        error.to_string(),
+      ),
+    }
+    for relative in &paths {
       let warnings_before = warnings.len();
       collect_files(
         run_dir,

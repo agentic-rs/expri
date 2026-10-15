@@ -1371,7 +1371,7 @@ fn schema_eight_upgrade_keeps_accepted_allocations_and_requires_new_gpu_observat
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    9
+    crate::service::store::METADATA_SCHEMA_VERSION
   );
   assert_eq!(
     store
@@ -1953,7 +1953,7 @@ fn source_mismatch_rolls_back_and_schema_seven_upgrade_preserves_records() {
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    9
+    crate::service::store::METADATA_SCHEMA_VERSION
   );
   assert_eq!(
     store

@@ -10,6 +10,7 @@ pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
 pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
 pub const SUPERVISOR_RESTART_CAPABILITY: &str = "run-supervisor-restart-v1";
+pub const TASK_CONTINUATION_CAPABILITY: &str = "run-task-continuation-v1";
 pub const RUN_PUBLISHING_CAPABILITY: &str = "run-publishing-v1";
 pub const SMOKE_RUNS_CAPABILITY: &str = "smoke-runs-v1";
 #[cfg(unix)]
@@ -26,6 +27,8 @@ pub enum NodeCommand {
   RunWorker(RunWorkerCommand),
   #[command(hide = true)]
   ResumeRunWorker(ResumeRunWorkerCommand),
+  #[command(hide = true)]
+  ContinueWorker(ContinueWorkerCommand),
   Env(RequestCommand),
   Runs(RequestCommand),
   Jobs(RequestCommand),
@@ -42,6 +45,14 @@ pub struct RunWorkerCommand {
 pub struct ResumeRunWorkerCommand {
   #[arg(long, value_parser = clap::value_parser!(i32).range(3..))]
   pub handoff_fd: i32,
+}
+
+#[derive(Debug, Args)]
+pub struct ContinueWorkerCommand {
+  #[arg(long)]
+  pub run_dir: PathBuf,
+  #[arg(long)]
+  pub request_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -97,6 +108,9 @@ pub fn run(command: NodeCommand) -> Result<()> {
     }
     NodeCommand::RunWorker(command) => crate::node::run::worker(&command.run_dir),
     NodeCommand::ResumeRunWorker(command) => resume_run_worker(command.handoff_fd),
+    NodeCommand::ContinueWorker(command) => {
+      expri_worker::continuation::worker(&command.run_dir, &command.request_id)
+    }
     NodeCommand::Env(command) => {
       if let Some(path) = command.request {
         crate::node::environment::apply_request_file(&path)
@@ -148,6 +162,8 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     DURABLE_RUNS_CAPABILITY,
     #[cfg(target_os = "linux")]
     SUPERVISOR_RESTART_CAPABILITY,
+    #[cfg(target_os = "linux")]
+    TASK_CONTINUATION_CAPABILITY,
     RUN_METRICS_CAPABILITY,
     RUN_PUBLISHING_CAPABILITY,
     SMOKE_RUNS_CAPABILITY,

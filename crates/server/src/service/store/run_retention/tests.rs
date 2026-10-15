@@ -868,6 +868,7 @@ fn expired_references_upload_sessions_and_zip_jobs_cannot_revive_a_run() {
   store
     .queue_archive(ArchiveSnapshot {
       scope: scope(),
+      publication_epoch: 0,
       files: vec![store.file(&run_file(&scope(), "run-state.json")).unwrap()],
       incomplete: true,
     })

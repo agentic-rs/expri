@@ -484,6 +484,10 @@ details.inspector-controls { display: block; }
 .supervisor-failed, .supervisor-error { color: var(--error-ink); }
 .supervisor-reason, .supervisor-error { margin: 5px 0 0; overflow-wrap: anywhere; font-size: 12px; }
 .supervisor-event-context, .supervisor-empty, .supervisor-history-note { margin: 5px 0 0; font-size: 11px; }
+.attempt-dates { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 5px; font-size: 11px; }
+.attempt-provenance { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 10px; margin: 7px 0; font-size: 11px; }
+.attempt-provenance dt { color: var(--muted); }
+.attempt-provenance dd { margin: 0; overflow-wrap: anywhere; }
 .notice { padding: 8px 10px; margin: 0 0 10px; border: 1px solid var(--warning-line); border-radius: 4px; color: var(--warning-ink); background: var(--warning-bg); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .notice.error { color: var(--error-ink); background: var(--error-bg); border-color: var(--error-line); }
 #result-upload-summary[data-upload-status=uploaded]:not([data-incomplete=true]) { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }

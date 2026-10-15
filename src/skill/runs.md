@@ -94,6 +94,41 @@ restart does not upgrade per-run supervisors. This operation cannot recover or
 adopt a task after an arbitrary supervisor crash or SIGKILL and never restarts a
 worker from a checkpoint.
 
+## Continue a task from a checkpoint
+
+```sh
+expri -T gpu runs continue run-abc123 --checkpoint outputs/checkpoint-1000.pt --reason extend-2000 --request-id extend-2000 --expected-attempt 1 -- --max-steps 2000
+```
+
+This starts another task attempt in the same direct, detached run on a native
+Linux worker. Running or waiting tasks stop before the replacement starts;
+completed, failed, and cancelled direct runs can also continue. Active runs need
+a supervisor that advertises continuation support. Queued runs, foreground runs,
+Python fallback, preparing runs, lost supervision, and cancellation in progress
+are unsupported. The operation does not recover an arbitrary supervisor crash.
+
+The command resolves the recorded task in the current configuration (`--task`
+overrides it), pushes source, and prepares an isolated snapshot/environment before
+stopping the old task. `--no-push` uses the existing worker checkout. Arguments
+after `--` append to the configured command. Use a finalized checkpoint beneath
+the run's `outputs/`; the task must load `EXPRI_RESUME_CHECKPOINT` through its own
+training framework. Expri does not choose framework-specific loading arguments.
+
+The run ID, original start time, metric/log prefixes, and registered artifacts
+remain. Each attempt records code, checkpoint, reason, dates, and outcome. The
+updated Python metrics helper maps the first observed local step to the earlier
+global maximum plus one and retains local spacing. Direct JSONL writers must
+apply their own global mapping using `EXPRI_STEP_OFFSET`; `EXPRI_ATTEMPT` identifies
+the attempt. Continued parameters live in `outputs/attempts/<attempt>/params.json`.
+Real timestamps preserve downtime gaps; no observations are invented.
+
+Save the request ID and retry an interrupted request with the same arguments.
+`--expected-attempt` rejects a stale request after another attempt starts. A
+recorded failure returns a nonzero exit code, including with `--json`; inspect
+`continuation.error`. Failed source/checkpoint/environment preparation leaves an
+active old task running.
+After fixing a recorded failure, use a new request ID for a fresh attempt.
+
 ## Retrieve directly from a worker
 
 ```sh
