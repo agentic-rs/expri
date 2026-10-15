@@ -41,7 +41,7 @@ logger.params({'batch_size': 32})
 set_run_status(sys.argv[1])
 os.write(1, b'initial\x00\xff\n')
 os.write(2, b'stderr\x80\n')
-logger.log(0, {'tick': 0})
+logger.log(0, {'tick': 0}, step_mode='global')
 (out / 'started.json').write_text(json.dumps({'pid': os.getpid(), 'supervisor_pid': os.getppid()}))
 deadline = time.monotonic() + 45
 step = 1
@@ -52,7 +52,7 @@ while not (out / 'release').exists():
   if phase.exists():
     set_run_status(phase.read_text())
     phase.unlink()
-  logger.log(step, {'tick': step, 'task_pid': os.getpid(), 'supervisor_pid': os.getppid()})
+  logger.log(step, {'tick': step, 'task_pid': os.getpid(), 'supervisor_pid': os.getppid()}, step_mode='global')
   os.write(1, ('tick %s\n' % step).encode())
   step += 1
   time.sleep(0.025)

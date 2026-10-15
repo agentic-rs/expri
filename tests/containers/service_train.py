@@ -17,7 +17,7 @@ print('STDOUT_BURST:' + 'x' * (256 * 1024), flush=True)
 with MetricsLogger() as logger:
   logger.params({'learning_rate': 0.001, 'input_id': 'dataset-v1'})
   for step in range(80):
-    logger.log(step, {'loss': 1.0 / (step + 1)})
+    logger.log(step, {'loss': 1.0 / (step + 1)}, step_mode='global')
     if step == 0:
       # An entirely legacy series exercises empty time views while Step and
       # offline synchronization preserve every repeated-coordinate sample.

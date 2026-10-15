@@ -499,10 +499,13 @@ the immutable checkpoint path provided in `EXPRI_RESUME_CHECKPOINT`; expri does 
 guess framework-specific loading arguments. Use a finalized checkpoint beneath
 the run's `outputs/` directory.
 
-Use the updated Python metrics helper in continued tasks. Its first local step
-maps to the previous history's maximum step plus one, and later steps retain their
-relative spacing. Rows retain `local_step` and `attempt` provenance; timestamps
-remain the actual observation times. Parameters can change between attempts and
+Use the updated Python metrics helper in continued tasks. `logger.initial_step`
+is the previous history's maximum step plus one. By default, `log(step, metrics)`
+writes `initial_step + step`, so local step 0 starts at that base and gaps are
+preserved. If the task restores a global step counter from its checkpoint, pass
+`step_mode="global"` to use that counter unchanged. Relative rows retain
+`local_step`, and managed rows identify their `attempt`; timestamps remain the
+actual observation times. Parameters can change between attempts and
 are saved separately under `outputs/attempts/<attempt>/params.json`. Direct JSONL
 writers must use global steps themselves; `EXPRI_STEP_OFFSET` provides the next
 global step and `EXPRI_ATTEMPT` identifies the attempt. Checkpoint loading never
@@ -579,16 +582,24 @@ defaults and command-line overrides, then record scalar metrics during training:
 from expri_metrics import MetricsLogger
 
 with MetricsLogger() as logger:
+  initial_step = logger.initial_step
   logger.params({"learning_rate": 0.001, "batch_size": 64, "seed": 42})
-  for step in range(100):
+  for local_step in range(100):
     loss, accuracy = train_step()
-    logger.log(step, {"train/loss": loss, "train/accuracy": accuracy})
+    logger.log(local_step, {"train/loss": loss, "train/accuracy": accuracy})
 ```
 
 By default, the helper writes `metrics.jsonl` and optional `params.json` into
 `EXPRI_OUTPUT_DIR`: `.expri/runs/<run_id>/outputs/`. Outside a managed run, pass
 an explicit directory to `MetricsLogger("outputs")`. Parameters are immutable:
 repeating identical values is allowed, while changing saved parameters fails.
+Initialization exposes `logger.initial_step`: 0 for empty history, otherwise the
+maximum existing step plus one. Steps are relative to this fixed base by default;
+pass `step_mode="global"` to `log()` when supplying an absolute step counter.
+You can append existing complete JSONL events before initialization to continue
+their history, including copied or manually prepared measurements. A managed
+task attempt shares one saved base across logger instances; opening a standalone
+logger starts a new logging session from the current history.
 Each event is flushed before `log()` returns. For distributed training, log from
 rank 0 and create the logger within that process. See [Python metrics guide](crates/worker/python/README.md)
 for the complete producer contract.

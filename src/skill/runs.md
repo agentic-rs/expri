@@ -116,10 +116,13 @@ training framework. Expri does not choose framework-specific loading arguments.
 
 The run ID, original start time, metric/log prefixes, and registered artifacts
 remain. Each attempt records code, checkpoint, reason, dates, and outcome. The
-updated Python metrics helper maps the first observed local step to the earlier
-global maximum plus one and retains local spacing. Direct JSONL writers must
-apply their own global mapping using `EXPRI_STEP_OFFSET`; `EXPRI_ATTEMPT` identifies
-the attempt. Continued parameters live in `outputs/attempts/<attempt>/params.json`.
+updated Python metrics helper exposes `logger.initial_step`, the earlier global
+maximum plus one. Relative logging defaults to `initial_step + step`, with local
+step 0 at that base; pass `step_mode="global"` to preserve an absolute counter.
+The base is shared by logger instances within the same attempt. Direct JSONL
+writers must apply their own global mapping using `EXPRI_STEP_OFFSET`;
+`EXPRI_ATTEMPT` identifies the attempt. Continued parameters live in
+`outputs/attempts/<attempt>/params.json`.
 Real timestamps preserve downtime gaps; no observations are invented.
 
 Save the request ID and retry an interrupted request with the same arguments.

@@ -353,8 +353,8 @@ mod python_producer {
       r#"from expri_metrics import MetricsLogger
 with MetricsLogger() as logger:
   logger.params({"learning_rate": 0.01, "model": {"width": 64}, "seed": 42})
-  logger.log(0, {"train/loss": 4, "train/accuracy": 0.25})
-  logger.log(18446744073709551615, {"train/loss": 0.5})
+  logger.log(0, {"train/loss": 4, "train/accuracy": 0.25}, step_mode="global")
+  logger.log(18446744073709551615, {"train/loss": 0.5}, step_mode="global")
   "#,
     )
     .unwrap();
@@ -362,6 +362,11 @@ with MetricsLogger() as logger:
       .args(["-B", "-S", "train.py"])
       .current_dir(&code)
       .env_remove("PYTHONPATH")
+      .env_remove("EXPRI_RUN_DIR")
+      .env_remove("EXPRI_RUN_ID")
+      .env_remove("EXPRI_ATTEMPT")
+      .env_remove("EXPRI_STEP_OFFSET")
+      .env_remove("EXPRI_RESUME_CHECKPOINT")
       .env("EXPRI_OUTPUT_DIR", run.join("outputs"))
       .output()
       .unwrap();
@@ -378,5 +383,101 @@ with MetricsLogger() as logger:
     assert_eq!(read.metrics["train/loss"].summary.last.value, 0.5);
     assert!(read.metrics["train/loss"].points[0].timestamp.is_some());
     assert_eq!(read.metrics["train/accuracy"].summary.count, 1);
+  }
+
+  #[test]
+  fn virtual_resume_appends_relative_and_global_steps_to_source_agnostic_history() {
+    let fixture = Fixture::new();
+    let prefix =
+      b"{\"step\":1000,\"metrics\":{\"loss\":9}}\n{\"step\":7,\"metrics\":{\"loss\":8}}\n";
+    let run = fixture.run("run-virtual", prefix);
+    let original_state = fs::read(run.join("run-state.json")).unwrap();
+    let code = run.join("code");
+    fs::create_dir(&code).unwrap();
+    fs::write(
+      code.join("expri_metrics.py"),
+      expri_worker::METRICS_PRODUCER_SCRIPT,
+    )
+    .unwrap();
+    fs::write(code.join("resume.py"), r#"import json, os
+from expri_metrics import MetricsLogger
+assert not any(name in os.environ for name in ('EXPRI_RUN_DIR', 'EXPRI_RUN_ID', 'EXPRI_ATTEMPT', 'EXPRI_STEP_OFFSET', 'EXPRI_RESUME_CHECKPOINT'))
+with MetricsLogger() as logger:
+  initial_step = logger.initial_step
+  logger.params({'history_source': 'external'})
+  logger.log(3, {'loss': 7})
+  logger.log(7, {'loss': 6})
+  logger.log(42, {'loss': 5}, step_mode='global')
+  logger.log(9, {'loss': 4})
+  print(json.dumps({'initial_step': initial_step, 'unchanged_initial_step': logger.initial_step}))
+"#).unwrap();
+    let output = std::process::Command::new("python3")
+      .args(["-B", "-S", "resume.py"])
+      .current_dir(&code)
+      .env_remove("PYTHONPATH")
+      .env_remove("EXPRI_RUN_DIR")
+      .env_remove("EXPRI_RUN_ID")
+      .env_remove("EXPRI_ATTEMPT")
+      .env_remove("EXPRI_STEP_OFFSET")
+      .env_remove("EXPRI_RESUME_CHECKPOINT")
+      .env("EXPRI_OUTPUT_DIR", run.join("outputs"))
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "{}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let initialized: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(initialized["initial_step"], 1001);
+    assert_eq!(initialized["unchanged_initial_step"], 1001);
+    let bytes = fs::read(run.join("outputs/metrics.jsonl")).unwrap();
+    assert!(
+      bytes.starts_with(prefix),
+      "virtual resume rewrote imported history"
+    );
+    let rows: Vec<serde_json::Value> = bytes
+      .split(|byte| *byte == b'\n')
+      .filter(|row| !row.is_empty())
+      .map(|row| serde_json::from_slice(row).unwrap())
+      .collect();
+    assert_eq!(
+      rows
+        .iter()
+        .map(|row| row["step"].as_u64().unwrap())
+        .collect::<Vec<_>>(),
+      [1000, 7, 1004, 1008, 42, 1010]
+    );
+    assert_eq!(rows[2]["local_step"], 3);
+    assert_eq!(rows[3]["local_step"], 7);
+    assert_eq!(rows[4]["step_mode"], "global");
+    assert!(rows[4].get("local_step").is_none());
+    assert!(rows[2..].iter().all(|row| row.get("attempt").is_none()));
+    let metrics = read(&fixture.runs, "run-virtual", &[]).unwrap();
+    assert_eq!(metrics.warnings.len(), 1, "{:?}", metrics.warnings);
+    assert!(
+      metrics.warnings[0]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("steps decreased; last values use recorded order")),
+      "{:?}",
+      metrics.warnings
+    );
+    assert_eq!(metrics.metrics["loss"].summary.count, 6);
+    assert_eq!(metrics.metrics["loss"].summary.last.step, 1010);
+    assert_eq!(metrics.metrics["loss"].summary.last.value, 4.0);
+    assert_eq!(
+      metrics.metrics["loss"]
+        .points
+        .iter()
+        .map(|point| point.step)
+        .collect::<Vec<_>>(),
+      [1000, 7, 1004, 1008, 42, 1010]
+    );
+    assert!(!run.join("outputs/checkpoint.bin").exists());
+    assert!(!run.join("outputs/attempts").exists());
+    assert_eq!(
+      fs::read(run.join("run-state.json")).unwrap(),
+      original_state
+    );
   }
 }
