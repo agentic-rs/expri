@@ -417,6 +417,67 @@ fn capture(id: &str, start: i64, end: i64) -> Vec<u8> {
 }
 
 #[test]
+fn current_capture_completion_can_supersede_only_its_stale_attempt_snapshot() {
+  for finished_at in [Value::Null, json!("1970-01-01T00:00:01Z")] {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let mut value = json!({
+      "status":"completed", "system_capture_id":"capture-1", "machine_id":"machine",
+      "system_capture_status":"complete", "started_at":"1970-01-01T00:00:00Z",
+      "finished_at":"1970-01-01T00:00:01Z",
+      "system_capture_started_at":"1970-01-01T00:00:00Z",
+      "system_capture_finished_at":"1970-01-01T00:00:01Z"
+    });
+    let mut attempt = value.clone();
+    attempt["system_capture_status"] = json!("capturing");
+    attempt["finished_at"] = finished_at.clone();
+    attempt["system_capture_finished_at"] = finished_at;
+    value["task_attempts"] = json!({"attempts":[attempt]});
+    append(
+      &store,
+      expri_core::run_system::RUN_SYSTEM_PATH,
+      0,
+      &capture("capture-1", 0, 1000),
+    )
+    .unwrap();
+    let mut revision = 0;
+    for (field, invalid) in [
+      ("machine_id", json!("another-machine")),
+      (
+        "system_capture_started_at",
+        json!("1970-01-01T00:00:00.001Z"),
+      ),
+      ("system_capture_started_at", json!("invalid")),
+      ("system_capture_finished_at", json!("1970-01-01T00:00:02Z")),
+      ("system_capture_finished_at", json!("invalid")),
+      ("system_capture_status", json!("incomplete")),
+      ("system_capture_id", json!("historical-capture")),
+    ] {
+      let mut bad = value.clone();
+      bad["task_attempts"]["attempts"][0][field] = invalid;
+      revision += 1;
+      state(&store, 0, revision, bad);
+      let (documents, streams) = snapshot(&store);
+      assert_eq!(
+        store
+          .execute(Request::SealRun {
+            scope: scope(),
+            documents,
+            streams,
+            incomplete: false,
+          })
+          .unwrap_err()
+          .status,
+        409,
+        "contradictory {field} must not be superseded"
+      );
+    }
+    state(&store, 0, revision + 1, value);
+    seal_at(&store, 0);
+  }
+}
+
+#[test]
 fn consecutive_system_segments_keep_the_gap_and_require_every_attempt_identity() {
   let directory = tempfile::tempdir().unwrap();
   let store = Store::open(directory.path(), MockStorage::default()).unwrap();

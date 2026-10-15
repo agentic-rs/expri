@@ -139,6 +139,44 @@ def client(container, action, *args, check=True, config=None):
 def worker_service_status(container):
   return json.loads(execute(container, 'expri', 'service', 'status', '--json').stdout)
 
+def collect_publisher_diagnostics(container):
+  """Keep bounded public state when a drain wait fails; never read credentials."""
+  report = python(container, '''import json
+from collections import Counter
+from pathlib import Path
+def read(path):
+  if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+    return {}
+  return json.loads(path.read_text())
+def capture_fields(value):
+  return {key:value[key] for key in ["attempt","status","started_at","finished_at","system_capture_id","machine_id","system_capture_started_at","system_capture_finished_at","system_capture_status","system_capture_error"] if key in value}
+runs=[]
+for root in sorted(Path('/home/tester/experiment/.expri/runs').glob('*'))[:20]:
+  state=read(root/'run-state.json')
+  publishing=read(root/'publishing-state.json')
+  queue=read(Path('/home/tester/experiment/.expri/publish/runs/demo/worker')/root.name/'queue.json')
+  system=root/'outputs/system-profile.jsonl'
+  records=[]
+  counts=Counter()
+  if system.is_file() and system.stat().st_size <= 4 * 1024 * 1024:
+    for line in system.read_text().splitlines():
+      value=json.loads(line)
+      counts[value.get('kind')]+=1
+      if value.get('kind') in ['capture','end']:
+        records.append(value)
+  runs.append({'run_id':root.name,'run':capture_fields(state),
+    'attempts':[capture_fields(entry) for entry in state.get('task_attempts',{}).get('attempts',[])[:100]],
+    'publishing':publishing,'queue':{key:queue.get(key) for key in ['protocol','streams','documents','archive']},
+    'capture_records':records[:200],'capture_counts':dict(counts)})
+print(json.dumps(runs))
+''')
+  public = execute(container, 'expri', 'service', 'status', '--json', check=False, timeout=10)
+  output = json.dumps({'runs': json.loads(report),
+    'worker_service': json.loads(public.stdout) if public.returncode == 0 else {'status_unavailable': True}})
+  if len(output.encode()) > 256 * 1024:
+    raise AssertionError('publisher diagnostics exceeded their public metadata bound')
+  (logs / 'publisher-diagnostics.log').write_text(redact(output) + '\n')
+
 def stop_worker_service(container):
   stopped = json.loads(execute(container, 'expri', 'service', 'stop', '--json').stdout)
   assert stopped['jobs_preserved'] is True, 'stopping the worker service discarded its durable jobs'
@@ -1425,6 +1463,12 @@ finally:
             refresh_browser.wait(timeout=5)
         except (OSError, subprocess.TimeoutExpired):
           workflow_progress.note('Browser cleanup did not finish; container cleanup will stop it.')
+      for container in containers:
+        if container.endswith('-worker'):
+          try:
+            collect_publisher_diagnostics(container)
+          except (OSError, AssertionError, ValueError, subprocess.TimeoutExpired):
+            workflow_progress.note('Could not collect public publisher state before cleanup.')
       for container in containers:
         role = container.rsplit('-', 1)[-1]
         with workflow_progress.phase(f'Collect {role} diagnostics and remove container'):

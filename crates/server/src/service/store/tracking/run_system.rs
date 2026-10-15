@@ -21,6 +21,13 @@ fn time(value: &Value) -> Option<i64> {
     .map(|value| value.timestamp_millis())
 }
 
+fn capture_time<'a>(value: &'a Value, field: &str, fallback: &str) -> Option<&'a Value> {
+  value
+    .get(field)
+    .filter(|value| !value.is_null())
+    .or_else(|| value.get(fallback).filter(|value| !value.is_null()))
+}
+
 #[derive(Eq, PartialEq)]
 struct Capture {
   machine_id: String,
@@ -30,23 +37,39 @@ struct Capture {
 }
 
 fn captures(state: &Value) -> ApiResult<BTreeMap<String, Capture>> {
-  let mut captures = BTreeMap::new();
+  let mut captures = BTreeMap::<String, Capture>::new();
   let attempts = state["task_attempts"]["attempts"].as_array();
   if attempts.is_some_and(|attempts| attempts.len() > expri_core::protocol::MAX_TASK_ATTEMPTS) {
     return Err(invalid());
   }
-  for value in attempts.into_iter().flatten().chain(std::iter::once(state)) {
+  for value in std::iter::once(state).chain(attempts.into_iter().flatten()) {
     let Some(id) = value["system_capture_id"].as_str() else {
       continue;
     };
+    let machine_id = value["machine_id"].as_str().ok_or_else(invalid)?;
+    let start_ms = capture_time(value, "system_capture_started_at", "started_at")
+      .and_then(time)
+      .ok_or_else(invalid)?;
+    let end = capture_time(value, "system_capture_finished_at", "finished_at");
+    if value["system_capture_status"] == "capturing"
+      && state["system_capture_id"].as_str() == Some(id)
+      && let Some(current) = captures.get(id)
+    {
+      // Collector completion updates the current capture after the attempt's
+      // terminal snapshot. Supersede that pending status only when its identity
+      // and any recorded endpoint agree with the canonical completion.
+      if machine_id != current.machine_id
+        || start_ms != current.start_ms
+        || end.is_some_and(|end| time(end) != Some(current.end_ms))
+      {
+        return Err(invalid());
+      }
+      continue;
+    }
     let capture = Capture {
-      machine_id: value["machine_id"].as_str().ok_or_else(invalid)?.into(),
-      start_ms: time(&value["system_capture_started_at"])
-        .or_else(|| time(&value["started_at"]))
-        .ok_or_else(invalid)?,
-      end_ms: time(&value["system_capture_finished_at"])
-        .or_else(|| time(&value["finished_at"]))
-        .ok_or_else(invalid)?,
+      machine_id: machine_id.into(),
+      start_ms,
+      end_ms: end.and_then(time).ok_or_else(invalid)?,
       complete: match value["system_capture_status"].as_str() {
         Some("complete") => true,
         Some("incomplete") => false,
