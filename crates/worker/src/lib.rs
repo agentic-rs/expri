@@ -13,6 +13,7 @@ pub mod queue;
 pub mod run_logs;
 pub mod runs;
 pub mod shell;
+pub mod supervisor;
 
 pub const JOBS_SCRIPT: &str = include_str!("jobs.py");
 pub const RUN_LOGS_SCRIPT: &str = include_str!("run_logs.py");

@@ -142,6 +142,13 @@ The next run or publication starts the process again with saved component choice
 `service restart` drains and replaces the shared process with those same choices,
 preserving training, jobs, captures, and accepted execution allocations.
 It does not start automatically at boot; the next start recovers enabled work.
+
+Whole-service and component restarts leave existing per-run supervisors on their
+current executable. To upgrade a supported native Linux detached run's supervisor
+while its task keeps running, use `runs restart-supervisor`; read `expri skill runs`
+for request IDs, generation checks, and unsupported cases. It does not recover a
+crashed supervisor or restart training from a checkpoint.
+
 Deploy the updated server before upgrading workers to automatic collection;
 complete system captures require its nine-file tracking archive limit.
 Keep original run files and `.expri/publish` until acknowledgment. Inspect publishing separately from task

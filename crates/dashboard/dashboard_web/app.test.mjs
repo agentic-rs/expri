@@ -4121,3 +4121,30 @@ test("native deep links for a worker named queue remain ordinary run inspections
   await click(nodes.get("review-tab-overview")); assert.match(nodes.get("run-detail").textContent, /Started|Duration/);
   assert.equal(model.requests.some(url => url.includes("queue%3A%3A")), false, "a native worker name never becomes a synthetic job key");
 });
+
+for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} Overview displays supervisor history without changing run identity or duration`, async t => {
+  const source = { source_id: "local", label: "Local", kind: hosted ? "service" : "local", target_name: null };
+  const run = { run_id: "run-supervisor", task: "train", status: "completed", started_at: "2026-10-15T01:00:00Z", finished_at: "2026-10-15T01:00:03Z", exit_code: 0 };
+  const event = { generation: 2, request_id: "request-upgrade", reason: "Upgrade supervisor", mode: "live", status: "completed", requested_at: "2026-10-15T01:00:01Z", completed_at: "2026-10-15T01:00:02Z", failed_at: null, worker_restarted: false, error: null };
+  let supervisor = { protocol_version: 1, generation: 2, mode: "live", events: [event], total_count: 1, truncated: false };
+  const model = await reviewFixture(t, { hosted, sources: [source], project_runs: [run], override: request => request.pathname === "/api/run"
+    ? response({ ...detailRecord(source, run), state: { command: "python train.py", supervisor } }) : null });
+  const { nodes } = model;
+  await inspect(model); await click(nodes.get("review-tab-overview"));
+  const history = nodes.get("run-detail").querySelector(".supervisor-history"), row = nodes.get("run-rows").children[0];
+  assert.ok(history);
+  assert.equal(history.open, false);
+  assert.match(history.querySelector("summary").textContent, /Generation 2 · 1 restart attempt$/);
+  assert.match(history.textContent, /Task kept running · Worker not restarted/);
+  assert.equal(overviewDuration(nodes).textContent, "3s");
+  history.open = true;
+  supervisor = { ...supervisor, events: [...supervisor.events, { ...event, request_id: "request-failed", status: "failed", reason: "Upgrade retry", completed_at: null, failed_at: "2026-10-15T01:00:02Z", error: "Target unavailable" }], total_count: 2 };
+  await click(nodes.get("refresh-button"));
+  await settled(() => history.querySelector("summary").textContent.includes("2 restart attempts"));
+  assert.equal(nodes.get("run-detail").querySelector(".supervisor-history"), history);
+  assert.equal(history.open, true);
+  assert.match(history.querySelector("li").textContent, /Upgrade retry/);
+  assert.equal(nodes.get("review-title").textContent, run.run_id);
+  assert.equal(row.dataset.runKey, run.run_id);
+  assert.equal(overviewDuration(nodes).textContent, "3s");
+});

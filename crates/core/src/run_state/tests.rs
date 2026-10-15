@@ -16,6 +16,39 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Value) {
 }
 
 #[test]
+fn nonblocking_state_updates_skip_busy_callbacks_and_preserve_noop_bytes() {
+  let (_root, directory, original) = fixture();
+  let path = directory.join("run-state.json");
+  let bytes = fs::read(&path).unwrap();
+  let lease = lock::run_state_lock(&directory).unwrap();
+  let mut called = false;
+  assert_eq!(
+    try_update_state(&path, |_| {
+      called = true;
+      Ok(42)
+    })
+    .unwrap(),
+    None
+  );
+  assert!(!called);
+  assert_eq!(fs::read(&path).unwrap(), bytes);
+  drop(lease);
+  assert_eq!(try_update_state(&path, |_| Ok(42)).unwrap(), Some(42));
+  assert_eq!(fs::read(&path).unwrap(), bytes);
+  assert_eq!(
+    try_update_state(&path, |state| {
+      state["new_field"] = json!(true);
+      Ok(())
+    })
+    .unwrap(),
+    Some(())
+  );
+  let mut expected = original;
+  expected["new_field"] = json!(true);
+  assert_eq!(read_state(&path).unwrap(), expected);
+}
+
+#[test]
 fn tasks_round_trip_waiting_without_changing_provenance_or_capture() {
   let (_root, directory, state) = fixture();
   let _supervisor = lock::run_lock(&directory).unwrap();

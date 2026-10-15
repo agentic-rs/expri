@@ -63,7 +63,12 @@ fn execute_with_preference(
   preference: ProtocolPreference,
   node_bin: &str,
 ) -> Result<Option<serde_json::Value>> {
-  let native = select_native(remote, preference, node_bin)?;
+  let native = if matches!(request, JobRequest::RestartSupervisor { .. }) {
+    require_supervisor_restart(remote, preference, node_bin)?;
+    true
+  } else {
+    select_native(remote, preference, node_bin)?
+  };
   let command = job_command(remote, request, node_bin, native)?;
   if matches!(request, JobRequest::Logs { .. }) {
     remote.execute_stream(&with_profile(&command))?;
@@ -99,6 +104,30 @@ fn select_native(remote: &Remote, preference: ProtocolPreference, node_bin: &str
   Ok(supported)
 }
 
+fn require_supervisor_restart(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  if preference == ProtocolPreference::Python {
+    return Err(ExpriError::Message(
+      "supervisor restart requires a native Linux worker; Python fallback cannot transfer live ownership".into(),
+    ));
+  }
+  let capability = crate::node::cli::SUPERVISOR_RESTART_CAPABILITY;
+  if !remote.execute_success(&format!(
+    "cd {} && {} node capabilities --has {}",
+    remote.quoted_remote_dir(),
+    shell::quote(node_bin),
+    shell::quote(capability),
+  ))? {
+    return Err(ExpriError::Message(format!(
+      "supervisor restart requires {capability} on a native Linux worker; upgrade expri on the target. Existing supervisors must also support live restart"
+    )));
+  }
+  Ok(())
+}
+
 fn job_command(
   remote: &Remote,
   request: &JobRequest,
@@ -113,6 +142,11 @@ fn job_command(
       shell::quote(node_bin)
     ))
   } else {
+    if matches!(request, JobRequest::RestartSupervisor { .. }) {
+      return Err(ExpriError::Message(
+        "supervisor restart cannot use the Python fallback".into(),
+      ));
+    }
     Ok(python_command(remote, &python_jobs_script(request)?))
   }
 }

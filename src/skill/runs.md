@@ -59,6 +59,41 @@ terminates preparation or the task gracefully, escalating after two seconds if
 needed; check status afterward. Finished runs retain their result. Active
 foreground runs and lost detached runs cannot be cancelled with this command.
 
+## Live supervisor upgrades
+
+New native Linux detached runs support an explicit supervisor handoff while
+their task remains `running` or `waiting`:
+
+```sh
+expri -T gpu runs status run-abc123 --json
+expri -T gpu runs restart-supervisor run-abc123 --reason upgrade --request-id upgrade-1 --expected-generation 1 --binary /opt/expri/bin/expri --json
+```
+
+Use the run's current `state.supervisor.generation` from status; generation starts
+at 1 and advances only after a successful handoff. `--expected-generation`
+protects against stale requests. `--binary` is an absolute path on the executing
+worker, not a local file to upload. Omit it to use the native executable handling
+the request. Omit `-T` for a local run.
+
+The command waits for the result. Save its request ID and reuse it with the same
+reason, binary option, and expected generation after an interrupted connection
+or acknowledgement timeout. An identical retry returns the recorded result
+without a second handoff; reusing an ID with changed arguments is rejected.
+Without `--request-id`, the CLI generates and prints one. A recorded failure
+produces a nonzero exit code, including with `--json`; inspect `restart.error`
+and the event history. Failed target validation leaves the worker running.
+Use a new request ID for a fresh attempt after fixing a recorded failure.
+
+The task PID, run ID, start time, logs, metrics, and artifacts are preserved.
+`run-state.json` retains generation/reason/outcome history and explicitly records
+`worker_restarted: false`; dashboard Overview shows its newest bounded preview.
+When run metadata approaches its size limit, new requests are refused rather
+than dropping history. Old supervisors, Python fallback, foreground, preparing,
+terminal, and cancellation-in-progress runs are unsupported. A service/component
+restart does not upgrade per-run supervisors. This operation cannot recover or
+adopt a task after an arbitrary supervisor crash or SIGKILL and never restarts a
+worker from a checkpoint.
+
 ## Retrieve directly from a worker
 
 ```sh

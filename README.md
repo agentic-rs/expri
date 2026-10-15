@@ -70,6 +70,8 @@ or `expri service restart` to replace the shared process while preserving compon
 choices, jobs, and training. Component failures and server
 outages do not stop the other parts. See
 [component controls](docs/self-hosted-service.md#independent-worker-components).
+These service restarts leave existing per-run supervisors on their current
+executable; use [a live supervisor upgrade](#live-supervisor-upgrades) for a supported run.
 Both local and server stores keep 72 hours of machine detail and retain historical
 hourly summaries indefinitely. New runs also preserve their exact system observations
 for as long as the run is retained. Existing project configuration, caches, and run
@@ -446,6 +448,29 @@ termination signal to its current preparation or task process group, then
 escalates after two seconds if needed. Inspect status again to confirm
 `cancelled`. Cancelling an already finished run leaves its result intact;
 active foreground or lost runs cannot be cancelled through this command.
+
+### Live supervisor upgrades
+
+New native Linux detached runs support replacing their supervisor while the
+same task process keeps running:
+
+```sh
+expri -T runpod runs status run-abc123 --json
+expri -T runpod runs restart-supervisor run-abc123 --reason "Upgrade expri" --request-id upgrade-1 --expected-generation 1 --binary /opt/expri/bin/expri --json
+```
+
+`--binary` names an absolute executable path on the training machine; when
+omitted, the native executable handling the request is used. The command waits
+for the handoff result. Retrying the same `--request-id` with identical arguments
+returns its saved result; `--expected-generation` rejects a stale request.
+The task PID, run ID, start time, logs, metrics, and artifacts stay with the
+existing run. Its record retains restart reasons and generations, with
+`worker_restarted: false`; Overview shows a bounded history preview.
+Old supervisors, Python fallback, foreground, preparing, finished, and cancelling
+runs cannot use this operation. Failed target checks leave the task running and
+report failure. This feature does not recover a crashed or killed supervisor or
+restart training from a checkpoint. See [the upgrade guide](docs/self-hosted-service.md#live-run-supervisor-upgrades)
+for failure handling and history limits.
 
 ## Run records and selective fetching
 

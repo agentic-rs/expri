@@ -24,6 +24,12 @@ pub fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
     truncated,
   );
   if state.is_object()
+    && let Some(supervisor) = record["state"].get("supervisor")
+    && let Some(supervisor) = supervisor_metadata(supervisor, truncated)
+  {
+    state["supervisor"] = supervisor;
+  }
+  if state.is_object()
     && let Some(assets) = record["state"]["assets"].as_array()
   {
     state["asset_count"] = json!(assets.len());
@@ -117,6 +123,106 @@ pub fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
     }
   }
   json!({"state": state, "snapshot": snapshot, "environment": environment})
+}
+
+/// Supervisor state also contains private handoff details. Project its public history
+/// explicitly, independently of the generic preview's object and depth limits.
+fn supervisor_metadata(value: &Value, truncated: &mut bool) -> Option<Value> {
+  const EVENT_LIMIT: usize = 16;
+  const BYTE_LIMIT: usize = 16 * 1024;
+  let Some(generation) = value["generation"].as_u64().filter(|value| *value > 0) else {
+    *truncated = true;
+    return None;
+  };
+  let Some(events) = value["events"]
+    .as_array()
+    .filter(|_| value["protocol_version"] == 1 && value["mode"].as_str() == Some("live"))
+  else {
+    *truncated = true;
+    return None;
+  };
+  let mut omitted = events.len() > EVENT_LIMIT;
+  // Reserve ample space for the fixed envelope, including total_count.
+  let mut remaining = BYTE_LIMIT - 512;
+  let mut output = Vec::new();
+  for event in events.iter().rev().take(EVENT_LIMIT) {
+    let Some(event) = supervisor_event(event, &mut omitted) else {
+      omitted = true;
+      continue;
+    };
+    let size = serde_json::to_vec(&event).unwrap().len() + 1;
+    if size > remaining {
+      omitted = true;
+      break;
+    }
+    remaining -= size;
+    output.push(event);
+  }
+  output.reverse();
+  *truncated |= omitted;
+  Some(json!({
+    "protocol_version": 1,
+    "generation": generation,
+    "mode": "live",
+    "events": output,
+    "total_count": events.len(),
+    "truncated": omitted,
+  }))
+}
+
+fn supervisor_event(value: &Value, truncated: &mut bool) -> Option<Value> {
+  let generation = value["generation"].as_u64().filter(|value| *value > 0)?;
+  let status = value["status"].as_str()?;
+  if value["mode"].as_str() != Some("live")
+    || !["restarting", "completed", "failed"].contains(&status)
+  {
+    return None;
+  }
+  let timestamp = |field: &str| -> Option<Value> {
+    match value.get(field) {
+      Some(Value::String(text))
+        if text.len() <= 64 && chrono::DateTime::parse_from_rfc3339(text).is_ok() =>
+      {
+        Some(json!(text))
+      }
+      None | Some(Value::Null) if field != "requested_at" => Some(Value::Null),
+      _ => None,
+    }
+  };
+  let request_id = supervisor_text(value.get("request_id")?, 96, truncated)?;
+  let reason = supervisor_text(value.get("reason")?, 512, truncated)?;
+  if request_id.as_str()?.is_empty() || reason.as_str()?.is_empty() {
+    return None;
+  }
+  let error = match value.get("error") {
+    None | Some(Value::Null) => Value::Null,
+    Some(error) => supervisor_text(error, 512, truncated)?,
+  };
+  Some(json!({
+    "generation": generation,
+    "request_id": request_id,
+    "reason": reason,
+    "mode": "live",
+    "status": status,
+    "requested_at": timestamp("requested_at")?,
+    "completed_at": timestamp("completed_at")?,
+    "failed_at": timestamp("failed_at")?,
+    "worker_restarted": value["worker_restarted"].as_bool(),
+    "error": error,
+  }))
+}
+
+fn supervisor_text(value: &Value, limit: usize, truncated: &mut bool) -> Option<Value> {
+  let text = value.as_str()?;
+  let filtered: String = text
+    .chars()
+    .filter(|value| !value.is_control())
+    .take(limit)
+    .collect();
+  if filtered != text {
+    *truncated = true;
+  }
+  Some(json!(filtered))
 }
 
 pub fn projection(value: &Value, fields: &[&str], truncated: &mut bool) -> Value {
@@ -243,6 +349,140 @@ fn preview_inner(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn supervisor_event_fixture(generation: u64) -> Value {
+    json!({
+      "generation": generation,
+      "request_id": format!("request-{generation}"),
+      "reason": "Upgrade supervisor",
+      "mode": "live",
+      "status": "completed",
+      "requested_at": "2026-10-15T01:00:00Z",
+      "completed_at": "2026-10-15T01:00:01Z",
+      "failed_at": null,
+      "worker_restarted": false,
+      "error": null,
+    })
+  }
+
+  #[test]
+  fn supervisor_preview_projects_only_public_history_and_preserves_raw_records() {
+    let mut event = supervisor_event_fixture(2);
+    event["target_digest"] = json!("private-target");
+    event["handoff_fd"] = json!(12);
+    let record = json!({"state": {"supervisor": {
+      "protocol_version": 1, "generation": 2, "mode": "live", "events": [event],
+      "control_socket": "/private/control.sock", "task_pid": 123,
+      "target_path": "/private/expri", "process_identity": {"secret": "private"},
+    }}});
+    let original = record.clone();
+    let mut truncated = false;
+    let preview = run_metadata(&record, &mut truncated);
+    assert_eq!(
+      preview["state"]["supervisor"],
+      json!({
+        "protocol_version": 1, "generation": 2, "mode": "live",
+        "events": [supervisor_event_fixture(2)], "total_count": 1, "truncated": false,
+      })
+    );
+    assert!(!preview.to_string().contains("private"));
+    assert!(!preview.to_string().contains("handoff_fd"));
+    assert!(!preview.to_string().contains("task_pid"));
+    assert_eq!(record, original);
+    assert!(!truncated);
+  }
+
+  #[test]
+  fn supervisor_preview_keeps_latest_events_without_generic_depth_truncation() {
+    let events: Vec<_> = (2..=21).map(supervisor_event_fixture).collect();
+    let record = json!({"state": {"supervisor": {
+      "protocol_version": 1, "generation": 21, "mode": "live", "events": events,
+    }}});
+    let mut truncated = false;
+    let preview = run_metadata(&record, &mut truncated);
+    let supervisor = &preview["state"]["supervisor"];
+    assert_eq!(supervisor["total_count"], 20);
+    assert_eq!(supervisor["events"].as_array().unwrap().len(), 16);
+    assert_eq!(supervisor["events"][0]["generation"], 6);
+    assert_eq!(supervisor["events"][15]["generation"], 21);
+    assert_eq!(supervisor["events"][15]["status"], "completed");
+    assert_eq!(supervisor["truncated"], true);
+    assert!(truncated);
+  }
+
+  #[test]
+  fn supervisor_preview_bounds_text_bytes_and_does_not_invent_worker_restart_evidence() {
+    let mut event = supervisor_event_fixture(2);
+    event["reason"] = json!(format!("{}\n\0", "😀".repeat(600)));
+    event["error"] = json!("😀".repeat(600));
+    event["worker_restarted"] = json!({"private": true});
+    let record = json!({"state": {"supervisor": {
+      "protocol_version": 1, "generation": 2, "mode": "live", "events": vec![event; 16],
+    }}});
+    let mut truncated = false;
+    let preview = run_metadata(&record, &mut truncated);
+    let supervisor = &preview["state"]["supervisor"];
+    assert!(serde_json::to_vec(supervisor).unwrap().len() <= 16 * 1024);
+    let events = supervisor["events"].as_array().unwrap();
+    assert!(!events.is_empty());
+    assert!(events.len() < 16);
+    assert_eq!(events[0]["reason"].as_str().unwrap().chars().count(), 512);
+    assert!(
+      !events[0]["reason"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .any(char::is_control)
+    );
+    assert!(events[0]["worker_restarted"].is_null());
+    assert_eq!(supervisor["total_count"], 16);
+    assert_eq!(supervisor["truncated"], true);
+    assert!(truncated);
+  }
+
+  #[test]
+  fn supervisor_preview_rejects_invalid_protocols_and_events_without_affecting_legacy_records() {
+    let mut truncated = false;
+    let preview = run_metadata(&json!({"state": {"status": "running"}}), &mut truncated);
+    assert!(preview["state"].get("supervisor").is_none());
+    assert!(!truncated);
+    for invalid in [
+      Value::Null,
+      json!([]),
+      json!({}),
+      json!({
+        "protocol_version": 2, "generation": 1, "mode": "live", "events": [],
+      }),
+      json!({"protocol_version": 1, "generation": -1, "mode": "live", "events": []}),
+    ] {
+      let mut truncated = false;
+      let preview = run_metadata(&json!({"state": {"supervisor": invalid}}), &mut truncated);
+      assert!(preview["state"].get("supervisor").is_none());
+      assert!(truncated);
+    }
+    let mut event = supervisor_event_fixture(2);
+    event["requested_at"] = json!("invalid");
+    let mut restarted = supervisor_event_fixture(3);
+    restarted["worker_restarted"] = json!(true);
+    let record = json!({"state": {"supervisor": {
+      "protocol_version": 1, "generation": 3, "mode": "live", "events": [event, restarted],
+    }}});
+    let mut truncated = false;
+    let preview = run_metadata(&record, &mut truncated);
+    assert_eq!(
+      preview["state"]["supervisor"]["events"]
+        .as_array()
+        .unwrap()
+        .len(),
+      1
+    );
+    assert_eq!(
+      preview["state"]["supervisor"]["events"][0]["worker_restarted"],
+      true
+    );
+    assert_eq!(preview["state"]["supervisor"]["total_count"], 2);
+    assert!(truncated);
+  }
 
   #[test]
   fn asset_preview_preserves_short_lineage_and_omits_private_connection_settings() {

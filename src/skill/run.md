@@ -93,6 +93,11 @@ not imply completed training or uploaded outputs. `--no-publish` before the
 task name disables automatic publishing for that run while retaining asset
 download credentials.
 
-Read `expri skill runs` for logs, cancellation, and result retrieval,
+New native Linux detached runs can upgrade their per-run supervisor with
+`runs restart-supervisor` while the same task keeps running. Shared service or
+component restarts do not upgrade it. Older supervisors and the Python fallback
+cannot hand off a live task; arbitrary supervisor crashes are not recovered.
+
+Read `expri skill runs` for logs, cancellation, supervisor upgrades, and result retrieval,
 `expri skill environment` for preparation failures, and `expri skill service`
 for publishing. Use `expri run --help` for exact flags.

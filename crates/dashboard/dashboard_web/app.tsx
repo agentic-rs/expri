@@ -80,6 +80,8 @@ export * from "./system_monitor";
 export * from "./run_system";
 export * from "./run_queue";
 export * from "./run_queue_view";
+export * from "./run_supervisor";
+export * from "./run_supervisor_view";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-mod groups;
+pub(crate) mod groups;
 
 pub const STDOUT_LOG: &str = "logs/stdout.log";
 pub const STDERR_LOG: &str = "logs/stderr.log";
@@ -62,6 +62,10 @@ impl PipeRead for ChildStderr {
   }
 }
 impl RunLogs {
+  #[cfg(target_os = "linux")]
+  pub(crate) fn supervisor_files(&self) -> io::Result<(File, File)> {
+    Ok((self.stdout.try_clone()?, self.stderr.try_clone()?))
+  }
   pub fn create(run_dir: &Path) -> io::Result<Self> {
     Self::create_mode(run_dir, false, false)
   }
@@ -175,7 +179,7 @@ impl RunLogs {
   }
 }
 
-fn unbuffered_if_absent(command: &mut Command) {
+pub(crate) fn unbuffered_if_absent(command: &mut Command) {
   let explicit = command
     .get_envs()
     .find(|(name, _)| *name == "PYTHONUNBUFFERED")
