@@ -312,6 +312,12 @@ fn pump_inner(
       acknowledgment = None;
     }
     if finished && stdout.closed && stderr.closed {
+      // Cleanup and log writes can outlast the loop's first cancellation
+      // check. Consume requests accepted while the supervisor still owned the
+      // run before publishing the completed child's terminal result.
+      if !cancelled {
+        cancelled = cancel_requested(run_dir)?;
+      }
       let mut raw_status = 0;
       loop {
         if unsafe { libc::waitpid(*pid as i32, &mut raw_status, 0) } == *pid as i32 {
