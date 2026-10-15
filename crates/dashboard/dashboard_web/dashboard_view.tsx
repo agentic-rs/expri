@@ -12,6 +12,7 @@ import { RunControlPopover } from "./run_control_popover";
 import { RunDuration, RunDurationProvider, RunStatusTiming } from "./run_duration";
 import { queueContext, queueMessage, queuePlaceholder } from "./run_queue";
 import { QueueOverview } from "./run_queue_view";
+import { RunSupervisorHistory } from "./run_supervisor_view";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -990,6 +991,7 @@ function Overview({ detail }: { detail: Detail | null }) {
                   <pre className="command">{formatValue(command)}</pre>
                 </>
               )}
+              <RunSupervisorHistory state={detail.state} />
               {(
                 [
                   ["Run record", detail.state],

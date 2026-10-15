@@ -6,15 +6,27 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub(super) fn stop(child: &mut Child) -> io::Result<()> {
+  #[cfg(unix)]
+  {
+    stop_pid(child.id())
+  }
+  #[cfg(not(unix))]
+  {
+    child.kill()
+  }
+}
+
+#[cfg(unix)]
+pub(crate) fn stop_pid(pid: u32) -> io::Result<()> {
   verify_parent()?;
   let deadline = Instant::now() + Duration::from_secs(5);
   let mut empty_observations = 0;
   loop {
     // ECHILD means ownership was lost; never signal that numeric ID afterward.
-    super::child_exit_pending(child)?;
+    exit_pending(pid)?;
     // Its unreaped leader reserves this group ID until our last signal.
-    super::signal_group(child, super::StopSignal::Kill)?;
-    if super::child_exit_pending(child)? && !has_live_members(child.id(), child.id())? {
+    signal(pid, libc::SIGKILL)?;
+    if exit_pending(pid)? && !has_live_members(pid, pid)? {
       empty_observations += 1;
       if empty_observations >= 2 {
         return Ok(());
@@ -33,7 +45,43 @@ pub(super) fn stop(child: &mut Child) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(super) fn verify_parent() -> io::Result<()> {
+pub(crate) fn exit_pending(pid: u32) -> io::Result<bool> {
+  let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+  // WNOWAIT keeps ownership of the child ID until the final group signal.
+  if unsafe {
+    libc::waitid(
+      libc::P_PID,
+      pid,
+      &mut info,
+      libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+    )
+  } < 0
+  {
+    return Err(io::Error::last_os_error());
+  }
+  Ok(unsafe { info.si_pid() } != 0)
+}
+
+#[cfg(unix)]
+pub(crate) fn signal(pid: u32, signal: i32) -> io::Result<()> {
+  exit_pending(pid)?;
+  if unsafe { libc::kill(-(pid as i32), signal) } == 0 {
+    return Ok(());
+  }
+  let error = io::Error::last_os_error();
+  if error.raw_os_error() == Some(libc::ESRCH) {
+    Ok(())
+  } else {
+    #[cfg(target_os = "macos")]
+    if error.raw_os_error() == Some(libc::EPERM) && unsafe { libc::kill(pid as i32, signal) } == 0 {
+      return Ok(());
+    }
+    Err(error)
+  }
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_parent() -> io::Result<()> {
   let mut disposition: libc::sigaction = unsafe { std::mem::zeroed() };
   // SAFETY: Reading the current action does not alter process signal handling.
   if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut disposition) } < 0 {

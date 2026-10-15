@@ -9,6 +9,7 @@ pub const ENVIRONMENT_MAINTENANCE_CAPABILITY: &str = "env-maintenance-v1";
 pub const RUN_RECORDS_CAPABILITY: &str = "run-records-v1";
 pub const RUN_METRICS_CAPABILITY: &str = "run-metrics-v1";
 pub const DURABLE_RUNS_CAPABILITY: &str = "durable-runs-v1";
+pub const SUPERVISOR_RESTART_CAPABILITY: &str = "run-supervisor-restart-v1";
 pub const RUN_PUBLISHING_CAPABILITY: &str = "run-publishing-v1";
 pub const SMOKE_RUNS_CAPABILITY: &str = "smoke-runs-v1";
 #[cfg(unix)]
@@ -23,6 +24,8 @@ pub enum NodeCommand {
   Run(SetupCommand),
   #[command(hide = true)]
   RunWorker(RunWorkerCommand),
+  #[command(hide = true)]
+  ResumeRunWorker(ResumeRunWorkerCommand),
   Env(RequestCommand),
   Runs(RequestCommand),
   Jobs(RequestCommand),
@@ -33,6 +36,12 @@ pub enum NodeCommand {
 pub struct RunWorkerCommand {
   #[arg(long)]
   pub run_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ResumeRunWorkerCommand {
+  #[arg(long, value_parser = clap::value_parser!(i32).range(3..))]
+  pub handoff_fd: i32,
 }
 
 #[derive(Debug, Args)]
@@ -87,6 +96,7 @@ pub fn run(command: NodeCommand) -> Result<()> {
       Ok(())
     }
     NodeCommand::RunWorker(command) => crate::node::run::worker(&command.run_dir),
+    NodeCommand::ResumeRunWorker(command) => resume_run_worker(command.handoff_fd),
     NodeCommand::Env(command) => {
       if let Some(path) = command.request {
         crate::node::environment::apply_request_file(&path)
@@ -112,6 +122,18 @@ pub fn run(command: NodeCommand) -> Result<()> {
   }
 }
 
+#[cfg(target_os = "linux")]
+fn resume_run_worker(handoff_fd: i32) -> Result<()> {
+  expri_worker::supervisor::resume_from_fd(handoff_fd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resume_run_worker(_: i32) -> Result<()> {
+  Err(ExpriError::Message(
+    "live supervisor restart requires a native Linux training machine".into(),
+  ))
+}
+
 pub(crate) fn initialize_worker_service() -> Result<()> {
   let paths = expri_core::storage::StoragePaths::resolve(None)?;
   expri_client::worker_service::ensure_collection_ready(&paths)?;
@@ -124,6 +146,8 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     ENVIRONMENT_MAINTENANCE_CAPABILITY,
     RUN_RECORDS_CAPABILITY,
     DURABLE_RUNS_CAPABILITY,
+    #[cfg(target_os = "linux")]
+    SUPERVISOR_RESTART_CAPABILITY,
     RUN_METRICS_CAPABILITY,
     RUN_PUBLISHING_CAPABILITY,
     SMOKE_RUNS_CAPABILITY,
@@ -142,4 +166,42 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     println!("{}", serde_json::json!({"capabilities": available}));
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use clap::Parser;
+
+  use super::*;
+
+  #[test]
+  fn resume_worker_requires_an_explicit_handoff_descriptor_above_standard_streams() {
+    let cli =
+      crate::Cli::try_parse_from(["expri", "node", "resume-run-worker", "--handoff-fd", "7"])
+        .unwrap();
+    let crate::Command::Node {
+      command: NodeCommand::ResumeRunWorker(command),
+    } = cli.command
+    else {
+      panic!("expected resume worker command");
+    };
+    assert_eq!(command.handoff_fd, 7);
+    for arguments in [
+      vec!["expri", "node", "resume-run-worker"],
+      vec!["expri", "node", "resume-run-worker", "--handoff-fd=-1"],
+      vec!["expri", "node", "resume-run-worker", "--handoff-fd=0"],
+      vec!["expri", "node", "resume-run-worker", "--handoff-fd=1"],
+      vec!["expri", "node", "resume-run-worker", "--handoff-fd=2"],
+    ] {
+      assert!(crate::Cli::try_parse_from(arguments).is_err());
+    }
+  }
+
+  #[test]
+  fn live_restart_capability_is_advertised_only_on_linux() {
+    let supported = capabilities(CapabilitiesCommand {
+      has: Some(SUPERVISOR_RESTART_CAPABILITY.into()),
+    });
+    assert_eq!(supported.is_ok(), cfg!(target_os = "linux"));
+  }
 }

@@ -130,6 +130,25 @@ pub fn set_task_status(run_dir: &Path, status: &str) -> Result<RunStatusUpdate> 
 pub fn update_state<T>(path: &Path, update: impl FnOnce(&mut Value) -> Result<T>) -> Result<T> {
   let directory = state_directory(path)?;
   let _lease = lock::run_state_lock(directory)?;
+  update_locked(path, update)
+}
+
+/// Attempt a short metadata update without delaying a live task's log pump.
+/// A busy state lease returns None and never invokes the update callback.
+pub fn try_update_state<T>(
+  path: &Path,
+  update: impl FnOnce(&mut Value) -> Result<T>,
+) -> Result<Option<T>> {
+  let directory = state_directory(path)?;
+  let LockAttempt::Acquired(_lease) =
+    lock::try_lock_file(&directory.join(".run-state.lock"), true)?
+  else {
+    return Ok(None);
+  };
+  update_locked(path, update).map(Some)
+}
+
+fn update_locked<T>(path: &Path, update: impl FnOnce(&mut Value) -> Result<T>) -> Result<T> {
   let mut state = read_state(path)?;
   let original = state.clone();
   let result = update(&mut state)?;

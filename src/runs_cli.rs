@@ -28,6 +28,8 @@ enum RunsSubcommand {
   Logs(RunsLogsCommand),
   /// Request graceful cancellation of a detached run.
   Cancel(RunsJobCommand),
+  /// Upgrade a supported detached supervisor while its task keeps running.
+  RestartSupervisor(RunsRestartSupervisorCommand),
   /// Fetch and inspect a run's scalar metrics and experiment parameters.
   Metrics(crate::metrics_cli::MetricsCommand),
   /// Compare scalar metrics across runs, with an optional local chart.
@@ -59,6 +61,25 @@ struct RunsJobCommand {
   #[command(flatten)]
   options: RunsArgs,
   run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct RunsRestartSupervisorCommand {
+  #[command(flatten)]
+  options: RunsArgs,
+  run_id: String,
+  /// Record why this supervisor is being restarted.
+  #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+  reason: String,
+  /// Reuse this ID to retry an interrupted request without another restart.
+  #[arg(long)]
+  request_id: Option<String>,
+  /// Refuse the operation if the supervisor generation has changed.
+  #[arg(long)]
+  expected_generation: Option<u64>,
+  /// Replacement expri executable on the training machine.
+  #[arg(long)]
+  binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -173,6 +194,29 @@ pub fn run(command: RunsCommand, target: Option<&str>, verbosity: u8, quiet: boo
         command.options,
         protocol::JobRequest::Cancel {
           run_id: command.run_id,
+        },
+        target,
+        verbosity,
+        quiet,
+      );
+    }
+    RunsSubcommand::RestartSupervisor(command) => {
+      let request_id = command
+        .request_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+      if !quiet {
+        eprintln!("Supervisor restart request: {request_id}");
+      }
+      return run_job(
+        command.options,
+        protocol::JobRequest::RestartSupervisor {
+          run_id: command.run_id,
+          restart: protocol::SupervisorRestartRequest {
+            request_id,
+            reason: command.reason,
+            expected_generation: command.expected_generation,
+            binary: command.binary,
+          },
         },
         target,
         verbosity,
@@ -304,6 +348,17 @@ fn run_job(
     } else if !quiet {
       print_job_report(&report);
     }
+    if report["restart"]["status"] == "failed" {
+      let request_id = report["restart"]["request_id"]
+        .as_str()
+        .unwrap_or("unknown");
+      let detail = report["restart"]["error"]
+        .as_str()
+        .unwrap_or("inspect the run's supervisor restart event for details");
+      return Err(ExpriError::Message(format!(
+        "supervisor restart {request_id} failed: {detail}"
+      )));
+    }
   }
   Ok(())
 }
@@ -326,6 +381,23 @@ fn print_job_report(report: &serde_json::Value) {
   }
   if report["already_finished"] == true {
     println!("The run already finished; no cancellation was needed.");
+  }
+  if let Some(restart) = report.get("restart") {
+    for (label, field) in [
+      ("Restart request", "request_id"),
+      ("Restart status", "status"),
+      ("Supervisor generation", "generation"),
+      ("Worker restarted", "worker_restarted"),
+      ("Restart reason", "reason"),
+      ("Restart detail", "error"),
+    ] {
+      if let Some(value) = restart.get(field).filter(|value| !value.is_null()) {
+        let value = value
+          .as_str()
+          .map_or_else(|| value.to_string(), str::to_owned);
+        println!("{label}: {value}");
+      }
+    }
   }
   print_publishing(report);
 }
@@ -636,6 +708,91 @@ mod tests {
       vec!["expri", "runs", "status", "run-123", "--cached"],
     ] {
       assert!(Cli::try_parse_from(args).is_err());
+    }
+  }
+
+  #[test]
+  fn supervisor_restart_parser_requires_a_reason_and_keeps_worker_local_options() {
+    let cli = Cli::try_parse_from([
+      "expri",
+      "-T",
+      "gpu",
+      "runs",
+      "restart-supervisor",
+      "run-123",
+      "--reason",
+      "upgrade runtime",
+      "--request-id",
+      "restart-one",
+      "--expected-generation",
+      "2",
+      "--binary",
+      "/opt/expri next/expri",
+      "--json",
+    ])
+    .unwrap();
+    let Command::Runs(RunsCommand {
+      command: RunsSubcommand::RestartSupervisor(command),
+    }) = cli.command
+    else {
+      panic!("expected supervisor restart");
+    };
+    assert_eq!(command.run_id, "run-123");
+    assert_eq!(command.reason, "upgrade runtime");
+    assert_eq!(command.request_id.as_deref(), Some("restart-one"));
+    assert_eq!(command.expected_generation, Some(2));
+    assert_eq!(command.binary, Some(PathBuf::from("/opt/expri next/expri")));
+    assert!(command.options.json);
+
+    let cli = Cli::try_parse_from([
+      "expri",
+      "runs",
+      "restart-supervisor",
+      "run-123",
+      "--reason",
+      "refresh runtime",
+    ])
+    .unwrap();
+    let Command::Runs(RunsCommand {
+      command: RunsSubcommand::RestartSupervisor(command),
+    }) = cli.command
+    else {
+      panic!("expected supervisor restart");
+    };
+    assert!(command.request_id.is_none());
+    assert!(command.expected_generation.is_none());
+    assert!(command.binary.is_none());
+    for arguments in [
+      vec!["expri", "runs", "restart-supervisor", "run-123"],
+      vec![
+        "expri",
+        "runs",
+        "restart-supervisor",
+        "run-123",
+        "--reason",
+        "",
+      ],
+      vec![
+        "expri",
+        "runs",
+        "restart-supervisor",
+        "run-123",
+        "--reason",
+        "upgrade",
+        "--expected-generation",
+        "-1",
+      ],
+      vec![
+        "expri",
+        "runs",
+        "restart-supervisor",
+        "run-123",
+        "--reason",
+        "upgrade",
+        "--cached",
+      ],
+    ] {
+      assert!(Cli::try_parse_from(arguments).is_err());
     }
   }
 }

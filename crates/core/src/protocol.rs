@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::config::{EnvironmentConfig, RunServiceConfig};
 
@@ -54,6 +55,18 @@ pub struct RunRequest {
   pub expected_sync: Option<SyncIdentity>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorRestartRequest {
+  pub request_id: String,
+  pub reason: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub expected_generation: Option<u64>,
+  /// Executable on the training machine, never a controller-side upload.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub binary: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum JobRequest {
@@ -71,6 +84,10 @@ pub enum JobRequest {
   },
   Cancel {
     run_id: String,
+  },
+  RestartSupervisor {
+    run_id: String,
+    restart: SupervisorRestartRequest,
   },
 }
 
@@ -162,6 +179,46 @@ pub struct SyncApplyRequest {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn supervisor_restart_request_round_trips_with_strict_options() {
+    let request = serde_json::json!({
+      "operation": "restart_supervisor", "run_id": "run-123",
+      "restart": {"request_id": "restart-123", "reason": "upgrade supervisor"},
+    });
+    let JobRequest::RestartSupervisor { run_id, restart } =
+      serde_json::from_value::<JobRequest>(request.clone()).unwrap()
+    else {
+      panic!("expected restart supervisor request");
+    };
+    assert_eq!(run_id, "run-123");
+    assert_eq!(restart.expected_generation, None);
+    assert_eq!(restart.binary, None);
+    assert_eq!(
+      serde_json::to_value(JobRequest::RestartSupervisor { run_id, restart }).unwrap(),
+      request
+    );
+    let mut explicit = request["restart"].clone();
+    explicit["expected_generation"] = serde_json::json!(2);
+    explicit["binary"] = serde_json::json!("/opt/expri next/bin/expri");
+    let restart = serde_json::from_value::<SupervisorRestartRequest>(explicit.clone()).unwrap();
+    assert_eq!(restart.expected_generation, Some(2));
+    assert_eq!(
+      restart.binary,
+      Some(PathBuf::from("/opt/expri next/bin/expri"))
+    );
+    assert_eq!(serde_json::to_value(restart).unwrap(), explicit);
+    for (field, value) in [
+      ("expected_generation", serde_json::json!(-1)),
+      ("expected_generation", serde_json::json!("2")),
+      ("binary", serde_json::json!(true)),
+      ("worker_restart", serde_json::json!(true)),
+    ] {
+      let mut invalid = request.clone();
+      invalid["restart"][field] = value;
+      assert!(serde_json::from_value::<JobRequest>(invalid).is_err());
+    }
+  }
 
   #[test]
   fn smoke_request_is_opt_in_and_rejects_non_boolean_markers() {

@@ -19,6 +19,10 @@ pub fn query_at(request: &JobRequest, repo_root: &Path) -> Result<Value> {
   match request {
     JobRequest::Status { run_id } => status_at(repo_root, run_id),
     JobRequest::Cancel { run_id } => cancel_at(repo_root, run_id),
+    JobRequest::RestartSupervisor { run_id, restart } => {
+      let run_dir = run_directory(repo_root, run_id)?;
+      crate::supervisor::request_restart(&run_dir, restart)
+    }
     JobRequest::Logs { .. } => Err(message("log requests produce a byte stream")),
   }
 }

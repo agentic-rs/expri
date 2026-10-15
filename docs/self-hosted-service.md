@@ -403,6 +403,8 @@ restart that component. Failure does not stop the other components.
 with the saved component choices. It preserves training, publication jobs,
 capture outboxes, and held execution allocations. It can also start a stopped
 service. Use component restart when only one part needs reloading.
+Neither operation upgrades an existing per-run supervisor. Use the explicit
+[live run supervisor upgrade](#live-run-supervisor-upgrades) when that run supports it.
 
 Pausing publishing does not cancel runs. New registrations remain durable,
 and `publish --wait`/`--watch` reports the pause rather than waiting indefinitely.
@@ -538,6 +540,54 @@ accepts files up to 1,000 × 5 GiB. This keeps resumable-upload receipts below t
 tracking runs retain raw files
 and their SQLite projection after uploading. Legacy publishers continue removing
 completed stream records after their individual S3 objects are published.
+
+## Live run supervisor upgrades
+
+The shared worker service and each detached run's supervisor have separate
+lifetimes. `service restart` replaces the shared process, and
+`service restart --component NAME` replaces a component's threads; neither
+changes the executable already supervising an active run.
+
+New native Linux detached runs support a live executable handoff for their
+per-run supervisor. First install the replacement expri executable on the worker,
+then inspect the current generation and request the upgrade:
+
+```sh
+expri -T gpu runs status run-abc123 --json
+expri -T gpu runs restart-supervisor run-abc123 --reason "Upgrade expri" --request-id upgrade-1 --expected-generation 1 --binary /opt/expri/bin/expri --json
+```
+
+`--binary` is an absolute path on the executing worker; the controller does not
+upload it. Omit the option to use the native executable handling the request.
+Omit `-T` when running the command on the worker's local checkout.
+`--reason` is required. The command waits for the handoff acknowledgement and
+reports the restart outcome. The run's generation starts at 1 and advances only
+on success; use `state.supervisor.generation` from status rather than assuming
+the example value. `--expected-generation` rejects a request if that generation
+has already changed.
+
+Keep the same `--request-id`, reason, binary option, and expected generation
+when retrying after a connection interruption or acknowledgement timeout.
+An identical request returns its durable result without another restart.
+Changed arguments with the same ID are rejected. If omitted, the CLI generates
+and prints a request ID. A failed target preflight leaves the existing task
+running and records a failed event; the CLI exits unsuccessfully, including
+with `--json`, whose report includes `restart.error`.
+Use a new request ID for a fresh attempt after fixing a recorded failure.
+
+The handoff retains the task PID, run ID, original start time, process ownership,
+log streams, metric history, and artifacts. Restart events record their reason,
+requested target generation, dates, outcome, and `worker_restarted: false` in
+`run-state.json`. Dashboard Overview shows the newest 16 events within a bounded
+preview, plus the total count; the raw record retains the full history. Further
+requests are refused when insufficient space remains within the 256 KiB run
+metadata limit, preserving earlier events and room for final state updates.
+
+Only a live, non-cancelling task in `running` or `waiting` with the supporting
+native Linux detached supervisor can hand off. Older supervisors, Python
+fallback, foreground runs, preparation, and terminal runs are unsupported. An
+arbitrary supervisor crash or SIGKILL is not recovered and surviving tasks are
+not adopted. This operation does not restart a worker from a checkpoint.
 
 ## Local download and dashboard
 

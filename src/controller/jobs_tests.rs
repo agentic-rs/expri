@@ -209,6 +209,49 @@ fn job_queries_select_capability_and_keep_profile_banners_off_json() {
 }
 
 #[test]
+fn supervisor_restart_negotiates_its_own_capability_without_python_fallback() {
+  let fixture = Fixture::new();
+  let request = JobRequest::RestartSupervisor {
+    run_id: "run-old".into(),
+    restart: crate::protocol::SupervisorRestartRequest {
+      request_id: "restart-123".into(),
+      reason: "upgrade 'supervisor' runtime".into(),
+      expected_generation: Some(3),
+      binary: Some(PathBuf::from("/opt/expri next/expri")),
+    },
+  };
+  fixture.node(crate::node::cli::SUPERVISOR_RESTART_CAPABILITY);
+  for preference in [ProtocolPreference::Auto, ProtocolPreference::ExpriNode] {
+    let report = execute_with_preference(&fixture.remote, &request, preference, "./node-stub")
+      .unwrap()
+      .unwrap();
+    assert_eq!(report["native"], true);
+    assert_eq!(report["request"], serde_json::to_value(&request).unwrap());
+  }
+  // Old durable workers are sufficient for status and logs, but cannot safely
+  // receive a request that their running supervisor does not understand.
+  fixture.node("durable-runs-v1");
+  for preference in [ProtocolPreference::Auto, ProtocolPreference::ExpriNode] {
+    let error =
+      execute_with_preference(&fixture.remote, &request, preference, "./node-stub").unwrap_err();
+    assert!(error.to_string().contains("run-supervisor-restart-v1"));
+  }
+  let error = execute_with_preference(
+    &fixture.remote,
+    &request,
+    ProtocolPreference::Python,
+    "./missing-node",
+  )
+  .unwrap_err();
+  assert!(
+    error
+      .to_string()
+      .contains("Python fallback cannot transfer")
+  );
+  assert!(job_command(&fixture.remote, &request, "unused-node", false).is_err());
+}
+
+#[test]
 fn streamed_logs_preserve_binary_bytes_without_profile_banners() {
   let fixture = Fixture::new();
   fixture.node("durable-runs-v1");

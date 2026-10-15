@@ -181,13 +181,14 @@ pub fn start_prepared(
     )
     .map(Some);
   }
-  let _run_lock = crate::lock::run_lock(&prepared.snapshot.run_dir)?;
+  let run_lock = crate::lock::run_lock(&prepared.snapshot.run_dir)?;
   execute_snapshot(
     request,
     &prepared.repo_root,
     &prepared.snapshot,
     prepared.state,
     false,
+    &run_lock,
   )?;
   Ok(None)
 }
@@ -224,7 +225,10 @@ fn execute_snapshot(
   snapshot: &RunSnapshot,
   mut state: serde_json::Value,
   worker: bool,
+  lease: &crate::lock::FileLock,
 ) -> Result<()> {
+  #[cfg(not(target_os = "linux"))]
+  let _ = lease;
   let state_path = snapshot.run_dir.join("run-state.json");
   if let Some(service) = &request.service
     && service.publish
@@ -236,8 +240,9 @@ fn execute_snapshot(
     );
   }
   let mut cancelled = false;
+  let mut cleanup_uncertain = false;
   let mut logs_created = None;
-  let mut result = (|| {
+  let result = (|| {
     let logs = logs_created.insert(if worker && state["queue_cleanup"] == true {
       RunLogs::create_queued_detached(&snapshot.run_dir)?
     } else if worker {
@@ -322,33 +327,84 @@ fn execute_snapshot(
       .env("EXPRI_RUN_DIR", &snapshot.run_dir)
       .env("EXPRI_OUTPUT_DIR", snapshot.run_dir.join("outputs"));
     command.env_remove("EXPRI_INPUT_DIR");
-    let output = logs.task_with_started(&mut command, || {
+    let on_started = || {
       expri_core::run_state::update_state(&state_path, |current| {
         current["task_started_at"] = json!(chrono::Utc::now().to_rfc3339());
         Ok(())
       })
       .map_err(std::io::Error::other)
-    })?;
-    state["task_exit_code"] = json!(command_exit_code(&output.status));
-    if let Some(error) = &output.log_error {
-      state["logging_error"] = json!(error.to_string());
-    }
-    if !output.status.success() {
-      return Err(ExpriError::CommandFailed {
-        program: argv[0].clone(),
-        code: command_exit_code(&output.status),
-      });
-    }
-    if let Some(error) = output.log_error {
-      return Err(error.into());
-    }
-    Ok(())
+    };
+    #[cfg(target_os = "linux")]
+    let output = if worker {
+      let (stdout, stderr) = logs.supervisor_files()?;
+      let output = crate::supervisor::task(
+        &mut command,
+        &snapshot.run_dir,
+        lease,
+        stdout,
+        stderr,
+        on_started,
+      )?;
+      cancelled |= output.cancelled;
+      cleanup_uncertain |= output.cleanup_uncertain;
+      output.output
+    } else {
+      logs.task_with_started(&mut command, on_started)?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output = logs.task_with_started(&mut command, on_started)?;
+    task_result(output, &mut state, &argv[0])
   })();
   cancelled |= logs_created.as_ref().is_some_and(RunLogs::was_cancelled);
-  if logs_created
+  cleanup_uncertain |= logs_created
     .as_ref()
-    .is_some_and(RunLogs::cleanup_uncertain)
-  {
+    .is_some_and(RunLogs::cleanup_uncertain);
+  finalize_snapshot(
+    snapshot,
+    state,
+    worker,
+    result,
+    cancelled,
+    cleanup_uncertain,
+  )
+}
+
+fn task_result(
+  output: crate::run_logs::LoggedOutput,
+  state: &mut serde_json::Value,
+  program: &str,
+) -> Result<()> {
+  state["task_exit_code"] = json!(command_exit_code(&output.status));
+  if let Some(error) = &output.log_error {
+    state["logging_error"] = json!(error.to_string());
+  }
+  if !output.status.success() {
+    return Err(ExpriError::CommandFailed {
+      program: program.into(),
+      code: command_exit_code(&output.status),
+    });
+  }
+  if let Some(error) = output.log_error {
+    return Err(error.into());
+  }
+  Ok(())
+}
+
+fn finalize_snapshot(
+  snapshot: &RunSnapshot,
+  mut state: serde_json::Value,
+  worker: bool,
+  mut result: Result<()>,
+  cancelled: bool,
+  cleanup_uncertain: bool,
+) -> Result<()> {
+  let state_path = snapshot.run_dir.join("run-state.json");
+  // Restart events are updated independently of this execution snapshot.
+  state
+    .as_object_mut()
+    .expect("run state object")
+    .remove("supervisor");
+  if cleanup_uncertain {
     state["queue_cleanup_uncertain"] = json!(true);
   }
   if worker {
@@ -386,6 +442,37 @@ fn execute_snapshot(
     });
   }
   result
+}
+
+/// Complete the existing task after an exec handoff. This path deliberately
+/// skips source/environment preparation, task launch, and capture creation.
+#[cfg(target_os = "linux")]
+pub(crate) fn finish_resumed(run_dir: &Path, output: crate::supervisor::TaskOutput) -> Result<()> {
+  let mut state = read_record(&run_dir.join("run-state.json"), 256 * 1024)?;
+  let command = state["command"].clone();
+  let program = command
+    .as_array()
+    .and_then(|args| args.first())
+    .and_then(|arg| arg.as_str())
+    .unwrap_or("task");
+  let result = task_result(output.output, &mut state, program);
+  let snapshot = RunSnapshot {
+    run_id: state["run_id"]
+      .as_str()
+      .ok_or_else(|| ExpriError::Message("missing run identity".into()))?
+      .into(),
+    code_dir: run_dir.join("code"),
+    run_dir: run_dir.into(),
+    assets: Vec::new(),
+  };
+  finalize_snapshot(
+    &snapshot,
+    state,
+    true,
+    result,
+    output.cancelled,
+    output.cleanup_uncertain,
+  )
 }
 
 fn prepare_assets(
@@ -583,7 +670,7 @@ pub fn worker(run_dir: &Path) -> Result<()> {
       "worker requires a detached run request".to_string(),
     ));
   }
-  let crate::lock::LockAttempt::Acquired(_lease) =
+  let crate::lock::LockAttempt::Acquired(lease) =
     crate::lock::try_lock_file(&run_dir.join(".run.lock"), true)?
   else {
     return Err(ExpriError::Message(
@@ -610,7 +697,7 @@ pub fn worker(run_dir: &Path) -> Result<()> {
     run_dir: run_dir.clone(),
     assets: crate::assets::discover(&run_dir.join("code"))?,
   };
-  execute_snapshot(&request, repo_root, &snapshot, state, true)
+  execute_snapshot(&request, repo_root, &snapshot, state, true, &lease)
 }
 
 fn read_record(path: &Path, limit: u64) -> Result<serde_json::Value> {

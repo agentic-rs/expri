@@ -7,6 +7,49 @@ pub struct FileLock {
   file: File,
 }
 
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for FileLock {
+  fn as_raw_fd(&self) -> std::os::fd::RawFd {
+    std::os::fd::AsRawFd::as_raw_fd(&self.file)
+  }
+}
+
+impl FileLock {
+  /// Adopt the same open description across exec, without releasing or
+  /// reacquiring its lease. Callers must pass an inherited, owned descriptor.
+  #[cfg(target_os = "linux")]
+  pub fn from_inherited_file(file: File, path: &Path) -> Result<Self> {
+    Self::verify_inherited_file(&file, path)?;
+    Ok(Self { file })
+  }
+
+  /// Verify an inherited open description while the caller retains ownership.
+  #[cfg(target_os = "linux")]
+  pub fn verify_inherited_file(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let named = open_lock_file(path, false, false)?
+      .ok_or_else(|| ExpriError::Message("inherited lease is missing".into()))?;
+    let inherited = file.metadata()?;
+    let current = named.metadata()?;
+    if inherited.dev() != current.dev() || inherited.ino() != current.ino() {
+      return Err(ExpriError::Message(
+        "inherited lease identity changed".into(),
+      ));
+    }
+    match named.try_lock_shared() {
+      Err(std::fs::TryLockError::WouldBlock) => match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(ExpriError::Message(
+          "inherited descriptor does not own the lease".into(),
+        )),
+        Err(std::fs::TryLockError::Error(source)) => Err(source.into()),
+      },
+      Ok(()) => Err(ExpriError::Message("inherited lease is not held".into())),
+      Err(std::fs::TryLockError::Error(source)) => Err(source.into()),
+    }
+  }
+}
+
 impl Drop for FileLock {
   fn drop(&mut self) {
     // A concurrently spawned child can briefly inherit the file description.
@@ -226,6 +269,28 @@ mod tests {
   use std::os::unix::fs::symlink;
 
   use super::*;
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn inherited_lease_verification_requires_the_owned_open_description() {
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let lease = run_lock(&root).unwrap();
+    let path = root.join(".run.lock");
+    let unrelated = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    assert!(FileLock::verify_inherited_file(&unrelated, &path).is_err());
+    let inherited = lease.file.try_clone().unwrap();
+    FileLock::verify_inherited_file(&inherited, &path).unwrap();
+    drop(inherited);
+    assert!(matches!(
+      try_lock_file_readonly(&path).unwrap(),
+      LockAttempt::Busy
+    ));
+  }
 
   #[test]
   fn readonly_probe_detects_exclusive_leases_without_write_permission() {
