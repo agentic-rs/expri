@@ -172,6 +172,13 @@ def _catalog_summary(run_id, state, warnings):
   if state.get("run_id") != run_id:
     _catalog_warning(warnings, run_id, "run-state.json run_id does not match its directory")
     return summary, None
+  if "task_attempts" in state:
+    try:
+      _catalog_parameters_path(state)
+      summary["current_attempt"] = state["task_attempts"]["current_attempt"]
+    except ValueError:
+      summary["current_attempt"] = None
+      _catalog_warning(warnings, run_id, "run-state.json has invalid or missing task_attempts")
   if "smoke" in state:
     if type(state["smoke"]) is bool:
       summary["smoke"] = state["smoke"]
@@ -317,13 +324,35 @@ def _catalog_invalid_json_constant(_):
   raise _catalog_json.JSONDecodeError("invalid JSON constant", "", 0)
 
 
+def _catalog_parameters_path(state):
+  if not isinstance(state, dict) or "task_attempts" not in state:
+    return "outputs/params.json"
+  history = state["task_attempts"]
+  if not isinstance(history, dict) or type(history.get("protocol_version")) is not int or history["protocol_version"] != 1 or history.get("truncated") is not False:
+    raise ValueError("invalid task attempt history envelope")
+  attempts = history.get("attempts")
+  current = history.get("current_attempt")
+  if not isinstance(attempts, list) or not attempts or len(attempts) > 100:
+    raise ValueError("invalid task attempt history")
+  ids = [attempt.get("attempt") if isinstance(attempt, dict) else None for attempt in attempts]
+  if any(type(number) is not int or not 1 <= number <= 100 for number in ids) or len(set(ids)) != len(ids) or type(current) is not int or current not in ids or type(history.get("total_count")) is not int or history["total_count"] != len(ids):
+    raise ValueError("invalid task attempt history envelope")
+  return "outputs/params.json" if current == 1 else "outputs/attempts/%s/params.json" % current
+
+
 def _catalog_files(run_dir, artifacts, metrics=False):
   warnings = []
   files = set()
   for relative in _CATALOG_METADATA_FILES:
     _catalog_collect_files(run_dir, relative, files, warnings, explicit=False, recurse=False)
   if metrics:
-    for relative in ("outputs/metrics.jsonl", "outputs/params.json"):
+    paths = ["outputs/metrics.jsonl"]
+    state = _catalog_optional_json(run_dir, "run-state.json", [], missing=True)
+    try:
+      paths.append(_catalog_parameters_path(state))
+    except ValueError as error:
+      _catalog_warning(warnings, run_dir.name, str(error))
+    for relative in paths:
       warnings_before = len(warnings)
       _catalog_collect_files(run_dir, relative, files, warnings, explicit=False, recurse=False)
       if relative not in files and len(warnings) == warnings_before:

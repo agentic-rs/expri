@@ -230,6 +230,64 @@ fn remote_metrics_compare_use_selective_fetches_and_remain_available_offline() {
 }
 
 #[test]
+fn continued_run_metrics_fetch_current_attempt_parameters_and_do_not_reuse_missing_remote_values() {
+  if !rsync_available() {
+    return;
+  }
+  for (protocol, old_node) in [("expri-node", false), ("python", false), ("auto", true)] {
+    let fixture = Fixture::new(protocol, old_node);
+    let run = fixture.remote.join(".expri/runs/run-one");
+    let mut state: Value =
+      serde_json::from_slice(&fs::read(run.join("run-state.json")).unwrap()).unwrap();
+    state["task_attempts"] = json!({"protocol_version":1,"current_attempt":2,"attempts":[{"attempt":1},{"attempt":2}],"total_count":2,"truncated":false});
+    fs::write(
+      run.join("run-state.json"),
+      serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(run.join("outputs/attempts/2")).unwrap();
+    fs::write(
+      run.join("outputs/attempts/2/params.json"),
+      br#"{"schema_version":1,"params":{"learning_rate":0.3,"max_steps":300}}"#,
+    )
+    .unwrap();
+    let preview = fixture.json(&[
+      "runs",
+      "fetch",
+      "run-one",
+      "--metrics",
+      "--dry-run",
+      "--json",
+    ]);
+    assert!(
+      preview["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("outputs/attempts/2/params.json"))
+    );
+    assert!(
+      !preview["files"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("outputs/params.json"))
+    );
+    let metrics = fixture.json(&["runs", "metrics", "run-one", "--json"]);
+    assert_eq!(metrics["params"]["max_steps"], 300);
+    let cached = fixture.json(&["runs", "metrics", "run-one", "--cached", "--json"]);
+    assert_eq!(cached["params"]["learning_rate"], 0.3);
+    fs::remove_file(run.join("outputs/attempts/2/params.json")).unwrap();
+    let missing = fixture.json(&["runs", "metrics", "run-one", "--json"]);
+    assert!(missing["params"].is_null());
+    assert!(
+      fixture
+        .cache("run-one")
+        .join("outputs/attempts/2/params.json")
+        .exists()
+    );
+  }
+}
+
+#[test]
 fn forced_older_nodes_refuse_metric_selection_before_creating_a_cache() {
   let fixture = Fixture::new("expri-node", true);
   let output = fixture

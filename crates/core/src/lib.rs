@@ -14,5 +14,6 @@ pub mod service_auth;
 pub mod service_catalog;
 pub mod storage;
 pub mod system_profile;
+pub mod task_attempts;
 
 pub mod filter;

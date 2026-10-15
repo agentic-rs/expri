@@ -227,6 +227,31 @@ def _write_state(directory, state):
       pass
 
 
+def _sync_attempt_phase(state, status):
+  if "task_attempts" not in state:
+    return False
+  history = state["task_attempts"]
+  if not isinstance(history, dict) or type(history.get("protocol_version")) is not int or history.get("protocol_version") != 1 or history.get("truncated") is not False or not isinstance(history.get("attempts"), list) or type(history.get("total_count")) is not int or history.get("total_count") != len(history["attempts"]):
+    raise ValueError("invalid task attempt history")
+  current = history.get("current_attempt")
+  if isinstance(current, bool) or not isinstance(current, int) or not 1 <= current <= 2 ** 64 - 1:
+    raise ValueError("invalid current task attempt")
+  ids = set()
+  active = None
+  for attempt in history["attempts"]:
+    number = attempt.get("attempt") if isinstance(attempt, dict) else None
+    if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= 2 ** 64 - 1 or number in ids:
+      raise ValueError("invalid task attempt number")
+    ids.add(number)
+    if number == current:
+      active = attempt
+  if active is None or active.get("status") not in ("running", "waiting") or active.get("finished_at") is not None:
+    raise ValueError("current task attempt is not active")
+  changed = active["status"] != status
+  active["status"] = status
+  return changed
+
+
 def set_run_status(status, run_dir=None):
   """Request running or waiting for a live managed run; return change details.
 
@@ -255,7 +280,8 @@ def set_run_status(status, run_dir=None):
     _validate_state(state, run_dir, directory)
     _require_live_lease(directory)
     previous = state["status"]
-    changed = previous != status
+    attempt_changed = _sync_attempt_phase(state, status)
+    changed = previous != status or attempt_changed
     if changed:
       state["status"] = status
       _write_state(directory, state)

@@ -32,13 +32,30 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
     (data, warnings)
   }
 
-  fn table_parameters(&self, scope: &RunScope, deadline: Instant) -> ApiResult<Option<Value>> {
-    let path = "outputs/params.json";
-    let Some(record) = self.store.dashboard_artifact(scope, path)? else {
+  pub(super) fn table_parameters(
+    &self,
+    scope: &RunScope,
+    deadline: Instant,
+  ) -> ApiResult<Option<Value>> {
+    let overview = self.overview(scope, deadline)?;
+    let current = match overview["run"].get("current_attempt") {
+      None => 1,
+      Some(value) => value
+        .as_u64()
+        .ok_or_else(|| ApiError::new(422, "run has no valid current task attempt"))?,
+    };
+    let path = if current == 1 {
+      "outputs/params.json".into()
+    } else {
+      format!("outputs/attempts/{current}/params.json")
+    };
+    let Some(record) = self.store.dashboard_artifact(scope, &path)? else {
       return Ok(None);
     };
     let version = version(&record);
-    if let Some(cached) = self.store.dashboard_cached_scalars(scope, path, &version)?
+    if let Some(cached) = self
+      .store
+      .dashboard_cached_scalars(scope, &path, &version)?
       && cached["table_schema"] == 1
       && cached["params"].is_object()
     {
@@ -47,7 +64,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
     if record.size > JSON_LIMIT {
       return Err(ApiError::new(
         413,
-        "outputs/params.json exceeds the 1 MiB size limit",
+        format!("{path} exceeds the 1 MiB size limit"),
       ));
     }
     let bytes = self.range(&record, 0, record.size as usize, deadline)?;
@@ -56,7 +73,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
       metrics::parse_parameters(&bytes).map_err(|error| ApiError::new(422, error.to_string()))?;
     self.store.dashboard_cache_scalars(
       scope,
-      path,
+      &path,
       &version,
       &json!({"table_schema":1,"params":value}),
     )?;

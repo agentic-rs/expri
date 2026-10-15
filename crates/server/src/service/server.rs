@@ -347,6 +347,15 @@ fn authorize<S: ObjectStorage>(
   worker: Option<&WorkerAuth>,
   request: &Request,
 ) -> ApiResult<()> {
+  if let Request::AtRunEpoch { request, .. } = request {
+    if !expri_core::service::run_mutation(request) {
+      return Err(ApiError::new(
+        400,
+        "publication epoch requires a run mutation",
+      ));
+    }
+    return authorize(store, worker, request);
+  }
   let server_archive = match request {
     Request::BeginUpload {
       upload_id, target, ..
@@ -386,6 +395,10 @@ fn authorize<S: ObjectStorage>(
       allowed_target(worker, &store.upload_target(upload_id)?, false)
     }
     Request::ListFiles { scope }
+    | Request::BeginRunAttempt { scope, .. }
+    | Request::CheckRunContinuation { scope }
+    | Request::RunPublication { scope }
+    | Request::ReconcileRunAttempt { scope, .. }
     | Request::AppendStream { scope, .. }
     | Request::ReadStream { scope, .. }
     | Request::PutDocument { scope, .. }
@@ -413,6 +426,7 @@ fn authorize<S: ObjectStorage>(
     | Request::GetSystemMachine { .. }
     | Request::SystemHistory { .. } => false,
     Request::Capabilities => true,
+    Request::AtRunEpoch { .. } => unreachable!("authorized inner request"),
     Request::SealRun {
       incomplete: true, ..
     } => false,
@@ -1823,6 +1837,78 @@ mod tests {
       HeaderValue::from_static("Bearer owner-token-with-at-least-24-characters"),
     );
     assert_eq!(route(&store, &auth, duplicate).unwrap_err().status, 401);
+  }
+
+  #[test]
+  fn publication_epoch_reads_are_scope_authorized_and_envelopes_authorize_the_inner_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let worker = Some(&auth.workers[0].1);
+    assert!(authorize(&store, worker, &Request::RunPublication { scope: scope() }).is_ok());
+    for foreign in [
+      RunScope {
+        project_id: "other".into(),
+        ..scope()
+      },
+      RunScope {
+        origin: "other".into(),
+        ..scope()
+      },
+    ] {
+      assert_eq!(
+        authorize(
+          &store,
+          worker,
+          &Request::RunPublication {
+            scope: foreign.clone()
+          }
+        )
+        .unwrap_err()
+        .status,
+        403
+      );
+      assert_eq!(
+        authorize(
+          &store,
+          worker,
+          &Request::AtRunEpoch {
+            epoch: 1,
+            request: Box::new(Request::PutDocument {
+              scope: foreign,
+              path: "run-state.json".into(),
+              revision: 1,
+              offset: 0,
+              total_size: 2,
+              data_base64: "e30=".into(),
+            })
+          }
+        )
+        .unwrap_err()
+        .status,
+        403
+      );
+    }
+    let wrapped_archive = Request::AtRunEpoch {
+      epoch: 1,
+      request: Box::new(Request::BeginUpload {
+        upload_id: "user-owned".into(),
+        target: FileTarget::Run {
+          scope: scope(),
+          path: "result.zip".into(),
+        },
+        size: 1,
+        sha256: "a".repeat(64),
+      }),
+    };
+    for role in [worker, None] {
+      assert_eq!(
+        authorize(&store, role, &wrapped_archive)
+          .unwrap_err()
+          .status,
+        403
+      );
+    }
   }
 
   #[test]

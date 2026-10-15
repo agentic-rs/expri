@@ -42,6 +42,18 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
         "json_extract({row}.scope,'$.project_id')",
       ),
       (
+        "tracking_run_epochs",
+        "json_extract({row}.scope,'$.project_id')",
+      ),
+      (
+        "tracking_attempt_history",
+        "json_extract({row}.scope,'$.project_id')",
+      ),
+      (
+        "tracking_attempt_aborts",
+        "json_extract({row}.scope,'$.project_id')",
+      ),
+      (
         "result_archives",
         "json_extract({row}.scope,'$.project_id')",
       ),
@@ -294,6 +306,11 @@ impl<S: ObjectStorage> Store<S> {
 
   pub(super) fn request_project(&self, request: &Request) -> ApiResult<Option<String>> {
     let project = match request {
+      Request::AtRunEpoch { request, .. } => return self.request_project(request),
+      Request::BeginRunAttempt { scope, .. }
+      | Request::CheckRunContinuation { scope }
+      | Request::RunPublication { scope }
+      | Request::ReconcileRunAttempt { scope, .. } => &scope.project_id,
       Request::Capabilities
       | Request::Queue { .. }
       | Request::BrowseRuns { .. }
@@ -443,7 +460,13 @@ impl<S: ObjectStorage> Store<S> {
         )
         .map_err(database)?;
     }
-    for table in ["tracking_run_seals", "result_archives"] {
+    for table in [
+      "tracking_run_seals",
+      "tracking_run_epochs",
+      "tracking_attempt_history",
+      "tracking_attempt_aborts",
+      "result_archives",
+    ] {
       transaction
         .execute(
           &format!("DELETE FROM {table} WHERE json_extract(scope,'$.project_id')=?1"),

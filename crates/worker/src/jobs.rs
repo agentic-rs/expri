@@ -23,6 +23,13 @@ pub fn query_at(request: &JobRequest, repo_root: &Path) -> Result<Value> {
       let run_dir = run_directory(repo_root, run_id)?;
       crate::supervisor::request_restart(&run_dir, restart)
     }
+    JobRequest::Continue {
+      run_id,
+      continuation,
+    } => {
+      let run_dir = run_directory(repo_root, run_id)?;
+      crate::continuation::request_continue(&run_dir, continuation)
+    }
     JobRequest::Logs { .. } => Err(message("log requests produce a byte stream")),
   }
 }

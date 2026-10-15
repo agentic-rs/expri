@@ -178,6 +178,34 @@ pub struct AssetProvenance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  /// Fence one mutation to the publication generation that prepared its bytes.
+  AtRunEpoch {
+    epoch: u64,
+    request: Box<Request>,
+  },
+  /// Explicitly reopen existing byte prefixes for a new task attempt.
+  BeginRunAttempt {
+    scope: RunScope,
+    request_id: String,
+    expected_epoch: u64,
+    attempt: u64,
+    documents: BTreeMap<String, u64>,
+    streams: BTreeMap<String, u64>,
+  },
+  /// Preflight retention and publication support before stopping a task.
+  CheckRunContinuation {
+    scope: RunScope,
+  },
+  /// Capture the current epoch for a new explicit scope-based owner operation.
+  RunPublication {
+    scope: RunScope,
+  },
+  /// Resolve an uncertain CAS, durably refusing a late commit if it never ran.
+  ReconcileRunAttempt {
+    scope: RunScope,
+    request_id: String,
+    expected_epoch: u64,
+  },
   /// Shared execution queue. All operations require an owner credential.
   Queue {
     request: crate::resource_queue::QueueRequest,
@@ -329,6 +357,12 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  ReconciledRunAttempt {
+    committed_epoch: Option<u64>,
+  },
+  RunAttempt {
+    epoch: u64,
+  },
   Queue {
     response: crate::resource_queue::QueueResponse,
   },
@@ -485,6 +519,9 @@ pub const TRACKING_DOCUMENT_PATHS: [&str; 5] = [
   "run-state.json",
 ];
 
+pub const TRACKING_DOCUMENT_LIMIT: usize =
+  TRACKING_DOCUMENT_PATHS.len() + 4 * crate::protocol::MAX_TASK_ATTEMPTS;
+
 /// Accepted append-only tracking streams, including the retained system capture.
 pub const TRACKING_STREAM_PATHS: [&str; 4] = [
   "outputs/metrics.jsonl",
@@ -494,7 +531,42 @@ pub const TRACKING_STREAM_PATHS: [&str; 4] = [
 ];
 
 pub fn document_path(path: &str) -> bool {
-  TRACKING_DOCUMENT_PATHS.contains(&path)
+  TRACKING_DOCUMENT_PATHS.contains(&path) || attempt_document(path).is_some()
+}
+
+/// Attempt metadata is published without permitting arbitrary source files.
+pub fn attempt_document(path: &str) -> Option<u64> {
+  let rest = path.strip_prefix("outputs/attempts/")?;
+  let (attempt, name) = rest.split_once('/')?;
+  if !matches!(
+    name,
+    "snapshot.json" | "environment-state.json" | "params.json" | "attempt-state.json"
+  ) || attempt.starts_with('0')
+    || attempt.len() > 19
+    || !attempt.bytes().all(|byte| byte.is_ascii_digit())
+  {
+    return None;
+  }
+  attempt
+    .parse::<u64>()
+    .ok()
+    .filter(|attempt| *attempt > 0 && *attempt <= crate::protocol::MAX_TASK_ATTEMPTS as u64)
+}
+
+pub fn run_mutation(request: &Request) -> bool {
+  matches!(
+    request,
+    Request::PutDocument { .. }
+      | Request::AppendTracking { .. }
+      | Request::SealRun { .. }
+      | Request::AppendStream { .. }
+      | Request::BeginUpload { .. }
+      | Request::PartUrl { .. }
+      | Request::RecordPart { .. }
+      | Request::CompleteUpload { .. }
+      | Request::ReferenceFile { .. }
+      | Request::ImportOutput { .. }
+  )
 }
 
 pub fn validate_scope(scope: &RunScope) -> crate::error::Result<()> {
@@ -561,6 +633,25 @@ pub fn upload_report(mut report: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn attempt_documents_have_one_bounded_canonical_path_per_metadata_kind() {
+    for path in [
+      "outputs/attempts/1/params.json",
+      "outputs/attempts/100/snapshot.json",
+    ] {
+      assert!(document_path(path));
+    }
+    for path in [
+      "outputs/attempts/+1/params.json",
+      "outputs/attempts/01/params.json",
+      "outputs/attempts/101/params.json",
+      "outputs/attempts/1/code/secrets.json",
+      "outputs/attempts/1/../params.json",
+    ] {
+      assert!(!document_path(path), "unsafe attempt document: {path}");
+    }
+  }
 
   fn client_config(token: Option<&str>, token_env: Option<&str>) -> ClientConfig {
     ClientConfig {

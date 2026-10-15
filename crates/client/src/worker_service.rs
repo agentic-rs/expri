@@ -517,6 +517,18 @@ pub fn resume_registered_run(
     .transpose()
 }
 
+pub(crate) fn saved_publishing_job(
+  paths: &StoragePaths,
+  run_dir: &std::path::Path,
+) -> Result<Option<PreparedJob>> {
+  registry::saved_run(paths, run_dir)
+}
+
+pub(crate) fn rearm_publishing_job(paths: &StoragePaths, job: PreparedJob) -> Result<()> {
+  registry::rearm(paths, &job)?;
+  register(paths, job).map(|_| ())
+}
+
 pub fn job_status(paths: &StoragePaths, job_id: &str) -> Result<Value> {
   registry::job_status(paths, job_id)
 }

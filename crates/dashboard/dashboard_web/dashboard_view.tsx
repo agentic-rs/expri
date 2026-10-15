@@ -13,6 +13,8 @@ import { RunDuration, RunDurationProvider, RunStatusTiming } from "./run_duratio
 import { queueContext, queueMessage, queuePlaceholder } from "./run_queue";
 import { QueueOverview } from "./run_queue_view";
 import { RunSupervisorHistory } from "./run_supervisor_view";
+import { RunAttemptHistory } from "./run_attempts_view";
+import { parseTaskAttempts } from "./run_attempts";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -968,6 +970,9 @@ function Overview({ detail }: { detail: Detail | null }) {
   const command = detail ? jsonObject(detail.state)["command"] : null;
   const values = detail ? Object.entries(jsonObject(detail.params)) : [];
   const names = detail ? Object.keys(detail.metrics).sort() : [];
+  const summary_attempt = detail?.run.current_attempt;
+  const current_attempt = detail ? parseTaskAttempts(jsonObject(detail.state).task_attempts)?.current_attempt ??
+    (typeof summary_attempt === "number" && Number.isSafeInteger(summary_attempt) && summary_attempt > 0 ? summary_attempt : undefined) : undefined;
   return (
     <div id="run-detail" hidden={!detail}>
       {detail && (queuePlaceholder(detail.run) ? <QueueOverview run={detail.run} /> : (
@@ -991,6 +996,7 @@ function Overview({ detail }: { detail: Detail | null }) {
                   <pre className="command">{formatValue(command)}</pre>
                 </>
               )}
+              <RunAttemptHistory state={detail.state} />
               <RunSupervisorHistory state={detail.state} />
               {(
                 [
@@ -1006,7 +1012,7 @@ function Overview({ detail }: { detail: Detail | null }) {
                 ))}
             </section>
             <section className="card">
-              <h3>{detail.params_truncated ? "Parameters · preview" : "Parameters"}</h3>
+              <h3>Parameters{current_attempt !== undefined && ` · Attempt ${current_attempt}`}{detail.params_truncated && " · preview"}</h3>
               {values.length ? (
                 <table className="params-table">
                   <tbody>

@@ -76,7 +76,7 @@ pub fn execute(options: RunOptions) -> Result<serde_json::Value> {
   }
 }
 
-/// Fetch fixed metric/parameter paths through the existing staged run pull.
+/// Fetch canonical metrics and current-attempt parameters through a staged pull.
 /// Presence reflects this remote selection, rather than older retained cache files.
 pub fn fetch_metrics(options: MetricsFetchOptions) -> Result<FetchedMetrics> {
   let runs_dir = super::run_pull::cached_runs_dir(
@@ -124,7 +124,16 @@ pub fn fetch_metrics(options: MetricsFetchOptions) -> Result<FetchedMetrics> {
       run_id,
       files: MetricFiles {
         metrics: selected("outputs/metrics.jsonl"),
-        params: selected("outputs/params.json"),
+        params: report["files"].as_array().is_some_and(|files| {
+          files
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|path| {
+              path == "outputs/params.json"
+                || expri_core::service::attempt_document(path).is_some()
+                  && path.ends_with("/params.json")
+            })
+        }),
       },
       warnings: report["warnings"].as_array().cloned().unwrap_or_default(),
     });

@@ -35,8 +35,8 @@ const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Version normalized run metadata independently of the unchanged artifact digest.
-// Schema 5 recognizes waiting as an active run state.
-const OVERVIEW_SCHEMA_VERSION: u64 = 5;
+// Schema 6 adds independently bounded task-attempt provenance.
+const OVERVIEW_SCHEMA_VERSION: u64 = 6;
 
 struct MetricReadMode {
   minimum: usize,
@@ -77,7 +77,7 @@ impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S
       .map_err(system_profile_error)?;
     let canonical = crate::runs::summary_from_state(&scope.run_id, state);
     let Some(window) =
-      expri_runs::system_metrics::RunSystemWindow::from_state(&scope.run_id, &canonical["run"])
+      expri_runs::system_metrics::RunSystemWindow::from_state(&scope.run_id, &canonical["state"])
     else {
       return Ok(
         expri_runs::system_metrics::RunSystemMetrics::unavailable_for_run(
@@ -812,7 +812,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       .unwrap_or(Value::Null);
     }
     let mut params_truncated = false;
-    let params = match self.parameters(&scope, deadline) {
+    let params = match self.parameters(&scope, Some(&record["state"]), deadline) {
       Ok(Some(value)) => preview(&value, &mut params_truncated),
       Ok(None) => Value::Null,
       Err(error) => {
@@ -1356,17 +1356,30 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       .map_err(|_| ApiError::new(422, format!("{path} contains invalid JSON")))
   }
 
-  fn parameters(&self, scope: &RunScope, deadline: Instant) -> ApiResult<Option<Value>> {
-    let Some(record) = self
-      .store
-      .dashboard_artifact(scope, "outputs/params.json")?
-    else {
+  fn parameters(
+    &self,
+    scope: &RunScope,
+    state: Option<&Value>,
+    deadline: Instant,
+  ) -> ApiResult<Option<Value>> {
+    let loaded;
+    let state = if let Some(state) = state {
+      state
+    } else {
+      loaded = self
+        .json_artifact(scope, "run-state.json", STATE_LIMIT, deadline)?
+        .unwrap_or(Value::Null);
+      &loaded
+    };
+    let path = expri_core::task_attempts::current_params_path(state)
+      .map_err(|error| ApiError::new(422, error.to_string()))?;
+    let Some(record) = self.store.dashboard_artifact(scope, &path)? else {
       return Ok(None);
     };
     if record.size > JSON_LIMIT {
       return Err(ApiError::new(
         413,
-        "outputs/params.json exceeds the 1 MiB size limit",
+        format!("{path} exceeds the 1 MiB size limit"),
       ));
     }
     let bytes = self.range(&record, 0, record.size as usize, deadline)?;
@@ -1405,7 +1418,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         let mut result = metric_record(&scope, overview["run"].clone(), None);
         result.warnings = overview["warnings"].as_array().cloned().unwrap_or_default();
         if mode.include_params {
-          match self.parameters(&scope, deadline) {
+          match self.parameters(&scope, None, deadline) {
             Ok(params) => result.params = params,
             Err(error) => result
               .warnings

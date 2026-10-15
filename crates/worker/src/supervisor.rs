@@ -12,7 +12,7 @@ use expri_core::{
 use serde_json::Value;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{TaskOutput, task};
 #[cfg(target_os = "linux")]

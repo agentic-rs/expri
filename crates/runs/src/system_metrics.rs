@@ -86,6 +86,16 @@ pub struct RunSystemWindow {
   pub start_ms: i64,
   pub end_ms: Option<i64>,
   pub terminal: bool,
+  pub segments: Vec<RunSystemSegment>,
+  capture_error: Option<String>,
+  recording: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunSystemSegment {
+  pub capture_id: String,
+  pub start_ms: i64,
+  pub end_ms: Option<i64>,
 }
 
 impl RunSystemWindow {
@@ -97,9 +107,7 @@ impl RunSystemWindow {
     {
       return None;
     }
-    let capture_id = state["system_capture_id"].as_str()?;
     let machine_id = state["machine_id"].as_str()?;
-    validate_component(capture_id).ok()?;
     validate_component(machine_id).ok()?;
     let start_ms = DateTime::parse_from_rfc3339(state["started_at"].as_str()?)
       .ok()?
@@ -116,14 +124,107 @@ impl RunSystemWindow {
     if start_ms < 0 || end_ms.is_some_and(|end| end < start_ms) || terminal && end_ms.is_none() {
       return None;
     }
+    let mut segments = Vec::new();
+    if let Some(attempts) = state["task_attempts"]["attempts"].as_array() {
+      for attempt in attempts {
+        let Some(capture_id) = attempt["system_capture_id"].as_str() else {
+          continue;
+        };
+        validate_component(capture_id).ok()?;
+        if attempt["machine_id"]
+          .as_str()
+          .is_some_and(|id| id != machine_id)
+        {
+          return None;
+        }
+        let segment_start = timestamp(&attempt["system_capture_started_at"])
+          .or_else(|| timestamp(&attempt["started_at"]))?;
+        let segment_end = timestamp(&attempt["system_capture_finished_at"])
+          .or_else(|| timestamp(&attempt["finished_at"]));
+        if segment_start < start_ms
+          || segment_end.is_some_and(|end| end < segment_start)
+          || end_ms
+            .zip(segment_end)
+            .is_some_and(|(end, segment)| segment > end)
+          || segments
+            .iter()
+            .any(|segment: &RunSystemSegment| segment.capture_id == capture_id)
+        {
+          return None;
+        }
+        segments.push(RunSystemSegment {
+          capture_id: capture_id.into(),
+          start_ms: segment_start,
+          end_ms: segment_end,
+        });
+      }
+    }
+    if let Some(capture_id) = state["system_capture_id"].as_str() {
+      validate_component(capture_id).ok()?;
+      let segment_start = timestamp(&state["system_capture_started_at"]).unwrap_or(start_ms);
+      let segment_end = timestamp(&state["system_capture_finished_at"]).or(end_ms);
+      let current = RunSystemSegment {
+        capture_id: capture_id.into(),
+        start_ms: segment_start,
+        end_ms: segment_end,
+      };
+      if let Some(existing) = segments
+        .iter_mut()
+        .find(|segment| segment.capture_id == capture_id)
+      {
+        if existing.start_ms != segment_start
+          || existing.end_ms.is_some() && existing.end_ms != segment_end
+        {
+          return None;
+        }
+        *existing = current;
+      } else {
+        segments.push(current);
+      }
+    }
+    if segments.is_empty() || segments.len() > expri_core::protocol::MAX_TASK_ATTEMPTS {
+      return None;
+    }
+    if segments.iter().any(|segment| {
+      segment.start_ms < start_ms
+        || segment.end_ms.is_some_and(|end| end < segment.start_ms)
+        || end_ms
+          .zip(segment.end_ms)
+          .is_some_and(|(end, segment)| segment > end)
+    }) {
+      return None;
+    }
+    for pair in segments.windows(2) {
+      if pair[0].end_ms.is_none_or(|end| end > pair[1].start_ms) {
+        return None;
+      }
+    }
+    let capture_id = segments.last()?.capture_id.clone();
+    let recording = !terminal
+      && state["system_capture_id"].as_str() == Some(capture_id.as_str())
+      && segments.last()?.end_ms.is_none();
     Some(Self {
-      capture_id: capture_id.into(),
+      capture_id,
       machine_id: machine_id.into(),
       start_ms,
       end_ms,
       terminal,
+      segments,
+      recording,
+      capture_error: state["system_capture_error"]
+        .as_str()
+        .filter(|error| {
+          !error.is_empty() && error.len() <= 1024 && !error.chars().any(char::is_control)
+        })
+        .map(str::to_owned),
     })
   }
+}
+
+fn timestamp(value: &Value) -> Option<i64> {
+  DateTime::parse_from_rfc3339(value.as_str()?)
+    .ok()
+    .map(|time| time.timestamp_millis())
 }
 
 fn rejected(status: u16, detail: &str) -> ExpriError {
@@ -253,10 +354,10 @@ pub fn read<R: Read>(
     machine_id: Some(window.machine_id.clone()),
     start_ms: Some(window.start_ms),
     end_ms: window.end_ms,
-    status: if window.terminal {
-      "incomplete"
-    } else {
+    status: if window.recording {
       "recording"
+    } else {
+      "incomplete"
     }
     .into(),
     inventories: Vec::new(),
@@ -267,7 +368,15 @@ pub fn read<R: Read>(
     warnings: Vec::new(),
   };
   let mut header = false;
+  if let Some(error) = &window.capture_error {
+    warning(&mut result, &format!("System capture: {error}"));
+  }
   let mut ended = false;
+  let mut segment_count = 0usize;
+  let mut segment_start = window.start_ms;
+  let mut segment_end = None;
+  let mut previous_end = None;
+  let mut all_complete = true;
   let mut inventory_revisions = BTreeSet::new();
   let mut ordinal = 0u64;
   let mut ordinals = Vec::new();
@@ -283,16 +392,29 @@ pub fn read<R: Read>(
         start_ms,
         ..
       } => {
-        if header
-          || capture_id != window.capture_id
+        let expected = window.segments.get(segment_count);
+        if header && !ended
+          || expected
+            .is_none_or(|segment| segment.capture_id != capture_id || segment.start_ms != start_ms)
           || machine_id != window.machine_id
-          || start_ms != window.start_ms
+          || previous_end.is_some_and(|end| start_ms < end)
         {
           return Err(rejected(
             409,
             "run system capture identity does not match canonical run metadata",
           ));
         }
+        if segment_count > 0 {
+          warning(
+            &mut result,
+            "System capture resumed for another task attempt; no observations are inferred for the interval between attempts.",
+          );
+        }
+        segment_count += 1;
+        segment_start = start_ms;
+        segment_end = expected.and_then(|segment| segment.end_ms);
+        inventory_revisions.clear();
+        ended = false;
         header = true;
       }
       _ if !header || ended => {
@@ -320,10 +442,8 @@ pub fn read<R: Read>(
             "run system sample references an unavailable inventory",
           ));
         }
-        if sample.observed_at_ms < window.start_ms
-          || window
-            .end_ms
-            .is_some_and(|end| sample.observed_at_ms >= end)
+        if sample.observed_at_ms < segment_start
+          || segment_end.is_some_and(|end| sample.observed_at_ms >= end)
         {
           return Ok(());
         }
@@ -340,7 +460,7 @@ pub fn read<R: Read>(
         if sample
           .observed_at_ms
           .saturating_sub(sample.interval_ms as i64)
-          < window.start_ms
+          < segment_start
         {
           warning(
             &mut result,
@@ -432,16 +552,23 @@ pub fn read<R: Read>(
         complete,
         warnings,
       } => {
-        if end_ms < window.start_ms || window.terminal && window.end_ms != Some(end_ms) {
+        if end_ms < segment_start || segment_end.is_some_and(|expected| expected != end_ms) {
           return Err(rejected(
             409,
             "run system completion does not match canonical run metadata",
           ));
         }
         ended = true;
-        if window.terminal {
-          result.status = if complete { "complete" } else { "incomplete" }.into();
-        } else {
+        previous_end = Some(end_ms);
+        all_complete &= complete;
+        if window.terminal && segment_count == window.segments.len() {
+          result.status = if all_complete && window.end_ms == Some(end_ms) {
+            "complete"
+          } else {
+            "incomplete"
+          }
+          .into();
+        } else if segment_end.is_none() {
           warning(
             &mut result,
             "Captured completion is waiting for canonical run finish metadata.",
@@ -474,9 +601,16 @@ pub fn read<R: Read>(
       "The run ended before system capture completion was recorded.",
     );
   }
+  if segment_count < window.segments.len() {
+    result.status = "incomplete".into();
+    warning(
+      &mut result,
+      "The latest task attempt has not recorded its system capture header.",
+    );
+  }
   fit_page(&mut result, &mut ordinals)?;
   if !result.samples.is_empty() {
-    let mut inventory_header = false;
+    let mut inventory_headers = 0usize;
     records(reopen()?, |record| {
       if let RunSystemRecord::Capture {
         capture_id,
@@ -485,16 +619,17 @@ pub fn read<R: Read>(
         ..
       } = &record
       {
-        if inventory_header
-          || *capture_id != window.capture_id
+        if window
+          .segments
+          .get(inventory_headers)
+          .is_none_or(|segment| segment.capture_id != *capture_id || segment.start_ms != *start_ms)
           || *machine_id != window.machine_id
-          || *start_ms != window.start_ms
         {
           return Err(rejected(409, "run system capture changed during review"));
         }
-        inventory_header = true;
+        inventory_headers += 1;
       }
-      if !inventory_header {
+      if inventory_headers == 0 {
         return Err(rejected(409, "run system capture changed during review"));
       }
       if let RunSystemRecord::Inventory { inventory } = record
@@ -521,6 +656,9 @@ pub fn read<R: Read>(
       }
       Ok(())
     })?;
+    if inventory_headers != segment_count {
+      return Err(rejected(409, "run system capture changed during review"));
+    }
     if result.samples.iter().any(|sample| {
       !result
         .inventories

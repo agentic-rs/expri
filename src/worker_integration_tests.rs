@@ -144,8 +144,13 @@ const WAITING_TASK: &str = r#"import json, os, pathlib, time
 from expri_run import set_run_status
 run = pathlib.Path(os.environ['EXPRI_RUN_DIR'])
 outputs = pathlib.Path(os.environ['EXPRI_OUTPUT_DIR'])
+def save_state(name):
+  destination = outputs / name
+  staged = destination.with_suffix('.tmp')
+  staged.write_text(run.joinpath('run-state.json').read_text())
+  staged.replace(destination)
 set_run_status('waiting')
-outputs.joinpath('waiting-state.json').write_text(run.joinpath('run-state.json').read_text())
+save_state('waiting-state.json')
 print('waiting', flush=True)
 gate = pathlib.Path(os.environ['EXPRI_TEST_SOURCE_ROOT']) / 'waiting-release'
 deadline = time.monotonic() + 10
@@ -154,7 +159,7 @@ while not gate.exists():
   time.sleep(0.01)
 if os.environ.get('EXPRI_TEST_RESUME_WAITING') == '1':
   set_run_status('running')
-  outputs.joinpath('resumed-state.json').write_text(run.joinpath('run-state.json').read_text())
+  save_state('resumed-state.json')
   print('resumed', flush=True)
 "#;
 

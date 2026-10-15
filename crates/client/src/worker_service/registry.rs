@@ -24,11 +24,13 @@ pub(super) struct JobState {
   pub last_error: Option<String>,
   pub report: Value,
   pub progress: Value,
+  #[serde(default)]
+  pub publication_epoch: u64,
 }
 
 impl JobState {
-  fn new(job_id: &str, job: &PreparedJob) -> Self {
-    Self {
+  fn new(job_id: &str, job: &PreparedJob) -> Result<Self> {
+    Ok(Self {
       schema_version: 1,
       job_id: job_id.into(),
       status: "queued".into(),
@@ -38,7 +40,8 @@ impl JobState {
       last_error: None,
       report: job.safe_report(),
       progress: json!({}),
-    }
+      publication_epoch: job_epoch(job)?,
+    })
   }
 
   pub fn save(&mut self, directory: &Path) -> Result<()> {
@@ -46,11 +49,23 @@ impl JobState {
     files::write(&directory.join("state.json"), self)
   }
 
+  /// Serialize with continuation rearm. An older slice may finish after its
+  /// publication lease was released, but cannot mark the new attempt published.
+  pub fn save_if_current(&mut self, directory: &Path) -> Result<bool> {
+    let _lease = state_lease(directory)?;
+    if read_state(directory)?.publication_epoch != self.publication_epoch {
+      return Ok(false);
+    }
+    self.save(directory)?;
+    Ok(true)
+  }
+
   pub fn value(&self) -> Value {
     json!({
       "job_id": self.job_id, "status": self.status, "updated_at_ms": self.updated_at_ms,
       "retry_at_ms": self.retry_at_ms, "last_error": self.last_error,
       "registration": self.report, "progress": self.progress,
+      "publication_epoch": self.publication_epoch,
     })
   }
 }
@@ -83,6 +98,18 @@ fn lease(directory: &Path) -> Result<FileLock> {
     return Err(error("worker service registration is busy; retry shortly"));
   };
   Ok(lease)
+}
+
+fn state_lease(directory: &Path) -> Result<FileLock> {
+  let path = directory.join("state.lock");
+  files::private_file(&path)?;
+  for _ in 0..100 {
+    if let LockAttempt::Acquired(lease) = try_lock_file(&path, false)? {
+      return Ok(lease);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(10));
+  }
+  Err(error("publishing job state is busy; retry shortly"))
 }
 
 pub(super) fn register(paths: &StoragePaths, job: PreparedJob) -> Result<Value> {
@@ -128,10 +155,11 @@ pub(super) fn register(paths: &StoragePaths, job: PreparedJob) -> Result<Value> 
   } else {
     files::write(&request, &job)?;
   }
+  let _state_lease = state_lease(&root)?;
   let mut state = if root.join("state.json").try_exists()? {
     read_state(&root)?
   } else {
-    JobState::new(&id, &job)
+    JobState::new(&id, &job)?
   };
   if state.status == "error" || state.status == "paused" {
     state.status = "queued".into();
@@ -146,6 +174,45 @@ pub(super) fn register(paths: &StoragePaths, job: PreparedJob) -> Result<Value> 
   report["accepted"] = json!(true);
   report["already_registered"] = json!(repeated);
   Ok(report)
+}
+
+pub(super) fn rearm(paths: &StoragePaths, job: &PreparedJob) -> Result<()> {
+  let directory = files::ensure(paths)?;
+  let _lease = lease(&directory)?;
+  let root = directory.join("jobs").join(job_id(job)?);
+  if read_job(&root)? != *job {
+    return Err(error(
+      "task continuation cannot change publishing credentials or destination",
+    ));
+  }
+  let _state_lease = state_lease(&root)?;
+  let mut state = read_state(&root)?;
+  let epoch = job_epoch(job)?;
+  if epoch < state.publication_epoch {
+    return Err(error(
+      "publishing registration has a newer publication epoch",
+    ));
+  }
+  state.publication_epoch = epoch;
+  state.status = "queued".into();
+  state.retry_at_ms = 0;
+  state.failures = 0;
+  state.last_error = None;
+  state.save(&root)
+}
+
+fn job_epoch(job: &PreparedJob) -> Result<u64> {
+  let state: Value = serde_json::from_slice(&crate::client::fs::read_bounded(
+    &job.run_dir().join("run-state.json"),
+    crate::client::RECORD_LIMIT,
+  )?)?;
+  match state.get("publication_epoch") {
+    None => Ok(0),
+    Some(value) => value
+      .as_u64()
+      .filter(|epoch| *epoch <= i64::MAX as u64)
+      .ok_or_else(|| error("run has an invalid publication epoch")),
+  }
 }
 
 const RUN_BINDING: &str = "publishing-binding.json";
@@ -350,7 +417,7 @@ pub(super) fn pending(directory: &Path) -> Result<Vec<PathBuf>> {
       read_state(&path)
     } else {
       read_job(&path).and_then(|job| {
-        let mut state = JobState::new(id, &job);
+        let mut state = JobState::new(id, &job)?;
         state.save(&path)?;
         Ok(state)
       })

@@ -25,6 +25,13 @@ def process_writer(directory, writer, count):
       logger.log(step, {"writer": writer, "value": writer * count + step})
 
 
+def continuation_writer(directory, step):
+  os.environ["EXPRI_ATTEMPT"] = "2"
+  os.environ["EXPRI_STEP_OFFSET"] = "11"
+  with MetricsLogger(directory) as logger:
+    logger.log(step, {"loss": 1})
+
+
 class MetricsLoggerTests(unittest.TestCase):
   def setUp(self):
     self.temporary = tempfile.TemporaryDirectory(prefix="expri-metrics-writer-tests-")
@@ -66,6 +73,112 @@ class MetricsLoggerTests(unittest.TestCase):
       for step in (expri_metrics.MAX_STEP, 0, 0, 7):
         logger.log(step, {"value": step})
     self.assertEqual([event["step"] for event in self.events()], [expri_metrics.MAX_STEP, 0, 0, 7])
+
+  def test_continuation_maps_first_local_step_once_across_logger_instances(self):
+    with MetricsLogger(self.output) as logger:
+      logger.log(10, {"loss": 2})
+      logger.log(3, {"loss": 1})
+    original = (self.output / "metrics.jsonl").read_bytes()
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "11"}):
+      with MetricsLogger(self.output) as logger:
+        logger.log(500, {"loss": 0.5})
+        logger.log(501, {"loss": 0.4})
+      with MetricsLogger(self.output) as logger:
+        logger.log(502, {"loss": 0.3})
+    events = self.events()
+    self.assertEqual([event["step"] for event in events], [10, 3, 11, 12, 13])
+    self.assertEqual([event["local_step"] for event in events[2:]], [500, 501, 502])
+    self.assertEqual([event["attempt"] for event in events[2:]], [2, 2, 2])
+    self.assertTrue((self.output / "metrics.jsonl").read_bytes().startswith(original))
+    origin = json.loads((self.output / "attempts/2/step-origin.json").read_bytes())
+    self.assertEqual(origin, {"schema_version": 1, "attempt": 2, "step_offset": "11", "first_local_step": "500"})
+
+  def test_initial_attempt_keeps_original_steps_without_rebasing(self):
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "1", "EXPRI_STEP_OFFSET": "0"}):
+      with MetricsLogger(self.output) as logger:
+        logger.log(500, {"loss": 1})
+    self.assertEqual(self.events()[0]["step"], 500)
+    self.assertFalse((self.output / "attempts").exists())
+
+  def test_invalid_attempt_environment_is_refused_before_creating_outputs(self):
+    for values in [{"EXPRI_ATTEMPT": "0"}, {"EXPRI_ATTEMPT": "01"}, {"EXPRI_ATTEMPT": "+2"},
+                   {"EXPRI_ATTEMPT": "2"}, {"EXPRI_STEP_OFFSET": "0"},
+                   {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "01"},
+                   {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": str(expri_metrics.MAX_STEP + 1)},
+                   {"EXPRI_ATTEMPT": "1", "EXPRI_STEP_OFFSET": "1"}]:
+      with self.subTest(values=values), patch.dict(os.environ, values, clear=True):
+        with self.assertRaises(ValueError):
+          MetricsLogger(self.output)
+        self.assertFalse(self.output.exists())
+
+  def test_continuation_underflow_overflow_and_offset_conflicts_preserve_prefix(self):
+    with MetricsLogger(self.output) as logger:
+      logger.log(expri_metrics.MAX_STEP - 1, {"loss": 1})
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": str(expri_metrics.MAX_STEP)}):
+      with MetricsLogger(self.output) as logger:
+        logger.log(10, {"loss": 1})
+        before = (self.output / "metrics.jsonl").read_bytes()
+        for step in (9, 11):
+          with self.assertRaisesRegex(ValueError, "underflow|overflow"):
+            logger.log(step, {"loss": 1})
+          self.assertEqual((self.output / "metrics.jsonl").read_bytes(), before)
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "0"}):
+      with MetricsLogger(self.output) as logger:
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+          logger.log(10, {"loss": 1})
+    self.assertEqual((self.output / "metrics.jsonl").read_bytes(), before)
+
+  def test_new_attempt_requires_exact_next_global_step_and_complete_canonical_rows(self):
+    self.output.mkdir()
+    for raw, offset in [(b'{"step":10,"metrics":{"loss":1}}\n', "10"),
+                        (b'{"step":10,"metrics":{"loss":1}}', "11"),
+                        (b'invalid\n', "11")]:
+      (self.output / "metrics.jsonl").write_bytes(raw)
+      with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": offset}):
+        with MetricsLogger(self.output) as logger:
+          with self.assertRaises(ValueError):
+            logger.log(0, {"loss": 1})
+      self.assertEqual((self.output / "metrics.jsonl").read_bytes(), raw)
+      self.assertFalse((self.output / "attempts/2/step-origin.json").exists())
+
+  def test_continuation_params_are_immutable_per_attempt_and_preserve_original(self):
+    with MetricsLogger(self.output) as logger:
+      logger.params({"steps": 10})
+    original = (self.output / "params.json").read_bytes()
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "0"}):
+      with MetricsLogger(self.output) as logger:
+        logger.params({"steps": 20})
+        logger.params({"steps": 20})
+        with self.assertRaisesRegex(ValueError, "different effective"):
+          logger.params({"steps": 21})
+    self.assertEqual((self.output / "params.json").read_bytes(), original)
+    self.assertEqual(json.loads((self.output / "attempts/2/params.json").read_bytes())["params"], {"steps": 20})
+
+  def test_continuation_origins_are_shared_across_processes(self):
+    with MetricsLogger(self.output) as logger:
+      logger.log(10, {"loss": 1})
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "11"}):
+      with MetricsLogger(self.output) as logger:
+        logger.log(500, {"loss": 1})
+    context = multiprocessing.get_context("spawn")
+    processes = [context.Process(target=continuation_writer, args=(str(self.output), step)) for step in (501, 502)]
+    for process in processes:
+      process.start()
+    for process in processes:
+      process.join(15)
+      self.assertEqual(process.exitcode, 0)
+    self.assertEqual(sorted(event["step"] for event in self.events()), [10, 11, 12, 13])
+
+  def test_attempt_directories_and_origin_files_cannot_be_symlinks(self):
+    self.output.mkdir()
+    outside = self.root / "outside"
+    outside.mkdir()
+    (self.output / "attempts").symlink_to(outside, target_is_directory=True)
+    with patch.dict(os.environ, {"EXPRI_ATTEMPT": "2", "EXPRI_STEP_OFFSET": "0"}):
+      with MetricsLogger(self.output) as logger:
+        with self.assertRaises((OSError, ValueError)):
+          logger.log(0, {"loss": 1})
+    self.assertEqual(list(outside.iterdir()), [])
 
   def test_invalid_steps_and_values_do_not_append(self):
     with MetricsLogger(self.output) as logger:

@@ -37,6 +37,9 @@ pub(super) fn record(run_dir: &Path) -> Result<()> {
     if let Some(digest) = registration.sha256 {
       entry["sha256"] = json!(digest);
     }
+    if let Some(attempt) = registration.task_attempt {
+      entry["task_attempt"] = json!(attempt);
+    }
     if !registration.labels.is_empty() {
       entry["labels"] = json!(registration.labels);
     }
@@ -96,6 +99,33 @@ pub(super) fn record(run_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn registered_artifacts_publish_their_captured_attempt_without_guessing_unregistered_files() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("outputs")).unwrap();
+    fs::atomic_json(
+      &root.join("run-state.json"),
+      &json!({
+        "run_id":"run-fixture", "status":"running",
+        "task_attempts":{"protocol_version":1,"current_attempt":2,
+          "attempts":[{"attempt":1},{"attempt":2}],"total_count":2,"truncated":false},
+      }),
+    )
+    .unwrap();
+    for path in ["outputs/registered.pt", "outputs/unregistered.pt"] {
+      std::fs::write(root.join(path), "checkpoint").unwrap();
+    }
+    crate::registrations::register(&root, "outputs/registered.pt").unwrap();
+    record(&root).unwrap();
+    let manifest: Value =
+      serde_json::from_slice(&std::fs::read(root.join(INVENTORY_PATH)).unwrap()).unwrap();
+    assert_eq!(manifest["files"][0]["path"], "outputs/registered.pt");
+    assert_eq!(manifest["files"][0]["task_attempt"], 2);
+    assert_eq!(manifest["files"][1]["path"], "outputs/unregistered.pt");
+    assert!(manifest["files"][1].get("task_attempt").is_none());
+  }
 
   #[test]
   fn inventory_changes_only_when_reported_outputs_change() {

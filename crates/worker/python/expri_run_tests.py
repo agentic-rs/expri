@@ -76,6 +76,23 @@ class RunStatusTests(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, "EXPRI_RUN_DIR"):
         set_run_status("waiting")
 
+  def test_current_attempt_phase_changes_with_run_without_modifying_old_attempts(self):
+    history = {"protocol_version": 1, "current_attempt": 2, "total_count": 2, "truncated": False,
+               "attempts": [{"attempt": 1, "status": "continued", "finished_at": "2026-10-14T01:24:00+08:00"},
+                            {"attempt": 2, "status": "running", "started_at": "2026-10-14T01:25:00+08:00", "finished_at": None}]}
+    self.save_state({**self.state, "task_attempts": history})
+    original = self.read_state()
+    self.assertTrue(set_run_status("waiting", self.run)["changed"])
+    state = self.read_state()
+    self.assertEqual(state["task_attempts"]["attempts"][0], original["task_attempts"]["attempts"][0])
+    self.assertEqual(state["task_attempts"]["attempts"][1]["status"], "waiting")
+    self.assertEqual(state["started_at"], original["started_at"])
+    before = self.path.read_bytes()
+    self.assertFalse(set_run_status("waiting", self.run)["changed"])
+    self.assertEqual(self.path.read_bytes(), before)
+    self.assertTrue(set_run_status("running", self.run)["changed"])
+    self.assertEqual(self.read_state(), original)
+
   def test_vendored_helper_works_in_isolated_python_without_native_binary(self):
     vendor = self.run / "code/expri_run.py"
     vendor.write_bytes(Path(expri_run.__file__).read_bytes())

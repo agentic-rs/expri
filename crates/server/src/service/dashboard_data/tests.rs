@@ -136,7 +136,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     columns["available_columns"]["params"],
     json!([{"key":"/optimizer/rate","label":"optimizer / rate"}])
   );
-  assert_eq!(fixture.backend.objects.lock().unwrap().requests.len(), 4);
+  assert_eq!(fixture.backend.objects.lock().unwrap().requests.len(), 7);
   fixture.backend.objects.lock().unwrap().requests.clear();
   let options = table::TableOptions::parse(
     vec!["/optimizer/rate".into()],
@@ -166,8 +166,8 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
   assert_eq!(page["runs"][0]["table_values"]["metrics"]["loss"], 4.0);
   assert_eq!(
     fixture.backend.objects.lock().unwrap().requests.len(),
-    3,
-    "only uncached run states should be read"
+    0,
+    "column discovery already warmed the current-attempt overview cache"
   );
   fixture.backend.objects.lock().unwrap().requests.clear();
   dashboard

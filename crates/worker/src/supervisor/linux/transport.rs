@@ -241,7 +241,7 @@ pub(super) fn validate_named_descriptor(descriptor: &Descriptor, path: &Path) ->
   Ok(())
 }
 
-pub(super) fn process_start(pid: u32) -> io::Result<u64> {
+pub(crate) fn process_start(pid: u32) -> io::Result<u64> {
   let bytes = fs::read(format!("/proc/{pid}/stat"))?;
   let close = bytes
     .iter()
@@ -255,7 +255,7 @@ pub(super) fn process_start(pid: u32) -> io::Result<u64> {
     .ok_or_else(|| io::Error::other("missing process start identity"))
 }
 
-pub(super) fn cancel_requested(run_dir: &Path) -> io::Result<bool> {
+pub(crate) fn cancel_requested(run_dir: &Path) -> io::Result<bool> {
   match fs::symlink_metadata(run_dir.join(".cancel-request")) {
     Ok(metadata)
       if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 0 =>
@@ -270,7 +270,7 @@ pub(super) fn cancel_requested(run_dir: &Path) -> io::Result<bool> {
   }
 }
 
-pub(super) fn read_json(path: &Path, limit: usize) -> io::Result<Value> {
+pub(crate) fn read_json(path: &Path, limit: usize) -> io::Result<Value> {
   let mut file = OpenOptions::new()
     .read(true)
     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -290,7 +290,7 @@ pub(super) fn read_json(path: &Path, limit: usize) -> io::Result<Value> {
   serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 
-pub(super) fn write_json(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn write_json(path: &Path, value: &Value) -> Result<()> {
   if let Ok(metadata) = fs::symlink_metadata(path)
     && (!metadata.is_file() || metadata.file_type().is_symlink())
   {
@@ -311,7 +311,7 @@ pub(super) fn write_json(path: &Path, value: &Value) -> Result<()> {
   Ok(())
 }
 
-pub(super) fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
   Sha256::digest(bytes)
     .iter()
     .map(|byte| format!("{byte:02x}"))

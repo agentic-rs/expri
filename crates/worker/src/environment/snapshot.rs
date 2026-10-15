@@ -129,6 +129,96 @@ pub fn create_expected_with_smoke(
   })
 }
 
+/// Freeze updated source for another attempt without changing the run identity.
+/// The destination is an unused direct child of the run's private attempts directory.
+pub fn create_attempt_at(
+  repo_root: &Path,
+  run_dir: &Path,
+  destination: &Path,
+  remote_managed: &[String],
+  expected_sync: Option<&SyncIdentity>,
+) -> Result<RunSnapshot> {
+  let repo_root = fs::canonicalize(repo_root)?;
+  let run_dir = fs::canonicalize(run_dir)?;
+  let run_id = run_dir
+    .file_name()
+    .and_then(|name| name.to_str())
+    .ok_or_else(|| ExpriError::Message("run directory has no UTF-8 identity".into()))?
+    .to_owned();
+  let attempts_dir = run_dir.join("attempts");
+  create_private_directory(&attempts_dir)?;
+  if destination.parent() != Some(attempts_dir.as_path())
+    || !matches!(destination.file_name(), Some(name) if !name.is_empty() && name != "." && name != "..")
+  {
+    return Err(ExpriError::Message(
+      "attempt snapshot must be a direct child of the run's attempts directory".into(),
+    ));
+  }
+  if destination.try_exists()? {
+    return Err(ExpriError::Message(format!(
+      "attempt snapshot already exists: {}",
+      destination.display()
+    )));
+  }
+  let state_dir = repo_root.join(".expri");
+  create_private_directory(&state_dir)?;
+  let _checkout_lock = crate::lock::worktree_lock(&state_dir)?;
+  if let Some(expected) = expected_sync {
+    verify_sync_identity(&state_dir, expected)?;
+  }
+  let source = select_source(&repo_root, remote_managed)?;
+  let temporary = tempfile::Builder::new()
+    .prefix(".preparing-")
+    .tempdir_in(&attempts_dir)?;
+  let temporary_code = temporary.path().join("code");
+  fs::create_dir(&temporary_code)?;
+  let files = copy_verified_source(&repo_root, &temporary_code, &source, remote_managed, None)?;
+  let manifest = SnapshotManifest {
+    run_id: &run_id,
+    smoke: false,
+    created_at: Utc::now().to_rfc3339(),
+    source: &source,
+    files: &files,
+  };
+  fs::write(
+    temporary.path().join("snapshot.json"),
+    serde_json::to_vec_pretty(&manifest)?,
+  )?;
+  // Discover before publishing, so malformed descriptors leave no partial attempt.
+  crate::assets::discover(&temporary_code)?;
+  fs::rename(temporary.path(), destination)?;
+  let code_dir = destination.join("code");
+  let assets = crate::assets::discover(&code_dir)?;
+  Ok(RunSnapshot {
+    run_id,
+    run_dir,
+    code_dir,
+    assets,
+  })
+}
+
+pub fn create_attempt(
+  repo_root: &Path,
+  run_dir: &Path,
+  attempt: u64,
+  remote_managed: &[String],
+  expected_sync: Option<&SyncIdentity>,
+) -> Result<RunSnapshot> {
+  if attempt < 2 {
+    return Err(ExpriError::Message(
+      "continuation attempt must be at least two".into(),
+    ));
+  }
+  let run_dir = fs::canonicalize(run_dir)?;
+  create_attempt_at(
+    repo_root,
+    &run_dir,
+    &run_dir.join("attempts").join(attempt.to_string()),
+    remote_managed,
+    expected_sync,
+  )
+}
+
 /// Freeze the same verified source selection without allocating a run record.
 pub(crate) fn freeze_source_at(
   repo_root: &Path,
@@ -841,6 +931,70 @@ mod tests {
     assert!(first.code_dir.join("results/source.py").is_file());
     assert!(first.run_dir.join("outputs").is_dir());
     assert!(first.run_dir.join("snapshot.json").is_file());
+  }
+
+  #[test]
+  fn continuation_snapshots_preserve_run_identity_and_original_source() {
+    let root = repository();
+    fs::write(root.path().join("train.py"), "original source").unwrap();
+    git(root.path(), &["add", "."]);
+    let first = create(root.path(), &[]).unwrap();
+    let original_manifest = fs::read(first.run_dir.join("snapshot.json")).unwrap();
+    fs::write(first.run_dir.join("outputs/metrics.jsonl"), "history\n").unwrap();
+    fs::write(root.path().join("train.py"), "extended training").unwrap();
+    let second = create_attempt(root.path(), &first.run_dir, 2, &[], None).unwrap();
+    assert_eq!(second.run_id, first.run_id);
+    assert_eq!(second.run_dir, first.run_dir);
+    assert_eq!(second.code_dir, first.run_dir.join("attempts/2/code"));
+    assert_eq!(
+      fs::read_to_string(first.code_dir.join("train.py")).unwrap(),
+      "original source"
+    );
+    assert_eq!(
+      fs::read_to_string(second.code_dir.join("train.py")).unwrap(),
+      "extended training"
+    );
+    assert_eq!(
+      fs::read(first.run_dir.join("snapshot.json")).unwrap(),
+      original_manifest
+    );
+    assert_eq!(
+      fs::read_to_string(first.run_dir.join("outputs/metrics.jsonl")).unwrap(),
+      "history\n"
+    );
+    assert!(create_attempt(root.path(), &first.run_dir, 2, &[], None).is_err());
+    assert_eq!(
+      fs::read_to_string(second.code_dir.join("train.py")).unwrap(),
+      "extended training"
+    );
+  }
+
+  #[test]
+  fn continuation_snapshot_rejects_stale_push_and_unsafe_destination() {
+    let root = repository();
+    fs::write(root.path().join("train.py"), "original source").unwrap();
+    git(root.path(), &["add", "."]);
+    let first = create(root.path(), &[]).unwrap();
+    let expected = SyncIdentity {
+      head: "old".into(),
+      patch_sha256: "old".into(),
+    };
+    assert!(create_attempt(root.path(), &first.run_dir, 2, &[], Some(&expected)).is_err());
+    assert!(!first.run_dir.join("attempts/2").exists());
+    assert!(
+      create_attempt_at(
+        root.path(),
+        &first.run_dir,
+        &first.run_dir.join("code"),
+        &[],
+        None
+      )
+      .is_err()
+    );
+    assert_eq!(
+      fs::read_to_string(first.code_dir.join("train.py")).unwrap(),
+      "original source"
+    );
   }
 
   #[test]

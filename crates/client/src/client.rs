@@ -1,5 +1,6 @@
 mod catalog;
 pub(crate) mod checkpoints;
+mod continuation;
 mod download;
 pub(super) mod fs;
 pub(crate) mod http;
@@ -34,6 +35,9 @@ use upload::sync_file;
 use upload::sync_stream;
 
 pub use catalog::ServiceCatalogClient;
+pub(crate) use continuation::{
+  begin_task_attempt, check_task_attempt_support, reconcile_task_attempt,
+};
 pub use download::{fetch, input_download, input_download_prepared};
 pub use http::ResolvedClient;
 pub use login::{login, logout, revoke_login, validate_login_url};
@@ -79,7 +83,7 @@ impl Publisher {
     Self::new_with_api(options, api)
   }
 
-  pub(super) fn new_with_api(options: &PublishOptions, api: Api) -> Result<Self> {
+  pub(super) fn new_with_api(options: &PublishOptions, mut api: Api) -> Result<Self> {
     let run_dir = std::path::absolute(&options.run_dir)?;
     fs::directory(&run_dir)?;
     let state: Value = serde_json::from_slice(&fs::read_bounded(
@@ -95,6 +99,7 @@ impl Publisher {
         .ok_or_else(|| message("run state has no run_id"))?
         .to_string(),
     };
+    api.publication_epoch = state["publication_epoch"].as_u64().unwrap_or(0);
     validate_scope(&scope)?;
     let artifacts = artifacts(&options.artifacts)?;
     if artifacts.contains("result.zip") {
@@ -238,13 +243,14 @@ pub(super) fn project_result_upload(report: &mut Value) {
 
 pub fn upload(config: &Path, scope: &RunScope, partial: bool) -> Result<Value> {
   validate_scope(scope)?;
-  let api = Api::new(config)?;
+  let mut api = Api::new(config)?;
   let Response::Capabilities { features } = api.request(&Request::Capabilities)? else {
     return Err(message("service did not return protocol capabilities"));
   };
   if !features.iter().any(|feature| feature == "tracking-v1") {
     return Err(message("service does not support server tracking uploads"));
   }
+  api.capture_run_epoch_if_supported(scope, &features)?;
   let Response::Files { files } = api.request(&Request::ListFiles {
     scope: scope.clone(),
   })?
@@ -333,6 +339,11 @@ fn publish_cycle(
   if state.get("run_id").and_then(Value::as_str) != Some(scope.run_id.as_str()) {
     return Err(message("run identity changed while publishing"));
   }
+  if state["publication_epoch"].as_u64().unwrap_or(0) != api.publication_epoch {
+    return Err(message(
+      "run publication epoch changed; restart this publishing slice",
+    ));
+  }
   let done = terminal(&state);
   if !done && !artifacts.is_empty() && !watch {
     return Err(message(
@@ -378,6 +389,10 @@ fn publish_cycle(
       sync_metadata(api, queue, scope, path, &source, protocol)?;
       progress(queue_progress(queue))?;
     }
+  }
+  for path in attempt_metadata_paths(run_dir)? {
+    sync_metadata(api, queue, scope, &path, &run_dir.join(&path), protocol)?;
+    progress(queue_progress(queue))?;
   }
   for path in STREAMS {
     if path == RUN_SYSTEM_PATH {
@@ -488,13 +503,50 @@ fn publish_cycle(
   Ok(done)
 }
 
+fn attempt_metadata_paths(run_dir: &Path) -> Result<Vec<String>> {
+  let root = run_dir.join("outputs/attempts");
+  if fs::inspect(&root)?.is_none() {
+    return Ok(Vec::new());
+  }
+  fs::directory(&root)?;
+  let mut paths = Vec::new();
+  for (index, entry) in std::fs::read_dir(&root)?.enumerate() {
+    if index >= expri_core::protocol::MAX_TASK_ATTEMPTS {
+      return Err(message("publish at most 100 task attempts per run"));
+    }
+    let entry = entry?;
+    let Some(attempt) = entry.file_name().to_str().map(str::to_owned) else {
+      continue;
+    };
+    for name in [
+      "snapshot.json",
+      "environment-state.json",
+      "params.json",
+      "attempt-state.json",
+    ] {
+      let path = format!("outputs/attempts/{attempt}/{name}");
+      if expri_core::service::attempt_document(&path).is_some()
+        && fs::inspect(&run_dir.join(&path))?.is_some()
+      {
+        fs::directory(&entry.path())?;
+        paths.push(path);
+      }
+    }
+  }
+  paths.sort();
+  Ok(paths)
+}
+
 fn system_capture_owned(run_dir: &Path, state: &Value) -> Result<bool> {
-  use std::io::{BufRead, BufReader, Read};
+  use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
   let Some(capture_id) = state["system_capture_id"].as_str() else {
     return Ok(false);
   };
   validate_component(capture_id)?;
-  let file = fs::open(&run_dir.join(RUN_SYSTEM_PATH))?;
+  let mut file = fs::open(&run_dir.join(RUN_SYSTEM_PATH))?;
+  file.seek(SeekFrom::Start(
+    state["system_capture_start_offset"].as_u64().unwrap_or(0),
+  ))?;
   let mut reader = BufReader::new(file.take(1024 * 1024));
   let mut header = String::new();
   reader.read_line(&mut header)?;
@@ -509,7 +561,9 @@ fn system_capture_owned(run_dir: &Path, state: &Value) -> Result<bool> {
   else {
     return Err(message("run system capture has no identity header"));
   };
-  let started_at = state["started_at"]
+  let started_at = state
+    .get("system_capture_started_at")
+    .unwrap_or(&state["started_at"])
     .as_str()
     .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
     .map(|timestamp| timestamp.timestamp_millis());
@@ -839,7 +893,9 @@ pub fn import_output(
     validate_component(input_id)?;
   }
   validate_digest(sha256)?;
-  let Response::File { file } = Api::new(config)?.request(&Request::ImportOutput {
+  let mut api = Api::new(config)?;
+  api.capture_run_epoch(scope)?;
+  let Response::File { file } = api.request(&Request::ImportOutput {
     scope: scope.clone(),
     path: path.into(),
     input_id: input_id.map(str::to_string),
@@ -879,7 +935,10 @@ pub fn reference(options: super::ReferenceOptions) -> Result<Value> {
   validate_target(&source)?;
   validate_target(&target)?;
   validate_digest(&options.sha256)?;
-  let api = Api::new(&options.config)?;
+  let mut api = Api::new(&options.config)?;
+  if let FileTarget::Run { scope, .. } = &target {
+    api.capture_run_epoch(scope)?;
+  }
   let Response::File { file } = api.request(&Request::ReferenceFile {
     source: source.clone(),
     target: target.clone(),
@@ -906,7 +965,7 @@ pub fn file_upload(options: super::FileUploadOptions) -> Result<Value> {
   if matches!(&target, FileTarget::Run { path, .. } if path == "result.zip") {
     return Err(message("result.zip is managed by the server"));
   }
-  let api = Api::new(&options.config)?;
+  let mut api = Api::new(&options.config)?;
   let path = std::path::absolute(&options.file)?;
   let mut source = fs::open(&path)?;
   let initial = source.metadata()?;
@@ -914,6 +973,9 @@ pub fn file_upload(options: super::FileUploadOptions) -> Result<Value> {
   let digest = fs::digest(&mut source, size)?;
   if !fs::unchanged(&initial, &source.metadata()?) {
     return Err(message("finalized artifact changed while reading"));
+  }
+  if let FileTarget::Run { scope, .. } = &target {
+    api.capture_run_epoch(scope)?;
   }
   // An existing output may be a reference adopted from an older input upload.
   // Keep that object key instead of uploading identical bytes under a new key.

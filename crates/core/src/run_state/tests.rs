@@ -74,6 +74,24 @@ fn tasks_round_trip_waiting_without_changing_provenance_or_capture() {
 }
 
 #[test]
+fn task_phase_updates_the_current_attempt_without_rewriting_previous_attempts() {
+  let (_root, directory, mut state) = fixture();
+  crate::task_attempts::ensure_initial(&mut state).unwrap();
+  let path = directory.join("run-state.json");
+  write_state(&path, &state).unwrap();
+  let _supervisor = lock::run_lock(&directory).unwrap();
+  assert!(set_task_status(&directory, "waiting").unwrap().changed);
+  let saved = read_state(&path).unwrap();
+  assert_eq!(saved["task_attempts"]["attempts"][0]["status"], "waiting");
+  assert_eq!(saved["started_at"], state["started_at"]);
+  let bytes = fs::read(&path).unwrap();
+  assert!(!set_task_status(&directory, "waiting").unwrap().changed);
+  assert_eq!(fs::read(&path).unwrap(), bytes);
+  assert!(set_task_status(&directory, "running").unwrap().changed);
+  assert_eq!(read_state(&path).unwrap(), state);
+}
+
+#[test]
 fn tasks_reject_nonlive_preparing_terminal_and_invalid_records_without_mutation() {
   let (_root, directory, state) = fixture();
   let path = directory.join("run-state.json");

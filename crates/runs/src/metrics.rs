@@ -136,7 +136,7 @@ fn read_mode(
   retain_points: bool,
 ) -> Result<RunMetrics> {
   validate_filters(filters)?;
-  let report = crate::runs::summary_directory(runs_dir, run_id)?;
+  let report = crate::runs::summary_state_directory(runs_dir, run_id)?;
   let runs_dir = fs::canonicalize(runs_dir)?;
   let run_dir = runs_dir.join(run_id);
   let mut result = RunMetrics {
@@ -148,7 +148,7 @@ fn read_mode(
     warnings: report["warnings"].as_array().cloned().unwrap_or_default(),
   };
   if files.params {
-    match read_params(&run_dir) {
+    match read_params(&run_dir, &report["state"]) {
       Ok(params) => result.params = params,
       Err(error) => warning(&mut result, error.to_string()),
     }
@@ -243,21 +243,31 @@ pub fn compare(
 
 /// Inspect parameters independently when a metric artifact cannot be read.
 pub fn read_parameters(runs_dir: &Path, run_id: &str) -> Result<Option<Value>> {
-  crate::runs::summary_directory(runs_dir, run_id)?;
-  read_params(&fs::canonicalize(runs_dir)?.join(run_id))
+  let report = crate::runs::summary_state_directory(runs_dir, run_id)?;
+  read_params(&fs::canonicalize(runs_dir)?.join(run_id), &report["state"])
 }
 
-fn read_params(run_dir: &Path) -> Result<Option<Value>> {
-  let Some(file) = open_output(run_dir, "params.json")? else {
+/// Safe current parameter identity for metadata revisions and selective reads.
+pub fn parameters_path(runs_dir: &Path, run_id: &str) -> Result<String> {
+  let report = crate::runs::summary_state_directory(runs_dir, run_id)?;
+  expri_core::task_attempts::current_params_path(&report["state"])
+}
+
+fn read_params(run_dir: &Path, state: &Value) -> Result<Option<Value>> {
+  let path = expri_core::task_attempts::current_params_path(state)?;
+  let name = path
+    .strip_prefix("outputs/")
+    .expect("parameter helper returns outputs path");
+  let Some(file) = open_output(run_dir, name)? else {
     return Ok(None);
   };
   if file.metadata()?.len() > LINE_LIMIT as u64 {
-    return Err(message("outputs/params.json exceeds the 1 MiB size limit"));
+    return Err(message(format!("{path} exceeds the 1 MiB size limit")));
   }
   let mut raw = Vec::new();
   file.take(LINE_LIMIT as u64 + 1).read_to_end(&mut raw)?;
   if raw.len() > LINE_LIMIT {
-    return Err(message("outputs/params.json exceeds the 1 MiB size limit"));
+    return Err(message(format!("{path} exceeds the 1 MiB size limit")));
   }
   parse_parameters(&raw).map(Some)
 }
@@ -300,6 +310,20 @@ fn open_output(run_dir: &Path, name: &str) -> Result<Option<File>> {
   if !metadata.is_dir() || metadata.file_type().is_symlink() {
     return Err(message("outputs must be a real directory"));
   }
+  let mut parent = outputs.clone();
+  let components: Vec<_> = name.split('/').collect();
+  for part in components.iter().take(components.len().saturating_sub(1)) {
+    if part.is_empty() || matches!(*part, "." | "..") {
+      return Err(message("output path is invalid"));
+    }
+    parent.push(part);
+    let Some(metadata) = optional_metadata(&parent)? else {
+      return Ok(None);
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+      return Err(message("output parents must be real directories"));
+    }
+  }
   let path = outputs.join(name);
   let Some(initial) = optional_metadata(&path)? else {
     return Ok(None);
@@ -330,6 +354,14 @@ fn open_output(run_dir: &Path, name: &str) -> Result<Option<File>> {
   let current_parent = fs::symlink_metadata(&outputs)?;
   if !current_parent.is_dir() || current_parent.file_type().is_symlink() {
     return Err(message("outputs must be a real directory"));
+  }
+  let mut parent = outputs;
+  for part in components.iter().take(components.len().saturating_sub(1)) {
+    parent.push(part);
+    let metadata = fs::symlink_metadata(&parent)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+      return Err(message("output parents changed while opening"));
+    }
   }
   Ok(Some(file))
 }

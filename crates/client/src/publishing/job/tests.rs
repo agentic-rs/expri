@@ -34,6 +34,25 @@ fn fixture(url: &str) -> (tempfile::TempDir, PublishOptions) {
 }
 
 #[test]
+fn continuation_never_treats_a_lost_manual_publication_binding_as_local_only() {
+  let (temporary, options) = fixture("http://127.0.0.1:1");
+  let paths =
+    expri_core::storage::StoragePaths::from_root(temporary.path().join("storage")).unwrap();
+  assert!(
+    continuation_job(&paths, &options.run_dir)
+      .unwrap()
+      .is_none()
+  );
+  std::fs::write(options.run_dir.join("publishing-binding.json"), b"{}").unwrap();
+  let detail = continuation_job(&paths, &options.run_dir)
+    .err()
+    .unwrap()
+    .to_string();
+  assert!(detail.contains("restore the worker service registry"));
+  assert!(!paths.root().try_exists().unwrap());
+}
+
+#[test]
 fn registration_pins_options_credentials_and_canonical_target_without_public_secrets() {
   let (_root, mut options) = fixture("http://127.0.0.1:1");
   options.artifacts = vec![

@@ -59,6 +59,8 @@ pub(super) struct Registration {
   pub(super) sync_error: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub(super) sha256: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(super) task_attempt: Option<u64>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub(super) labels: Vec<String>,
   identity: Identity,
@@ -70,6 +72,8 @@ struct Registry {
   run_id: String,
   #[serde(default)]
   closed: bool,
+  #[serde(default)]
+  continuation_reopened: bool,
   #[serde(default)]
   retired_paths: std::collections::BTreeSet<String>,
   files: BTreeMap<String, Registration>,
@@ -97,6 +101,19 @@ fn previously_published(run_dir: &Path) -> Result<bool> {
   Ok(state["status"] == "published")
 }
 
+fn current_task_attempt(run_dir: &Path) -> Result<u64> {
+  let _lease = crate::lock::run_state_lock(run_dir)?;
+  let state: Value = serde_json::from_slice(&fs::read_bounded(
+    &run_dir.join("run-state.json"),
+    expri_core::run_state::MAX_STATE_BYTES as u64,
+  )?)?;
+  if state.get("task_attempts").is_none() {
+    Ok(1)
+  } else {
+    expri_core::task_attempts::current_attempt(&state)
+  }
+}
+
 fn load(run_dir: &Path) -> Result<Registry> {
   let run_id = run_id(run_dir)?;
   let path = run_dir.join(RECORD);
@@ -105,6 +122,7 @@ fn load(run_dir: &Path) -> Result<Registry> {
       schema_version: 1,
       run_id,
       closed: previously_published(run_dir)?,
+      continuation_reopened: false,
       retired_paths: std::collections::BTreeSet::new(),
       files: BTreeMap::new(),
     });
@@ -146,6 +164,9 @@ fn load(run_dir: &Path) -> Result<Registry> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
       })
       || registration.size != registration.identity.size
+      || registration.task_attempt.is_some_and(|attempt| {
+        attempt == 0 || attempt > expri_core::protocol::MAX_TASK_ATTEMPTS as u64
+      })
       || !matches!(
         registration.sync_status.as_str(),
         "registered" | "uploading" | "cloud" | "needs_attention"
@@ -249,6 +270,7 @@ pub fn register_with_labels(run_dir: &Path, path: &str, labels: &[String]) -> Re
     sync_status: "registered".into(),
     sync_error: None,
     sha256: None,
+    task_attempt: Some(current_task_attempt(run_dir)?),
     labels: Vec::new(),
     identity,
   };
@@ -301,6 +323,7 @@ fn public_record(registration: &Registration) -> Value {
     "sync_error": registration.sync_error,
     "labels": registration.labels,
     "sha256": registration.sha256,
+    "task_attempt": registration.task_attempt,
   })
 }
 
@@ -337,6 +360,22 @@ pub(super) fn is_closed(run_dir: &Path) -> Result<bool> {
     return previously_published(run_dir);
   }
   Ok(load(run_dir)?.closed)
+}
+
+/// Only an explicit validated task continuation reopens the finalized handoff.
+pub(crate) fn reopen_for_attempt(run_dir: &Path) -> Result<()> {
+  let _lease = lock(run_dir)?;
+  let mut registry = load(run_dir)?;
+  if !registry.continuation_reopened {
+    if current_task_attempt(run_dir)? == 1 {
+      for registration in registry.files.values_mut() {
+        registration.task_attempt.get_or_insert(1);
+      }
+    }
+    registry.continuation_reopened = true;
+  }
+  registry.closed = false;
+  save(run_dir, &registry)
 }
 
 /// Freeze the handoff before attempting the immutable server seal.

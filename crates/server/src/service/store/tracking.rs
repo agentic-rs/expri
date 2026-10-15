@@ -9,9 +9,11 @@ use serde_json::Value;
 
 use super::*;
 
+mod continuation;
 mod projection;
 mod raw_io;
 mod run_system;
+pub(super) use continuation::publication_epoch;
 
 use projection::{index_metrics, seal_metric_tail};
 use raw_io::{append_raw, io_error, open_raw};
@@ -28,6 +30,13 @@ pub(super) fn initialize(connection: &Connection) -> crate::error::Result<()> {
     total_size INTEGER NOT NULL, document INTEGER NOT NULL, complete INTEGER NOT NULL,
     sealed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(target,revision));
     CREATE TABLE IF NOT EXISTS tracking_run_seals (scope TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS tracking_run_epochs (scope TEXT PRIMARY KEY, epoch INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS tracking_attempt_history (
+      scope TEXT NOT NULL, request_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+      fingerprint TEXT NOT NULL, snapshot TEXT NOT NULL, PRIMARY KEY(scope,request_id));
+    CREATE TABLE IF NOT EXISTS tracking_attempt_aborts (
+      scope TEXT NOT NULL, request_id TEXT NOT NULL, expected_epoch INTEGER NOT NULL,
+      PRIMARY KEY(scope,request_id));
     CREATE TABLE IF NOT EXISTS tracking_metric_state (target TEXT PRIMARY KEY, record TEXT NOT NULL, pending BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS tracking_metric_rows (
       target TEXT NOT NULL, name TEXT NOT NULL, ordinal INTEGER NOT NULL, raw_offset INTEGER NOT NULL,
@@ -179,7 +188,10 @@ impl<S: ObjectStorage> Store<S> {
     if latest.is_some_and(|latest| revision < latest) {
       return Err(ApiError::new(409, "document revision is stale"));
     }
-    if path == "outputs/params.json" && latest.is_some_and(|latest| latest != revision) {
+    if (path == "outputs/params.json"
+      || (expri_core::service::attempt_document(&path).is_some() && path.ends_with("/params.json")))
+      && latest.is_some_and(|latest| latest != revision)
+    {
       return Err(ApiError::new(409, "run parameters are immutable"));
     }
     let previous: Option<(u64, u64, bool)> = tx
@@ -476,10 +488,12 @@ impl<S: ObjectStorage> Store<S> {
       )
       .map_err(database)?;
     }
+    let publication_epoch = publication_epoch(&tx, &scope)?;
     tx.commit().map_err(database)?;
     drop(db);
     self.queue_archive(ArchiveSnapshot {
       scope,
+      publication_epoch,
       files,
       incomplete,
     })

@@ -31,6 +31,18 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
       "ALTER TABLE system_run_captures ADD COLUMN coverage_lost INTEGER NOT NULL DEFAULT 0",
     ))?;
   }
+  let segmented: bool = sql(connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('system_run_captures') WHERE name='segment_offset')", [], |row| row.get(0)))?;
+  if !segmented {
+    sql(connection.execute_batch(
+      "ALTER TABLE system_run_captures ADD COLUMN segment_offset INTEGER NOT NULL DEFAULT 0",
+    ))?;
+  }
+  let journaled: bool = sql(connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('system_run_captures') WHERE name='header_pending')", [], |row| row.get(0)))?;
+  if !journaled {
+    sql(connection.execute_batch(
+      "ALTER TABLE system_run_captures ADD COLUMN header_pending INTEGER NOT NULL DEFAULT 0",
+    ))?;
+  }
   Ok(())
 }
 
@@ -81,6 +93,8 @@ struct Checkpoint {
   file_identity: String,
   committed_bytes: u64,
   closed: bool,
+  #[serde(default)]
+  segment_offset: u64,
 }
 
 #[derive(Clone)]
@@ -96,6 +110,8 @@ struct Capture {
   closed: bool,
   complete: bool,
   file_offset: u64,
+  segment_offset: u64,
+  header_pending: bool,
   file_identity: String,
   inventory_revision: u64,
   warnings: Vec<String>,
@@ -104,7 +120,7 @@ struct Capture {
 fn capture(connection: &Connection, capture_id: &str) -> Result<Capture> {
   validate_component(capture_id)?;
   let (mut capture, warnings) = sql(connection.query_row(
-    "SELECT machine_id,run_id,run_dir,start_ms,end_ms,acknowledged,closed,complete,file_offset,file_identity,inventory_revision,warnings,coverage_lost FROM system_run_captures WHERE capture_id=?1",
+    "SELECT machine_id,run_id,run_dir,start_ms,end_ms,acknowledged,closed,complete,file_offset,file_identity,inventory_revision,warnings,coverage_lost,segment_offset,header_pending FROM system_run_captures WHERE capture_id=?1",
     [capture_id],
     |row| {
       Ok((Capture {
@@ -118,6 +134,8 @@ fn capture(connection: &Connection, capture_id: &str) -> Result<Capture> {
         closed: row.get(6)?,
         complete: row.get(7)?,
         file_offset: row.get(8)?,
+        segment_offset: row.get(13)?,
+        header_pending: row.get(14)?,
         file_identity: row.get(9)?,
         inventory_revision: row.get(10)?,
         coverage_lost: row.get(12)?,
@@ -195,6 +213,7 @@ fn open_stream(run_dir: &Path, create: bool) -> Result<File> {
   {
     use std::os::unix::fs::OpenOptionsExt;
     options.mode(0o600);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
   }
   let file = options.open(&path)?;
   if fs::symlink_metadata(&path)?.file_type().is_symlink() {
@@ -211,9 +230,9 @@ fn line(file: &mut File, record: &RunSystemRecord) -> Result<()> {
   Ok(())
 }
 
-fn header(file: &File) -> Result<RunSystemRecord> {
+fn header_at(file: &File, offset: u64) -> Result<RunSystemRecord> {
   let mut copy = file.try_clone()?;
-  copy.seek(SeekFrom::Start(0))?;
+  copy.seek(SeekFrom::Start(offset))?;
   let mut bytes = Vec::new();
   BufReader::new(copy.take(1024)).read_until(b'\n', &mut bytes)?;
   let result: RunSystemRecord = serde_json::from_slice(&bytes)?;
@@ -224,7 +243,7 @@ fn header(file: &File) -> Result<RunSystemRecord> {
 fn validate_file(file: &File, row: &Capture) -> Result<()> {
   if identity(file)? != row.file_identity
     || file.metadata()?.len() < row.file_offset
-    || header(file)?
+    || header_at(file, row.segment_offset)?
       != (RunSystemRecord::Capture {
         schema_version: RUN_SYSTEM_SCHEMA_VERSION,
         capture_id: row.capture_id.clone(),
@@ -251,10 +270,22 @@ fn save_checkpoint(row: &Capture) -> Result<()> {
     }
     let current: Checkpoint = serde_json::from_slice(&bounded_file(&path, 16 * 1024)?)?;
     if current.capture_id != row.capture_id || current.file_identity != row.file_identity {
-      return Err(rejection(
-        409,
-        "run system checkpoint belongs to another producer",
-      ));
+      if row.closed
+        && current.file_identity == row.file_identity
+        && current.committed_bytes >= row.file_offset
+      {
+        return Ok(());
+      }
+      if !(row.header_pending
+        && current.closed
+        && current.file_identity == row.file_identity
+        && current.committed_bytes == row.segment_offset)
+      {
+        return Err(rejection(
+          409,
+          "run system checkpoint belongs to another producer",
+        ));
+      }
     }
   }
   let mut temporary = tempfile::NamedTempFile::new_in(&row.run_dir)?;
@@ -265,6 +296,7 @@ fn save_checkpoint(row: &Capture) -> Result<()> {
       file_identity: row.file_identity.clone(),
       committed_bytes: row.file_offset,
       closed: row.closed,
+      segment_offset: row.segment_offset,
     },
   )?;
   temporary.as_file().sync_all()?;
@@ -302,7 +334,7 @@ fn known_end_from_store(store: &LocalStore, run_dir: &Path, state: &Value) -> Re
     || state["run_id"] != row.run_id
     || state["machine_id"].as_str() != Some(row.machine_id.as_str())
     || store.machine_id() != row.machine_id
-    || time(&state["started_at"])? != row.start_ms
+    || capture_start(state)? != row.start_ms
   {
     return Ok(None);
   }
@@ -340,9 +372,163 @@ pub fn begin_state(run_dir: &Path, state: &mut Value) {
   if let Ok(Some(capture_id)) = begin {
     state["system_capture_id"] = Value::String(capture_id);
     state["system_capture_status"] = Value::String("capturing".into());
+    state["system_capture_started_at"] = state["started_at"].clone();
+    state["system_capture_start_offset"] = serde_json::json!(0);
   } else {
     state["system_capture_error"] = Value::String(UNAVAILABLE.into());
   }
+}
+
+/// Start another exact observation segment without changing any earlier bytes.
+/// The previous segment must be durably closed before this explicit operation.
+pub fn begin_attempt_state(run_dir: &Path, state: &mut Value, started_at: &str) -> Result<()> {
+  begin_attempt_state_with_id(run_dir, state, started_at, None)
+}
+
+/// The supervisor journals this identity before registration or stream writes,
+/// allowing a stopped prelaunch attempt to recover its exact capture after a
+/// process death without inferring ownership from timestamps or process IDs.
+pub fn begin_attempt_state_reserved(
+  run_dir: &Path,
+  state: &mut Value,
+  started_at: &str,
+  capture_id: &str,
+) -> Result<()> {
+  begin_attempt_state_with_id(run_dir, state, started_at, Some(capture_id))
+}
+
+fn begin_attempt_state_with_id(
+  run_dir: &Path,
+  state: &mut Value,
+  started_at: &str,
+  reserved: Option<&str>,
+) -> Result<()> {
+  let started = time(&serde_json::json!(started_at))?;
+  let begin = (|| -> Result<Option<(String, u64)>> {
+    let Some((_, mut store)) = existing_store()? else {
+      return Ok(None);
+    };
+    if state["machine_id"].as_str() != Some(store.machine_id()) {
+      return Ok(None);
+    }
+    let id = state["run_id"]
+      .as_str()
+      .ok_or_else(|| rejection(400, "missing run identity"))?;
+    let offset = fs::metadata(run_dir.join(RUN_SYSTEM_PATH))
+      .map(|metadata| metadata.len())
+      .unwrap_or(0);
+    let capture_id = if let Some(reserved) = reserved {
+      store.begin_run_capture_segment_reserved(run_dir, id, started, reserved)?
+    } else {
+      store.begin_run_capture_segment(run_dir, id, started)?
+    };
+    Ok(Some((capture_id, offset)))
+  })();
+  match begin {
+    Ok(Some((capture_id, offset))) => {
+      state["system_capture_id"] = serde_json::json!(capture_id);
+      state["system_capture_started_at"] = serde_json::json!(started_at);
+      state["system_capture_start_offset"] = serde_json::json!(offset);
+      state["system_capture_status"] = serde_json::json!("capturing");
+      state
+        .as_object_mut()
+        .unwrap()
+        .remove("system_capture_error");
+    }
+    Ok(None) => {
+      for field in [
+        "system_capture_id",
+        "system_capture_started_at",
+        "system_capture_start_offset",
+        "system_capture_status",
+      ] {
+        state.as_object_mut().unwrap().remove(field);
+      }
+      state["system_capture_error"] = serde_json::json!(UNAVAILABLE);
+    }
+    Err(error) => return Err(error),
+  }
+  Ok(())
+}
+
+/// Restore only the journaled capture's metadata. Its registered run, machine
+/// and exact segment start must all match. This never adopts or signals a task.
+pub fn recover_attempt_state(
+  run_dir: &Path,
+  state: &mut Value,
+  capture_id: &str,
+  started_at: &str,
+) -> Result<bool> {
+  let Some((_, store)) = existing_store()? else {
+    return Err(rejection(
+      409,
+      "local capture storage is unavailable; retry capture recovery after restoring it",
+    ));
+  };
+  recover_attempt_from_store(&store, run_dir, state, capture_id, started_at)
+}
+
+fn recover_attempt_from_store(
+  store: &LocalStore,
+  run_dir: &Path,
+  state: &mut Value,
+  capture_id: &str,
+  started_at: &str,
+) -> Result<bool> {
+  validate_component(capture_id)?;
+  let exists: bool = sql(store.connection.query_row(
+    "SELECT EXISTS(SELECT 1 FROM system_run_captures WHERE capture_id=?1)",
+    [capture_id],
+    |row| row.get(0),
+  ))?;
+  if !exists {
+    return Ok(false);
+  }
+  let row = capture(&store.connection, capture_id)?;
+  if row.run_dir != fs::canonicalize(run_dir)?
+    || state["run_id"].as_str() != Some(row.run_id.as_str())
+    || row.machine_id != store.machine_id()
+    || state["machine_id"].as_str() != Some(row.machine_id.as_str())
+    || row.start_ms != time(&serde_json::json!(started_at))?
+  {
+    return Err(rejection(
+      409,
+      "journaled capture belongs to another run, machine, or start time",
+    ));
+  }
+  state["system_capture_id"] = serde_json::json!(capture_id);
+  state["system_capture_started_at"] = serde_json::json!(started_at);
+  state["system_capture_start_offset"] = serde_json::json!(row.segment_offset);
+  state["system_capture_status"] = serde_json::json!(if row.closed {
+    if row.complete {
+      "complete"
+    } else {
+      "incomplete"
+    }
+  } else {
+    "capturing"
+  });
+  if let Some(end) = row.end_ms {
+    state["system_capture_finished_at"] = serde_json::json!(
+      chrono::DateTime::from_timestamp_millis(end)
+        .ok_or_else(|| rejection(409, "journaled capture has an invalid end time"))?
+        .to_rfc3339()
+    );
+  } else {
+    state
+      .as_object_mut()
+      .unwrap()
+      .remove("system_capture_finished_at");
+  }
+  Ok(true)
+}
+
+fn capture_start(state: &Value) -> Result<i64> {
+  time(
+    state
+      .get("system_capture_started_at")
+      .unwrap_or(&state["started_at"]),
+  )
 }
 
 fn terminal(state: &Value) -> bool {
@@ -585,7 +771,8 @@ pub fn committed_prefix(run_dir: &Path, state: &Value) -> Result<Option<u64>> {
     return Err(rejection(400, "run system stream must be a regular file"));
   }
   let file = File::open(stream_path)?;
-  let matches_header = matches!(header(&file)?, RunSystemRecord::Capture { capture_id: actual, machine_id, start_ms, .. } if actual == capture_id && state["machine_id"].as_str() == Some(machine_id.as_str()) && time(&state["started_at"])? == start_ms);
+  let start_offset = state["system_capture_start_offset"].as_u64().unwrap_or(0);
+  let matches_header = matches!(header_at(&file,start_offset)?, RunSystemRecord::Capture { capture_id: actual, machine_id, start_ms, .. } if actual == capture_id && state["machine_id"].as_str() == Some(machine_id.as_str()) && capture_start(state)? == start_ms);
   if !matches_header {
     return Err(rejection(409, "run system capture header changed"));
   }

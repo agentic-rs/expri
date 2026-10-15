@@ -252,6 +252,53 @@ fn supervisor_restart_negotiates_its_own_capability_without_python_fallback() {
 }
 
 #[test]
+fn task_continuation_requires_native_capability_and_preserves_literal_payload() {
+  let fixture = Fixture::new();
+  let request: JobRequest = serde_json::from_value(json!({
+    "operation":"continue", "run_id":"run-old", "continuation":{
+      "request_id":"extend-123", "reason":"Extend 'task'\nEXPRI_JOB_REQUEST\n$(literal)",
+      "expected_attempt":1, "checkpoint":"outputs/step 80.pt",
+      "run":{"name":"train", "command":["python", "train.py", "--max-steps", "200"],
+        "environment":{}, "detach":true}
+    }
+  }))
+  .unwrap();
+  fixture.node(crate::node::cli::TASK_CONTINUATION_CAPABILITY);
+  let report = execute_with_preference(
+    &fixture.remote,
+    &request,
+    ProtocolPreference::Auto,
+    "./node-stub",
+  )
+  .unwrap()
+  .unwrap();
+  assert_eq!(report["request"], serde_json::to_value(&request).unwrap());
+  fixture.node("durable-runs-v1");
+  let error = execute_with_preference(
+    &fixture.remote,
+    &request,
+    ProtocolPreference::Auto,
+    "./node-stub",
+  )
+  .unwrap_err();
+  assert!(
+    error
+      .to_string()
+      .contains(crate::node::cli::TASK_CONTINUATION_CAPABILITY)
+  );
+  assert!(
+    execute_with_preference(
+      &fixture.remote,
+      &request,
+      ProtocolPreference::Python,
+      "./missing-node"
+    )
+    .is_err()
+  );
+  assert!(job_command(&fixture.remote, &request, "unused-node", false).is_err());
+}
+
+#[test]
 fn streamed_logs_preserve_binary_bytes_without_profile_banners() {
   let fixture = Fixture::new();
   fixture.node("durable-runs-v1");

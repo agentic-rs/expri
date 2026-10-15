@@ -28,7 +28,7 @@ const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
-pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 9;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 10;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -707,7 +707,9 @@ impl<S: ObjectStorage> Store<S> {
     path: &str,
     version: &str,
   ) -> ApiResult<Option<serde_json::Value>> {
-    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl") {
+    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl")
+      && !(expri_core::service::attempt_document(path).is_some() && path.ends_with("/params.json"))
+    {
       return Err(ApiError::new(400, "invalid scalar cache artifact"));
     }
     self.dashboard_cached_record(scope, path, version, 64 * 1024)
@@ -759,7 +761,9 @@ impl<S: ObjectStorage> Store<S> {
     version: &str,
     record: &serde_json::Value,
   ) -> ApiResult<()> {
-    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl") {
+    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl")
+      && !(expri_core::service::attempt_document(path).is_some() && path.ends_with("/params.json"))
+    {
       return Err(ApiError::new(400, "invalid scalar cache artifact"));
     }
     if serde_json::to_vec(record)
@@ -871,6 +875,44 @@ impl<S: ObjectStorage> Store<S> {
   }
 
   pub fn execute(&self, request: Request) -> ApiResult<Response> {
+    let (request, epoch) = match request {
+      Request::AtRunEpoch { epoch, request } => {
+        if !expri_core::service::run_mutation(&request) {
+          return Err(ApiError::new(
+            400,
+            "publication epoch requires a run mutation",
+          ));
+        }
+        (*request, epoch)
+      }
+      request => (request, 0),
+    };
+    if let Request::BeginRunAttempt {
+      scope,
+      request_id,
+      expected_epoch,
+      attempt,
+      documents,
+      streams,
+    } = request
+    {
+      return self.begin_run_attempt(
+        scope,
+        request_id,
+        expected_epoch,
+        attempt,
+        documents,
+        streams,
+      );
+    }
+    if let Request::ReconcileRunAttempt {
+      scope,
+      request_id,
+      expected_epoch,
+    } = request
+    {
+      return self.reconcile_run_attempt(scope, request_id, expected_epoch);
+    }
     let project = self.request_project(&request)?;
     let gate = project
       .as_deref()
@@ -888,7 +930,15 @@ impl<S: ObjectStorage> Store<S> {
       projects::ensure_active(&*self.db()?, project)?;
     }
     self.ensure_request_runs(&request)?;
+    self.guard_publication_epoch(&request, epoch)?;
     match request {
+      Request::AtRunEpoch { .. }
+      | Request::BeginRunAttempt { .. }
+      | Request::ReconcileRunAttempt { .. } => {
+        unreachable!("unwrapped publication control")
+      }
+      Request::CheckRunContinuation { scope } => self.check_run_continuation(&scope),
+      Request::RunPublication { scope } => self.run_publication(&scope),
       Request::BrowseRuns { query } => Ok(Response::RunPage {
         page: self.browse_runs(&query)?,
       }),
@@ -952,6 +1002,7 @@ impl<S: ObjectStorage> Store<S> {
       Request::Capabilities => Ok(Response::Capabilities {
         features: vec![
           "tracking-v1".into(),
+          "run-task-continuation-v1".into(),
           "file-references-v1".into(),
           "output-assets-v1".into(),
           "project-storage-management-v1".into(),

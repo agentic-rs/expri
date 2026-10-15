@@ -156,6 +156,7 @@ fn complete_system_capture_archives_every_tracking_document_and_stream() {
       store
         .queue_archive(ArchiveSnapshot {
           scope: scope.clone(),
+          publication_epoch: 0,
           incomplete: false,
           files,
         })
@@ -356,6 +357,7 @@ fn archive_jobs_are_durable_and_repeated_seals_reuse_the_snapshot() {
   };
   let snapshot = ArchiveSnapshot {
     scope: scope.clone(),
+    publication_epoch: 0,
     incomplete: true,
     files: vec![FileRecord {
       target: FileTarget::Run {

@@ -67,6 +67,282 @@ fn state(store: &LocalStore, id: &str) -> Value {
 }
 
 #[test]
+fn continuation_segments_preserve_committed_prefix_and_historical_exporters_cannot_truncate() {
+  let (_directory, mut store, run) = fixture();
+  let first = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  record(&mut store, 1200);
+  store.close_run_capture(&first, 2000).unwrap();
+  store.finish_capture(&first, true, Vec::new()).unwrap();
+  let prefix = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  let second = store
+    .begin_run_capture_segment(&run, "run-fixture", 3000)
+    .unwrap();
+  assert_ne!(first, second);
+  assert!(
+    fs::read(run.join(RUN_SYSTEM_PATH))
+      .unwrap()
+      .starts_with(&prefix)
+  );
+  let row = capture(&store.connection, &second).unwrap();
+  assert_eq!(row.segment_offset, prefix.len() as u64);
+  record(&mut store, 3500);
+  store.export_run_capture(&second).unwrap();
+  let before_old_export = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  assert!(!store.export_run_capture(&first).unwrap());
+  store.finish_capture(&first, true, Vec::new()).unwrap();
+  assert_eq!(
+    fs::read(run.join(RUN_SYSTEM_PATH)).unwrap(),
+    before_old_export
+  );
+  store.close_run_capture(&second, 4000).unwrap();
+  store.finish_capture(&second, true, Vec::new()).unwrap();
+  let final_bytes = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  assert!(final_bytes.starts_with(&prefix));
+  let mut current = state(&store, &second);
+  current["system_capture_status"] = serde_json::json!("complete");
+  current["system_capture_started_at"] = serde_json::json!("1970-01-01T00:00:03Z");
+  current["system_capture_start_offset"] = serde_json::json!(prefix.len());
+  current["finished_at"] = serde_json::json!("1970-01-01T00:00:04Z");
+  assert_eq!(
+    committed_prefix(&run, &current).unwrap(),
+    Some(final_bytes.len() as u64)
+  );
+  assert_eq!(
+    records(&run)
+      .iter()
+      .filter(|record| matches!(record, RunSystemRecord::Capture { .. }))
+      .count(),
+    2
+  );
+  assert_eq!(
+    records(&run)
+      .iter()
+      .filter(|record| matches!(record, RunSystemRecord::End { .. }))
+      .count(),
+    2
+  );
+}
+
+#[test]
+fn exporter_rechecks_a_cached_open_capture_after_its_successor_was_registered() {
+  let (_directory, mut store, run) = fixture();
+  let first = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  let cached = capture(&store.connection, &first).unwrap();
+  assert!(!cached.closed);
+  store.close_run_capture(&first, 2000).unwrap();
+  store.finish_capture(&first, true, Vec::new()).unwrap();
+  let second = store
+    .begin_run_capture_segment(&run, "run-fixture", 3000)
+    .unwrap();
+  record(&mut store, 3500);
+  store.export_run_capture(&second).unwrap();
+  let before = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  assert!(!store.export_capture_from(cached).unwrap());
+  assert_eq!(fs::read(run.join(RUN_SYSTEM_PATH)).unwrap(), before);
+}
+
+#[test]
+fn rejected_capture_registration_preserves_the_previous_segment_and_checkpoint() {
+  let (_directory, mut store, run) = fixture();
+  let first = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  store.close_run_capture(&first, 2000).unwrap();
+  store.finish_capture(&first, true, Vec::new()).unwrap();
+  let before = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  let checkpoint = fs::read(run.join(CHECKPOINT)).unwrap();
+  store.connection.execute_batch("CREATE TRIGGER reject_next_capture BEFORE INSERT ON system_run_captures BEGIN SELECT RAISE(ABORT, 'test registration failure'); END;").unwrap();
+  assert!(
+    store
+      .begin_run_capture_segment(&run, "run-fixture", 3000)
+      .is_err()
+  );
+  assert_eq!(fs::read(run.join(RUN_SYSTEM_PATH)).unwrap(), before);
+  assert_eq!(fs::read(run.join(CHECKPOINT)).unwrap(), checkpoint);
+  store
+    .connection
+    .execute_batch("DROP TRIGGER reject_next_capture")
+    .unwrap();
+  assert!(
+    store
+      .begin_run_capture_segment(&run, "run-fixture", 3000)
+      .is_ok()
+  );
+}
+
+#[test]
+fn registered_pending_capture_repairs_its_header_without_changing_the_old_prefix() {
+  let (_directory, mut store, run) = fixture();
+  let first = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  store.close_run_capture(&first, 2000).unwrap();
+  store.finish_capture(&first, true, Vec::new()).unwrap();
+  let before = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  let old_checkpoint = fs::read(run.join(CHECKPOINT)).unwrap();
+  let second = store
+    .begin_run_capture_segment(&run, "run-fixture", 3000)
+    .unwrap();
+  // Reproduce a crash after the journal commit, including a partially written
+  // header. The registered identity is sufficient for an exporter to repair it.
+  let file = OpenOptions::new()
+    .write(true)
+    .open(run.join(RUN_SYSTEM_PATH))
+    .unwrap();
+  file.set_len(before.len() as u64 + 7).unwrap();
+  fs::write(run.join(CHECKPOINT), old_checkpoint).unwrap();
+  store
+    .connection
+    .execute(
+      "UPDATE system_run_captures SET header_pending=1 WHERE capture_id=?1",
+      [&second],
+    )
+    .unwrap();
+  store.export_run_capture(&second).unwrap();
+  assert!(
+    fs::read(run.join(RUN_SYSTEM_PATH))
+      .unwrap()
+      .starts_with(&before)
+  );
+  assert!(!capture(&store.connection, &second).unwrap().header_pending);
+  let saved: Checkpoint = serde_json::from_slice(&fs::read(run.join(CHECKPOINT)).unwrap()).unwrap();
+  assert_eq!(saved.capture_id, second);
+  assert_eq!(
+    records(&run)
+      .iter()
+      .filter(|record| matches!(record, RunSystemRecord::Capture { .. }))
+      .count(),
+    2
+  );
+}
+
+#[test]
+#[cfg(unix)]
+fn reserved_capture_child_process_registers_without_publishing_metadata() {
+  let Some(database) = std::env::var_os("EXPRI_TEST_RESERVED_CAPTURE_DATABASE") else {
+    return;
+  };
+  let run = PathBuf::from(std::env::var_os("EXPRI_TEST_RESERVED_CAPTURE_RUN").unwrap());
+  let mut store = LocalStore::open_existing(Path::new(&database))
+    .unwrap()
+    .unwrap();
+  store
+    .begin_run_capture_segment_reserved(&run, "run-fixture", 3000, "capture-hard-death")
+    .unwrap();
+  // Kill the process after durable registration/header writes and before any
+  // caller could publish its returned identity into run-state.json.
+  unsafe {
+    libc::kill(std::process::id() as i32, libc::SIGKILL);
+  }
+  unreachable!("SIGKILL terminated the owned test subprocess");
+}
+
+#[test]
+#[cfg(unix)]
+fn reserved_capture_journal_recovers_after_process_death_before_state_publication() {
+  let (directory, mut store, run) = fixture();
+  let first = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
+  store.close_run_capture(&first, 2000).unwrap();
+  store.finish_capture(&first, true, Vec::new()).unwrap();
+  let prefix = fs::read(run.join(RUN_SYSTEM_PATH)).unwrap();
+  let mut previous = state(&store, &first);
+  previous["system_capture_status"] = serde_json::json!("complete");
+  previous["system_capture_finished_at"] = serde_json::json!("1970-01-01T00:00:02Z");
+  previous["task_attempts"] = serde_json::json!({"attempts":[{"attempt":1,"system_capture_id":first,"system_capture_finished_at":"1970-01-01T00:00:02Z"}]});
+  fs::write(
+    run.join("run-state.json"),
+    serde_json::to_vec(&previous).unwrap(),
+  )
+  .unwrap();
+  let database = directory.path().join("global/profiles.sqlite3");
+  drop(store);
+  let status = std::process::Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", "store::run_capture::tests::reserved_capture_child_process_registers_without_publishing_metadata", "--nocapture"])
+    .env("EXPRI_TEST_RESERVED_CAPTURE_DATABASE", &database)
+    .env("EXPRI_TEST_RESERVED_CAPTURE_RUN", &run)
+    .current_dir(directory.path())
+    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap();
+  use std::os::unix::process::ExitStatusExt;
+  assert_eq!(status.signal(), Some(libc::SIGKILL));
+  let mut store = LocalStore::open_existing(&database).unwrap().unwrap();
+  let mut recovered = read_state(&run.join("run-state.json")).unwrap();
+  assert_eq!(recovered["system_capture_id"], first);
+  let initial_attempt = recovered["task_attempts"]["attempts"][0].clone();
+  assert!(
+    recover_attempt_from_store(
+      &store,
+      &run,
+      &mut recovered,
+      "capture-hard-death",
+      "1970-01-01T00:00:03Z"
+    )
+    .unwrap()
+  );
+  assert_eq!(recovered["system_capture_id"], "capture-hard-death");
+  assert_eq!(recovered["system_capture_start_offset"], prefix.len());
+  assert_eq!(recovered["task_attempts"]["attempts"][0], initial_attempt);
+  store.close_run_capture("capture-hard-death", 4000).unwrap();
+  store
+    .finish_capture("capture-hard-death", true, Vec::new())
+    .unwrap();
+  assert!(
+    recover_attempt_from_store(
+      &store,
+      &run,
+      &mut recovered,
+      "capture-hard-death",
+      "1970-01-01T00:00:03Z"
+    )
+    .unwrap()
+  );
+  assert_eq!(recovered["system_capture_status"], "complete");
+  assert_eq!(
+    recovered["system_capture_finished_at"],
+    "1970-01-01T00:00:04+00:00"
+  );
+  assert!(
+    fs::read(run.join(RUN_SYSTEM_PATH))
+      .unwrap()
+      .starts_with(&prefix)
+  );
+  for field in ["run_id", "machine_id"] {
+    let mut wrong = previous.clone();
+    wrong[field] = serde_json::json!("another-identity");
+    let unchanged = wrong.clone();
+    assert!(
+      recover_attempt_from_store(
+        &store,
+        &run,
+        &mut wrong,
+        "capture-hard-death",
+        "1970-01-01T00:00:03Z"
+      )
+      .is_err()
+    );
+    assert_eq!(wrong, unchanged);
+  }
+  let mut wrong = previous.clone();
+  assert!(
+    recover_attempt_from_store(
+      &store,
+      &run,
+      &mut wrong,
+      "capture-hard-death",
+      "1970-01-01T00:00:05Z"
+    )
+    .is_err()
+  );
+  assert_eq!(wrong, previous);
+  assert!(
+    !recover_attempt_from_store(
+      &store,
+      &run,
+      &mut wrong,
+      "capture-not-registered",
+      "1970-01-01T00:00:03Z"
+    )
+    .unwrap()
+  );
+  assert_eq!(wrong, previous);
+}
+
+#[test]
 fn waiting_keeps_capture_open_and_records_observations_after_a_stale_finish() {
   let (_directory, mut store, run) = fixture();
   let id = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();

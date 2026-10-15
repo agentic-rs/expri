@@ -73,6 +73,75 @@ fn imported(store: &Store<MockStorage>, scope: &RunScope, input_id: Option<&str>
 }
 
 #[test]
+fn continued_outputs_use_the_registered_attempt_and_omit_unknown_task_provenance() {
+  for (attempt, digest) in [(Some(1), "a"), (Some(2), "a"), (None, "a"), (Some(2), "b")] {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = MockStorage::default();
+    let store = Store::open(directory.path(), storage.clone()).unwrap();
+    publish(&store, &storage, output(&scope()), "producer");
+    document(
+      &store,
+      &scope(),
+      "run-state.json",
+      1,
+      json!({"task":"current-task","status":"running","task_attempts":{"current_attempt":2,"attempts":[
+        {"attempt":1,"task":"original-task","status":"continued","started_at":"1970-01-01T00:00:00Z","finished_at":"1970-01-01T00:00:01Z"},
+        {"attempt":2,"task":"current-task","status":"running","started_at":"1970-01-01T00:00:02Z","finished_at":null}
+      ]}}),
+    );
+    for (path, value) in [
+      (
+        "snapshot.json",
+        json!({"source":{"git_head":"a".repeat(40)}}),
+      ),
+      (
+        "environment/environment-state.json",
+        json!({"lock_sha256":"b".repeat(64)}),
+      ),
+      (
+        "outputs/attempts/2/snapshot.json",
+        json!({"source":{"git_head":"c".repeat(40)}}),
+      ),
+      (
+        "outputs/attempts/2/environment-state.json",
+        json!({"lock_sha256":"d".repeat(64)}),
+      ),
+      (
+        crate::run_artifacts::INVENTORY_PATH,
+        json!({"schema_version":1,"files":[{"path":"outputs/best.pt","size":7,"sha256":digest.repeat(64),"task_attempt":attempt}]}),
+      ),
+    ] {
+      document(&store, &scope(), path, 1, value);
+    }
+    let provenance = imported(&store, &scope(), None).provenance.unwrap();
+    if let Some(attempt) = attempt.filter(|_| digest == "a") {
+      let first = attempt == 1;
+      assert_eq!(provenance.state["task_attempt"], attempt);
+      assert_eq!(
+        provenance.state["task"],
+        if first {
+          "original-task"
+        } else {
+          "current-task"
+        }
+      );
+      assert_eq!(
+        provenance.snapshot["source"]["git_head"],
+        if first { "a" } else { "c" }.repeat(40)
+      );
+      assert_eq!(
+        provenance.environment["lock_sha256"],
+        if first { "b" } else { "d" }.repeat(64)
+      );
+    } else {
+      assert!(provenance.state.is_null());
+      assert!(provenance.snapshot.is_null());
+      assert!(provenance.environment.is_null());
+    }
+  }
+}
+
+#[test]
 fn imports_share_one_object_capture_safe_provenance_and_survive_restart() {
   let directory = tempfile::tempdir().unwrap();
   let storage = MockStorage::default();

@@ -4,6 +4,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
+use std::process::Child;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -144,6 +145,9 @@ pub(crate) fn task(
         "owner_pid": std::process::id(), "owner_start": process_start(std::process::id())?,
         "worker_pid": pid,
       });
+      state["task_continuation_protocol_version"] = json!(1);
+      state["task_process_group_clean"] = json!(false);
+      expri_core::task_attempts::ensure_initial(state)?;
       Ok(())
     })
     .map_err(io::Error::other)?;
@@ -175,16 +179,38 @@ pub(super) fn pump(
   cleanup_groups: bool,
   acknowledgment: Option<&Handoff>,
 ) -> io::Result<TaskOutput> {
+  let mut pid = pid;
   match pump_inner(
     run_dir,
     lease,
-    pid,
+    &mut pid,
     stdout,
     stderr,
     cleanup_groups,
     acknowledgment,
   ) {
     Ok(output) => Ok(output),
+    Err(error) => Ok(failed_task(pid, error)),
+  }
+}
+
+pub(crate) fn resume_task(
+  run_dir: &Path,
+  lease: &impl AsRawFd,
+  mut child: Child,
+  stdout: File,
+  stderr: File,
+) -> io::Result<TaskOutput> {
+  let pid = child.id();
+  let source_out =
+    unsafe { File::from_raw_fd(child.stdout.take().expect("piped stdout").into_raw_fd()) };
+  let source_err =
+    unsafe { File::from_raw_fd(child.stderr.take().expect("piped stderr").into_raw_fd()) };
+  let pipes = LogPipe::new(source_out, stdout)
+    .and_then(|out| LogPipe::new(source_err, stderr).map(|err| (out, err)));
+  drop(child);
+  match pipes {
+    Ok((out, err)) => pump(run_dir, lease, pid, out, err, false, None),
     Err(error) => Ok(failed_task(pid, error)),
   }
 }
@@ -241,7 +267,7 @@ fn failed_task(pid: u32, error: io::Error) -> TaskOutput {
 fn pump_inner(
   run_dir: &Path,
   lease: &impl AsRawFd,
-  pid: u32,
+  pid: &mut u32,
   mut stdout: LogPipe,
   mut stderr: LogPipe,
   cleanup_groups: bool,
@@ -253,45 +279,108 @@ fn pump_inner(
   let mut group_cleaned = false;
   let mut observed_request = None;
   let mut observed_result = None;
+  let mut observed_continuation = None;
+  let mut continuing: Option<crate::continuation::PreparedContinuation> = None;
   loop {
     if !cancelled && cancel_requested(run_dir)? {
       cancelled = true;
-      groups::signal(pid, libc::SIGTERM)?;
+      groups::signal(*pid, libc::SIGTERM)?;
       cancellation_deadline = Some(Instant::now() + Duration::from_secs(2));
     }
     if cancellation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-      groups::signal(pid, libc::SIGKILL)?;
+      groups::signal(*pid, libc::SIGKILL)?;
       cancellation_deadline = None;
     }
-    let finished = cancellation_deadline.is_none() && groups::exit_pending(pid)?;
-    if finished && cleanup_groups && !group_cleaned {
-      if let Err(error) = groups::stop_pid(pid) {
+    let finished = cancellation_deadline.is_none() && groups::exit_pending(*pid)?;
+    if finished && !group_cleaned {
+      if let Err(error) = groups::stop_pid(*pid) {
         cleanup_uncertain = true;
         stdout.error.get_or_insert_with(|| error.to_string());
       }
+      update_state(&run_dir.join("run-state.json"), |state| {
+        state["task_process_group_clean"] = json!(!cleanup_uncertain);
+        Ok(())
+      })
+      .map_err(io::Error::other)?;
       group_cleaned = true;
     }
     stdout.drain(finished);
     stderr.drain(finished);
-    if let Some(payload) = acknowledgment {
-      // Metadata locks or temporarily unavailable paths must not orphan a live
-      // task after exec. Keep draining with the inherited lease and retry the
-      // durable acknowledgment while the very same child continues running.
-      if matches!(acknowledge_handoff(payload, lease), Ok(true)) {
-        acknowledgment = None;
-      }
+    if let Some(payload) = acknowledgment
+      && matches!(acknowledge_handoff(payload, lease), Ok(true))
+    {
+      acknowledgment = None;
     }
     if finished && stdout.closed && stderr.closed {
-      // Only reap after the last possible process-group signal and log drain.
       let mut raw_status = 0;
       loop {
-        let result = unsafe { libc::waitpid(pid as i32, &mut raw_status, 0) };
-        if result == pid as i32 {
+        if unsafe { libc::waitpid(*pid as i32, &mut raw_status, 0) } == *pid as i32 {
           break;
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
           return Err(error);
+        }
+      }
+      if let Some(mut prepared) = continuing.take() {
+        let replacement = (|| -> expri_core::error::Result<std::process::Child> {
+          if cancelled || cancel_requested(run_dir)? {
+            return Err(expri_core::error::ExpriError::Message(
+              "run cancellation requested during continuation".into(),
+            ));
+          }
+          if cleanup_uncertain || stdout.error.is_some() || stderr.error.is_some() {
+            return Err(expri_core::error::ExpriError::Message("old task cleanup or log capture could not be verified; no replacement worker was launched".into()));
+          }
+          let exit =
+            expri_core::error::command_exit_code(&std::process::ExitStatus::from_raw(raw_status));
+          crate::continuation::complete_old_attempt(run_dir, &mut prepared, exit)?;
+          crate::continuation::launch_replacement(run_dir, &mut prepared)
+        })();
+        match replacement {
+          Ok(mut child) => {
+            *pid = child.id();
+            let out = unsafe {
+              File::from_raw_fd(child.stdout.take().expect("piped stdout").into_raw_fd())
+            };
+            let err = unsafe {
+              File::from_raw_fd(child.stderr.take().expect("piped stderr").into_raw_fd())
+            };
+            let files = stdout
+              .log
+              .try_clone()
+              .and_then(|log| LogPipe::new(out, log))
+              .and_then(|out| {
+                stderr
+                  .log
+                  .try_clone()
+                  .and_then(|log| LogPipe::new(err, log))
+                  .map(|err| (out, err))
+              });
+            drop(child);
+            match files {
+              Ok((out, err)) => {
+                stdout = out;
+                stderr = err;
+                group_cleaned = false;
+                cleanup_uncertain = false;
+                continue;
+              }
+              Err(error) => return Ok(failed_task(*pid, error)),
+            }
+          }
+          Err(error) => {
+            let _ = crate::continuation::fail_after_stop(run_dir, &prepared, &error);
+            return Ok(TaskOutput {
+              output: LoggedOutput {
+                status: std::process::ExitStatus::from_raw(1 << 8),
+                stdout: Vec::new(),
+                log_error: Some(io::Error::other(error)),
+              },
+              cancelled: cancelled || cancel_requested(run_dir).unwrap_or(false),
+              cleanup_uncertain,
+            });
+          }
         }
       }
       return Ok(TaskOutput {
@@ -304,27 +393,46 @@ fn pump_inner(
         cleanup_uncertain,
       });
     }
-    if !finished && !cancelled && acknowledgment.is_none() {
-      if let Ok(metadata) = fs::symlink_metadata(run_dir.join(RESULT_FILE)) {
+    if !finished && !cancelled && acknowledgment.is_none() && continuing.is_none() {
+      if let Ok(metadata) = fs::symlink_metadata(run_dir.join(".task-continuation.json")) {
         let identity = (metadata.dev(), metadata.ino());
-        if observed_result != Some(identity) && matches!(reconcile_failure(run_dir), Ok(true)) {
-          observed_result = Some(identity);
+        if observed_continuation != Some(identity) {
+          observed_continuation = Some(identity);
+          if let Ok(Some(mut prepared)) = crate::continuation::pending(run_dir) {
+            if stdout.error.is_some() || stderr.error.is_some() {
+              let _ = crate::continuation::reject_prepared(
+                run_dir,
+                &prepared,
+                "task log capture has failed; continuation was not started",
+              );
+            } else if crate::continuation::mark_stopping(run_dir, &mut prepared).is_ok() {
+              groups::signal(*pid, libc::SIGTERM)?;
+              cancellation_deadline = Some(Instant::now() + Duration::from_secs(2));
+              continuing = Some(prepared);
+            }
+          }
         }
       }
-      let request_path = run_dir.join(REQUEST_FILE);
-      if let Ok(metadata) = fs::symlink_metadata(&request_path) {
-        let identity = (metadata.dev(), metadata.ino());
-        if observed_request != Some(identity) {
-          observed_request = Some(identity);
-          // Invalid control input must never terminate or relaunch the task.
-          let _ = process_request(
-            run_dir,
-            lease,
-            pid,
-            &mut stdout,
-            &mut stderr,
-            cleanup_groups,
-          );
+      if continuing.is_none() {
+        if let Ok(metadata) = fs::symlink_metadata(run_dir.join(RESULT_FILE)) {
+          let identity = (metadata.dev(), metadata.ino());
+          if observed_result != Some(identity) && matches!(reconcile_failure(run_dir), Ok(true)) {
+            observed_result = Some(identity);
+          }
+        }
+        if let Ok(metadata) = fs::symlink_metadata(run_dir.join(REQUEST_FILE)) {
+          let identity = (metadata.dev(), metadata.ino());
+          if observed_request != Some(identity) {
+            observed_request = Some(identity);
+            let _ = process_request(
+              run_dir,
+              lease,
+              *pid,
+              &mut stdout,
+              &mut stderr,
+              cleanup_groups,
+            );
+          }
         }
       }
     }

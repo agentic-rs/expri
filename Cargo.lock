@@ -673,6 +673,7 @@ version = "0.1.5"
 dependencies = [
  "chrono",
  "expri-core",
+ "libc",
  "nvml-wrapper",
  "rusqlite",
  "serde",

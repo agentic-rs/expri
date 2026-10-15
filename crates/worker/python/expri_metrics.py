@@ -20,6 +20,56 @@ MAX_METRIC_NAME_BYTES = 256
 MAX_PARAMS_DEPTH = 64
 MAX_STEP = 2 ** 64 - 1
 MIN_JSON_INTEGER = -(2 ** 63)
+MAX_METRICS_BYTES = 128 * 1024 * 1024
+
+
+def _decimal_u64(value, label, minimum=0):
+  if not isinstance(value, str) or not value or not value.isascii() or not value.isdigit() or (len(value) > 1 and value[0] == "0"):
+    raise ValueError(label + " must be a canonical unsigned decimal integer")
+  number = int(value) if len(value) <= 20 else MAX_STEP + 1
+  if not minimum <= number <= MAX_STEP:
+    raise ValueError(label + " must fit u64")
+  return number
+
+
+def _next_global_step(descriptor):
+  size = os.fstat(descriptor).st_size
+  if size > MAX_METRICS_BYTES:
+    raise ValueError("metrics.jsonl exceeds the 128 MiB continuation limit")
+  maximum = None
+  offset = 0
+  pending = b""
+  while offset < size:
+    chunk = os.pread(descriptor, min(65536, size - offset), offset)
+    if not chunk:
+      raise ValueError("metrics.jsonl changed while mapping continuation steps")
+    offset += len(chunk)
+    pending += chunk
+    rows = pending.split(b"\n")
+    pending = rows.pop()
+    for row in rows:
+      if len(row) + 1 > MAX_EVENT_BYTES:
+        raise ValueError("metrics.jsonl contains an oversized event")
+      if not row.strip():
+        continue
+      try:
+        event = json.loads(row)
+      except (ValueError, UnicodeError) as error:
+        raise ValueError("metrics.jsonl contains invalid JSON") from error
+      step = event.get("step") if isinstance(event, dict) else None
+      if isinstance(step, bool) or not isinstance(step, int) or not 0 <= step <= MAX_STEP:
+        raise ValueError("metrics.jsonl contains an invalid global step")
+      if "schema_version" in event and (type(event["schema_version"]) is not int or event["schema_version"] != 1):
+        raise ValueError("metrics.jsonl contains an unsupported schema version")
+      _metric_values(event.get("metrics"))
+      maximum = step if maximum is None else max(maximum, step)
+    if len(pending) > MAX_EVENT_BYTES:
+      raise ValueError("metrics.jsonl contains an oversized event")
+  if pending:
+    raise ValueError("metrics.jsonl ends without a newline; repair the incomplete row before appending")
+  if maximum == MAX_STEP:
+    raise ValueError("global metric steps exhausted u64")
+  return 0 if maximum is None else maximum + 1
 
 
 def _json_bytes(value, limit, label):
@@ -117,8 +167,19 @@ class MetricsLogger:
     self._thread_lock = threading.RLock()
     self._directory_fd = None
     self._metrics_fd = None
+    self._attempt_fd = None
     self._closed = False
     self._owner_pid = os.getpid()
+    attempt = os.environ.get("EXPRI_ATTEMPT")
+    offset = os.environ.get("EXPRI_STEP_OFFSET")
+    self._attempt = None if attempt is None else _decimal_u64(attempt, "EXPRI_ATTEMPT", 1)
+    self._step_offset = None if offset is None else _decimal_u64(offset, "EXPRI_STEP_OFFSET")
+    if self._attempt is None and self._step_offset is not None:
+      raise ValueError("EXPRI_STEP_OFFSET requires EXPRI_ATTEMPT")
+    if self._attempt is not None and self._attempt > 1 and self._step_offset is None:
+      raise ValueError("continuation attempts require EXPRI_STEP_OFFSET")
+    if self._attempt == 1 and self._step_offset not in (None, 0):
+      raise ValueError("the initial attempt must have zero EXPRI_STEP_OFFSET")
     if output_dir is None:
       output_dir = os.environ.get("EXPRI_OUTPUT_DIR")
       if not output_dir:
@@ -150,9 +211,10 @@ class MetricsLogger:
     if self._owner_pid != os.getpid():
       raise ValueError("create a MetricsLogger in each process; do not reuse one inherited through fork")
 
-  def _open_file(self, name, flags, missing=False):
+  def _open_file(self, name, flags, missing=False, directory_fd=None):
+    directory_fd = self._directory_fd if directory_fd is None else directory_fd
     try:
-      metadata = os.stat(name, dir_fd=self._directory_fd, follow_symlinks=False)
+      metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
       if not flags & os.O_CREAT:
         if missing:
@@ -166,13 +228,13 @@ class MetricsLogger:
     try:
       try:
         descriptor = os.open(name, open_flags | (os.O_EXCL if create_or_open else 0),
-                             0o600, dir_fd=self._directory_fd)
+                             0o600, dir_fd=directory_fd)
       except FileExistsError:
         if not create_or_open:
           raise
         # Keep creation exclusive, then open the winning regular file. Darwin's
         # O_CREAT|O_NOFOLLOW path can fail during concurrent first creation.
-        descriptor = os.open(name, open_flags & ~os.O_CREAT, dir_fd=self._directory_fd)
+        descriptor = os.open(name, open_flags & ~os.O_CREAT, dir_fd=directory_fd)
     except FileNotFoundError:
       if missing:
         return None
@@ -181,6 +243,74 @@ class MetricsLogger:
       os.close(descriptor)
       raise ValueError(name + " must be a regular file")
     return descriptor
+
+  def _attempt_directory(self):
+    if self._attempt_fd is not None:
+      return self._attempt_fd
+    parent = self._directory_fd
+    owned = None
+    try:
+      for name in ("attempts", str(self._attempt)):
+        try:
+          os.mkdir(name, mode=0o700, dir_fd=parent)
+          os.fsync(parent)
+        except FileExistsError:
+          pass
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        if owned is not None:
+          os.close(owned)
+        parent = owned = descriptor
+      self._attempt_fd = owned
+      return owned
+    except BaseException:
+      if owned is not None:
+        os.close(owned)
+      raise
+
+  def _mapped_step(self, descriptor, local_step):
+    if self._attempt is None or self._attempt == 1:
+      return local_step, None
+    directory = self._attempt_directory()
+    origin_fd = self._open_file("step-origin.json", os.O_RDONLY, missing=True, directory_fd=directory)
+    origin = None
+    if origin_fd is not None:
+      with os.fdopen(origin_fd, "rb") as handle:
+        raw = handle.read(4097)
+      try:
+        origin = json.loads(raw) if len(raw) <= 4096 else None
+      except (ValueError, UnicodeError) as error:
+        raise ValueError("attempt step origin is invalid JSON") from error
+      if not isinstance(origin, dict) or set(origin) != {"schema_version", "attempt", "step_offset", "first_local_step"} or type(origin["schema_version"]) is not int or origin["schema_version"] != 1 or type(origin["attempt"]) is not int or origin["attempt"] != self._attempt:
+        raise ValueError("attempt step origin does not match this attempt")
+      base = _decimal_u64(origin["step_offset"], "attempt step offset")
+      first = _decimal_u64(origin["first_local_step"], "attempt first local step")
+      if base != self._step_offset:
+        raise ValueError("EXPRI_STEP_OFFSET conflicts with the durable attempt step origin")
+    else:
+      if _next_global_step(descriptor) != self._step_offset:
+        raise ValueError("EXPRI_STEP_OFFSET must equal the next global metric step")
+      base = self._step_offset
+      first = local_step
+      origin = {"schema_version": 1, "attempt": self._attempt, "step_offset": str(base), "first_local_step": str(first)}
+    if local_step < first or base + local_step - first > MAX_STEP:
+      raise ValueError("mapped global step underflows the attempt origin or overflows u64")
+    return base + local_step - first, origin if origin_fd is None else None
+
+  def _save_step_origin(self, origin):
+    directory = self._attempt_directory()
+    name = ".step-origin-" + secrets.token_hex(12) + ".tmp"
+    descriptor = self._open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, directory_fd=directory)
+    try:
+      with os.fdopen(descriptor, "wb", buffering=0) as handle:
+        _write_all(handle.fileno(), _json_bytes(origin, 4096, "attempt step origin"))
+        os.fsync(handle.fileno())
+      os.replace(name, "step-origin.json", src_dir_fd=directory, dst_dir_fd=directory)
+      os.fsync(directory)
+    finally:
+      try:
+        os.unlink(name, dir_fd=directory)
+      except FileNotFoundError:
+        pass
 
   @contextmanager
   def _append_lease(self):
@@ -202,6 +332,8 @@ class MetricsLogger:
       "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
       "metrics": _metric_values(metrics),
     }
+    if self._attempt is not None:
+      event.update({"attempt": self._attempt, "local_step": int(step)})
     raw = _json_bytes(event, MAX_EVENT_BYTES, "metrics event")
     with self._thread_lock:
       self._check_open()
@@ -209,11 +341,16 @@ class MetricsLogger:
         size = os.fstat(descriptor).st_size
         if size and os.pread(descriptor, 1, size - 1) != b"\n":
           raise ValueError("metrics.jsonl ends without a newline; repair the incomplete row before appending")
+        event["step"], origin = self._mapped_step(descriptor, int(step))
+        raw = _json_bytes(event, MAX_EVENT_BYTES, "metrics event")
+        if origin is not None:
+          self._save_step_origin(origin)
         # Unbuffered writes make the complete event visible before returning.
         _write_all(descriptor, raw)
 
   def _existing_params(self):
-    descriptor = self._open_file("params.json", os.O_RDONLY, missing=True)
+    directory = self._attempt_directory() if self._attempt is not None and self._attempt > 1 else self._directory_fd
+    descriptor = self._open_file("params.json", os.O_RDONLY, missing=True, directory_fd=directory)
     if descriptor is None:
       return None
     with os.fdopen(descriptor, "rb") as handle:
@@ -238,25 +375,26 @@ class MetricsLogger:
     raw = _json_bytes({"schema_version": 1, "params": value}, MAX_PARAMS_BYTES, "params")
     with self._thread_lock:
       self._check_open()
+      directory = self._attempt_directory() if self._attempt is not None and self._attempt > 1 else self._directory_fd
       existing = self._existing_params()
       if existing is not None:
         if existing != raw:
           raise ValueError("params.json already contains different effective parameters")
         return
       name = ".params-" + secrets.token_hex(12) + ".tmp"
-      descriptor = self._open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+      descriptor = self._open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, directory_fd=directory)
       try:
         with os.fdopen(descriptor, "wb", buffering=0) as handle:
           _write_all(handle.fileno(), raw)
         try:
           # Publish only complete bytes, without replacing another writer's file.
-          os.link(name, "params.json", src_dir_fd=self._directory_fd,
-                  dst_dir_fd=self._directory_fd, follow_symlinks=False)
+          os.link(name, "params.json", src_dir_fd=directory,
+                  dst_dir_fd=directory, follow_symlinks=False)
         except FileExistsError:
           if self._existing_params() != raw:
             raise ValueError("params.json already contains different effective parameters") from None
       finally:
-        os.unlink(name, dir_fd=self._directory_fd)
+        os.unlink(name, dir_fd=directory)
 
   def close(self):
     """Close owned descriptors; events have already been flushed after each log."""
@@ -269,14 +407,16 @@ class MetricsLogger:
 
   def _close_descriptors(self):
     self._closed = True
-    descriptors = (self._metrics_fd, self._directory_fd)
-    self._metrics_fd = self._directory_fd = None
+    descriptors = (self._metrics_fd, self._directory_fd, self._attempt_fd)
+    self._metrics_fd = self._directory_fd = self._attempt_fd = None
     try:
       if descriptors[0] is not None:
         os.close(descriptors[0])
     finally:
       if descriptors[1] is not None:
         os.close(descriptors[1])
+      if descriptors[2] is not None:
+        os.close(descriptors[2])
 
   def __enter__(self):
     self._check_open()

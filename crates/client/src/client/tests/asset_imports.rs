@@ -28,9 +28,16 @@ fn metadata_and_output_import_use_only_control_requests_without_downloading() {
   let target = run_target(&scope(), "outputs/best.pt");
   let expected = target.clone();
   let mut requests = 0;
-  let (url, task) = mock(2, move |request, _| {
+  let (url, task) = mock(3, move |request, _| {
     assert_eq!(request.path, "/v1/request");
     let target = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+      Request::Capabilities => {
+        return (
+          200,
+          vec![],
+          serde_json::to_vec(&Response::Capabilities { features: vec![] }).unwrap(),
+        );
+      }
       Request::GetFile { target } => {
         assert_eq!(requests, 0);
         assert_eq!(target, expected);
@@ -94,7 +101,17 @@ fn metadata_and_output_import_use_only_control_requests_without_downloading() {
 fn output_import_rejects_an_inconsistent_or_foreign_canonical_record() {
   for change in ["project", "identity", "producer", "input_id", "provenance"] {
     let (_temporary, root) = root();
-    let (url, task) = mock(1, move |_, _| {
+    let (url, task) = mock(2, move |request, _| {
+      if matches!(
+        serde_json::from_slice::<Request>(&request.body).unwrap(),
+        Request::Capabilities
+      ) {
+        return (
+          200,
+          vec![],
+          serde_json::to_vec(&Response::Capabilities { features: vec![] }).unwrap(),
+        );
+      }
       let mut file = FileRecord {
         target: FileTarget::Input {
           project_id: "example-project".into(),
