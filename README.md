@@ -18,6 +18,19 @@ expri --version
 See the [release notes](CHANGELOG.md) for features and migration instructions.
 Install the same version on native workers when upgrading their capabilities.
 
+## Language SDKs
+
+Task instrumentation packages live under [`sdk/<lang>`](sdk/README.md):
+[`sdk/python`](sdk/python/README.md) provides the `expri-sdk` Python distribution
+with `import expri`, and [`sdk/rust`](sdk/rust/README.md) provides the lightweight
+`expri-sdk` Rust crate. Both expose initial steps, parameters, scalar metrics,
+running/waiting status, and finalized artifact registration. They write locally
+while the shared worker service handles publishing and monitoring.
+
+Install these initial packages from source; they have not been published by this
+change. The Python package also retains the standalone dependency-free helpers.
+See the [SDK guide](sdk/README.md) for installation and examples.
+
 ## Agent guidance
 
 `expri skill` prints a short agent skill with essential behavior and a topic
@@ -407,7 +420,7 @@ project or server configuration. Add `--run-dir` for an explicit live run and
 supervisor owns preparation and final states; tasks cannot change a finished run.
 Waiting preserves the original start time, system capture, publication, and
 cancellation, so elapsed time includes the wait. The optional dependency-free
-[`expri_run.py`](crates/worker/python/expri_run.py) helper exposes
+[`expri_run.py`](sdk/python/expri_run.py) helper exposes
 `set_run_status("waiting")` and `set_run_status("running")`, including on the
 Python worker fallback; copy it into the task's source before importing it.
 
@@ -573,8 +586,9 @@ an upgrade error when the installed node lacks the requested capability.
 
 ## Metrics and comparison charts
 
-Copy [expri_metrics.py](crates/worker/python/expri_metrics.py) into your experiment's
-source directory. The helper uses the Python standard library and works in the
+Install the [Python SDK](sdk/python/README.md) or copy its standalone
+[expri_metrics.py](sdk/python/expri_metrics.py) into your experiment's source
+directory. The helper uses the Python standard library and works in the
 run's uv environment. Log effective parameters after applying configuration
 defaults and command-line overrides, then record scalar metrics during training:
 
@@ -601,7 +615,7 @@ their history, including copied or manually prepared measurements. A managed
 task attempt shares one saved base across logger instances; opening a standalone
 logger starts a new logging session from the current history.
 Each event is flushed before `log()` returns. For distributed training, log from
-rank 0 and create the logger within that process. See [Python metrics guide](crates/worker/python/README.md)
+rank 0 and create the logger within that process. See the [standalone metrics guide](sdk/python/STANDALONE.md)
 for the complete producer contract.
 
 Inspect one run or compare runs locally:

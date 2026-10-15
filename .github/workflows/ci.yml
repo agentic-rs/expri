@@ -30,13 +30,50 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          python3 -B scripts/sync_python_sdk.py --check
+          cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Verify standalone Rust SDK package
+        run: cargo package --locked -p expri-sdk
+
+  sdk-compatibility:
+    name: SDK compatibility (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install minimum supported Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache SDK dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test SDK APIs and language interoperability
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          cargo test --locked -p expri-sdk
+          cargo build --locked -p expri-sdk --example contract_probe
+          python3 -B -m unittest discover -s sdk/python -p '*_tests.py'
+          python3 -B sdk/contract/interop_tests.py
 
   dashboard-web:
     name: Dashboard web
@@ -152,8 +189,12 @@ jobs:
 
       - name: Run producer API tests
         run: |
-          python3 -B crates/worker/python/expri_metrics_tests.py
-          python3 -B crates/worker/python/expri_run_tests.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s sdk/python -p '*_tests.py'
+
+      - name: Build and verify Python SDK distributions
+        run: |
+          uv build sdk/python --out-dir "${{ runner.temp }}/expri-sdk-dist"
+          python3 -B sdk/python/tests/installed_wheel.py "${{ runner.temp }}"/expri-sdk-dist/*.whl
 
       - name: Verify installed-package fixture wheels
         run: python3 -B tests/containers/fixtures_tests.py

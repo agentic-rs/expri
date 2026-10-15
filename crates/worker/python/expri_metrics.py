@@ -1,4 +1,6 @@
-"""Optional, dependency-free metrics writer for expri training scripts on Unix."""
+# Generated from sdk/python/expri_metrics.py; edit that source instead.
+# Regenerate with python3 scripts/sync_python_sdk.py.
+"""Dependency-free metrics writer shared by the expri SDK and standalone tasks."""
 
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -44,6 +46,10 @@ def _validate_timestamp(value):
     raise ValueError("metrics.jsonl timestamp must be RFC3339")
   # RFC3339 accepts leap seconds; datetime represents seconds 0 through 59.
   normalized = value[:17] + "59" + value[19:] if value[17:19] == "60" else value
+  # Python 3.10 accepts only three or six fractional digits. Normalize a
+  # validation-only copy; the original timestamp and metric bytes stay intact.
+  normalized = re.sub(r"\.(\d+)", lambda match: "." + match.group(1)[:6].ljust(6, "0"),
+                      normalized, count=1)
   try:
     datetime.fromisoformat(normalized.upper().replace("Z", "+00:00"))
   except ValueError as error:

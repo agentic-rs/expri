@@ -4,9 +4,8 @@ import os
 from pathlib import Path
 import sys
 import time
-import subprocess
 import torch
-from expri_metrics import MetricsLogger
+import expri
 
 out = Path(os.environ['EXPRI_OUTPUT_DIR'])
 private = Path('data/dataset.bin').read_bytes()
@@ -14,7 +13,7 @@ assert private == b'private-input-fixture' * 1024
 assert (torch.ones(1, device='cuda') + 1).item() == 2
 print('STDOUT_BURST:' + 'x' * (256 * 1024), flush=True)
 (out / 'input-proof.json').write_text(json.dumps({'size': len(private), 'torch': torch.__version__}))
-with MetricsLogger() as logger:
+with expri.init() as logger:
   logger.params({'learning_rate': 0.001, 'input_id': 'dataset-v1'})
   for step in range(80):
     logger.log(step, {'loss': 1.0 / (step + 1)}, step_mode='global')
@@ -30,8 +29,7 @@ with MetricsLogger() as logger:
         completed.write(b'registered-live-checkpoint' * 4096)
         completed.flush()
         os.fsync(completed.fileno())
-      subprocess.run(['expri', 'artifact', 'register', str(checkpoint), '--label', 'best',
-        '--label', 'latest'], check=True, stdout=subprocess.DEVNULL)
+      logger.register_artifact(checkpoint, labels=['best', 'latest'])
       if len(sys.argv) > 1:
         # The acceptance test opens this gate only after the laptop watcher has
         # received the checkpoint and live metadata while training is running.
