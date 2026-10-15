@@ -36,8 +36,8 @@ print('training started ' + mode, flush=True)
 print('diagnostic ' + mode, file=sys.stderr, flush=True)
 with MetricsLogger() as logger:
   logger.params({'learning_rate': rate, 'mode': mode})
-  logger.log(0, {'loss': 2.0, 'accuracy': 0.25})
-  logger.log(1, {'loss': rate * 10, 'accuracy': 0.75})
+  logger.log(0, {'loss': 2.0, 'accuracy': 0.25}, step_mode='global')
+  logger.log(1, {'loss': rate * 10, 'accuracy': 0.75}, step_mode='global')
 if mode == 'cancel':
   while True:
     time.sleep(0.1)

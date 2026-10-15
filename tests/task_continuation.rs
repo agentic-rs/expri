@@ -47,11 +47,17 @@ else:
 logger = MetricsLogger()
 logger.params({'max_steps': args.limit})
 for step in ([100, 5] if attempt == 1 else [10, 12]):
-  logger.log(step, {'loss': 1 / (step + 1)})
+  if attempt == 1:
+    logger.log(step, {'loss': 1 / (step + 1)}, step_mode='global')
+  else:
+    logger.log(step, {'loss': 1 / (step + 1)})
+with MetricsLogger() as another_logger:
+  assert another_logger.initial_step == logger.initial_step
 os.write(1, ('attempt %s stdout\n' % attempt).encode())
 os.write(2, ('attempt %s stderr\n' % attempt).encode())
 (out / ('started-%s.json' % attempt)).write_text(json.dumps({
   'pid': os.getpid(), 'revision': pathlib.Path('revision.txt').read_text(),
+  'initial_step': logger.initial_step,
   'checkpoint': os.environ.get('EXPRI_RESUME_CHECKPOINT')}))
 if args.mode == 'orphan':
   child = os.fork()
@@ -359,6 +365,7 @@ fn active_continuation_preserves_history_and_extends_steps_with_new_source() {
     let id = fixture.start(mode);
     let before = fixture.state();
     let initial = fixture.json("outputs/started-1.json");
+    assert_eq!(initial["initial_step"], 0);
     let paths = [
       "outputs/metrics.jsonl",
       "outputs/params.json",
@@ -379,6 +386,7 @@ fn active_continuation_preserves_history_and_extends_steps_with_new_source() {
     assert_eq!(report["run_id"], id);
     assert_eq!(report["state"]["started_at"], before["started_at"]);
     let current = fixture.json("outputs/started-2.json");
+    assert_eq!(current["initial_step"], 101);
     assert_ne!(current["pid"], initial["pid"]);
     assert_eq!(current["revision"], "updated");
     assert_eq!(
@@ -401,8 +409,11 @@ fn active_continuation_preserves_history_and_extends_steps_with_new_source() {
         .iter()
         .map(|row| row["step"].as_u64().unwrap())
         .collect::<Vec<_>>(),
-      [100, 5, 101, 103]
+      [100, 5, 111, 113]
     );
+    assert_eq!(rows[0]["step_mode"], "global");
+    assert!(rows[0].get("local_step").is_none());
+    assert_eq!(rows[2]["step_mode"], "relative");
     assert_eq!(rows[2]["local_step"], 10);
     assert_eq!(rows[2]["attempt"], 2);
     assert_eq!(
@@ -581,6 +592,7 @@ fn a_failed_environment_preparation_can_continue_after_the_environment_is_fixed(
     || fixture.path("outputs/started-2.json").exists(),
     "continued task after failed environment",
   );
+  assert_eq!(fixture.json("outputs/started-2.json")["initial_step"], 0);
   let rows: Vec<Value> = fs::read_to_string(fixture.path("outputs/metrics.jsonl"))
     .unwrap()
     .lines()
@@ -591,7 +603,7 @@ fn a_failed_environment_preparation_can_continue_after_the_environment_is_fixed(
       .iter()
       .map(|row| row["step"].as_u64().unwrap())
       .collect::<Vec<_>>(),
-    [0, 2]
+    [10, 12]
   );
   fs::write(fixture.path("outputs/release-2"), "release").unwrap();
   fixture.terminal();

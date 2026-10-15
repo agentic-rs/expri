@@ -33,12 +33,22 @@ directory before importing it:
 from expri_metrics import MetricsLogger
 
 with MetricsLogger() as logger:
+  initial_step = logger.initial_step
   logger.params({"learning_rate": 0.001, "batch_size": 64, "seed": 42})
   logger.log(12, {"train/loss": 0.42, "train/accuracy": 0.87})
 ```
 
 The helper uses the standard library, flushes each event, and rejects parameter
 changes. Outside a managed run, use `MetricsLogger("outputs")` explicitly.
+`initial_step` is available at initialization: 0 for empty history, otherwise the
+maximum existing step plus one. `log(step, metrics)` defaults to relative steps
+and writes `initial_step + step`; `log(step, metrics, step_mode="global")` writes
+the supplied step unchanged. With history through 1000, relative 0 writes 1001
+and relative 10 writes 1011. Use global mode when restoring an absolute counter.
+Append any existing complete events before initialization to continue their
+history. The base is fixed for the logger session; a managed task attempt shares
+its saved base across logger instances. A new standalone logger starts a new
+session from the current history.
 Existing trainers can write the same files directly. Flush complete JSONL rows
 for live inspection; in distributed training write from rank 0 and create the
 logger within that process.

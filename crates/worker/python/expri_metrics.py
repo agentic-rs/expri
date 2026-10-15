@@ -9,6 +9,7 @@ import math
 from numbers import Integral, Real
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import threading
@@ -21,6 +22,32 @@ MAX_PARAMS_DEPTH = 64
 MAX_STEP = 2 ** 64 - 1
 MIN_JSON_INTEGER = -(2 ** 63)
 MAX_METRICS_BYTES = 128 * 1024 * 1024
+_TIMESTAMP = re.compile(
+  r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)",
+  re.ASCII,
+)
+
+
+def _invalid_json_constant(_value):
+  raise ValueError("JSON must not contain NaN or Infinity")
+
+
+def _finite_json_float(value):
+  number = float(value)
+  if not math.isfinite(number):
+    raise ValueError("JSON numbers must be finite")
+  return number
+
+
+def _validate_timestamp(value):
+  if not isinstance(value, str) or _TIMESTAMP.fullmatch(value) is None:
+    raise ValueError("metrics.jsonl timestamp must be RFC3339")
+  # RFC3339 accepts leap seconds; datetime represents seconds 0 through 59.
+  normalized = value[:17] + "59" + value[19:] if value[17:19] == "60" else value
+  try:
+    datetime.fromisoformat(normalized.upper().replace("Z", "+00:00"))
+  except ValueError as error:
+    raise ValueError("metrics.jsonl timestamp must be RFC3339") from error
 
 
 def _decimal_u64(value, label, minimum=0):
@@ -32,7 +59,7 @@ def _decimal_u64(value, label, minimum=0):
   return number
 
 
-def _next_global_step(descriptor):
+def _next_global_step(descriptor, allow_exhausted=False):
   size = os.fstat(descriptor).st_size
   if size > MAX_METRICS_BYTES:
     raise ValueError("metrics.jsonl exceeds the 128 MiB continuation limit")
@@ -53,7 +80,8 @@ def _next_global_step(descriptor):
       if not row.strip():
         continue
       try:
-        event = json.loads(row)
+        event = json.loads(row, parse_constant=_invalid_json_constant,
+                           parse_float=_finite_json_float)
       except (ValueError, UnicodeError) as error:
         raise ValueError("metrics.jsonl contains invalid JSON") from error
       step = event.get("step") if isinstance(event, dict) else None
@@ -61,13 +89,15 @@ def _next_global_step(descriptor):
         raise ValueError("metrics.jsonl contains an invalid global step")
       if "schema_version" in event and (type(event["schema_version"]) is not int or event["schema_version"] != 1):
         raise ValueError("metrics.jsonl contains an unsupported schema version")
+      if "timestamp" in event:
+        _validate_timestamp(event["timestamp"])
       _metric_values(event.get("metrics"))
       maximum = step if maximum is None else max(maximum, step)
     if len(pending) > MAX_EVENT_BYTES:
       raise ValueError("metrics.jsonl contains an oversized event")
   if pending:
     raise ValueError("metrics.jsonl ends without a newline; repair the incomplete row before appending")
-  if maximum == MAX_STEP:
+  if maximum == MAX_STEP and not allow_exhausted:
     raise ValueError("global metric steps exhausted u64")
   return 0 if maximum is None else maximum + 1
 
@@ -170,8 +200,19 @@ class MetricsLogger:
     self._attempt_fd = None
     self._closed = False
     self._owner_pid = os.getpid()
+    self._initial_step = None
+    self._legacy_first_local_step = None
+    configured_output = os.environ.get("EXPRI_OUTPUT_DIR")
+    if output_dir is None:
+      output_dir = configured_output
+      if not output_dir:
+        raise ValueError("EXPRI_OUTPUT_DIR is unset; pass output_dir explicitly")
+    self.output_dir = Path(os.path.abspath(output_dir))
+    redirected = configured_output is not None and self.output_dir != Path(os.path.abspath(configured_output))
     attempt = os.environ.get("EXPRI_ATTEMPT")
     offset = os.environ.get("EXPRI_STEP_OFFSET")
+    if redirected:
+      attempt = offset = None
     self._attempt = None if attempt is None else _decimal_u64(attempt, "EXPRI_ATTEMPT", 1)
     self._step_offset = None if offset is None else _decimal_u64(offset, "EXPRI_STEP_OFFSET")
     if self._attempt is None and self._step_offset is not None:
@@ -180,11 +221,6 @@ class MetricsLogger:
       raise ValueError("continuation attempts require EXPRI_STEP_OFFSET")
     if self._attempt == 1 and self._step_offset not in (None, 0):
       raise ValueError("the initial attempt must have zero EXPRI_STEP_OFFSET")
-    if output_dir is None:
-      output_dir = os.environ.get("EXPRI_OUTPUT_DIR")
-      if not output_dir:
-        raise ValueError("EXPRI_OUTPUT_DIR is unset; pass output_dir explicitly")
-    self.output_dir = Path(output_dir).absolute()
     try:
       metadata = self.output_dir.lstat()
     except FileNotFoundError:
@@ -193,10 +229,47 @@ class MetricsLogger:
       raise ValueError("output_dir must be a real directory, without a symlink")
     self.output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    self._directory_fd = os.open(self.output_dir, flags)
-    if not stat.S_ISDIR(os.fstat(self._directory_fd).st_mode):
+    try:
+      self._directory_fd = os.open(self.output_dir, flags)
+      if not stat.S_ISDIR(os.fstat(self._directory_fd).st_mode):
+        raise ValueError("output_dir must be a real directory")
+      if self._attempt is None and not redirected:
+        self._attempt = self._initial_managed_attempt(configured_output)
+      self._initialize_step_base()
+    except BaseException:
       self.close()
-      raise ValueError("output_dir must be a real directory")
+      raise
+
+  @property
+  def initial_step(self):
+    """Fixed global base for relative steps in this logging session."""
+    return self._initial_step
+
+  def _initial_managed_attempt(self, configured_output):
+    run_dir = os.environ.get("EXPRI_RUN_DIR")
+    run_id = os.environ.get("EXPRI_RUN_ID")
+    if not configured_output or not run_dir or not run_id:
+      return None
+    run_dir = Path(os.path.abspath(run_dir))
+    if run_dir.name != run_id or self.output_dir != run_dir / "outputs":
+      return None
+    if not stat.S_ISDIR(run_dir.lstat().st_mode):
+      raise ValueError("managed run directory must be a real directory")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with os.fdopen(os.open(run_dir / "run-state.json", flags), "rb") as handle:
+      if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        raise ValueError("managed run-state.json must be a regular file")
+      raw = handle.read(256 * 1024 + 1)
+    try:
+      state = json.loads(raw, parse_constant=_invalid_json_constant) if len(raw) <= 256 * 1024 else None
+    except (ValueError, UnicodeError) as error:
+      raise ValueError("managed run-state.json is invalid JSON") from error
+    if not isinstance(state, dict) or type(state.get("schema_version")) is not int or state["schema_version"] != 1 or state.get("run_id") != run_id:
+      raise ValueError("managed run-state.json does not match this run")
+    history = state.get("task_attempts")
+    if history is not None and (not isinstance(history, dict) or type(history.get("protocol_version")) is not int or history["protocol_version"] != 1 or type(history.get("current_attempt")) is not int or history["current_attempt"] != 1):
+      raise ValueError("managed continuation requires EXPRI_ATTEMPT and EXPRI_STEP_OFFSET")
+    return 1
 
   @property
   def closed(self):
@@ -267,34 +340,38 @@ class MetricsLogger:
         os.close(owned)
       raise
 
-  def _mapped_step(self, descriptor, local_step):
-    if self._attempt is None or self._attempt == 1:
-      return local_step, None
-    directory = self._attempt_directory()
-    origin_fd = self._open_file("step-origin.json", os.O_RDONLY, missing=True, directory_fd=directory)
-    origin = None
-    if origin_fd is not None:
-      with os.fdopen(origin_fd, "rb") as handle:
-        raw = handle.read(4097)
-      try:
-        origin = json.loads(raw) if len(raw) <= 4096 else None
-      except (ValueError, UnicodeError) as error:
-        raise ValueError("attempt step origin is invalid JSON") from error
-      if not isinstance(origin, dict) or set(origin) != {"schema_version", "attempt", "step_offset", "first_local_step"} or type(origin["schema_version"]) is not int or origin["schema_version"] != 1 or type(origin["attempt"]) is not int or origin["attempt"] != self._attempt:
-        raise ValueError("attempt step origin does not match this attempt")
-      base = _decimal_u64(origin["step_offset"], "attempt step offset")
-      first = _decimal_u64(origin["first_local_step"], "attempt first local step")
-      if base != self._step_offset:
-        raise ValueError("EXPRI_STEP_OFFSET conflicts with the durable attempt step origin")
-    else:
-      if _next_global_step(descriptor) != self._step_offset:
-        raise ValueError("EXPRI_STEP_OFFSET must equal the next global metric step")
-      base = self._step_offset
-      first = local_step
-      origin = {"schema_version": 1, "attempt": self._attempt, "step_offset": str(base), "first_local_step": str(first)}
-    if local_step < first or base + local_step - first > MAX_STEP:
-      raise ValueError("mapped global step underflows the attempt origin or overflows u64")
-    return base + local_step - first, origin if origin_fd is None else None
+  def _initialize_step_base(self):
+    with self._append_lease() as descriptor:
+      origin = None
+      if self._attempt is not None:
+        directory = self._attempt_directory()
+        origin_fd = self._open_file("step-origin.json", os.O_RDONLY, missing=True, directory_fd=directory)
+        if origin_fd is not None:
+          with os.fdopen(origin_fd, "rb") as handle:
+            raw = handle.read(4097)
+          try:
+            origin = json.loads(raw, parse_constant=_invalid_json_constant) if len(raw) <= 4096 else None
+          except (ValueError, UnicodeError) as error:
+            raise ValueError("attempt step origin is invalid JSON") from error
+          version = origin.get("schema_version") if isinstance(origin, dict) else None
+          fields = {"schema_version", "attempt", "step_offset"}
+          if version == 1:
+            fields.add("first_local_step")
+          if not isinstance(origin, dict) or type(version) is not int or version not in (1, 2) or set(origin) != fields or type(origin["attempt"]) is not int or origin["attempt"] != self._attempt:
+            raise ValueError("attempt step origin does not match this attempt")
+          base = _decimal_u64(origin["step_offset"], "attempt step offset")
+          if version == 1:
+            self._legacy_first_local_step = _decimal_u64(origin["first_local_step"], "attempt first local step")
+          if self._attempt > 1 and base != self._step_offset:
+            raise ValueError("EXPRI_STEP_OFFSET conflicts with the durable attempt step origin")
+      next_step = _next_global_step(descriptor, allow_exhausted=origin is not None)
+      if origin is None:
+        base = next_step
+        if self._attempt is not None:
+          if self._attempt > 1 and base != self._step_offset:
+            raise ValueError("EXPRI_STEP_OFFSET must equal the next global metric step")
+          self._save_step_origin({"schema_version": 2, "attempt": self._attempt, "step_offset": str(base)})
+      self._initial_step = base
 
   def _save_step_origin(self, origin):
     directory = self._attempt_directory()
@@ -322,18 +399,30 @@ class MetricsLogger:
     finally:
       fcntl.flock(self._metrics_fd, fcntl.LOCK_UN)
 
-  def log(self, step, metrics):
-    """Append one event; steps need not be unique or consecutive."""
+  def log(self, step, metrics, *, step_mode="relative"):
+    """Append a relative step (initial_step + step), or an explicit global step."""
     self._check_owner()
     if isinstance(step, bool) or not isinstance(step, Integral) or not 0 <= step <= MAX_STEP:
       raise ValueError("step must be a nonnegative integer at most u64::MAX")
+    if step_mode not in ("relative", "global"):
+      raise ValueError("step_mode must be relative or global")
+    if step_mode == "relative":
+      if self._legacy_first_local_step not in (None, 0):
+        raise ValueError("legacy attempt step origin uses a first-local-step anchor; use step_mode='global' or start a new attempt")
+      global_step = self.initial_step + int(step)
+      if global_step > MAX_STEP:
+        raise ValueError("mapped global step overflows u64")
+    else:
+      global_step = int(step)
     event = {
-      "schema_version": 1, "step": int(step),
+      "schema_version": 1, "step": global_step, "step_mode": step_mode,
       "timestamp": datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
       "metrics": _metric_values(metrics),
     }
+    if step_mode == "relative":
+      event["local_step"] = int(step)
     if self._attempt is not None:
-      event.update({"attempt": self._attempt, "local_step": int(step)})
+      event["attempt"] = self._attempt
     raw = _json_bytes(event, MAX_EVENT_BYTES, "metrics event")
     with self._thread_lock:
       self._check_open()
@@ -341,10 +430,6 @@ class MetricsLogger:
         size = os.fstat(descriptor).st_size
         if size and os.pread(descriptor, 1, size - 1) != b"\n":
           raise ValueError("metrics.jsonl ends without a newline; repair the incomplete row before appending")
-        event["step"], origin = self._mapped_step(descriptor, int(step))
-        raw = _json_bytes(event, MAX_EVENT_BYTES, "metrics event")
-        if origin is not None:
-          self._save_step_origin(origin)
         # Unbuffered writes make the complete event visible before returning.
         _write_all(descriptor, raw)
 
@@ -358,7 +443,7 @@ class MetricsLogger:
     if len(raw) > MAX_PARAMS_BYTES:
       raise ValueError("existing params.json exceeds the 1 MiB limit")
     try:
-      existing = json.loads(raw)
+      existing = json.loads(raw, parse_constant=_invalid_json_constant)
     except (ValueError, UnicodeError) as error:
       raise ValueError("existing params.json is invalid JSON") from error
     return _json_bytes(existing, MAX_PARAMS_BYTES, "existing params.json")

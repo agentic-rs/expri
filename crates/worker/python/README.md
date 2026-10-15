@@ -6,10 +6,11 @@ macOS; no package installation or changes to `PYTHONPATH` are required.
 from expri_metrics import MetricsLogger
 
 with MetricsLogger() as logger:
+  initial_step = logger.initial_step
   logger.params({"learning_rate": 0.001, "batch_size": 64, "seed": 42})
-  for step in range(100):
+  for local_step in range(100):
     loss, accuracy = train_step()
-    logger.log(step, {"train/loss": loss, "train/accuracy": accuracy})
+    logger.log(local_step, {"train/loss": loss, "train/accuracy": accuracy})
 ```
 
 The default directory is `EXPRI_OUTPUT_DIR`, which expri sets for each managed
@@ -19,24 +20,53 @@ Use the effective parameters after applying defaults and command-line overrides.
 The first `params()` call saves them; subsequent calls allow identical values and
 reject changes within the same task attempt.
 
+`logger.initial_step` is available immediately after initialization: 0 for empty
+history, otherwise the maximum existing step plus one. The base stays fixed for
+the logging session. Each `log()` call accepts `step_mode="relative"` (the default)
+or `step_mode="global"`:
+
+```python
+with MetricsLogger("outputs") as logger:
+  # Existing history has maximum step 1000, so initial_step is 1001.
+  logger.log(0, {"train/loss": 0.4})  # Writes step 1001.
+  logger.log(10, {"train/loss": 0.3})  # Writes step 1011.
+  logger.log(1200, {"train/loss": 0.2}, step_mode="global")  # Writes step 1200.
+```
+
+Relative steps always use `initial_step + step`, even when the first logged step
+is nonzero. Global steps are written unchanged, which is useful when a checkpoint
+restores an absolute counter. Relative rows include `local_step`; all helper rows
+include `step_mode`. Existing callers that already supply global counters should
+pass `step_mode="global"` when using this version of the helper.
+
+To continue history without launching a checkpoint continuation, append complete
+events to `metrics.jsonl` before creating the logger. The helper uses their steps
+regardless of whether the events were copied from another experiment or prepared
+manually. It validates existing history at initialization and preserves its bytes.
+Initialization scans at most 128 MiB and rejects malformed or incomplete rows.
+A new standalone logger starts a new session using the current history's maximum;
+logger instances in a managed task attempt share a saved base.
+
 For `expri runs continue`, use this version of the helper in the task's source.
-Expri sets `EXPRI_ATTEMPT` and `EXPRI_STEP_OFFSET`: the helper maps the first local
-step to the previous history's maximum global step plus one, then preserves local
-step spacing. Continued rows include `local_step` and `attempt` alongside `step`.
-The step origin is saved under `outputs/attempts/<attempt>/step-origin.json` while
-holding the metrics file lock, so separate logger instances agree on the mapping.
-Steps below that attempt's first local step and global u64 overflow are rejected
-without modifying the metric history. Attempt 1 keeps the original step behavior.
+Expri sets `EXPRI_ATTEMPT` and `EXPRI_STEP_OFFSET` for continued attempts. Managed
+rows include `attempt`, and the session base is saved under
+`outputs/attempts/<attempt>/step-origin.json` while holding the metrics file lock.
+This keeps the mapping stable across logger instances and process restarts within
+the same attempt. Global u64 overflow is rejected without changing metric bytes.
+An older saved origin that anchored a nonzero first local step keeps its recorded
+base. Use global mode for that existing attempt; relative mode rejects the
+incompatible origin instead of silently changing its mapping.
 
 Continued attempts save parameters in `outputs/attempts/<attempt>/params.json`,
 allowing a new training limit or other changed settings without overwriting the
 original parameters. Metric rows still append to the same `metrics.jsonl` file.
 The task loads its checkpoint from `EXPRI_RESUME_CHECKPOINT` using its own training
-framework. System readings and metric timestamps retain real observation times;
-the inactive interval is never backfilled with synthetic values.
+framework. System readings and newly logged metric timestamps retain real
+observation times; checkpoint continuation does not automatically fill the
+inactive interval.
 
 Each `log()` call appends one complete JSONL row and flushes it before returning.
-Rows include `schema_version: 1`, a UTC `timestamp`, `step`, and `metrics`.
+Rows include `schema_version: 1`, a UTC `timestamp`, `step`, `step_mode`, and `metrics`.
 Steps are nonnegative integers up to `2**64 - 1`; they may repeat or arrive out of
 order. Metric values must be finite real numbers, with booleans excluded. Integer
 values retain their exact representation when they fit i64 or u64; larger finite
