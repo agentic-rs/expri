@@ -11,15 +11,20 @@ instrumentation; the supervisor owns task launch, completion, and cancellation.
 | [rust](rust/README.md) | `expri-sdk` | `expri_sdk` | Rust 1.89+, Linux/macOS |
 | [contract](contract/README.md) | Shared producer contract and interoperability tests | | |
 
-These packages start at version 0.1.0, independently of the CLI. Install the
-initial packages from source or locally built distributions; adding them here
-does not publish them to PyPI or crates.io.
+The CLI and both SDK packages are prepared at version 0.1.6. The `expri`
+PyPI distribution is the prebuilt CLI; `expri-sdk` is the Python instrumentation
+API imported as `expri`. Install either or both as needed after publication.
 
-From this repository, install the Python package into your experiment environment:
+After the release is published, install the Python SDK into your experiment
+environment:
 
 ```sh
-uv pip install ./sdk/python
+python -m pip install expri-sdk==0.1.6
+# Optional native CLI for artifact registration:
+python -m pip install expri==0.1.6
 ```
+
+For development before publication, use `python -m pip install ./sdk/python`.
 
 ```python
 import expri
@@ -36,11 +41,13 @@ The task must finish and close a checkpoint before registering it. Relative
 artifact paths are rooted in the run's output directory. Registration returns
 after local handoff, independently of cloud availability.
 
-Add the Rust package to an experiment using its source path:
+Add the released Rust package to an experiment:
 
 ```sh
-cargo add expri-sdk --path /path/to/expri/sdk/rust
+cargo add expri-sdk@0.1.6
 ```
+
+For local development, use `cargo add expri-sdk --path /path/to/expri/sdk/rust`.
 
 ```rust
 let run = expri_sdk::init()?;
@@ -66,4 +73,6 @@ python3 scripts/sync_python_sdk.py --check
 
 Generated copies keep the published worker crate self-contained. CI checks that
 they match and tests both installed Python distributions and the packaged Rust
-crate. The existing CLI tag release workflow remains separate from SDK releases.
+crate. Distribution preparation builds and checks packages without publishing
+them. SDK and PyPI publication is not yet enabled; see the
+[release checklist](../docs/releasing.md) before activating a coordinated release.

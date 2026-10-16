@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
+
+[project]
+name = "expri"
+dynamic = ["version"]
+description = "Remote experiment workflows and resource monitoring"
+readme = "docs/pip-cli.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+  "Programming Language :: Rust",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
+]
+
+[project.urls]
+Repository = "https://github.com/agentic-rs/expri"
+Documentation = "https://github.com/agentic-rs/expri#readme"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+python-packages = []
+compatibility = "pypi"
+strip = true

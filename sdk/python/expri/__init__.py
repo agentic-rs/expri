@@ -9,4 +9,4 @@ __all__ = [
   "ArtifactLabel", "MetricsLogger", "Run", "RunStatus", "StepMode", "init",
   "set_run_status",
 ]
-__version__ = "0.1.0"
+__version__ = "0.1.6"

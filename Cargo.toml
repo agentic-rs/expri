@@ -13,21 +13,21 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/agentic-rs/expri"
 
 [workspace.dependencies]
-expri-core = { version = "=0.1.5", path = "crates/core" }
-expri-runs = { version = "=0.1.5", path = "crates/runs" }
-expri-client = { version = "=0.1.5", path = "crates/client" }
-expri-assets = { version = "=0.1.5", path = "crates/assets" }
-expri-worker = { version = "=0.1.5", path = "crates/worker" }
-expri-dashboard = { version = "=0.1.5", path = "crates/dashboard" }
-expri-server = { version = "=0.1.5", path = "crates/server" }
-expri-system = { version = "=0.1.5", path = "crates/system", default-features = false }
+expri-core = { version = "=0.1.6", path = "crates/core" }
+expri-runs = { version = "=0.1.6", path = "crates/runs" }
+expri-client = { version = "=0.1.6", path = "crates/client" }
+expri-assets = { version = "=0.1.6", path = "crates/assets" }
+expri-worker = { version = "=0.1.6", path = "crates/worker" }
+expri-dashboard = { version = "=0.1.6", path = "crates/dashboard" }
+expri-server = { version = "=0.1.6", path = "crates/server" }
+expri-system = { version = "=0.1.6", path = "crates/system", default-features = false }
 attohttpc = { version = "0.30.1", default-features = false }
 base64 = "0.22.1"
 flate2 = "1.1.9"
