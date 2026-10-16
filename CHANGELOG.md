@@ -1,47 +1,133 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 — 2026-10-16
 
-- `run --queue` freezes source and submits managed tasks to a shared server queue.
-  Configured executors in the shared worker service report explicit CPU, memory,
-  and whole-GPU budgets; the server assigns jobs across live workers and holds
-  reservations, with optional worker/device pins. Worker reports show available,
-  reserved and total resources.
-  Worker capacity defaults to detected logical CPUs, 90% of RAM, and selectable
-  whole GPUs, with optional per-field overrides and `gpus = []` for CPU-only workers.
-  Project restrictions are opt-in: omitted or empty `project_ids` accepts any
-  permitted project. Live NVIDIA GPU reports exclude busy or unverified devices;
-  the configurable per-process memory threshold defaults to 64 MiB. Stale reports
-  block GPU placement after 30 seconds while accepted reservations remain held.
-  `queue list`, `show`, `workers`, and `cancel` report tables or `--json`.
-  Durable claims and launch journals prevent duplicate execution on retries;
-  uncertain attempts retain reservations until reconciliation or confirmed recovery.
-  Back up the service data directory before upgrading to SQLite schema 9.
-- Native runs now start one shared worker service lazily for collection and run
-  publication. `service start` runs in the background or reuses it;
-  `--foreground` runs in the terminal. `service status` is read-only, and
-  `service stop` preserves queued jobs and leaves training alive. Saved jobs
-  recover on the next start after a reboot. `system daemon` is a deprecated
-  foreground alias. Stop an older standalone collector before starting the new
-  service after upgrading the worker binary.
-- `service publish` now queues ongoing publication and returns a durable
-  receipt. Use `--wait` to wait quietly or `--watch` to observe progress; Ctrl-C
-  stops observation while publication continues. Jobs pin their destination,
-  options and private credential snapshot; conflicting registration is rejected.
-- Server archives now accept all nine supported tracking files, including run
-  system captures. Deploy the updated server before upgrading workers that
-  automatically capture system metrics.
+The CLI and the first packaged Python and Rust SDKs are prepared at version
+0.1.6. This release adds a prebuilt CLI installable with pip, shared worker
+services, resource scheduling, machine monitoring, and continuation of existing
+runs. Registry publication remains a separate step; see the
+[release checklist](docs/releasing.md).
 
-- `run --smoke` marks managed runs and generates `smoke-run-…` IDs. An updated
-  server automatically archives finished published smoke runs with the existing
-  15-day retention, including failed and cancelled runs; worker files remain
-  available. Local and hosted dashboards show a Smoke badge.
+- **CLI and SDK packages:** install the native CLI with `pip install expri`,
+  or build it with Cargo. `sdk/python` packages `expri-sdk`, imported as
+  `expri`; `sdk/rust` packages the lightweight `expri-sdk` crate. Both SDKs
+  expose initial steps, parameters, scalar metrics, running/waiting status,
+  and finalized artifact registration through the same local producer contract.
+  Python's dependency-free `expri_metrics` and `expri_run` modules remain available.
+- **Shared worker service:** native runs lazily start one service per worker
+  for collection, publication, and queue execution. Components can be paused,
+  resumed, and restarted independently; saved choices and durable jobs survive
+  service restarts. `service publish` queues ongoing publication and returns a
+  receipt; `--wait` waits quietly and `--watch` observes progress. Ctrl-C stops
+  observation while publication continues. Jobs pin their destination, options,
+  and private credential snapshot.
+- **Resource scheduling:** `run --queue` freezes source and blocks in server-owned
+  `pending` until the assigned worker starts the task. `--queue --detach` returns
+  a durable receipt immediately. The server reserves logical CPU slots, memory,
+  and exclusive whole GPUs across live workers, with worker/device/model pins.
+  Worker budgets default to detected logical CPUs, 90% of RAM, and selectable
+  GPUs; `gpus = []` selects CPU-only execution. Omitted or empty `project_ids`
+  permits any project allowed by the worker credentials. Live NVIDIA checks
+  exclude busy or unverified GPUs; the per-process memory threshold defaults to
+  64 MiB. Reports older than 30 seconds block new GPU placement while accepted
+  reservations stay held. Durable claims and launch journals prevent duplicate
+  launches; uncertain attempts retain their reservations until reconciliation.
+- **Run phases and smoke tests:** tasks can switch between `running` and
+  `waiting` without releasing resources, changing the start time, or interrupting
+  captures. Server-owned `pending` means execution has not started. `run --smoke`
+  marks test runs; updated servers automatically archive finished published
+  smoke runs, including failures and cancellations, with 15-day retention.
+  Worker files remain available.
+- **System monitoring:** a dedicated dashboard page and CLI browse machine
+  inventory plus CPU, memory, GPU, disk, and network history. Detailed machine
+  history lasts 72 hours, with hourly summaries retained indefinitely. Run
+  captures align exact readings to each run's period and retain them for the
+  run's lifetime. Readings describe the whole machine, including for overlapping
+  runs, rather than attributed per-process usage.
+- **Dashboard and run annotations:** a redesigned workspace keeps full run
+  history beside inspection and comparison, with compact filters, run-specific
+  errors, task names, and live durations. Source selection moves to the header;
+  refresh controls move to the status bar. Hosted runs support editable nicknames
+  and multiple tags through the dashboard and CLI, preserved across publication.
+  Chart responses use bounded JSON while retaining exact coordinates.
+- **Live supervisor upgrades:** capable native Linux detached runs can replace
+  the supervisor executable while retaining the same task process, run ID, logs,
+  metrics, and artifacts. Guarded requests record reasons and generations;
+  failed target checks leave training running.
+- **Checkpoint continuation:** direct detached runs on native Linux can continue
+  from a finalized checkpoint with updated source or a longer training limit.
+  The run keeps its ID and metric/log history; separate attempts record source,
+  command, checkpoint digest, timestamps, and outcome. Running, waiting,
+  completed, failed, and cancelled runs are supported. Queued runs remain outside
+  this operation because their allocations belong to the server scheduler.
+- **Metric step modes:** SDK initialization exposes a fixed `initial_step` of
+  `MAX(existing step) + 1`, or zero for empty history. Logging defaults to
+  `initial_step + step`; explicit global mode preserves the supplied step.
+  Existing valid JSONL history can be appended before initialization without
+  creating a checkpoint or execution attempt. Managed attempts share a durable
+  step origin; each standalone initialization begins a new logging session.
+- **CLI and architecture:** server login saves revocable API credentials;
+  query commands inspect published runs directly. Reports use tables by default,
+  with `--json` for scripts. Progressive `expri skill` guides work offline. The
+  executable is split into eight internal subsystem crates, packaged with exact
+  aligned versions so source installation remains supported.
 
-- User-facing query, configuration, login, service, system, asset, artifact,
-  transfer, and detached-start reports now use tables by default. Scripts must
-  request `--json` to retain structured output. Use `run --detach --json TASK`
-  for a machine-readable start receipt. Worker protocols and foreground task
-  streams retain their existing formats.
+### Migration
+
+- **Upgrade the server first.** Back up its entire data directory before opening
+  SQLite schema 10. Older binaries refuse the upgraded directory; downgrading
+  requires restoring the backup. Updated archive support accepts all nine
+  tracking files, including system captures. Then upgrade workstation and worker
+  binaries together. Existing S3 runs remain readable.
+- **Structured CLI output is explicit.** Add `--json` to scripts consuming query,
+  configuration, login, service, system, asset, artifact, transfer, or detached
+  start reports. Use `run --detach --json TASK` for a start receipt. Worker
+  protocols and foreground task streams retain their existing formats.
+- **Review metric counters when updating helpers or adopting an SDK.** Default
+  relative mode now adds the fixed initial step in all logging sessions. A task
+  restoring an already-global checkpoint counter must pass Python's
+  `step_mode="global"` or Rust's `StepMode::Global`. Relative steps are zero-based:
+  with history through 1000, supplied steps 0 and 10 become 1001 and 1011.
+  Legacy persisted origins with a nonzero first-local-step anchor reject new
+  relative logging rather than silently changing coordinates; global mode works.
+- **Use the shared service controls.** Stop an older standalone collector after
+  upgrading a worker, then use `expri service start` for background operation or
+  `service start --foreground` for a terminal process. `system daemon` remains a
+  deprecated foreground alias. `service status` is read-only; `service stop`
+  preserves queued jobs and leaves training alive. Saved jobs recover on the
+  next service start after a reboot; training itself does not restart.
+- **Treat publication as a durable job.** `service publish` returns after local
+  registration. Add `--wait` or `--watch` to observe it through completion.
+  Shared service restarts leave existing run supervisors on their original
+  executable; explicitly request a supported live supervisor upgrade when needed.
+
+### Installation and update
+
+After publication, install the prebuilt native CLI without a Rust compiler on
+supported wheel platforms:
+
+```sh
+python -m pip install --upgrade expri==0.1.6
+expri --version
+```
+
+Install task instrumentation separately:
+
+```sh
+python -m pip install expri-sdk==0.1.6
+# Or add the Rust SDK to an experiment:
+cargo add expri-sdk@0.1.6
+```
+
+The `expri` CLI distribution and `expri-sdk` Python distribution can coexist;
+only `expri-sdk` provides the `import expri` instrumentation API. Source builds
+require Rust 1.89 or newer:
+
+```sh
+cargo install expri --version 0.1.6 --locked --force
+```
+
+[Changes since v0.1.5](https://github.com/agentic-rs/expri/compare/v0.1.5...v0.1.6)
 
 ## 0.1.5
 

@@ -8,15 +8,26 @@ Building expri requires Rust 1.89 or newer.
 
 ## Install
 
-Install or update the released CLI with Cargo:
+Version 0.1.6 aligns the CLI and both language SDKs. After the release is
+published, install or update the prebuilt CLI with pip:
 
 ```sh
-cargo install expri --version 0.1.5 --locked --force
+python -m pip install --upgrade expri==0.1.6
 expri --version
+```
+
+The `expri` Python distribution supplies the native executable; it is separate
+from the `expri-sdk` instrumentation package. Supported binary wheels do not
+require a Rust compiler. To build the CLI from source instead:
+
+```sh
+cargo install expri --version 0.1.6 --locked --force
 ```
 
 See the [release notes](CHANGELOG.md) for features and migration instructions.
 Install the same version on native workers when upgrading their capabilities.
+Version 0.1.6 is prepared here; registry publication remains a separate release
+step. See the [release checklist](docs/releasing.md) for its activation requirements.
 
 ## Language SDKs
 
@@ -27,9 +38,17 @@ with `import expri`, and [`sdk/rust`](sdk/rust/README.md) provides the lightweig
 running/waiting status, and finalized artifact registration. They write locally
 while the shared worker service handles publishing and monitoring.
 
-Install these initial packages from source; they have not been published by this
-change. The Python package also retains the standalone dependency-free helpers.
-See the [SDK guide](sdk/README.md) for installation and examples.
+After version 0.1.6 is published, add the SDK to your experiment:
+
+```sh
+python -m pip install expri-sdk==0.1.6
+# Or for a Rust experiment:
+cargo add expri-sdk@0.1.6
+```
+
+The Python package also retains the standalone dependency-free helpers.
+Source installation remains available; see the [SDK guide](sdk/README.md) for
+installation and examples.
 
 ## Agent guidance
 
@@ -292,10 +311,10 @@ executing the task there. Pass `--no-push` before the task name to skip that
 source push. Run options must appear before the task name; arguments after the task
 name are passed through to the task.
 
-An optional `[service]` or `[target.<name>.service]` starts a separate publisher
-for each recorded run. It forwards metadata, metrics, and logs through a durable
-queue while training continues independently. `expri runs status <run_id>` shows
-both task and publishing status; `--no-publish` disables it for one run.
+An optional `[service]` or `[target.<name>.service]` registers each recorded run
+with the shared worker service. It forwards metadata, metrics, and logs through
+a durable queue while training continues independently. `expri runs status <run_id>`
+shows both task and publishing status; `--no-publish` disables it for one run.
 See [automatic publishing and worker credentials](docs/self-hosted-service.md#worker-uploads)
 for configuration, dashboard links, and resuming a stopped publisher.
 

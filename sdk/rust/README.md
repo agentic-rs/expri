@@ -5,13 +5,17 @@ parameters locally and hands finalized artifacts to the existing worker
 service. It does not start an uploader, request credentials, or own task
 completion.
 
-Install the local package during development:
+Version 0.1.6 aligns with the CLI and Python SDK. After publication, add the
+released crate to your experiment:
 
 ```toml
 [dependencies]
-expri-sdk = { path = "/path/to/expri/sdk/rust" }
+expri-sdk = "0.1.6"
 serde_json = "1"
 ```
+
+For development before publication, replace the dependency with
+`expri-sdk = { path = "/path/to/expri/sdk/rust" }`.
 
 ```rust,no_run
 use expri_sdk::{StepMode, TaskStatus};
@@ -74,5 +78,6 @@ parameters; status and artifact operations require a managed run directory.
 Dropping or closing a `Run` only releases local SDK resources. Each metric event
 is visible before `log` returns; `flush()` additionally syncs metric bytes to
 local storage without waiting for publication. Initialize independently after forking; use
-rank zero for distributed training metrics. No package publication is implied
-by this source package.
+rank zero for distributed training metrics. This crate is prepared for version
+0.1.6; automated SDK publication is not yet enabled. See the
+[release checklist](../../docs/releasing.md) before publishing.

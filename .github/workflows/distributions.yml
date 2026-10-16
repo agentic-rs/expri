@@ -1,0 +1,159 @@
+name: Distribution preparation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/distributions.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - 'sdk/**'
+      - 'scripts/release.py'
+      - 'scripts/sync_python_sdk.py'
+      - 'scripts/pip_cli_tests.py'
+      - 'tests/release_tests.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preparation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  validate:
+    name: Validate coordinated release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Check release metadata and event
+        id: release
+        run: >-
+          python3 -B scripts/release.py check
+          --github-event "$GITHUB_EVENT_NAME"
+          --github-ref "$GITHUB_REF"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Test release boundaries
+        run: python3 -B tests/release_tests.py
+
+  python-sdk:
+    name: Build Python SDK distributions
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Build and test SDK distributions
+        run: |
+          python3 -m pip install 'build>=1.2,<2' 'twine>=6,<7'
+          python3 -B -m unittest discover -s sdk/python -p '*_tests.py'
+          python3 -m build sdk/python --outdir dist
+          python3 -m twine check --strict dist/*
+          python3 -B sdk/python/tests/installed_wheel.py dist/*.whl
+
+      - name: Save Python SDK distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-sdk-distributions
+          path: dist/*
+          if-no-files-found: error
+
+  cli-wheels:
+    name: Build and install CLI (${{ matrix.target }})
+    needs: [validate, python-sdk]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: '2_28'
+            compatibility: manylinux_2_28
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: '2_28'
+            compatibility: manylinux_2_28
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: 'off'
+            compatibility: pypi
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            manylinux: 'off'
+            compatibility: pypi
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Install minimum supported Rust on macOS
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.89.0'
+          targets: ${{ matrix.target }}
+
+      - name: Build precompiled CLI wheel
+        uses: PyO3/maturin-action@86b9d133d34bc1b40018696f782949dac11bd380 # v1.49.4
+        with:
+          maturin-version: v1.11.5
+          rust-toolchain: '1.89.0'
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist --compatibility ${{ matrix.compatibility }}
+
+      - name: Download Python SDK distributions
+        uses: actions/download-artifact@v7
+        with:
+          name: python-sdk-distributions
+          path: sdk-dist
+
+      - name: Verify CLI distribution metadata
+        run: |
+          python3 -m pip install 'twine>=6,<7'
+          python3 -m twine check --strict dist/*.whl
+
+      - name: Install CLI and SDK together in a clean environment
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: >-
+          python3 -B scripts/pip_cli_tests.py
+          --cli-wheel dist/*.whl
+          --sdk-wheel sdk-dist/*.whl
+          --expected-version "$RELEASE_VERSION"
+
+      - name: Save CLI wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error

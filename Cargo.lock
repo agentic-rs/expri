@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "expri"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "expri-assets"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "expri-client",
  "expri-core",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "expri-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "expri-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "globset",
@@ -611,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "expri-dashboard"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "expri-core",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "expri-runs"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "expri-core",
@@ -639,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "expri-sdk"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "libc",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "expri-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "attohttpc",
  "base64 0.22.1",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "expri-system"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "expri-core",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "expri-worker"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "expri-assets",

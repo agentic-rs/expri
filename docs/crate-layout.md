@@ -35,7 +35,7 @@ to the dashboard. Its generated `app.js` stays committed, so building or
 installing the Rust CLI does not require Node.js.
 
 Public task instrumentation packages live separately under `sdk/<lang>`.
-`sdk/rust` is the `expri-sdk` crate, with its own version and lightweight
+`sdk/rust` is the `expri-sdk` crate, with lightweight
 dependencies; the CLI does not depend on it. `sdk/python` packages the `expri`
 Python API and owns the standalone metrics/status helper sources. The worker's
 Python copies are generated with `scripts/sync_python_sdk.py` so its Cargo
@@ -83,25 +83,24 @@ succeeded.
 ## Release
 
 The libraries remain internal implementation boundaries, but must be published
-so `cargo install expri --locked` can resolve them. Keep all package versions and
-exact internal dependency versions aligned. The release following v0.1.5 needs
-a new version because that CLI version is already published.
+so `cargo install expri --locked` can resolve them. Keep all CLI package versions
+and exact internal dependency versions aligned. Version 0.1.6 also aligns the
+Python and Rust SDKs. The prepared distributions are the Cargo packages, the
+prebuilt CLI Python distribution `expri`, and the instrumentation distribution
+`expri-sdk`.
+The two Python distributions can coexist: the CLI supplies an executable and the
+SDK supplies the `expri` import. The root `pyproject.toml` builds binary CLI wheels;
+`sdk/python/pyproject.toml` builds the independent pure-Python SDK wheel.
 
-The independently versioned `expri-sdk` crate and Python distribution have
-separate release lifecycles. The CLI tag workflow below publishes only the
-internal crates and executable. SDK package validation runs in CI; introducing
-their source directories does not publish either SDK to a registry.
+The [release checklist](releasing.md) is the authority for registry setup and
+activation. `distributions.yml` builds and checks distributions on pull requests
+and manual dispatch without publishing them. Automated SDK and PyPI publication
+is not enabled. The existing `release.yml` still publishes the nine original
+Rust packages on version tags; it does not publish the SDK or Python packages.
+Do not push `v0.1.6` until the coordinated publication steps and first-time crate
+bootstrap are ready, because the legacy workflow can start a partial release.
 
-Configure crates.io trusted publishing for each library and `expri`, using this
-repository's `release.yml` workflow and `cargo` environment. The existing CLI
-publisher registration does not authorize the new package names automatically.
-New crate names need an initial manual publication before their trusted
-publisher can be configured, as described in the
-[Rust trusted publishing design](https://rust-lang.github.io/rfcs/3691-trusted-publishing-cratesio.html#trusted-publisher-configuration-on-cratesio).
-Complete that one-time bootstrap separately before using the tag workflow;
-versions selected for a tag must still be unpublished for every package.
-
-The tag workflow publishes in dependency order:
+For the existing Cargo publisher, dependency order is:
 
 ```sh
 cargo publish --locked -p expri-core
@@ -117,4 +116,10 @@ cargo publish --locked -p expri
 
 These explicit package commands work with Rust 1.89, where workspace-wide
 publication is unstable. Crate extraction and packaging checks do not publish
-anything.
+anything. The Rust SDK adds the independent `expri-sdk` crate to a future
+coordinated release; registry ownership and trusted publishing must be configured
+for each new package name. Distribution preparation uploads build artifacts for
+review, without uploading them to package registries. Users installing a
+supported CLI wheel need no Rust toolchain. See
+[the release notes](../CHANGELOG.md#016--2026-10-16) for installation and upgrade
+sequencing.

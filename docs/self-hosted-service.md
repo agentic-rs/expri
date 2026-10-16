@@ -86,11 +86,13 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this version upgrades the SQLite schema to version 10. Older binaries
-refuse that directory because they cannot preserve task-attempt publication fences,
-durable queue allocations, worker fencing, smoke archival, asset provenance, and run retention. Back up the entire
-service directory before upgrading; restoring that backup is required for a
-backend downgrade. Existing S3 runs remain readable after the upgrade.
+Opening version 0.1.6 upgrades the SQLite schema to version 10. Older binaries
+refuse that directory because they cannot preserve task-attempt publication
+fences, durable queue allocations, worker fencing, smoke archival, asset
+provenance, and run retention. Back up the entire service directory before
+upgrading; restoring that backup is required for a backend downgrade. Deploy
+the server before upgrading workers so it can accept system captures and the
+new publication records. Existing S3 runs remain readable after the upgrade.
 
 The optional object prefix is limited to 512 bytes to leave room for scoped IDs
 within S3's object-key limit.

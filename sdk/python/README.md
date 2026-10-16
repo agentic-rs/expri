@@ -1,12 +1,19 @@
 # Expri Python SDK
 
 The `expri-sdk` distribution imports as `expri`. It supports Python 3.10 or newer
-on Linux and macOS, with no runtime dependencies. This package is versioned
-independently of the expri CLI. Install from this repository:
+on Linux and macOS, with no runtime dependencies. Version 0.1.6 aligns with the
+CLI and Rust SDK. After publication, install it into the experiment environment:
 
 ```sh
-python -m pip install ./sdk/python
+python -m pip install expri-sdk==0.1.6
 ```
+
+For development, use `python -m pip install ./sdk/python` from this repository.
+The separate `expri` distribution provides the native CLI, available as
+`python -m pip install expri==0.1.6` after publication. It can be installed
+alongside the SDK when artifact registration needs a local CLI.
+Automated PyPI publication is not yet enabled; see the
+[release checklist](../../docs/releasing.md) before publishing these packages.
 
 ```python
 import expri
@@ -67,7 +74,7 @@ Run the SDK and standalone suites from this directory:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s . -p '*_tests.py'
 python -m pip wheel --no-deps --wheel-dir dist .
-PYTHONDONTWRITEBYTECODE=1 python tests/installed_wheel.py dist/expri_sdk-0.1.0-py3-none-any.whl
+PYTHONDONTWRITEBYTECODE=1 python tests/installed_wheel.py dist/expri_sdk-0.1.6-py3-none-any.whl
 ```
 
 The wheel smoke test installs the wheel into a temporary virtual environment
