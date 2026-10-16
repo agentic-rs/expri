@@ -91,19 +91,15 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             manylinux: '2_28'
-            compatibility: manylinux_2_28
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: '2_28'
-            compatibility: manylinux_2_28
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             manylinux: 'off'
-            compatibility: pypi
           - runner: macos-14
             target: aarch64-apple-darwin
             manylinux: 'off'
-            compatibility: pypi
     env:
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
@@ -128,8 +124,9 @@ jobs:
           maturin-version: v1.11.5
           rust-toolchain: '1.89.0'
           target: ${{ matrix.target }}
+          # The action supplies --manylinux; do not repeat its platform tag in args.
           manylinux: ${{ matrix.manylinux }}
-          args: --release --locked --out dist --compatibility ${{ matrix.compatibility }}
+          args: --release --locked --out dist
 
       - name: Download Python SDK distributions
         uses: actions/download-artifact@v7
