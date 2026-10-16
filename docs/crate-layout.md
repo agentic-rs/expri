@@ -34,6 +34,13 @@ scripts belong to the worker; the complete `dashboard_web` directory belongs
 to the dashboard. Its generated `app.js` stays committed, so building or
 installing the Rust CLI does not require Node.js.
 
+Public task instrumentation packages live separately under `sdk/<lang>`.
+`sdk/rust` is the `expri-sdk` crate, with its own version and lightweight
+dependencies; the CLI does not depend on it. `sdk/python` packages the `expri`
+Python API and owns the standalone metrics/status helper sources. The worker's
+Python copies are generated with `scripts/sync_python_sdk.py` so its Cargo
+package can embed them without referring outside its package directory.
+
 ## Validation and packaging
 
 Check every workspace library and the existing CLI integration tests:
@@ -79,6 +86,11 @@ The libraries remain internal implementation boundaries, but must be published
 so `cargo install expri --locked` can resolve them. Keep all package versions and
 exact internal dependency versions aligned. The release following v0.1.5 needs
 a new version because that CLI version is already published.
+
+The independently versioned `expri-sdk` crate and Python distribution have
+separate release lifecycles. The CLI tag workflow below publishes only the
+internal crates and executable. SDK package validation runs in CI; introducing
+their source directories does not publish either SDK to a registry.
 
 Configure crates.io trusted publishing for each library and `expri`, using this
 repository's `release.yml` workflow and `cargo` environment. The existing CLI

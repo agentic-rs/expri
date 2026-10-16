@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "expri-sdk"
+version = "0.1.0"
+description = "Local task instrumentation for expri experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
+]
+
+[project.urls]
+Repository = "https://github.com/agentic-rs/expri"
+
+[tool.setuptools]
+packages = ["expri"]
+py-modules = ["expri_metrics", "expri_run"]
+
+[tool.setuptools.package-data]
+expri = ["py.typed"]

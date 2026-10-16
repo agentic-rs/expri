@@ -1,4 +1,4 @@
-"""Validation, persistence, concurrency, and vendoring tests for the writer."""
+"""Validation, persistence, concurrency, and vendoring tests for the metrics writer."""
 
 from datetime import datetime
 from fractions import Fraction
@@ -257,6 +257,8 @@ class MetricsLoggerTests(unittest.TestCase):
           MetricsLogger(self.output)
         self.assertEqual(path.read_bytes(), raw)
     for timestamp in [None, "2026-10-15T03:04:05Z", "2026-10-15t03:04:05.123456789z",
+                      "2026-10-15T03:04:05.1+08:00", "2026-10-15T03:04:05.1234-08:00",
+                      "2016-12-31T23:59:60.123456789Z",
                       "2026-10-15T03:04:05+08:00", "2016-12-31T23:59:60Z"]:
       with self.subTest(timestamp=timestamp):
         event = {"step": 7, "metrics": {"loss": 1}}

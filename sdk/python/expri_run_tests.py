@@ -1,4 +1,4 @@
-"""Live lease, metadata validation, persistence, and status race tests."""
+"""Live lease, metadata validation, persistence, and task status race tests."""
 
 import fcntl
 import json
@@ -155,13 +155,16 @@ class RunStatusTests(unittest.TestCase):
   def test_missing_invalid_and_non_rfc3339_start_is_rejected(self):
     for started in (None, False, 1, "", "yesterday", "2026-10-14", "2026-10-14T01:23:45",
                     "2026-02-30T01:23:45Z", "2026-10-14T25:23:45Z", "2026-10-14T01:61:45Z",
-                    "2026-10-14T01:23:61Z", "2026-10-14T01:23:45+24:00"):
+                    "2026-10-14T01:23:61Z", "2026-10-14T01:23:45+24:00",
+                    "2026-10-14T01:23:45+00:60"):
       with self.subTest(started=started):
         self.save_state({**self.state, "started_at": started})
         self.assert_rejected_without_rewrite("started_at")
 
   def test_valid_utc_offsets_fraction_and_leap_second_preserve_exact_timestamp(self):
     for started in ("2026-10-14T01:23:45Z", "2026-10-14t01:23:45.123z",
+                    "2026-10-14T01:23:45.1+08:00", "2026-10-14T01:23:45.1234-08:00",
+                    "2026-10-14T01:23:45.123456789Z", "2016-12-31T23:59:60.123456789Z",
                     "2026-10-14T01:23:45-08:30", "2016-12-31T23:59:60Z"):
       with self.subTest(started=started):
         self.save_state({**self.state, "started_at": started})

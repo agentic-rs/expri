@@ -1160,7 +1160,12 @@ prefix = "acceptance"
     execute(worker, 'mkdir', '-p', '/home/tester/experiment')
     copy(ROOT / 'tests/containers/service_seed.py', worker, '/tmp/seed.py')
     copy(ROOT / 'tests/containers/service_train.py', worker, '/home/tester/experiment/train.py')
-    copy(ROOT / 'crates/worker/python/expri_metrics.py', worker, '/home/tester/experiment/expri_metrics.py')
+    sdk_python = ROOT / 'sdk/python'
+    for name in ['expri_metrics.py', 'expri_run.py']:
+      copy(sdk_python / name, worker, '/home/tester/experiment/' + name)
+    execute(worker, 'mkdir', '-p', '/home/tester/experiment/expri')
+    for name in ['__init__.py', 'api.py', 'py.typed']:
+      copy(sdk_python / 'expri' / name, worker, '/home/tester/experiment/expri/' + name)
     execute(worker, 'python3', '/tmp/seed.py')
   with workflow_progress.phase('Training through a service outage and publisher resume'):
     receipt = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train').stdout)

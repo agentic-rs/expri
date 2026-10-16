@@ -8,6 +8,7 @@ members = [
   "crates/dashboard",
   "crates/server",
   "crates/system",
+  "sdk/rust",
 ]
 resolver = "3"
 

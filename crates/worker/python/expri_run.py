@@ -1,4 +1,6 @@
-"""Dependency-free task status requests for live expri runs on Unix."""
+# Generated from sdk/python/expri_run.py; edit that source instead.
+# Regenerate with python3 scripts/sync_python_sdk.py.
+"""Dependency-free task status requests shared by the expri SDK and standalone tasks."""
 
 from datetime import datetime
 import errno
@@ -18,7 +20,7 @@ _LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.01
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _TIMESTAMP = re.compile(
-  r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})",
+  r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)",
   re.ASCII,
 )
 
@@ -148,6 +150,10 @@ def _valid_started_at(value):
     return False
   # RFC3339 permits a leap second. datetime only represents seconds 0 through 59.
   normalized = value[:17] + ("59" if value[17:19] == "60" else value[17:19]) + value[19:]
+  # Python 3.10 requires three or six fractional digits; only the validation
+  # copy is normalized so native nanosecond timestamps remain unchanged.
+  normalized = re.sub(r"\.(\d+)", lambda match: "." + match.group(1)[:6].ljust(6, "0"),
+                      normalized, count=1)
   try:
     datetime.fromisoformat(normalized.upper().replace("Z", "+00:00"))
   except ValueError:

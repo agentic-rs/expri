@@ -71,7 +71,7 @@ These operations use `EXPRI_RUN_DIR` without loading project or server settings.
 They require a live running/waiting task and are idempotent. Waiting retains
 elapsed time, publication, system capture, and cancellation; the supervisor
 publishes preparation and final states. Tasks cannot change finished runs.
-The dependency-free `crates/worker/python/expri_run.py` helper provides
+The dependency-free `sdk/python/expri_run.py` helper provides
 `set_run_status("waiting")` and `set_run_status("running")` on both worker paths;
 copy it into task source before importing it.
 

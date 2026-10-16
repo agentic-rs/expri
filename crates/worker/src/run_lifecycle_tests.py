@@ -471,7 +471,7 @@ class RunLifecycleTests(unittest.TestCase):
     self.assertEqual((self.run / "logs/stdout.log").read_bytes(), b"running\n")
 
   def start_waiting_task(self, continuation):
-    helper = SOURCE_DIR.parent / "python/expri_run.py"
+    helper = SOURCE_DIR.parents[2] / "sdk/python/expri_run.py"
     (self.repo / "expri_run.py").write_bytes(helper.read_bytes())
     with (self.repo / ".expri/checkout.manifest").open("a") as manifest:
       manifest.write("expri_run.py\n")

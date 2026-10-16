@@ -638,6 +638,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "expri-sdk"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "expri-server"
 version = "0.1.5"
 dependencies = [

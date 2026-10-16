@@ -2,6 +2,10 @@
 .agents
 .github/_pr_
 target
+sdk/python/build
+sdk/python/dist
+sdk/python/*.egg-info
+**/__pycache__
 **/node_modules
 .pnpm-store
 .expri

@@ -26,7 +26,7 @@ Optional timestamps are RFC3339 strings. Repeated steps and step resets remain
 in logging order; readers report malformed or incomplete rows as warnings.
 
 If you have an expri source checkout, its optional helper is
-`crates/worker/python/expri_metrics.py`. Copy it into the experiment's source
+`sdk/python/expri_metrics.py`. Copy it into the experiment's source
 directory before importing it:
 
 ```python
@@ -54,7 +54,7 @@ for live inspection; in distributed training write from rank 0 and create the
 logger within that process.
 
 Task phases are independent of scalar metrics. Copy the optional
-`crates/worker/python/expri_run.py` helper into task source and use
+`sdk/python/expri_run.py` helper into task source and use
 `from expri_run import set_run_status` to switch between `waiting` and `running`.
 Waiting is an active phase: elapsed time and system readings continue, and the
 supervisor still owns completion and cancellation.

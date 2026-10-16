@@ -7,6 +7,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY sdk/ sdk/
 COPY src/ src/
 COPY tests/container_workflow.rs tests/container_workflow.rs
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

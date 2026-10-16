@@ -1,0 +1,3 @@
+include STANDALONE.md
+include *_tests.py
+include tests/installed_wheel.py
