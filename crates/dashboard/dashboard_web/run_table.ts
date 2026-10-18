@@ -16,13 +16,28 @@ export function runColumnSortKey(column: RunColumn): string {
   return `${column.kind}:${column.key}`;
 }
 
+export function runColumnCount(column: RunColumn): number | undefined {
+  return typeof column.run_count === "number" && Number.isSafeInteger(column.run_count) && column.run_count >= 0
+    ? column.run_count : undefined;
+}
+
 /** Keep chosen columns available even when bounded discovery no longer includes them. */
 export function runColumnChoices(available: RunColumn[], selected: RunColumn[]): RunColumn[] {
   const choices = new Map<string, RunColumn>();
-  for (const column of [...available, ...selected])
+  for (const column of selected) {
+    const retained = { ...column };
+    delete retained.run_count;
+    choices.set(runColumnIdentity(column), retained);
+  }
+  // Fresh discovery owns prevalence; a saved selection may come from another
+  // source or an earlier sample and must not overwrite the current counts.
+  for (const column of available)
     choices.set(runColumnIdentity(column), column);
   return [...choices.values()].sort(
-    (first, second) => first.kind.localeCompare(second.kind) || first.label.localeCompare(second.label),
+    (first, second) => first.kind.localeCompare(second.kind)
+      || (runColumnCount(second) ?? -1) - (runColumnCount(first) ?? -1)
+      || first.label.localeCompare(second.label)
+      || first.key.localeCompare(second.key),
   );
 }
 

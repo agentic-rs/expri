@@ -11,6 +11,12 @@ use crate::metrics::{MetricSummary, Reduction};
 pub const COLUMN_LIMIT: usize = 8;
 const KEY_LIMIT: usize = 256;
 const DISCOVERY_LIMIT: usize = 100;
+// Count more candidates than the response can display so a common key first
+// seen in a later run can displace rare early keys. Keep an explicit memory
+// bound by retaining the first 4,096 candidates per group, then returning the
+// most common 100 within that pool. After the budget is exhausted, retained
+// counts remain exact but new keys are omitted and discovery is truncated.
+const DISCOVERY_CANDIDATE_LIMIT: usize = 4096;
 const STRING_LIMIT: usize = 256;
 
 pub struct ListQuery<'a> {
@@ -231,13 +237,20 @@ impl TableRow {
 
 #[derive(Default)]
 pub struct Columns {
-  params: BTreeMap<String, String>,
-  metrics: BTreeSet<String>,
+  params: BTreeMap<String, DiscoveredColumn>,
+  metrics: BTreeMap<String, DiscoveredColumn>,
+  sampled_run_count: usize,
   pub truncated: bool,
+}
+
+struct DiscoveredColumn {
+  label: String,
+  run_count: usize,
 }
 
 impl Columns {
   pub fn add(&mut self, data: &ScalarData) {
+    self.sampled_run_count += 1;
     if let Some(params) = &data.params {
       self.parameters(params, "", &[], 0);
     }
@@ -246,14 +259,7 @@ impl Columns {
         self.truncated = true;
         continue;
       }
-      if self.metrics.contains(name) {
-        continue;
-      }
-      if self.metrics.len() == DISCOVERY_LIMIT {
-        self.truncated = true;
-      } else {
-        self.metrics.insert(name.clone());
-      }
+      Self::record_column(&mut self.metrics, name, name, &mut self.truncated);
     }
   }
 
@@ -274,21 +280,57 @@ impl Columns {
       } else if value.is_object() {
         self.parameters(value, &key, &path, depth + 1);
       } else if scalar(value) || value.is_null() {
-        if self.params.contains_key(&key) {
-          continue;
-        }
-        if self.params.len() == DISCOVERY_LIMIT {
-          self.truncated = true;
-        } else {
-          self.params.insert(key, path.join(" / "));
-        }
+        Self::record_column(
+          &mut self.params,
+          &key,
+          &path.join(" / "),
+          &mut self.truncated,
+        );
       }
     }
   }
 
+  fn record_column(
+    columns: &mut BTreeMap<String, DiscoveredColumn>,
+    key: &str,
+    label: &str,
+    truncated: &mut bool,
+  ) {
+    if let Some(column) = columns.get_mut(key) {
+      column.run_count += 1;
+    } else if columns.len() == DISCOVERY_CANDIDATE_LIMIT {
+      *truncated = true;
+    } else {
+      columns.insert(
+        key.into(),
+        DiscoveredColumn {
+          label: label.into(),
+          run_count: 1,
+        },
+      );
+      *truncated |= columns.len() > DISCOVERY_LIMIT;
+    }
+  }
+
+  fn ranked_columns(columns: &BTreeMap<String, DiscoveredColumn>) -> Vec<Value> {
+    let mut columns: Vec<_> = columns.iter().collect();
+    columns.sort_unstable_by(|(left_key, left), (right_key, right)| {
+      right
+        .run_count
+        .cmp(&left.run_count)
+        .then_with(|| left.label.cmp(&right.label))
+        .then_with(|| left_key.cmp(right_key))
+    });
+    columns
+      .into_iter()
+      .take(DISCOVERY_LIMIT)
+      .map(|(key, column)| json!({"key":key,"label":column.label,"run_count":column.run_count}))
+      .collect()
+  }
+
   pub fn response(&self) -> Value {
-    json!({"params":self.params.iter().map(|(key,label)|json!({"key":key,"label":label})).collect::<Vec<_>>(),
-      "metrics":self.metrics.iter().map(|key|json!({"key":key,"label":key})).collect::<Vec<_>>(),"truncated":self.truncated})
+    json!({"params":Self::ranked_columns(&self.params),
+      "metrics":Self::ranked_columns(&self.metrics),"sampled_run_count":self.sampled_run_count,"truncated":self.truncated})
   }
 }
 

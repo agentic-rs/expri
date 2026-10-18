@@ -127,8 +127,9 @@ fn run_table_routes_discover_keys_validate_selection_and_sort_before_paging() {
   let columns: Value = serde_json::from_slice(&columns.body).unwrap();
   assert_eq!(
     columns["available_columns"]["params"],
-    json!([{"key":"/learning_rate","label":"learning_rate"}])
+    json!([{"key":"/learning_rate","label":"learning_rate","run_count":2}])
   );
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 2);
   let page = fixture.get("/api/runs?source=local&param=%2Flearning_rate&metric=train%2Floss&reduction=last&sort=metric%3Atrain%2Floss&direction=asc&limit=1&offset=1");
   assert_eq!(page.status, 200);
   let page: Value = serde_json::from_slice(&page.body).unwrap();

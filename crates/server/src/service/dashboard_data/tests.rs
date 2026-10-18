@@ -134,7 +134,12 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
   let columns = dashboard.columns("hosted:project:worker").unwrap();
   assert_eq!(
     columns["available_columns"]["params"],
-    json!([{"key":"/optimizer/rate","label":"optimizer / rate"}])
+    json!([{"key":"/optimizer/rate","label":"optimizer / rate","run_count":2}])
+  );
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 3);
+  assert_eq!(
+    columns["available_columns"]["metrics"],
+    json!([{"key":"loss","label":"loss","run_count":2}])
   );
   assert_eq!(fixture.backend.objects.lock().unwrap().requests.len(), 7);
   fixture.backend.objects.lock().unwrap().requests.clear();
@@ -234,12 +239,13 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     "replacing one metric artifact invalidates only its scalar cache"
   );
   let columns = dashboard.columns("hosted:project:worker").unwrap();
-  assert!(
-    columns["available_columns"]["metrics"]
-      .as_array()
-      .unwrap()
-      .iter()
-      .any(|column| column["key"] == "new_metric")
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 3);
+  assert_eq!(
+    columns["available_columns"]["metrics"],
+    json!([
+      {"key":"loss","label":"loss","run_count":2},
+      {"key":"new_metric","label":"new_metric","run_count":1}
+    ])
   );
   assert_eq!(fixture.backend.objects.lock().unwrap().requests.len(), 1);
 }
@@ -280,7 +286,12 @@ fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_sto
       .unwrap();
   }
   let dashboard = HostedDashboard::new(&fixture.store).unwrap();
-  dashboard.columns("hosted:project:worker").unwrap();
+  let columns = dashboard.columns("hosted:project:worker").unwrap();
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 2);
+  assert_eq!(
+    columns["available_columns"]["params"],
+    json!([{"key":"/rate","label":"rate","run_count":2}])
+  );
   let options = table::TableOptions::parse(
     vec!["/rate".into()],
     vec!["loss".into()],
@@ -330,12 +341,13 @@ fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_sto
   assert_eq!(page["runs"][0]["run_id"], "run-b");
   assert_eq!(page["runs"][0]["table_values"]["metrics"]["loss"], 1.0);
   let columns = dashboard.columns("hosted:project:worker").unwrap();
-  assert!(
-    columns["available_columns"]["metrics"]
-      .as_array()
-      .unwrap()
-      .iter()
-      .any(|column| column["key"] == "new_metric")
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 2);
+  assert_eq!(
+    columns["available_columns"]["metrics"],
+    json!([
+      {"key":"loss","label":"loss","run_count":2},
+      {"key":"new_metric","label":"new_metric","run_count":1}
+    ])
   );
   assert!(fixture.backend.objects.lock().unwrap().requests.is_empty());
   assert_eq!(

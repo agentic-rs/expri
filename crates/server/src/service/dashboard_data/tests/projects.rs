@@ -942,10 +942,18 @@ fn project_run_identity_survives_global_sort_paging_machine_filters_and_collisio
       )
       .is_err()
   );
+  let columns = dashboard.columns("hosted-project:project").unwrap();
   assert_eq!(
-    dashboard.columns("hosted-project:project").unwrap()["available_columns"]["params"],
-    json!([{"key":"/rate","label":"rate"}])
+    columns["available_columns"]["params"],
+    json!([{"key":"/rate","label":"rate","run_count":3}])
   );
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 3);
+  let columns = dashboard.columns("hosted:project:worker-b").unwrap();
+  assert_eq!(
+    columns["available_columns"]["params"],
+    json!([{"key":"/rate","label":"rate","run_count":2}])
+  );
+  assert_eq!(columns["available_columns"]["sampled_run_count"], 2);
 }
 
 #[test]

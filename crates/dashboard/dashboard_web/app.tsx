@@ -57,6 +57,7 @@ import { SystemMonitor } from "./system_monitor";
 import { RunSystemMonitor, runSystemItem } from "./run_system";
 import { parseRunQueue, parseRunRedirect, queueContext, queuePlaceholder } from "./run_queue";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
+import { warningSeverity } from "./run_diagnostics";
 import {
   DashboardView,
   type DashboardActions,
@@ -190,6 +191,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   let run_reduction: ComparisonReduction = "last";
   let run_columns_source: string | null = null;
   let run_columns_version = 0;
+  let run_columns_request: { source: string; version: number; promise: Promise<boolean> } | null = null;
   let offset = 0;
   const previous_run_offsets: number[] = [];
   let next_offset: number | null = null;
@@ -805,6 +807,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function resetRunColumns(): void {
     run_columns_version++;
     run_columns_lane.cancel();
+    run_columns_request = null;
     run_columns_source = null;
     available_run_columns = [];
     ui.run_columns_loading = false;
@@ -813,13 +816,19 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     ui.run_columns_supported = true;
     ui.run_columns_warnings = [];
   }
-  async function loadRunColumns(force = false): Promise<boolean> {
+  function loadRunColumns(force = false): Promise<boolean> {
     const source = source_id;
-    if (!source) return false;
-    if (!force && run_columns_source === source) return ui.run_columns_supported;
+    if (!source) return Promise.resolve(false);
+    if (!force && run_columns_source === source) return Promise.resolve(ui.run_columns_supported);
+    if (run_columns_request?.source === source) return run_columns_request.promise;
     const version = ++run_columns_version;
-    const current = () => source_id === source && version === run_columns_version;
     updateUi({ run_columns_loading: true, run_columns_error: null });
+    const promise = fetchRunColumns(source, version);
+    run_columns_request = { source, version, promise };
+    return promise;
+  }
+  async function fetchRunColumns(source: string, version: number): Promise<boolean> {
+    const current = () => !disposed && source_id === source && version === run_columns_version;
     try {
       const result = await run_columns_lane.run<RunColumns>(
         apiUrl("/api/run-columns", { source }),
@@ -851,6 +860,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       } else updateUi({ run_columns_error: errorText(error) });
       return false;
     } finally {
+      if (run_columns_request?.version === version) run_columns_request = null;
       if (current()) updateUi({ run_columns_loading: false });
     }
   }
@@ -950,10 +960,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     last_run_list = result;
     last_run_list_context = context;
     last_list_snapshot = now();
-    // Discovery diagnostics describe saved files too. Recheck them after a fresh
-    // list read, even when repairing an unselected column leaves the rows equal.
-    if (run_columns_source === source_id && ui.run_columns_warnings.some((item) => item.run_id)) {
-      ui.run_columns_warnings = ui.run_columns_warnings.filter((item) => !item.run_id);
+    // Recheck actionable saved-file diagnostics even when a repair leaves the
+    // rows equal. Informational notes do not justify repeatedly scanning history.
+    if (run_columns_source === source_id && ui.run_columns_warnings.some((item) => item.run_id && warningSeverity(item) !== "info")) {
       void loadRunColumns(true);
     }
     if (quiet && unchanged && was_ready) return;

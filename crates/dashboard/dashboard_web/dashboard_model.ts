@@ -4,7 +4,7 @@ import type { EventSourceFactory } from "./live_updates";
 import type { RunQueue, RunRedirect } from "./run_queue";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-export type Warning = { run_id?: string; message: string };
+export type Warning = { run_id?: string; message: string; severity?: "info" | "warning" | "error" };
 export const RUN_STATUSES: readonly string[] = [
   "pending", "preparing", "running", "waiting", "completed", "failed", "cancelled", "lost", "unknown",
 ];
@@ -80,13 +80,14 @@ export type RunArchival = {
   last_error: string | null;
 };
 export type RunTableValue = null | boolean | number | string;
-export type RunColumnChoice = { key: string; label: string };
+export type RunColumnChoice = { key: string; label: string; run_count?: number };
 export type RunColumn = RunColumnChoice & { kind: "param" | "metric" };
 export type RunSort = { key: string; direction: "asc" | "desc" };
 export type AvailableRunColumns = {
   params: RunColumnChoice[];
   metrics: RunColumnChoice[];
   truncated: boolean;
+  sampled_run_count?: number;
 };
 export type RunColumns = {
   available_columns: AvailableRunColumns;
