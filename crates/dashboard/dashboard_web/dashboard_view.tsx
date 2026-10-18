@@ -21,6 +21,7 @@ import type { ArchivalAction, ArchivalView } from "./run_archival";
 import {
   MAX_RUN_COLUMNS,
   formatRunTableValue,
+  runColumnCount,
   runColumnChoices,
   runColumnIdentity,
   runColumnSortKey,
@@ -373,15 +374,15 @@ function RunColumnPicker({
       column.label.toLocaleLowerCase().includes(query) ||
       column.key.toLocaleLowerCase().includes(query),
   );
-  const disabled =
-    s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported;
+  const disabled = s.controls_disabled || !s.run_columns_supported;
   return (
     <RunControlPopover id="run-columns" label="Columns" icon="columns" count={s.run_columns.length}
       open={open} disabled={s.controls_disabled} on_change={(value) => { on_change(value); if (value) a.refresh_run_columns(); }}>
       <p id="run-columns-hint" className="muted">
-        Runs include task names. Status and start time stay visible. Add up to eight parameter or metric columns.
+        Add up to eight parameter or metric columns.
+        {choices.some((column) => runColumnCount(column) !== undefined) && " Fields recorded in more sampled runs appear first."}
       </p>
-      {s.run_columns_loading && <p role="status">Finding recorded columns…</p>}
+      {s.run_columns_loading && <p role="status">{choices.length ? "Updating recorded columns…" : "Finding recorded columns…"}</p>}
       {choices.length > 0 && (
         <label className="field">
           Find a column
@@ -405,6 +406,7 @@ function RunColumnPicker({
               {columns.map((column) => {
                 const identity = runColumnIdentity(column);
                 const selected = chosen.has(identity);
+                const run_count = runColumnCount(column);
                 return (
                   <label className="run-column-choice choice-tag" key={identity}>
                     <input
@@ -415,7 +417,10 @@ function RunColumnPicker({
                       aria-label={`${kind === "param" ? "Parameter" : "Metric"} ${column.label}`}
                       onChange={(event) => a.run_column(column, event.currentTarget.checked)}
                     />
-                    <span title={column.key}>{column.label}</span>
+                    <span title={run_count === undefined ? column.key : `${column.key} · Recorded in ${run_count} sampled ${run_count === 1 ? "run" : "runs"}`}>
+                      {column.label}
+                      {run_count !== undefined && <small className="run-column-count">{run_count} {run_count === 1 ? "run" : "runs"}</small>}
+                    </span>
                   </label>
                 );
               })}
@@ -465,7 +470,7 @@ function RunColumnPicker({
           value={s.run_reduction}
           hidden={!s.run_columns.some((column) => column.kind === "metric")}
           disabled={
-            s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported
+            s.controls_disabled || s.list_busy || !s.run_columns_supported
           }
           options={[
             { id: "run-reduction-last", value: "last", label: "Last" },
@@ -518,7 +523,7 @@ function RunSortHeader({
         type="button"
         className="run-sort-button"
         disabled={
-          s.controls_disabled || s.list_busy || s.run_columns_loading || !s.run_columns_supported
+          s.controls_disabled || s.list_busy || !s.run_columns_supported
         }
         aria-label={`Sort by ${label} ${direction}`}
         title={label}

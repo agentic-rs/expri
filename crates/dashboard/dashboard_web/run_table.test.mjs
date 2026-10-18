@@ -62,3 +62,38 @@ test("column discovery retains selected columns outside the preview and sort lab
   assert.equal(runSortLabel({ key: "param:/learning_rate", direction: "asc" }, selected), "learning_rate · ascending");
   assert.equal(runSortLabel({ key: "status", direction: "desc" }, []), "Status · descending");
 });
+
+test("common columns lead each group, with deterministic alphabetical ties and fresh discovery counts", () => {
+  const available = [
+    { kind: "param", key: "/rare", label: "aaa_rare", run_count: 1 },
+    { kind: "param", key: "/common", label: "zzz_common", run_count: 20 },
+    { kind: "param", key: "/batch", label: "batch_size", run_count: 10 },
+    { kind: "param", key: "/same-label-z", label: "batch_size", run_count: 10 },
+    { kind: "metric", key: "rare", label: "aaa_rare", run_count: 2 },
+    { kind: "metric", key: "loss", label: "loss", run_count: 20 },
+  ];
+  const selected = [
+    { ...available[0], run_count: 500 },
+    { kind: "param", key: "/outside", label: "outside", run_count: 500 },
+  ];
+  const choices = runColumnChoices(available, selected);
+  assert.deepEqual(choices.filter(item => item.kind === "param").map(item => item.key), ["/common", "/batch", "/same-label-z", "/rare", "/outside"]);
+  assert.deepEqual(choices.filter(item => item.kind === "metric").map(item => item.key), ["loss", "rare"]);
+  assert.equal(choices.find(item => item.key === "/rare").run_count, 1, "saved selections cannot override current frequency");
+  assert.equal(choices.find(item => item.key === "/outside").run_count, undefined, "retained choices cannot claim prevalence from a different sample");
+  assert.equal(selected[0].run_count, 500, "sorting leaves saved selection metadata untouched");
+});
+
+test("older backends without prevalence retain alphabetical ordering and invalid counts cannot outrank known columns", () => {
+  const legacy = [
+    { kind: "metric", key: "z", label: "z" },
+    { kind: "metric", key: "a", label: "a" },
+  ];
+  assert.deepEqual(runColumnChoices(legacy, []).map(item => item.key), ["a", "z"]);
+  const mixed = [
+    { ...legacy[1], run_count: NaN },
+    { ...legacy[0], run_count: 0 },
+    { kind: "metric", key: "negative", label: "negative", run_count: -1 },
+  ];
+  assert.deepEqual(runColumnChoices(mixed, []).map(item => item.key), ["z", "a", "negative"]);
+});

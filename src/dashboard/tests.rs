@@ -280,6 +280,57 @@ fn configurable_columns_sort_the_filtered_history_before_pagination() {
 }
 
 #[test]
+fn local_and_cached_column_discovery_rank_run_presence_instead_of_metric_samples() {
+  let fixture = Fixture::new();
+  for (id, params, metrics) in [
+    (
+      "run-a",
+      json!({"a_rare":1,"z_common":1}),
+      format!(
+        "{}\n{}\n",
+        json!({"step":0,"metrics":{"a_rare":1,"z_common":2}}),
+        json!({"step":1,"metrics":{"z_common":3}})
+      ),
+    ),
+    (
+      "run-b",
+      json!({"z_common":2}),
+      format!("{}\n", json!({"step":0,"metrics":{"z_common":4}})),
+    ),
+    ("run-c", json!({}), String::new()),
+  ] {
+    let run = fixture.run(id);
+    fs::write(run.join("outputs/params.json"), params.to_string()).unwrap();
+    fs::write(run.join("outputs/metrics.jsonl"), metrics).unwrap();
+  }
+  for source in ["local", "cached:worker"] {
+    if source != "local" {
+      let cached = fixture.root.join("results/worker");
+      fs::create_dir_all(&cached).unwrap();
+      fs::rename(fixture.root.join(".expri/runs"), cached.join("runs")).unwrap();
+    }
+    let response = fixture.dashboard.columns(source).unwrap();
+    let columns = &response["available_columns"];
+    assert_eq!(columns["sampled_run_count"], 3);
+    assert_eq!(
+      columns["params"],
+      json!([
+        {"key":"/z_common","label":"z_common","run_count":2},
+        {"key":"/a_rare","label":"a_rare","run_count":1}
+      ])
+    );
+    assert_eq!(
+      columns["metrics"],
+      json!([
+        {"key":"z_common","label":"z_common","run_count":2},
+        {"key":"a_rare","label":"a_rare","run_count":1}
+      ])
+    );
+    assert_eq!(columns["truncated"], false);
+  }
+}
+
+#[test]
 fn parameter_only_tables_do_not_open_metrics_and_long_values_have_explicit_previews() {
   let fixture = Fixture::new();
   let run = fixture.run("run-a");

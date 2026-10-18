@@ -80,13 +80,14 @@ export type RunArchival = {
   last_error: string | null;
 };
 export type RunTableValue = null | boolean | number | string;
-export type RunColumnChoice = { key: string; label: string };
+export type RunColumnChoice = { key: string; label: string; run_count?: number };
 export type RunColumn = RunColumnChoice & { kind: "param" | "metric" };
 export type RunSort = { key: string; direction: "asc" | "desc" };
 export type AvailableRunColumns = {
   params: RunColumnChoice[];
   metrics: RunColumnChoice[];
   truncated: boolean;
+  sampled_run_count?: number;
 };
 export type RunColumns = {
   available_columns: AvailableRunColumns;
