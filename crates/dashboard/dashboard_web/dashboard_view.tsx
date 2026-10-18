@@ -6,7 +6,7 @@ import { ProjectStorageManagement } from "./storage_management_view";
 import { RunArchivalPanel } from "./run_archival_view";
 import { RunAnnotationsPanel, RunTags } from "./run_annotations_view";
 import { RunAssets } from "./dashboard_assets";
-import { RunDetailDiagnostics, RunRowDiagnostics, runWarnings, warningsOutsideRuns } from "./run_diagnostics";
+import { RunDetailDiagnostics, RunRowDiagnostics, runWarnings, visibleWarnings, warningSeverity, warningsOutsideRuns } from "./run_diagnostics";
 import { Icon } from "./dashboard_icons";
 import { RunControlPopover } from "./run_control_popover";
 import { RunDuration, RunDurationProvider, RunStatusTiming } from "./run_duration";
@@ -659,7 +659,7 @@ function RunBrowser({
       ...warningsOutsideRuns(s.run_columns_warnings, s.runs),
       ...(s.run_columns_error ? [{ message: s.run_columns_error }] : []),
     ] },
-  ].map((group) => ({ ...group, items: group.items.filter((item) => {
+  ].map((group) => ({ ...group, items: visibleWarnings(group.items).filter((item) => {
     const key = JSON.stringify([item.run_id ?? null, item.message]);
     if (seen_issues.has(key)) return false;
     seen_issues.add(key);
@@ -1249,6 +1249,9 @@ function ReviewWorkspace({
     s.detail && runIdentity(s.detail.run) === s.review.run_ids[0] ? s.detail.run :
       s.runs.find((run) => runIdentity(run) === s.review?.run_ids[0])
   ) : null;
+  const review_notes = s.review?.kind === "run"
+    ? s.review_warnings.filter((item) => !item.run_id && warningSeverity(item) === "info")
+    : [];
   const queue_only = review_run != null && queuePlaceholder(review_run);
   const available: ReviewTab[] = queue_only ? ["overview"] : s.review?.kind === "compare"
     ? s.run_system_supported ? ["charts", "system"] : ["charts"]
@@ -1330,10 +1333,14 @@ function ReviewWorkspace({
         </div>
         <ErrorNotice id="review-error" message={s.review_error} />
         {s.review?.kind === "run" && <RunDetailDiagnostics
+          key={s.review.run_ids[0]}
           id="review-run-errors"
-          items={review_run ? runWarnings(review_run, s.review_warnings, s.list_warnings, s.run_columns_warnings) : s.review_warnings.filter((item) => item.run_id === s.review?.run_ids[0])}
+          items={[
+            ...(review_run ? runWarnings(review_run, s.review_warnings, s.list_warnings, s.run_columns_warnings) : s.review_warnings.filter((item) => item.run_id === s.review?.run_ids[0])),
+            ...review_notes,
+          ]}
         />}
-        <Warnings id="review-warnings" items={s.review?.kind === "run" ? s.review_warnings.filter((item) => !item.run_id) : s.review_warnings} />
+        <Warnings id="review-warnings" items={s.review?.kind === "run" ? s.review_warnings.filter((item) => !item.run_id && warningSeverity(item) !== "info") : s.review_warnings} />
         <div
           id="review-panel-charts"
           role="tabpanel"

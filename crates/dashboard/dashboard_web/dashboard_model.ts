@@ -4,7 +4,7 @@ import type { EventSourceFactory } from "./live_updates";
 import type { RunQueue, RunRedirect } from "./run_queue";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
-export type Warning = { run_id?: string; message: string };
+export type Warning = { run_id?: string; message: string; severity?: "info" | "warning" | "error" };
 export const RUN_STATUSES: readonly string[] = [
   "pending", "preparing", "running", "waiting", "completed", "failed", "cancelled", "lost", "unknown",
 ];

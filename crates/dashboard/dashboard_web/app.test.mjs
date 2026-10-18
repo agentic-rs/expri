@@ -2711,10 +2711,10 @@ test("run data errors stay on the exact worker row and deduplicate list and colu
   const [affected, healthy] = nodes.get("run-rows").children;
   const diagnostic = affected.querySelector("details.run-diagnostics");
   assert.ok(diagnostic, "the affected row exposes its data errors");
-  assert.equal(diagnostic.querySelector("summary .run-diagnostics-label").textContent, "Data issues (2)");
-  assert.equal(diagnostic.querySelector("summary .run-diagnostics-message").textContent, message, "the first error is visible without expanding the row");
-  assert.equal(diagnostic.querySelectorAll("li").length, 1, "duplicate messages across the row, list, and columns appear once");
-  assert.equal(diagnostic.querySelector("li").textContent, unsafe_message);
+  assert.equal(diagnostic.querySelector("summary .run-diagnostics-label").textContent, "Errors (2)");
+  assert.doesNotMatch(diagnostic.querySelector("summary").textContent, /started_at|environment\.json/, "the compact badge does not repeat full error messages");
+  assert.equal(diagnostic.open, false);
+  assert.deepEqual([...diagnostic.querySelectorAll("li")].map(item => item.textContent), [message, unsafe_message], "duplicate messages across the row, list, and columns appear once");
   assert.equal(diagnostic.querySelector("img"), null, "diagnostic text never creates HTML elements");
   assert.equal(healthy.querySelector(".run-diagnostics"), null, "a duplicate run ID on a different worker stays healthy");
   assert.doesNotMatch(healthy.textContent, /started_at|environment\.json/);
@@ -2777,7 +2777,7 @@ test("run data errors without a displayable matching worker row remain visible g
   assert.equal(nodes.get("list-warnings").textContent, `${excluded_issue.run_id}: ${excluded_issue.message}`);
   assert.equal(nodes.get("run-columns-warnings").textContent, `${excluded_column_issue.run_id}: ${excluded_column_issue.message}`);
   const diagnostic = nodes.get("run-rows").querySelector(".run-diagnostics");
-  assert.match(diagnostic.textContent, /Data issues \(1\)/);
+  assert.match(diagnostic.textContent, /Errors \(1\)/);
   assert.match(diagnostic.textContent, /invalid or missing started_at/);
   assert.doesNotMatch(diagnostic.textContent, /cannot be read/, "a missing worker row's errors cannot attach to a different worker with the same run ID");
 });
@@ -2787,8 +2787,8 @@ test("run data errors show an explicit omission notice when the row preview reac
   const model = await reviewFixture(t, { project_runs: [run] }), { nodes } = model;
   await settledTable(nodes);
   const diagnostic = nodes.get("run-rows").querySelector(".run-diagnostics");
-  assert.equal(diagnostic.querySelectorAll("li").length, 100, "the first issue stays in the summary, with a bounded remaining list");
-  assert.equal(diagnostic.querySelector("summary .run-diagnostics-message").textContent, "Invalid recorded field 0");
+  assert.equal(diagnostic.querySelectorAll("li").length, 101, "the compact badge expands a bounded issue list with an omission notice");
+  assert.doesNotMatch(diagnostic.querySelector("summary").textContent, /Invalid recorded field/);
   assert.match(diagnostic.textContent, /Additional data issues omitted; inspect records with expri runs show\./);
   assert.equal([...diagnostic.querySelectorAll("li")].some(item => item.textContent === "Invalid recorded field 100"), false);
   await inspect(model);
@@ -2816,6 +2816,86 @@ test("run data errors from column discovery clear after an automatic unchanged-r
   assert.equal(columnCheckbox(nodes, "Parameter learning_rate"), choice);
   assert.equal(choice.checked, true, "column discovery refresh keeps the selected table column");
   assert.equal(nodes.document.querySelector(".runs-table").dataset.columnCount, "1");
+});
+
+test("opening Columns keeps step-order notes out of run rows and Issues while retaining collapsed metric notes", async t => {
+  const message = "metrics.jsonl line 41: steps decreased; last values use recorded order";
+  const model = await reviewFixture(t, {
+    column_warnings: [
+      { run_id: "run-0", message },
+      { run_id: "off-page-run", message },
+      { message, severity: "info" },
+    ],
+    detail_warnings: [{ message }],
+  }), { nodes } = model;
+  await settledTable(nodes);
+  const row = nodes.get("run-rows").children[0], before = row.textContent;
+  assert.equal(requestCounts(model.requests)["/api/run-columns"] ?? 0, 0, "column discovery remains lazy");
+  await openColumns(nodes);
+  assert.ok(requestCounts(model.requests)["/api/run-columns"] > 0);
+  assert.equal(nodes.get("run-rows").children[0], row);
+  assert.equal(row.textContent, before, "discovering a data note does not expand or mark the run row");
+  assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics"), null);
+  assert.equal(nodes.get("run-issues").hidden, true, "off-page and unscoped informational notes do not create an Issues count");
+  await click(columnCheckbox(nodes, "Metric loss")); await settledTable(nodes);
+  assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics"), null, "adding a metric column does not promote notes to errors");
+  await inspect(model);
+  const notes = nodes.get("review-run-errors-notes");
+  assert.equal(notes.hidden, false);
+  assert.equal(notes.open, false, "metric notes start collapsed");
+  assert.match(notes.querySelector("summary").textContent, /Metric notes/);
+  assert.deepEqual([...notes.querySelectorAll("li")].map(item => item.textContent), [message], "column and unscoped detail copies deduplicate");
+  assert.equal(nodes.get("review-run-errors").hidden, true);
+  assert.doesNotMatch(nodes.get("review-warnings").textContent, /steps decreased/);
+  await click(notes.querySelector("summary"));
+  assert.equal(notes.open, true, "the note remains available through a native disclosure");
+});
+
+test("column diagnostics distinguish incomplete metrics from actual errors with compact badges", async t => {
+  const incomplete = "metrics.jsonl line 8: invalid JSON; skipped";
+  const unreadable = "outputs/metrics.jsonl cannot be read";
+  const model = await reviewFixture(t, {
+    column_warnings: [
+      { run_id: "run-0", message: incomplete },
+      { run_id: "run-1", message: unreadable },
+    ],
+  }), { nodes } = model;
+  await openColumns(nodes);
+  const [partial, broken] = nodes.get("run-rows").children;
+  const warning = partial.querySelector("details.run-diagnostics.warning");
+  const error = broken.querySelector("details.run-diagnostics.error");
+  assert.ok(warning, "a skipped metric row gets an amber incomplete-data indicator");
+  assert.ok(error, "an unreadable file keeps a red error indicator");
+  assert.match(warning.querySelector("summary").textContent, /Incomplete metrics \(1\)/);
+  assert.match(error.querySelector("summary").textContent, /Errors \(1\)/);
+  assert.equal(warning.open, false); assert.equal(error.open, false);
+  assert.doesNotMatch(warning.querySelector("summary").textContent, /metrics\.jsonl/);
+  assert.doesNotMatch(error.querySelector("summary").textContent, /cannot be read/);
+  await inspect(model);
+  assert.equal(nodes.get("review-run-errors").hidden, true);
+  assert.equal(nodes.get("review-run-errors-warnings").hidden, false);
+  assert.match(nodes.get("review-run-errors-warnings").textContent, /Incomplete metrics/);
+  assert.match(nodes.get("review-run-errors-warnings").textContent, /invalid JSON; skipped/);
+});
+
+test("explicit diagnostic severity wins and informational notes cannot displace an actual run error", async t => {
+  const message = "metrics.jsonl line 41: steps decreased; last values use recorded order";
+  const metadata_error = { message: "run-state.json has invalid or missing started_at" };
+  const run = { ...publishedRun("run-many-notes"), warnings: [
+    ...Array.from({ length: 105 }, (_, index) => ({ message: `Imported history note ${index}`, severity: "info" })),
+    { message, severity: "error" },
+    metadata_error,
+  ] };
+  const model = await reviewFixture(t, { project_runs: [run] }), { nodes } = model;
+  await settledTable(nodes);
+  const errors = nodes.get("run-rows").querySelector("details.run-diagnostics.error");
+  assert.ok(errors);
+  assert.equal(nodes.get("run-rows").querySelector("details.run-diagnostics.warning"), null);
+  assert.deepEqual([...errors.querySelectorAll("li")].map(item => item.textContent), [message, metadata_error.message]);
+  await inspect(model);
+  assert.match(nodes.get("review-run-errors").textContent, /invalid or missing started_at/);
+  assert.equal(nodes.get("review-run-errors-notes").open, false);
+  assert.match(nodes.get("review-run-errors-notes").textContent, /omitted/);
 });
 
 test("project tables retain separate run and review panes before and after optional columns", async t => {
