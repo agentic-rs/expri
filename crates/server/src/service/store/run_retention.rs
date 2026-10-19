@@ -159,6 +159,7 @@ impl<S: ObjectStorage> Store<S> {
   pub(super) fn ensure_request_runs(&self, request: &Request) -> ApiResult<()> {
     let mut targets = Vec::new();
     let scope = match request {
+      Request::RunControl { request } => Some(request.scope()),
       Request::ArchiveRun { .. }
       | Request::RestoreRun { .. }
       | Request::RunArchival { .. }
@@ -427,6 +428,8 @@ impl<S: ObjectStorage> Store<S> {
       "tracking_attempt_history",
       "tracking_attempt_aborts",
       "result_archives",
+      "run_control_bindings",
+      "run_control_commands",
     ] {
       tx.execute(&format!("DELETE FROM {table} WHERE scope=?1"), [&encoded])
         .map_err(database)?;

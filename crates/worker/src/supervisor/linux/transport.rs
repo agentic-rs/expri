@@ -291,6 +291,10 @@ pub(crate) fn read_json(path: &Path, limit: usize) -> io::Result<Value> {
 }
 
 pub(crate) fn write_json(path: &Path, value: &Value) -> Result<()> {
+  write_json_bounded(path, value, REQUEST_LIMIT)
+}
+
+pub(crate) fn write_json_bounded(path: &Path, value: &Value, limit: usize) -> Result<()> {
   if let Ok(metadata) = fs::symlink_metadata(path)
     && (!metadata.is_file() || metadata.file_type().is_symlink())
   {
@@ -300,7 +304,7 @@ pub(crate) fn write_json(path: &Path, value: &Value) -> Result<()> {
     .parent()
     .ok_or_else(|| message("supervisor request needs a run directory"))?;
   let bytes = serde_json::to_vec(value)?;
-  if bytes.len() > REQUEST_LIMIT {
+  if bytes.len() > limit {
     return Err(message("supervisor request exceeds its size limit"));
   }
   let mut file = tempfile::NamedTempFile::new_in(parent)?;

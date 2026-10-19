@@ -104,7 +104,7 @@ pub(super) fn verify_parent() -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn has_live_members(group_id: u32, leader_id: u32) -> io::Result<bool> {
+pub(crate) fn has_live_members(group_id: u32, leader_id: u32) -> io::Result<bool> {
   for entry in std::fs::read_dir("/proc")? {
     let entry = entry?;
     let Some(pid) = entry

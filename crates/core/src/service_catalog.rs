@@ -461,7 +461,7 @@ mod tests {
   use super::*;
 
   #[test]
-  fn published_run_entries_accept_waiting_and_reject_unknown_phases() {
+  fn published_run_entries_accept_waiting_and_paused_and_reject_unknown_phases() {
     let mut run = RunListEntry {
       scope: RunScope {
         project_id: "project".into(),
@@ -478,6 +478,8 @@ mod tests {
     };
     validate_run_entry(&run).unwrap();
     run.status = "paused".into();
+    validate_run_entry(&run).unwrap();
+    run.status = "unsupported-phase".into();
     assert!(validate_run_entry(&run).is_err());
   }
 

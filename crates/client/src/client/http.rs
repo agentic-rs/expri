@@ -115,6 +115,16 @@ pub(crate) struct Api {
 }
 
 impl Api {
+  pub(crate) fn with_short_control_timeout(mut self) -> Result<Self> {
+    self.control = Client::builder()
+      .redirect(reqwest::redirect::Policy::none())
+      .connect_timeout(Duration::from_secs(2))
+      .timeout(Duration::from_secs(5))
+      .build()
+      .map_err(|_| message("cannot initialize run-control HTTP client"))?;
+    Ok(self)
+  }
+
   /// Only an explicit owner operation captures a fresh epoch. Background
   /// publishers retain the generation that prepared their immutable work.
   pub(super) fn capture_run_epoch(&mut self, scope: &RunScope) -> Result<()> {

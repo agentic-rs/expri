@@ -66,19 +66,21 @@ class JobTests(unittest.TestCase):
     lease.close()
     self.assertEqual(self.request("status")["status"], "lost")
 
-  def test_waiting_is_live_cancellable_and_becomes_lost_after_lease_release(self):
-    self.state["status"] = "waiting"
-    self.save_state()
-    lease = self.hold_lease()
-    before = (self.run / "run-state.json").read_bytes()
-    report = self.request("status")
-    self.assertEqual(report["status"], "waiting")
-    self.assertTrue(report["alive"])
-    self.assertTrue(self.request("cancel")["cancel_requested"])
-    self.assertEqual((self.run / "run-state.json").read_bytes(), before)
-    lease.close()
-    self.assertEqual(self.request("status")["status"], "lost")
-    self.assertEqual(self.request("status")["recorded_status"], "waiting")
+  def test_waiting_and_paused_are_live_cancellable_and_become_lost_after_lease_release(self):
+    for status in ("waiting", "paused"):
+      with self.subTest(status=status):
+        self.state["status"] = status
+        self.save_state()
+        lease = self.hold_lease()
+        before = (self.run / "run-state.json").read_bytes()
+        report = self.request("status")
+        self.assertEqual(report["status"], status)
+        self.assertTrue(report["alive"])
+        self.assertTrue(self.request("cancel")["cancel_requested"])
+        self.assertEqual((self.run / "run-state.json").read_bytes(), before)
+        lease.close()
+        self.assertEqual(self.request("status")["status"], "lost")
+        self.assertEqual(self.request("status")["recorded_status"], status)
 
   def test_cancel_refuses_lost_and_foreground_runs(self):
     with self.assertRaisesRegex(ValueError, "lost"):

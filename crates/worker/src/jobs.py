@@ -10,7 +10,7 @@ import sys as _jobs_sys
 import time as _jobs_time
 
 
-_JOBS_ACTIVE = {"preparing", "running", "waiting"}
+_JOBS_ACTIVE = {"preparing", "running", "waiting", "paused"}
 _JOBS_TERMINAL = {"completed", "failed", "cancelled", "lost"}
 _JOBS_STATE_LIMIT = 256 * 1024
 

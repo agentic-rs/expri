@@ -11,6 +11,7 @@ use crate::service::storage::{CompletedPart, ObjectMetadata};
 use crate::service::types::{Request, Response as ApiResponse};
 
 mod projects;
+mod run_control;
 mod system_profiles;
 
 #[test]

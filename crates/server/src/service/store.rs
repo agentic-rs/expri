@@ -20,6 +20,7 @@ mod projects;
 mod references;
 mod resource_queue;
 mod run_annotations;
+pub(super) mod run_control;
 mod run_retention;
 mod system_profiles;
 mod tracking;
@@ -28,7 +29,7 @@ const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
-pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 10;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 11;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -200,6 +201,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
     projects::initialize(&connection)?;
     run_annotations::initialize(&connection)?;
+    run_control::initialize(&connection)?;
     run_retention::initialize(&connection)?;
     resource_queue::initialize(&connection)?;
     expri_system::store::initialize(&connection)?;
@@ -632,6 +634,7 @@ impl<S: ObjectStorage> Store<S> {
       metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
       metadata_revision.push(run_retention::revision(&db, scope)?);
       metadata_revision.push(run_annotations::revision(&db, scope)?);
+      metadata_revision.push(run_control::revision(&db, scope)?);
       runs.push(RunUpdate {
         run_id: run_id.clone(),
         metadata_revision: Some(updates::metadata_revision(metadata_revision).map_err(bad)?),
@@ -887,6 +890,9 @@ impl<S: ObjectStorage> Store<S> {
       }
       request => (request, 0),
     };
+    if let Request::RunControlBatch { requests } = request {
+      return self.poll_run_control_batch(requests);
+    }
     if let Request::BeginRunAttempt {
       scope,
       request_id,
@@ -933,6 +939,7 @@ impl<S: ObjectStorage> Store<S> {
     self.guard_publication_epoch(&request, epoch)?;
     match request {
       Request::AtRunEpoch { .. }
+      | Request::RunControlBatch { .. }
       | Request::BeginRunAttempt { .. }
       | Request::ReconcileRunAttempt { .. } => {
         unreachable!("unwrapped publication control")
@@ -1003,6 +1010,8 @@ impl<S: ObjectStorage> Store<S> {
         features: vec![
           "tracking-v1".into(),
           "run-task-continuation-v1".into(),
+          "run-control-v1".into(),
+          "run-control-batch-v1".into(),
           "file-references-v1".into(),
           "output-assets-v1".into(),
           "project-storage-management-v1".into(),
@@ -1017,6 +1026,9 @@ impl<S: ObjectStorage> Store<S> {
       }),
       Request::Queue { request } => Ok(Response::Queue {
         response: self.resource_queue(request)?,
+      }),
+      Request::RunControl { request } => Ok(Response::RunControl {
+        response: self.poll_run_control(request)?,
       }),
       Request::PutDocument {
         scope,

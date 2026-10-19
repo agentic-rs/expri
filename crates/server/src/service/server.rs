@@ -347,6 +347,26 @@ fn authorize<S: ObjectStorage>(
   worker: Option<&WorkerAuth>,
   request: &Request,
 ) -> ApiResult<()> {
+  if let Request::RunControlBatch { requests } = request {
+    if requests.is_empty() || requests.len() > expri_core::run_control::MAX_CONTROL_POLLS {
+      return Err(ApiError::new(
+        400,
+        "run control batch must contain 1 to 64 polls",
+      ));
+    }
+    for request in requests {
+      types::validate_scope(request.scope())
+        .map_err(|_| ApiError::new(400, "invalid run control scope"))?;
+      authorize(
+        store,
+        worker,
+        &Request::RunControl {
+          request: request.clone(),
+        },
+      )?;
+    }
+    return Ok(());
+  }
   if let Request::AtRunEpoch { request, .. } = request {
     if !expri_core::service::run_mutation(request) {
       return Err(ApiError::new(
@@ -381,6 +401,10 @@ fn authorize<S: ObjectStorage>(
     return Ok(());
   };
   let allowed = match request {
+    Request::RunControlBatch { .. } => unreachable!("authorized batch children"),
+    Request::RunControl { request } => {
+      worker.project_id == request.scope().project_id && worker.origin == request.scope().origin
+    }
     Request::BrowseRuns { query } => {
       query.project_id.as_deref() == Some(worker.project_id.as_str())
         && query.origin.as_deref() == Some(worker.origin.as_str())
@@ -1909,6 +1933,107 @@ mod tests {
         403
       );
     }
+  }
+
+  #[test]
+  fn lifecycle_worker_polls_are_authorized_for_exact_project_and_origin() {
+    use expri_core::run_control::RunControlRequest;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let worker = Some(&auth.workers[0].1);
+    let operation = |scope| Request::RunControl {
+      request: RunControlRequest::Poll {
+        scope,
+        binding_id: "binding-1".into(),
+        attempt: 1,
+        generation: 1,
+        status: "running".into(),
+        capabilities: vec![],
+        command: vec!["train".into()],
+        checkpoints: vec![],
+        lifecycle: None,
+        result: None,
+      },
+    };
+    assert!(authorize(&store, worker, &operation(scope())).is_ok());
+    assert!(authorize(&store, None, &operation(scope())).is_ok());
+    for foreign in [
+      RunScope {
+        project_id: "other".into(),
+        ..scope()
+      },
+      RunScope {
+        origin: "other".into(),
+        ..scope()
+      },
+    ] {
+      assert_eq!(
+        authorize(&store, worker, &operation(foreign))
+          .unwrap_err()
+          .status,
+        403
+      );
+    }
+  }
+
+  #[test]
+  fn lifecycle_batch_authorizes_every_child_before_publishing_any_facts() {
+    use expri_core::run_control::RunControlRequest;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let auth = auth();
+    let poll = |scope| RunControlRequest::Poll {
+      scope,
+      binding_id: "binding-1".into(),
+      attempt: 1,
+      generation: 1,
+      status: "running".into(),
+      capabilities: vec![],
+      command: vec!["train".into()],
+      checkpoints: vec![],
+      lifecycle: None,
+      result: None,
+    };
+    for foreign in [
+      RunScope {
+        project_id: "other".into(),
+        ..scope()
+      },
+      RunScope {
+        origin: "other".into(),
+        ..scope()
+      },
+    ] {
+      let batch = Request::RunControlBatch {
+        requests: vec![poll(scope()), poll(foreign)],
+      };
+      assert_eq!(
+        route(
+          &store,
+          &auth,
+          request(Some("worker-token-with-at-least-24-characters"), &batch)
+        )
+        .unwrap_err()
+        .status,
+        403
+      );
+      assert_eq!(store.run_control(&scope()).unwrap()["supported"], false);
+    }
+    let batch = Request::RunControlBatch {
+      requests: vec![poll(scope())],
+    };
+    let reply = route(
+      &store,
+      &auth,
+      request(Some("worker-token-with-at-least-24-characters"), &batch),
+    )
+    .unwrap();
+    assert!(matches!(
+      serde_json::from_slice::<Response>(&reply).unwrap(),
+      Response::RunControlBatch { .. }
+    ));
+    assert_eq!(store.run_control(&scope()).unwrap()["supported"], true);
   }
 
   #[test]

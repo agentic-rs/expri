@@ -76,7 +76,7 @@ impl Fixture {
     fs::create_dir_all(repo.join(".expri")).unwrap();
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&bin).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_expri"), bin.join("expri")).unwrap();
+    install_binary(&bin.join("expri"));
     fs::write(bin.join("uv"), UV).unwrap();
     fs::set_permissions(bin.join("uv"), fs::Permissions::from_mode(0o755)).unwrap();
     for (name, text) in [
@@ -189,6 +189,22 @@ fn wait_for(mut condition: impl FnMut() -> bool, label: &str) {
     assert!(Instant::now() < deadline, "timed out awaiting {label}");
     thread::sleep(Duration::from_millis(10));
   }
+}
+
+fn install_binary(destination: &Path) {
+  fs::copy(env!("CARGO_BIN_EXE_expri"), destination).unwrap();
+  // Cargo's debug ELF can exceed the production supervisor image limit.
+  // Remove only fixture debug sections, as deployment strips its binary too.
+  let output = Command::new("strip")
+    .arg("--strip-debug")
+    .arg(destination)
+    .output()
+    .expect("supervisor restart tests require the Linux binutils strip tool");
+  assert!(
+    output.status.success(),
+    "strip test fixture: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
 }
 
 struct LeaseWatch {
@@ -314,7 +330,7 @@ fn running_and_waiting_handoffs_preserve_task_identity_prefixes_and_continuous_o
     assert_eq!(after["supervisor"]["events"].as_array().unwrap().len(), 1);
     // Replace the installed path atomically, then request another default
     // upgrade while the current supervisor is executing its sealed image.
-    fs::copy(env!("CARGO_BIN_EXE_expri"), fixture.bin.join("expri.next")).unwrap();
+    install_binary(&fixture.bin.join("expri.next"));
     fs::rename(fixture.bin.join("expri.next"), fixture.bin.join("expri")).unwrap();
     let second = fixture.run(&[
       "runs",

@@ -91,7 +91,7 @@ New machine configuration and profile history live in `~/.tokn/expri`.
 Native runs start one shared worker service lazily and reuse it across runs.
 It samples every ten seconds and stays running until `expri service stop` or a
 worker restart. Use `expri service start --foreground` to run it in a terminal.
-Collection, publishing, and queue execution have independently supervised threads.
+Collection, publishing, queue execution, and website run control have independently supervised threads.
 Collection includes capture export; publishing handles machine history and run
 uploads. Pause one with `expri service stop --component publishing`, resume it
 with `expri service start --component publishing`, and inspect it with
@@ -506,6 +506,15 @@ for failure handling and history limits.
 
 ### Continue training from a checkpoint
 
+The primary hosted dashboard also offers **Pause**, **Resume**, **Stop**,
+**Continue**, and **Restart** for supported direct runs. Pause retains memory and
+allocated resources; Resume restores the same task. Stop ends the current attempt
+without removing its history. Continue selects a registered checkpoint and adds an
+attempt to the same run. Restart starts a linked run with a new ID and clean metrics.
+Continue and Restart reuse the recorded source and task executable; their argument
+array is editable. See [website task controls](docs/self-hosted-service.md#website-task-controls)
+for worker requirements and acknowledgement behavior.
+
 Continue a direct, detached run on a native Linux worker with updated source or a longer training limit:
 
 ```sh
@@ -557,7 +566,7 @@ expri -T runpod runs show run-abc123 --json
 ```
 
 `list` defaults to the 20 newest records. Its status filters are `pending`, `preparing`,
-`running`, `waiting`, `completed`, `failed`, `cancelled`, `lost`, and `unknown`. `show` includes the run state,
+`running`, `waiting`, `paused`, `completed`, `failed`, `cancelled`, `lost`, and `unknown`. `show` includes the run state,
 source snapshot provenance, and recorded Python environment when available.
 Missing, malformed, or unsupported records produce warnings; incomplete runs
 can still be inspected. These commands read fixed records rather than scanning

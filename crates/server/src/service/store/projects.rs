@@ -307,11 +307,13 @@ impl<S: ObjectStorage> Store<S> {
   pub(super) fn request_project(&self, request: &Request) -> ApiResult<Option<String>> {
     let project = match request {
       Request::AtRunEpoch { request, .. } => return self.request_project(request),
+      Request::RunControl { request } => &request.scope().project_id,
       Request::BeginRunAttempt { scope, .. }
       | Request::CheckRunContinuation { scope }
       | Request::RunPublication { scope }
       | Request::ReconcileRunAttempt { scope, .. } => &scope.project_id,
       Request::Capabilities
+      | Request::RunControlBatch { .. }
       | Request::Queue { .. }
       | Request::BrowseRuns { .. }
       | Request::BrowseRunFiles { .. }
@@ -480,6 +482,14 @@ impl<S: ObjectStorage> Store<S> {
         [project_id],
       )
       .map_err(database)?;
+    for table in ["run_control_bindings", "run_control_commands"] {
+      transaction
+        .execute(
+          &format!("DELETE FROM {table} WHERE json_extract(scope,'$.project_id')=?1"),
+          [project_id],
+        )
+        .map_err(database)?;
+    }
     transaction
       .execute(
         "DELETE FROM smoke_run_archivals WHERE project_id=?1",

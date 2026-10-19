@@ -561,3 +561,40 @@ pub(super) fn saved_run(paths: &StoragePaths, run_dir: &Path) -> Result<Option<P
   }
   Ok(found)
 }
+
+pub(super) fn registered_runs(paths: &StoragePaths) -> Result<Vec<PreparedJob>> {
+  let Some(directory) = files::existing(paths)? else {
+    return Ok(Vec::new());
+  };
+  let jobs = directory.join("jobs");
+  if !jobs.try_exists()? {
+    return Ok(Vec::new());
+  }
+  files::validate(&fs::symlink_metadata(&jobs)?, true)?;
+  let mut registrations = Vec::new();
+  let mut inspected = 0;
+  for entry in fs::read_dir(jobs)? {
+    let path = entry?.path();
+    let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+      continue;
+    };
+    if valid_id(id).is_err() {
+      continue;
+    }
+    inspected += 1;
+    if inspected > 4096 {
+      return Err(error(
+        "worker service run registry exceeds its discovery limit",
+      ));
+    }
+    // Missing/deleted runs and corrupt unrelated entries must not block controls
+    // for healthy registrations. read_job verifies private storage and identity.
+    if let Ok(job) = read_job(&path)
+      && job.source_root().is_some()
+    {
+      registrations.push(job);
+    }
+  }
+  registrations.sort_by(|left, right| left.run_dir().cmp(right.run_dir()));
+  Ok(registrations)
+}

@@ -148,8 +148,10 @@ pub fn request_restart(run_dir: &Path, request: &SupervisorRestartRequest) -> Re
         "supervisor ownership was lost during restart; the worker was not relaunched. Inspect the run before recovery",
       ));
     }
-    if !matches!(state["status"].as_str(), Some("running" | "waiting"))
-      || !state["finished_at"].is_null()
+    if !matches!(
+      state["status"].as_str(),
+      Some("running" | "waiting" | "paused")
+    ) || !state["finished_at"].is_null()
     {
       return Err(message(
         "run finished before supervisor restart completed; it was not restarted",
@@ -410,8 +412,10 @@ fn acknowledge_handoff(payload: &Handoff, lease: &impl AsRawFd) -> Result<bool> 
       "supervisor handoff no longer matches the owned run",
     ));
   }
-  if !matches!(state["status"].as_str(), Some("running" | "waiting"))
-    || !state["finished_at"].is_null()
+  if !matches!(
+    state["status"].as_str(),
+    Some("running" | "waiting" | "paused")
+  ) || !state["finished_at"].is_null()
   {
     return Err(message(
       "terminal or inactive runs cannot resume a supervisor",
@@ -471,11 +475,13 @@ fn validate_restartable(run_dir: &Path, state: &Value) -> Result<()> {
       "live supervisor restart is unsupported for this run; launch it with a supporting native Linux detached worker. Older, Python fallback, and foreground supervisors cannot hand off an existing task",
     ));
   }
-  if !matches!(state["status"].as_str(), Some("running" | "waiting"))
-    || !state["finished_at"].is_null()
+  if !matches!(
+    state["status"].as_str(),
+    Some("running" | "waiting" | "paused")
+  ) || !state["finished_at"].is_null()
   {
     return Err(message(
-      "supervisor restart requires a running or waiting task; preparing and terminal runs cannot restart",
+      "supervisor restart requires a running, waiting, or paused task; preparing and terminal runs cannot restart",
     ));
   }
   if cancel_requested(run_dir)? {

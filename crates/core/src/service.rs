@@ -210,6 +210,12 @@ pub enum Request {
   Queue {
     request: crate::resource_queue::QueueRequest,
   },
+  RunControl {
+    request: crate::run_control::RunControlRequest,
+  },
+  RunControlBatch {
+    requests: Vec<crate::run_control::RunControlRequest>,
+  },
   /// Paginated run discovery across the scopes visible to the authenticated caller.
   BrowseRuns {
     query: RunListQuery,
@@ -365,6 +371,12 @@ pub enum Response {
   },
   Queue {
     response: crate::resource_queue::QueueResponse,
+  },
+  RunControl {
+    response: crate::run_control::RunControlResponse,
+  },
+  RunControlBatch {
+    responses: Vec<crate::run_control::ControlPollResult>,
   },
   RunPage {
     page: RunListPage,

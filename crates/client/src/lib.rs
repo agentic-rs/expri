@@ -12,6 +12,7 @@ pub mod registrations;
 pub mod worker_service;
 
 pub use client::ResourceQueueClient;
+pub use client::RunControlClient;
 pub use client::{ResolvedClient, ServiceCatalogClient, SystemProfileClient};
 pub use client::{
   fetch_files, fetch_files_with_reporter, file_metadata, import_output, input_download_prepared,

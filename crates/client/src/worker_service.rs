@@ -35,16 +35,23 @@ pub enum ServiceComponent {
   Collection,
   Publishing,
   QueueExecution,
+  RunControl,
 }
 
 impl ServiceComponent {
-  pub const ALL: [Self; 3] = [Self::Collection, Self::Publishing, Self::QueueExecution];
+  pub const ALL: [Self; 4] = [
+    Self::Collection,
+    Self::Publishing,
+    Self::QueueExecution,
+    Self::RunControl,
+  ];
 
   pub const fn as_str(self) -> &'static str {
     match self {
       Self::Collection => "collection",
       Self::Publishing => "publishing",
       Self::QueueExecution => "queue_execution",
+      Self::RunControl => "run_control",
     }
   }
 
@@ -53,6 +60,7 @@ impl ServiceComponent {
       Self::Collection => "expri-collection",
       Self::Publishing => "expri-publishing",
       Self::QueueExecution => "expri-queue-execution",
+      Self::RunControl => "expri-run-control",
     }
   }
 }
@@ -71,7 +79,8 @@ impl FromStr for ServiceComponent {
       "collection" => Ok(Self::Collection),
       "publishing" => Ok(Self::Publishing),
       "queue_execution" => Ok(Self::QueueExecution),
-      _ => Err("component must be collection, publishing or queue-execution".into()),
+      "run_control" => Ok(Self::RunControl),
+      _ => Err("component must be collection, publishing, queue-execution or run-control".into()),
     }
   }
 }
@@ -522,6 +531,12 @@ pub(crate) fn saved_publishing_job(
   run_dir: &std::path::Path,
 ) -> Result<Option<PreparedJob>> {
   registry::saved_run(paths, run_dir)
+}
+
+/// Private, validated registrations, including finished runs that can continue.
+/// Credentials remain inside PreparedJob and must never enter status responses.
+pub fn registered_runs(paths: &StoragePaths) -> Result<Vec<PreparedJob>> {
+  registry::registered_runs(paths)
 }
 
 pub(crate) fn rearm_publishing_job(paths: &StoragePaths, job: PreparedJob) -> Result<()> {

@@ -146,6 +146,7 @@ pub(crate) fn task(
         "worker_pid": pid,
       });
       state["task_continuation_protocol_version"] = json!(1);
+      state["run_control_protocol_version"] = json!(1);
       state["task_process_group_clean"] = json!(false);
       expri_core::task_attempts::ensure_initial(state)?;
       Ok(())
@@ -280,18 +281,31 @@ fn pump_inner(
   let mut observed_request = None;
   let mut observed_result = None;
   let mut observed_continuation = None;
+  let mut observed_lifecycle = None;
   let mut continuing: Option<crate::continuation::PreparedContinuation> = None;
+  update_state(&run_dir.join("run-state.json"), |state| {
+    state["run_control_protocol_version"] = json!(1);
+    Ok(())
+  })
+  .map_err(io::Error::other)?;
   loop {
     if !cancelled && cancel_requested(run_dir)? {
       cancelled = true;
+      update_state(&run_dir.join("run-state.json"), |state| {
+        crate::run_control::linux::restore_phase(state);
+        Ok(())
+      })
+      .map_err(io::Error::other)?;
       groups::signal(*pid, libc::SIGTERM)?;
+      groups::signal(*pid, libc::SIGCONT)?;
       cancellation_deadline = Some(Instant::now() + Duration::from_secs(2));
     }
     if cancellation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
       groups::signal(*pid, libc::SIGKILL)?;
       cancellation_deadline = None;
     }
-    let finished = cancellation_deadline.is_none() && groups::exit_pending(*pid)?;
+    let finished = groups::exit_pending(*pid)?
+      && (cancellation_deadline.is_none() || !groups::has_live_members(*pid, *pid)?);
     if finished && !group_cleaned {
       if let Err(error) = groups::stop_pid(*pid) {
         cleanup_uncertain = true;
@@ -329,6 +343,9 @@ fn pump_inner(
         }
       }
       if let Some(mut prepared) = continuing.take() {
+        // This deadline belongs to the reaped predecessor. Replacement setup
+        // can outlast its grace period and must not kill the newly owned child.
+        cancellation_deadline = None;
         let replacement = (|| -> expri_core::error::Result<std::process::Child> {
           if cancelled || cancel_requested(run_dir)? {
             return Err(expri_core::error::ExpriError::Message(
@@ -400,6 +417,21 @@ fn pump_inner(
       });
     }
     if !finished && !cancelled && acknowledgment.is_none() && continuing.is_none() {
+      if let Ok(metadata) = fs::symlink_metadata(run_dir.join(crate::run_control::linux::MAILBOX)) {
+        let identity = (metadata.dev(), metadata.ino());
+        if observed_lifecycle != Some(identity) {
+          observed_lifecycle = Some(identity);
+          if let Some(grace) =
+            crate::run_control::linux::process(run_dir, *pid).map_err(io::Error::other)?
+          {
+            cancelled = true;
+            cancellation_deadline = Some(Instant::now() + Duration::from_secs(u64::from(grace)));
+          }
+        }
+      }
+      if cancelled {
+        continue;
+      }
       if let Ok(metadata) = fs::symlink_metadata(run_dir.join(".task-continuation.json")) {
         let identity = (metadata.dev(), metadata.ino());
         if observed_continuation != Some(identity) {
@@ -413,7 +445,9 @@ fn pump_inner(
               );
             } else if crate::continuation::mark_stopping(run_dir, &mut prepared).is_ok() {
               groups::signal(*pid, libc::SIGTERM)?;
-              cancellation_deadline = Some(Instant::now() + Duration::from_secs(2));
+              groups::signal(*pid, libc::SIGCONT)?;
+              cancellation_deadline =
+                Some(Instant::now() + Duration::from_secs(u64::from(prepared.grace_seconds)));
               continuing = Some(prepared);
             }
           }

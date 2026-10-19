@@ -52,22 +52,24 @@ fn live_status_reports_lost_without_mutating_records_or_creating_leases() {
 }
 
 #[test]
-fn waiting_runs_remain_live_cancellable_and_become_lost_only_after_lease_release() {
-  let (_temporary, root, directory) = fixture("waiting", true);
-  let before = fs::read(directory.join("run-state.json")).unwrap();
-  let lease = lock::run_lock(&directory).unwrap();
-  let live = status_at(&root, "run-test").unwrap();
-  assert_eq!(live["status"], "waiting");
-  assert_eq!(live["alive"], true);
-  assert_eq!(
-    query_at(&cancel(), &root).unwrap()["cancel_requested"],
-    true
-  );
-  assert_eq!(fs::read(directory.join("run-state.json")).unwrap(), before);
-  drop(lease);
-  let lost = status_at(&root, "run-test").unwrap();
-  assert_eq!(lost["status"], "lost");
-  assert_eq!(lost["recorded_status"], "waiting");
+fn waiting_and_paused_runs_remain_live_cancellable_and_become_lost_only_after_lease_release() {
+  for phase in ["waiting", "paused"] {
+    let (_temporary, root, directory) = fixture(phase, true);
+    let before = fs::read(directory.join("run-state.json")).unwrap();
+    let lease = lock::run_lock(&directory).unwrap();
+    let live = status_at(&root, "run-test").unwrap();
+    assert_eq!(live["status"], phase);
+    assert_eq!(live["alive"], true);
+    assert_eq!(
+      query_at(&cancel(), &root).unwrap()["cancel_requested"],
+      true
+    );
+    assert_eq!(fs::read(directory.join("run-state.json")).unwrap(), before);
+    drop(lease);
+    let lost = status_at(&root, "run-test").unwrap();
+    assert_eq!(lost["status"], "lost");
+    assert_eq!(lost["recorded_status"], phase);
+  }
 }
 
 #[test]

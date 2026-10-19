@@ -1,5 +1,6 @@
 mod config;
 mod daemon;
+mod run_control;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -241,9 +242,13 @@ fn components_with_options(
       daemon::run_publishing(writable_paths(&publishing_paths)?, publishing, context)
     }),
   );
+  runners.insert(ServiceComponent::QueueExecution, {
+    let execution_paths = paths.clone();
+    Arc::new(move |context| run_executor(&execution_paths, context))
+  });
   runners.insert(
-    ServiceComponent::QueueExecution,
-    Arc::new(move |context| run_executor(&paths, context)),
+    ServiceComponent::RunControl,
+    Arc::new(move |context| run_control::run(&paths, context)),
   );
   runners
 }

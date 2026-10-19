@@ -86,9 +86,9 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening version 0.1.6 upgrades the SQLite schema to version 10. Older binaries
+Opening this server revision upgrades the SQLite schema to version 11. Older binaries
 refuse that directory because they cannot preserve task-attempt publication
-fences, durable queue allocations, worker fencing, smoke archival, asset
+fences, durable website lifecycle commands, queue allocations, worker fencing, smoke archival, asset
 provenance, and run retention. Back up the entire service directory before
 upgrading; restoring that backup is required for a backend downgrade. Deploy
 the server before upgrading workers so it can accept system captures and the
@@ -356,6 +356,7 @@ started, stopped, restarted, or inspected while the other components continue:
 | `collection` | Sample the machine and export committed readings into run captures | Finish the in-flight observation, release the collector lease, and preserve the capture outbox; terminal supervisors can finalize captures |
 | `publishing` | Upload machine profiles, run metadata, streams, and registered checkpoints | Drain cancelled uploads and preserve pending batches, jobs, and transfer receipts |
 | `queue-execution` | Report execution resources and accept server assignments | Stop polling and heartbeats; keep training, launch journals, and accepted allocations for reconciliation |
+| `run-control` | Receive website commands for registered direct runs and report worker acknowledgements | Stop command polling, drain accepted transitions, and leave running or paused tasks in their current state |
 
 ```sh
 expri service stop --component publishing
@@ -373,7 +374,7 @@ Manual component choices are saved privately in
 ```
 
 Values are `"enable"` or `"disable"`; omitted components are enabled by default.
-JSON component names use snake_case, including `queue_execution`. Saved choices
+JSON component names use snake_case, including `queue_execution` and `run_control`. Saved choices
 survive whole-service restart, and automatic startup from a run or publishing
 request respects paused choices.
 Stopping the whole service does not change those choices. Component start reuses
@@ -590,6 +591,55 @@ native Linux detached supervisor can hand off. Older supervisors, Python
 fallback, foreground runs, preparation, and terminal runs are unsupported. An
 arbitrary supervisor crash or SIGKILL is not recovered and surviving tasks are
 not adopted. This operation does not restart a worker from a checkpoint.
+
+### Website task controls
+
+The primary hosted dashboard controls published direct runs through the shared
+service on their original worker. AB previews and local review remain read-only.
+Queued runs are outside this first implementation; their scheduler allocations
+must not be bypassed by a direct task command.
+
+| Action | Task and history |
+| --- | --- |
+| Pause | Suspend the owned task process group in memory; keep its attempt, RAM, GPU memory, and other allocated resources |
+| Resume | Unfreeze the same process group and restore its previous running or waiting phase |
+| Stop | Request graceful termination, then force termination after the selected grace period; retain metrics, outputs, and checkpoints and record `cancelled` |
+| Continue | Select a registered finalized checkpoint, reuse the recorded source, and start another attempt in the same run, extending its history |
+| Restart | Reuse the recorded source and task in a linked run with a new ID and clean metrics |
+
+`paused` is a supervisor-owned state distinct from the task-reported `waiting`
+phase. The supervisor, machine collection, and publishing remain active while
+training is paused. Worker reboot loses its in-memory task. If its owning
+supervisor is lost, expri cannot resume the surviving process safely; the run is
+reported as lost and surviving paused processes may require operating-system
+cleanup. Stop gives a paused task the opportunity to run its termination
+handler; its grace period defaults to 30 seconds and accepts 1–3,600 seconds.
+Graceful termination cannot create a checkpoint unless the task implements it.
+
+Continue and Restart preserve the recorded executable and allow editing the
+remaining argument array. The website displays a JSON array so argument
+boundaries, whitespace, and literal shell characters remain intact. Preparation
+and source/checkpoint validation happen before an active task is replaced.
+Continued tasks must load `EXPRI_RESUME_CHECKPOINT` themselves and use the usual
+attempt and metric-step fields. No checkpoint measurements are invented.
+
+Only lifecycle-capable native Linux detached runs with an intact recorded
+request and source are supported. Install the new worker binary and restart the
+shared service; existing live runs need a supported supervisor upgrade before
+the website can control them. Python fallback, foreground, imported, and lost
+runs show unavailable controls instead of guessing process ownership. A saved
+automatic publishing registration binds commands to the original worker and
+server destination; `--no-publish` runs are not remotely controllable.
+
+The UI waits for worker acknowledgements and reports requested, delivered,
+executing, applied, or failed operations. Idempotent request IDs and expected
+attempt/generation guards protect retries and stale browser tabs. Offline
+workers cannot accept new requests. Undelivered commands expire after one
+minute; delivered commands retain their durable result for reconciliation.
+Polling batches up to 64 runs under the same saved credential and enforces
+request and reply byte limits. The `run-control` component is independent of
+publishing; stopping it drains accepted transitions and leaves task processes
+in their current state.
 
 ## Local download and dashboard
 

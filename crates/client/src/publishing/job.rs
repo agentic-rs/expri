@@ -341,6 +341,28 @@ impl PreparedJob {
   pub fn source_root(&self) -> Option<&Path> {
     self.repo_root.as_deref()
   }
+  pub fn scope(&self) -> &RunScope {
+    &self.scope
+  }
+
+  /// Private pool key includes credentials, unlike the public run binding.
+  /// Never include this key or its input in public operational summaries.
+  pub fn run_control_destination(&self) -> Result<String> {
+    Ok(
+      Sha256::digest(serde_json::to_vec(&self.client)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect(),
+    )
+  }
+  /// The service can control only a run already bound to this saved destination.
+  pub fn run_control_client(
+    &self,
+    stop: Arc<AtomicBool>,
+  ) -> Result<Option<crate::RunControlClient>> {
+    self.validate()?;
+    crate::RunControlClient::new(&self.client, self.scope.clone(), self.identity()?, stop)
+  }
   pub fn run_dir(&self) -> &Path {
     &self.run_dir
   }

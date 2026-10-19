@@ -34,9 +34,12 @@ from expri_run import set_run_status
 parser = argparse.ArgumentParser()
 parser.add_argument('--mode', default='running')
 parser.add_argument('--limit', type=int, default=100)
+parser.add_argument('--startup-delay', type=float, default=0)
 args = parser.parse_args()
 out = pathlib.Path(os.environ['EXPRI_OUTPUT_DIR'])
 attempt = int(os.environ.get('EXPRI_ATTEMPT', '1'))
+if attempt > 1:
+  time.sleep(args.startup_delay)
 set_run_status('running')
 exclusive = open(out / '.task-exclusive', 'a')
 fcntl.flock(exclusive, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -192,6 +195,26 @@ impl Fixture {
   }
   fn terminal(&self) {
     wait_for(|| self.state()["finished_at"].is_string(), "terminal state");
+  }
+  fn started(&self, attempt: u64, label: &str) {
+    wait_for(
+      || {
+        if self
+          .path(&format!("outputs/started-{attempt}.json"))
+          .exists()
+        {
+          return true;
+        }
+        let state = self.state();
+        assert!(
+          !state["finished_at"].is_string(),
+          "task ended before {label}: {state}\nstderr: {}",
+          fs::read_to_string(self.path("logs/stderr.log")).unwrap_or_default()
+        );
+        false
+      },
+      label,
+    );
   }
   fn continue_run(&self, id: &str, request: &str) -> Value {
     let output = self.continuation_command(id, request).output().unwrap();
@@ -379,10 +402,7 @@ fn active_continuation_preserves_history_and_extends_steps_with_new_source() {
       .collect();
     fs::write(fixture.repo.join("revision.txt"), "updated").unwrap();
     let report = fixture.continue_run(&id, "extend-1");
-    wait_for(
-      || fixture.path("outputs/started-2.json").exists(),
-      "continued task",
-    );
+    fixture.started(2, "continued task");
     assert_eq!(report["run_id"], id);
     assert_eq!(report["state"]["started_at"], before["started_at"]);
     let current = fixture.json("outputs/started-2.json");
@@ -441,6 +461,42 @@ fn active_continuation_preserves_history_and_extends_steps_with_new_source() {
     assert_eq!(after["task_attempts"]["attempts"][0]["status"], "continued");
     assert_eq!(after["task_attempts"]["attempts"][1]["status"], "completed");
   }
+}
+
+#[test]
+fn an_active_successor_survives_startup_beyond_the_previous_task_stop_grace() {
+  let mut fixture = Fixture::new();
+  let id = fixture.start("running");
+  let output = fixture
+    .continuation_command(&id, "delayed-successor")
+    .args(["--startup-delay", "3"])
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "{}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  fixture.started(2, "successor startup beyond the old two-second stop grace");
+  let state = fixture.state();
+  assert_eq!(state["status"], "running");
+  assert_eq!(state["task_attempts"]["current_attempt"], 2);
+  let rows: Vec<Value> = fs::read_to_string(fixture.path("outputs/metrics.jsonl"))
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+  assert_eq!(
+    rows
+      .iter()
+      .map(|row| row["step"].as_u64().unwrap())
+      .collect::<Vec<_>>(),
+    [100, 5, 111, 113]
+  );
+  assert_eq!(rows[3]["attempt"], 2);
+  fs::write(fixture.path("outputs/release-2"), "release").unwrap();
+  fixture.terminal();
+  assert_eq!(fixture.state()["status"], "completed");
 }
 
 #[test]
@@ -513,10 +569,7 @@ fn failed_checkpoint_preparation_leaves_the_current_task_and_history_running() {
     metrics
   );
   fixture.continue_run(&id, "valid-after-failure");
-  wait_for(
-    || fixture.path("outputs/started-3.json").exists(),
-    "continuation after failed preparation",
-  );
+  fixture.started(3, "continuation after failed preparation");
   assert_eq!(fixture.state()["task_attempts"]["current_attempt"], 3);
   assert_eq!(
     fixture.state()["task_attempts"]["attempts"][1]["status"],
