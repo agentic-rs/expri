@@ -1228,7 +1228,7 @@ def workspace(run_id, second_run_id):
     assert_chart_preview_cleaned(browser)
     set_run_control(browser, 'run-filters', True)
     status_choices = evaluate("return Array.from(document.querySelectorAll('#run-filters-panel #status-options input[type=\"radio\"]'), input => input.value);")
-    assert status_choices == ['', 'pending', 'preparing', 'running', 'waiting', 'completed', 'failed', 'cancelled', 'lost', 'unknown'], 'fixed status choices are not native single-click radio tags'
+    assert status_choices == ['', 'pending', 'preparing', 'running', 'waiting', 'paused', 'completed', 'failed', 'cancelled', 'lost', 'unknown'], 'fixed status choices are not native single-click radio tags'
     browser.click('#status-completed + span')
     wait_for(lambda: evaluate("return document.querySelector('#status-completed').checked && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'native Completed status tag did not finish filtering')
     browser.keys('#status-completed', '\ue014')
