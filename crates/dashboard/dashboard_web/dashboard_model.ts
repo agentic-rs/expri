@@ -6,7 +6,7 @@ import type { RunQueue, RunRedirect } from "./run_queue";
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string; severity?: "info" | "warning" | "error" };
 export const RUN_STATUSES: readonly string[] = [
-  "pending", "preparing", "running", "waiting", "completed", "failed", "cancelled", "lost", "unknown",
+  "pending", "preparing", "running", "waiting", "paused", "completed", "failed", "cancelled", "lost", "unknown",
 ];
 
 export function runStatusClass(status: string): string {
@@ -288,7 +288,7 @@ export function formatNumber(value: number): string {
 }
 
 export function runInProgress(run: Pick<Run, "status" | "finished_at" | "queue_only">): boolean {
-  return run.queue_only !== true && ["preparing", "running", "waiting"].includes(run.status) && run.finished_at == null;
+  return run.queue_only !== true && ["preparing", "running", "waiting", "paused"].includes(run.status) && run.finished_at == null;
 }
 
 export function hasRunningDuration(run: Run): boolean {

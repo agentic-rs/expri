@@ -45,7 +45,7 @@ publication, or explicit start recovers saved jobs; expri does not install an OS
 service. Commands execute on the current machine and reject `-T`; invoke them on
 the worker itself. `service status` creates no files and reports collection,
 machine publishing, capture export, run publishing, and queue execution separately.
-The three public components are `collection`, `publishing`, and `queue-execution`.
+The public components are `collection`, `publishing`, `queue-execution`, and `run-control`.
 Collection supervises sampling and capture export; publishing supervises machine
 history and run uploads. Each group supervises its own threads; stopping or
 failing one does not stop the others. Control the relevant component with:

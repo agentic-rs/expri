@@ -85,6 +85,8 @@ export * from "./run_supervisor";
 export * from "./run_supervisor_view";
 export * from "./run_attempts";
 export * from "./run_attempts_view";
+export * from "./run_lifecycle";
+export * from "./run_lifecycle_view";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);

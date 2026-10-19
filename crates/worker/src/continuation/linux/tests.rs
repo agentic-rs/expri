@@ -50,6 +50,7 @@ fn interrupted(stage: &str) -> (tempfile::TempDir, PathBuf, ContinueRunRequest, 
     stage: stage.into(),
     capture_id: None,
     capture_started_at: None,
+    grace_seconds: 2,
   };
   write_prepared(&run, &prepared).unwrap();
   (root, run, request, fingerprint)

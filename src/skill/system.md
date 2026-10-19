@@ -33,7 +33,7 @@ a foreground service. Commands run on the current machine and reject `-T`.
 is a deprecated foreground alias; its `--no-publish` disables machine publishing
 only. `run --no-publish` disables only that run's publication.
 
-The three public components are `collection`, `publishing`, and `queue-execution`.
+The public components are `collection`, `publishing`, `queue-execution`, and `run-control`.
 Collection supervises sampling and capture export; publishing supervises machine
 history and run uploads. Use:
 

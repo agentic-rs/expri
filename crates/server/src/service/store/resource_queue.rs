@@ -113,6 +113,26 @@ fn decode<T: serde::de::DeserializeOwned>(value: &str) -> ApiResult<T> {
     .map_err(|_| ApiError::new(500, "stored execution queue metadata is invalid"))
 }
 
+/// The reservation ledger owns queued-run identity even after an allocation is
+/// released. Worker-reported capabilities cannot opt that run into direct controls.
+pub(super) fn is_queued_run(db: &Connection, scope: &RunScope) -> ApiResult<bool> {
+  db.query_row(
+    "SELECT EXISTS(SELECT 1 FROM queue_jobs j JOIN queue_attempts a ON a.job_id=j.job_id WHERE j.project_id=?1 AND a.worker_id=?2 AND json_extract(a.record,'$.run_id')=?3)",
+    params![scope.project_id,scope.origin,scope.run_id],
+    |row| row.get(0),
+  ).map_err(database)
+}
+
+pub(super) fn ensure_direct_run(db: &Connection, scope: &RunScope) -> ApiResult<()> {
+  if is_queued_run(db, scope)? {
+    return Err(ApiError::new(
+      409,
+      "server-queued runs require scheduler-managed lifecycle controls",
+    ));
+  }
+  Ok(())
+}
+
 fn page<T: serde::Serialize>(
   ids: Vec<String>,
   limit: usize,

@@ -19,7 +19,10 @@ fn message(detail: &str) -> ExpriError {
 }
 
 pub fn is_attempt_status(status: &str) -> bool {
-  matches!(status, "preparing" | "running" | "waiting" | "continued") || is_terminal_status(status)
+  matches!(
+    status,
+    "preparing" | "running" | "waiting" | "paused" | "continued"
+  ) || is_terminal_status(status)
 }
 
 fn timestamp(value: &str) -> Result<()> {

@@ -31,6 +31,21 @@ fn forget_attempt(root: &Path, path: &str) {
 }
 
 #[test]
+fn finalized_checkpoint_verification_refuses_unregistered_or_replaced_files() {
+  let (_temporary, root) = fixture();
+  let path = root.join("outputs/state.bin");
+  std::fs::write(&path, "checkpoint").unwrap();
+  assert!(verify_registered(&root, "outputs/state.bin").is_err());
+  register(&root, "outputs/state.bin").unwrap();
+  verify_registered(&root, "outputs/state.bin").unwrap();
+  let replacement = root.join("outputs/replacement.bin");
+  std::fs::write(&replacement, "checkpoint").unwrap();
+  std::fs::rename(replacement, &path).unwrap();
+  assert!(verify_registered(&root, "outputs/state.bin").is_err());
+  assert!(verify_registered(&root, "../state.bin").is_err());
+}
+
+#[test]
 fn checkpoint_attempt_is_captured_once_and_survives_later_registrations() {
   let (_temporary, root) = fixture();
   std::fs::write(root.join("outputs/old.pt"), "old").unwrap();

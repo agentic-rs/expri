@@ -35,8 +35,8 @@ const METRICS_LIMIT: u64 = 16 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Version normalized run metadata independently of the unchanged artifact digest.
-// Schema 6 adds independently bounded task-attempt provenance.
-const OVERVIEW_SCHEMA_VERSION: u64 = 6;
+// Schema 7 retains the published supervisor generation for lifecycle fencing.
+const OVERVIEW_SCHEMA_VERSION: u64 = 7;
 
 struct MetricReadMode {
   minimum: usize,
@@ -49,6 +49,19 @@ struct MetricReadMode {
 pub(super) struct HostedDashboard<'a, S> {
   store: &'a Store<S>,
   client: Client,
+}
+
+impl<S: ObjectStorage> HostedDashboard<'_, S> {
+  pub(super) fn run_control(&self, scope: &RunScope) -> ApiResult<Value> {
+    self.store.run_control(scope)
+  }
+
+  pub(super) fn submit_run_control(
+    &self,
+    selection: super::store::run_control::ControlSubmission,
+  ) -> ApiResult<Value> {
+    self.store.submit_run_control(selection)
+  }
 }
 
 impl<S: ObjectStorage> crate::dashboard::DashboardView for HostedDashboard<'_, S> {
@@ -559,7 +572,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         // Payload reads may be fenced while an expired run finishes cleanup.
         // Its retained dashboard metadata still describes that cleanup row.
         if report["run"]["archival"].is_null()
-          && let Err(error) = self.decorate_run_metadata(&mut report["run"], scope)
+          && let Err(error) = self.decorate_run_metadata(&mut report["run"], scope, 0)
           && let Some(warnings) = report["warnings"].as_array_mut()
         {
           warnings.push(json!({"run_id": scope.run_id, "message": error.message}));
@@ -858,7 +871,13 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut run = preview(&record["run"], &mut metadata_truncated);
     self
-      .decorate_run_metadata(&mut run, &scope)
+      .decorate_run_metadata(
+        &mut run,
+        &scope,
+        record["state"]["supervisor"]["generation"]
+          .as_u64()
+          .unwrap_or(0),
+      )
       .map_err(api_error)?;
     source.decorate_run(&mut run, &scope);
     source.decorate_warnings(&mut warnings, &scope);
@@ -1219,7 +1238,8 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     if let Some(mut value) = self.store.dashboard_cached_overview(scope, &version)?
       && value["overview_schema"] == OVERVIEW_SCHEMA_VERSION
     {
-      self.decorate_run_metadata(&mut value["run"], scope)?;
+      let generation = value["published_generation"].as_u64().unwrap_or(0);
+      self.decorate_run_metadata(&mut value["run"], scope, generation)?;
       return Ok(value);
     }
     let mut warnings = Vec::new();
@@ -1251,7 +1271,10 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     }
     let mut metadata_truncated = false;
     let run = preview(&normalized["run"], &mut metadata_truncated);
-    let mut result = json!({"overview_schema": OVERVIEW_SCHEMA_VERSION, "run": run, "task_filter": task_filter, "metadata_truncated": metadata_truncated, "warnings": bounded_warnings(&warnings)});
+    let generation = normalized["state"]["supervisor"]["generation"]
+      .as_u64()
+      .unwrap_or(0);
+    let mut result = json!({"overview_schema": OVERVIEW_SCHEMA_VERSION, "published_generation":generation, "run": run, "task_filter": task_filter, "metadata_truncated": metadata_truncated, "warnings": bounded_warnings(&warnings)});
     // A failed network read must remain retryable; a missing or malformed
     // immutable state can safely share its versioned normalized preview.
     if record.is_none() || normalized["state"].is_object() {
@@ -1259,11 +1282,16 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         .store
         .dashboard_cache_overview(scope, &version, &result)?;
     }
-    self.decorate_run_metadata(&mut result["run"], scope)?;
+    self.decorate_run_metadata(&mut result["run"], scope, generation)?;
     Ok(result)
   }
 
-  fn decorate_run_metadata(&self, run: &mut Value, scope: &RunScope) -> ApiResult<()> {
+  fn decorate_run_metadata(
+    &self,
+    run: &mut Value,
+    scope: &RunScope,
+    published_generation: u64,
+  ) -> ApiResult<()> {
     if let Some(context) = self.store.dashboard_run_queue_context(scope)? {
       run["queue"] = serde_json::to_value(context)
         .map_err(|_| ApiError::new(500, "cannot encode scheduling context"))?;
@@ -1284,6 +1312,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     } else {
       Value::Null
     };
+    if matches!(
+      run["archival"]["status"].as_str(),
+      Some("active" | "archived")
+    ) {
+      self
+        .store
+        .decorate_run_control(run, scope, published_generation)?;
+    }
     Ok(())
   }
 
@@ -1456,6 +1492,8 @@ fn run_preview(run: &Value, truncated: &mut bool) -> Value {
     "run_key",
     "queue_message",
     "queue_only",
+    "control",
+    "recorded_status",
   ] {
     if let Some(value) = run.get(field) {
       result[field] = value.clone();

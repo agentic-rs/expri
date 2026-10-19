@@ -524,7 +524,7 @@ fn parse_component(
 ) -> std::result::Result<expri_client::worker_service::ServiceComponent, String> {
   value
     .parse()
-    .map_err(|_| "expected collection, publishing, or queue-execution".into())
+    .map_err(|_| "expected collection, publishing, queue-execution, or run-control".into())
 }
 
 impl TryFrom<PublishOptions> for expri_client::PublishOptions {
@@ -909,7 +909,7 @@ mod tests {
 
   #[test]
   fn component_controls_accept_named_parts_and_keep_foreground_process_control_separate() {
-    for component in ["collection", "publishing", "queue-execution"] {
+    for component in ["collection", "publishing", "queue-execution", "run-control"] {
       for action in ["start", "stop", "restart", "status"] {
         assert!(Cli::try_parse_from(["expri", action, "--component", component, "--json"]).is_ok());
       }

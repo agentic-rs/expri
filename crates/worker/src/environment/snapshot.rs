@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::archive::sha256_file;
@@ -37,7 +37,7 @@ struct SourceSelection {
   paths: BTreeSet<PathBuf>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct SourceFile {
   path: PathBuf,
   sha256: Option<String>,
@@ -72,6 +72,65 @@ pub fn create_expected(
   expected_sync: Option<&SyncIdentity>,
 ) -> Result<RunSnapshot> {
   create_expected_with_smoke(repo_root, remote_managed, expected_sync, false)
+}
+
+/// Copy the last attempt's recorded source, checking every manifest entry.
+/// Never consult the worker checkout, which may already contain newer code.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn copy_recorded(
+  source_code: &Path,
+  manifest_path: &Path,
+  destination: &Path,
+  run_id: &str,
+) -> Result<RunSnapshot> {
+  let metadata = fs::symlink_metadata(source_code)?;
+  if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    return Err(ExpriError::Message(
+      "recorded source must be a real directory".into(),
+    ));
+  }
+  let raw = read_optional_regular_file(manifest_path)?
+    .filter(|raw| raw.len() <= 2 * 1024 * 1024)
+    .ok_or_else(|| {
+      ExpriError::Message("recorded source manifest is unavailable or too large".into())
+    })?;
+  let mut manifest: serde_json::Value = serde_json::from_slice(&raw)?;
+  let files: Vec<SourceFile> = serde_json::from_value(manifest["files"].clone())?;
+  create_private_directory(destination)?;
+  let code_dir = destination.join("code");
+  fs::create_dir(&code_dir)?;
+  let copied = (|| {
+    for expected in &files {
+      validate_source_path(&expected.path)?;
+      ensure_safe_parents(source_code, &expected.path)?;
+      if inspect_source_file(source_code, &expected.path)?.as_ref() != Some(expected) {
+        return Err(source_changed(&expected.path));
+      }
+      let actual = copy_source_file(source_code, &code_dir, &expected.path, None)?;
+      if actual.as_ref() != Some(expected)
+        || inspect_source_file(source_code, &expected.path)?.as_ref() != Some(expected)
+      {
+        return Err(source_changed(&expected.path));
+      }
+    }
+    manifest["run_id"] = serde_json::json!(run_id);
+    manifest["created_at"] = serde_json::json!(Utc::now().to_rfc3339());
+    fs::write(
+      destination.join("snapshot.json"),
+      serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    let assets = crate::assets::discover(&code_dir)?;
+    Ok(RunSnapshot {
+      run_id: run_id.into(),
+      run_dir: destination.into(),
+      code_dir: code_dir.clone(),
+      assets,
+    })
+  })();
+  if copied.is_err() {
+    let _ = fs::remove_dir_all(&code_dir);
+  }
+  copied
 }
 
 pub fn create_expected_with_smoke(
@@ -1065,6 +1124,57 @@ mod tests {
       error
         .to_string()
         .contains("Git checkout or push source to the target")
+    );
+  }
+
+  #[test]
+  fn recorded_copy_ignores_checkout_edits_and_refuses_modified_snapshot() {
+    let root = synced_repository("train.py\n");
+    fs::write(root.path().join("train.py"), "recorded source").unwrap();
+    let original = create(root.path(), &[]).unwrap();
+    fs::write(root.path().join("train.py"), "new checkout source").unwrap();
+    fs::write(
+      original.run_dir.join("outputs/private.env"),
+      "private output",
+    )
+    .unwrap();
+    fs::write(
+      original.code_dir.join("local.env"),
+      "unrecorded local credentials",
+    )
+    .unwrap();
+    let target = original.run_dir.join("recorded-copy");
+    let copied = copy_recorded(
+      &original.code_dir,
+      &original.run_dir.join("snapshot.json"),
+      &target,
+      "copy-run",
+    )
+    .unwrap();
+    assert_eq!(
+      fs::read_to_string(copied.code_dir.join("train.py")).unwrap(),
+      "recorded source"
+    );
+    assert!(!copied.code_dir.join("outputs/private.env").exists());
+    assert!(!copied.code_dir.join("local.env").exists());
+    fs::write(copied.code_dir.join("train.py"), "changed copy").unwrap();
+    assert_eq!(
+      fs::read_to_string(original.code_dir.join("train.py")).unwrap(),
+      "recorded source"
+    );
+    fs::write(
+      original.code_dir.join("train.py"),
+      "changed recorded source",
+    )
+    .unwrap();
+    assert!(
+      copy_recorded(
+        &original.code_dir,
+        &original.run_dir.join("snapshot.json"),
+        &original.run_dir.join("rejected-copy"),
+        "copy-run"
+      )
+      .is_err()
     );
   }
 

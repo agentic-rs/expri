@@ -93,6 +93,60 @@ pub fn prepare_request_at_with_initializer(
     request.expected_sync.as_ref(),
     request.smoke,
   )?;
+  prepare_snapshot(request, repo_root, snapshot, initialize)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_recorded(
+  request: &RunRequest,
+  repo_root: &Path,
+  snapshot: RunSnapshot,
+  parent_run_id: &str,
+) -> Result<PreparedRun> {
+  let mut prepared = prepare_snapshot(request, repo_root.to_owned(), snapshot, || Ok(()))?;
+  prepared.state["restarted_from"] = json!(parent_run_id);
+  write_state(
+    &prepared.snapshot.run_dir.join("run-state.json"),
+    &prepared.state,
+  )?;
+  Ok(prepared)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn load_prepared(run_dir: &Path) -> Result<PreparedRun> {
+  let state = read_record(&run_dir.join("run-state.json"), 256 * 1024)?;
+  if state["status"] != "preparing" || state["detached"] != true {
+    return Err(ExpriError::Message(
+      "restart successor is no longer awaiting launch".into(),
+    ));
+  }
+  let repo_root = run_dir
+    .parent()
+    .and_then(Path::parent)
+    .and_then(Path::parent)
+    .ok_or_else(|| ExpriError::Message("invalid restart run directory".into()))?
+    .to_owned();
+  Ok(PreparedRun {
+    snapshot: RunSnapshot {
+      run_id: state["run_id"]
+        .as_str()
+        .ok_or_else(|| ExpriError::Message("missing restart run identity".into()))?
+        .into(),
+      code_dir: run_dir.join("code"),
+      run_dir: run_dir.into(),
+      assets: crate::assets::discover(&run_dir.join("code"))?,
+    },
+    repo_root,
+    state,
+  })
+}
+
+fn prepare_snapshot(
+  request: &RunRequest,
+  repo_root: std::path::PathBuf,
+  snapshot: RunSnapshot,
+  initialize: impl FnOnce() -> Result<()>,
+) -> Result<PreparedRun> {
   let service_unavailable = initialize().is_err();
   if service_unavailable {
     let _ = writeln!(
@@ -496,7 +550,7 @@ fn finalize_snapshot(
         .is_some_and(|entry| {
           matches!(
             entry["status"].as_str(),
-            Some("preparing" | "running" | "waiting")
+            Some("preparing" | "running" | "waiting" | "paused")
           )
         });
       if active {

@@ -2,6 +2,7 @@ use http::{Request as HttpRequest, Response as HttpResponse};
 use serde_json::json;
 
 mod project_management;
+mod run_control;
 mod run_management;
 
 use super::browser_assets::{Asset, DashboardAssets};
@@ -208,6 +209,9 @@ fn route<S: ObjectStorage>(
     ("POST", "/api/runs/archive" | "/api/runs/restore" | "/api/runs/annotations") => {
       return run_management::mutate(dashboard, auth, allow_run_management, request);
     }
+    ("POST", "/api/runs/control") => {
+      return run_control::mutate(dashboard, auth, allow_run_management, request);
+    }
     _ if !matches!(method, "GET" | "HEAD") => {
       return Err(ApiError::new(405, "dashboard routes require GET or HEAD"));
     }
@@ -244,6 +248,9 @@ fn route<S: ObjectStorage>(
     .uri()
     .path_and_query()
     .map_or("/", |uri| uri.as_str());
+  if path == "/api/runs/control" {
+    return run_control::read(dashboard, request);
+  }
   if let Some(reply) = project_management::read(dashboard, allow_project_deletion, request)? {
     return Ok(reply);
   }

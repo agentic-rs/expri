@@ -41,9 +41,37 @@ pub(crate) struct PreparedContinuation {
   capture_id: Option<String>,
   #[serde(default)]
   capture_started_at: Option<String>,
+  #[serde(default = "legacy_grace")]
+  pub(crate) grace_seconds: u32,
+}
+
+fn legacy_grace() -> u32 {
+  2
+}
+
+struct PreparationMode {
+  recorded_source: bool,
+  grace_seconds: u32,
 }
 
 pub fn request_continue(run_dir: &Path, request: &ContinueRunRequest) -> Result<Value> {
+  request_continue_inner(run_dir, request, false, 2)
+}
+
+pub(crate) fn request_recorded(
+  run_dir: &Path,
+  request: &ContinueRunRequest,
+  grace_seconds: u32,
+) -> Result<Value> {
+  request_continue_inner(run_dir, request, true, grace_seconds)
+}
+
+fn request_continue_inner(
+  run_dir: &Path,
+  request: &ContinueRunRequest,
+  recorded: bool,
+  grace_seconds: u32,
+) -> Result<Value> {
   validate_request(request)?;
   let run_dir = crate::supervisor::linux::validate_run_directory(run_dir)?;
   let path = run_dir.join("run-state.json");
@@ -137,6 +165,10 @@ pub fn request_continue(run_dir: &Path, request: &ContinueRunRequest) -> Result<
     current,
     &fingerprint,
     terminal_before_preparation,
+    PreparationMode {
+      recorded_source: recorded,
+      grace_seconds,
+    },
   ) {
     Ok(prepared) => prepared,
     Err(error) => {
@@ -156,6 +188,7 @@ fn prepare(
   previous_attempt: u64,
   fingerprint: &str,
   terminal_before_preparation: bool,
+  mode: PreparationMode,
 ) -> Result<PreparedContinuation> {
   let root = repo_root(run_dir)?;
   let directory = run_dir.join("attempts").join(attempt.to_string());
@@ -177,6 +210,16 @@ fn prepare(
       code_dir: directory.join("code"),
       assets: crate::assets::discover(&directory.join("code"))?,
     }
+  } else if mode.recorded_source {
+    create_directory(&run_dir.join("attempts"))?;
+    let state = read_json(&run_dir.join("run-state.json"), MAX_STATE_BYTES)?;
+    let (code, manifest) = crate::run_control::recorded_source(run_dir, &state)?;
+    environment::snapshot::copy_recorded(
+      &code,
+      &manifest,
+      &directory,
+      run_dir.file_name().unwrap().to_str().unwrap(),
+    )?
   } else {
     environment::snapshot::create_attempt(
       root,
@@ -194,6 +237,11 @@ fn prepare(
   } else {
     pin_checkpoint(run_dir, &request.checkpoint, &checkpoint)?
   };
+  if mode.recorded_source {
+    // A writer cannot replace the finalized file between the initial readiness
+    // check and pinning and silently supply a different checkpoint.
+    expri_client::registrations::verify_registered(run_dir, &request.checkpoint)?;
+  }
   crate::node::run::prepare_assets(
     root,
     &snapshot,
@@ -261,6 +309,7 @@ fn prepare(
     stage: "preparing".into(),
     capture_id: None,
     capture_started_at: None,
+    grace_seconds: mode.grace_seconds,
   })
 }
 
@@ -391,7 +440,11 @@ pub(crate) fn complete_old_attempt(
 
 pub(crate) fn mark_stopping(run_dir: &Path, prepared: &mut PreparedContinuation) -> Result<()> {
   prepared.stage = "stopping".into();
-  write_prepared(run_dir, prepared)
+  write_prepared(run_dir, prepared)?;
+  update_state(&run_dir.join("run-state.json"), |state| {
+    crate::run_control::linux::restore_phase(state);
+    Ok(())
+  })
 }
 
 pub(crate) fn reject_prepared(
@@ -730,7 +783,8 @@ fn wait_for_result(
   request: &ContinueRunRequest,
   fingerprint: &str,
 ) -> Result<Value> {
-  let deadline = Instant::now() + Duration::from_secs(180);
+  let grace = read_prepared(run_dir)?.map_or(2, |prepared| prepared.grace_seconds);
+  let deadline = Instant::now() + Duration::from_secs(u64::from(grace) + 180);
   let mut launched = false;
   loop {
     let state = read_json(&run_dir.join("run-state.json"), MAX_STATE_BYTES)?;
@@ -846,7 +900,7 @@ fn validate_run(run_dir: &Path, state: &Value) -> Result<()> {
     return Err(message("task continuation requires a detached run"));
   }
   let status = state["status"].as_str().unwrap_or_default();
-  if matches!(status, "running" | "waiting") {
+  if matches!(status, "running" | "waiting" | "paused") {
     if state["task_continuation_protocol_version"] != 1 {
       return Err(message(
         "this active supervisor does not support checkpoint continuation; upgrade its supervisor first",
@@ -876,7 +930,7 @@ fn validate_run(run_dir: &Path, state: &Value) -> Result<()> {
     }
   } else if !matches!(status, "completed" | "failed" | "cancelled") {
     return Err(message(
-      "task continuation requires running, waiting, completed, failed, or cancelled state",
+      "task continuation requires running, waiting, paused, completed, failed, or cancelled state",
     ));
   } else if state["task_process_group_clean"] != true {
     // Historical supervisors did not necessarily clean descendants after their
@@ -1093,7 +1147,10 @@ fn find_request<'a>(state: &'a Value, id: &str) -> Option<&'a Value> {
 fn attempt_result_ready(state: &Value, attempt: &Value) -> bool {
   attempt["status"] != "preparing"
     && !(state["task_launch_uncertain"] == true
-      && matches!(attempt["status"].as_str(), Some("running" | "waiting")))
+      && matches!(
+        attempt["status"].as_str(),
+        Some("running" | "waiting" | "paused")
+      ))
 }
 fn verify_fingerprint(entry: &Value, fingerprint: &str) -> Result<()> {
   if entry["request_fingerprint"] != fingerprint {

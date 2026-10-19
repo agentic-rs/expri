@@ -8,6 +8,7 @@ mod inventory;
 mod login;
 mod queue;
 mod resource_queue;
+mod run_control;
 mod system_profile;
 #[cfg(test)]
 pub(super) mod tests;
@@ -42,6 +43,7 @@ pub use download::{fetch, input_download, input_download_prepared};
 pub use http::ResolvedClient;
 pub use login::{login, logout, revoke_login, validate_login_url};
 pub use resource_queue::ResourceQueueClient;
+pub use run_control::RunControlClient;
 pub use system_profile::SystemProfileClient;
 pub use watch::{fetch as fetch_files, fetch_with_reporter as fetch_files_with_reporter};
 

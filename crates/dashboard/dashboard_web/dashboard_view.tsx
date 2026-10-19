@@ -15,6 +15,7 @@ import { QueueOverview } from "./run_queue_view";
 import { RunSupervisorHistory } from "./run_supervisor_view";
 import { RunAttemptHistory } from "./run_attempts_view";
 import { parseTaskAttempts } from "./run_attempts";
+import { lifecyclePanelKey, RunLifecyclePanel } from "./run_lifecycle_view";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -1307,6 +1308,10 @@ function ReviewWorkspace({
             <Icon name="close" />{s.selected.length ? "Back to selection" : "Close"}
           </button>
         </header>
+        {s.review?.kind === "run" && review_run && <RunLifecyclePanel key={lifecyclePanelKey(s.source_id, review_run)}
+          run={review_run} source={s.sources.find(source => source.source_id === s.source_id)} detail={s.detail}
+          enabled={s.run_management_enabled} visible={s.workspace_view === "workspace"}
+          on_applied={a.refresh} on_open_run={a.inspect_run} />}
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {(queue_only ? available : tabs).map((tab) => (
             <button

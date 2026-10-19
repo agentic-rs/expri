@@ -104,6 +104,8 @@ fn validate_metadata_directory(path: &Path) -> Result<()> {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+pub(crate) use linux::request_recorded;
+#[cfg(target_os = "linux")]
 pub(crate) use linux::{
   PreparedContinuation, complete_old_attempt, fail_after_stop, launch_replacement, mark_stopping,
   pending, reject_prepared,

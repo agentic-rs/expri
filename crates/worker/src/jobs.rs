@@ -270,7 +270,7 @@ fn read_state(run_dir: &Path, run_id: &str) -> Result<Value> {
   }
   if state
     .get("schema_version")
-    .is_some_and(|value| !value.as_u64().is_some_and(|schema| schema <= 1))
+    .is_some_and(|value| value.as_u64().is_none_or(|schema| schema > 1))
   {
     return Err(message("run state uses an unsupported schema_version"));
   }

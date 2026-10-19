@@ -210,8 +210,9 @@ fn restarting_component_waits_for_old_generation_while_control_stays_responsive(
   let first = started.recv_timeout(Duration::from_secs(2)).unwrap();
   stop_component(&paths, ServiceComponent::QueueExecution).unwrap();
   wait_component(&paths, ServiceComponent::QueueExecution, "stopping");
-  start_component(&paths, ServiceComponent::QueueExecution).unwrap();
-  let current = status(&paths).unwrap();
+  // The acknowledged mutation is authoritative. Passive status intentionally
+  // falls back to an older durable snapshot if its best-effort RPC times out.
+  let current = start_component(&paths, ServiceComponent::QueueExecution).unwrap();
   assert_eq!(current["components"]["queue_execution"]["generation"], 1);
   assert_eq!(
     current["components"]["queue_execution"]["desired_running"],

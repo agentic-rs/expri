@@ -63,8 +63,8 @@ fn stream_batch(api: &Api, record: &FileRecord, offset: u64) -> Result<Vec<u8>> 
   let FileTarget::Run { scope, path } = &record.target else {
     return Err(message("private inputs cannot use stream storage"));
   };
-  if !stream_path(path)
-    && !(matches!(record.storage, FileStorage::Tracking { .. }) && document_path(path))
+  if !(stream_path(path)
+    || matches!(record.storage, FileStorage::Tracking { .. }) && document_path(path))
   {
     return Err(message("service returned an invalid stream path"));
   }

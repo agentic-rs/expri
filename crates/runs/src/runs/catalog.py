@@ -11,7 +11,7 @@ import stat as _catalog_stat
 _CATALOG_METADATA_LIMIT = 256 * 1024
 _CATALOG_DETAIL_LIMIT = 16 * 1024 * 1024
 _CATALOG_EXCLUDED_COMPONENTS = {".venv", ".expri", ".git", ".cache", "cache", "__pycache__"}
-_CATALOG_STATUSES = {"preparing", "running", "waiting", "pending", "completed", "failed", "cancelled", "lost", "unknown"}
+_CATALOG_STATUSES = {"preparing", "running", "waiting", "paused", "pending", "completed", "failed", "cancelled", "lost", "unknown"}
 _CATALOG_METADATA_FILES = (
   "outputs/.expri-artifacts.json",
   "run-state.json", "snapshot.json", "environment/environment-state.json",

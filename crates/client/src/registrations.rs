@@ -334,6 +334,19 @@ pub fn list(run_dir: &Path) -> Result<Value> {
   )
 }
 
+/// Check a finalized local readiness record without hashing or uploading data.
+/// Lifecycle callers pin its bytes separately after this identity check.
+pub fn verify_registered(run_dir: &Path, path: &str) -> Result<()> {
+  validate_path(path)?;
+  let _lease = lock(run_dir)?;
+  let registry = load(run_dir)?;
+  let registration = registry
+    .files
+    .get(path)
+    .ok_or_else(|| message("checkpoint has no finalized readiness record"))?;
+  verify(run_dir, registration)
+}
+
 pub(super) fn records(run_dir: &Path) -> Result<Vec<Registration>> {
   if fs::inspect(&run_dir.join(RECORD))?.is_none() {
     return Ok(Vec::new());

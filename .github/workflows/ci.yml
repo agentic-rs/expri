@@ -40,6 +40,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked
 
+      - name: Verify direct task lifecycle with real processes
+        run: cargo run --locked -p expri-worker --example lifecycle_process_check
+
       - name: Verify standalone Rust SDK package
         run: cargo package --locked -p expri-sdk
 

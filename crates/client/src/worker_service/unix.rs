@@ -171,6 +171,9 @@ fn service_status(paths: &StoragePaths) -> Result<Value> {
       if !detail.is_object() {
         *detail = json!({"generation": 0});
       }
+      if !detail["parts"].is_object() {
+        detail["parts"] = json!({});
+      }
       detail["desired_running"] = json!(choices.enabled(component));
       if detail["phase"] != "failed" || !choices.enabled(component) {
         detail["phase"] = json!("stopped");

@@ -103,8 +103,8 @@ the checkout, so a shared service never swaps process environment credentials.
 in the terminal and rejects a duplicate. `service status` is read-only and never
 starts it. With `[queue_worker]`, the same service reports its execution budget
 and accepts server-assigned queue tasks; `service status` includes an independent
-`execution` report. Its three public components are `collection`, `publishing`,
-and `queue-execution`. Collection supervises sampling and capture export;
+`execution` report. Its public components are `collection`, `publishing`,
+`queue-execution`, and `run-control`. Collection supervises sampling and capture export;
 publishing supervises machine history and run uploads. Control one without stopping
 peers:
 
