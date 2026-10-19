@@ -343,6 +343,9 @@ fn pump_inner(
         }
       }
       if let Some(mut prepared) = continuing.take() {
+        // This deadline belongs to the reaped predecessor. Replacement setup
+        // can outlast its grace period and must not kill the newly owned child.
+        cancellation_deadline = None;
         let replacement = (|| -> expri_core::error::Result<std::process::Child> {
           if cancelled || cancel_requested(run_dir)? {
             return Err(expri_core::error::ExpriError::Message(
