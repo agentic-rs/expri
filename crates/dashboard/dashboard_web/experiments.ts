@@ -33,7 +33,6 @@ export type ExperimentState = {
   error: string | null;
   catalog: ExperimentCatalog | null;
   filter: string;
-  view: "experiments" | "runs";
 };
 
 export function experimentDisplayName(experiment: ExperimentSummary, experiments: ExperimentSummary[]): string {
@@ -123,10 +122,4 @@ export function removeExperimentMember(experiment: Experiment, member: RunDeepLi
   return { name: experiment.name, description: experiment.description,
     members: experiment.members.filter((scope) => !sameScope(scope, member)),
     lineage: experiment.lineage.filter((edge) => !sameScope(edge.parent, member) && !sameScope(edge.child, member)) };
-}
-export function experimentActivity(runs: Run[]): string {
-  const counts = new Map<string, number>();
-  for (const run of runs) counts.set(run.status, (counts.get(run.status) ?? 0) + 1);
-  const order = ["running", "waiting", "paused", "pending", "preparing", "completed", "failed", "cancelled", "lost", "unknown"];
-  return [...counts].sort(([a], [b]) => order.indexOf(a) - order.indexOf(b)).map(([status, count]) => `${count} ${status}`).join(" · ");
 }

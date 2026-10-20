@@ -483,23 +483,6 @@ details.inspector-controls { display: block; }
 .review-management > * { flex: 1; min-width: 250px; }
 
 /* Experiments organize durable identities without changing run histories. */
-.experiment-browser-controls { display: flex; align-items: center; gap: 6px; padding: 0 10px 7px; flex-shrink: 0; flex-wrap: wrap; }
-.experiment-view-control { display: flex; flex: 0 0 auto; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 4px; min-width: 0; background: var(--surface-soft); }
-.experiment-view-control .theme-choice { flex: 0 0 auto; }
-.experiment-view-control .theme-choice span { min-height: 28px; padding: 4px 7px; white-space: nowrap; }
-.experiment-filter { flex: 1; min-width: 110px; max-width: 230px; }
-.experiment-filter select { height: 29px; font-size: 11px; }
-.experiment-browser-controls .run-control-trigger { min-height: 28px; }
-.experiment-browser-controls .experiment-load-error { font-size: 10px; }
-.experiment-group-row > td { padding: 6px 8px !important; background: var(--surface-soft); border-top: 1px solid var(--line-strong); }
-.experiment-group-heading { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.experiment-expand { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 1px 0; border: 0; background: transparent; color: var(--ink); font-size: 11px; text-align: left; }
-.experiment-expand strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
-.experiment-expand > span { width: 10px; color: var(--muted); font-size: 16px; line-height: 16px; }
-.experiment-group-focus { margin-left: auto; font-size: 10px; white-space: nowrap; }
-.experiment-page-activity { padding-left: 16px; color: var(--muted); font-size: 10px; line-height: 15px; }
-.run-lineage-badge, .run-experiment-name { margin-top: 2px; color: var(--muted); font-size: 10px; line-height: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.run-lineage-badge { color: var(--accent); }
 .experiment-manager { display: flex; flex-direction: column; gap: 8px; }
 .experiment-manager-heading, .experiment-run-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .experiment-chooser, .experiment-lineage-list { list-style: none; margin: 0; padding: 0; }

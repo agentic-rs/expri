@@ -14,20 +14,22 @@ from different machines remain separate members.
 ## Group runs in the website
 
 On the primary hosted dashboard, select a project and use **Experiments** in the
-run browser. Create an experiment, then add runs from the current selection or a
+run history header. Create an experiment, then add runs from the current selection or a
 run's inspector. Give the experiment a name that describes the ongoing goal,
 such as “Train translation model v2”. Empty experiments are allowed.
 
-Expand a group to inspect its runs, or select that experiment as a filter to page
-through its members. Search, machine, status, sorting, and optional columns still
-apply to the individual runs. The experiment filter searches the experiment's
-recorded membership, including older runs beyond the normal recent-run window.
-Ungrouped runs remain accessible.
+Run history is a flat table, newest first by default. Experiment membership does
+not move older runs beside newer ones or override the selected sort. Select an
+experiment under **Filters**, or select its name in **Experiments**, to page
+through its members in the same sortable table. Clear the experiment filter to
+return to all runs. **Ungrouped runs** is also available in Filters.
 
-Group headers distinguish the experiment's total recorded membership from runs
-shown on the current page. Activity counts describe that page. They do not infer
-that an experiment failed because one historical run failed, or completed because
-all currently visible runs finished. Run comparisons preserve separate series.
+Search, machine, status, sorting, and optional columns apply to the individual
+runs. The experiment filter searches the experiment's recorded membership,
+including older runs beyond the normal recent-run window. Counts in the
+experiment manager describe its full membership; table counts and pagination
+describe the filtered runs. Lineage stays in the run inspector and experiment
+manager, keeping run history compact. Run comparisons preserve separate series.
 
 Names, descriptions, membership, and lineage are service-owned metadata. Worker
 publishing cannot replace them. Edits use the experiment's revision so that a

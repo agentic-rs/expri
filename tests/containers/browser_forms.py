@@ -921,9 +921,7 @@ def workspace_layout(browser, width, wide=False):
         }),
         run: bounds('#run-rows .run-cell'), selection: bounds('#run-rows .selection-column'),
         status: bounds('#run-rows .status-column'), region: bounds('#runs-region'),
-        row_counts: [...table.querySelectorAll('tbody tr[data-run-key]')].map(row => row.children.length),
-        group_spans: [...table.querySelectorAll('tbody .experiment-group-row')].map(row =>
-          row.children.length === 1 ? row.firstElementChild.colSpan : 0)},
+        row_counts: [...table.querySelectorAll('tbody tr')].map(row => row.children.length)},
       table: {client_width: table.clientWidth, scroll_width: table.scrollWidth, scroll_left: table.scrollLeft}};''', 'args': []})
   assert geometry['viewport_width'] == width, f'layout viewport is not {width} CSS pixels wide'
   assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px workspace overflows horizontally'
@@ -948,7 +946,6 @@ def workspace_layout(browser, width, wide=False):
   expected_columns = columns['builtin_count'] + columns['custom_count']
   assert columns['header_count'] == expected_columns, 'run table omitted built-in or selected column headings'
   assert all(count == expected_columns for count in columns['row_counts']), 'run rows do not align with their column headings'
-  assert all(span == expected_columns for span in columns['group_spans']), 'experiment grouping headers do not span the run columns'
   if width > 1000 and geometry['table']['scroll_left'] == 0:
     assert columns['status']['right'] <= columns['region']['left'] + geometry['table']['client_width'] + 1, 'desktop Run status is outside the visible table'
   assert geometry['table']['client_width'] <= runs['width'] + 1, f'{width}px table escapes its Runs panel'

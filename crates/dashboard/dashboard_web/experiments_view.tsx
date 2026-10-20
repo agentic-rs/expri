@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { apiUrl, errorText, parseProjectRunKey, runIdentity, type Run, type RunDeepLink } from "./dashboard_model";
+import { apiUrl, errorText, parseProjectRunKey, runIdentity, type RunDeepLink } from "./dashboard_model";
 import { RunControlPopover } from "./run_control_popover";
-import { checkpointStep, experimentActivity, experimentDisplayName, experimentProject, experimentRunScope, memberExperiment, removeExperimentMember,
+import { checkpointStep, experimentDisplayName, experimentProject, experimentRunScope, memberExperiment, removeExperimentMember,
   sameScope, scopeIdentity, type Experiment, type ExperimentDraft, type ExperimentLineage, type LineageKind } from "./experiments";
 import type { DashboardActions, DashboardSnapshot } from "./dashboard_view";
 
@@ -36,8 +36,24 @@ export function ExperimentRecordedHistory({ experiment, draft, on_remove }: {
   </details>;
 }
 
-export function ExperimentToolbar({ snapshot: s, actions: a }: { snapshot: DashboardSnapshot; actions: DashboardActions }) {
-  const [open, setOpen] = useState(false);
+export function ExperimentFilter({ snapshot: s, actions: a }: { snapshot: DashboardSnapshot; actions: DashboardActions }) {
+  const source = s.sources.find((item) => item.source_id === s.source_id);
+  const state = s.experiments;
+  if (!state.supported || !experimentProject(source)) return null;
+  const choices = [...(state.catalog?.experiments ?? [])].sort((first, second) => first.name.localeCompare(second.name));
+  return <label className="field experiment-filter">
+    Experiment
+    <select id="experiment-filter" value={state.filter} disabled={s.controls_disabled || state.loading || !state.catalog} onChange={(event) => a.experiment_filter(event.currentTarget.value)}>
+      <option value="">All experiments</option>
+      <option value="ungrouped">Ungrouped runs</option>
+      {choices.map((item) => <option value={item.experiment_id} key={item.experiment_id} title={`${item.name} · ${item.experiment_id}`}>{experimentDisplayName(item, choices)} · {item.membership_count}</option>)}
+    </select>
+  </label>;
+}
+
+export function ExperimentManager({ snapshot: s, actions: a, open, on_change }: {
+  snapshot: DashboardSnapshot; actions: DashboardActions; open: boolean; on_change: (open: boolean) => void;
+}) {
   const [editing, setEditing] = useState<string | null | undefined>(undefined);
   const [draft, setDraft] = useState<ExperimentDraft>({ name: "", description: "", members: [], lineage: [] });
   const [revision, setRevision] = useState<string | null>(null);
@@ -46,7 +62,7 @@ export function ExperimentToolbar({ snapshot: s, actions: a }: { snapshot: Dashb
   const [create_request_id, setCreateRequestId] = useState<string | undefined>();
   const source = s.sources.find((item) => item.source_id === s.source_id);
   const project_id = experimentProject(source), state = s.experiments;
-  useEffect(() => { setOpen(false); setEditing(undefined); }, [s.source_id]);
+  useEffect(() => setEditing(undefined), [s.source_id]);
   if (!state.supported || !project_id) return null;
   const catalog = state.catalog;
   const choices = [...(catalog?.experiments ?? [])].sort((a, b) => a.name.localeCompare(b.name));
@@ -66,34 +82,18 @@ export function ExperimentToolbar({ snapshot: s, actions: a }: { snapshot: Dashb
     const members = add_selected ? [...new Map([...draft.members, ...selected_members].map((member) => [scopeIdentity(member), member])).values()] : draft.members;
     if (await a.experiment_save(editing, { ...draft, members }, revision, editing === null ? create_request_id : undefined)) { setEditing(undefined); setConfirmDelete(false); }
   };
-  return <div className="experiment-browser-controls">
-    <fieldset className="experiment-view-control" disabled={s.controls_disabled}>
-      <legend className="sr-only">Run grouping</legend>
-      {([['experiments', 'Experiments'], ['runs', 'Runs']] as const).map(([value, label]) => <label className="theme-choice" key={value}>
-        <input className="sr-only" type="radio" name="run_grouping" value={value} checked={state.view === value} onChange={() => a.experiment_view(value)} />
-        <span>{label}</span>
-      </label>)}
-    </fieldset>
-    <label className="field experiment-filter">
-      <span className="sr-only">Filter by experiment</span>
-      <select id="experiment-filter" value={state.filter} disabled={s.controls_disabled || state.loading || !catalog} onChange={(event) => a.experiment_filter(event.currentTarget.value)}>
-        <option value="">All experiments</option>
-        <option value="ungrouped">Ungrouped runs</option>
-        {choices.map((item) => <option value={item.experiment_id} key={item.experiment_id} title={`${item.name} · ${item.experiment_id}`}>{experimentDisplayName(item, choices)} · {item.membership_count}</option>)}
-      </select>
-    </label>
-    <RunControlPopover id="experiment-manager" label="Manage experiments" icon="runs" open={open} on_change={(value) => { setOpen(value); if (value) a.experiments_refresh(); }}>
+  return <RunControlPopover id="experiment-manager" label="Experiments" icon="runs" count={Number(state.error !== null)}
+    open={open} disabled={s.controls_disabled} on_change={(value) => { on_change(value); if (value) a.experiments_refresh(); }}>
       <div className="experiment-manager">
-        <div className="experiment-manager-heading"><h3>Experiments</h3><button className="text-button" type="button" disabled={!editable || choices.length >= 128} onClick={() => {
+        <div className="experiment-manager-heading"><p className="muted">Group related runs across machines.</p><button className="text-button" type="button" disabled={!editable || choices.length >= 128} onClick={() => {
           setEditing(null); setCreateRequestId(crypto.randomUUID()); setDraft({ name: "", description: "", members: [], lineage: [] }); setRevision(null); setConfirmDelete(false); setAddSelected(selected_members.length > 0);
         }}>+ New</button></div>
-        <p className="muted">Group work across runs and machines. Run histories stay separate.</p>
         {state.loading && <p className="muted" role="status">Updating experiments…</p>}
         {!state.management_enabled && <p className="muted">Experiment management is read only on this dashboard.</p>}
         <ul className="experiment-chooser" aria-label="Experiments">
           {choices.map((item) => <li key={item.experiment_id}>
             <div className="experiment-choice-row">
-            <button type="button" className="experiment-choice" title={`${item.name} · ${item.experiment_id}`} onClick={() => { a.experiment_filter(item.experiment_id); setOpen(false); }}>
+            <button type="button" className="experiment-choice" title={`${item.name} · ${item.experiment_id}`} onClick={() => { a.experiment_filter(item.experiment_id); on_change(false); }}>
               <span>{experimentDisplayName(item, choices)}</span><small>{item.membership_count} {item.membership_count === 1 ? "member" : "members"}{item.unavailable_runs.length ? ` · ${item.unavailable_runs.length} unavailable` : ""}</small>
             </button>
             <button type="button" className="text-button" disabled={!editable} aria-label={`Edit experiment ${item.name}`} onClick={() => {
@@ -129,31 +129,7 @@ export function ExperimentToolbar({ snapshot: s, actions: a }: { snapshot: Dashb
         </form>}
         {state.error && <p className="notice error" role="alert">{state.error}</p>}
       </div>
-    </RunControlPopover>
-    {state.error && !open && <button type="button" className="experiment-load-error text-button" onClick={() => { setOpen(true); a.experiments_refresh(); }}>Experiments need attention</button>}
-  </div>;
-}
-
-export function ExperimentGroupHeader({ experiment, runs, expanded, on_toggle, on_filter, columns }: {
-  experiment: Experiment | null; runs: Run[]; expanded: boolean; on_toggle: () => void; on_filter: () => void; columns: number;
-}) {
-  const label = experiment?.name ?? "Ungrouped runs";
-  return <tr className="experiment-group-row"><td colSpan={columns}>
-    <div className="experiment-group-heading">
-      <button className="experiment-expand" type="button" aria-label={`${expanded ? "Collapse" : "Expand"} ${label}`} aria-expanded={expanded} onClick={on_toggle}><span aria-hidden="true">{expanded ? "⌄" : "›"}</span><strong>{label}</strong></button>
-      <button className="experiment-group-focus text-button" type="button" onClick={on_filter} title={`Show all runs in ${label}`}>{runs.length} shown{experiment ? ` · ${experiment.membership_count} members` : ""} <span aria-hidden="true">↗</span></button>
-    </div>
-    {runs.length > 0 && <p className="experiment-page-activity">This page: {experimentActivity(runs)}</p>}
-  </td></tr>;
-}
-
-export function ExperimentLineageBadge({ experiment, member }: { experiment: Experiment | null; member: RunDeepLink | null }) {
-  if (!experiment || !member) return null;
-  const edges = experiment.lineage.filter((edge) => sameScope(edge.child, member));
-  if (!edges.length) return null;
-  return <div className="run-lineage-badge" title={edges.map((edge) => `${LINEAGE_LABELS[edge.kind]} ${memberLabel(edge.parent)}${edge.step !== null ? ` at step ${edge.step}` : ""}${edge.checkpoint ? ` · ${edge.checkpoint}` : ""}`).join("\n")}>
-    {LINEAGE_LABELS[edges[0]!.kind]} {edges[0]!.parent.run_id}{edges.length > 1 ? ` +${edges.length - 1}` : ""}
-  </div>;
+    </RunControlPopover>;
 }
 
 export function ExperimentRunPanel({ snapshot: s, actions: a }: { snapshot: DashboardSnapshot; actions: DashboardActions }) {
@@ -225,7 +201,7 @@ function ExperimentRunEditor({ member, snapshot: s, actions: a }: { member: RunD
         event.preventDefault(); const chosen = catalog?.experiments.find((item) => item.experiment_id === target);
         if (!chosen || disabled) return;
         void a.experiment_save(chosen.experiment_id, { ...draftOf(chosen), members: [...chosen.members, member] }, chosen.revision);
-      }}><fieldset disabled={disabled}><label className="field">Experiment<select id="run-experiment-choice" value={target} onChange={(event) => setTarget(event.currentTarget.value)}><option value="">Choose an experiment</option>{catalog?.experiments.map((item) => <option value={item.experiment_id} key={item.experiment_id} title={`${item.name} · ${item.experiment_id}`}>{experimentDisplayName(item, catalog.experiments)}</option>)}</select></label><div className="experiment-form-actions"><button id="assign-run-experiment" className="button primary" type="submit" disabled={!target}>Add run</button></div><p className="muted">Create an experiment from Manage experiments in the run history toolbar.</p></fieldset></form>}
+      }}><fieldset disabled={disabled}><label className="field">Experiment<select id="run-experiment-choice" value={target} onChange={(event) => setTarget(event.currentTarget.value)}><option value="">Choose an experiment</option>{catalog?.experiments.map((item) => <option value={item.experiment_id} key={item.experiment_id} title={`${item.name} · ${item.experiment_id}`}>{experimentDisplayName(item, catalog.experiments)}</option>)}</select></label><div className="experiment-form-actions"><button id="assign-run-experiment" className="button primary" type="submit" disabled={!target}>Add run</button></div><p className="muted">Create an experiment from Experiments in the run history header.</p></fieldset></form>}
       {(error || state.error) && <p className="notice error" role="alert">{error || state.error}</p>}
       {state.loading && <p className="muted" role="status">Updating experiments…</p>}
     </div>

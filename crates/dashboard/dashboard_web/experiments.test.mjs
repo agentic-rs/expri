@@ -4,7 +4,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
 import { checkpointStep, parseExperimentCatalog, experimentDisplayName, experimentRunScope, memberExperiment, removeExperimentMember,
-  experimentActivity, ExperimentGroupHeader, ExperimentLineageBadge } from "./.test/app.js";
+  ExperimentFilter, ExperimentRunPanel } from "./.test/app.js";
 
 const scope = (origin, run_id = "same-run") => ({ project_id: "vision", origin, run_id });
 const first = scope("gpu-a"), second = scope("gpu-b");
@@ -46,25 +46,36 @@ test("membership uses project, origin and run ID while removing a member preserv
   assert.equal(original.members.length, 4, "editing does not mutate the stored catalog");
 });
 
-test("experiment headers distinguish page activity from full membership without inventing a parent status", () => {
-  const runs = [{ status: "failed" }, { status: "running" }];
-  assert.equal(experimentActivity(runs), "1 running · 1 failed");
-  const markup = renderToStaticMarkup(createElement(ExperimentGroupHeader, { experiment: experiment({ membership_count: 25 }), runs,
-    expanded: true, on_toggle() {}, on_filter() {}, columns: 5 }));
-  const dom = new JSDOM(`<table><tbody>${markup}</tbody></table>`);
-  assert.match(dom.window.document.body.textContent, /2 shown · 25 members.*This page: 1 running · 1 failed/s);
-  assert.equal(dom.window.document.querySelector("td").colSpan, 5);
-  assert.equal(dom.window.document.querySelector(".status"), null);
-  assert.equal(dom.window.document.querySelector("[aria-expanded]").getAttribute("aria-expanded"), "true");
+test("experiment filtering keeps distinct scoped choices usable on a read-only dashboard", () => {
+  const first = experiment({ name: "<img src=x onerror=alert(1)>" });
+  const second = experiment({ experiment_id: "experiment-2", name: first.name, members: [], lineage: [], membership_count: 0, unavailable_runs: [] });
+  const source = { source_id: "hosted-project:vision", project_id: "vision", kind: "hosted_project" };
+  const snapshot = { source_id: source.source_id, sources: [source], controls_disabled: false,
+    experiments: { supported: true, management_enabled: false, loading: false, filter: second.experiment_id,
+      catalog: { project_id: "vision", revision: "1", experiments: [first, second] } } };
+  const dom = new JSDOM(renderToStaticMarkup(createElement(ExperimentFilter, { snapshot, actions: {} })));
+  const select = dom.window.document.querySelector("select");
+  assert.equal(select.disabled, false);
+  assert.equal(select.value, second.experiment_id);
+  assert.deepEqual([...select.options].map((option) => option.value), ["", "ungrouped", first.experiment_id, second.experiment_id]);
+  assert.notEqual(select.options[2].textContent, select.options[3].textContent);
+  assert.match(select.options[2].title, /experiment-1/);
+  assert.equal(dom.window.document.querySelector("img"), null, "names remain text rather than HTML");
   dom.window.close();
 });
 
-test("lineage badges preserve machine identity and escape checkpoint references", () => {
+test("run inspection preserves exact lineage and escapes checkpoint references without adding history rows", () => {
   const item = experiment({ lineage: [{ parent: first, child: second, kind: "continued", step: "900", checkpoint: "<script>alert(1)</script>" }] });
-  const dom = new JSDOM(renderToStaticMarkup(createElement(ExperimentLineageBadge, { experiment: item, member: second })));
-  assert.match(dom.window.document.body.textContent, /Continued from same-run/);
-  assert.match(dom.window.document.querySelector("div").title, /gpu-a.*step 900.*<script>/);
+  const source = { source_id: "hosted-project:vision", project_id: "vision", kind: "hosted_project" };
+  const run = { run_id: second.run_id, run_key: `${second.origin}:${second.run_id}`, origin: second.origin };
+  const snapshot = { source_id: source.source_id, sources: [source], detail: { source, run }, review: { kind: "run", run_ids: [run.run_key] },
+    experiments: { supported: true, management_enabled: false, loading: false, busy: false, error: null, catalog: catalog(item) } };
+  const dom = new JSDOM(renderToStaticMarkup(createElement(ExperimentRunPanel, { snapshot, actions: {} })));
+  assert.match(dom.window.document.body.textContent, /Continued from same-run · gpu-a.*Checkpoint step 900.*<script>alert\(1\)<\/script>/s);
+  const parent = new URL(dom.window.document.querySelector(".experiment-lineage-list a").getAttribute("href"), "http://localhost");
+  assert.deepEqual(Object.fromEntries(parent.searchParams), first);
   assert.equal(dom.window.document.querySelector("script"), null);
+  assert.equal(dom.window.document.querySelector("tr"), null, "lineage belongs to the inspector rather than the run table");
   dom.window.close();
 });
 

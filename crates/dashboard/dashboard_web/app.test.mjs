@@ -346,22 +346,28 @@ function latestRunQuery(model) {
   return new URL(model.requests.filter(url => url.startsWith("/api/runs?")).at(-1), "http://localhost").searchParams;
 }
 
-async function experimentFixture(t, { mutable = true, count = 3, experiments: initial, intercept, ...fields } = {}) {
+async function experimentFixture(t, { mutable = true, count = 3, member_indices = [0, 1], experiments: initial, catalog_status = 200, server_orders = {}, intercept, ...fields } = {}) {
   const source = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] };
   const scope = (origin, run_id) => ({ project_id: "vision", origin, run_id });
   const runs = Array.from({ length: count }, (_, index) => ({ run_id: `run-${index}`, run_key: `gpu-${index === 1 ? "b" : "a"}:run-${index}`,
     origin: index === 1 ? "gpu-b" : "gpu-a", task: "train", status: index === 0 ? "running" : index === 1 ? "failed" : "completed",
-    started_at: "2026-10-03T01:00:00Z", finished_at: index === 0 ? null : "2026-10-03T01:00:03Z", exit_code: index === 1 ? 1 : null }));
+    started_at: new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000).toISOString(),
+    finished_at: index === 0 ? null : new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000 + 3000).toISOString(), exit_code: index === 1 ? 1 : null }));
   const make = (patch = {}) => ({ experiment_id: "experiment-1", name: "Language model", description: "Across machines\nIndependent metrics", revision: "exp-revision-1",
-    members: [scope("gpu-a", "run-0"), scope("gpu-b", "run-1")], lineage: [{ parent: scope("gpu-a", "run-0"), child: scope("gpu-b", "run-1"), kind: "continued", checkpoint: "checkpoint-900", step: "900" }],
-    created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: 2, unavailable_runs: [], ...patch });
-  const state = { experiments: initial ?? [make()], saves: [], deletes: [], reads: 0, project_revision: "project-1", replay: new Map() };
+    members: member_indices.map((index) => scope(runs[index].origin, runs[index].run_id)),
+    lineage: member_indices.includes(0) && member_indices.includes(1) ? [{ parent: scope("gpu-a", "run-0"), child: scope("gpu-b", "run-1"), kind: "continued", checkpoint: "checkpoint-900", step: "900" }] : [],
+    created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: member_indices.length, unavailable_runs: [], ...patch });
+  const state = { experiments: initial ?? [make()], catalog_status, saves: [], deletes: [], reads: 0, project_revision: "project-1", replay: new Map() };
   const model = await reviewFixture(t, { ...fields, hosted: true, projects: true, project_runs: runs, override: (url, options) => {
     const overridden = intercept?.(url, options, state);
     if (overridden !== undefined) return overridden;
     if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [source], initial_source: source.source_id,
       access_mode: "hosted", warnings: [], run_management_enabled: mutable, experiments_supported: true, experiment_management_enabled: mutable });
-    if (url.pathname === "/api/experiments") { state.reads++; return response({ project_id: "vision", revision: state.project_revision, experiments: structuredClone(state.experiments) }); }
+    if (url.pathname === "/api/experiments") {
+      state.reads++;
+      return state.catalog_status === 200 ? response({ project_id: "vision", revision: state.project_revision, experiments: structuredClone(state.experiments) }) :
+        response({ error: "Experiment metadata is temporarily unavailable" }, state.catalog_status);
+    }
     if (url.pathname === "/api/experiments/save") {
       const body = JSON.parse(options.body); state.saves.push(body);
       assert.equal(options.method, "POST"); assert.equal(options.credentials, "same-origin");
@@ -380,34 +386,78 @@ async function experimentFixture(t, { mutable = true, count = 3, experiments: in
       const chosen = state.experiments.find((item) => item.experiment_id === id);
       const contains = (item, run) => item.members.some((member) => member.origin === run.origin && member.run_id === run.run_id);
       const visible = runs.filter((run) => !id || (id === "ungrouped" ? !state.experiments.some((item) => contains(item, run)) : chosen && contains(chosen, run)));
-      return response({ source, runs: visible.slice(offset, offset + limit), total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null, warnings: [] });
+      const order = server_orders[`${url.searchParams.get("sort")}:${url.searchParams.get("direction")}`];
+      const ordered = order ? order.flatMap((run_id) => visible.filter((run) => run.run_id === run_id)) : visible;
+      return response({ source, runs: ordered.slice(offset, offset + limit), total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null, warnings: [] });
     }
   } });
-  await settled(() => model.nodes.document.querySelector("#experiment-filter") && !model.nodes.get("experiment-filter").disabled);
+  await settled(() => model.nodes.document.querySelector("#experiment-manager-trigger") && state.reads > 0 &&
+    (state.catalog_status !== 200 || !model.nodes.get("experiment-filter").disabled));
   return Object.assign(model, { state, source, scope, make });
 }
 
-test("experiments group a paged run history with exact membership, scoped identity and explicit page activity", async t => {
-  const model = await experimentFixture(t);
+test("experiment membership never regroups interleaved chronological run history", async t => {
+  const model = await experimentFixture(t, { count: 5, member_indices: [0, 2, 4] });
   const { nodes } = model;
-  const groups = nodes.get("run-rows").querySelectorAll(".experiment-group-row");
-  assert.equal(groups.length, 2);
-  assert.match(groups[0].textContent, /Language model.*2 shown · 2 members.*This page: 1 running · 1 failed/s);
-  assert.equal(groups[0].querySelector(".status"), null, "a failed historical run does not mark the experiment failed");
-  assert.match(nodes.get("run-rows").textContent, /Continued from run-0/);
+  const expected = ["gpu-a:run-0", "gpu-b:run-1", "gpu-a:run-2", "gpu-a:run-3", "gpu-a:run-4"];
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), expected);
+  assert.deepEqual(runRows(nodes).map((row) => row.querySelector("time").dateTime), model.runs.map((run) => run.started_at));
+  assert.equal(nodes.get("run-rows").querySelector(".experiment-group-row, .run-lineage-badge, .run-experiment-name"), null,
+    "membership and provenance do not add rows or metadata lines to run history");
+  assert.equal(nodes.document.querySelector('input[name="run_grouping"]'), null);
+  assert.ok(nodes.get("experiment-manager-trigger").closest(".run-history-header"));
+  assert.ok(nodes.get("experiment-filter").closest("#run-filters-panel"));
   const row = nodes.get("run-rows").querySelector('[data-run-key="gpu-b:run-1"]');
   assert.match(row.querySelector(".machine-name").textContent, /gpu-b/);
-  await click(groups[0].querySelector("[aria-expanded]"));
-  assert.equal(nodes.get("run-rows").querySelectorAll("[data-run-key]").length, 1);
-  await click(nodes.document.querySelector('input[name="run_grouping"][value="runs"]'));
-  assert.equal(nodes.get("run-rows").querySelectorAll("[data-run-key]").length, 3);
-  assert.equal(nodes.get("run-rows").querySelectorAll(".experiment-group-row").length, 0);
-  assert.match(nodes.get("run-rows").textContent, /Language model/);
+  await openRunControl(nodes, "experiment-manager");
+  await openRunControl(nodes, "run-filters");
+  assert.equal(nodes.get("experiment-manager-panel").hidden, true, "only one history popover remains open");
+  await openRunControl(nodes, "experiment-manager");
+  assert.equal(nodes.get("run-filters-panel").hidden, true);
+  await openRunControl(nodes, "run-filters");
   setValue(nodes.get("experiment-filter"), "ungrouped"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("experiment_id"), "ungrouped");
-  assert.equal(nodes.get("run-rows").querySelectorAll("[data-run-key]").length, 1);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), ["gpu-b:run-1", "gpu-a:run-3"]);
   await click(nodes.get("clear-filter-experiment")); await settledTable(nodes);
   assert.equal(latestRunQuery(model).has("experiment_id"), false);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), expected);
+});
+
+test("experiment filters preserve server sorting and pagination without hiding or moving rows", async t => {
+  const ascending = Array.from({ length: 45 }, (_, index) => `run-${index}`).sort();
+  const descending = [...ascending].reverse(), members = Array.from({ length: 23 }, (_, index) => index * 2);
+  const model = await experimentFixture(t, { count: 45, member_indices: members,
+    server_orders: { "run_id:asc": ascending, "run_id:desc": descending } });
+  const { nodes } = model;
+  const keys = (ids) => ids.map((id) => `gpu-a:${id}`), rendered = () => runRows(nodes).map((row) => row.dataset.runKey);
+  await openRunControl(nodes, "run-filters");
+  setValue(nodes.get("experiment-filter"), "experiment-1"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
+  assert.deepEqual(rendered(), keys(members.slice(0, 20).map((index) => `run-${index}`)));
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("experiment_id"), "experiment-1");
+  assert.equal(latestRunQuery(model).get("offset"), "20");
+  assert.deepEqual(rendered(), keys(["run-40", "run-42", "run-44"]));
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run ascending"]')); await settledTable(nodes);
+  const ascending_members = ascending.filter((id) => Number(id.slice(4)) % 2 === 0);
+  assert.equal(latestRunQuery(model).get("sort"), "run_id");
+  assert.equal(latestRunQuery(model).get("direction"), "asc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(latestRunQuery(model).get("experiment_id"), "experiment-1");
+  assert.equal(nodes.get("previous-page").disabled, true);
+  assert.deepEqual(rendered(), keys(ascending_members.slice(0, 20)));
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.deepEqual(rendered(), keys(ascending_members.slice(20)));
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run descending"]')); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("direction"), "desc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.deepEqual(rendered(), keys([...ascending_members].reverse().slice(0, 20)));
+  await click(nodes.get("clear-filter-experiment")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).has("experiment_id"), false);
+  assert.equal(latestRunQuery(model).get("sort"), "run_id");
+  assert.equal(latestRunQuery(model).get("direction"), "desc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(nodes.get("previous-page").disabled, true);
+  assert.deepEqual(rendered(), descending.slice(0, 20).map((id) => `${id === "run-1" ? "gpu-b" : "gpu-a"}:${id}`));
 });
 
 test("experiment creation reuses its request ID after a committed response is lost", async t => {
@@ -472,7 +522,39 @@ test("read-only experiments expose retained lineage and members without allowing
   assert.match(history.textContent, /run-0 · gpu-a.*Unavailable · provenance retained.*Continued from run-0 · gpu-a.*step 900.*checkpoint-900/s);
   assert.equal([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "+ New").disabled, true);
   assert.equal(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]').disabled, true);
+  await openRunControl(nodes, "run-filters");
+  assert.equal(nodes.get("experiment-filter").disabled, false, "read-only dashboards can still filter experiments");
+  setValue(nodes.get("experiment-filter"), "experiment-1"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), ["gpu-a:run-0", "gpu-b:run-1"]);
   assert.equal(model.state.saves.length, 0);
+});
+
+test("missing experiment capabilities preserve ordinary chronological run browsing", async t => {
+  const source = { source_id: "hosted-project:vision", project_id: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const runs = ["new", "middle", "old"].map((name, index) => ({ run_id: name, run_key: `gpu-a:${name}`, origin: "gpu-a", task: "train", status: "completed",
+    started_at: new Date(Date.UTC(2026, 9, 3 - index)).toISOString(), finished_at: new Date(Date.UTC(2026, 9, 3 - index, 1)).toISOString(), exit_code: 0,
+    experiment: index === 1 ? null : { experiment_id: "experiment-1", name: "Shared work", revision: "1" } }));
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs });
+  assert.deepEqual(runRows(model.nodes).map((row) => row.dataset.runKey), runs.map((run) => run.run_key));
+  assert.equal(model.nodes.document.querySelector("#experiment-manager-trigger, #experiment-filter, .experiment-group-row"), null);
+  assert.equal(model.requests.some((url) => new URL(url, "http://localhost").pathname === "/api/experiments"), false);
+  assert.equal(latestRunQuery(model).get("source"), source.source_id);
+});
+
+test("failed experiment metadata never hides or reorders the available run history", async t => {
+  const model = await experimentFixture(t, { count: 5, member_indices: [0, 2, 4], catalog_status: 503 });
+  const { nodes, state } = model, before = runRows(nodes);
+  assert.deepEqual(before.map((row) => row.dataset.runKey), model.runs.map((run) => run.run_key));
+  assert.equal(nodes.get("experiment-filter").disabled, true);
+  assert.equal(nodes.get("runs-region").getAttribute("aria-busy"), "false");
+  await openRunControl(nodes, "experiment-manager");
+  assert.match(nodes.get("experiment-manager-panel").textContent, /Experiment metadata is temporarily unavailable/);
+  state.catalog_status = 200;
+  await click(nodes.get("experiment-manager-trigger"));
+  await openRunControl(nodes, "experiment-manager");
+  await settled(() => !nodes.get("experiment-filter").disabled);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), before.map((row) => row.dataset.runKey));
+  runRows(nodes).forEach((row, index) => assert.equal(row, before[index], "metadata recovery preserves each run row"));
 });
 
 test("experiment conflicts retain drafts and require an explicit reload before retrying", async t => {
@@ -497,6 +579,7 @@ test("empty experiment metadata refreshes on catalog revisions without changes t
   const clock = new RefreshClock();
   const model = await experimentFixture(t, { updates: true, refresh_clock: clock });
   await clock.advance(5000);
+  const rows_before = runRows(model.nodes);
   const empty = model.make({ experiment_id: "empty-experiment", name: "Empty experiment", revision: "empty-1", members: [], lineage: [], membership_count: 0 });
   model.state.experiments.push(empty);
   const reads = model.state.reads, runs_before = model.requests.filter((url) => url.startsWith("/api/runs?")).length;
@@ -510,6 +593,13 @@ test("empty experiment metadata refreshes on catalog revisions without changes t
   await clock.advance(5000);
   await settled(() => model.nodes.get("experiment-filter").textContent.includes("Renamed empty group"));
   assert.ok(model.state.reads > previous_reads);
+  model.state.experiments[0] = { ...model.state.experiments[0], name: "Membership changed", revision: "membership-2",
+    members: [model.scope("gpu-a", "run-2"), model.scope("gpu-a", "run-0")], lineage: [] };
+  model.catalog_revision = "catalog-changed-membership";
+  await clock.advance(5000);
+  await settled(() => model.nodes.get("experiment-filter").textContent.includes("Membership changed"));
+  assert.deepEqual(runRows(model.nodes).map((row) => row.dataset.runKey), ["gpu-a:run-0", "gpu-b:run-1", "gpu-a:run-2"]);
+  runRows(model.nodes).forEach((row, index) => assert.equal(row, rows_before[index], "membership-only changes preserve the ordered row DOM"));
   assert.equal(model.requests.filter((url) => url.startsWith("/api/runs?")).length, runs_before,
     "metadata updates do not need to reread the unchanged run list");
 });

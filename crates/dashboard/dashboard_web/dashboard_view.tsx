@@ -1,4 +1,4 @@
-import { Fragment, useSyncExternalStore, useState, useEffect, useMemo, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useSyncExternalStore, useState, useEffect, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
@@ -17,8 +17,8 @@ import { RunAttemptHistory } from "./run_attempts_view";
 import { parseTaskAttempts } from "./run_attempts";
 import { lifecyclePanelKey, RunLifecyclePanel } from "./run_lifecycle_view";
 import { RunResourceBadge } from "./run_resources_view";
-import { ExperimentToolbar, ExperimentRunPanel, ExperimentGroupHeader, ExperimentLineageBadge } from "./experiments_view";
-import { experimentRunScope, scopeIdentity, type ExperimentState, type ExperimentDraft, type Experiment } from "./experiments";
+import { ExperimentFilter, ExperimentManager, ExperimentRunPanel } from "./experiments_view";
+import type { ExperimentState, ExperimentDraft } from "./experiments";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -161,7 +161,6 @@ export type DashboardSnapshot = DashboardUi & {
 };
 export type DashboardActions = {
   experiment_filter: (value: string) => void;
-  experiment_view: (value: "experiments" | "runs") => void;
   experiments_refresh: () => void;
   experiment_save: (experiment_id: string | null, values: ExperimentDraft, expected_revision: string | null, create_request_id?: string) => Promise<boolean>;
   experiment_delete: (experiment_id: string, expected_revision: string) => Promise<boolean>;
@@ -603,6 +602,7 @@ function RunFilterPanel({ snapshot: s, actions: a }: { snapshot: DashboardSnapsh
           ))}
         </datalist>
       </label>
+      <ExperimentFilter snapshot={s} actions={a} />
       {s.access_mode === "hosted" && <RadioTags
         id="archival-options"
         name="archival"
@@ -654,24 +654,9 @@ function RunBrowser({
   snapshot: DashboardSnapshot;
   actions: DashboardActions;
 }) {
-  const [open_control, setOpenControl] = useState<"filters" | "columns" | "issues" | null>(null);
-  const [collapsed_groups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [open_control, setOpenControl] = useState<"experiments" | "filters" | "columns" | "issues" | null>(null);
   useEffect(() => setOpenControl(null), [s.source_id]);
-  useEffect(() => setCollapsedGroups(new Set()), [s.source_id]);
-  const membership = useMemo(() => new Map((s.experiments.catalog?.experiments ?? [])
-    .flatMap((experiment) => experiment.members.map((member) => [scopeIdentity(member), experiment] as const))), [s.experiments.catalog]);
-  const source = s.sources.find((item) => item.source_id === s.source_id);
-  const grouped = s.experiments.supported && s.experiments.catalog !== null && s.experiments.view === "experiments";
-  const groups = new Map<string, { experiment: Experiment | null; runs: Run[] }>();
-  for (const run of s.runs) {
-    const member = experimentRunScope(run, source);
-    const experiment = member ? membership.get(scopeIdentity(member)) ?? null : null;
-    const key = experiment?.experiment_id ?? "ungrouped";
-    if (!groups.has(key)) groups.set(key, { experiment, runs: [] });
-    groups.get(key)!.runs.push(run);
-  }
-  const ordered_runs = grouped ? [...groups.values()].flatMap((group) => group.runs) : s.runs;
-  function changeControl(control: "filters" | "columns" | "issues", open: boolean): void {
+  function changeControl(control: "experiments" | "filters" | "columns" | "issues", open: boolean): void {
     setOpenControl((current) => open ? control : current === control ? null : current);
   }
   const active_filters = [
@@ -707,6 +692,8 @@ function RunBrowser({
       <div className="section-heading run-history-header">
         <div><h2 id="runs-heading" tabIndex={-1}>Run history</h2><p id="run-count" className="muted">{s.run_count}</p></div>
         <div className="run-history-actions">
+          <ExperimentManager key={`experiment-manager:${s.source_id}`} snapshot={s} actions={a}
+            open={open_control === "experiments"} on_change={(open) => changeControl("experiments", open)} />
           <RunControlPopover id="run-filters" label="Filters" icon="filter" count={filter_count}
             open={open_control === "filters"} disabled={s.controls_disabled} on_change={(open) => changeControl("filters", open)}>
             <RunFilterPanel snapshot={s} actions={a} />
@@ -740,7 +727,6 @@ function RunBrowser({
           </span>
         </div>
       </div>
-      <ExperimentToolbar key={s.source_id} snapshot={s} actions={a} />
       <div className="active-run-filters" aria-label="Active run filters" hidden={!filter_count}>
         {active_filters.map((filter) => <button key={filter.key} id={`clear-filter-${filter.key}`} type="button" className="run-filter-chip"
           title={filter.label} aria-label={`Clear ${filter.name} filter`} disabled={s.controls_disabled} onClick={filter.clear}>
@@ -788,23 +774,12 @@ function RunBrowser({
             </tr>
           </thead>
           <tbody id="run-rows">
-            {ordered_runs.map((run) => {
+            {s.runs.map((run) => {
               const identity = runIdentity(run);
               const selected = s.selected.includes(identity);
-              const member = experimentRunScope(run, source);
-              const experiment = member ? membership.get(scopeIdentity(member)) ?? null : null;
-              const group_key = experiment?.experiment_id ?? "ungrouped";
-              const group = groups.get(group_key)!;
-              const expanded = !collapsed_groups.has(group_key);
               return (
-                <Fragment key={identity}>
-                {grouped && group.runs[0] === run && <ExperimentGroupHeader experiment={experiment} runs={group.runs}
-                  expanded={expanded} columns={4 + Number(Boolean(project)) + s.run_columns.length}
-                  on_filter={() => a.experiment_filter(group_key)} on_toggle={() => setCollapsedGroups((current) => {
-                    const next = new Set(current); next.has(group_key) ? next.delete(group_key) : next.add(group_key); return next;
-                  })} />}
-                {(!grouped || expanded) &&
                 <tr
+                  key={identity}
                   data-run-key={identity}
                   className={[
                     selected && "selected",
@@ -840,8 +815,6 @@ function RunBrowser({
                       {runNickname(run) ?? run.run_id}
                     </button>
                     <div className="run-task" title={run.task ?? undefined}>{run.task ?? "—"}</div>
-                    {!grouped && experiment && <div className="run-experiment-name" title={experiment.name}>{experiment.name}</div>}
-                    <ExperimentLineageBadge experiment={experiment} member={member} />
                     <div className="run-summary-meta">
                       {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
                       <RunSmokeMark run={run} />
@@ -887,8 +860,7 @@ function RunBrowser({
                       </td>
                     );
                   })}
-                </tr>}
-                </Fragment>
+                </tr>
               );
             })}
           </tbody>

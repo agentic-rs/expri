@@ -817,9 +817,9 @@ Whitespace is trimmed and duplicate tags are removed, preserving their order.
 Hosted projects also support **Experiments**: named groups of runs that serve the
 same ongoing goal across machines and implementations. Group related runs and
 record checkpoint continuation, restart, or split relationships in the website.
-Runs keep their own metrics and lifecycle controls. Group headers distinguish
-total membership from the current page's activity; deleting a group preserves
-its runs. See [experiments and lineage](docs/experiments.md).
+Runs keep their own metrics and lifecycle controls. Filter run history by an
+experiment while preserving its chronological or selected sort order; deleting
+an experiment preserves its runs. See [experiments and lineage](docs/experiments.md).
 
 On the hosted dashboard, switch to **Storage** to browse finalized S3 objects
 for the selected project. **Private inputs** shows immutable input IDs and

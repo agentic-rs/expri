@@ -230,7 +230,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
   const experiments: ExperimentState = { supported: false, management_enabled: false, loading: false,
-    busy: false, error: null, catalog: null, filter: "", view: "experiments" };
+    busy: false, error: null, catalog: null, filter: "" };
   let experiments_context: string | null = null;
   let experiments_loading: Promise<boolean> | null = null;
   let experiment_read_generation = 0;
@@ -368,7 +368,6 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       experiments.filter = value;
       filtersChanged();
     },
-    experiment_view: (value) => { experiments.view = value; publish(); },
     experiments_refresh: () => { void loadExperiments(true); },
     experiment_save: (experiment_id, values, expected_revision, create_request_id) => mutateExperiment(experiment_id, values, expected_revision, create_request_id),
     experiment_delete: (experiment_id, expected_revision) => mutateExperiment(experiment_id, null, expected_revision),
