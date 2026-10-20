@@ -15,6 +15,7 @@ mod output;
 mod push_cli;
 mod query_cli;
 mod queue_cli;
+mod resource_requirements_cli;
 mod runs;
 mod runs_cli;
 mod service;
@@ -239,6 +240,8 @@ struct RunCommand {
   queue: bool,
   #[command(flatten)]
   resources: queue_cli::RunResources,
+  #[command(flatten)]
+  requirements: resource_requirements_cli::RunRequirements,
   #[arg(long)]
   config: Option<PathBuf>,
 
@@ -475,6 +478,13 @@ fn run_setup(
 fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: bool) -> Result<()> {
   let context = CommandContext::load(command.config.clone(), command.repo.clone())?;
   if command.queue {
+    let name = command.task.first().expect("clap requires a task");
+    let task = context.config.task(name)?;
+    if !command.requirements.resolve(&task.requirements)?.is_empty() {
+      return Err(ExpriError::Message(
+        "disk requirements currently support direct detached runs; remove requirements before using --queue".into(),
+      ));
+    }
     return queue_cli::submit(command, context, target, quiet);
   }
   let mut task_parts = command.task.into_iter();
@@ -482,7 +492,8 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     .next()
     .expect("clap requires at least one task argument");
   let args = task_parts.collect::<Vec<_>>();
-  let task = context.config.task(&name)?;
+  let mut task = context.config.task(&name)?;
+  task.requirements = command.requirements.resolve(&task.requirements)?;
   let remote_managed = context
     .config
     .push
@@ -526,6 +537,18 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
         "--detach requires a configured target environment".to_string(),
       ));
     }
+    controller::task::check_run_requirements_target(
+      controller::task::RunRequirementsTargetOptions {
+        target: &context.target,
+        control_path: &context.control_path,
+        control_persist: &command.control_persist,
+        requirements: &task.requirements,
+        detach: command.detach,
+        dry_run: command.dry_run,
+        verbosity,
+        quiet,
+      },
+    )?;
     if context.target.service.is_some() {
       controller::task::check_run_publishing_target(
         &context.target,
@@ -768,6 +791,71 @@ mod tests {
       ])
       .is_ok()
     );
+  }
+
+  #[test]
+  fn disk_requirement_flags_are_explicit_and_keep_task_arguments_literal() {
+    let Command::Run(command) = Cli::try_parse_from([
+      "expri",
+      "run",
+      "--detach",
+      "--disk-free",
+      "20GiB",
+      "--disk-path",
+      "/mnt/data",
+      "--disk-resume-free",
+      "30GiB",
+      "--disk-recovery-seconds",
+      "15",
+      "train",
+      "--disk-free",
+      "2",
+    ])
+    .unwrap()
+    .command
+    else {
+      panic!("expected run command");
+    };
+    let requirements = command.requirements.resolve(&Default::default()).unwrap();
+    assert_eq!(requirements.disk[0].path, "/mnt/data");
+    assert_eq!(requirements.disk[0].min_free_bytes, 20 * 1024_u64.pow(3));
+    assert_eq!(requirements.disk[0].resume_free_bytes, 30 * 1024_u64.pow(3));
+    assert_eq!(requirements.recovery_seconds, 15);
+    assert_eq!(command.task, ["train", "--disk-free", "2"]);
+    for args in [
+      vec!["expri", "run", "--disk-path", "/mnt/data", "train"],
+      vec!["expri", "run", "--disk-resume-free", "30GiB", "train"],
+      vec!["expri", "run", "--disk-recovery-seconds", "3601", "train"],
+    ] {
+      assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+    }
+  }
+
+  #[test]
+  fn queued_disk_requirements_fail_before_submission() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("expri.toml");
+    std::fs::write(
+      &config,
+      "[tasks.train]\ncommand=['true']\n[[tasks.train.requirements.disk]]\nmin_free='20GiB'\n",
+    )
+    .unwrap();
+    let Command::Run(command) = Cli::try_parse_from([
+      "expri",
+      "run",
+      "--config",
+      config.to_str().unwrap(),
+      "--queue",
+      "train",
+    ])
+    .unwrap()
+    .command
+    else {
+      panic!("expected run command");
+    };
+    let error = run_task(command, None, 0, true).unwrap_err().to_string();
+    assert!(error.contains("direct detached runs"), "{error}");
+    assert!(!directory.path().join(".expri").exists());
   }
 
   #[test]

@@ -26,7 +26,10 @@ pub const TASK_STATUSES: &[&str] = &["running", "waiting"];
 pub const MAX_STATE_BYTES: usize = 256 * 1024;
 
 pub fn is_active_status(status: &str) -> bool {
-  matches!(status, "preparing" | "running" | "waiting" | "paused")
+  matches!(
+    status,
+    "pending" | "preparing" | "running" | "waiting" | "paused"
+  )
 }
 
 pub fn is_terminal_status(status: &str) -> bool {

@@ -2,6 +2,13 @@ use super::*;
 use serde_json::json;
 use std::sync::{Arc, Barrier};
 
+#[test]
+fn resource_pending_runs_are_active_but_tasks_cannot_set_pending() {
+  assert!(is_active_status("pending"));
+  assert!(!is_terminal_status("pending"));
+  assert!(!TASK_STATUSES.contains(&"pending"));
+}
+
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Value) {
   let root = tempfile::tempdir().unwrap();
   let run_dir = root.path().canonicalize().unwrap().join("run-test");

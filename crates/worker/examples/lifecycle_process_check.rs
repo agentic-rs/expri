@@ -162,9 +162,97 @@ mod linux {
       Ok(())
     })();
     checked?;
+    fs::write(repo.join("train.py"), TASK)?;
+    resource_checks(&repo, &request, &mut children)?;
     println!(
       "Lifecycle process check passed: recorded source, same-run continuation/history, fresh restart, and replay."
     );
+    Ok(())
+  }
+
+  fn disk_policy(blocked: bool) -> expri_core::resource_requirements::ResourceRequirements {
+    serde_json::from_value(json!({"disk":[{"path":"outputs", "min_free_bytes":if blocked {9_000_000_000_000_000_u64} else {1}, "resume_free_bytes":if blocked {9_000_000_000_000_001_u64} else {2}}], "recovery_seconds":0})).unwrap()
+  }
+
+  fn set_policy(run: &Path, blocked: bool, id: &str) -> Result<()> {
+    let mut change = command(run, ControlAction::SetRequirements, id)?;
+    change.requirements = Some(disk_policy(blocked));
+    assert_eq!(run_control::execute(run, &change)?.status, "applied");
+    Ok(())
+  }
+
+  fn resource_checks(repo: &Path, request: &RunRequest, children: &mut Cleanup) -> Result<()> {
+    let mut request = request.clone();
+    request.requirements = disk_policy(true);
+    let receipt = node::run::execute_request_at(&request, repo)?.unwrap();
+    let run = PathBuf::from(receipt["run_dir"].as_str().unwrap());
+    children.0.push(run.clone());
+    wait_for(|| read_state(&run).is_ok_and(|state| state["status"] == "pending"))?;
+    assert!(!run.join("outputs/metrics.jsonl").exists());
+    set_policy(&run, false, "resources-before-start")?;
+    wait_for(|| run.join("outputs/checkpoint.bin").exists())?;
+    expri_client::registrations::register(&run, "outputs/checkpoint.bin")?;
+    set_policy(&run, true, "resources-before-continue")?;
+    wait_for(|| read_state(&run).is_ok_and(|state| state["status"] == "paused"))?;
+    let mut continuation = command(&run, ControlAction::Continue, "resource-continue")?;
+    continuation.checkpoint = Some("outputs/checkpoint.bin".into());
+    let continued = run_control::execute(&run, &continuation)?;
+    assert_eq!(continued.status, "applied", "{continued:?}");
+    assert_eq!(read_state(&run)?["status"], "pending");
+    assert_eq!(metrics(&run)?.len(), 1);
+    let mut release = command(
+      &run,
+      ControlAction::SetRequirements,
+      "resources-for-continuation",
+    )?;
+    let mut healthy = disk_policy(false);
+    healthy.recovery_seconds = 1;
+    release.requirements = Some(healthy.clone());
+    assert_eq!(run_control::execute(&run, &release)?.status, "applied");
+    wait_for(|| {
+      fs::read_to_string(run.join("outputs/seen-attempt")).is_ok_and(|value| value == "2")
+    })?;
+    assert_eq!(
+      read_state(&run)?["requirements"],
+      serde_json::to_value(healthy)?
+    );
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+      read_state(&run)?["status"],
+      "running",
+      "replacement must not inherit the old monitor's resource hold"
+    );
+    assert_eq!(metrics(&run)?.len(), 2);
+    fs::copy(
+      run.join("outputs/checkpoint.bin"),
+      run.join("outputs/checkpoint-next.bin"),
+    )?;
+    expri_client::registrations::register(&run, "outputs/checkpoint-next.bin")?;
+    set_policy(&run, true, "resources-block-next-continuation")?;
+    wait_for(|| read_state(&run).is_ok_and(|state| state["status"] == "paused"))?;
+    let mut next = command(&run, ControlAction::Continue, "resource-continue-stop")?;
+    next.checkpoint = Some("outputs/checkpoint-next.bin".into());
+    let continued = run_control::execute(&run, &next)?;
+    assert_eq!(continued.status, "applied", "{continued:?}");
+    assert_eq!(read_state(&run)?["status"], "pending");
+    let stop = command(&run, ControlAction::Stop, "stop-blocked-continuation")?;
+    assert_eq!(run_control::execute(&run, &stop)?.status, "applied");
+    assert_eq!(read_state(&run)?["status"], "cancelled");
+    assert_eq!(metrics(&run)?.len(), 2);
+    let restart = command(&run, ControlAction::Restart, "restart-blocked-resources")?;
+    let restarted = run_control::execute(&run, &restart)?;
+    assert_eq!(restarted.status, "applied", "{restarted:?}");
+    let successor = run.parent().unwrap().join(restarted.new_run_id.unwrap());
+    children.0.push(successor.clone());
+    wait_for(|| read_state(&successor).is_ok_and(|state| state["status"] == "pending"))?;
+    assert_eq!(
+      read_state(&successor)?["requirements"],
+      serde_json::to_value(disk_policy(true))?
+    );
+    assert!(!successor.join("outputs/metrics.jsonl").exists());
+    set_policy(&successor, false, "resources-for-restart")?;
+    wait_for(|| successor.join("outputs/checkpoint.bin").exists())?;
+    assert_eq!(metrics(&successor)?[0]["step"], 0);
     Ok(())
   }
 
@@ -189,6 +277,7 @@ mod linux {
       action,
       arguments: None,
       checkpoint: None,
+      requirements: None,
       reason: "isolated lifecycle verification".into(),
       grace_seconds: 3,
       expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,

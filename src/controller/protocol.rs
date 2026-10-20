@@ -368,6 +368,21 @@ pub(crate) fn require_run_assets(
   )
 }
 
+pub(crate) fn require_run_requirements(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  require_run_capability(
+    remote,
+    preference,
+    node_bin,
+    expri_core::resource_requirements::RUN_REQUIREMENTS_CAPABILITY,
+    "disk requirements",
+    "or remove the run's disk requirements",
+  )
+}
+
 fn require_run_capability(
   remote: &Remote,
   preference: ProtocolPreference,

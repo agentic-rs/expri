@@ -36,7 +36,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 // Version normalized run metadata independently of the unchanged artifact digest.
 // Schema 7 retains the published supervisor generation for lifecycle fencing.
-const OVERVIEW_SCHEMA_VERSION: u64 = 7;
+const OVERVIEW_SCHEMA_VERSION: u64 = 8;
 
 struct MetricReadMode {
   minimum: usize,
@@ -869,7 +869,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         );
       }
     }
-    let mut run = preview(&record["run"], &mut metadata_truncated);
+    let mut run = run_preview(&record["run"], &mut metadata_truncated);
     self
       .decorate_run_metadata(
         &mut run,
@@ -1270,7 +1270,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
       warnings.push(json!({"run_id": scope.run_id, "message": "This task name exceeds the 4 KiB hosted filter limit; task filters and searches omit it. Download the original state for its full name."}));
     }
     let mut metadata_truncated = false;
-    let run = preview(&normalized["run"], &mut metadata_truncated);
+    let run = run_preview(&normalized["run"], &mut metadata_truncated);
     let generation = normalized["state"]["supervisor"]["generation"]
       .as_u64()
       .unwrap_or(0);
@@ -1493,6 +1493,9 @@ fn run_preview(run: &Value, truncated: &mut bool) -> Value {
     "queue_message",
     "queue_only",
     "control",
+    "requirements",
+    "resource_status",
+    "manual_paused",
     "recorded_status",
   ] {
     if let Some(value) = run.get(field) {

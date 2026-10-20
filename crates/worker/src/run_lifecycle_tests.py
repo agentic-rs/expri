@@ -97,6 +97,12 @@ class RunLifecycleTests(unittest.TestCase):
       self.start()
     self.assertFalse((self.repo / ".expri/runs").exists())
 
+  def test_disk_requirements_require_native_worker_before_snapshot(self):
+    self.request["requirements"] = {"disk": [{"path": "outputs", "min_free_bytes": 100, "resume_free_bytes": 120}]}
+    with self.assertRaisesRegex(ValueError, "run-requirements-v1"):
+      self.start()
+    self.assertFalse((self.repo / ".expri/runs").exists())
+
   def test_disabled_publishing_preserves_ordinary_python_fallback(self):
     self.request["service"] = {
       "project_id": "vision", "origin": "gpu-1", "publish": False,

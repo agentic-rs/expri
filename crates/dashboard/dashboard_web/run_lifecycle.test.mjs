@@ -23,7 +23,7 @@ test("lifecycle actions follow acknowledged state and explicit server capabiliti
   for (const status of ["completed", "failed", "cancelled", "lost"]) assert.deepEqual(lifecycleActions({ ...control, status }), ["continue", "restart"]);
   assert.deepEqual(lifecycleActions({ ...control, capabilities: ["stop"] }), ["stop"]);
   assert.deepEqual(lifecycleActions({ ...control, status: "preparing" }), ["stop"]);
-  assert.deepEqual(lifecycleActions({ ...control, status: "pending" }), []);
+  assert.deepEqual(lifecycleActions({ ...control, status: "pending" }), ["stop"]);
   assert.equal(lifecyclePending({ status: "executing" }), true);
   assert.equal(lifecyclePending({ status: "applied" }), false);
   assert.equal(runStatusClass("paused"), "paused");
@@ -242,4 +242,107 @@ test("worker failure is shown without claiming that the run state changed", asyn
   await f.click("run-lifecycle-pause");
   assert.match(f.container.textContent, /Task changed; refresh before retrying/);
   assert.ok(f.container.querySelector("#run-lifecycle-pause")); assert.equal(f.container.querySelector("#run-lifecycle-resume"), null); assert.equal(f.applied(), 0);
+});
+
+const disk_requirements = { disk: [{ path: "outputs", min_free_bytes: 20 * 1024 ** 3, resume_free_bytes: 30 * 1024 ** 3 }], recovery_seconds: 30 };
+const resource_status = { phase: "blocked", blocked: true, checked_at: "2026-10-20T01:00:00Z", recovery_started_at: null,
+  disk: [{ ...disk_requirements.disk[0], available_bytes: 10 * 1024 ** 3, phase: "blocked", error: null }] };
+const resource_control = { ...control, requirements: disk_requirements, resource_status, manual_paused: false,
+  capabilities: [...control.capabilities, "set_requirements"] };
+
+test("resource controls retain old-server compatibility and never expose a raw configuration action", async t => {
+  assert.deepEqual(parseRunLifecycle(resource_control), resource_control);
+  assert.equal(lifecycleActions(resource_control).includes("set_requirements"), false);
+  const f = await fixture(t, {}, () => reply({ ...resource_control, status: "paused" }));
+  assert.ok(f.container.querySelector("#run-resource-edit"));
+  assert.equal(f.container.querySelector("#run-lifecycle-set_requirements"), null);
+  assert.match(f.container.textContent, /outputs.*10 GiB free.*Minimum 20 GiB/s);
+  await f.render({ run: { ...run, run_id: "old-worker", run_key: "gpu-a:old-worker" } });
+  const old = parseRunLifecycle(control);
+  assert.equal(old.requirements, undefined);
+  for (const patch of [{ manual_paused: "yes" }, { requirements: {} }, { resource_status: {} }]) assert.throws(() => parseRunLifecycle({ ...resource_control, ...patch }));
+});
+
+test("requirements are opt-in, validate friendly sizes and save exact bytes with the current binding", async t => {
+  const initial = { ...resource_control, requirements: { disk: [], recovery_seconds: 30 }, resource_status: null };
+  const f = await fixture(t, {}, request => reply(request.method === "POST" ? { ...initial, request: { request_id: JSON.parse(request.body).request_id,
+    action: "set_requirements", status: "requested", error: null, new_run_id: null } } : initial));
+  await f.click("run-resource-edit");
+  assert.match(f.container.textContent, /No disk requirements/);
+  await f.click("run-resource-add");
+  assert.equal(f.container.querySelector("#run-resource-path-0").value, "outputs");
+  assert.equal(f.container.querySelector("#run-resource-min-0").value, "");
+  assert.equal(f.container.querySelector("#run-resource-resume-0").value, "");
+  await f.click("run-resource-save");
+  assert.match(f.container.querySelector("#run-resource-error").textContent, /Enter a disk size/);
+  assert.equal(f.requests.some(request => request.method === "POST"), false);
+  await f.setValue("run-resource-min-0", "20 GiB");
+  await f.setValue("run-resource-resume-0", "10 GiB");
+  await f.click("run-resource-save");
+  assert.match(f.container.querySelector("#run-resource-error").textContent, /higher recovery limit/);
+  await f.setValue("run-resource-resume-0", "30 GiB");
+  await f.setValue("run-resource-recovery", "0");
+  await f.click("run-resource-save");
+  const body = JSON.parse(f.requests.find(request => request.method === "POST").body);
+  assert.deepEqual(body.requirements, { ...disk_requirements, recovery_seconds: 0 });
+  assert.equal(body.action, "set_requirements"); assert.equal(body.expected_attempt, 2); assert.equal(body.expected_generation, 8);
+  assert.equal(body.binding_id, "worker-binding"); assert.equal(body.reason, "Requested from website");
+  assert.match(f.container.textContent, /Requirements requested · waiting for worker/);
+  assert.equal(f.container.querySelector("#run-resource-save").disabled, true);
+});
+
+test("removing all disk paths is an explicit disable request and worker acknowledgement closes the editor", async t => {
+  const f = await fixture(t, {}, request => reply(request.method === "POST" ? { ...resource_control, requirements: { disk: [], recovery_seconds: 30 }, resource_status: null,
+    request: { request_id: JSON.parse(request.body).request_id, action: "set_requirements", status: "applied", error: null, new_run_id: null } } : resource_control));
+  await f.click("run-resource-edit"); await f.click("run-resource-remove-0");
+  assert.equal(f.requests.some(request => request.method === "POST"), false);
+  await f.click("run-resource-save");
+  assert.deepEqual(JSON.parse(f.requests.find(request => request.method === "POST").body).requirements, { disk: [], recovery_seconds: 30 });
+  assert.equal(f.container.querySelector("#run-resource-form"), null);
+  assert.equal(f.container.querySelector("#run-resource-status"), null);
+  assert.equal(f.applied(), 1);
+});
+
+test("requirements stay reviewable on read-only dashboards and cannot be sent", async t => {
+  const f = await fixture(t, { enabled: false }, () => reply(resource_control));
+  await f.click("run-resource-edit");
+  assert.equal(f.container.querySelector("#run-resource-min-0").value, "20 GiB");
+  assert.equal(f.container.querySelector("#run-resource-form fieldset").disabled, true);
+  assert.equal(f.container.querySelector("#run-resource-save"), null);
+  assert.equal(f.requests.some(request => request.method === "POST"), false);
+});
+
+test("polling preserves unsaved requirements and a changed generation fences their submission", async t => {
+  let current = resource_control;
+  const f = await fixture(t, {}, () => reply(current));
+  await f.click("run-resource-edit"); await f.setValue("run-resource-min-0", "25 GiB");
+  await f.poll(); assert.equal(f.container.querySelector("#run-resource-min-0").value, "25 GiB");
+  current = { ...current, generation: current.generation + 1 };
+  await f.poll(); await f.click("run-resource-save");
+  assert.match(f.container.textContent, /task changed while this form was open/);
+  assert.equal(f.requests.some(request => request.method === "POST"), false);
+});
+
+test("resource pending is stoppable and resource pause keeps manual intent separate", async t => {
+  let current = { ...resource_control, status: "pending" };
+  const f = await fixture(t, { run: { ...run, status: "pending", started_at: null } }, request => {
+    if (request.method === "POST") {
+      const body = JSON.parse(request.body);
+      current = { ...current, manual_paused: body.action === "pause", request: { request_id: body.request_id, action: body.action,
+        status: "applied", error: null, new_run_id: null } };
+    }
+    return reply(current);
+  });
+  assert.ok(f.container.querySelector("#run-lifecycle-stop"));
+  assert.match(f.container.textContent, /Waiting to start/);
+  assert.doesNotMatch(f.container.textContent, /managed by the scheduler/);
+  current = { ...current, status: "paused" }; await f.poll();
+  assert.equal(f.container.querySelector("#run-lifecycle-pause").textContent, "Keep paused");
+  await f.click("run-lifecycle-pause");
+  assert.equal(f.container.querySelector("#run-lifecycle-pause"), null);
+  assert.match(f.container.textContent, /Manual pause is active/);
+  await f.click("run-lifecycle-resume");
+  assert.match(f.container.textContent, /resumes automatically after every recovery limit/);
+  const bodies = f.requests.filter(request => request.method === "POST").map(request => JSON.parse(request.body));
+  assert.deepEqual(bodies.map(body => body.action), ["pause", "resume"]);
 });

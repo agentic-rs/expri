@@ -17,10 +17,11 @@ test("attempt history projects exact steps and never retains private execution m
   assert.deepEqual(parsed, history);
   assert.equal(JSON.stringify(parsed).includes("private"), false);
   assert.equal(parsed.attempts[0].metric_step_offset, "18446744073709551615");
+  assert.equal(parseTaskAttempts({ ...history, attempts: [{ ...attempt, status: "pending", started_at: null }] }).attempts[0].status, "pending");
 });
 
 test("malformed attempt evidence cannot fabricate dates, status, gaps or exact step values", () => {
-  for (const patch of [{ attempt: 0 }, { attempt: Infinity }, { status: "pending" }, { started_at: "invalid" }, { exit_code: 0.5 }, { reason: "bad\nreason" }, { metric_step_offset: 1 }, { metric_step_offset: "01" }, { metric_step_offset: "18446744073709551616" }, { first_local_step: "-1" }]) {
+  for (const patch of [{ attempt: 0 }, { attempt: Infinity }, { status: "invalid" }, { started_at: "invalid" }, { exit_code: 0.5 }, { reason: "bad\nreason" }, { metric_step_offset: 1 }, { metric_step_offset: "01" }, { metric_step_offset: "18446744073709551616" }, { first_local_step: "-1" }]) {
     const parsed = parseTaskAttempts({ ...history, attempts: [{ ...attempt, ...patch }] });
     assert.deepEqual(parsed.attempts, []);
     assert.equal(parsed.truncated, true);

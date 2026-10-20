@@ -75,8 +75,8 @@ pub(super) fn mutate<S: ObjectStorage>(
   {
     return Err(ApiError::new(415, "run lifecycle requires JSON"));
   }
-  if request.body().len() > 48 * 1024 {
-    return Err(ApiError::new(413, "run lifecycle request exceeds 48 KiB"));
+  if request.body().len() > 96 * 1024 {
+    return Err(ApiError::new(413, "run lifecycle request exceeds 96 KiB"));
   }
   let selection: ControlSubmission = serde_json::from_slice(request.body())
     .map_err(|_| ApiError::new(400, "invalid run lifecycle request"))?;

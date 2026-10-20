@@ -616,6 +616,14 @@ cleanup. Stop gives a paused task the opportunity to run its termination
 handler; its grace period defaults to 30 seconds and accepts 1–3,600 seconds.
 Graceful termination cannot create a checkpoint unless the task implements it.
 
+Supported native Linux detached supervisors also enforce optional
+[disk resource requirements](resource-requirements.md) locally. Requirements can
+hold a direct run in `pending` before launch or suspend its task in memory as
+`paused`. The website displays the resource reason and lets you edit thresholds;
+manual pause intent remains independent of automatic recovery. A worker must
+advertise the resource capability before the editor is offered, so older live
+supervisors retain their existing controls safely.
+
 Continue and Restart preserve the recorded executable and allow editing the
 remaining argument array. The website displays a JSON array so argument
 boundaries, whitespace, and literal shell characters remain intact. Preparation

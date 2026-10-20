@@ -62,6 +62,14 @@ pub struct PreparedRun {
 /// Queue supervisors must verify their preparation/task groups stopped before
 /// their terminal record can release a server-side resource reservation.
 pub fn enable_queue_cleanup(prepared: &mut PreparedRun) -> Result<()> {
+  if !prepared.state["requirements"]["disk"]
+    .as_array()
+    .is_none_or(Vec::is_empty)
+  {
+    return Err(ExpriError::Message(
+      "queued runs do not support local resource requirements yet".into(),
+    ));
+  }
   prepared.state["queue_cleanup"] = json!(true);
   write_state(
     &prepared.snapshot.run_dir.join("run-state.json"),
@@ -83,6 +91,12 @@ pub fn prepare_request_at_with_initializer(
 ) -> Result<PreparedRun> {
   let repo_root = fs::canonicalize(repo_root)?;
   request.environment.validate()?;
+  request.requirements.validate()?;
+  if !request.requirements.is_empty() && (!cfg!(target_os = "linux") || !request.detach) {
+    return Err(ExpriError::Message(
+      "resource requirements require a native Linux detached direct run".into(),
+    ));
+  }
   if let Some(service) = &request.service {
     service.validate()?;
   }
@@ -164,6 +178,7 @@ fn prepare_snapshot(
     "output_dir": snapshot.run_dir.join("outputs"),
     "status": "preparing",
     "detached": request.detach,
+    "requirements": request.requirements,
     "started_at": chrono::Utc::now().to_rfc3339(),
     "logs": {"stdout": STDOUT_LOG, "stderr": STDERR_LOG},
     "assets": snapshot.assets.iter().map(|asset| json!({
@@ -550,7 +565,7 @@ fn finalize_snapshot(
         .is_some_and(|entry| {
           matches!(
             entry["status"].as_str(),
-            Some("preparing" | "running" | "waiting" | "paused")
+            Some("preparing" | "pending" | "running" | "waiting" | "paused")
           )
         });
       if active {
@@ -1010,6 +1025,7 @@ mod tests {
       extras: vec![],
       sync_args: vec![],
       expected_sync: None,
+      requirements: Default::default(),
     };
     let prepared = prepare_request_at_with_initializer(&request, root.path(), || {
       Err(ExpriError::Message("private-initializer-secret".into()))
@@ -1181,6 +1197,7 @@ mod tests {
       extras: vec![],
       sync_args: vec![],
       expected_sync: None,
+      requirements: Default::default(),
     };
     let initialized = std::cell::Cell::new(false);
     let error = execute_request_at_with_initializer(&request, &canonical, || {

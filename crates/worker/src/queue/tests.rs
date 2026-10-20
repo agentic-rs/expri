@@ -678,6 +678,7 @@ fn preparing_a_run_records_its_path_without_launching_and_can_cancel_before_laun
     extras: vec![],
     sync_args: vec![],
     expected_sync: None,
+    requirements: Default::default(),
   };
   let prepared = crate::node::run::prepare_request_at(&request, temporary.path()).unwrap();
   let run = prepared.snapshot.run_dir.clone();

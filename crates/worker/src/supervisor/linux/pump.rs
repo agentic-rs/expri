@@ -132,28 +132,52 @@ pub(crate) fn task(
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
   crate::run_logs::unbuffered_if_absent(command);
-  let mut child = command.spawn()?;
+  if !cleanup_groups
+    && !crate::resource_guard::wait_before_start(run_dir).map_err(io::Error::other)?
+  {
+    return Ok(TaskOutput {
+      output: LoggedOutput {
+        status: std::process::ExitStatus::from_raw(130 << 8),
+        stdout: Vec::new(),
+        log_error: None,
+      },
+      cancelled: true,
+      cleanup_uncertain: false,
+    });
+  }
+  let mut child = None;
+  let initialized = update_state(&run_dir.join("run-state.json"), |state| {
+    state["status"] = json!("running");
+    // A fast task may report its phase immediately. Keep the state lease
+    // from spawn through activation so it sees its own active attempt.
+    let spawned = command.spawn()?;
+    let pid = spawned.id();
+    child = Some(spawned);
+    state["supervisor"] = json!({
+      "protocol_version": 1, "generation": 1, "mode": "live", "events": [],
+      "owner_pid": std::process::id(), "owner_start": process_start(std::process::id())?,
+      "worker_pid": pid,
+    });
+    state["task_continuation_protocol_version"] = json!(1);
+    state["run_control_protocol_version"] = json!(1);
+    state["task_process_group_clean"] = json!(false);
+    expri_core::task_attempts::ensure_initial(state)?;
+    Ok(())
+  })
+  .map_err(io::Error::other);
+  let Some(mut child) = child else {
+    return Err(
+      initialized
+        .err()
+        .unwrap_or_else(|| io::Error::other("task did not spawn")),
+    );
+  };
   let pid = child.id();
   let stdout_pipe =
     unsafe { File::from_raw_fd(child.stdout.take().expect("piped stdout").into_raw_fd()) };
   let stderr_pipe =
     unsafe { File::from_raw_fd(child.stderr.take().expect("piped stderr").into_raw_fd()) };
-  let initialized = (|| {
-    update_state(&run_dir.join("run-state.json"), |state| {
-      state["supervisor"] = json!({
-        "protocol_version": 1, "generation": 1, "mode": "live", "events": [],
-        "owner_pid": std::process::id(), "owner_start": process_start(std::process::id())?,
-        "worker_pid": pid,
-      });
-      state["task_continuation_protocol_version"] = json!(1);
-      state["run_control_protocol_version"] = json!(1);
-      state["task_process_group_clean"] = json!(false);
-      expri_core::task_attempts::ensure_initial(state)?;
-      Ok(())
-    })
-    .map_err(io::Error::other)?;
-    on_started()
-  })();
+  let initialized = initialized.and_then(|()| on_started());
   if let Err(error) = initialized {
     drop(child);
     return Ok(failed_task(pid, error));
@@ -283,8 +307,12 @@ fn pump_inner(
   let mut observed_continuation = None;
   let mut observed_lifecycle = None;
   let mut continuing: Option<crate::continuation::PreparedContinuation> = None;
+  let mut resources = crate::resource_guard::Guard::default();
   update_state(&run_dir.join("run-state.json"), |state| {
     state["run_control_protocol_version"] = json!(1);
+    if !cleanup_groups {
+      state["run_requirements_protocol_version"] = json!(1);
+    }
     Ok(())
   })
   .map_err(io::Error::other)?;
@@ -387,6 +415,10 @@ fn pump_inner(
                 stderr = err;
                 group_cleaned = false;
                 cleanup_uncertain = false;
+                // Resource recovery and in-flight observations belong to the
+                // predecessor. The replacement was checked by its own
+                // prelaunch guard and starts with fresh monitor state.
+                resources = crate::resource_guard::Guard::default();
                 continue;
               }
               Err(error) => return Ok(failed_task(*pid, error)),
@@ -427,10 +459,16 @@ fn pump_inner(
             cancelled = true;
             cancellation_deadline = Some(Instant::now() + Duration::from_secs(u64::from(grace)));
           }
+          resources.force_check();
         }
       }
       if cancelled {
         continue;
+      }
+      if !cleanup_groups {
+        resources
+          .tick(run_dir, Some(*pid))
+          .map_err(io::Error::other)?;
       }
       if let Ok(metadata) = fs::symlink_metadata(run_dir.join(".task-continuation.json")) {
         let identity = (metadata.dev(), metadata.ino());

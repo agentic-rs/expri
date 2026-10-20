@@ -1953,6 +1953,9 @@ mod tests {
         command: vec!["train".into()],
         checkpoints: vec![],
         lifecycle: None,
+        requirements: None,
+        resource_status: None,
+        manual_paused: None,
         result: None,
       },
     };
@@ -1993,6 +1996,9 @@ mod tests {
       command: vec!["train".into()],
       checkpoints: vec![],
       lifecycle: None,
+      requirements: None,
+      resource_status: None,
+      manual_paused: None,
       result: None,
     };
     for foreign in [

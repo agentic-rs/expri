@@ -158,6 +158,8 @@ def _lifecycle_existing_machine_id():
 
 def start_run(repo_root, request, context, worker_source, ready_timeout=10.0):
   """Snapshot before acknowledgement; return a detached receipt or foreground exit."""
+  if request.get("requirements", {}).get("disk"):
+    raise ValueError("resource requirements require a native Linux detached worker with run-requirements-v1")
   if request.get("service") is not None and request["service"].get("publish", True):
     raise ValueError("automatic publishing requires a native expri worker with run-publishing-v1")
   if not request.get("command"):

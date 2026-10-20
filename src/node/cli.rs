@@ -164,6 +164,8 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     SUPERVISOR_RESTART_CAPABILITY,
     #[cfg(target_os = "linux")]
     TASK_CONTINUATION_CAPABILITY,
+    #[cfg(target_os = "linux")]
+    expri_core::resource_requirements::RUN_REQUIREMENTS_CAPABILITY,
     RUN_METRICS_CAPABILITY,
     RUN_PUBLISHING_CAPABILITY,
     SMOKE_RUNS_CAPABILITY,

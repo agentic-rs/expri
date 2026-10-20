@@ -127,10 +127,10 @@ pub(super) fn archive_smoke_document(
   if path != "run-state.json"
     || value["smoke"].as_bool() != Some(true)
     || value["run_id"].as_str() != Some(scope.run_id.as_str())
-    || !value
+    || value
       .get("schema_version")
       .map_or(Some(0), serde_json::Value::as_u64)
-      .is_some_and(|schema| schema <= 1)
+      .is_none_or(|schema| schema > 1)
     || !value["status"]
       .as_str()
       .is_some_and(expri_core::run_state::is_terminal_status)

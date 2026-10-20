@@ -219,6 +219,7 @@ impl Fixture {
       .expect("ambient Python alias");
     let request = RunRequest {
       service: None,
+      requirements: Default::default(),
       detach: false,
       smoke: false,
       name: "train".to_string(),

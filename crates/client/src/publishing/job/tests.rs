@@ -65,13 +65,7 @@ fn registration_pins_options_credentials_and_canonical_target_without_public_sec
   let saved = serde_json::to_vec(&job).unwrap();
   let recovered: PreparedJob = serde_json::from_slice(&saved).unwrap();
   assert!(job == recovered);
-  assert!(
-    job
-      .safe_report()
-      .to_string()
-      .find("bound-worker-token")
-      .is_none()
-  );
+  assert!(!job.safe_report().to_string().contains("bound-worker-token"));
   assert_eq!(
     job.redact("bound-worker-token rejected"),
     "[redacted] rejected"

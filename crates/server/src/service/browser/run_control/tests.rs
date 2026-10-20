@@ -39,6 +39,9 @@ fn fixture() -> (tempfile::TempDir, Store<MockStorage>, BrowserAuth, String) {
         command: vec!["python".into(), "train.py".into()],
         checkpoints: vec![],
         lifecycle: None,
+        requirements: None,
+        resource_status: None,
+        manual_paused: None,
         result: None,
       },
     })
@@ -175,7 +178,7 @@ fn lifecycle_request_limits_reject_extra_fields_and_server_assigned_expiry() {
       &store,
       &auth,
       true,
-      &request("POST", PATH, Some(&cookie), vec![b' '; 48 * 1024 + 1])
+      &request("POST", PATH, Some(&cookie), vec![b' '; 96 * 1024 + 1])
     )
     .status(),
     413

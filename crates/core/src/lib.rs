@@ -7,6 +7,7 @@ pub mod identifiers;
 pub mod lock;
 pub mod protocol;
 pub mod resource_queue;
+pub mod resource_requirements;
 pub mod run_control;
 pub mod run_state;
 pub mod run_system;

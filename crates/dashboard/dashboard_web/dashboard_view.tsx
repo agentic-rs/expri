@@ -16,6 +16,7 @@ import { RunSupervisorHistory } from "./run_supervisor_view";
 import { RunAttemptHistory } from "./run_attempts_view";
 import { parseTaskAttempts } from "./run_attempts";
 import { lifecyclePanelKey, RunLifecyclePanel } from "./run_lifecycle_view";
+import { RunResourceBadge } from "./run_resources_view";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -829,6 +830,7 @@ function RunBrowser({
                       {run.status}
                     </span>
                     {!queuePlaceholder(run) && <RunStatusTiming run={run} />}
+                    <RunResourceBadge status={["pending", "paused"].includes(run.status) ? run.resource_status : null} />
                   </td>
                   {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
                   <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
