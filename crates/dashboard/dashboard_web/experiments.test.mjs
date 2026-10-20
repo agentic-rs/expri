@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { JSDOM } from "jsdom";
-import { checkpointStep, parseExperimentCatalog, experimentDisplayName, experimentRunScope, memberExperiment, removeExperimentMember,
+import { checkpointStep, parseExperimentCatalog, parseExperimentGroups, experimentDisplayName, experimentRunScope, memberExperiment, removeExperimentMember,
   ExperimentFilter, ExperimentRunPanel } from "./.test/app.js";
 
 const scope = (origin, run_id = "same-run") => ({ project_id: "vision", origin, run_id });
@@ -14,6 +14,37 @@ function experiment(patch = {}) {
     created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", unavailable_runs: [first], membership_count: 2, ...patch };
 }
 function catalog(item = experiment()) { return { project_id: "vision", revision: "project-1", experiments: [item] }; }
+
+test("group summaries preserve top-level order, full representative identities and empty retained experiments", () => {
+  const runs = [first, second].map((member) => ({ ...member, run_key: `${member.origin}:${member.run_id}` }));
+  const summary = { experiment_id: "experiment-1", name: "Translation", revision: "1" };
+  const group = { experiment: summary, run_key: runs[0].run_key, membership_count: 3, matching_count: 2, active_count: 1, unavailable_count: 1 };
+  const standalone = { experiment: null, run_key: runs[1].run_key, membership_count: 1, matching_count: 1, active_count: 1, unavailable_count: 0 };
+  const retained = { ...group, experiment: { ...summary, experiment_id: "retained" }, run_key: null,
+    membership_count: 1, matching_count: 0, active_count: 0, unavailable_count: 1 };
+  const empty = { ...retained, experiment: { ...summary, experiment_id: "empty" }, membership_count: 0, unavailable_count: 0 };
+  const entries = [standalone, retained, group, empty];
+  assert.deepEqual(parseExperimentGroups(entries, runs), entries,
+    "group order comes from the server, while equal actual run IDs remain distinct across workers");
+});
+
+test("invalid group responses cannot invent representatives, duplicate identities or impossible activity", () => {
+  const run = { run_id: first.run_id, run_key: `${first.origin}:${first.run_id}` };
+  const group = { experiment: { experiment_id: "experiment-1", name: "Translation", revision: "1" }, run_key: run.run_key,
+    membership_count: 2, matching_count: 2, active_count: 1, unavailable_count: 0 };
+  for (const entries of [null, [null], Array(101).fill(group),
+    [{ ...group, membership_count: -1 }], [{ ...group, membership_count: 257 }], [{ ...group, active_count: 1.5 }],
+    [{ ...group, matching_count: 3 }], [{ ...group, active_count: 3 }], [{ ...group, unavailable_count: 3 }],
+    [{ ...group, unavailable_count: 1 }],
+    [{ ...group, run_key: "outside:unknown-run" }], [{ ...group, run_key: null }],
+    [{ ...group, matching_count: 0, active_count: 0 }], [{ ...group, experiment: null }],
+    [{ ...group, experiment: null, membership_count: 1, matching_count: 1, unavailable_count: 1 }],
+    [group, group], [group, { ...group, experiment: { ...group.experiment, experiment_id: "other" } }], []]) {
+    assert.throws(() => parseExperimentGroups(entries, [run]));
+  }
+  assert.throws(() => parseExperimentGroups([group], [run, { ...run }]));
+  assert.deepEqual(parseExperimentGroups([], []), []);
+});
 
 test("experiment parsing preserves multiline descriptions, Unicode checkpoints and exact u64 steps", () => {
   assert.deepEqual(parseExperimentCatalog(catalog(), "vision"), catalog());

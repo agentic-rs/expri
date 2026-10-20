@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
-const EXPERIMENT_LIMIT: usize = 128;
+pub(in crate::service) const EXPERIMENT_LIMIT: usize = 128;
 const MEMBER_LIMIT: usize = 256;
 const LINEAGE_LIMIT: usize = 512;
 const PROJECT_BYTE_LIMIT: usize = 1024 * 1024;

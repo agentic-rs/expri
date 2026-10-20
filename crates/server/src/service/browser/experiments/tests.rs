@@ -112,7 +112,27 @@ fn experiment_routes_require_session_same_origin_and_primary_writes() {
   );
   let catalog: Value = serde_json::from_slice(catalog.body()).unwrap();
   assert_eq!(catalog["experiments_supported"], true);
+  assert_eq!(catalog["experiment_groups_supported"], true);
   assert_eq!(catalog["experiment_management_enabled"], false);
+  let grouped = handle(
+    &store,
+    &auth,
+    false,
+    &request(
+      "GET",
+      "/api/runs?source=hosted-project:project&group_experiments=true",
+      b"",
+      Some(cookie),
+    ),
+  );
+  assert_eq!(grouped.status(), 200);
+  let grouped: Value = serde_json::from_slice(grouped.body()).unwrap();
+  assert_eq!(grouped["total_count"], 1);
+  assert_eq!(
+    grouped["experiment_groups"][0]["experiment"]["experiment_id"],
+    experiment["experiment_id"]
+  );
+  assert!(grouped["experiment_groups"][0]["run_key"].is_null());
   let delete = serde_json::to_vec(&json!({"project_id":"project","experiment_id":experiment["experiment_id"],"expected_revision":experiment["revision"]})).unwrap();
   assert_eq!(
     handle(

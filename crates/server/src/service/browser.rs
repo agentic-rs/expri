@@ -287,6 +287,7 @@ fn route<S: ObjectStorage>(
       .ok_or_else(|| ApiError::new(500, "invalid dashboard capabilities"))?;
     fields.insert("run_management_enabled".into(), json!(allow_run_management));
     fields.insert("experiments_supported".into(), json!(true));
+    fields.insert("experiment_groups_supported".into(), json!(true));
     fields.insert(
       "experiment_management_enabled".into(),
       json!(allow_run_management),

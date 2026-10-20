@@ -1,3 +1,4 @@
+mod experiment_groups;
 mod queue;
 mod reader;
 mod source;
@@ -469,6 +470,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     self.list_table(
       source_id,
       &ListQuery {
+        group_experiments: false,
         experiment_id: None,
         archived: false,
         origin: None,
@@ -483,7 +485,11 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   pub(super) fn list_table(&self, source_id: &str, query: &ListQuery<'_>) -> Result<Value> {
+    if query.group_experiments {
+      return self.list_experiment_groups(source_id, query);
+    }
     let ListQuery {
+      group_experiments: _,
       archived,
       origin,
       experiment_id,

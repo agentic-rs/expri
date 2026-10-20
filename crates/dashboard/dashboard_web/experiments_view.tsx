@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { apiUrl, errorText, parseProjectRunKey, runIdentity, type RunDeepLink } from "./dashboard_model";
+import { apiUrl, errorText, parseProjectRunKey, parseRunDeepLink, runIdentity, type RunDeepLink } from "./dashboard_model";
 import { RunControlPopover } from "./run_control_popover";
 import { checkpointStep, experimentDisplayName, experimentProject, experimentRunScope, memberExperiment, removeExperimentMember,
-  sameScope, scopeIdentity, type Experiment, type ExperimentDraft, type ExperimentLineage, type LineageKind } from "./experiments";
+  sameScope, scopeIdentity, type Experiment, type ExperimentDraft, type ExperimentGroup, type ExperimentLineage, type LineageKind } from "./experiments";
 import type { DashboardActions, DashboardSnapshot } from "./dashboard_view";
 
 const LINEAGE_LABELS: Record<LineageKind, string> = { continued: "Continued from", restarted: "Restarted from", split: "Split from" };
@@ -51,6 +51,55 @@ export function ExperimentFilter({ snapshot: s, actions: a }: { snapshot: Dashbo
   </label>;
 }
 
+export function ExperimentViewControl({ snapshot: s, actions: a }: { snapshot: DashboardSnapshot; actions: DashboardActions }) {
+  if (!s.experiments.groups_supported) return null;
+  return <fieldset className="run-history-view" disabled={s.controls_disabled || s.list_busy}>
+    <legend className="sr-only">Run history view</legend>
+    {([['experiments', 'Experiments'], ['runs', 'Runs']] as const).map(([value, label]) => <label className="history-view-choice" key={value}>
+      <input id={`history-view-${value}`} className="sr-only" type="radio" name="run_history_view" value={value}
+        checked={s.experiments.view === value} onChange={() => a.experiment_view(value)} />
+      <span>{label}</span>
+    </label>)}
+  </fieldset>;
+}
+
+export function ExperimentGroupLabel({ group, snapshot: s, actions: a }: {
+  group: ExperimentGroup; snapshot: DashboardSnapshot; actions: DashboardActions;
+}) {
+  const experiment = group.experiment;
+  if (!experiment) return null;
+  const expanded = s.experiments.expanded.includes(experiment.experiment_id);
+  const name = experimentDisplayName(experiment, s.experiments.catalog?.experiments ?? s.experiments.groups.flatMap((group) => group.experiment ? [group.experiment] : []));
+  const counts = `${group.membership_count} retained runs · ${group.matching_count} matching · ${group.active_count} active matching · ${group.unavailable_count} unavailable`;
+  return <div className="experiment-group-label">
+    <button type="button" className="experiment-expand" disabled={s.list_busy} title={`${experiment.name} · ${experiment.experiment_id}`}
+      aria-label={`${expanded ? "Collapse" : "Expand"} experiment ${name}`} aria-expanded={expanded}
+      onClick={() => a.experiment_expand(experiment.experiment_id, !expanded)}>
+      <svg viewBox="0 0 12 12" aria-hidden="true"><path d="m4 2 4 4-4 4" /></svg><strong>{name}</strong>
+    </button>
+    <span className="experiment-member-count" title={counts} aria-label={`${group.matching_count} matching runs of ${group.membership_count} retained runs`}>
+      {group.matching_count === group.membership_count ? group.membership_count : `${group.matching_count}/${group.membership_count}`}
+    </span>
+    {group.active_count > 0 && <span className="experiment-active-count" title={`${group.active_count} active matching ${group.active_count === 1 ? "run" : "runs"}`} aria-label={`${group.active_count} active matching runs`}><span aria-hidden="true">●</span>{group.active_count}</span>}
+  </div>;
+}
+
+export function ExperimentHistoryFooter({ group, shown, snapshot: s, actions: a, columns }: {
+  group: ExperimentGroup; shown: number; snapshot: DashboardSnapshot; actions: DashboardActions; columns: number;
+}) {
+  const experiment = group.experiment;
+  if (!experiment) return null;
+  const history = s.experiments.histories[experiment.experiment_id];
+  return <tr className="experiment-history-footer" data-experiment-history={experiment.experiment_id}><td colSpan={columns}>
+    <div className="experiment-history-controls">
+      <span className="muted">{shown} matching {shown === 1 ? "run" : "runs"} shown</span>
+      {(history?.loading ?? true) && <span className="muted" role="status">Loading history…</span>}
+      {history?.error && <><span className="experiment-history-error" role="alert">{history.error}</span><button id={`experiment-retry-${experiment.experiment_id}`} type="button" className="text-button" disabled={history.loading || s.list_busy} onClick={() => a.experiment_more(experiment.experiment_id)}>Retry</button></>}
+      {history?.next_offset !== null && history?.next_offset !== undefined && !history.error && <button id={`experiment-more-${experiment.experiment_id}`} type="button" className="text-button" disabled={history.loading || s.list_busy} onClick={() => a.experiment_more(experiment.experiment_id)}>Load more runs</button>}
+    </div>
+  </td></tr>;
+}
+
 export function ExperimentManager({ snapshot: s, actions: a, open, on_change }: {
   snapshot: DashboardSnapshot; actions: DashboardActions; open: boolean; on_change: (open: boolean) => void;
 }) {
@@ -73,8 +122,8 @@ export function ExperimentManager({ snapshot: s, actions: a, open, on_change }: 
     const run = s.runs.find((item) => runIdentity(item) === identity);
     const member = run ? experimentRunScope(run, source) : source?.kind === "hosted_project" ? (() => {
       const parsed = parseProjectRunKey(identity); return parsed ? { project_id, ...parsed } : null;
-    })() : null;
-    return member ? [member] : [];
+    })() : source?.kind === "service" && source.origin ? { project_id, origin: source.origin, run_id: identity } : null;
+    return member && parseRunDeepLink(apiUrl("", member)) ? [member] : [];
   });
   const save = async (event: FormEvent) => {
     event.preventDefault();

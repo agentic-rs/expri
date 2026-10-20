@@ -25,6 +25,22 @@ export type Experiment = {
 export type ExperimentCatalog = { project_id: string; revision: string; experiments: Experiment[] };
 export type ExperimentDraft = Pick<Experiment, "name" | "description" | "members" | "lineage">;
 export type ExperimentSummary = Pick<Experiment, "experiment_id" | "name" | "revision">;
+export type ExperimentGroup = {
+  experiment: ExperimentSummary | null;
+  run_key: string | null;
+  membership_count: number;
+  matching_count: number;
+  active_count: number;
+  unavailable_count: number;
+};
+export type ExperimentHistory = {
+  runs: Run[];
+  loading: boolean;
+  error: string | null;
+  next_offset: number | null;
+  offset: number;
+  total_count: number | null;
+};
 export type ExperimentState = {
   supported: boolean;
   management_enabled: boolean;
@@ -33,7 +49,42 @@ export type ExperimentState = {
   error: string | null;
   catalog: ExperimentCatalog | null;
   filter: string;
+  groups_supported: boolean;
+  view: "experiments" | "runs";
+  groups: ExperimentGroup[];
+  expanded: string[];
+  histories: Record<string, ExperimentHistory>;
 };
+
+export function parseExperimentGroups(value: unknown, runs: Run[]): ExperimentGroup[] {
+  if (!Array.isArray(value) || value.length > 100) throw new Error("Experiment groups are unavailable. Switch to Runs or refresh the server.");
+  const run_keys = new Set(runs.map(runIdentity)), seen_runs = new Set<string>(), seen_groups = new Set<string>();
+  if (run_keys.size !== runs.length) throw new Error("Experiment groups contain duplicate run identities.");
+  const groups = value.map((entry): ExperimentGroup => {
+    if (!entry || typeof entry !== "object") throw new Error("The experiment group response is invalid.");
+    const group = entry as ExperimentGroup;
+    for (const name of ["membership_count", "matching_count", "active_count", "unavailable_count"] as const)
+      if (!Number.isSafeInteger(group[name]) || group[name] < 0 || group[name] > 256) throw new Error("The experiment group counts are invalid.");
+    if (group.matching_count > group.membership_count || group.active_count > group.matching_count ||
+      group.unavailable_count + group.matching_count > group.membership_count) throw new Error("The experiment group counts are inconsistent.");
+    if (group.experiment !== null) {
+      const experiment = group.experiment;
+      if (!experiment || !/^[A-Za-z0-9._-]{1,96}$/.test(experiment.experiment_id) ||
+        typeof experiment.revision !== "string" || !experiment.revision || seen_groups.has(experiment.experiment_id))
+        throw new Error("The experiment group identity is invalid.");
+      text(experiment.name, "experiment name", 512, false, 128);
+      seen_groups.add(experiment.experiment_id);
+    } else if (group.membership_count !== 1 || group.matching_count !== 1 || group.unavailable_count !== 0) throw new Error("An ungrouped run has invalid counts.");
+    if (group.run_key !== null) {
+      if (!run_keys.has(group.run_key) || seen_runs.has(group.run_key) || group.matching_count === 0)
+        throw new Error("The latest experiment run is invalid.");
+      seen_runs.add(group.run_key);
+    } else if (!group.experiment || group.matching_count !== 0) throw new Error("The experiment is missing its latest run.");
+    return group;
+  });
+  if (seen_runs.size !== run_keys.size) throw new Error("The experiment group response has unreferenced runs.");
+  return groups;
+}
 
 export function experimentDisplayName(experiment: ExperimentSummary, experiments: ExperimentSummary[]): string {
   const duplicates = experiments.filter((item) => item.name === experiment.name && item.experiment_id !== experiment.experiment_id);

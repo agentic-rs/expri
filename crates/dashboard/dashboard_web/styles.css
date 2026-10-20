@@ -483,6 +483,29 @@ details.inspector-controls { display: block; }
 .review-management > * { flex: 1; min-width: 250px; }
 
 /* Experiments organize durable identities without changing run histories. */
+.run-history-title { display: inline-flex; min-width: 0; border-radius: 4px; }
+.run-history-view { display: inline-flex; flex: 0 0 auto; align-items: center; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-soft); min-width: 0; }
+.history-view-choice { position: relative; display: inline-flex; flex: 0 0 auto; cursor: pointer; }
+.history-view-choice > span { display: block; min-height: 28px; padding: 4px 7px; border-radius: 3px; color: var(--muted); font-size: 11px; line-height: 18px; white-space: nowrap; }
+.history-view-choice input:checked + span { color: var(--ink); background: var(--paper); box-shadow: inset 0 0 0 1px var(--line-strong); }
+.history-view-choice input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 2px; }
+.history-view-choice:hover > span { color: var(--ink); }
+.experiment-group-label { display: flex; align-items: center; gap: 4px; min-width: 0; margin-bottom: 3px; }
+.experiment-expand { display: inline-flex; align-items: center; gap: 4px; flex: 1; min-width: 0; padding: 0; border: 0; color: var(--ink); background: transparent; text-align: left; font-size: 11px; line-height: 16px; }
+.experiment-expand strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.experiment-expand svg { flex-shrink: 0; width: 10px; height: 10px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.experiment-expand[aria-expanded=true] svg { transform: rotate(90deg); }
+.experiment-member-count, .experiment-active-count { flex-shrink: 0; display: inline-flex; align-items: center; gap: 3px; font-size: 10px; line-height: 16px; font-variant-numeric: tabular-nums; }
+.experiment-member-count { color: var(--muted); background: var(--surface-soft); padding-inline: 4px; border-radius: 3px; }
+.experiment-active-count { color: var(--accent); }
+.experiment-active-count > span { font-size: 6px; }
+.experiment-latest-label { margin-right: 3px; color: var(--muted); font: 10px/16px var(--font-sans); }
+.runs-table .experiment-child .run-cell { padding-left: 20px; }
+.runs-table .experiment-child .selection-column { border-left: 2px solid var(--accent-line); }
+.experiment-history-footer > td { padding: 5px 8px 7px 22px !important; background: var(--surface-soft); }
+.experiment-history-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 10px; }
+.experiment-history-controls .text-button { padding: 0; min-height: 24px; font-size: 10px; }
+.experiment-history-error { color: var(--error-ink); overflow-wrap: anywhere; }
 .experiment-manager { display: flex; flex-direction: column; gap: 8px; }
 .experiment-manager-heading, .experiment-run-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .experiment-chooser, .experiment-lineage-list { list-style: none; margin: 0; padding: 0; }
@@ -911,7 +934,7 @@ details.inspector-controls { display: block; }
   .auto-refresh { font-size: 11px; }
   .field input, .field select, .search-control, .asset-reference-input { height: 36px; }
   .search-control input { height: 34px; }
-  .button, .navigation-item > span, .theme-choice span, .metric-choice, .log-tab, .review-tab { min-height: 36px; }
+  .button, .navigation-item > span, .theme-choice span, .history-view-choice > span, .metric-choice, .log-tab, .review-tab { min-height: 36px; }
   .text-button { min-height: 32px; }
   .choice-tag span { min-height: 32px; }
   .run-history { min-height: 430px; height: 68dvh; max-height: 650px; }

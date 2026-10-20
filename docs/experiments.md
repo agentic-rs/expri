@@ -13,23 +13,35 @@ from different machines remain separate members.
 
 ## Group runs in the website
 
-On the primary hosted dashboard, select a project and use **Experiments** in the
-run history header. Create an experiment, then add runs from the current selection or a
+On the primary hosted dashboard, select a project and open the experiment manager
+in the run history header. Create an experiment, then add runs from the current selection or a
 run's inspector. Give the experiment a name that describes the ongoing goal,
 such as “Train translation model v2”. Empty experiments are allowed.
 
-Run history is a flat table, newest first by default. Experiment membership does
-not move older runs beside newer ones or override the selected sort. Select an
-experiment under **Filters**, or select its name in **Experiments**, to page
-through its members in the same sortable table. Clear the experiment filter to
-return to all runs. **Ungrouped runs** is also available in Filters.
+The **Experiments** view starts with each experiment collapsed. Its row shows
+the latest started run, including that run's status, machine, elapsed time, and
+selected columns. The count beside the experiment includes all retained members;
+the active count includes running, waiting, paused, and pending members. Expand a
+group to load its other runs newest first, with separate history pagination.
+Ungrouped runs remain ordinary rows. Empty experiments and unavailable members
+remain visible without invented run statuses or execution controls.
 
-Search, machine, status, sorting, and optional columns apply to the individual
-runs. The experiment filter searches the experiment's recorded membership,
-including older runs beyond the normal recent-run window. Counts in the
-experiment manager describe its full membership; table counts and pagination
-describe the filtered runs. Lineage stays in the run inspector and experiment
-manager, keeping run history compact. Run comparisons preserve separate series.
+Search, machine, task, and status filters select matching members. A filtered
+group shows its **Latest matching** run, matching member count, and matching
+active count. The full membership count stays visible. The latest run is a
+summary, not a designated primary version. Sorting uses that representative's
+values and paginates complete groups, so older members never split an experiment
+across top-level pages. Optional scalar columns are loaded for representatives
+and expanded history, rather than every hidden member.
+
+Choose **Runs** for a flat sortable table, newest first by default. Select an
+experiment under **Filters**, or select its name in the experiment manager, to
+page through its full recorded membership, including older runs beyond the
+normal recent-run window. **Ungrouped runs** is also available in Filters.
+Table counts and pagination describe top-level entries in Experiments and
+individual runs in Runs. Selection, inspection, and lifecycle actions always
+target individual runs. Lineage stays in the inspector and experiment manager;
+run comparisons preserve separate series.
 
 Names, descriptions, membership, and lineage are service-owned metadata. Worker
 publishing cannot replace them. Edits use the experiment's revision so that a
@@ -92,11 +104,19 @@ partitioning, collective pause/stop, and combined experiment metrics are separat
 execution features.
 
 AB previews expose experiment browsing as read-only. Local and cached dashboards
-and older hosted servers keep their existing run browsing without experiment
-management. Upgrade the hosted backend before using the new website controls.
+and older hosted servers keep their existing run browsing. Grouped browsing is
+enabled only when the hosted backend advertises support; older servers that
+support experiment metadata keep the flat table and experiment filters.
 
 Each project supports up to 128 experiments. An experiment can contain up to 256
 runs and 512 relationships. The serialized project experiment catalog is limited
 to 1 MiB. Names support 128 characters and descriptions 2,048 characters, with
 UTF-8 byte limits as well. Limits are enforced before a save commits, preserving
 the previous experiment on invalid or oversized edits.
+
+Grouped reads consider full retained experiment membership, plus the normal
+recent windows of up to 500 ungrouped runs and 500 pending queued runs. Each
+request has a 2,048-overview budget and a 30-second deadline. If it cannot read
+enough metadata to determine an accurate latest run and counts, it asks you to
+narrow the machine or experiment filter, or switch to Runs, instead of showing
+a partial group as complete.

@@ -346,23 +346,26 @@ function latestRunQuery(model) {
   return new URL(model.requests.filter(url => url.startsWith("/api/runs?")).at(-1), "http://localhost").searchParams;
 }
 
-async function experimentFixture(t, { mutable = true, count = 3, member_indices = [0, 1], experiments: initial, catalog_status = 200, server_orders = {}, intercept, ...fields } = {}) {
+async function experimentFixture(t, { mutable = true, count = 3, member_indices = [0, 1], experiments: initial, catalog_status = 200,
+  group_supported = false, group_entries = [], group_orders = {}, run_patches = {}, server_orders = {}, intercept, ...fields } = {}) {
   const source = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] };
   const scope = (origin, run_id) => ({ project_id: "vision", origin, run_id });
   const runs = Array.from({ length: count }, (_, index) => ({ run_id: `run-${index}`, run_key: `gpu-${index === 1 ? "b" : "a"}:run-${index}`,
     origin: index === 1 ? "gpu-b" : "gpu-a", task: "train", status: index === 0 ? "running" : index === 1 ? "failed" : "completed",
     started_at: new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000).toISOString(),
-    finished_at: index === 0 ? null : new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000 + 3000).toISOString(), exit_code: index === 1 ? 1 : null }));
+    finished_at: index === 0 ? null : new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000 + 3000).toISOString(), exit_code: index === 1 ? 1 : null,
+    ...run_patches[index] }));
   const make = (patch = {}) => ({ experiment_id: "experiment-1", name: "Language model", description: "Across machines\nIndependent metrics", revision: "exp-revision-1",
     members: member_indices.map((index) => scope(runs[index].origin, runs[index].run_id)),
-    lineage: member_indices.includes(0) && member_indices.includes(1) ? [{ parent: scope("gpu-a", "run-0"), child: scope("gpu-b", "run-1"), kind: "continued", checkpoint: "checkpoint-900", step: "900" }] : [],
+    lineage: member_indices.includes(0) && member_indices.includes(1) ? [{ parent: scope(runs[0].origin, runs[0].run_id), child: scope(runs[1].origin, runs[1].run_id), kind: "continued", checkpoint: "checkpoint-900", step: "900" }] : [],
     created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: member_indices.length, unavailable_runs: [], ...patch });
-  const state = { experiments: initial ?? [make()], catalog_status, saves: [], deletes: [], reads: 0, project_revision: "project-1", replay: new Map() };
+  const state = { experiments: initial ?? [make()], runs, group_entries, catalog_status, saves: [], deletes: [], reads: 0, project_revision: "project-1", replay: new Map() };
   const model = await reviewFixture(t, { ...fields, hosted: true, projects: true, project_runs: runs, override: (url, options) => {
     const overridden = intercept?.(url, options, state);
     if (overridden !== undefined) return overridden;
     if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [source], initial_source: source.source_id,
-      access_mode: "hosted", warnings: [], run_management_enabled: mutable, experiments_supported: true, experiment_management_enabled: mutable });
+      access_mode: "hosted", warnings: [], run_management_enabled: mutable, experiments_supported: true, experiment_management_enabled: mutable,
+      ...(group_supported ? { experiment_groups_supported: true } : {}) });
     if (url.pathname === "/api/experiments") {
       state.reads++;
       return state.catalog_status === 200 ? response({ project_id: "vision", revision: state.project_revision, experiments: structuredClone(state.experiments) }) :
@@ -383,6 +386,15 @@ async function experimentFixture(t, { mutable = true, count = 3, member_indices 
     }
     if (url.pathname === "/api/runs") {
       const id = url.searchParams.get("experiment_id"), offset = Number(url.searchParams.get("offset")), limit = Number(url.searchParams.get("limit"));
+      if (url.searchParams.get("group_experiments") === "true") {
+        assert.equal(group_supported, true, "group requests require explicit server support");
+        const order = group_orders[`${url.searchParams.get("sort")}:${url.searchParams.get("direction")}`];
+        const ordered = order ? order.flatMap((key) => state.group_entries.filter((entry) => (entry.experiment?.experiment_id ?? entry.run_key) === key)) : state.group_entries;
+        const entries = ordered.slice(offset, offset + limit);
+        return response({ source, runs: entries.flatMap((entry) => runs.filter((run) => runIdentity(run) === entry.run_key)),
+          experiment_groups: structuredClone(entries), total_count: ordered.length, offset,
+          next_offset: offset + limit < ordered.length ? offset + limit : null, warnings: [] });
+      }
       const chosen = state.experiments.find((item) => item.experiment_id === id);
       const contains = (item, run) => item.members.some((member) => member.origin === run.origin && member.run_id === run.run_id);
       const visible = runs.filter((run) => !id || (id === "ungrouped" ? !state.experiments.some((item) => contains(item, run)) : chosen && contains(chosen, run)));
@@ -395,6 +407,358 @@ async function experimentFixture(t, { mutable = true, count = 3, member_indices 
     (state.catalog_status !== 200 || !model.nodes.get("experiment-filter").disabled));
   return Object.assign(model, { state, source, scope, make });
 }
+
+function experimentGroup(run_key, fields = {}) {
+  return { experiment: { experiment_id: "experiment-1", name: "Language model", revision: "exp-revision-1" }, run_key,
+    membership_count: 2, matching_count: 2, active_count: 1, unavailable_count: 0, ...fields };
+}
+function standaloneGroup(run_key) {
+  return { experiment: null, run_key, membership_count: 1, matching_count: 1, active_count: 0, unavailable_count: 0 };
+}
+function experimentChildRequests(model) {
+  return model.requests.map((url) => new URL(url, "http://localhost")).filter((url) =>
+    url.pathname === "/api/runs" && url.searchParams.has("experiment_id") && url.searchParams.get("group_experiments") !== "true");
+}
+function experimentTopKeys(nodes) {
+  return runRows(nodes).filter((row) => !row.hasAttribute("data-experiment-child")).map((row) => row.dataset.runKey);
+}
+function experimentChildren(nodes, id = "experiment-1") {
+  return [...nodes.get("run-rows").querySelectorAll(`tr[data-experiment-child="${id}"]`)];
+}
+async function expandExperiment(nodes, id = "experiment-1") {
+  const button = nodes.get("run-rows").querySelector(`tr[data-experiment-id="${id}"] button[aria-expanded]`);
+  assert.ok(button, "the experiment has an explicit expansion control");
+  if (button.getAttribute("aria-expanded") !== "true") await click(button);
+}
+
+test("collapsed experiments show the latest failed run and other matching activity with lazy read-only history", async t => {
+  const model = await experimentFixture(t, { mutable: false, count: 4, member_indices: [0, 1, 2], group_supported: true,
+    run_patches: { 0: { status: "failed", finished_at: "2026-10-03T01:00:03Z", exit_code: 1 },
+      1: { run_id: "run-0", run_key: "gpu-b:run-0", status: "running", finished_at: null, exit_code: null }, 2: { status: "waiting", finished_at: null } },
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 3, matching_count: 3, active_count: 2 }), standaloneGroup("gpu-a:run-3")] });
+  const { nodes } = model;
+  assert.equal(latestRunQuery(model).get("group_experiments"), "true");
+  assert.equal(nodes.get("history-view-experiments").checked, true);
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-3"]);
+  const row = nodes.get("run-rows").querySelector('tr[data-experiment-id="experiment-1"]');
+  assert.match(row.textContent, /Latest/i);
+  assert.equal(row.querySelector(".experiment-active-count").getAttribute("aria-label"), "2 active matching runs");
+  assert.equal(row.querySelector(".status").textContent.trim(), "failed");
+  assert.equal(row.querySelector("button[aria-expanded]").getAttribute("aria-expanded"), "false");
+  assert.equal(experimentChildRequests(model).length, 0, "collapsed groups do not read child run history");
+  const top_rows = runRows(nodes);
+  await expandExperiment(nodes);
+  await settled(() => experimentChildren(nodes).length === 2);
+  assert.deepEqual(experimentChildren(nodes).map((child) => child.dataset.runKey), ["gpu-b:run-0", "gpu-a:run-2"],
+    "representative exclusion uses the full worker/run identity rather than the actual run ID");
+  assert.equal(nodes.get("run-rows").querySelectorAll('[data-run-key="gpu-a:run-0"]').length, 1,
+    "the representative appears only once after expansion");
+  assert.equal(experimentChildRequests(model).length, 1);
+  const request = experimentChildRequests(model)[0].searchParams;
+  assert.equal(request.get("experiment_id"), "experiment-1");
+  assert.notEqual(request.get("group_experiments"), "true");
+  assert.equal(request.get("sort") ?? "started_at", "started_at");
+  assert.equal(request.get("direction") ?? "desc", "desc");
+  runRows(nodes).filter((item) => !item.hasAttribute("data-experiment-child")).forEach((item, index) => assert.equal(item, top_rows[index]));
+  assert.equal(model.state.saves.length, 0, "read-only expansion does not mutate experiments");
+  await click(row.querySelector("button[aria-expanded]"));
+  assert.equal(experimentChildren(nodes).length, 0);
+  await click(nodes.get("history-view-runs")); await settledTable(nodes);
+  assert.notEqual(latestRunQuery(model).get("group_experiments"), "true");
+  assert.deepEqual(runRows(nodes).map((item) => item.dataset.runKey), model.runs.map((run) => run.run_key));
+  assert.equal(nodes.get("run-rows").querySelector("[data-experiment-id], [data-experiment-child]"), null);
+});
+
+test("experiment pages count top-level entries while expanded history has independent pagination and ordering", async t => {
+  const standalone = Array.from({ length: 22 }, (_, index) => `gpu-a:run-${index + 23}`);
+  const model = await experimentFixture(t, { count: 45, member_indices: Array.from({ length: 23 }, (_, index) => index), group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 23, matching_count: 23 }), ...standalone.map(standaloneGroup)],
+    group_orders: { "run_id:asc": ["experiment-1", ...standalone], "run_id:desc": [...standalone].reverse().concat("experiment-1") } });
+  const { nodes } = model;
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", ...standalone.slice(0, 19)]);
+  const parent_request_count = () => model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length;
+  await expandExperiment(nodes);
+  await settled(() => experimentChildren(nodes).length === 19);
+  const top_keys = experimentTopKeys(nodes), parent_reads = parent_request_count();
+  await click(nodes.get("experiment-more-experiment-1"));
+  await settled(() => experimentChildren(nodes).length === 22);
+  assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), Array.from({ length: 22 }, (_, index) =>
+    `${index === 0 ? "gpu-b" : "gpu-a"}:run-${index + 1}`));
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  assert.equal(parent_request_count(), parent_reads, "loading child pages does not reload or advance the group page");
+  assert.equal(latestRunQuery(model).get("experiment_id"), "experiment-1");
+  assert.equal(experimentChildRequests(model).at(-1).searchParams.get("offset"), "20");
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("offset"), "20");
+  assert.equal(latestRunQuery(model).get("group_experiments"), "true");
+  assert.deepEqual(experimentTopKeys(nodes), standalone.slice(19));
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run ascending"]')); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(latestRunQuery(model).get("sort"), "run_id");
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", ...standalone.slice(0, 19)]);
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run descending"]')); await settledTable(nodes);
+  assert.deepEqual(experimentTopKeys(nodes), [...standalone].reverse().slice(0, 20));
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.deepEqual(experimentTopKeys(nodes), [standalone[1], standalone[0], "gpu-a:run-0"]);
+  await expandExperiment(nodes);
+  await settled(() => experimentChildren(nodes).length > 0);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1", "child history keeps chronology when top-level entries sort by Run descending");
+  assert.equal(nodes.get("run-rows").querySelector('tr[data-experiment-id="experiment-1"]').dataset.runKey, "gpu-a:run-0",
+    "changing the group sort does not choose a different representative");
+});
+
+test("empty and wholly unavailable experiments remain visible without invented run controls", async t => {
+  const historical = { project_id: "vision", origin: "retired-worker", run_id: "old-run" };
+  const record = (id, name, members) => ({ experiment_id: id, name, description: "", revision: "1", members, lineage: [],
+    created_at: "2026-10-20T00:00:00Z", updated_at: "2026-10-20T00:00:00Z", membership_count: members.length, unavailable_runs: members });
+  const records = [record("empty", "Empty experiment", []), record("retained", "Retained experiment", [historical])];
+  const model = await experimentFixture(t, { mutable: false, experiments: records, group_supported: true,
+    group_entries: records.map((item) => experimentGroup(null, { experiment: { experiment_id: item.experiment_id, name: item.name, revision: item.revision },
+      membership_count: item.membership_count, matching_count: 0, active_count: 0, unavailable_count: item.unavailable_runs.length })) });
+  const { nodes } = model;
+  assert.equal(runRows(nodes).length, 0);
+  assert.equal(nodes.get("list-empty").hidden, true, "experiments remain browseable without a representative run");
+  for (const item of records) {
+    const row = nodes.get("run-rows").querySelector(`tr[data-experiment-id="${item.experiment_id}"]`);
+    assert.ok(row); assert.match(row.textContent, new RegExp(item.name));
+    assert.equal(row.querySelector('.run-link, input[type="checkbox"], .status'), null);
+  }
+  assert.match(nodes.get("run-rows").querySelector('tr[data-experiment-id="retained"]').textContent, /1 retained run is unavailable/i);
+  assert.equal(model.state.saves.length, 0);
+});
+
+test("changing an experiment representative discards an in-flight child snapshot before it can replace current history", async t => {
+  const stale = deferred(); let held = false, signal;
+  const model = await experimentFixture(t, { count: 3, member_indices: [0, 1, 2], group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 3, matching_count: 3 })],
+    intercept: (url, options) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && !held) {
+        held = true; signal = options.signal; return stale.promise;
+      }
+    } });
+  const { nodes, state } = model;
+  await expandExperiment(nodes); await settled(() => held);
+  state.runs[2].started_at = "2026-10-04T01:00:00Z";
+  state.group_entries[0].run_key = "gpu-a:run-2";
+  await click(nodes.get("refresh-button"));
+  await settled(() => experimentTopKeys(nodes)[0] === "gpu-a:run-2");
+  assert.equal(signal.aborted, true);
+  await act(async () => { stale.resolve(response({ source: model.source, runs: [{ ...state.runs[1], task: "STALE CHILD SNAPSHOT" }],
+    total_count: 1, offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  assert.doesNotMatch(nodes.get("run-rows").textContent, /STALE CHILD SNAPSHOT/);
+  assert.equal(nodes.get("run-rows").querySelectorAll('[data-run-key="gpu-a:run-2"]').length, 1);
+});
+
+test("late experiment child pages cannot replace history after switching projects away and back", async t => {
+  const stale = deferred(); let held = false, signal;
+  const vision = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const other = { ...vision, source_id: "hosted-project:other", project_id: "other", label: "other" };
+  const model = await experimentFixture(t, { group_supported: true, group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url, options) => {
+      if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [vision, other], initial_source: vision.source_id,
+        access_mode: "hosted", warnings: [], run_management_enabled: true, experiments_supported: true, experiment_management_enabled: true, experiment_groups_supported: true });
+      if (url.pathname === "/api/experiments" && url.searchParams.get("project_id") === "other") return response({ project_id: "other", revision: "1", experiments: [] });
+      if (url.pathname === "/api/runs" && url.searchParams.get("source") === other.source_id)
+        return response({ source: other, runs: [], experiment_groups: [], total_count: 0, offset: 0, next_offset: null, warnings: [] });
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && !held) {
+        held = true; signal = options.signal; return stale.promise;
+      }
+    } });
+  const { nodes } = model;
+  await expandExperiment(nodes); await settled(() => held);
+  await click(nodes.get("project-other")); await settled(() => nodes.get("project-other").checked && nodes.get("runs-region").getAttribute("aria-busy") === "false");
+  assert.equal(nodes.get("run-rows").querySelector('[data-experiment-id="experiment-1"]'), null);
+  assert.equal(signal.aborted, true);
+  await click(nodes.get("project-vision")); await settled(() => nodes.get("project-vision").checked && nodes.get("run-rows").querySelector('[data-experiment-id="experiment-1"]'));
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 1);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  await act(async () => { stale.resolve(response({ source: vision, runs: [{ ...model.runs[1], task: "OLD PROJECT CHILD PAGE" }],
+    total_count: 1, offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  assert.doesNotMatch(nodes.get("run-rows").textContent, /OLD PROJECT CHILD PAGE/);
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+});
+
+test("failed initial experiment history can retry without moving or rereading the top-level groups", async t => {
+  let fail = true;
+  const model = await experimentFixture(t, { group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && fail)
+        return response({ error: "Child history temporarily unavailable" }, 503);
+    } });
+  const { nodes } = model, before = runRows(nodes), top_keys = experimentTopKeys(nodes);
+  const group_reads = model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length;
+  await expandExperiment(nodes);
+  await settled(() => nodes.document.querySelector("#experiment-retry-experiment-1"));
+  assert.match(nodes.get("run-rows").querySelector('[data-experiment-history="experiment-1"]').textContent, /Child history temporarily unavailable/);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  assert.equal(experimentChildren(nodes).length, 0);
+  fail = false;
+  await click(nodes.get("experiment-retry-experiment-1"));
+  await settled(() => experimentChildren(nodes).length === 1 && !nodes.document.querySelector("#experiment-retry-experiment-1"));
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  assert.equal(experimentChildRequests(model).length, 2);
+  assert.equal(model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length, group_reads);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  runRows(nodes).filter((row) => !row.hasAttribute("data-experiment-child")).forEach((row, index) => assert.equal(row, before[index]));
+});
+
+test("expanded experiment history retains its loaded page window across manual and quiet refreshes", async t => {
+  const clock = new RefreshClock();
+  const model = await experimentFixture(t, { count: 26, member_indices: Array.from({ length: 24 }, (_, index) => index),
+    updates: true, refresh_clock: clock, group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 24, matching_count: 24 }), standaloneGroup("gpu-a:run-24"), standaloneGroup("gpu-a:run-25")] });
+  const { nodes, state } = model;
+  await clock.advance(5000);
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 19);
+  await click(nodes.get("experiment-more-experiment-1")); await settled(() => experimentChildren(nodes).length === 23);
+  const top_keys = experimentTopKeys(nodes), child_keys = experimentChildren(nodes).map((row) => row.dataset.runKey);
+  let reads = experimentChildRequests(model).length;
+  state.runs[1].task = "Manually refreshed child";
+  await click(nodes.get("refresh-button"));
+  await settled(() => experimentChildRequests(model).length >= reads + 2 && experimentChildren(nodes).length === 23 &&
+    !nodes.get("run-rows").querySelector('[data-experiment-history="experiment-1"]').textContent.includes("Loading history"));
+  assert.deepEqual(experimentChildRequests(model).slice(-2).map((url) => url.searchParams.get("offset")), ["0", "20"]);
+  assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), child_keys);
+  assert.match(experimentChildren(nodes)[0].textContent, /Manually refreshed child/);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  reads = experimentChildRequests(model).length;
+  state.runs[22].task = "Quietly refreshed child";
+  model.list_revision = "worker-changed-child-history";
+  await clock.advance(5000);
+  await settled(() => experimentChildRequests(model).length >= reads + 2 && experimentChildren(nodes).length === 23 &&
+    !nodes.get("run-rows").querySelector('[data-experiment-history="experiment-1"]').textContent.includes("Loading history"));
+  assert.deepEqual(experimentChildRequests(model).slice(-2).map((url) => url.searchParams.get("offset")), ["0", "20"]);
+  assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), child_keys);
+  assert.match(experimentChildren(nodes)[21].textContent, /Quietly refreshed child/);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  assert.equal(nodes.get("page-label").textContent, "Page 1");
+});
+
+test("unchanged pending experiment history survives main-list refresh while workers remain active", async t => {
+  const pending = deferred(), clock = new RefreshClock(); let signal, held = false;
+  const model = await experimentFixture(t, { updates: true, refresh_clock: clock, group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url, options) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && !held) {
+        held = true; signal = options.signal; return pending.promise;
+      }
+    } });
+  const { nodes } = model;
+  await clock.advance(5000);
+  await expandExperiment(nodes); await settled(() => held);
+  const group_reads = model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length;
+  model.list_revision = "worker-still-publishing";
+  await clock.advance(5000);
+  assert.ok(model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length > group_reads);
+  assert.equal(signal.aborted, false, "an unchanged group refresh must not starve a slower child read");
+  assert.equal(experimentChildRequests(model).length, 1);
+  await act(async () => { pending.resolve(response({ source: model.source, runs: model.runs.slice(0, 2), total_count: 2,
+    offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  await settled(() => experimentChildren(nodes).length === 1);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+});
+
+test("experiment history rejects stale or foreign membership metadata while accepting older responses without it", async t => {
+  const invalid = [{ experiment_id: "experiment-1", name: "Language model", revision: "stale-revision" },
+    { experiment_id: "another-experiment", name: "Other work", revision: "exp-revision-1" }, null];
+  let attempt = 0;
+  const model = await experimentFixture(t, { group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url, _options, state) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1") {
+        const valid = attempt >= invalid.length;
+        const run = { ...state.runs[1], task: valid ? "Recovered child" : "UNTRUSTED CHILD METADATA",
+          ...(valid ? {} : { experiment: invalid[attempt] }) };
+        return response({ source: { source_id: "hosted-project:vision" }, runs: [run], total_count: 1, offset: 0, next_offset: null, warnings: [] });
+      }
+    } });
+  const { nodes } = model;
+  await expandExperiment(nodes);
+  for (let index = 0; index < invalid.length; index++) {
+    await settled(() => nodes.document.querySelector("#experiment-retry-experiment-1"));
+    assert.equal(experimentChildren(nodes).length, 0);
+    assert.doesNotMatch(nodes.get("run-rows").textContent, /UNTRUSTED CHILD METADATA/);
+    assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+    attempt = index + 1;
+    await click(nodes.get("experiment-retry-experiment-1"));
+  }
+  await settled(() => experimentChildren(nodes).length === 1);
+  assert.match(experimentChildren(nodes)[0].textContent, /Recovered child/);
+  assert.equal(nodes.get("run-rows").querySelector(".experiment-history-error"), null);
+});
+
+test("acknowledged child nickname saves invalidate pre-save experiment history reads", async t => {
+  const pending = deferred(); let hold = false, held = false, signal, old_rows;
+  const scope = { project_id: "vision", origin: "gpu-b", run_id: "run-1" };
+  const model = await experimentFixture(t, { group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    run_patches: { 1: { nickname: null, tags: [], annotations: { scope, nickname: null, tags: [] } } },
+    intercept: (url, options, state) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && hold && !held) {
+        held = true; signal = options.signal; old_rows = structuredClone(state.runs.slice(0, 2)); return pending.promise;
+      }
+      if (url.pathname === "/api/runs/annotations") {
+        const body = JSON.parse(options.body);
+        assert.deepEqual({ project_id: body.project_id, origin: body.origin, run_id: body.run_id }, scope);
+        const annotations = { scope, nickname: body.nickname, tags: body.tags };
+        state.runs[1] = { ...state.runs[1], nickname: body.nickname, tags: body.tags, annotations };
+        return response(annotations);
+      }
+    } });
+  const { nodes } = model;
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 1);
+  await click(experimentChildren(nodes)[0].querySelector(".run-link"));
+  await settled(() => nodes.document.querySelector("#run-nickname") && !nodes.get("run-nickname").matches(":disabled"));
+  hold = true;
+  await click(nodes.get("refresh-button")); await settled(() => held && !nodes.get("refresh-button").disabled);
+  setValue(nodes.get("run-nickname"), "Acknowledged child nickname"); await emit(nodes.get("run-nickname"), "input");
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  await settled(() => experimentChildren(nodes)[0]?.querySelector(".run-link").textContent === "Acknowledged child nickname" && signal.aborted);
+  assert.equal(signal.aborted, true);
+  assert.equal(nodes.get("run-rows").querySelector('tr[data-experiment-id="experiment-1"] button[aria-expanded]').getAttribute("aria-expanded"), "true");
+  await act(async () => { pending.resolve(response({ source: model.source, runs: old_rows, total_count: 2,
+    offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  assert.equal(experimentChildren(nodes).length, 1);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  assert.equal(experimentChildren(nodes)[0].querySelector(".run-link").textContent, "Acknowledged child nickname");
+  assert.equal(nodes.get("review-title").textContent, "Acknowledged child nickname");
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+});
+
+test("experiment history Retry replays a failed refresh instead of appending at its retained cursor", async t => {
+  let fail_at = null;
+  const model = await experimentFixture(t, { count: 46, member_indices: Array.from({ length: 45 }, (_, index) => index), group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 45, matching_count: 45 }), standaloneGroup("gpu-a:run-45")],
+    intercept: (url) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && url.searchParams.get("offset") === fail_at) {
+        fail_at = null; return response({ error: "Refresh page temporarily unavailable" }, 503);
+      }
+    } });
+  const { nodes, state } = model;
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 19);
+  await click(nodes.get("experiment-more-experiment-1")); await settled(() => experimentChildren(nodes).length === 39);
+  const keys = experimentChildren(nodes).map((row) => row.dataset.runKey), top_keys = experimentTopKeys(nodes);
+  for (const offset of ["0", "20"]) {
+    const changed = offset === "0" ? 1 : 30;
+    state.runs[changed] = { ...state.runs[changed], task: `Refreshed after failure at ${offset}` };
+    fail_at = offset;
+    await click(nodes.get("refresh-button"));
+    await settled(() => nodes.document.querySelector("#experiment-retry-experiment-1"));
+    assert.equal(experimentChildren(nodes).length, 39, "a failed refresh retains the loaded window");
+    const reads = experimentChildRequests(model).length;
+    await click(nodes.get("experiment-retry-experiment-1"));
+    await settled(() => experimentChildRequests(model).length >= reads + 2 && !nodes.document.querySelector("#experiment-retry-experiment-1"));
+    assert.deepEqual(experimentChildRequests(model).slice(reads).map((url) => url.searchParams.get("offset")), ["0", "20"],
+      "Retry rereads the loaded pages instead of starting at the still-available cursor 40");
+    assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), keys);
+    assert.match(experimentChildren(nodes).find((row) => row.dataset.runKey === state.runs[changed].run_key).textContent,
+      new RegExp(`Refreshed after failure at ${offset}`));
+    assert.ok(nodes.document.querySelector("#experiment-more-experiment-1"), "later child pages remain available after refresh recovery");
+    assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  }
+});
 
 test("experiment membership never regroups interleaved chronological run history", async t => {
   const model = await experimentFixture(t, { count: 5, member_indices: [0, 2, 4] });

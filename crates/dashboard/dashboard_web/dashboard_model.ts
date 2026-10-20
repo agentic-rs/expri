@@ -3,7 +3,7 @@ import type { RefreshClock } from "./auto_refresh";
 import type { EventSourceFactory } from "./live_updates";
 import type { RunQueue, RunRedirect } from "./run_queue";
 import type { ResourceRequirements, ResourceStatus } from "./run_resources";
-import type { ExperimentSummary } from "./experiments";
+import type { ExperimentGroup, ExperimentSummary } from "./experiments";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string; severity?: "info" | "warning" | "error" };
@@ -111,6 +111,7 @@ export type Catalog = {
   capabilities?: string[];
   experiments_supported?: boolean;
   experiment_management_enabled?: boolean;
+  experiment_groups_supported?: boolean;
 };
 export type RunList = {
   source: Source;
@@ -119,6 +120,7 @@ export type RunList = {
   total_count: number;
   offset: number;
   next_offset: number | null;
+  experiment_groups?: ExperimentGroup[];
 };
 export type Detail = {
   source: Source;

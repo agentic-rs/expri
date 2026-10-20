@@ -322,6 +322,7 @@ impl Dashboard {
         archived: false,
         origin: None,
         experiment_id: None,
+        group_experiments: false,
         search,
         task,
         status,
@@ -337,6 +338,7 @@ impl Dashboard {
       archived,
       origin,
       experiment_id,
+      group_experiments,
       search,
       task,
       status,
@@ -350,7 +352,7 @@ impl Dashboard {
     if origin.is_some() {
       return Err(message("machine filters are available for hosted projects"));
     }
-    if experiment_id.is_some() {
+    if experiment_id.is_some() || group_experiments {
       return Err(message(
         "experiment filters are available on the hosted dashboard",
       ));

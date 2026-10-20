@@ -17,8 +17,8 @@ import { RunAttemptHistory } from "./run_attempts_view";
 import { parseTaskAttempts } from "./run_attempts";
 import { lifecyclePanelKey, RunLifecyclePanel } from "./run_lifecycle_view";
 import { RunResourceBadge } from "./run_resources_view";
-import { ExperimentFilter, ExperimentManager, ExperimentRunPanel } from "./experiments_view";
-import type { ExperimentState, ExperimentDraft } from "./experiments";
+import { ExperimentFilter, ExperimentGroupLabel, ExperimentHistoryFooter, ExperimentManager, ExperimentRunPanel, ExperimentViewControl } from "./experiments_view";
+import type { ExperimentState, ExperimentDraft, ExperimentGroup } from "./experiments";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -161,6 +161,9 @@ export type DashboardSnapshot = DashboardUi & {
 };
 export type DashboardActions = {
   experiment_filter: (value: string) => void;
+  experiment_view: (value: "experiments" | "runs") => void;
+  experiment_expand: (experiment_id: string, open: boolean) => void;
+  experiment_more: (experiment_id: string) => void;
   experiments_refresh: () => void;
   experiment_save: (experiment_id: string | null, values: ExperimentDraft, expected_revision: string | null, create_request_id?: string) => Promise<boolean>;
   experiment_delete: (experiment_id: string, expected_revision: string) => Promise<boolean>;
@@ -647,6 +650,53 @@ function RunFilterPanel({ snapshot: s, actions: a }: { snapshot: DashboardSnapsh
     </div>
   );
 }
+function RunHistoryRow({ run, snapshot: s, actions: a, group, child_of }: {
+  run: Run; snapshot: DashboardSnapshot; actions: DashboardActions; group?: ExperimentGroup; child_of?: string;
+}) {
+  const identity = runIdentity(run), selected = s.selected.includes(identity);
+  const project = s.sources.some((source) => source.source_id === s.source_id && source.kind === "hosted_project");
+  const filtered = Boolean(s.search.trim() || s.task.trim() || s.status || s.origin || s.experiments.filter || s.archival === "archived");
+  return <tr data-run-key={identity} data-experiment-id={group?.experiment?.experiment_id} data-experiment-child={child_of}
+    className={[selected && "selected", s.review?.kind === "run" && s.review.run_ids[0] === identity && "active",
+      group?.experiment && "experiment-representative", child_of && "experiment-child"].filter(Boolean).join(" ")}>
+    <td className="selection-column"><input type="checkbox" checked={selected}
+      disabled={s.list_busy || queuePlaceholder(run) || (s.selected.length >= 8 && !selected)}
+      aria-label={`Select ${runLabel(run)} for comparison`} onChange={(event) => {
+        const checked = event.currentTarget.checked;
+        if (s.workspace_view !== "workspace") a.workspace_view("workspace");
+        a.select_run(identity, checked);
+      }} /></td>
+    <td className="run-cell">
+      {group?.experiment && <ExperimentGroupLabel group={group} snapshot={s} actions={a} />}
+      <button type="button" className={`run-link${runNickname(run) ? " has-nickname" : ""}`} disabled={s.list_busy}
+        title={group?.experiment ? `${filtered ? "Latest matching run" : "Latest run"}: ${runLabel(run)}` : runLabel(run)}
+        onClick={() => { a.inspect_run(identity); revealOnCompactLayout(s.workspace_view === "system" && s.system_run_aligned ? "system-heading" : "review-title"); }}>
+        {group?.experiment && <span className="experiment-latest-label">{filtered ? "Latest matching" : "Latest"} </span>}{runNickname(run) ?? run.run_id}
+      </button>
+      <div className="run-task" title={run.task ?? undefined}>{run.task ?? "—"}</div>
+      <div className="run-summary-meta">
+        {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
+        <RunSmokeMark run={run} /><RunTags run={run} limit={2} />
+      </div>
+      {run.archival && run.archival.status !== "active" && <div className="run-meta">
+        {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` : run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
+      </div>}
+      <RunRowDiagnostics run={run} items={runWarnings(run, s.list_warnings, s.run_columns_warnings)} />
+      {run.table_values_truncated && <div className="run-value-warning" title="Some selected values exceed the table preview limit.">Limited values</div>}
+    </td>
+    <td className="status-column"><span className={`status ${runStatusClass(run.status)}`} title={queueContext(run)?.pending_reason ?? queueMessage(run) ?? undefined}>{run.status}</span>
+      {!queuePlaceholder(run) && <RunStatusTiming run={run} />}<RunResourceBadge status={["pending", "paused"].includes(run.status) ? run.resource_status : null} />
+    </td>
+    {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
+    <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
+    {s.run_columns.map((column) => {
+      const value = formatRunTableValue(runColumnValue(run, column));
+      return <td key={runColumnIdentity(column)} className={`run-column-value${value.numeric ? " number" : ""}`}
+        data-column-kind={column.kind} data-column-key={column.key} title={value.title}>{value.text}</td>;
+    })}
+  </tr>;
+}
+
 function RunBrowser({
   snapshot: s,
   actions: a,
@@ -656,6 +706,8 @@ function RunBrowser({
 }) {
   const [open_control, setOpenControl] = useState<"experiments" | "filters" | "columns" | "issues" | null>(null);
   useEffect(() => setOpenControl(null), [s.source_id]);
+  const grouped = s.experiments.groups_supported && s.experiments.view === "experiments";
+  const diagnostic_runs = grouped ? [...s.runs, ...s.experiments.expanded.flatMap((experiment_id) => s.experiments.histories[experiment_id]?.runs ?? [])] : s.runs;
   function changeControl(control: "experiments" | "filters" | "columns" | "issues", open: boolean): void {
     setOpenControl((current) => open ? control : current === control ? null : current);
   }
@@ -671,9 +723,9 @@ function RunBrowser({
   const seen_issues = new Set<string>();
   const issue_groups = [
     { id: "catalog-warnings", label: "Workspace", items: s.catalog_warnings },
-    { id: "list-warnings", label: "Other run records", items: warningsOutsideRuns(s.list_warnings, s.runs) },
+    { id: "list-warnings", label: "Other run records", items: warningsOutsideRuns(s.list_warnings, diagnostic_runs) },
     { id: "run-columns-warnings", label: "Column discovery", items: [
-      ...warningsOutsideRuns(s.run_columns_warnings, s.runs),
+      ...warningsOutsideRuns(s.run_columns_warnings, diagnostic_runs),
       ...(s.run_columns_error ? [{ message: s.run_columns_error }] : []),
     ] },
   ].map((group) => ({ ...group, items: visibleWarnings(group.items).filter((item) => {
@@ -687,10 +739,14 @@ function RunBrowser({
     if (!issue_count) setOpenControl((current) => current === "issues" ? null : current);
   }, [issue_count]);
   const project = s.sources.find((source) => source.source_id === s.source_id && source.kind === "hosted_project");
+  const columns = 4 + Number(Boolean(project)) + s.run_columns.length;
+  const representatives = new Map(s.runs.map((run) => [runIdentity(run), run]));
   return (
     <aside className="runs-card run-history" aria-labelledby="runs-heading">
       <div className="section-heading run-history-header">
-        <div><h2 id="runs-heading" tabIndex={-1}>Run history</h2><p id="run-count" className="muted">{s.run_count}</p></div>
+        <div>{s.experiments.groups_supported ? <div id="runs-heading" className="run-history-title" role="heading" aria-level={2} aria-label="Run history" tabIndex={-1}>
+          <ExperimentViewControl snapshot={s} actions={a} />
+        </div> : <h2 id="runs-heading" tabIndex={-1}>Run history</h2>}<p id="run-count" className="muted">{s.run_count}</p></div>
         <div className="run-history-actions">
           <ExperimentManager key={`experiment-manager:${s.source_id}`} snapshot={s} actions={a}
             open={open_control === "experiments"} on_change={(open) => changeControl("experiments", open)} />
@@ -774,95 +830,29 @@ function RunBrowser({
             </tr>
           </thead>
           <tbody id="run-rows">
-            {s.runs.map((run) => {
-              const identity = runIdentity(run);
-              const selected = s.selected.includes(identity);
-              return (
-                <tr
-                  key={identity}
-                  data-run-key={identity}
-                  className={[
-                    selected && "selected",
-                    s.review?.kind === "run" && s.review.run_ids[0] === identity && "active",
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                >
-                  <td className="selection-column">
-                    <input
-                      type="checkbox"
-                      checked={selected}
-                      disabled={s.list_busy || queuePlaceholder(run) || (s.selected.length >= 8 && !selected)}
-                      aria-label={`Select ${runLabel(run)} for comparison`}
-                      onChange={(event) => {
-                        const checked = event.currentTarget.checked;
-                        if (s.workspace_view !== "workspace") a.workspace_view("workspace");
-                        a.select_run(identity, checked);
-                      }}
-                    />
-                  </td>
-                  <td className="run-cell">
-                    <button
-                      type="button"
-                      className={`run-link${runNickname(run) ? " has-nickname" : ""}`}
-                      disabled={s.list_busy}
-                      title={runLabel(run)}
-                      onClick={() => {
-                        a.inspect_run(identity);
-                        revealOnCompactLayout(s.workspace_view === "system" && s.system_run_aligned ? "system-heading" : "review-title");
-                      }}
-                    >
-                      {runNickname(run) ?? run.run_id}
-                    </button>
-                    <div className="run-task" title={run.task ?? undefined}>{run.task ?? "—"}</div>
-                    <div className="run-summary-meta">
-                      {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
-                      <RunSmokeMark run={run} />
-                      <RunTags run={run} limit={2} />
-                    </div>
-                    {run.archival && run.archival.status !== "active" && <div className="run-meta">
-                      {run.archival.status === "archived" ? `Archived · Deletes ${dateText(run.archival.delete_after)}` :
-                        run.archival.status === "needs_attention" ? "Deletion needs attention" : "Deletion in progress"}
-                    </div>}
-                    <RunRowDiagnostics run={run} items={runWarnings(run, s.list_warnings, s.run_columns_warnings)} />
-                    {run.table_values_truncated && (
-                      <div
-                        className="run-value-warning"
-                        title="Some selected values exceed the table preview limit."
-                      >
-                        Limited values
-                      </div>
-                    )}
-                  </td>
-                  <td className="status-column">
-                    <span
-                      className={`status ${runStatusClass(run.status)}`}
-                      title={queueContext(run)?.pending_reason ?? queueMessage(run) ?? undefined}
-                    >
-                      {run.status}
-                    </span>
-                    {!queuePlaceholder(run) && <RunStatusTiming run={run} />}
-                    <RunResourceBadge status={["pending", "paused"].includes(run.status) ? run.resource_status : null} />
-                  </td>
-                  {project && <td className="machine-column"><span className="machine-name">{run.origin ?? "—"}</span></td>}
-                  <td className="started-column"><time dateTime={run.started_at ?? undefined}>{dateText(run.started_at)}</time></td>
-                  {s.run_columns.map((column) => {
-                    const value = formatRunTableValue(runColumnValue(run, column));
-                    return (
-                      <td
-                        key={runColumnIdentity(column)}
-                        className={`run-column-value${value.numeric ? " number" : ""}`}
-                        data-column-kind={column.kind}
-                        data-column-key={column.key}
-                        title={value.title}
-                      >
-                        {value.text}
-                      </td>
-                    );
-                  })}
-                </tr>
-              );
-            })}
+            {grouped ? s.experiments.groups.map((group) => {
+              const experiment = group.experiment;
+              const representative = group.run_key ? representatives.get(group.run_key) : undefined;
+              if (!experiment) return representative ? <RunHistoryRow key={`run:${runIdentity(representative)}`} run={representative} snapshot={s} actions={a} /> : null;
+              const expanded = s.experiments.expanded.includes(experiment.experiment_id);
+              const children = s.experiments.histories[experiment.experiment_id]?.runs.filter((run) => runIdentity(run) !== group.run_key) ?? [];
+              return <Fragment key={`experiment:${experiment.experiment_id}`}>
+                {representative ? <RunHistoryRow run={representative} group={group} snapshot={s} actions={a} /> :
+                  <tr className="experiment-empty-row" data-experiment-id={experiment.experiment_id}>
+                    <td className="selection-column" /><td className="run-cell"><ExperimentGroupLabel group={group} snapshot={s} actions={a} />
+                      <div className="run-meta">{group.unavailable_count > 0 ? `${group.unavailable_count} retained ${group.unavailable_count === 1 ? "run is" : "runs are"} unavailable` : "No matching runs"}</div>
+                    </td>
+                    <td className="status-column"><span className="muted">—</span></td>
+                    {project && <td className="machine-column"><span className="muted">—</span></td>}
+                    <td className="started-column"><span className="muted">—</span></td>
+                    {s.run_columns.map((column) => <td className="run-column-value" key={runColumnIdentity(column)}>—</td>)}
+                  </tr>}
+                {expanded && <>
+                  {children.map((run) => <RunHistoryRow key={runIdentity(run)} run={run} child_of={experiment.experiment_id} snapshot={s} actions={a} />)}
+                  <ExperimentHistoryFooter group={group} shown={children.length + Number(Boolean(representative))} columns={columns} snapshot={s} actions={a} />
+                </>}
+              </Fragment>;
+            }) : s.runs.map((run) => <RunHistoryRow key={runIdentity(run)} run={run} snapshot={s} actions={a} />)}
           </tbody>
         </table>
         <div id="list-empty" className="empty-state" hidden={s.list_empty === null}>

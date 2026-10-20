@@ -298,7 +298,7 @@ impl<S: ObjectStorage> Store<S> {
     limit: usize,
     offset: usize,
   ) -> ApiResult<DashboardPage<RunScope>> {
-    self.dashboard_project_runs_filtered(project_id, origin, limit, offset, None)
+    self.dashboard_project_runs_filtered(project_id, origin, limit, offset, None, false)
   }
 
   pub(in crate::service) fn dashboard_project_runs_with_archival(
@@ -309,7 +309,17 @@ impl<S: ObjectStorage> Store<S> {
     offset: usize,
     archived: bool,
   ) -> ApiResult<DashboardPage<RunScope>> {
-    self.dashboard_project_runs_filtered(project_id, origin, limit, offset, Some(archived))
+    self.dashboard_project_runs_filtered(project_id, origin, limit, offset, Some(archived), false)
+  }
+
+  pub(in crate::service) fn dashboard_ungrouped_runs_with_archival(
+    &self,
+    project_id: &str,
+    origin: Option<&str>,
+    limit: usize,
+    archived: bool,
+  ) -> ApiResult<DashboardPage<RunScope>> {
+    self.dashboard_project_runs_filtered(project_id, origin, limit, 0, Some(archived), true)
   }
 
   fn dashboard_project_runs_filtered(
@@ -319,6 +329,7 @@ impl<S: ObjectStorage> Store<S> {
     limit: usize,
     offset: usize,
     archived: Option<bool>,
+    ungrouped: bool,
   ) -> ApiResult<DashboardPage<RunScope>> {
     validate_component(project_id).map_err(bad)?;
     if let Some(origin) = origin {
@@ -327,7 +338,14 @@ impl<S: ObjectStorage> Store<S> {
     dashboard_page_bounds(limit, offset)?;
     let db = self.db()?;
     let at = run_retention::now();
-    let selection = "SELECT DISTINCT json_extract(target,'$.scope.origin') AS origin,json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND (?2 IS NULL OR json_extract(target,'$.scope.origin')=?2) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id'))=?5) AND NOT EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id') AND (status<>'archived' OR delete_after<=?6))";
+    let membership = if ungrouped {
+      " AND NOT EXISTS(SELECT 1 FROM experiment_members WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id'))"
+    } else {
+      ""
+    };
+    let selection = format!(
+      "SELECT DISTINCT json_extract(target,'$.scope.origin') AS origin,json_extract(target,'$.scope.run_id') AS run_id FROM (SELECT target FROM files UNION SELECT target FROM streams) WHERE json_extract(target,'$.kind')='run' AND json_extract(target,'$.scope.project_id')=?1 AND (?2 IS NULL OR json_extract(target,'$.scope.origin')=?2) AND (?5 IS NULL OR EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id'))=?5) AND NOT EXISTS(SELECT 1 FROM run_retention WHERE project_id=?1 AND origin=json_extract(target,'$.scope.origin') AND run_id=json_extract(target,'$.scope.run_id') AND (status<>'archived' OR delete_after<=?6)){membership}"
+    );
     let total_count = db
       .query_row(
         &format!("SELECT COUNT(*) FROM ({selection})"),

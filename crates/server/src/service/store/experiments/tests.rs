@@ -1,6 +1,8 @@
 use super::*;
 use crate::service::store::tests::MockStorage;
 
+mod grouped;
+
 fn scope(origin: &str, run_id: &str) -> RunScope {
   RunScope {
     project_id: "project".into(),
@@ -406,6 +408,7 @@ fn selected_experiment_reads_old_members_before_recent_run_window_and_pagination
   }
   let dashboard = crate::service::dashboard_data::HostedDashboard::new(&store).unwrap();
   let query = crate::dashboard::table::ListQuery {
+    group_experiments: false,
     archived: false,
     origin: None,
     experiment_id: Some(&experiment.experiment_id),

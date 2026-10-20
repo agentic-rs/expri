@@ -679,6 +679,7 @@ fn route_content_checked(
         "origin",
         "archival",
         "experiment_id",
+        "group_experiments",
       ])?;
       let archived = match query.optional("archival").unwrap_or("active") {
         "active" => false,
@@ -688,6 +689,11 @@ fn route_content_checked(
       let limit = query.number("limit", 100, 1, 1000)?;
       let offset = query.number("offset", 0, 0, usize::MAX)?;
       let experiment_id = query.optional("experiment_id");
+      let group_experiments = match query.optional("group_experiments") {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => return Err(Reply::error(400, "group_experiments must be true or false")),
+      };
       if let Some(experiment_id) = experiment_id {
         expri_core::identifiers::validate_component(experiment_id)
           .map_err(|_| Reply::error(400, "invalid experiment filter"))?;
@@ -714,6 +720,7 @@ fn route_content_checked(
               archived,
               origin: query.optional("origin"),
               experiment_id,
+              group_experiments,
               search: query.optional("search"),
               task: query.optional("task"),
               status: query.optional("status"),

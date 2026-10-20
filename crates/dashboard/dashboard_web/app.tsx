@@ -58,7 +58,8 @@ import { RunSystemMonitor, runSystemItem } from "./run_system";
 import { parseRunQueue, parseRunRedirect, queueContext, queuePlaceholder } from "./run_queue";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import { warningSeverity } from "./run_diagnostics";
-import { experimentProject, parseExperiment, parseExperimentCatalog, type ExperimentDraft, type ExperimentState } from "./experiments";
+import { experimentProject, parseExperiment, parseExperimentCatalog, parseExperimentGroups, type ExperimentDraft, type ExperimentState } from "./experiments";
+import { ExperimentHistoryController } from "./experiment_history";
 import {
   DashboardView,
   type DashboardActions,
@@ -230,7 +231,11 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
   const experiments: ExperimentState = { supported: false, management_enabled: false, loading: false,
-    busy: false, error: null, catalog: null, filter: "" };
+    busy: false, error: null, catalog: null, filter: "", groups_supported: false, view: "experiments",
+    groups: [], expanded: [], histories: {} };
+  const experiment_history = new ExperimentHistoryController(experiments, {
+    context: () => listUrl(), url: (id, cursor) => historyUrl(id, cursor), publish, login_run: () => pending_deep_link,
+  });
   let experiments_context: string | null = null;
   let experiments_loading: Promise<boolean> | null = null;
   let experiment_read_generation = 0;
@@ -363,6 +368,14 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     publish();
   }
   const actions: DashboardActions = {
+    experiment_view: (value) => {
+      if (experiments.view === value || (value === "experiments" && !experiments.groups_supported)) return;
+      experiments.view = value;
+      experiments.groups = [];
+      reloadRunTable();
+    },
+    experiment_expand: (id, open) => experiment_history.expand(id, open),
+    experiment_more: (id) => experiment_history.more(id),
     experiment_filter: (value) => {
       if (!experiments.supported || experiments.filter === value) return;
       experiments.filter = value;
@@ -447,6 +460,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       publish();
     },
     previous: () => {
+      experiment_history.reset();
       discardDeepLink();
       cancelRefresh();
       offset = previous_run_offsets.pop() ?? Math.max(0, offset - page_size);
@@ -455,6 +469,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     next: () => {
       discardDeepLink();
       if (next_offset !== null) {
+        experiment_history.reset();
         cancelRefresh();
         previous_run_offsets.push(offset);
         offset = next_offset;
@@ -462,7 +477,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       }
     },
     select_run: (id, checked) => {
-      if (runs.some(run => runIdentity(run) === id && queuePlaceholder(run))) return;
+      if (allLoadedRuns().some(run => runIdentity(run) === id && queuePlaceholder(run))) return;
       discardDeepLink();
       if (checked && selected.size >= 8) return;
       checked ? selected.add(id) : selected.delete(id);
@@ -716,7 +731,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function reviewedRun(): Run | undefined {
     const id = review?.kind === "run" ? review.run_ids[0] : undefined;
     if (!id) return undefined;
-    return rendered_detail && runIdentity(rendered_detail.run) === id ? rendered_detail.run : runs.find(run => runIdentity(run) === id);
+    return rendered_detail && runIdentity(rendered_detail.run) === id ? rendered_detail.run : allLoadedRuns().find(run => runIdentity(run) === id);
   }
   function reviewingQueueJob(): boolean {
     const run = reviewedRun();
@@ -816,6 +831,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       origin: currentSource()?.kind === "hosted_project" ? ui.origin : null,
       archival: access_mode === "hosted" ? ui.archival : null,
       experiment_id: experiments.supported && experimentProject(currentSource()) ? experiments.filter : null,
+      group_experiments: groupedExperiments() ? "true" : null,
       limit: page_size,
       offset,
       param: ui.run_columns_supported
@@ -832,7 +848,25 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       direction: ui.run_columns_supported && !runSortIsDefault(run_sort) ? run_sort.direction : null,
     });
   }
+  function groupedExperiments(): boolean {
+    return experiments.supported && experiments.groups_supported && experiments.view === "experiments" && !!experimentProject(currentSource());
+  }
+  function allLoadedRuns(): Run[] {
+    const records = Object.values(experiments.histories).flatMap((history) => history.runs);
+    return [...new Map([...records, ...runs].map((run) => [runIdentity(run), run])).values()];
+  }
+  function historyUrl(id: string, cursor: number): string {
+    const url = new URL(listUrl(), "http://expri.local");
+    url.searchParams.delete("group_experiments");
+    url.searchParams.set("experiment_id", id);
+    url.searchParams.set("offset", String(cursor));
+    url.searchParams.set("sort", "started_at");
+    url.searchParams.set("direction", "desc");
+    return url.pathname + url.search;
+  }
   function resetExperiments(): void {
+    experiment_history.reset();
+    experiments.groups = [];
     experiment_read_generation++;
     experiment_mutation_generation++;
     experiments_lane.cancel();
@@ -988,6 +1022,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     }
   }
   function reloadRunTable(): void {
+    experiment_history.reset();
     cancelRefresh();
     list_lane.cancel();
     clearSearchTimeout();
@@ -1076,6 +1111,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     publish();
   }
   function applyRunList(result: RunList, context: string, quiet = false): void {
+    const groups = groupedExperiments() ? parseExperimentGroups(result.experiment_groups, result.runs) : [];
     if (!experiments.busy) void loadExperiments(true);
     const unchanged =
       last_run_list_context === context && JSON.stringify(last_run_list) === JSON.stringify(result);
@@ -1089,20 +1125,22 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (run_columns_source === source_id && ui.run_columns_warnings.some((item) => item.run_id && warningSeverity(item) !== "info")) {
       void loadRunColumns(true);
     }
-    if (quiet && unchanged && was_ready) return;
+    experiments.groups = groups;
+    if (quiet && unchanged && was_ready) { experiment_history.reconcile(); return; }
     const focused = document.activeElement as HTMLElement | null;
     const focused_key = focused?.closest<HTMLElement>("[data-run-key]")?.dataset.runKey;
     const focused_job = runs.find(run => runIdentity(run) === focused_key && queuePlaceholder(run));
     const replacement = focused_job ? result.runs.find(run => !queuePlaceholder(run) && run.queue?.job_id === focused_job.queue?.job_id) : undefined;
     runs = result.runs;
+    experiment_history.reconcile();
     reconcileArchivedSelection(runs);
     offset = result.offset;
     next_offset = result.next_offset;
     updateUi({
       list_warnings: result.warnings,
       run_count: result.total_count
-        ? `${offset + 1}–${offset + runs.length} of ${result.total_count.toLocaleString()} runs`
-        : "No matching runs",
+        ? `${offset + 1}–${offset + (groupedExperiments() ? groups.length : runs.length)} of ${result.total_count.toLocaleString()} ${groupedExperiments() ? "entries" : "runs"}`
+        : groupedExperiments() ? "No matching experiments or runs" : "No matching runs",
       page_label: `Page ${previous_run_offsets.length + 1}`,
       previous_disabled: offset === 0,
       next_disabled: next_offset === null,
@@ -1113,8 +1151,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       const row = [...document.querySelectorAll<HTMLElement>("[data-run-key]")].find(node => node.dataset.runKey === runIdentity(replacement));
       row?.querySelector<HTMLElement>(".run-link")?.focus({ preventScroll: true });
     }
-    if (!runs.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status || ui.origin || experiments.filter), result.source);
-    announce(`${result.total_count} matching runs`);
+    if (!runs.length && !groups.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status || ui.origin || experiments.filter), result.source);
+    announce(`${result.total_count} matching ${groupedExperiments() ? "entries" : "runs"}`);
   }
   async function loadRuns(): Promise<boolean> {
     if (!source_id) return false;
@@ -1142,7 +1180,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       global_error: errorText(error),
       list_busy: false,
       run_count: "Could not read run history",
-      list_empty: runs.length ? null : {
+      list_empty: runs.length || experiments.groups.length ? null : {
         title: "Runs are unavailable",
         message: "Check your connection, then choose Refresh to try again.",
         setup: false,
@@ -1530,6 +1568,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       rendered_detail = { ...latest_detail, run: updated_run };
       runs = runs.map((run) => runIdentity(run) === id
         ? { ...run, nickname: result.nickname, tags: result.tags, annotations: result } : run);
+      experiment_history.mapRuns((run) => runIdentity(run) === id
+        ? { ...run, nickname: result.nickname, tags: result.tags, annotations: result } : run);
       publish();
       announce("Run nickname and tags saved.");
       await loadRuns();
@@ -1587,6 +1627,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       rendered_detail = { ...latest_detail, run: { ...latest_detail.run, archival: result } };
       runs = runs.map((run) => runIdentity(run) === id ? { ...run, archival: result } : run)
         .filter((run) => runIsArchived(run) === (ui.archival === "archived"));
+      experiment_history.mapRuns((run) => {
+        const updated = runIdentity(run) === id ? { ...run, archival: result } : run;
+        return runIsArchived(updated) === (ui.archival === "archived") ? updated : null;
+      });
       reconcileArchivedSelection([rendered_detail.run]);
       updateUi({ archival_confirming: false });
       announce(action === "archive" ? "Run archived. Automatic deletion is scheduled in 15 days." : "Run restored.");
@@ -1605,7 +1649,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     previous?: Review,
     tab: ReviewTab = "charts",
   ): Promise<void> {
-    const record = runs.find(run => runIdentity(run) === id) ?? detail_cache.get(id)?.run;
+    const record = allLoadedRuns().find(run => runIdentity(run) === id) ?? detail_cache.get(id)?.run;
     if (record && queuePlaceholder(record)) tab = "overview";
     beginReview("run", [id], origin, tab);
     if (previous && review) {
@@ -1795,6 +1839,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   function applyCatalog(catalog: Catalog, quiet = false): void {
     experiments.supported = catalog.access_mode === "hosted" && catalog.experiments_supported === true;
     experiments.management_enabled = experiments.supported && catalog.experiment_management_enabled === true;
+    experiments.groups_supported = experiments.supported && catalog.experiment_groups_supported === true;
+    if (!experiments.groups_supported) { experiment_history.reset(); experiments.groups = []; }
     if (!experiments.supported) resetExperiments();
     run_system_supported = catalog.capabilities?.includes("run-system-metrics-v1") === true;
     if (!run_system_supported) {
@@ -1849,6 +1895,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (experiments.supported) void loadExperiments(true);
   }
   function emptyCatalog(): void {
+    experiment_history.reset();
+    experiments.groups = [];
     list_lane.cancel();
     resetRunColumns();
     runs = [];
@@ -2503,6 +2551,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     }
   }
   function resetFilters(): void {
+    experiment_history.reset();
+    experiments.groups = [];
     cancelRefresh();
     list_lane.cancel();
     clearSearchTimeout();
@@ -2558,6 +2608,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     run_system_monitor.cancel();
     for (const lane of foreground_lanes) lane.cancel();
     experiments_lane.cancel();
+    experiment_history.reset();
     clearSearchTimeout();
     clearStorageSearchTimeout();
     clearSelectionTimeout();
