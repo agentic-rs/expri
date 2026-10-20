@@ -484,8 +484,9 @@ details.inspector-controls { display: block; }
 
 /* Experiments organize durable identities without changing run histories. */
 .experiment-browser-controls { display: flex; align-items: center; gap: 6px; padding: 0 10px 7px; flex-shrink: 0; flex-wrap: wrap; }
-.experiment-view-control { display: flex; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 4px; min-width: 0; background: var(--surface-soft); }
-.experiment-view-control .theme-choice span { min-height: 28px; padding: 4px 7px; }
+.experiment-view-control { display: flex; flex: 0 0 auto; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 4px; min-width: 0; background: var(--surface-soft); }
+.experiment-view-control .theme-choice { flex: 0 0 auto; }
+.experiment-view-control .theme-choice span { min-height: 28px; padding: 4px 7px; white-space: nowrap; }
 .experiment-filter { flex: 1; min-width: 110px; max-width: 230px; }
 .experiment-filter select { height: 29px; font-size: 11px; }
 .experiment-browser-controls .run-control-trigger { min-height: 28px; }
