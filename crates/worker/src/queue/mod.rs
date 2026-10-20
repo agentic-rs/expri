@@ -863,6 +863,7 @@ fn queued_run_request(
     extras: submission.extras.clone(),
     sync_args: submission.sync_args.clone(),
     expected_sync: None,
+    requirements: Default::default(),
   }
 }
 fn terminal_status(status: &serde_json::Value) -> bool {

@@ -164,6 +164,48 @@ fn native_and_python_catalogs_keep_only_valid_optional_capture_metadata() {
   assert_eq!(report["warnings"].as_array().unwrap().len(), 3);
 }
 
+#[test]
+fn native_and_python_catalogs_project_only_valid_resource_requirements() {
+  let (_directory, root) = fixture();
+  let runs = root.join(".expri/runs");
+  let mut good = state("valid", "pending", "2026-10-20T00:00:00Z");
+  good["requirements"] = json!({"disk":[{"min_free_bytes":100,"resume_free_bytes":120}]});
+  good["resource_status"] = json!({"phase":"blocked","blocked":true,"checked_at":"2026-10-20T00:00:01Z",
+    "disk":[{"path":"outputs","min_free_bytes":100,"resume_free_bytes":120,"phase":"unavailable"}]});
+  good["manual_paused"] = json!(false);
+  run(&runs, "valid", Some(&good));
+  for (run_id, field, value) in [
+    (
+      "bad-policy",
+      "requirements",
+      json!({"disk":[{"path":"../private","min_free_bytes":100,"resume_free_bytes":120}]}),
+    ),
+    (
+      "bad-observation",
+      "resource_status",
+      json!({"phase":{},"blocked":true,"checked_at":"2026-10-20T00:00:01Z","disk":[]}),
+    ),
+    ("bad-manual", "manual_paused", json!("true")),
+  ] {
+    let mut saved = good.clone();
+    saved["run_id"] = json!(run_id);
+    saved[field] = value;
+    run(&runs, run_id, Some(&saved));
+  }
+  let report = parity(&root, &request_list(), false);
+  let valid = report["runs"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|run| run["run_id"] == "valid")
+    .unwrap();
+  assert_eq!(valid["requirements"]["recovery_seconds"], 30);
+  assert_eq!(valid["requirements"]["disk"][0]["path"], "outputs");
+  assert_eq!(valid["resource_status"]["disk"][0]["error"], Value::Null);
+  assert_eq!(valid["manual_paused"], false);
+  assert_eq!(report["warnings"].as_array().unwrap().len(), 4);
+}
+
 fn python_query(
   root: &Path,
   request: &RunQueryRequest,

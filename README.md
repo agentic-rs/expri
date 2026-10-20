@@ -504,6 +504,14 @@ report failure. This feature does not recover a crashed or killed supervisor or
 restart training from a checkpoint. See [the upgrade guide](docs/self-hosted-service.md#live-run-supervisor-upgrades)
 for failure handling and history limits.
 
+### Disk resource requirements
+
+Direct native Linux detached runs can also use [disk resource requirements](docs/resource-requirements.md).
+Configure minimum free space in the task, supply `--disk-free` when launching,
+or edit **Requirements** on the primary dashboard. A run waits in `pending`
+before startup, pauses in memory when space falls below its limit, and resumes
+after every disk recovers. Manual pauses remain in effect until you resume them.
+
 ### Continue training from a checkpoint
 
 The primary hosted dashboard also offers **Pause**, **Resume**, **Stop**,

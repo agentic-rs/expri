@@ -451,6 +451,27 @@ thead .selection-column { z-index: 3; background: var(--surface-soft); }
 .lifecycle-checkpoint-list .choice-tag span { white-space: normal; overflow-wrap: anywhere; }
 .lifecycle-form-actions { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
 .lifecycle-replacement { color: var(--warning-ink); }
+.run-resource-badge { display: block; margin-top: 3px; color: var(--warning-ink); font-size: 10px; line-height: 1.4; }
+.resource-status { margin-top: 8px; padding: 8px 10px; border-left: 2px solid var(--warning-ink); font-size: 11px; line-height: 1.5; }
+.resource-status-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+.resource-status-heading strong { color: var(--warning-ink); font-weight: 600; }
+.resource-status ul { padding: 0; margin: 5px 0; list-style: none; }
+.resource-status li { display: flex; flex-wrap: wrap; gap: 4px 12px; overflow-wrap: anywhere; }
+.resource-status li code { max-width: 100%; }
+.resource-status p { margin: 5px 0 0; }
+.resource-check-error { flex-basis: 100%; color: var(--warning-ink); }
+.resource-form fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.resource-disk-row { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding-block: 8px; border-bottom: 1px solid var(--line); }
+.resource-disk-row > .field { flex: 1 1 100px; min-width: 0; }
+.resource-disk-row > .resource-path { flex: 2 1 180px; }
+.resource-disk-row input { box-sizing: border-box; width: 100%; }
+.resource-remove { min-height: 30px; }
+.resource-options { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 8px 16px; margin-top: 12px; }
+.resource-recovery { max-width: 180px; }
+.resource-path-note { margin-bottom: 0; }
+@media (max-width: 600px) {
+  .resource-disk-row > .resource-path { flex-basis: 100%; }
+}
 .inspector-actions, .inspector-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 details.inspector-controls { display: block; }
 .inspector-toolbar .annotation-summary-description { display: none; }

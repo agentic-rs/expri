@@ -7,6 +7,10 @@ use serde::Deserialize;
 use crate::error::{ExpriError, Result};
 use crate::filter::{DEFAULT_EXCLUDED_DIRS, DEFAULT_EXCLUDED_FILES, SyncRules};
 use crate::protocol::SetupStep;
+use expri_core::resource_requirements::{
+  DiskRequirement, ResourceRequirements, default_disk_path, default_recovery_seconds,
+  default_resume_free_bytes, parse_byte_size,
+};
 
 #[cfg(test)]
 use expri_core::config::normalize_package_name;
@@ -129,6 +133,61 @@ pub struct TaskOptionsConfig {
   #[serde(default)]
   pub uv: bool,
   pub resources: Option<crate::queue_cli::ResourceDefaults>,
+  #[serde(default)]
+  pub requirements: TaskRequirementsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRequirementsConfig {
+  #[serde(default)]
+  pub disk: Vec<TaskDiskRequirementConfig>,
+  #[serde(default = "default_recovery_seconds")]
+  pub recovery_seconds: u32,
+}
+
+impl Default for TaskRequirementsConfig {
+  fn default() -> Self {
+    Self {
+      disk: Vec::new(),
+      recovery_seconds: default_recovery_seconds(),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDiskRequirementConfig {
+  #[serde(default = "default_disk_path")]
+  pub path: String,
+  pub min_free: String,
+  pub resume_free: Option<String>,
+}
+
+impl TaskRequirementsConfig {
+  fn resolve(&self) -> Result<ResourceRequirements> {
+    let disk = self
+      .disk
+      .iter()
+      .map(|disk| {
+        let min_free_bytes = parse_byte_size(&disk.min_free)?;
+        Ok(DiskRequirement {
+          path: disk.path.clone(),
+          min_free_bytes,
+          resume_free_bytes: match disk.resume_free.as_deref() {
+            Some(value) => parse_byte_size(value)?,
+            None => default_resume_free_bytes(min_free_bytes)?,
+          },
+        })
+      })
+      .collect::<Result<Vec<_>>>()?;
+    let requirements = ResourceRequirements {
+      disk,
+      recovery_seconds: self.recovery_seconds,
+    };
+    requirements.validate()?;
+    Ok(requirements)
+  }
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +195,7 @@ pub struct TaskConfig {
   pub command: Vec<String>,
   pub uv: bool,
   pub resources: Option<crate::queue_cli::ResourceDefaults>,
+  pub requirements: ResourceRequirements,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +244,9 @@ impl Config {
     }
     for name in config.target.keys() {
       config.target(name)?;
+    }
+    for name in config.tasks.keys() {
+      config.task(name)?;
     }
     Ok(config)
   }
@@ -259,11 +322,12 @@ impl Config {
   }
 
   pub fn task(&self, name: &str) -> Result<TaskConfig> {
-    self
+    let definition = self
       .tasks
       .get(name)
-      .map(TaskConfig::from)
-      .ok_or_else(|| ExpriError::Message(format!("unknown task: {name}")))
+      .ok_or_else(|| ExpriError::Message(format!("unknown task: {name}")))?;
+    TaskConfig::try_from(definition)
+      .map_err(|error| ExpriError::Message(format!("task {name:?}: {error}")))
   }
 
   pub fn push_rules(&self) -> Result<SyncRules> {
@@ -331,20 +395,24 @@ impl Config {
   }
 }
 
-impl From<&TaskDefinition> for TaskConfig {
-  fn from(definition: &TaskDefinition) -> Self {
-    match definition {
+impl TryFrom<&TaskDefinition> for TaskConfig {
+  type Error = ExpriError;
+
+  fn try_from(definition: &TaskDefinition) -> Result<Self> {
+    Ok(match definition {
       TaskDefinition::Command(command) => Self {
         command: command.clone(),
         uv: false,
         resources: None,
+        requirements: ResourceRequirements::default(),
       },
       TaskDefinition::Options(options) => Self {
         command: options.command.clone(),
         uv: options.uv,
         resources: options.resources.clone(),
+        requirements: options.requirements.resolve()?,
       },
-    }
+    })
   }
 }
 
@@ -361,6 +429,61 @@ fn target_config_path(path: &Path) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn task_requirements_resolve_multiple_paths_and_default_hysteresis() {
+    let config: Config = toml::from_str(
+      r#"
+[tasks.train]
+command = ["python", "train.py"]
+[tasks.train.requirements]
+recovery_seconds = 45
+[[tasks.train.requirements.disk]]
+path = "outputs"
+min_free = "20GiB"
+resume_free = "30GiB"
+[[tasks.train.requirements.disk]]
+path = "/mnt/dataset"
+min_free = "10GB"
+"#,
+    )
+    .unwrap();
+    let task = config.task("train").unwrap();
+    assert_eq!(task.requirements.recovery_seconds, 45);
+    assert_eq!(task.requirements.disk.len(), 2);
+    assert_eq!(
+      task.requirements.disk[0].min_free_bytes,
+      20 * 1024_u64.pow(3)
+    );
+    assert_eq!(
+      task.requirements.disk[0].resume_free_bytes,
+      30 * 1024_u64.pow(3)
+    );
+    assert_eq!(task.requirements.disk[1].resume_free_bytes, 12_000_000_000);
+  }
+
+  #[test]
+  fn task_requirements_are_opt_in_and_invalid_policies_fail_when_resolved() {
+    let config: Config = toml::from_str("[tasks]\ntrain=['true']\n").unwrap();
+    assert!(config.task("train").unwrap().requirements.is_empty());
+    for (path, minimum, resume) in [
+      ("outputs", "0", "100"),
+      ("../other", "100", "120"),
+      ("outputs", "100", "100"),
+    ] {
+      let raw = format!(
+        "[tasks.train]\ncommand=['true']\n[[tasks.train.requirements.disk]]\npath='{path}'\nmin_free='{minimum}'\nresume_free='{resume}'\n",
+      );
+      let config: Config = toml::from_str(&raw).unwrap();
+      assert!(
+        config
+          .task("train")
+          .unwrap_err()
+          .to_string()
+          .contains("task \"train\"")
+      );
+    }
+  }
 
   #[test]
   fn service_rejects_removed_input_configuration() {

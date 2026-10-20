@@ -2,7 +2,7 @@ export type TaskAttempt = {
   attempt: number;
   request_id: string | null;
   reason: string | null;
-  status: "preparing" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "lost" | "continued";
+  status: "pending" | "preparing" | "running" | "waiting" | "paused" | "completed" | "failed" | "cancelled" | "lost" | "continued";
   error: string | null;
   requested_at: string | null;
   started_at: string | null;
@@ -23,7 +23,7 @@ export type TaskAttempts = {
   truncated: boolean;
 };
 
-const STATUSES = ["preparing", "running", "waiting", "paused", "completed", "failed", "cancelled", "lost", "continued"];
+const STATUSES = ["pending", "preparing", "running", "waiting", "paused", "completed", "failed", "cancelled", "lost", "continued"];
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }

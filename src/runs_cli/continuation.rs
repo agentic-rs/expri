@@ -7,6 +7,7 @@ use crate::controller::jobs::{JobOptions, execute};
 use crate::controller::sync::{SyncOptions, sync_target_with_diagnostic_receipt};
 use crate::error::{ExpriError, Result};
 use crate::protocol::{ContinueRunRequest, JobRequest, RunRequest};
+use expri_core::resource_requirements::ResourceRequirements;
 
 #[derive(Debug, Args)]
 pub(super) struct ContinueCommand {
@@ -79,6 +80,19 @@ pub(super) fn run(
       },
     })?
     .ok_or_else(|| message("worker returned no run status"))?;
+    let requirements = recorded_requirements(&status)?;
+    crate::controller::task::check_run_requirements_target(
+      crate::controller::task::RunRequirementsTargetOptions {
+        target: &context.target,
+        control_path: &context.control_path,
+        control_persist: &command.connection.control_persist,
+        requirements: &requirements,
+        detach: true,
+        dry_run: false,
+        verbosity,
+        quiet,
+      },
+    )?;
     let name = task_name(command.task, &status)?;
     let mut argv = context.config.task(&name)?.command;
     argv.extend(command.args);
@@ -122,6 +136,7 @@ pub(super) fn run(
             name,
             command: argv,
             environment,
+            requirements,
             service: context.target.service,
             detach: true,
             smoke: status["state"]["smoke"].as_bool().unwrap_or(false),
@@ -163,6 +178,7 @@ pub(super) fn run(
             name,
             command: argv,
             environment,
+            requirements: recorded_requirements(&status)?,
             service: context.config.local_service()?,
             detach: true,
             smoke: status["state"]["smoke"].as_bool().unwrap_or(false),
@@ -200,6 +216,15 @@ fn task_name(requested: Option<String>, status: &Value) -> Result<String> {
     .ok_or_else(|| message("run has no recorded task; specify --task"))
 }
 
+fn recorded_requirements(status: &Value) -> Result<ResourceRequirements> {
+  let requirements: ResourceRequirements = match status["state"].get("requirements") {
+    Some(value) => serde_json::from_value(value.clone())?,
+    None => ResourceRequirements::default(),
+  };
+  requirements.validate()?;
+  Ok(requirements)
+}
+
 fn message(detail: impl Into<String>) -> ExpriError {
   ExpriError::Message(detail.into())
 }
@@ -209,6 +234,25 @@ mod tests {
   use super::*;
   use clap::Parser;
   use serde_json::json;
+
+  #[test]
+  fn continuation_keeps_the_runs_current_disk_policy() {
+    let requirements = json!({
+      "disk":[{"path":"/mnt/checkpoints", "min_free_bytes":100, "resume_free_bytes":150}],
+      "recovery_seconds":15,
+    });
+    let status = json!({"state":{"requirements":requirements}});
+    assert_eq!(
+      serde_json::to_value(recorded_requirements(&status).unwrap()).unwrap(),
+      requirements
+    );
+    assert!(
+      recorded_requirements(&json!({"state":{}}))
+        .unwrap()
+        .is_empty()
+    );
+    assert!(recorded_requirements(&json!({"state":{"requirements":null}})).is_err());
+  }
 
   #[test]
   fn continuation_cli_keeps_task_arguments_literal_and_requires_checkpoint_and_reason() {

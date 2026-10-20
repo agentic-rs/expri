@@ -224,8 +224,8 @@ fn route<S: ObjectStorage>(
       Err(error) if error.status == 401 => return Ok(redirect(&format!("/login{query}"), None)),
       Err(error) => return Err(error),
     }
-  } else if !matches!(path, "/styles.css" | "/app.js")
-    && !(assets.is_external() && path.starts_with("/assets/"))
+  } else if !(matches!(path, "/styles.css" | "/app.js")
+    || assets.is_external() && path.starts_with("/assets/"))
   {
     auth.authorized(request)?;
   }

@@ -125,7 +125,13 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
     Ok(()) => {
       match value["status"].as_str().unwrap_or_default() {
         "running" | "waiting" => capabilities.extend([ControlAction::Pause, ControlAction::Stop]),
-        "paused" => capabilities.extend([ControlAction::Resume, ControlAction::Stop]),
+        "paused" => {
+          capabilities.extend([ControlAction::Resume, ControlAction::Stop]);
+          if value["resource_paused"] == true && value["manual_paused"] != true {
+            capabilities.push(ControlAction::Pause);
+          }
+        }
+        "pending" => capabilities.push(ControlAction::Stop),
         _ => {}
       }
       if matches!(
@@ -133,6 +139,9 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
         Some("running" | "waiting" | "paused" | "completed" | "failed" | "cancelled")
       ) {
         capabilities.extend([ControlAction::Continue, ControlAction::Restart]);
+      }
+      if value["run_requirements_protocol_version"] == 1 || terminal(&value) {
+        capabilities.push(ControlAction::SetRequirements);
       }
     }
     Err(error) => reason = Some(error.to_string()),
@@ -153,11 +162,13 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
   let mut checkpoints = registered_checkpoints(&run_dir)?;
   checkpoints.sort();
   let recorded_status = value["status"].as_str().unwrap_or("unknown");
-  let status = if matches!(recorded_status, "running" | "waiting" | "paused")
-    && !matches!(
-      expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?,
-      LockAttempt::Busy
-    ) {
+  let status = if matches!(
+    recorded_status,
+    "preparing" | "pending" | "running" | "waiting" | "paused"
+  ) && !matches!(
+    expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?,
+    LockAttempt::Busy
+  ) {
     "lost"
   } else {
     recorded_status
@@ -171,7 +182,7 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
     .filter(|value| !value.is_null())
     .unwrap_or(&value["exit_code"]);
   Ok(
-    json!({"supported":reason.is_none(),"protocol_version":value["run_control_protocol_version"].as_u64().unwrap_or(0),"attempt":attempt(&value),"generation":generation(&value),"status":status,"capabilities":capabilities,"command":command,"checkpoints":checkpoints,"reason":reason,"lifecycle":{"started_at":value["started_at"],"finished_at":value["finished_at"],"exit_code":exit_code}}),
+    json!({"supported":reason.is_none(),"protocol_version":value["run_control_protocol_version"].as_u64().unwrap_or(0),"attempt":attempt(&value),"generation":generation(&value),"status":status,"capabilities":capabilities,"command":command,"checkpoints":checkpoints,"reason":reason,"requirements":crate::resource_guard::requirements(&value)?,"resource_status":value["resource_status"],"manual_paused":value["manual_paused"].as_bool().unwrap_or(value["status"] == "paused" && value["resource_paused"] != true),"lifecycle":{"started_at":value["started_at"],"finished_at":value["finished_at"],"exit_code":exit_code}}),
   )
 }
 
@@ -230,6 +241,14 @@ pub fn execute(run_dir: &Path, command: &ControlCommand) -> Result<ControlResult
     || command.grace_seconds > 3600
   {
     return Err(message("lifecycle reason or grace period is invalid"));
+  }
+  if let Some(requirements) = &command.requirements {
+    requirements.validate()?;
+  }
+  if (command.action == ControlAction::SetRequirements) != command.requirements.is_some() {
+    return Err(message(
+      "set_requirements requires a resource policy, and other actions must not supply one",
+    ));
   }
   let run_dir = crate::supervisor::linux::validate_run_directory(run_dir)?;
   let LockAttempt::Acquired(_lock) =
@@ -295,6 +314,29 @@ pub fn execute(run_dir: &Path, command: &ControlCommand) -> Result<ControlResult
   let performed = match command.action {
     ControlAction::Pause | ControlAction::Resume | ControlAction::Stop => {
       supervisor_action(&run_dir, command)
+    }
+    ControlAction::SetRequirements => {
+      let current = state(&run_dir)?;
+      if !terminal(&current) && current["run_requirements_protocol_version"] != 1 {
+        Err(message(
+          "this live supervisor does not enforce resource requirements; upgrade it before changing the policy",
+        ))
+      } else if terminal(&current) {
+        update_state(&run_dir.join("run-state.json"), |value| {
+          fence(value, command)?;
+          if !terminal(value) {
+            return Err(message(
+              "run became active before requirements were updated",
+            ));
+          }
+          value["requirements"] = serde_json::to_value(command.requirements.as_ref().unwrap())?;
+          value.as_object_mut().unwrap().remove("resource_status");
+          Ok(())
+        })
+        .map(|_| None)
+      } else {
+        supervisor_action(&run_dir, command)
+      }
     }
     ControlAction::Continue => continue_recorded(&run_dir, command),
     ControlAction::Restart => restart_recorded(&run_dir, &mut journal),
@@ -462,6 +504,7 @@ fn recorded_request(run_dir: &Path, command: &ControlCommand) -> Result<RunReque
     return Err(message("recorded task arguments are invalid"));
   }
   request.expected_sync = None;
+  request.requirements = crate::resource_guard::requirements(&value)?;
   request.name = value["task"].as_str().unwrap_or(&request.name).to_owned();
   request.detach = true;
   crate::environment::task_argv(&request.command)?;
@@ -634,6 +677,14 @@ fn restart_recorded(run_dir: &Path, journal: &mut Journal) -> Result<Option<Stri
 
 /// Called only by the supervisor that still owns an unreaped direct child.
 pub(crate) fn process(run_dir: &Path, pid: u32) -> Result<Option<u32>> {
+  process_owned(run_dir, Some(pid))
+}
+
+pub(crate) fn process_pending(run_dir: &Path) -> Result<Option<u32>> {
+  process_owned(run_dir, None)
+}
+
+fn process_owned(run_dir: &Path, pid: Option<u32>) -> Result<Option<u32>> {
   let command: ControlCommand = serde_json::from_value(read_json(&run_dir.join(MAILBOX), LIMIT)?)?;
   let value = state(run_dir)?;
   if saved_event(&value, &command).is_some() {
@@ -651,7 +702,27 @@ pub(crate) fn process(run_dir: &Path, pid: u32) -> Result<Option<u32>> {
     }
     let status = value["status"].as_str().unwrap_or_default();
     match command.action {
+      ControlAction::SetRequirements => {
+        if value["run_requirements_protocol_version"] != 1 {
+          return Err(message(
+            "this supervisor does not enforce resource requirements; upgrade it before changing the policy",
+          ));
+        }
+        let policy = command
+          .requirements
+          .as_ref()
+          .ok_or_else(|| message("resource requirements are missing"))?;
+        policy.validate()?;
+        update_state(&run_dir.join("run-state.json"), |current| {
+          fence(current, &command)?;
+          current["requirements"] = serde_json::to_value(policy)?;
+          current.as_object_mut().unwrap().remove("resource_status");
+          Ok(())
+        })?;
+        Ok(None)
+      }
       ControlAction::Pause if matches!(status, "running" | "waiting" | "paused") => {
+        let pid = pid.ok_or_else(|| message("task has not started"))?;
         update_state(&run_dir.join("run-state.json"), |current| {
           // Acquire the state lease first: freezing a task which currently owns
           // it would strand that lease and prevent the pause acknowledgement.
@@ -660,6 +731,7 @@ pub(crate) fn process(run_dir: &Path, pid: u32) -> Result<Option<u32>> {
           if current["status"] != "paused" {
             current["paused_previous_status"] = current["status"].clone();
           }
+          current["manual_paused"] = json!(true);
           current["status"] = json!("paused");
           set_attempt_phase(current, "paused");
           Ok(())
@@ -667,21 +739,37 @@ pub(crate) fn process(run_dir: &Path, pid: u32) -> Result<Option<u32>> {
         Ok(None)
       }
       ControlAction::Resume if matches!(status, "paused" | "running" | "waiting") => {
+        let pid = pid.ok_or_else(|| message("task has not started"))?;
         update_state(&run_dir.join("run-state.json"), |current| {
           fence(current, &command)?;
-          groups::signal(pid, libc::SIGCONT)?;
-          restore_phase(current);
+          current["manual_paused"] = json!(false);
+          if current["resource_paused"] != true {
+            groups::signal(pid, libc::SIGCONT)?;
+            restore_phase(current);
+          }
           Ok(())
         })?;
         Ok(None)
       }
-      ControlAction::Stop if matches!(status, "running" | "waiting" | "paused") => {
+      ControlAction::Stop
+        if matches!(
+          status,
+          "preparing" | "pending" | "running" | "waiting" | "paused"
+        ) =>
+      {
         update_state(&run_dir.join("run-state.json"), |current| {
           fence(current, &command)?;
           // Deliver TERM before CONT so a paused task resumes into its handler,
           // after the shared state lease makes its former phase visible again.
-          groups::signal(pid, libc::SIGTERM)?;
-          groups::signal(pid, libc::SIGCONT)?;
+          if let Some(pid) = pid {
+            groups::signal(pid, libc::SIGTERM)?;
+            groups::signal(pid, libc::SIGCONT)?;
+          } else {
+            fs::OpenOptions::new()
+              .write(true)
+              .create_new(true)
+              .open(run_dir.join(".cancel-request"))?;
+          }
           restore_phase(current);
           Ok(())
         })?;
@@ -714,7 +802,7 @@ pub(crate) fn process(run_dir: &Path, pid: u32) -> Result<Option<u32>> {
   }
 }
 
-fn set_attempt_phase(value: &mut Value, phase: &str) {
+pub(crate) fn set_attempt_phase(value: &mut Value, phase: &str) {
   let number = attempt(value);
   if let Some(entry) = value["task_attempts"]["attempts"]
     .as_array_mut()

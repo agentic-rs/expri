@@ -184,6 +184,7 @@ def _catalog_summary(run_id, state, warnings):
       summary["smoke"] = state["smoke"]
     else:
       _catalog_warning(warnings, run_id, "run-state.json has invalid or missing smoke")
+  _catalog_resource_metadata(state, summary, warnings, run_id)
   machine_id = state.get("machine_id")
   if machine_id is not None:
     if (isinstance(machine_id, str) and len(machine_id) <= 96 and
@@ -253,6 +254,91 @@ def _catalog_parse_timestamp(timestamp):
     return None
   nanos = int((match.group("fraction") or "").ljust(9, "0")[:9])
   return seconds, nanos
+
+
+def _catalog_resource_metadata(state, summary, warnings, run_id):
+  def invalid(field):
+    _catalog_warning(warnings, run_id, "run-state.json has invalid or missing " + field)
+
+  def text(value, limit):
+    return isinstance(value, str) and len(value.encode("utf-8")) <= limit and not any(
+      ord(character) < 32 or 127 <= ord(character) < 160 for character in value)
+
+  def integer(value, maximum):
+    return type(value) is int and 0 <= value <= maximum
+
+  policy = state.get("requirements")
+  normalized = None
+  if policy is not None:
+    valid = isinstance(policy, dict) and set(policy) <= {"disk", "recovery_seconds"}
+    recovery = policy.get("recovery_seconds", 30) if valid else None
+    disk = policy.get("disk", []) if valid else None
+    valid = valid and integer(recovery, 3600) and isinstance(disk, list) and len(disk) <= 16
+    normalized_disk = []
+    paths = set()
+    for entry in disk if valid else []:
+      if not isinstance(entry, dict) or not {"min_free_bytes", "resume_free_bytes"} <= set(entry) <= {"path", "min_free_bytes", "resume_free_bytes"}:
+        valid = False
+        break
+      path = entry.get("path", "outputs")
+      minimum, resume = entry["min_free_bytes"], entry["resume_free_bytes"]
+      if (not text(path, 4096) or not path or (path != "outputs" and not path.startswith("/")) or
+          any(part in {".", ".."} for part in path.split("/")) or path in paths or
+          not integer(minimum, 9007199254740991) or not integer(resume, 9007199254740991) or not 0 < minimum < resume):
+        valid = False
+        break
+      paths.add(path)
+      normalized_disk.append({"path": path, "min_free_bytes": minimum, "resume_free_bytes": resume})
+    if valid:
+      normalized = {"disk": normalized_disk, "recovery_seconds": recovery}
+      summary["requirements"] = normalized
+    else:
+      invalid("requirements")
+  observation = state.get("resource_status")
+  if observation is not None:
+    phases = {"ready", "blocked", "recovering", "unavailable"}
+    fields = {"phase", "blocked", "checked_at", "recovery_started_at", "disk"}
+    valid = (normalized is not None and isinstance(observation, dict) and
+      {"phase", "blocked", "checked_at", "disk"} <= set(observation) <= fields)
+    if valid:
+      observation = dict(observation, recovery_started_at=observation.get("recovery_started_at"))
+      checked = observation["checked_at"]
+      started = observation["recovery_started_at"]
+      checked_time = _catalog_parse_timestamp(checked) if isinstance(checked, str) and len(checked) <= 64 else None
+      started_time = _catalog_parse_timestamp(started) if isinstance(started, str) and len(started) <= 64 else None
+      disks = observation["disk"]
+      valid = (checked_time is not None and (started is None or started_time is not None and started_time <= checked_time) and
+        isinstance(observation["phase"], str) and observation["phase"] in phases and type(observation["blocked"]) is bool and
+        observation["blocked"] == (observation["phase"] != "ready") and isinstance(disks, list) and len(disks) == len(normalized["disk"]))
+      expected = {entry["path"]: entry for entry in normalized["disk"]}
+      seen = set()
+      normalized_observations = []
+      for entry in disks if valid else []:
+        if (not isinstance(entry, dict) or
+            not {"path", "min_free_bytes", "resume_free_bytes", "phase"} <= set(entry) <= {"path", "available_bytes", "min_free_bytes", "resume_free_bytes", "phase", "error"}):
+          valid = False
+          break
+        entry = dict(entry, available_bytes=entry.get("available_bytes"), error=entry.get("error"))
+        path = entry["path"]
+        if (not isinstance(path, str) or path not in expected or path in seen or
+            type(entry["min_free_bytes"]) is not int or type(entry["resume_free_bytes"]) is not int or
+            entry["min_free_bytes"] != expected[path]["min_free_bytes"] or entry["resume_free_bytes"] != expected[path]["resume_free_bytes"] or
+            not isinstance(entry["phase"], str) or entry["phase"] not in phases or entry["available_bytes"] is not None and not integer(entry["available_bytes"], 2 ** 64 - 1) or
+            entry["error"] is not None and not text(entry["error"], 512)):
+          valid = False
+          break
+        seen.add(path)
+        normalized_observations.append(entry)
+      observation["disk"] = normalized_observations
+    if valid:
+      summary["resource_status"] = observation
+    else:
+      invalid("resource_status")
+  if "manual_paused" in state:
+    if type(state["manual_paused"]) is bool:
+      summary["manual_paused"] = state["manual_paused"]
+    else:
+      invalid("manual_paused")
 
 
 def _catalog_directory(path, missing=False, catalog=False):

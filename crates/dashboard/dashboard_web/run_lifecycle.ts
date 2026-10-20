@@ -1,6 +1,7 @@
 import { apiUrl, parseProjectRunKey, parseRunDeepLink, type Run, type RunDeepLink, type Source } from "./dashboard_model";
+import { parseResourceRequirements, parseResourceStatus, type ResourceRequirements, type ResourceStatus } from "./run_resources";
 
-export const RUN_LIFECYCLE_ACTIONS = ["pause", "resume", "stop", "continue", "restart"] as const;
+export const RUN_LIFECYCLE_ACTIONS = ["pause", "resume", "stop", "continue", "restart", "set_requirements"] as const;
 export type RunLifecycleAction = typeof RUN_LIFECYCLE_ACTIONS[number];
 export type RunLifecycleRequest = {
   request_id: string;
@@ -21,6 +22,9 @@ export type RunLifecycle = {
   checkpoints: string[];
   last_seen_at_ms: number;
   request: RunLifecycleRequest | null;
+  requirements?: ResourceRequirements | null;
+  resource_status?: ResourceStatus | null;
+  manual_paused?: boolean;
 };
 
 export function lifecycleScope(run: Run, source: Source | undefined): RunDeepLink | null {
@@ -38,8 +42,8 @@ export function lifecyclePending(request: RunLifecycleRequest | null | undefined
 
 export function lifecycleActions(value: RunLifecycle): RunLifecycleAction[] {
   const allowed: RunLifecycleAction[] = ["running", "waiting"].includes(value.status) ? ["pause", "stop", "continue", "restart"] :
-    value.status === "paused" ? ["resume", "stop", "continue", "restart"] :
-      value.status === "preparing" ? ["stop"] :
+    value.status === "paused" ? [...(value.manual_paused === false && value.resource_status?.blocked ? ["pause" as const] : []), "resume", "stop", "continue", "restart"] :
+      ["pending", "preparing"].includes(value.status) ? ["stop"] :
       ["completed", "failed", "cancelled", "lost"].includes(value.status) ? ["continue", "restart"] : [];
   return allowed.filter(action => value.capabilities.includes(action));
 }
@@ -56,6 +60,11 @@ export function parseRunLifecycle(value: unknown): RunLifecycle {
     !strings(item.command) || !strings(item.checkpoints) || !integer(item.last_seen_at_ms) ||
     !Number.isFinite(new Date(item.last_seen_at_ms).valueOf())) throw new Error("Invalid run control response.");
   if (item.supported && (item.attempt < 1 || !item.binding_id)) throw new Error("Run control is missing its worker binding.");
+  if (item.manual_paused !== undefined && typeof item.manual_paused !== "boolean") throw new Error("Invalid manual pause state.");
+  const resource_fields: Pick<RunLifecycle, "requirements" | "resource_status" | "manual_paused"> = {};
+  if (item.requirements !== undefined) resource_fields.requirements = item.requirements === null ? null : parseResourceRequirements(item.requirements);
+  if (item.resource_status !== undefined) resource_fields.resource_status = item.resource_status === null ? null : parseResourceStatus(item.resource_status);
+  if (item.manual_paused !== undefined) resource_fields.manual_paused = item.manual_paused;
   let request: RunLifecycleRequest | null = null;
   if (item.request !== null) {
     const record = item.request as Partial<RunLifecycleRequest> | undefined;
@@ -73,7 +82,7 @@ export function parseRunLifecycle(value: unknown): RunLifecycle {
     supported: item.supported, online: item.online, status: item.status,
     attempt: item.attempt, generation: item.generation, binding_id: item.binding_id,
     capabilities: item.capabilities as RunLifecycleAction[], command: item.command,
-    checkpoints: item.checkpoints, last_seen_at_ms: item.last_seen_at_ms, request,
+    checkpoints: item.checkpoints, last_seen_at_ms: item.last_seen_at_ms, request, ...resource_fields,
   };
 }
 

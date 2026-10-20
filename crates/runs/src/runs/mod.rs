@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 use crate::error::{ExpriError, Result};
 use crate::protocol::RunQueryRequest;
 
+mod resource_metadata;
+pub use resource_metadata::resource_metadata;
+
 pub const CATALOG_SCRIPT: &str = include_str!("catalog.py");
 const METADATA_LIMIT: u64 = 256 * 1024;
 const DETAIL_LIMIT: u64 = 16 * 1024 * 1024;
@@ -328,6 +331,13 @@ fn record_from_state(run_id: &str, state: Option<Value>) -> Record {
         } else {
           field_warning(&mut warnings, run_id, "smoke");
         }
+      }
+      let (resources, invalid_resources) = resource_metadata(state);
+      for (field, value) in resources.as_object().unwrap() {
+        summary[field] = value.clone();
+      }
+      for field in invalid_resources {
+        field_warning(&mut warnings, run_id, field);
       }
       if let Some(machine_id) = object.get("machine_id").filter(|value| !value.is_null()) {
         if let Some(machine_id) = machine_id

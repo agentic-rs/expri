@@ -1,3 +1,4 @@
+use expri_core::resource_requirements::{ResourceRequirements, ResourceStatus};
 use expri_core::run_control::{
   ControlAction, ControlCommand, ControlLifecycle, ControlResult, RunControlRequest,
   RunControlResponse,
@@ -8,6 +9,7 @@ use serde_json::{Value, json};
 use super::*;
 
 mod overlay;
+mod requirements;
 
 const ONLINE_MS: i64 = 15_000;
 const DELIVERY_MS: i64 = 60_000;
@@ -56,6 +58,8 @@ pub(in crate::service) struct ControlSubmission {
   pub action: ControlAction,
   pub arguments: Option<Vec<String>>,
   pub checkpoint: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub requirements: Option<ResourceRequirements>,
   pub reason: String,
   pub grace_seconds: u32,
 }
@@ -81,6 +85,12 @@ struct Facts {
   checkpoints: Vec<String>,
   #[serde(default)]
   lifecycle: Option<ControlLifecycle>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  requirements: Option<ResourceRequirements>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  resource_status: Option<ResourceStatus>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  manual_paused: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -253,12 +263,19 @@ fn snapshot(db: &Connection, scope: &str, at: i64) -> ApiResult<Value> {
       "last_seen_at_ms":0,"request":request}),
     );
   };
-  Ok(
-    json!({"supported":true,"online":at.saturating_sub(last_seen_at_ms)<=ONLINE_MS,
+  let mut snapshot = json!({"supported":true,"online":at.saturating_sub(last_seen_at_ms)<=ONLINE_MS,
     "status":facts.status,"attempt":facts.attempt,"generation":facts.generation,
     "binding_id":facts.binding_id,"capabilities":facts.capabilities,"command":facts.command,
-    "checkpoints":facts.checkpoints,"lifecycle":facts.lifecycle,"last_seen_at_ms":last_seen_at_ms,"request":request}),
-  )
+    "checkpoints":facts.checkpoints,"lifecycle":facts.lifecycle,
+    "last_seen_at_ms":last_seen_at_ms,"request":request});
+  if let Some(requirements) = &facts.requirements {
+    snapshot["requirements"] = json!(requirements);
+    snapshot["resource_status"] = json!(facts.resource_status);
+  }
+  if let Some(paused) = facts.manual_paused {
+    snapshot["manual_paused"] = json!(paused);
+  }
+  Ok(snapshot)
 }
 
 fn validate_result(result: &ControlResult) -> ApiResult<()> {
@@ -420,6 +437,9 @@ impl<S: ObjectStorage> Store<S> {
       command,
       checkpoints,
       lifecycle,
+      requirements,
+      resource_status,
+      manual_paused,
       result,
     } = request;
     validate_scope(&scope).map_err(bad)?;
@@ -430,6 +450,7 @@ impl<S: ObjectStorage> Store<S> {
       || !matches!(
         status.as_str(),
         "preparing"
+          | "pending"
           | "running"
           | "waiting"
           | "paused"
@@ -438,12 +459,17 @@ impl<S: ObjectStorage> Store<S> {
           | "cancelled"
           | "lost"
       )
-      || capabilities.len() > 5
+      || capabilities.len() > 6
       || checkpoints.len() > 100
     {
       return Err(ApiError::new(400, "invalid lifecycle worker facts"));
     }
     validate_argv(&command, false)?;
+    requirements::validate_facts(
+      requirements.as_ref(),
+      resource_status.as_deref(),
+      &capabilities,
+    )?;
     for path in &checkpoints {
       checkpoint(path)?;
     }
@@ -469,6 +495,9 @@ impl<S: ObjectStorage> Store<S> {
       command,
       checkpoints,
       lifecycle,
+      requirements,
+      resource_status: resource_status.map(|status| *status),
+      manual_paused,
     };
     let mut db = self.db()?;
     let tx = db.transaction().map_err(database)?;
@@ -604,6 +633,24 @@ impl<S: ObjectStorage> Store<S> {
     if selection.action == ControlAction::Restart && selection.checkpoint.is_some() {
       return Err(ApiError::new(400, "restart does not accept a checkpoint"));
     }
+    match (&selection.action, &selection.requirements) {
+      (ControlAction::SetRequirements, Some(requirements)) => {
+        requirements.validate().map_err(bad)?
+      }
+      (ControlAction::SetRequirements, None) => {
+        return Err(ApiError::new(
+          400,
+          "set_requirements requires a disk requirements policy",
+        ));
+      }
+      (_, Some(_)) => {
+        return Err(ApiError::new(
+          400,
+          "only set_requirements accepts requirements",
+        ));
+      }
+      (_, None) => {}
+    }
     let fingerprint = encode(&selection)?;
     let scope_json = encode(&scope)?;
     let gate = self.project_gate(&scope.project_id)?;
@@ -678,6 +725,7 @@ impl<S: ObjectStorage> Store<S> {
       action: selection.action,
       arguments: selection.arguments,
       checkpoint: selection.checkpoint,
+      requirements: selection.requirements,
       reason: selection.reason,
       grace_seconds: selection.grace_seconds,
       expires_at_ms: at.saturating_add(DELIVERY_MS),

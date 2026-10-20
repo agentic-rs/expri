@@ -25,6 +25,7 @@ fn control(action: ControlAction, id: &str) -> ControlCommand {
     action,
     arguments: None,
     checkpoint: None,
+    requirements: None,
     reason: "test lifecycle".into(),
     grace_seconds: 3,
     expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
@@ -81,6 +82,166 @@ fn start_counter(run: &Path, script: &'static str) -> Counter {
     run_dir: run.to_owned(),
     handle: Some(handle),
   }
+}
+
+fn disk_policy(blocked: bool) -> expri_core::resource_requirements::ResourceRequirements {
+  use expri_core::resource_requirements::{DiskRequirement, ResourceRequirements};
+  ResourceRequirements {
+    disk: vec![DiskRequirement {
+      path: "outputs".into(),
+      min_free_bytes: if blocked { 9_000_000_000_000_000 } else { 1 },
+      resume_free_bytes: if blocked { 9_000_000_000_000_001 } else { 2 },
+    }],
+    recovery_seconds: 0,
+  }
+}
+
+#[test]
+fn an_older_live_lifecycle_supervisor_never_receives_a_requirements_mailbox() {
+  let (_root, run) = fixture();
+  let _lease = expri_core::lock::run_lock(&run).unwrap();
+  update_state(&run.join("run-state.json"), |state| {
+    state["run_control_protocol_version"] = json!(1);
+    state["supervisor"] = json!({"generation":1});
+    Ok(())
+  })
+  .unwrap();
+  let capabilities = inspect(&run).unwrap()["capabilities"].clone();
+  assert!(capabilities.as_array().unwrap().contains(&json!("pause")));
+  assert!(
+    !capabilities
+      .as_array()
+      .unwrap()
+      .contains(&json!("set_requirements"))
+  );
+  let mut command = control(
+    ControlAction::SetRequirements,
+    "old-supervisor-requirements",
+  );
+  command.requirements = Some(disk_policy(true));
+  let result = execute(&run, &command).unwrap();
+  assert_eq!(result.status, "failed");
+  assert!(result.error.unwrap().contains("upgrade"));
+  assert!(!run.join(MAILBOX).exists());
+  assert!(state(&run).unwrap()["requirements"].is_null());
+}
+
+fn set_disk_policy(run: &Path, blocked: bool, id: &str) {
+  let mut command = control(ControlAction::SetRequirements, id);
+  command.requirements = Some(disk_policy(blocked));
+  assert_eq!(execute(run, &command).unwrap().status, "applied");
+}
+
+#[test]
+fn offline_resource_hold_blocks_launch_and_pending_stop_never_starts_a_task() {
+  let (_root, run) = fixture();
+  update_state(&run.join("run-state.json"), |state| {
+    state["requirements"] = serde_json::to_value(disk_policy(true))?;
+    Ok(())
+  })
+  .unwrap();
+  let supervisor = start_counter(
+    &run,
+    "echo started > outputs/started; while :; do sleep 0.1; done",
+  );
+  wait_for(|| state(&run).unwrap()["status"] == "pending");
+  assert!(!run.join("outputs/started").exists());
+  assert!(state(&run).unwrap()["supervisor"]["worker_pid"].is_null());
+  let capabilities = inspect(&run).unwrap()["capabilities"].clone();
+  assert!(
+    capabilities
+      .as_array()
+      .unwrap()
+      .contains(&json!("set_requirements"))
+  );
+  assert!(capabilities.as_array().unwrap().contains(&json!("stop")));
+  assert_eq!(
+    execute(&run, &control(ControlAction::Stop, "stop-pending"))
+      .unwrap()
+      .status,
+    "applied"
+  );
+  assert!(supervisor.join().unwrap().cancelled);
+  assert!(!run.join("outputs/started").exists());
+}
+
+#[test]
+fn changing_pending_requirements_allows_the_original_attempt_to_launch() {
+  let (_root, run) = fixture();
+  update_state(&run.join("run-state.json"), |state| {
+    state["requirements"] = serde_json::to_value(disk_policy(true))?;
+    Ok(())
+  })
+  .unwrap();
+  let supervisor = start_counter(
+    &run,
+    "echo started > outputs/started; while :; do sleep 0.1; done",
+  );
+  wait_for(|| state(&run).unwrap()["status"] == "pending");
+  set_disk_policy(&run, false, "release-pending");
+  wait_for(|| run.join("outputs/started").exists());
+  assert_eq!(state(&run).unwrap()["task_attempts"]["current_attempt"], 1);
+  assert_eq!(
+    execute(&run, &control(ControlAction::Stop, "stop-after-pending"))
+      .unwrap()
+      .status,
+    "applied"
+  );
+  assert!(supervisor.join().unwrap().cancelled);
+}
+
+#[test]
+fn resource_recovery_never_undoes_manual_pause_and_resume_cannot_bypass_a_hold() {
+  let (_root, run) = fixture();
+  let supervisor = start_counter(
+    &run,
+    "while :; do echo tick >> outputs/counter; sleep 0.02; done",
+  );
+  wait_for(|| run.join("outputs/counter").exists());
+  set_disk_policy(&run, true, "disk-low");
+  wait_for(|| state(&run).unwrap()["status"] == "paused");
+  assert_eq!(state(&run).unwrap()["resource_paused"], true);
+  assert_eq!(state(&run).unwrap()["manual_paused"], false);
+  assert_eq!(
+    execute(&run, &control(ControlAction::Resume, "resume-blocked"))
+      .unwrap()
+      .status,
+    "applied"
+  );
+  assert_eq!(state(&run).unwrap()["status"], "paused");
+  assert_eq!(
+    execute(&run, &control(ControlAction::Pause, "keep-paused"))
+      .unwrap()
+      .status,
+    "applied"
+  );
+  let bytes = fs::metadata(run.join("outputs/counter")).unwrap().len();
+  set_disk_policy(&run, false, "disk-recovered");
+  wait_for(|| state(&run).unwrap()["resource_paused"] == false);
+  thread::sleep(Duration::from_millis(100));
+  assert_eq!(state(&run).unwrap()["status"], "paused");
+  assert_eq!(state(&run).unwrap()["manual_paused"], true);
+  assert_eq!(
+    fs::metadata(run.join("outputs/counter")).unwrap().len(),
+    bytes
+  );
+  assert_eq!(
+    execute(&run, &control(ControlAction::Resume, "manual-resume"))
+      .unwrap()
+      .status,
+    "applied"
+  );
+  wait_for(|| fs::metadata(run.join("outputs/counter")).unwrap().len() > bytes);
+  assert_eq!(state(&run).unwrap()["task_attempts"]["current_attempt"], 1);
+  set_disk_policy(&run, true, "disk-low-again");
+  wait_for(|| state(&run).unwrap()["status"] == "paused");
+  assert_eq!(
+    execute(&run, &control(ControlAction::Stop, "stop-resource-paused"))
+      .unwrap()
+      .status,
+    "applied"
+  );
+  assert!(supervisor.join().unwrap().cancelled);
 }
 
 #[test]

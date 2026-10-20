@@ -57,6 +57,9 @@ fn observe(
           finished_at: finished.then(|| FINISH.into()),
           exit_code: finished.then_some(130),
         }),
+        requirements: None,
+        resource_status: None,
+        manual_paused: None,
         result: None,
       },
     })
@@ -155,4 +158,71 @@ fn newer_published_generations_and_terminal_same_attempt_records_fence_stale_obs
       published_status
     );
   }
+}
+
+#[test]
+fn pending_resource_reason_reaches_rows_and_detail_without_truncating_the_policy() {
+  use expri_core::resource_requirements::{
+    DiskObservation, DiskRequirement, ResourcePhase, ResourceRequirements, ResourceStatus,
+  };
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  publish(&store, "running", 1);
+  let path = format!("/mnt/{}", "p".repeat(600));
+  let requirements = ResourceRequirements {
+    disk: vec![DiskRequirement {
+      path: path.clone(),
+      min_free_bytes: 100,
+      resume_free_bytes: 120,
+    }],
+    recovery_seconds: 30,
+  };
+  store
+    .execute(Request::RunControl {
+      request: RunControlRequest::Poll {
+        scope: scope(),
+        binding_id: "control-binding".into(),
+        attempt: 1,
+        generation: 1,
+        status: "pending".into(),
+        capabilities: vec![ControlAction::Stop, ControlAction::SetRequirements],
+        command: vec!["train".into()],
+        checkpoints: vec![],
+        lifecycle: Some(ControlLifecycle {
+          started_at: START.into(),
+          finished_at: None,
+          exit_code: None,
+        }),
+        requirements: Some(requirements.clone()),
+        resource_status: Some(Box::new(ResourceStatus {
+          phase: ResourcePhase::Blocked,
+          blocked: true,
+          checked_at: START.into(),
+          recovery_started_at: None,
+          disk: vec![DiskObservation {
+            path: path.clone(),
+            available_bytes: Some(90),
+            min_free_bytes: 100,
+            resume_free_bytes: 120,
+            phase: ResourcePhase::Blocked,
+            error: None,
+          }],
+        })),
+        manual_paused: Some(false),
+        result: None,
+      },
+    })
+    .unwrap();
+  let dashboard = HostedDashboard::new(&store).unwrap();
+  let detail = dashboard.detail(SOURCE, "run-control").unwrap();
+  assert_eq!(detail["run"]["status"], "pending");
+  assert_eq!(detail["run"]["requirements"], json!(requirements));
+  assert_eq!(detail["run"]["resource_status"]["disk"][0]["path"], path);
+  assert_eq!(detail["run"]["manual_paused"], false);
+  assert!(detail["state"].get("resource_status").is_none());
+  let rows = dashboard
+    .list(SOURCE, None, None, Some("pending"), 100, 0)
+    .unwrap();
+  assert_eq!(rows["total_count"], 1);
+  assert_eq!(rows["runs"][0]["resource_status"]["disk"][0]["path"], path);
 }

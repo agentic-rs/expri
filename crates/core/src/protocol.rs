@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::config::{EnvironmentConfig, RunServiceConfig};
+use crate::resource_requirements::ResourceRequirements;
 
 /// Bound retained source, checkpoint and capture provenance for a logical run.
 pub const MAX_TASK_ATTEMPTS: usize = 100;
@@ -42,6 +43,8 @@ pub struct RunRequest {
   pub name: String,
   pub command: Vec<String>,
   pub environment: EnvironmentConfig,
+  #[serde(default, skip_serializing_if = "ResourceRequirements::is_empty")]
+  pub requirements: ResourceRequirements,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub service: Option<RunServiceConfig>,
   #[serde(default)]
@@ -244,6 +247,13 @@ mod tests {
     });
     let mut request: RunRequest = serde_json::from_value(legacy.clone()).unwrap();
     assert!(!request.smoke);
+    assert!(request.requirements.is_empty());
+    assert!(
+      serde_json::to_value(&request)
+        .unwrap()
+        .get("requirements")
+        .is_none()
+    );
     assert!(
       serde_json::to_value(&request)
         .unwrap()

@@ -710,8 +710,8 @@ impl<S: ObjectStorage> Store<S> {
     path: &str,
     version: &str,
   ) -> ApiResult<Option<serde_json::Value>> {
-    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl")
-      && !(expri_core::service::attempt_document(path).is_some() && path.ends_with("/params.json"))
+    if !(matches!(path, "outputs/params.json" | "outputs/metrics.jsonl")
+      || expri_core::service::attempt_document(path).is_some() && path.ends_with("/params.json"))
     {
       return Err(ApiError::new(400, "invalid scalar cache artifact"));
     }
@@ -764,8 +764,8 @@ impl<S: ObjectStorage> Store<S> {
     version: &str,
     record: &serde_json::Value,
   ) -> ApiResult<()> {
-    if !matches!(path, "outputs/params.json" | "outputs/metrics.jsonl")
-      && !(expri_core::service::attempt_document(path).is_some() && path.ends_with("/params.json"))
+    if !(matches!(path, "outputs/params.json" | "outputs/metrics.jsonl")
+      || expri_core::service::attempt_document(path).is_some() && path.ends_with("/params.json"))
     {
       return Err(ApiError::new(400, "invalid scalar cache artifact"));
     }
@@ -1012,6 +1012,7 @@ impl<S: ObjectStorage> Store<S> {
           "run-task-continuation-v1".into(),
           "run-control-v1".into(),
           "run-control-batch-v1".into(),
+          expri_core::resource_requirements::RUN_REQUIREMENTS_CAPABILITY.into(),
           "file-references-v1".into(),
           "output-assets-v1".into(),
           "project-storage-management-v1".into(),

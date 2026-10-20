@@ -1,8 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { apiUrl, dateText, errorText, jsonObject, parseRunDeepLink, projectRunKey, RequestError, RequestLane, runIdentity, runStatusClass, type Detail, type Run, type Source } from "./dashboard_model";
 import { lifecycleActions, lifecyclePending, lifecycleScope, parseLifecycleArguments, parseLifecycleReason, parseRunLifecycle, type RunLifecycle, type RunLifecycleAction } from "./run_lifecycle";
+import { ResourceRequirementsEditor, ResourceStatusSummary } from "./run_resources_view";
+import type { ResourceRequirements } from "./run_resources";
 
-const LABELS: Record<RunLifecycleAction, string> = { pause: "Pause", resume: "Resume", stop: "Stop", continue: "Continue", restart: "Restart" };
+const LABELS: Record<RunLifecycleAction, string> = { pause: "Pause", resume: "Resume", stop: "Stop", continue: "Continue", restart: "Restart", set_requirements: "Requirements" };
+type Fence = { expected_attempt: number; expected_generation: number; binding_id: string };
 type Draft = { action: "stop" | "continue" | "restart"; arguments: string; checkpoint: string; reason: string; grace_seconds: number;
   expected_attempt: number; expected_generation: number; binding_id: string };
 
@@ -24,6 +27,7 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
   const [error, setError] = useState<string | null>(null);
   const [unavailable, setUnavailable] = useState(false);
   const [draft, setDraft] = useState<Draft | null>(null);
+  const [requirements_fence, setRequirementsFence] = useState<Fence | null>(null);
   const [checkpoint_search, setCheckpointSearch] = useState("");
   const lane = useRef(new RequestLane());
   const posting = useRef(false);
@@ -42,6 +46,7 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
     if (next.request?.status === "applied" && applied.current !== next.request.request_id) {
       applied.current = next.request.request_id;
       setDraft(null);
+      setRequirementsFence(null);
       if (initialized.current || next.request.request_id === submission.current?.request_id) callbacks.current.on_applied();
     }
     initialized.current = true;
@@ -93,12 +98,14 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
 
   const pending = lifecyclePending(control?.request);
   const available = control && control.supported ? lifecycleActions(control) : [];
+  const can_configure = control?.supported === true && control.capabilities.includes("set_requirements");
   const disabled = !enabled || !visible || sending || pending || !control?.online;
-  const send = async (action: RunLifecycleAction, form: Draft | null = null) => {
-    if (disabled || posting.current || !scope || !control || !available.includes(action)) return;
+  const send = async (action: RunLifecycleAction, form: Draft | null = null, requirements: ResourceRequirements | null = null) => {
+    if (disabled || posting.current || !scope || !control || !(action === "set_requirements" ? can_configure && requirements : available.includes(action))) return;
     let arguments_value: string[] | null = null;
     try {
-      if (form && (form.expected_attempt !== control.attempt || form.expected_generation !== control.generation || form.binding_id !== control.binding_id)) {
+      const fence = action === "set_requirements" ? requirements_fence : form;
+      if (fence && (fence.expected_attempt !== control.attempt || fence.expected_generation !== control.generation || fence.binding_id !== control.binding_id)) {
         throw new Error("The task changed while this form was open. Cancel and reopen the action to review its current state.");
       }
       if (action === "continue" || action === "restart") {
@@ -112,11 +119,12 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
         expected_generation: control.generation, binding_id: control.binding_id, action,
         arguments: arguments_value, checkpoint: action === "continue" ? form!.checkpoint : null,
         reason: parseLifecycleReason(form?.reason ?? ""), grace_seconds: form?.grace_seconds ?? 30,
+        ...(action === "set_requirements" ? { requirements } : {}),
       };
       const key = JSON.stringify(body);
       if (submission.current?.key !== key) submission.current = { key, request_id: crypto.randomUUID() };
       const payload = { ...body, request_id: submission.current.request_id };
-      if (new TextEncoder().encode(JSON.stringify(payload)).length > 48 * 1024) throw new Error("The encoded lifecycle request exceeds 48 KiB. Use shorter task arguments.");
+      if (new TextEncoder().encode(JSON.stringify(payload)).length > 48 * 1024) throw new Error("The encoded lifecycle request exceeds 48 KiB. Use fewer or shorter paths and task arguments.");
       posting.current = true;
       setSending(true);
       setError(null);
@@ -130,7 +138,8 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
     }
   };
   const choose = (action: RunLifecycleAction) => {
-    if (disabled) return;
+    if (disabled || action === "set_requirements") return;
+    setRequirementsFence(null);
     if (action === "pause" || action === "resume") { void send(action); return; }
     setError(null);
     setDraft({ action, arguments: JSON.stringify(control?.command.slice(1) ?? [], null, 2),
@@ -152,6 +161,10 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
       unavailable ? "Lifecycle controls are unavailable on this server. Upgrade the server and worker service." :
         control?.supported === false ? "This run has no supported worker binding. Lifecycle controls require a current native Linux worker service." : null;
   const paused = (control?.status ?? run.status) === "paused";
+  const resource_status = control && control.resource_status !== undefined ? control.resource_status : run.resource_status;
+  const requirements = control && control.requirements !== undefined ? control.requirements : run.requirements;
+  const manual_paused = control?.manual_paused ?? run.manual_paused ?? false;
+  const resource_paused = paused && resource_status?.blocked === true;
   const new_id = request?.status === "applied" ? request.new_run_id : null;
   const new_key = new_id && scope ? source?.kind === "hosted_project" ? projectRunKey(scope.origin, new_id) : new_id : null;
   const restarted_from = current_detail ? jsonObject(current_detail.state).restarted_from : null;
@@ -171,7 +184,14 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
       {!explanation && loading && !control && <span className="muted">Checking worker…</span>}
       {!explanation && available.map(action => <button key={action} id={`run-lifecycle-${action}`} type="button"
         className={`button ${action === "stop" ? "lifecycle-stop" : "secondary"}`} disabled={disabled}
-        onClick={() => choose(action)}>{LABELS[action]}</button>)}
+        onClick={() => choose(action)}>{action === "pause" && resource_paused && !manual_paused ? "Keep paused" : LABELS[action]}</button>)}
+      {!explanation && control && (can_configure || requirements?.disk.length) && <button id="run-resource-edit" type="button" className="button secondary"
+        aria-expanded={requirements_fence !== null} aria-controls="run-resource-form" disabled={sending || pending || !visible}
+        onClick={() => {
+          setDraft(null);
+          setError(null);
+          setRequirementsFence(current => current ? null : { expected_attempt: control!.attempt, expected_generation: control!.generation, binding_id: control!.binding_id });
+        }}>Requirements{requirements?.disk.length ? ` · ${requirements.disk.length}` : ""}</button>}
       {scope && !queued && !enabled && <span className="muted">Read only on this dashboard</span>}
       {control?.supported && !control.online && <span className="lifecycle-offline" title={`Last seen ${dateText(new Date(control.last_seen_at_ms).toISOString())}`}>Worker offline</span>}
       {request && <span className={`lifecycle-request ${request.status === "failed" || request.status === "expired" ? "error" : "muted"}`} role="status">
@@ -183,9 +203,12 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
         onClick={() => callbacks.current.on_open_run(parent_key)}>Restarted from <code>{parent_scope.run_id}</code></button>}
     </div>
     {explanation && <p className="muted lifecycle-note">{explanation}</p>}
+    <ResourceStatusSummary status={resource_status} requirements={requirements} manual_paused={manual_paused} task_status={control?.status ?? run.status} />
     {paused && <p className="muted lifecycle-note">Task processes are suspended in memory. Allocated resources are retained; elapsed time includes this pause. A worker reboot ends the in-memory pause.</p>}
     {request?.error && <p className="notice error" role="alert">{request.error}</p>}
     {error && <p id="run-lifecycle-error" className="notice error" role="alert">{error}</p>}
+    {requirements_fence && <ResourceRequirementsEditor requirements={requirements} disabled={disabled} sending={sending || pending}
+      readonly={!enabled || !can_configure} on_save={value => void send("set_requirements", null, value)} on_cancel={() => setRequirementsFence(null)} />}
     {draft && <form id="run-lifecycle-form" className="lifecycle-form" onSubmit={submit}>
       <h3>{LABELS[draft.action]} task</h3>
       <p className="muted">{draft.action === "stop" ? "Request graceful termination. Outputs and checkpoints are retained, and this attempt ends as cancelled." :

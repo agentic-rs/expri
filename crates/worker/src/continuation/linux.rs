@@ -418,6 +418,10 @@ pub(crate) fn complete_old_attempt(
     copy_capture_to_attempt(current, capture_owner)?;
     entry_mut(current, prepared.attempt)?["previous_worker_stopped_at"] = json!(previous_end);
     current["status"] = json!("preparing");
+    // Continue explicitly starts a new attempt; a former manual pause belongs
+    // to the replaced task. The current resource policy and hold remain.
+    current["manual_paused"] = json!(false);
+    current.as_object_mut().unwrap().remove("task_started_at");
     current["finished_at"] = Value::Null;
     current.as_object_mut().unwrap().remove("error");
     current.as_object_mut().unwrap().remove("exit_code");
@@ -460,6 +464,11 @@ pub(crate) fn launch_replacement(
   prepared: &mut PreparedContinuation,
 ) -> Result<Child> {
   if cancel_requested(run_dir)? {
+    return Err(message(
+      "run cancellation requested before continuation launch",
+    ));
+  }
+  if !crate::resource_guard::wait_before_start(run_dir)? {
     return Err(message(
       "run cancellation requested before continuation launch",
     ));
@@ -670,13 +679,18 @@ pub(crate) fn fail_after_stop(
     .as_str()
     .unwrap_or(&failure_time)
     .to_owned();
-  terminal["status"] = json!("failed");
+  let cancelled = cancel_requested(run_dir)?;
+  let phase = if cancelled { "cancelled" } else { "failed" };
+  terminal["status"] = json!(phase);
   terminal["finished_at"] = json!(capture_end);
   expri_system::store::run_capture::close_state(run_dir, &mut terminal);
   update_state(&run_dir.join("run-state.json"), |state| {
-    state["status"] = json!("failed");
+    state["status"] = json!(phase);
     state["finished_at"] = json!(failure_time);
-    state["exit_code"] = json!(1);
+    state["exit_code"] = json!(if cancelled { 130 } else { 1 });
+    if cancelled {
+      entry_mut(state, prepared.attempt)?["status"] = json!("cancelled");
+    }
     state["error"] = json!(error.to_string());
     for field in ["system_capture_status", "system_capture_error"] {
       if let Some(value) = terminal.get(field) {
@@ -803,6 +817,19 @@ fn wait_for_result(
           expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?,
           LockAttempt::Acquired(_) | LockAttempt::Missing
         );
+        if prepared.stage == "stopped"
+          && !lease_available
+          && state["status"] == "pending"
+          && state["resource_status"]["blocked"] == true
+          && state["task_process_group_clean"] == true
+          && state["supervisor"]["worker_pid"].is_null()
+          && state["task_launch_uncertain"] != true
+        {
+          // The old task is gone and this durable intent is owned locally.
+          // Returning its pending receipt frees the lifecycle command lock so
+          // the user can change the policy or stop the blocked continuation.
+          return report(run_dir, attempt);
+        }
         if prepared.stage == "ready"
           && matches!(
             state["status"].as_str(),
@@ -871,6 +898,7 @@ fn validate_request(request: &ContinueRunRequest) -> Result<()> {
     return Err(message("task continuation requires a detached task"));
   }
   request.run.environment.validate()?;
+  request.run.requirements.validate()?;
   environment::task_argv(&request.run.command)?;
   if !request.checkpoint.starts_with("outputs/")
     || Path::new(&request.checkpoint)

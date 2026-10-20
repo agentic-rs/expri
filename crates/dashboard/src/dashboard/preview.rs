@@ -23,6 +23,13 @@ pub fn run_metadata(record: &Value, truncated: &mut bool) -> Value {
     ],
     truncated,
   );
+  if state.is_object() {
+    let (resources, invalid) = expri_runs::runs::resource_metadata(&record["state"]);
+    *truncated |= !invalid.is_empty();
+    for (field, value) in resources.as_object().unwrap() {
+      state[field] = value.clone();
+    }
+  }
   if state.is_object()
     && let Some(supervisor) = record["state"].get("supervisor")
     && let Some(supervisor) = supervisor_metadata(supervisor, truncated)

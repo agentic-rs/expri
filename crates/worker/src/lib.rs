@@ -11,6 +11,8 @@ pub mod git;
 pub mod jobs;
 pub mod node;
 pub mod queue;
+#[cfg(target_os = "linux")]
+mod resource_guard;
 pub mod run_control;
 pub mod run_logs;
 pub mod runs;

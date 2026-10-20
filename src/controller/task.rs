@@ -8,6 +8,7 @@ use crate::error::{ExpriError, Result, command_exit_code};
 use crate::filter::SyncRules;
 use crate::protocol::{RunRequest, SyncIdentity};
 use crate::shell;
+use expri_core::resource_requirements::ResourceRequirements;
 
 pub struct LocalTaskOptions {
   pub repo_root: PathBuf,
@@ -48,6 +49,58 @@ pub struct RemoteTaskOptions {
   pub extras: Vec<String>,
   pub sync_args: Vec<String>,
   pub expected_sync: Option<SyncIdentity>,
+}
+
+pub struct RunRequirementsTargetOptions<'a> {
+  pub target: &'a TargetConfig,
+  pub control_path: &'a str,
+  pub control_persist: &'a str,
+  pub requirements: &'a ResourceRequirements,
+  pub detach: bool,
+  pub dry_run: bool,
+  pub verbosity: u8,
+  pub quiet: bool,
+}
+
+/// Reject unsupported workers before source synchronization or request upload.
+pub fn check_run_requirements_target(options: RunRequirementsTargetOptions<'_>) -> Result<()> {
+  validate_requirements_mode(
+    options.requirements,
+    options.detach,
+    options.target.environment.is_some(),
+  )?;
+  if options.requirements.is_empty() {
+    return Ok(());
+  }
+  let preference = ProtocolPreference::parse(options.target.protocol.as_deref())?;
+  let remote = Remote::new(
+    options.target.clone(),
+    options.control_path.into(),
+    options.control_persist.into(),
+    options.dry_run,
+    options.verbosity,
+    options.quiet,
+  )?;
+  remote.connect()?;
+  super::protocol::require_run_requirements(
+    &remote,
+    preference,
+    options.target.node_bin.as_deref().unwrap_or("expri"),
+  )
+}
+
+fn validate_requirements_mode(
+  requirements: &ResourceRequirements,
+  detach: bool,
+  environment: bool,
+) -> Result<()> {
+  requirements.validate()?;
+  if !requirements.is_empty() && (!detach || !environment) {
+    return Err(ExpriError::Message(
+      "disk requirements require a native Linux detached run with a configured environment; use --detach".into(),
+    ));
+  }
+  Ok(())
 }
 
 /// Check before pushing so an incompatible worker cannot receive a publishing run.
@@ -133,6 +186,16 @@ fn require_asset_environment(environment: Option<&EnvironmentConfig>) -> Result<
 }
 
 pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
+  validate_requirements_mode(
+    &options.task.requirements,
+    options.detach,
+    options.environment.is_some(),
+  )?;
+  if !options.task.requirements.is_empty() && !cfg!(target_os = "linux") {
+    return Err(ExpriError::Message(
+      "disk requirements require a native Linux worker".into(),
+    ));
+  }
   if options.smoke && options.environment.is_none() {
     return Err(ExpriError::Message(
       "--smoke requires a configured environment".to_string(),
@@ -148,6 +211,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
       name: options.name.clone(),
       command,
       environment: environment.clone(),
+      requirements: options.task.requirements,
       service: options.service,
       remote_managed: options.remote_managed,
       extras: options.extras,
@@ -223,6 +287,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
 }
 
 pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
+  validate_requirements_mode(
+    &options.task.requirements,
+    options.detach,
+    options.target.environment.is_some(),
+  )?;
   if options.smoke && options.target.environment.is_none() {
     return Err(ExpriError::Message(
       "--smoke requires a configured target environment".to_string(),
@@ -240,6 +309,7 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
       name: options.name.clone(),
       command,
       environment: environment.clone(),
+      requirements: options.task.requirements,
       service: options.target.service.clone(),
       remote_managed: options.remote_managed,
       extras: options.extras,
@@ -264,6 +334,10 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     )?
     .with_diagnostic_stdout(options.detach);
     remote.connect()?;
+    if !request.requirements.is_empty() {
+      super::protocol::require_run_requirements(&remote, preference, &node_bin)?;
+      preference = ProtocolPreference::ExpriNode;
+    }
     if request
       .service
       .as_ref()
@@ -441,7 +515,10 @@ mod tests {
     let root = tempfile::tempdir().unwrap();
     let options = LocalTaskOptions {
       repo_root: root.path().into(), project_name: None, name: "train".into(),
-      task: TaskConfig { command: vec!["python".into(), "train.py".into()], uv: false, resources: None },
+      task: TaskConfig {
+        command: vec!["python".into(), "train.py".into()], uv: false, resources: None,
+        requirements: ResourceRequirements::default(),
+      },
       args: Vec::new(), dry_run: true, detach: false, smoke: false, json: false, verbosity: 0, quiet: true,
       environment: None,
       service: Some(toml::from_str(
@@ -450,5 +527,49 @@ mod tests {
       remote_managed: Vec::new(), extras: Vec::new(), sync_args: Vec::new(),
     };
     run_local_task(options).unwrap();
+  }
+
+  #[test]
+  fn disk_requirements_reject_legacy_protocol_before_dispatch() {
+    let mut target: TargetConfig = toml::from_str(
+      "host='not-contacted.example'\nremote_dir='/srv/project'\nprotocol='python'\n[environment]\n",
+    )
+    .unwrap();
+    let requirements = ResourceRequirements {
+      disk: vec![expri_core::resource_requirements::DiskRequirement {
+        path: "outputs".into(),
+        min_free_bytes: 100,
+        resume_free_bytes: 120,
+      }],
+      ..Default::default()
+    };
+    let error = check_run_requirements_target(RunRequirementsTargetOptions {
+      target: &target,
+      control_path: "/tmp/control",
+      control_persist: "10m",
+      requirements: &requirements,
+      detach: true,
+      dry_run: true,
+      verbosity: 0,
+      quiet: true,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("native expri worker"), "{error}");
+    target.environment = None;
+    let error = check_run_requirements_target(RunRequirementsTargetOptions {
+      target: &target,
+      control_path: "/tmp/control",
+      control_persist: "10m",
+      requirements: &requirements,
+      detach: true,
+      dry_run: true,
+      verbosity: 0,
+      quiet: true,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("configured environment"), "{error}");
+    assert!(validate_requirements_mode(&requirements, false, true).is_err());
   }
 }

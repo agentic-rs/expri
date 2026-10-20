@@ -2,6 +2,7 @@ import type { ChartController } from "./interactive_charts";
 import type { RefreshClock } from "./auto_refresh";
 import type { EventSourceFactory } from "./live_updates";
 import type { RunQueue, RunRedirect } from "./run_queue";
+import type { ResourceRequirements, ResourceStatus } from "./run_resources";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string; severity?: "info" | "warning" | "error" };
@@ -50,6 +51,9 @@ export type Run = {
   machine_id?: string;
   smoke?: boolean;
   current_attempt?: number;
+  requirements?: ResourceRequirements | null;
+  resource_status?: ResourceStatus | null;
+  manual_paused?: boolean;
   task: string | null;
   status: string;
   started_at: string | null;

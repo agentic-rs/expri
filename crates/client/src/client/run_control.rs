@@ -2,6 +2,9 @@
 
 use std::sync::{Arc, atomic::AtomicBool};
 
+use expri_core::resource_requirements::{
+  RUN_REQUIREMENTS_CAPABILITY, ResourceRequirements, ResourceStatus,
+};
 use expri_core::run_control::{
   ControlAction, ControlLifecycle, ControlPollResult, ControlResult, MAX_CONTROL_POLLS,
   RunControlRequest, RunControlResponse,
@@ -13,7 +16,7 @@ use serde_json::Value;
 use super::http::{Api, ResolvedClient};
 use crate::error::Result;
 
-/// Public facts only. Local filesystem paths and credentials are never sent.
+/// Public facts and explicitly configured requirement paths, without credentials.
 #[derive(Deserialize)]
 struct Facts {
   #[serde(alias = "current_attempt")]
@@ -24,6 +27,12 @@ struct Facts {
   command: Vec<String>,
   checkpoints: Vec<String>,
   lifecycle: Option<ControlLifecycle>,
+  #[serde(default)]
+  requirements: Option<ResourceRequirements>,
+  #[serde(default)]
+  resource_status: Option<ResourceStatus>,
+  #[serde(default)]
+  manual_paused: Option<bool>,
 }
 
 /// Reuses one HTTP pool without exposing its saved bearer credential.
@@ -33,6 +42,7 @@ pub struct RunControlClient {
   scope: RunScope,
   binding_id: String,
   batch: bool,
+  requirements: bool,
 }
 
 impl RunControlClient {
@@ -54,11 +64,15 @@ impl RunControlClient {
     let batch = features
       .iter()
       .any(|feature| feature == "run-control-batch-v1");
+    let requirements = features
+      .iter()
+      .any(|feature| feature == RUN_REQUIREMENTS_CAPABILITY);
     Ok(Some(Self {
       api,
       scope,
       binding_id,
       batch,
+      requirements,
     }))
   }
 
@@ -69,11 +83,30 @@ impl RunControlClient {
       scope,
       binding_id,
       batch: self.batch,
+      requirements: self.requirements,
     }
   }
 
   fn request(&self, facts: &Value, result: Option<ControlResult>) -> Result<RunControlRequest> {
-    let facts: Facts = serde_json::from_value(facts.clone())?;
+    let mut facts: Facts = serde_json::from_value(facts.clone())?;
+    if let Some(requirements) = &facts.requirements {
+      requirements.validate()?;
+    }
+    if let Some(status) = &facts.resource_status {
+      let requirements = facts
+        .requirements
+        .as_ref()
+        .ok_or_else(|| super::fs::message("resource observations require a requirements policy"))?;
+      status.validate(requirements)?;
+    }
+    if !self.requirements {
+      facts
+        .capabilities
+        .retain(|action| *action != ControlAction::SetRequirements);
+      facts.requirements = None;
+      facts.resource_status = None;
+      facts.manual_paused = None;
+    }
     Ok(RunControlRequest::Poll {
       scope: self.scope.clone(),
       binding_id: self.binding_id.clone(),
@@ -84,6 +117,9 @@ impl RunControlClient {
       command: facts.command,
       checkpoints: facts.checkpoints,
       lifecycle: facts.lifecycle,
+      requirements: facts.requirements,
+      resource_status: facts.resource_status.map(Box::new),
+      manual_paused: facts.manual_paused,
       result,
     })
   }
@@ -215,6 +251,9 @@ mod tests {
           let body = String::from_utf8(request.body).unwrap();
           assert!(!body.contains("/private/"));
           assert!(!body.contains("bound-worker-token"));
+          assert!(!body.contains("set_requirements"));
+          assert!(!body.contains("requirements"));
+          assert!(!body.contains("manual_paused"));
           Response::RunControl {
             response: RunControlResponse { command: None },
           }
@@ -238,7 +277,7 @@ mod tests {
     )
     .unwrap()
     .unwrap();
-    let facts = json!({"current_attempt":2,"generation":1,"status":"paused","capabilities":["resume","stop"],"command":["python","train.py"],"checkpoints":["outputs/best.pt"],"scope":{"run_id":"untrusted"},"run_dir":"/private/run","source":"/private/source"});
+    let facts = json!({"current_attempt":2,"generation":1,"status":"paused","capabilities":["resume","stop","set_requirements"],"requirements":{"disk":[],"recovery_seconds":30},"manual_paused":true,"command":["python","train.py"],"checkpoints":["outputs/best.pt"],"scope":{"run_id":"untrusted"},"run_dir":"/private/run","source":"/private/source"});
     let response = transport
       .poll(
         &facts,
@@ -254,6 +293,72 @@ mod tests {
     let mut damaged = facts;
     damaged["command"] = json!([42]);
     assert!(transport.validate_facts(&damaged).is_err());
+    server.join().unwrap();
+  }
+
+  #[test]
+  fn resource_facts_are_sent_only_after_capability_negotiation() {
+    let (url, server) = mock(2, move |request, _| {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::Capabilities => Response::Capabilities {
+          features: vec!["run-control-v1".into(), RUN_REQUIREMENTS_CAPABILITY.into()],
+        },
+        Request::RunControl {
+          request:
+            RunControlRequest::Poll {
+              status,
+              capabilities,
+              requirements,
+              resource_status,
+              manual_paused,
+              ..
+            },
+        } => {
+          assert_eq!(status, "pending");
+          assert_eq!(
+            capabilities,
+            vec![ControlAction::Stop, ControlAction::SetRequirements]
+          );
+          assert_eq!(requirements.unwrap().disk[0].path, "/mnt/checkpoints");
+          assert!(resource_status.unwrap().blocked);
+          assert_eq!(manual_paused, Some(false));
+          Response::RunControl {
+            response: RunControlResponse { command: None },
+          }
+        }
+        _ => panic!("unexpected resource lifecycle request"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    });
+    let client = ResolvedClient::from_config(ClientConfig {
+      url,
+      token: Some("bound-worker-token".into()),
+      token_env: None,
+      project_id: None,
+    })
+    .unwrap();
+    let transport = RunControlClient::new(
+      &client,
+      RunScope {
+        project_id: "project".into(),
+        origin: "worker".into(),
+        run_id: "run-one".into(),
+      },
+      "binding-one".into(),
+      Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap()
+    .unwrap();
+    let facts = json!({"attempt":1,"generation":1,"status":"pending",
+      "capabilities":["stop","set_requirements"],"command":["train"],"checkpoints":[],
+      "requirements":{"disk":[{"path":"/mnt/checkpoints","min_free_bytes":100,"resume_free_bytes":120}],"recovery_seconds":30},
+      "resource_status":{"phase":"blocked","blocked":true,"checked_at":"2026-10-20T00:00:00Z","recovery_started_at":null,
+        "disk":[{"path":"/mnt/checkpoints","available_bytes":90,"min_free_bytes":100,"resume_free_bytes":120,"phase":"blocked","error":null}]},
+      "manual_paused":false});
+    assert!(transport.poll(&facts, None).unwrap().command.is_none());
+    let mut mismatched = facts;
+    mismatched["resource_status"]["disk"][0]["path"] = json!("/unconfigured");
+    assert!(transport.validate_facts(&mismatched).is_err());
     server.join().unwrap();
   }
 

@@ -2,6 +2,7 @@ use super::*;
 use crate::service::store::tests::MockStorage;
 
 mod observations;
+mod requirements;
 
 const AT: i64 = 100_000;
 
@@ -30,6 +31,9 @@ fn poll(result: Option<ControlResult>) -> RunControlRequest {
     command: vec!["python".into(), "train.py".into()],
     checkpoints: vec!["checkpoints/last.pt".into()],
     lifecycle: None,
+    requirements: None,
+    resource_status: None,
+    manual_paused: None,
     result,
   }
 }
@@ -47,6 +51,7 @@ fn selection(action: ControlAction) -> ControlSubmission {
     action,
     arguments: None,
     checkpoint: (action == ControlAction::Continue).then(|| "checkpoints/last.pt".into()),
+    requirements: None,
     reason: "Requested from dashboard".into(),
     grace_seconds: 30,
   }

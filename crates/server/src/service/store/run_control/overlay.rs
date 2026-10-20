@@ -59,6 +59,13 @@ impl<S: ObjectStorage> Store<S> {
     };
     run["control"] = json!({"status":facts.status,"attempt":facts.attempt,"generation":facts.generation,
       "online":now_ms().saturating_sub(last_seen_at_ms)<=ONLINE_MS,"last_seen_at_ms":last_seen_at_ms});
+    if let Some(requirements) = &facts.requirements {
+      run["requirements"] = json!(requirements);
+      run["resource_status"] = json!(facts.resource_status);
+    }
+    if let Some(paused) = facts.manual_paused {
+      run["manual_paused"] = json!(paused);
+    }
     Ok(())
   }
 }
