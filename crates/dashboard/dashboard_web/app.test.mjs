@@ -322,8 +322,9 @@ async function selectRow(nodes, index, checked = true) {
   assert.equal(input.disabled, false, "the row must be selectable");
   if (input.checked !== checked) await click(input);
 }
-function runCheckbox(nodes, index) { return nodes.get("run-rows").children[index].querySelector('input[type="checkbox"]'); }
-function runButton(nodes, index) { return nodes.get("run-rows").children[index].querySelector("button"); }
+function runRows(nodes) { return [...nodes.get("run-rows").querySelectorAll("tr[data-run-key]")]; }
+function runCheckbox(nodes, index) { return runRows(nodes)[index].querySelector('input[type="checkbox"]'); }
+function runButton(nodes, index) { return runRows(nodes)[index].querySelector(".run-link"); }
 function columnCheckbox(nodes, name) {
   const input = [...nodes.get("run-columns-panel").querySelectorAll('input[type="checkbox"]')]
     .find(node => node.getAttribute("aria-label") === name);
@@ -931,7 +932,7 @@ test("System polling and manual Refresh work with no project catalog or experime
   assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /55%/);
   value = 60; await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
   assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /60%/);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   assert.equal(model.requests.some(url => url.startsWith("/api/run?")), false);
 });
 
@@ -1194,7 +1195,7 @@ test("compact explicit inspection moves to review while refresh preserves positi
 
 test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
   const model = await reviewFixture(t), { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(chartQuery(nodes).get("x_axis"), "step");
@@ -1226,7 +1227,7 @@ test("axis choice applies to run and comparison charts and survives manual refre
 
 test("summary tags select reductions in one action and retain the choice on refresh", async t => {
   const model = await reviewFixture(t), { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   await selectRow(nodes, 0); await selectRow(nodes, 1);
   await settled(() => model.requests.some(url => url.startsWith("/api/compare")));
   assert.equal(nodes.get("reduction-last").checked, true);
@@ -1265,8 +1266,8 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 6);
-  assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
+  assert.equal(runRows(nodes)[0].children.length, 6);
+  assert.equal(runRows(nodes)[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
   await click(nodes.get("next-page")); await settledTable(nodes);
   assert.equal(nodes.get("page-label").textContent, "Page 2");
   const loss_header = () => [...nodes.document.querySelectorAll("th")].find(node => node.querySelector("button")?.getAttribute("aria-label")?.startsWith("Sort by loss "));
@@ -1305,7 +1306,7 @@ test("column discovery failure leaves the dashboard usable and retries after an 
   await openRunControl(nodes, "run-issues");
   assert.match(nodes.get("run-issues-panel").textContent, /Upgrade the expri server/);
   assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.has("sort")), false);
-  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(nodes).length, 3);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   await openRunControl(nodes, "run-columns");
@@ -1331,7 +1332,7 @@ test("automatic list updates keep table choices and sorting while refreshing onl
   fixture.model.metric_value = 0.125;
   fixture.model.list_revision = "table-2";
   await fixture.clock.advance(5_000);
-  const cell = nodes.get("run-rows").children[0].querySelector('[data-column-kind="metric"]');
+  const cell = runRows(nodes)[0].querySelector('[data-column-kind="metric"]');
   assert.equal(cell.textContent, "0.125");
   assert.equal(columnCheckbox(nodes, "Metric loss").checked, true);
   assert.equal(latestRunQuery(fixture).get("sort"), "metric:loss");
@@ -1373,7 +1374,7 @@ test("informational column notes do not rescan history during periodic run refre
   model.model.metric_value = 0.125;
   model.model.list_revision = "new-metric-values";
   await clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="metric"]').textContent, "0.125");
+  assert.equal(runRows(nodes)[0].querySelector('[data-column-kind="metric"]').textContent, "0.125");
   assert.equal(requestCounts(model.requests)["/api/run-columns"], discoveries, "a harmless history note does not force another full column scan");
   assert.equal(columnCheckbox(nodes, "Metric loss"), choice);
   assert.equal(choice.disabled, false); assert.equal(choice.checked, true);
@@ -1406,7 +1407,7 @@ test("cached columns remain interactive through a periodic discovery repair and 
   assert.equal(list_signal.aborted, true, "the newer column selection replaces its obsolete table request");
   pending_list.resolve(response({ source: model.sources[0], runs: [], warnings: [], total_count: 0, offset: 0, next_offset: null }));
   await flush();
-  assert.equal(nodes.get("run-rows").children.length, 3, "an older table response cannot remove the current runs");
+  assert.equal(runRows(nodes).length, 3, "an older table response cannot remove the current runs");
   await click(nodes.get("run-columns-trigger")); await openRunControl(nodes, "run-columns");
   assert.equal(requestCounts(model.requests)["/api/run-columns"], discoveries, "table changes and reopening join the existing discovery");
   assert.equal(signal.aborted, false);
@@ -1475,10 +1476,10 @@ test("initial column discovery joins repeated opens and ignores a late response 
 
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = await reviewFixture(t);
-  await settled(() => nodes.get("run-rows").children.length === 3);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 4);
-  assert.equal(nodes.get("run-rows").children[0].querySelector(".run-cell .run-task").textContent, "train");
-  assert.match(text(nodes.get("run-rows").children[0].querySelector(".status-column")), /3s/);
+  await settled(() => runRows(nodes).length === 3);
+  assert.equal(runRows(nodes)[0].children.length, 4);
+  assert.equal(runRows(nodes)[0].querySelector(".run-cell .run-task").textContent, "train");
+  assert.match(text(runRows(nodes)[0].querySelector(".status-column")), /3s/);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
@@ -1506,7 +1507,7 @@ test("run inspection opens Charts and keyboard tabs load logs only on demand", a
 
 test("selection updates charts, caps eight runs, and inspection returns to the selection", async t => {
   const { nodes, requests } = await reviewFixture(t, { count: 9 });
-  await settled(() => nodes.get("run-rows").children.length === 9);
+  await settled(() => runRows(nodes).length === 9);
   await selectRow(nodes, 0);
   assert.equal(nodes.get("review-section").hidden, false);
   await settled(() => chartQuery(nodes).getAll("run_id").length === 1);
@@ -1543,7 +1544,7 @@ test("selection updates charts, caps eight runs, and inspection returns to the s
 
 test("pagination preserves explicit selected IDs while edited filters immediately clear the review", async t => {
   const { nodes, requests } = await reviewFixture(t, { count: 40, hosted: true });
-  await settled(() => nodes.get("run-rows").children.length === 20);
+  await settled(() => runRows(nodes).length === 20);
   await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   await click(nodes.get("next-page"));
@@ -1571,7 +1572,7 @@ test("late comparison and catalog responses cannot restore an old source after a
   ];
   const model = await reviewFixture(t, { sources, hosted: true });
   const { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   const old_comparison = deferred();
   let comparison_started = false;
   model.override = parsed => {
@@ -1601,7 +1602,7 @@ test("late comparison and catalog responses cannot restore an old source after a
 test("manual Refresh preserves the review tab and metrics and only updates Last checked after success", async t => {
   const model = await reviewFixture(t);
   const { nodes, requests } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   const accuracy = metricCheckbox(nodes, "accuracy");
@@ -1635,7 +1636,7 @@ test("manual Refresh preserves the review tab and metrics and only updates Last 
 test("a tab change during Refresh does not strand an unfinished initial run review", async t => {
   const model = await reviewFixture(t);
   const { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   const initial_detail = deferred();
   const refresh_catalog = deferred();
   let detail_started = false;
@@ -1687,7 +1688,7 @@ test("empty hosted catalog refreshes into published runs with opaque source IDs 
   await settled(() => nodes.get("refresh-button").disabled === false);
   catalog = { ...catalog, sources: [source], initial_source: source.source_id, warnings: [{ message: "The overview is limited to 500 runs." }] };
   await emit(nodes.get("refresh-button"), "click");
-  await settled(() => nodes.get("run-rows").children.length === 20);
+  await settled(() => runRows(nodes).length === 20);
   assert.equal(nodes.get("source-select").value, source.source_id);
   assert.equal(nodes.get("source-select").disabled, false);
   assert.equal(nodes.get("search-input").disabled, false);
@@ -1772,7 +1773,7 @@ async function autoFixture(t, fields = {}) {
   return { ...model, model, clock, chart, page_document: globalThis.document };
 }
 async function inspect(model, index = 0) {
-  await settled(() => model.nodes.get("run-rows").children.length > index);
+  await settled(() => runRows(model.nodes).length > index);
   await click(runButton(model.nodes, index));
   await settled(() => chartQuery(model.nodes).get("run_id") === runIdentity(model.runs[index]));
 }
@@ -1797,7 +1798,7 @@ test("running durations tick with automatic refresh off without requests or repl
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); assert.equal(nodes.get("auto-refresh-toggle").checked, false);
   await inspect(model); await click(nodes.get("review-tab-overview"));
-  const rows = [...nodes.get("run-rows").children], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
+  const rows = [...runRows(nodes)], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
   const header = nodes.document.querySelector(".inspector-meta .run-duration"), overview = overviewDuration(nodes), checked_at = nodes.get("updated-at").textContent;
   const durations = () => rows.map(row => row.querySelector(".status-column .run-duration").textContent);
   assert.deepEqual(durations(), ["1m 5s", "30s", "2s", "45s"]);
@@ -1809,7 +1810,7 @@ test("running durations tick with automatic refresh off without requests or repl
   assert.deepEqual(durations(), ["1m 7s", "30s", "4s", "47s"]);
   assert.equal(header.textContent, "1m 7s"); assert.equal(overview.textContent, "1m 7s");
   assert.deepEqual(requestCounts(model.requests), requests, "display ticks never poll the API");
-  assert.deepEqual([...nodes.get("run-rows").children], rows); assert.equal(nodes.get("chart-preview"), preview);
+  assert.deepEqual([...runRows(nodes)], rows); assert.equal(nodes.get("chart-preview"), preview);
   assert.equal(chartSource(nodes), chart_url); assert.equal(previewMounts(nodes), mounts);
   assert.equal(nodes.document.activeElement, runCheckbox(nodes, 0)); assert.equal(nodes.get("updated-at").textContent, checked_at);
   assert.equal(overviewDuration(nodes), overview);
@@ -1824,13 +1825,13 @@ for (const status of ["running", "waiting"]) test(`${status} durations freeze at
   await clock.advance(2000); assert.equal(overviewDuration(nodes).textContent, "12s");
   run.status = "completed"; run.finished_at = new Date(clock.time - 1000).toISOString(); run.exit_code = 0;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
-  const row = nodes.get("run-rows").children[0], duration = row.querySelector(".run-duration"), header = nodes.document.querySelector(".inspector-meta .run-duration");
+  const row = runRows(nodes)[0], duration = row.querySelector(".run-duration"), header = nodes.document.querySelector(".inspector-meta .run-duration");
   assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
   assert.equal(duration.dataset.live, "false"); assert.equal(clock.timers.size, 0, "terminal records need no display timer");
   const requests = requestCounts(model.requests);
   await clock.advance(60_000);
   assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
-  assert.deepEqual(requestCounts(model.requests), requests); assert.equal(nodes.get("run-rows").children[0], row);
+  assert.deepEqual(requestCounts(model.requests), requests); assert.equal(runRows(nodes)[0], row);
 });
 
 for (const status of ["running", "waiting"]) test(`${status} durations keep missing invalid and future starts explicitly unavailable`, async t => {
@@ -1839,12 +1840,12 @@ for (const status of ["running", "waiting"]) test(`${status} durations keep miss
   runs.push({ ...publishedRun("run-terminal-unknown"), status: "completed", started_at: null });
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
-  for (const row of [...nodes.get("run-rows").children].slice(0, 3)) {
+  for (const row of [...runRows(nodes)].slice(0, 3)) {
     const duration = row.querySelector(".run-duration");
     assert.equal(duration.textContent, "—"); assert.equal(duration.title, "Elapsed time unavailable");
     assert.equal(duration.getAttribute("aria-label"), "Elapsed time: unavailable");
   }
-  assert.equal(nodes.get("run-rows").children[3].querySelector(".run-duration"), null, "unknown terminal timing does not invent elapsed time");
+  assert.equal(runRows(nodes)[3].querySelector(".run-duration"), null, "unknown terminal timing does not invent elapsed time");
   const header = nodes.document.querySelector(".inspector-meta .run-duration");
   assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—");
   const requests = requestCounts(model.requests); await clock.advance(2000);
@@ -1862,13 +1863,13 @@ test("running and waiting metadata changes retain focused runs, filters and char
   await emit(nodes.document, "keydown", { key: "Escape" });
   await inspect(model); await chooseAxis(nodes, "wall_clock"); await chooseTimeZone(nodes, "utc");
   await clock.advance(5000);
-  const row = nodes.get("run-rows").children[0], focused = runCheckbox(nodes, 0), preview = nodes.get("chart-preview");
+  const row = runRows(nodes)[0], focused = runCheckbox(nodes, 0), preview = nodes.get("chart-preview");
   const chart_url = chartSource(nodes), mounts = previewMounts(nodes), start = run.started_at;
   await act(async () => focused.focus());
   for (const status of ["waiting", "running"]) {
     run.status = status; model.model.list_revision = `list-${status}`; model.model.metadata_revision = `metadata-${status}`;
     await clock.advance(5000);
-    assert.equal(nodes.get("run-rows").children[0], row);
+    assert.equal(runRows(nodes)[0], row);
     assert.equal(row.querySelector(".status").textContent, status);
     assert.equal(row.querySelector(".status").classList.contains(status), true);
     assert.equal(nodes.document.querySelector(".inspector-status").textContent, status);
@@ -1894,7 +1895,7 @@ test("waiting filters track resumed and waiting runs without losing an off-list 
   await openRunControl(nodes, "run-filters"); await click(nodes.get("status-waiting")); await settledTable(nodes);
   assert.equal(nodes.get("status-waiting").type, "radio"); assert.equal(nodes.get("status-waiting").checked, true);
   assert.equal(nodes.document.activeElement, nodes.get("status-waiting")); assert.equal(latestRunQuery(model).get("status"), "waiting");
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-waiting");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-waiting");
   await emit(nodes.document, "keydown", { key: "Escape" });
   await click(runButton(nodes, 0)); await settled(() => chartQuery(nodes).get("run_id") === runIdentity(waiting));
   const preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
@@ -1902,14 +1903,14 @@ test("waiting filters track resumed and waiting runs without losing an off-list 
   await clock.advance(5000);
   waiting.status = "running"; model.model.list_revision = "resumed-list"; model.model.metadata_revision = "resumed-metadata";
   await clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children.length, 0); assert.equal(nodes.get("list-empty").hidden, false);
+  assert.equal(runRows(nodes).length, 0); assert.equal(nodes.get("list-empty").hidden, false);
   assert.equal(nodes.get("review-section").hidden, false); assert.equal(nodes.document.querySelector(".inspector-status").textContent, "running");
   assert.equal(nodes.get("status-waiting").checked, true); assert.equal(latestRunQuery(model).get("status"), "waiting");
   assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
   assert.equal(nodes.get("review-error").hidden, true);
   running.status = "waiting"; model.model.list_revision = "waiting-list"; model.model.metadata_revision = "waiting-metadata";
   await clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-running");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-running");
   assert.equal(nodes.document.querySelector(".inspector-status").textContent, "running", "the inspector keeps its original run when a different run enters the filter");
   assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview);
   assert.equal(model.requests.some(url => url === "/api/runs/archive"), false);
@@ -2256,7 +2257,7 @@ test("an active chart drag defers adoption and the next check still applies the 
 
 test("automatic recovery completes an initially failed comparison and reopening a review gets a fresh baseline", async t => {
   const model = await autoFixture(t);
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   model.model.override = parsed => parsed.pathname === "/api/compare" ? response({ error: "temporarily unavailable" }, 503) : undefined;
   await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
   await settled(() => model.nodes.get("review-error").hidden === false);
@@ -2441,7 +2442,7 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
     if (!parsed.searchParams.has("source")) return response({ catalog_revision: "catalog-1", source_revision: null, runs: [] });
   };
   await model.clock.advance(5_000);
-  assert.equal(model.nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(model.nodes).length, 3);
   assert.equal(model.nodes.get("source-select").value, source.source_id);
   assert.equal(model.nodes.get("global-error").hidden, true);
   const probe = new URL(model.requests.find(url => url.startsWith("/api/updates")), "http://localhost");
@@ -2458,18 +2459,18 @@ test("failed initial run loading ends the loading state and retains successful r
   assert.equal(nodes.get("refresh-button").disabled, false);
   unavailable = false;
   await click(nodes.get("refresh-button"));
-  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(nodes).length, 3);
   assert.equal(nodes.get("list-empty").hidden, true);
   unavailable = true;
   await click(nodes.get("refresh-button"));
-  assert.equal(nodes.get("run-rows").children.length, 3, "an error must keep the last successful run history");
+  assert.equal(runRows(nodes).length, 3, "an error must keep the last successful run history");
   assert.equal(nodes.get("list-empty").hidden, true);
   assert.match(nodes.get("global-error").textContent, /Results unavailable/);
 });
 
 test("an initially failed run can recover directly into Logs without overlapping log requests", async t => {
   const model = await autoFixture(t);
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   model.model.override = parsed => parsed.pathname === "/api/run" ? response({ error: "Run temporarily unavailable" }, 503) : undefined;
   await click(runButton(model.nodes, 0));
   await settled(() => model.nodes.get("review-error").hidden === false);
@@ -2487,7 +2488,7 @@ test("an initially failed run can recover directly into Logs without overlapping
 
 test("failed page loads recover even with unchanged revisions and identical retries restore controls", async t => {
   const model = await autoFixture(t, { count: 45 });
-  await settled(() => model.nodes.get("run-rows").children.length === 20);
+  await settled(() => runRows(model.nodes).length === 20);
   await model.clock.advance(5_000);
   model.model.failed_list = true;
   await click(model.nodes.get("next-page"));
@@ -2500,10 +2501,10 @@ test("failed page loads recover even with unchanged revisions and identical retr
   await click(model.nodes.get("refresh-button"));
   await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(model.nodes.get("run-count").textContent, "Could not read run history");
-  const row = model.nodes.get("run-rows").children[0];
+  const row = runRows(model.nodes)[0];
   model.model.failed_list = false;
   await model.clock.advance(5_000);
-  assert.equal(model.nodes.get("run-rows").children[0], row, "an identical quiet retry does not rebuild the table");
+  assert.equal(runRows(model.nodes)[0], row, "an identical quiet retry does not rebuild the table");
   assert.equal(model.nodes.get("previous-page").disabled, false);
   assert.equal(model.nodes.get("next-page").disabled, false);
   assert.match(model.nodes.get("run-count").textContent, /21–40 of 45 runs/);
@@ -2513,7 +2514,7 @@ test("failed page loads recover even with unchanged revisions and identical retr
 test("missing selected runs retain their preview without artifact retries and reappear with identical revisions", async t => {
   const model = await autoFixture(t, { hosted: false });
   model.model.catalog_revision = null; model.model.list_revision = null;
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   await selectRow(model.nodes, 0);
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-0");
   await model.clock.advance(5_000);
@@ -2566,7 +2567,7 @@ test("source changes cancel only obsolete background work and late probes cannot
   };
   await model.clock.advance(5_000);
   setValue(model.nodes.get("source-select"), "hosted:b"); await emit(model.nodes.get("source-select"), "change");
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   assert.equal(signal.aborted, true);
   model.model.override = null;
   pending.resolve(response({ catalog_revision: "late", source_revision: "late", runs: [] })); await flush();
@@ -2651,7 +2652,7 @@ test("a published run link selects its catalog source and opens a run outside th
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-44");
   assert.equal(model.nodes.get("source-select").value, linked_source.source_id);
   assert.equal(model.nodes.get("review-title").textContent, "run-44");
-  assert.equal(model.nodes.get("run-rows").children.length, 20);
+  assert.equal(runRows(model.nodes).length, 20);
   assert.equal(model.nodes.get("source-note").textContent.includes("Waiting for"), false);
   assert.equal(model.requests.filter(url => url.startsWith("/api/run?")).length, 1, "the linked detail is reused for rendering");
   assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.get("source") === other_source.source_id), false);
@@ -2690,7 +2691,7 @@ test("a missing linked run waits using lightweight probes and opens after public
 
 test("explicit source choice cancels a pending link before its source arrives", async t => {
   const model = await autoFixture(t, { count: 2, sources: [other_source], url: runLink() });
-  await settled(() => model.nodes.get("run-rows").children.length === 2);
+  await settled(() => runRows(model.nodes).length === 2);
   setValue(model.nodes.get("source-select"), other_source.source_id); await emit(model.nodes.get("source-select"), "change");
   await settled(() => model.nodes.get("runs-region").getAttribute("aria-busy") === "false");
   model.sources.push(linked_source); model.model.catalog_revision = "catalog-published";
@@ -3076,7 +3077,7 @@ test("run data errors stay on the exact worker row and deduplicate list and colu
   });
   const { nodes } = model;
   await settledTable(nodes); await openColumns(nodes);
-  const [affected, healthy] = nodes.get("run-rows").children;
+  const [affected, healthy] = runRows(nodes);
   const diagnostic = affected.querySelector("details.run-diagnostics");
   assert.ok(diagnostic, "the affected row exposes its data errors");
   assert.equal(diagnostic.querySelector("summary .run-diagnostics-label").textContent, "Errors (2)");
@@ -3169,7 +3170,7 @@ test("run data errors from column discovery clear after an automatic unchanged-r
   const model = await autoFixture(t, { column_warnings: [issue] }), { nodes, clock } = model;
   await settledTable(nodes); await openColumns(nodes);
   await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
-  const choice = columnCheckbox(nodes, "Parameter learning_rate"), row = nodes.get("run-rows").children[0];
+  const choice = columnCheckbox(nodes, "Parameter learning_rate"), row = runRows(nodes)[0];
   assert.match(row.querySelector(".run-diagnostics").textContent, /invalid record/);
   await clock.advance(5000);
   const counts = requestCounts(model.requests);
@@ -3180,7 +3181,7 @@ test("run data errors from column discovery clear after an automatic unchanged-r
   await settled(() => nodes.get("run-rows").querySelector(".run-diagnostics") === null);
   assert.ok(requestCounts(model.requests)["/api/runs"] > counts["/api/runs"]);
   assert.ok(requestCounts(model.requests)["/api/run-columns"] > counts["/api/run-columns"], "an unchanged run-list body still rechecks saved-file diagnostics");
-  assert.equal(nodes.get("run-rows").children[0], row, "quiet repair preserves the row DOM");
+  assert.equal(runRows(nodes)[0], row, "quiet repair preserves the row DOM");
   assert.equal(columnCheckbox(nodes, "Parameter learning_rate"), choice);
   assert.equal(choice.checked, true, "column discovery refresh keeps the selected table column");
   assert.equal(nodes.document.querySelector(".runs-table").dataset.columnCount, "1");
@@ -3197,11 +3198,11 @@ test("opening Columns keeps step-order notes out of run rows and Issues while re
     detail_warnings: [{ message }],
   }), { nodes } = model;
   await settledTable(nodes);
-  const row = nodes.get("run-rows").children[0], before = row.textContent;
+  const row = runRows(nodes)[0], before = row.textContent;
   assert.equal(requestCounts(model.requests)["/api/run-columns"] ?? 0, 0, "column discovery remains lazy");
   await openColumns(nodes);
   assert.ok(requestCounts(model.requests)["/api/run-columns"] > 0);
-  assert.equal(nodes.get("run-rows").children[0], row);
+  assert.equal(runRows(nodes)[0], row);
   assert.equal(row.textContent, before, "discovering a data note does not expand or mark the run row");
   assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics"), null);
   assert.equal(nodes.get("run-issues").hidden, true, "off-page and unscoped informational notes do not create an Issues count");
@@ -3229,7 +3230,7 @@ test("column diagnostics distinguish incomplete metrics from actual errors with 
     ],
   }), { nodes } = model;
   await openColumns(nodes);
-  const [partial, broken] = nodes.get("run-rows").children;
+  const [partial, broken] = runRows(nodes);
   const warning = partial.querySelector("details.run-diagnostics.warning");
   const error = broken.querySelector("details.run-diagnostics.error");
   assert.ok(warning, "a skipped metric row gets an amber incomplete-data indicator");
@@ -3373,7 +3374,7 @@ test("Storage searches and pages on the server, including a project with no runs
   const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
   model.model.storage_inputs = Array.from({ length: 105 }, (_, index) => ({ input_id: `dataset-${String(index).padStart(3, "0")}`, size: index }));
   await settled(() => nodes.get("refresh-button").disabled === false);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   await click(nodes.get("workspace-view-storage"));
   await settled(() => nodes.get("storage-rows").children.length === 100);
   assert.equal(nodes.get("storage-page-label").textContent, "1–100 of 105");
@@ -3588,8 +3589,8 @@ test("project browsing selects projects and preserves duplicate run IDs across r
   assert.equal(nodes.document.title, "expri · vision");
   assert.equal(nodes.get("project-vision").checked, true);
   assert.equal(nodes.get("machine-all").checked, true);
-  assert.equal(nodes.get("run-rows").children.length, 2);
-  assert.deepEqual([...nodes.get("run-rows").children].map(row => row.dataset.runKey), ["gpu-a:same-run", "gpu-b:same-run"]);
+  assert.equal(runRows(nodes).length, 2);
+  assert.deepEqual([...runRows(nodes)].map(row => row.dataset.runKey), ["gpu-a:same-run", "gpu-b:same-run"]);
   assert.deepEqual([...nodes.get("run-rows").querySelectorAll("button.run-link")].map(button => button.textContent), ["same-run", "same-run"]);
   assert.deepEqual(model.requests.filter(url => url.startsWith("/api/runs")).map(url => new URL(url, "http://localhost").searchParams.get("source")), [project_source.source_id], "no transient worker list is fetched");
   await selectRow(nodes, 0); await selectRow(nodes, 1); await click(nodes.get("compare-button"));
@@ -3636,13 +3637,13 @@ test("machine filters operate within projects, clear run selection and use one-c
   await settledTable(nodes); await selectRow(nodes, 0);
   await openRunControl(nodes, "run-filters");
   await click(nodes.get("machine-gpu-b")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 1);
-  assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-b:same-run");
+  assert.equal(runRows(nodes).length, 1);
+  assert.equal(runRows(nodes)[0].dataset.runKey, "gpu-b:same-run");
   assert.equal(latestRunQuery(model).get("origin"), "gpu-b");
   assert.equal(nodes.get("review-section").hidden, true);
   assert.equal(runCheckbox(nodes, 0).checked, false);
   await click(nodes.get("machine-all")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 2);
+  assert.equal(runRows(nodes).length, 2);
   assert.equal(latestRunQuery(model).has("origin"), false);
   await click(nodes.document.querySelector('button[aria-label="Sort by Machine ascending"]')); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("sort"), "origin");
@@ -3687,7 +3688,7 @@ test("project capability fallback retries manually and transient project failure
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
   assert.match(nodes.get("global-error").textContent, /Project browsing unavailable/);
   assert.equal(nodes.get("project-vision").checked, true);
-  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(nodes).length, 3);
   assert.equal(nodes.get("chart-preview"), frame);
   model.model.projects_status = 200;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
@@ -3917,7 +3918,7 @@ test("smoke badges follow explicit metadata rather than run ID prefixes", async 
     { ...annotatedRun("run-invalid"), smoke: "true" },
   ];
   const { nodes } = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs });
-  const rows = [...nodes.get("run-rows").children];
+  const rows = [...runRows(nodes)];
   assert.equal(rows[0].querySelector(".run-smoke")?.textContent, "Smoke");
   for (const row of rows.slice(1)) assert.equal(row.querySelector(".run-smoke"), null);
   await click(runButton(nodes, 0));
@@ -3930,7 +3931,7 @@ test("history limits tag badges while keeping every tag accessible in inspection
   run.tags = ["baseline", "vision", "resnet-50", "validated", "published"];
   run.annotations = { ...run.annotations, tags: run.tags };
   const { nodes } = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run] });
-  const row = nodes.get("run-rows").children[0];
+  const row = runRows(nodes)[0];
   assert.deepEqual([...row.querySelectorAll(".run-tag")].map(node => node.textContent), run.tags.slice(0, 2));
   const remaining = row.querySelector(".run-tag-count");
   assert.equal(remaining.textContent, "+3");
@@ -4097,7 +4098,7 @@ test("run pagination remembers actual offsets when annotation-rich pages contain
       offset, next_offset: offset + count < runs.length ? offset + count : null });
   } });
   const { nodes } = model;
-  const ids = () => [...nodes.document.querySelectorAll("#run-rows tr")].map(row => row.dataset.runKey);
+  const ids = () => [...nodes.document.querySelectorAll("#run-rows tr[data-run-key]")].map(row => row.dataset.runKey);
   assert.deepEqual(ids(), ["gpu-a:run-0", "gpu-a:run-1"]);
   await click(nodes.get("next-page"));
   assert.equal(nodes.get("page-label").textContent, "Page 2");
@@ -4183,7 +4184,7 @@ test("hosted archive tags filter in one click without replacing training statuse
   await settledTable(nodes);
   assert.equal(nodes.get("archival-active").checked, true);
   assert.equal(latestRunQuery(model).get("archival"), "active");
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(runButton(nodes, 0).textContent, "active");
   await selectRow(nodes, 0);
   await settled(() => nodes.get("selected-runs").textContent.includes("active"));
@@ -4223,7 +4224,7 @@ test("archiving confirms the exact worker run, clears its selection, and preserv
   await click(nodes.get("cancel-archive-run"));
   assert.equal(nodes.document.getElementById("archive-run-confirmation"), null);
   await click(nodes.get("archive-run-button")); await click(nodes.get("confirm-archive-run"));
-  await settled(() => nodes.document.getElementById("restore-run-button") && nodes.get("run-rows").children.length === 1);
+  await settled(() => nodes.document.getElementById("restore-run-button") && runRows(nodes).length === 1);
   assert.equal(model.runs[0].archival.status, "archived");
   assert.equal(model.runs[1].archival.status, "active");
   assert.equal(nodes.get("selected-runs").textContent, "");
@@ -4236,7 +4237,7 @@ test("archiving confirms the exact worker run, clears its selection, and preserv
   await click(nodes.get("review-tab-overview"));
   assert.match(nodes.get("run-detail").textContent, /completed/);
   await click(nodes.get("restore-run-button"));
-  await settled(() => nodes.document.getElementById("archive-run-button") && nodes.get("run-rows").children.length === 2);
+  await settled(() => nodes.document.getElementById("archive-run-button") && runRows(nodes).length === 2);
   assert.equal(model.runs[0].archival.status, "active");
   assert.equal(model.requests.filter(url => url === "/api/runs/restore").length, 1);
   assert.equal(nodes.document.getElementById("run-archival-summary"), null);
@@ -4254,7 +4255,7 @@ test("archived direct links open from the active list and restoration leaves the
   await click(nodes.get("archival-archived")); await settledTable(nodes);
   await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("restore-run-button"));
   await click(nodes.get("restore-run-button")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   assert.match(nodes.get("list-empty").textContent, /No archived runs.*15 days/s);
   assert.equal(nodes.get("review-section").hidden, false);
   assert.equal(nodes.document.getElementById("archive-run-button")?.disabled, false);
@@ -4301,7 +4302,7 @@ test("archive failures preserve the row and confirmation, with no automatic retr
   await settled(() => nodes.document.getElementById("run-archival-error"));
   assert.match(nodes.get("run-archival-error").textContent, /Refresh the run before trying again.*Run is still running/);
   assert.equal(model.runs[0].archival.status, "active");
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.get("confirm-archive-run").disabled, false);
   assert.equal(model.requests.filter(url => url === "/api/runs/archive").length, 1);
   await click(nodes.get("cancel-archive-run"));
@@ -4332,7 +4333,7 @@ test("busy archive requests prevent duplicate submits and ignore successes after
     delete_after: new Date(Date.now() + 15 * 86_400_000).toISOString() })); await flush();
   assert.equal(nodes.get("source-select").value, sources[1].source_id);
   assert.equal(nodes.get("review-section").hidden, true);
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.document.getElementById("run-archival-error"), null);
 });
 
@@ -4345,7 +4346,7 @@ test("an external archive refreshes the detail and removes hidden selections wit
   model.runs[0].archival = { ...archivalRun("run", { archived: true }).archival };
   model.model.list_revision = "archived-elsewhere"; model.model.metadata_revision = "archived-elsewhere";
   await model.clock.advance(5_000);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   assert.equal(nodes.get("selected-runs").textContent, "");
   assert.equal(nodes.document.getElementById("archive-run-button"), null);
   assert.ok(nodes.document.getElementById("restore-run-button"));
@@ -4364,7 +4365,7 @@ test("external archival removes only that run from a comparison and retains the 
   model.model.list_revision = "first-archived"; model.model.metadata_revision = "first-archived";
   await model.clock.advance(5_000);
   await settled(() => nodes.get("review-title").textContent.includes("second") && nodes.document.getElementById("archive-run-button"));
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.match(nodes.get("selected-runs").textContent, /second/);
   assert.equal(nodes.get("selected-runs").textContent.includes("first"), false);
   assert.equal(runCheckbox(nodes, 0).checked, true);
@@ -4382,7 +4383,7 @@ test("a successful response for another worker never hides or alters the reviewe
   await settled(() => nodes.document.getElementById("run-archival-error"));
   assert.match(nodes.get("run-archival-error").textContent, /different run or archive state/);
   assert.equal(run.archival.status, "active");
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.document.getElementById("run-archival-summary"), null);
 });
 
@@ -4492,10 +4493,10 @@ test("queue publication follows the native run once while preserving history foc
   const preview = nodes.get("chart-preview"), mounts = previewMounts(nodes);
   await act(async () => runButton(nodes, 0).focus());
   model.phase("running", { acknowledged: true }); await model.clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "job-mock-pending"); assert.equal(nativeRequestCount(model), 0);
+  assert.equal(runRows(nodes).length, 1); assert.equal(runButton(nodes, 0).textContent, "job-mock-pending"); assert.equal(nativeRequestCount(model), 0);
   model.publishNative(); await model.clock.advance(5000);
   await settled(() => nodes.get("review-title").textContent === "MOCK published worker run");
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-a:run-mock-native");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runRows(nodes)[0].dataset.runKey, "gpu-a:run-mock-native");
   assert.equal(nodes.document.activeElement, runButton(nodes, 0)); assert.equal(nodes.get("review-eyebrow").textContent, "Run");
   assert.equal(nodes.get("review-tab-overview").getAttribute("aria-selected"), "true"); assert.equal(nodes.document.getElementById("queue-overview"), null);
   assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
@@ -4503,22 +4504,22 @@ test("queue publication follows the native run once while preserving history foc
   assert.equal(nodes.document.querySelector(".inspector-meta .run-duration").textContent, "15s");
   assert.ok(nativeRequestCount(model) > 0, "real worker metadata unlocks native inspection");
   for (const url of model.requests.filter(url => url.startsWith("/api/chart-data"))) assert.equal(new URL(url, "http://localhost").searchParams.get("run_id"), "gpu-a:run-mock-native");
-  await model.clock.advance(5000); assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("review-title").textContent, "MOCK published worker run");
+  await model.clock.advance(5000); assert.equal(runRows(nodes).length, 1); assert.equal(nodes.get("review-title").textContent, "MOCK published worker run");
 });
 
 test("the Pending filter retains a followed native inspector after the job leaves the scheduling list", async t => {
   const model = await pendingFixture(t), { nodes } = model;
   await settledTable(nodes); await openRunControl(nodes, "run-filters"); await click(nodes.get("status-pending")); await settledTable(nodes);
   assert.equal(nodes.get("status-pending").type, "radio"); assert.equal(nodes.get("status-pending").checked, true);
-  assert.equal(latestRunQuery(model).get("status"), "pending"); assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(latestRunQuery(model).get("status"), "pending"); assert.equal(runRows(nodes).length, 1);
   await emit(nodes.document, "keydown", { key: "Escape" }); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
   await model.clock.advance(5000); model.publishNative(); await model.clock.advance(5000);
   await settled(() => nodes.get("review-title").textContent === "MOCK published worker run");
-  assert.equal(nodes.get("run-rows").children.length, 0); assert.equal(nodes.get("status-pending").checked, true); assert.equal(nodes.get("list-empty").hidden, false);
+  assert.equal(runRows(nodes).length, 0); assert.equal(nodes.get("status-pending").checked, true); assert.equal(nodes.get("list-empty").hidden, false);
   assert.equal(nodes.get("review-section").hidden, false); assert.equal(nodes.get("review-error").hidden, true);
   assert.equal(chartQuery(nodes).get("run_id"), "gpu-a:run-mock-native");
   await click(nodes.get("clear-filter-status")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-a:run-mock-native");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runRows(nodes)[0].dataset.runKey, "gpu-a:run-mock-native");
 });
 
 test("explicit refresh follows a queue detail redirect when update hints are unavailable", async t => {
@@ -4526,7 +4527,7 @@ test("explicit refresh follows a queue detail redirect when update hints are una
   await settledTable(nodes); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
   assert.equal(nativeRequestCount(model), 0); model.publishNative();
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
-  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.get("review-error").hidden, true); assert.equal(nodes.document.getElementById("queue-overview"), null);
 });
 
@@ -4551,7 +4552,7 @@ test("explicit Refresh during the first queue detail load follows the valid nati
   assert.equal(nodes.document.getElementById("queue-overview"), null, "the first scheduling detail has not arrived");
   const preview = nodes.get("chart-preview");
   model.publishNative(); await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "queue:run-mock-native");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runRows(nodes)[0].dataset.runKey, "queue:run-mock-native");
   assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(nodes.get("review-error").hidden, true);
   assert.equal(nodes.get("review-eyebrow").textContent, "Run"); assert.equal(nodes.get("chart-preview"), preview);
   model.resolveInitial(); await flush();
@@ -4579,7 +4580,7 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} Overvie
     ? response({ ...detailRecord(source, run), state: { command: "python train.py", supervisor } }) : null });
   const { nodes } = model;
   await inspect(model); await click(nodes.get("review-tab-overview"));
-  const history = nodes.get("run-detail").querySelector(".supervisor-history"), row = nodes.get("run-rows").children[0];
+  const history = nodes.get("run-detail").querySelector(".supervisor-history"), row = runRows(nodes)[0];
   assert.ok(history);
   assert.equal(history.open, false);
   assert.match(history.querySelector("summary").textContent, /Generation 2 · 1 restart attempt$/);
@@ -4610,7 +4611,7 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} checkpo
   model.logs.stdout = "Original attempt output\n";
   await inspect(model); await chooseAxis(nodes, "elapsed");
   await click(nodes.get("review-tab-overview"));
-  const panel = nodes.get("run-detail").querySelector(".task-attempt-history"), row = nodes.get("run-rows").children[0], preview = nodes.get("chart-preview");
+  const panel = nodes.get("run-detail").querySelector(".task-attempt-history"), row = runRows(nodes)[0], preview = nodes.get("chart-preview");
   assert.ok(panel); assert.equal(overviewDuration(nodes).textContent, "3s");
   panel.open = true;
   const next = { ...first, attempt: 2, request_id: "continue-2", reason: "Extend steps", status: "running", requested_at: "2026-10-15T01:01:00Z", started_at: "2026-10-15T01:01:02Z", finished_at: null, exit_code: null, worker_restarted: true, previous_worker_stopped_at: first.finished_at, source: { kind: "git", git_head: "b".repeat(40) }, checkpoint: { name: "checkpoint.pt", relative_path: "outputs/checkpoint.pt", sha256: "c".repeat(64), size: "100" }, metric_step_offset: "101" };
@@ -4620,7 +4621,7 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} checkpo
   await click(nodes.get("refresh-button"));
   await settled(() => panel.querySelector("summary").textContent.includes("Current 2"));
   assert.equal(nodes.get("run-detail").querySelector(".task-attempt-history"), panel); assert.equal(panel.open, true);
-  assert.equal(nodes.get("run-rows").children[0], row); assert.equal(row.dataset.runKey, run.run_id);
+  assert.equal(runRows(nodes)[0], row); assert.equal(row.dataset.runKey, run.run_id);
   assert.equal(nodes.get("review-title").textContent, run.run_id); assert.equal(nodes.get("chart-preview"), preview);
   assert.equal(selectedAxis(nodes), "elapsed"); assert.equal(run.started_at, original_start);
   assert.equal(overviewDuration(nodes).textContent, "1m 5s");
