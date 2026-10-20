@@ -678,6 +678,7 @@ fn route_content_checked(
         "direction",
         "origin",
         "archival",
+        "experiment_id",
       ])?;
       let archived = match query.optional("archival").unwrap_or("active") {
         "active" => false,
@@ -686,6 +687,11 @@ fn route_content_checked(
       };
       let limit = query.number("limit", 100, 1, 1000)?;
       let offset = query.number("offset", 0, 0, usize::MAX)?;
+      let experiment_id = query.optional("experiment_id");
+      if let Some(experiment_id) = experiment_id {
+        expri_core::identifiers::validate_component(experiment_id)
+          .map_err(|_| Reply::error(400, "invalid experiment filter"))?;
+      }
       let table = ["param", "metric", "reduction", "sort", "direction"]
         .iter()
         .any(|field| query.optional(field).is_some())
@@ -707,6 +713,7 @@ fn route_content_checked(
             &super::table::ListQuery {
               archived,
               origin: query.optional("origin"),
+              experiment_id,
               search: query.optional("search"),
               task: query.optional("task"),
               status: query.optional("status"),

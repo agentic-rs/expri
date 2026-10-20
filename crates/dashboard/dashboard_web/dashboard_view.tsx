@@ -1,4 +1,4 @@
-import { Fragment, useSyncExternalStore, useState, useEffect, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useSyncExternalStore, useState, useEffect, useMemo, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { FilesPanel, formatFileSize } from "./dashboard_files";
 import { StoragePanel, type StorageCatalog, type StorageKind } from "./dashboard_storage";
@@ -17,6 +17,8 @@ import { RunAttemptHistory } from "./run_attempts_view";
 import { parseTaskAttempts } from "./run_attempts";
 import { lifecyclePanelKey, RunLifecyclePanel } from "./run_lifecycle_view";
 import { RunResourceBadge } from "./run_resources_view";
+import { ExperimentToolbar, ExperimentRunPanel, ExperimentGroupHeader, ExperimentLineageBadge } from "./experiments_view";
+import { experimentRunScope, scopeIdentity, type ExperimentState, type ExperimentDraft, type Experiment } from "./experiments";
 import type { RefreshClock } from "./auto_refresh";
 import { ThemeControl } from "./dashboard_theme";
 import type { ArchivalAction, ArchivalView } from "./run_archival";
@@ -131,6 +133,7 @@ export type DashboardSnapshot = DashboardUi & {
   access_mode: "local" | "hosted";
   project_catalog_enabled: boolean;
   runs: Run[];
+  experiments: ExperimentState;
   run_columns: RunColumn[];
   available_run_columns: RunColumn[];
   run_sort: RunSort;
@@ -157,6 +160,11 @@ export type DashboardSnapshot = DashboardUi & {
   reduction: ComparisonReduction;
 };
 export type DashboardActions = {
+  experiment_filter: (value: string) => void;
+  experiment_view: (value: "experiments" | "runs") => void;
+  experiments_refresh: () => void;
+  experiment_save: (experiment_id: string | null, values: ExperimentDraft, expected_revision: string | null, create_request_id?: string) => Promise<boolean>;
+  experiment_delete: (experiment_id: string, expected_revision: string) => Promise<boolean>;
   archival: (value: ArchivalView) => void;
   archival_confirm: () => void;
   archival_cancel: () => void;
@@ -647,7 +655,22 @@ function RunBrowser({
   actions: DashboardActions;
 }) {
   const [open_control, setOpenControl] = useState<"filters" | "columns" | "issues" | null>(null);
+  const [collapsed_groups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   useEffect(() => setOpenControl(null), [s.source_id]);
+  useEffect(() => setCollapsedGroups(new Set()), [s.source_id]);
+  const membership = useMemo(() => new Map((s.experiments.catalog?.experiments ?? [])
+    .flatMap((experiment) => experiment.members.map((member) => [scopeIdentity(member), experiment] as const))), [s.experiments.catalog]);
+  const source = s.sources.find((item) => item.source_id === s.source_id);
+  const grouped = s.experiments.supported && s.experiments.catalog !== null && s.experiments.view === "experiments";
+  const groups = new Map<string, { experiment: Experiment | null; runs: Run[] }>();
+  for (const run of s.runs) {
+    const member = experimentRunScope(run, source);
+    const experiment = member ? membership.get(scopeIdentity(member)) ?? null : null;
+    const key = experiment?.experiment_id ?? "ungrouped";
+    if (!groups.has(key)) groups.set(key, { experiment, runs: [] });
+    groups.get(key)!.runs.push(run);
+  }
+  const ordered_runs = grouped ? [...groups.values()].flatMap((group) => group.runs) : s.runs;
   function changeControl(control: "filters" | "columns" | "issues", open: boolean): void {
     setOpenControl((current) => open ? control : current === control ? null : current);
   }
@@ -656,6 +679,8 @@ function RunBrowser({
     ...(s.status ? [{ key: "status", name: "status", label: `Status: ${s.status}`, clear: () => a.filter("status", "") }] : []),
     ...(s.origin ? [{ key: "origin", name: "machine", label: `Machine: ${s.origin}`, clear: () => a.filter("origin", "") }] : []),
     ...(s.archival === "archived" ? [{ key: "archival", name: "archive", label: "Archived", clear: () => a.archival("active") }] : []),
+    ...(s.experiments.filter ? [{ key: "experiment", name: "experiment", label: s.experiments.filter === "ungrouped" ? "Ungrouped" :
+      `Experiment: ${s.experiments.catalog?.experiments.find((item) => item.experiment_id === s.experiments.filter)?.name ?? s.experiments.filter}`, clear: () => a.experiment_filter("") }] : []),
   ];
   const filter_count = active_filters.length;
   const seen_issues = new Set<string>();
@@ -715,6 +740,7 @@ function RunBrowser({
           </span>
         </div>
       </div>
+      <ExperimentToolbar key={s.source_id} snapshot={s} actions={a} />
       <div className="active-run-filters" aria-label="Active run filters" hidden={!filter_count}>
         {active_filters.map((filter) => <button key={filter.key} id={`clear-filter-${filter.key}`} type="button" className="run-filter-chip"
           title={filter.label} aria-label={`Clear ${filter.name} filter`} disabled={s.controls_disabled} onClick={filter.clear}>
@@ -762,12 +788,23 @@ function RunBrowser({
             </tr>
           </thead>
           <tbody id="run-rows">
-            {s.runs.map((run) => {
+            {ordered_runs.map((run) => {
               const identity = runIdentity(run);
               const selected = s.selected.includes(identity);
+              const member = experimentRunScope(run, source);
+              const experiment = member ? membership.get(scopeIdentity(member)) ?? null : null;
+              const group_key = experiment?.experiment_id ?? "ungrouped";
+              const group = groups.get(group_key)!;
+              const expanded = !collapsed_groups.has(group_key);
               return (
+                <Fragment key={identity}>
+                {grouped && group.runs[0] === run && <ExperimentGroupHeader experiment={experiment} runs={group.runs}
+                  expanded={expanded} columns={4 + Number(Boolean(project)) + s.run_columns.length}
+                  on_filter={() => a.experiment_filter(group_key)} on_toggle={() => setCollapsedGroups((current) => {
+                    const next = new Set(current); next.has(group_key) ? next.delete(group_key) : next.add(group_key); return next;
+                  })} />}
+                {(!grouped || expanded) &&
                 <tr
-                  key={identity}
                   data-run-key={identity}
                   className={[
                     selected && "selected",
@@ -803,6 +840,8 @@ function RunBrowser({
                       {runNickname(run) ?? run.run_id}
                     </button>
                     <div className="run-task" title={run.task ?? undefined}>{run.task ?? "—"}</div>
+                    {!grouped && experiment && <div className="run-experiment-name" title={experiment.name}>{experiment.name}</div>}
+                    <ExperimentLineageBadge experiment={experiment} member={member} />
                     <div className="run-summary-meta">
                       {runNickname(run) && <span className="run-meta run-identifier" title={run.run_id}>{run.run_id}</span>}
                       <RunSmokeMark run={run} />
@@ -848,7 +887,8 @@ function RunBrowser({
                       </td>
                     );
                   })}
-                </tr>
+                </tr>}
+                </Fragment>
               );
             })}
           </tbody>
@@ -1336,6 +1376,7 @@ function ReviewWorkspace({
         {!queue_only && s.access_mode === "hosted" && s.review?.kind === "run" && (
           <div className="inspector-toolbar review-management">
             <RunAnnotationsPanel snapshot={s} actions={a} />
+            <ExperimentRunPanel snapshot={s} actions={a} />
             <RunArchivalPanel snapshot={s} actions={a} />
             <ResultUploadSummary detail={s.detail} />
           </div>
@@ -1464,7 +1505,7 @@ function ReviewWorkspace({
             </div>
             <p id="chart-note" className="muted chart-context">{s.chart_note}</p>
             <ErrorNotice id="chart-error" message={s.chart_error} />
-            <div id="chart-preview" role="region" aria-label="Interactive experiment metric curves"></div>
+            <div id="chart-preview" role="region" aria-label="Interactive run metric curves"></div>
             <p className="chart-footnote muted">
               Hover to inspect · Drag to zoom · Click a legend entry to show or hide a run. Time views omit samples without timestamps.
             </p>

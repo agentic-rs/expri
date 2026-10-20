@@ -344,6 +344,241 @@ async function settledTable(nodes) {
 function latestRunQuery(model) {
   return new URL(model.requests.filter(url => url.startsWith("/api/runs?")).at(-1), "http://localhost").searchParams;
 }
+
+async function experimentFixture(t, { mutable = true, count = 3, experiments: initial, intercept, ...fields } = {}) {
+  const source = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] };
+  const scope = (origin, run_id) => ({ project_id: "vision", origin, run_id });
+  const runs = Array.from({ length: count }, (_, index) => ({ run_id: `run-${index}`, run_key: `gpu-${index === 1 ? "b" : "a"}:run-${index}`,
+    origin: index === 1 ? "gpu-b" : "gpu-a", task: "train", status: index === 0 ? "running" : index === 1 ? "failed" : "completed",
+    started_at: "2026-10-03T01:00:00Z", finished_at: index === 0 ? null : "2026-10-03T01:00:03Z", exit_code: index === 1 ? 1 : null }));
+  const make = (patch = {}) => ({ experiment_id: "experiment-1", name: "Language model", description: "Across machines\nIndependent metrics", revision: "exp-revision-1",
+    members: [scope("gpu-a", "run-0"), scope("gpu-b", "run-1")], lineage: [{ parent: scope("gpu-a", "run-0"), child: scope("gpu-b", "run-1"), kind: "continued", checkpoint: "checkpoint-900", step: "900" }],
+    created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: 2, unavailable_runs: [], ...patch });
+  const state = { experiments: initial ?? [make()], saves: [], deletes: [], reads: 0, project_revision: "project-1", replay: new Map() };
+  const model = await reviewFixture(t, { ...fields, hosted: true, projects: true, project_runs: runs, override: (url, options) => {
+    const overridden = intercept?.(url, options, state);
+    if (overridden !== undefined) return overridden;
+    if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [source], initial_source: source.source_id,
+      access_mode: "hosted", warnings: [], run_management_enabled: mutable, experiments_supported: true, experiment_management_enabled: mutable });
+    if (url.pathname === "/api/experiments") { state.reads++; return response({ project_id: "vision", revision: state.project_revision, experiments: structuredClone(state.experiments) }); }
+    if (url.pathname === "/api/experiments/save") {
+      const body = JSON.parse(options.body); state.saves.push(body);
+      assert.equal(options.method, "POST"); assert.equal(options.credentials, "same-origin");
+      const existing = state.experiments.find((item) => item.experiment_id === body.experiment_id);
+      if (existing && existing.revision !== body.expected_revision) return response({ error: "Experiment changed; reload its latest revision." }, 409);
+      const replay = body.create_request_id && state.replay.get(body.create_request_id);
+      if (replay) return response(replay);
+      const saved = make({ ...body, experiment_id: body.experiment_id ?? `experiment-${state.experiments.length + 1}`, revision: `saved-${state.saves.length}`, membership_count: body.members.length });
+      delete saved.project_id; delete saved.expected_revision; delete saved.create_request_id;
+      state.experiments = [...state.experiments.filter((item) => item.experiment_id !== saved.experiment_id), saved];
+      if (body.create_request_id) state.replay.set(body.create_request_id, saved);
+      return response(saved);
+    }
+    if (url.pathname === "/api/runs") {
+      const id = url.searchParams.get("experiment_id"), offset = Number(url.searchParams.get("offset")), limit = Number(url.searchParams.get("limit"));
+      const chosen = state.experiments.find((item) => item.experiment_id === id);
+      const contains = (item, run) => item.members.some((member) => member.origin === run.origin && member.run_id === run.run_id);
+      const visible = runs.filter((run) => !id || (id === "ungrouped" ? !state.experiments.some((item) => contains(item, run)) : chosen && contains(chosen, run)));
+      return response({ source, runs: visible.slice(offset, offset + limit), total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null, warnings: [] });
+    }
+  } });
+  await settled(() => model.nodes.document.querySelector("#experiment-filter") && !model.nodes.get("experiment-filter").disabled);
+  return Object.assign(model, { state, source, scope, make });
+}
+
+test("experiments group a paged run history with exact membership, scoped identity and explicit page activity", async t => {
+  const model = await experimentFixture(t);
+  const { nodes } = model;
+  const groups = nodes.get("run-rows").querySelectorAll(".experiment-group-row");
+  assert.equal(groups.length, 2);
+  assert.match(groups[0].textContent, /Language model.*2 shown · 2 members.*This page: 1 running · 1 failed/s);
+  assert.equal(groups[0].querySelector(".status"), null, "a failed historical run does not mark the experiment failed");
+  assert.match(nodes.get("run-rows").textContent, /Continued from run-0/);
+  const row = nodes.get("run-rows").querySelector('[data-run-key="gpu-b:run-1"]');
+  assert.match(row.querySelector(".machine-name").textContent, /gpu-b/);
+  await click(groups[0].querySelector("[aria-expanded]"));
+  assert.equal(nodes.get("run-rows").querySelectorAll("[data-run-key]").length, 1);
+  await click(nodes.document.querySelector('input[name="run_grouping"][value="runs"]'));
+  assert.equal(nodes.get("run-rows").querySelectorAll("[data-run-key]").length, 3);
+  assert.equal(nodes.get("run-rows").querySelectorAll(".experiment-group-row").length, 0);
+  assert.match(nodes.get("run-rows").textContent, /Language model/);
+  setValue(nodes.get("experiment-filter"), "ungrouped"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("experiment_id"), "ungrouped");
+  assert.equal(nodes.get("run-rows").querySelectorAll("[data-run-key]").length, 1);
+  await click(nodes.get("clear-filter-experiment")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).has("experiment_id"), false);
+});
+
+test("experiment creation reuses its request ID after a committed response is lost", async t => {
+  let first = true, committed = null;
+  const attempts = [];
+  const model = await experimentFixture(t, { experiments: [], intercept: (url, options, state) => {
+    if (url.pathname !== "/api/experiments/save") return;
+    const body = JSON.parse(options.body); attempts.push(body);
+    assert.ok(body.create_request_id);
+    if (first) {
+      first = false;
+      committed = { experiment_id: "created-once", name: body.name, description: body.description, revision: "committed-1", members: body.members,
+        lineage: body.lineage, created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: body.members.length, unavailable_runs: [] };
+      state.experiments = [committed];
+      return Promise.reject(new Error("Connection lost after the server committed"));
+    }
+    assert.equal(body.create_request_id, attempts[0].create_request_id);
+    return response(committed);
+  } });
+  const { nodes } = model;
+  await click(nodes.get("experiment-manager-trigger"));
+  await click([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "+ New"));
+  setValue(nodes.get("experiment-name"), "Stable work"); await emit(nodes.get("experiment-name"), "input");
+  await click(nodes.get("save-experiment"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("Connection lost"));
+  assert.equal(nodes.get("experiment-name").value, "Stable work", "an unknown outcome retains the draft");
+  await click(nodes.get("save-experiment"));
+  await settled(() => !nodes.document.querySelector("#experiment-name"));
+  assert.equal(attempts.length, 2); assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(model.state.experiments.length, 1);
+  assert.equal(model.state.experiments[0].experiment_id, "created-once");
+});
+
+test("experiment lineage retains checkpoint provenance across relationship choices and submits captured revisions", async t => {
+  const { nodes, state } = await experimentFixture(t);
+  await click(nodes.get("run-rows").querySelector('[data-run-key="gpu-b:run-1"] .run-link'));
+  await settled(() => nodes.document.querySelector("#run-experiment-panel"));
+  const panel = nodes.get("run-experiment-panel"); panel.open = true; await emit(panel, "toggle");
+  await click([...panel.querySelectorAll("button")].find((button) => button.textContent === "Edit lineage"));
+  await click(panel.querySelector('[aria-label="Remove relationship from run-0 · gpu-a"]'));
+  const parent = nodes.get("experiment-lineage-parent"); setValue(parent, parent.options[1].value); await emit(parent, "change");
+  setValue(nodes.get("experiment-checkpoint-step"), "18446744073709551615"); await emit(nodes.get("experiment-checkpoint-step"), "input");
+  setValue(nodes.get("experiment-checkpoint-reference"), "weights/checkpoint-900"); await emit(nodes.get("experiment-checkpoint-reference"), "input");
+  await click(panel.querySelector('input[name="lineage_kind"][value="split"]'));
+  assert.equal(nodes.get("experiment-checkpoint-reference").value, "weights/checkpoint-900");
+  assert.equal(nodes.get("experiment-checkpoint-step").disabled, false);
+  await click(nodes.get("save-experiment-lineage"));
+  await settled(() => state.saves.length === 1 && !nodes.document.querySelector("#save-experiment-lineage"));
+  assert.equal(state.saves[0].expected_revision, "exp-revision-1");
+  assert.deepEqual(state.saves[0].lineage[0], { parent: { project_id: "vision", origin: "gpu-a", run_id: "run-0" },
+    child: { project_id: "vision", origin: "gpu-b", run_id: "run-1" }, kind: "split", checkpoint: "weights/checkpoint-900", step: "18446744073709551615" });
+});
+
+test("read-only experiments expose retained lineage and members without allowing writes", async t => {
+  const model = await experimentFixture(t, { mutable: false });
+  model.state.experiments[0].unavailable_runs = [model.scope("gpu-a", "run-0")];
+  const { nodes } = model;
+  await click(nodes.get("experiment-manager-trigger"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("1 unavailable"));
+  const history = nodes.get("experiment-manager-panel").querySelector(".experiment-recorded-history");
+  history.open = true; await emit(history, "toggle");
+  assert.match(history.textContent, /run-0 · gpu-a.*Unavailable · provenance retained.*Continued from run-0 · gpu-a.*step 900.*checkpoint-900/s);
+  assert.equal([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "+ New").disabled, true);
+  assert.equal(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]').disabled, true);
+  assert.equal(model.state.saves.length, 0);
+});
+
+test("experiment conflicts retain drafts and require an explicit reload before retrying", async t => {
+  const { nodes, state } = await experimentFixture(t);
+  await click(nodes.get("experiment-manager-trigger"));
+  await click(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]'));
+  setValue(nodes.get("experiment-name"), "My unsaved name"); await emit(nodes.get("experiment-name"), "input");
+  state.experiments[0] = { ...state.experiments[0], name: "Changed elsewhere", revision: "external-revision" };
+  await click(nodes.get("save-experiment"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("changed while you were editing"));
+  assert.equal(nodes.get("experiment-name").value, "My unsaved name");
+  assert.equal(nodes.get("save-experiment").disabled, true);
+  await click([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "Reload latest"));
+  assert.equal(nodes.get("experiment-name").value, "Changed elsewhere");
+  assert.equal(nodes.get("save-experiment").disabled, false);
+  await click(nodes.get("save-experiment"));
+  await settled(() => !nodes.document.querySelector("#experiment-name"));
+  assert.equal(state.saves.at(-1).expected_revision, "external-revision");
+});
+
+test("empty experiment metadata refreshes on catalog revisions without changes to run history", async t => {
+  const clock = new RefreshClock();
+  const model = await experimentFixture(t, { updates: true, refresh_clock: clock });
+  await clock.advance(5000);
+  const empty = model.make({ experiment_id: "empty-experiment", name: "Empty experiment", revision: "empty-1", members: [], lineage: [], membership_count: 0 });
+  model.state.experiments.push(empty);
+  const reads = model.state.reads, runs_before = model.requests.filter((url) => url.startsWith("/api/runs?")).length;
+  model.catalog_revision = "catalog-with-empty-experiment";
+  await clock.advance(5000);
+  await settled(() => model.nodes.get("experiment-filter").textContent.includes("Empty experiment"));
+  assert.ok(model.state.reads > reads);
+  const previous_reads = model.state.reads;
+  empty.name = "Renamed empty group"; empty.revision = "empty-2";
+  model.catalog_revision = "catalog-renamed-empty-experiment";
+  await clock.advance(5000);
+  await settled(() => model.nodes.get("experiment-filter").textContent.includes("Renamed empty group"));
+  assert.ok(model.state.reads > previous_reads);
+  assert.equal(model.requests.filter((url) => url.startsWith("/api/runs?")).length, runs_before,
+    "metadata updates do not need to reread the unchanged run list");
+});
+
+test("a precommit experiment refresh cannot overwrite an acknowledged save", async t => {
+  const post = deferred(), stale = deferred();
+  let hold_read = false, read_held = false, submitted = null;
+  const model = await experimentFixture(t, { intercept: (url, options) => {
+    if (url.pathname === "/api/experiments/save") { submitted = JSON.parse(options.body); return post.promise; }
+    if (url.pathname === "/api/experiments" && hold_read) { hold_read = false; read_held = true; return stale.promise; }
+  } });
+  const { nodes, state } = model;
+  const old_snapshot = structuredClone(state.experiments);
+  await click(nodes.get("experiment-manager-trigger"));
+  await click(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]'));
+  setValue(nodes.get("experiment-name"), "Acknowledged new name"); await emit(nodes.get("experiment-name"), "input");
+  await click(nodes.get("save-experiment"));
+  await settled(() => submitted !== null);
+  hold_read = true; await click(nodes.get("refresh-button"));
+  await settled(() => read_held);
+  const saved = { ...state.experiments[0], name: submitted.name, revision: "acknowledged-revision" };
+  state.experiments = [saved];
+  await act(async () => { post.resolve(response(saved)); await microtasks(); });
+  await settled(() => !nodes.document.querySelector("#experiment-name"));
+  await act(async () => { stale.resolve(response({ project_id: "vision", revision: "old-project", experiments: old_snapshot })); await microtasks(); });
+  assert.match(nodes.get("experiment-filter").textContent, /Acknowledged new name/);
+  assert.doesNotMatch(nodes.get("experiment-filter").textContent, /Language model/);
+});
+
+test("unavailable experiment members can be removed with their edges while all runs are preserved", async t => {
+  const model = await experimentFixture(t);
+  const { nodes, state } = model;
+  state.experiments[0].unavailable_runs = [model.scope("gpu-a", "run-0")];
+  await click(nodes.get("experiment-manager-trigger"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("1 unavailable"));
+  await click(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]'));
+  const history = nodes.get("experiment-manager-panel").querySelector("form .experiment-recorded-history");
+  history.open = true; await emit(history, "toggle");
+  assert.match(history.textContent, /Removing a member also removes its lineage relationships when you save/);
+  await click(history.querySelector('[aria-label="Remove member run-0 · gpu-a"]'));
+  assert.equal(state.experiments[0].members.length, 2, "removal remains an unsaved draft until Save");
+  await click(nodes.get("save-experiment"));
+  await settled(() => state.saves.length === 1);
+  assert.equal(state.saves[0].members.length, 1); assert.deepEqual(state.saves[0].lineage, []);
+  assert.equal(model.runs.length, 3, "removing membership does not remove a run");
+});
+
+test("late experiment reads cannot replace the catalog after switching projects away and back", async t => {
+  const old = deferred(); let hold = false, held = false;
+  const vision = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const other = { ...vision, source_id: "hosted-project:other", project_id: "other", label: "other" };
+  const model = await experimentFixture(t, { intercept: (url, _options, state) => {
+    if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [vision, other], initial_source: vision.source_id,
+      access_mode: "hosted", warnings: [], run_management_enabled: true, experiments_supported: true, experiment_management_enabled: true });
+    if (url.pathname === "/api/experiments") {
+      if (url.searchParams.get("project_id") === "other") return response({ project_id: "other", revision: "other-1", experiments: [] });
+      if (hold) { hold = false; held = true; return old.promise; }
+    }
+    if (url.pathname === "/api/runs" && url.searchParams.get("source") === other.source_id) return response({ source: other, runs: [], total_count: 0, offset: 0, next_offset: null, warnings: [] });
+  } });
+  const { nodes } = model;
+  hold = true; await click(nodes.get("experiment-manager-trigger")); await settled(() => held);
+  await click(nodes.get("project-other")); await settled(() => nodes.get("project-other").checked && !nodes.get("experiment-filter").disabled);
+  assert.doesNotMatch(nodes.get("experiment-filter").textContent, /Language model/);
+  await click(nodes.get("project-vision")); await settled(() => nodes.get("experiment-filter").textContent.includes("Language model"));
+  const stale = { ...model.state.experiments[0], name: "Late wrong catalog", revision: "old-read" };
+  await act(async () => { old.resolve(response({ project_id: "vision", revision: "old-project", experiments: [stale] })); await microtasks(); });
+  assert.match(nodes.get("experiment-filter").textContent, /Language model/);
+  assert.doesNotMatch(nodes.get("experiment-filter").textContent, /Late wrong catalog/);
+});
 function workspacePanes(nodes) {
   const grid = nodes.document.querySelector(".workspace-grid");
   const browser = grid.querySelector(":scope > .runs-card");

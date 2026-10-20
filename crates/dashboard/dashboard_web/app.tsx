@@ -58,6 +58,7 @@ import { RunSystemMonitor, runSystemItem } from "./run_system";
 import { parseRunQueue, parseRunRedirect, queueContext, queuePlaceholder } from "./run_queue";
 import { MAX_RUN_COLUMNS, runColumnIdentity, runColumnSortKey, runSortIsDefault } from "./run_table";
 import { warningSeverity } from "./run_diagnostics";
+import { experimentProject, parseExperiment, parseExperimentCatalog, type ExperimentDraft, type ExperimentState } from "./experiments";
 import {
   DashboardView,
   type DashboardActions,
@@ -89,6 +90,8 @@ export * from "./run_lifecycle";
 export * from "./run_lifecycle_view";
 export * from "./run_resources";
 export * from "./run_resources_view";
+export * from "./experiments";
+export * from "./experiments_view";
 
 function required<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -113,6 +116,8 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const artifact_lane = new RequestLane(() => pending_deep_link);
   const archival_lane = new RequestLane(() => pending_deep_link);
   const annotations_lane = new RequestLane(() => pending_deep_link);
+  const experiments_lane = new RequestLane(() => pending_deep_link);
+  const experiment_mutation_lane = new RequestLane(() => pending_deep_link);
   const storage_lane = new RequestLane(() => pending_deep_link);
   const system_lane = new RequestLane(() => pending_deep_link);
   const run_system_lane = new RequestLane(() => pending_deep_link);
@@ -141,6 +146,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     artifact_lane,
     archival_lane,
     annotations_lane,
+    experiment_mutation_lane,
     storage_lane,
     system_lane,
     run_system_lane,
@@ -223,6 +229,12 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
   const selected_files = new Set<string>();
   const selected = new Set<string>();
   const detail_cache = new Map<string, Detail>();
+  const experiments: ExperimentState = { supported: false, management_enabled: false, loading: false,
+    busy: false, error: null, catalog: null, filter: "", view: "experiments" };
+  let experiments_context: string | null = null;
+  let experiments_loading: Promise<boolean> | null = null;
+  let experiment_read_generation = 0;
+  let experiment_mutation_generation = 0;
 
   let x_axis: ChartAxis = "step";
   let time_zone: ChartTimeZone = "local";
@@ -297,6 +309,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       access_mode,
       project_catalog_enabled: project_catalog_status === "supported",
       runs,
+      experiments: { ...experiments },
       selected: [...selected],
       review: review
         ? { ...review, run_ids: [...review.run_ids], metric_names: [...review.metric_names] }
@@ -350,6 +363,15 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     publish();
   }
   const actions: DashboardActions = {
+    experiment_filter: (value) => {
+      if (!experiments.supported || experiments.filter === value) return;
+      experiments.filter = value;
+      filtersChanged();
+    },
+    experiment_view: (value) => { experiments.view = value; publish(); },
+    experiments_refresh: () => { void loadExperiments(true); },
+    experiment_save: (experiment_id, values, expected_revision, create_request_id) => mutateExperiment(experiment_id, values, expected_revision, create_request_id),
+    experiment_delete: (experiment_id, expected_revision) => mutateExperiment(experiment_id, null, expected_revision),
     annotations_save: (nickname, tags) => {
       void saveRunAnnotations(nickname, tags);
     },
@@ -386,6 +408,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       ui.task = "";
       ui.status = "";
       ui.origin = "";
+      experiments.filter = "";
       clearSearchTimeout();
       ui.archival = "active";
       filtersChanged();
@@ -395,6 +418,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       cancelRefresh();
       clearSearchTimeout();
       source_id = value;
+      resetExperiments();
       resetStorage();
       ui.origin = "";
       ui.archival = "active";
@@ -792,6 +816,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       status: ui.status,
       origin: currentSource()?.kind === "hosted_project" ? ui.origin : null,
       archival: access_mode === "hosted" ? ui.archival : null,
+      experiment_id: experiments.supported && experimentProject(currentSource()) ? experiments.filter : null,
       limit: page_size,
       offset,
       param: ui.run_columns_supported
@@ -807,6 +832,101 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       sort: ui.run_columns_supported && !runSortIsDefault(run_sort) ? run_sort.key : null,
       direction: ui.run_columns_supported && !runSortIsDefault(run_sort) ? run_sort.direction : null,
     });
+  }
+  function resetExperiments(): void {
+    experiment_read_generation++;
+    experiment_mutation_generation++;
+    experiments_lane.cancel();
+    experiment_mutation_lane.cancel();
+    experiments_context = null;
+    experiments_loading = null;
+    Object.assign(experiments, { catalog: null, loading: false, busy: false, error: null, filter: "" });
+  }
+  function loadExperiments(force = false): Promise<boolean> {
+    const project_id = experimentProject(currentSource()), source = source_id;
+    if (!experiments.supported || !project_id) return Promise.resolve(false);
+    if (experiments_loading && experiments_context === source) return experiments_loading;
+    if (!force && experiments.catalog?.project_id === project_id) return Promise.resolve(true);
+    experiments_context = source;
+    const generation = ++experiment_read_generation;
+    experiments.loading = experiments.catalog === null;
+    publish();
+    const current = () => !disposed && source_id === source && experiments_context === source && generation === experiment_read_generation;
+    const pending = (async () => {
+      try {
+        const result = await experiments_lane.runJson<unknown>(apiUrl("/api/experiments", { project_id }), 1024 * 1024 + 16 * 1024,
+          "The experiment catalog exceeds its preview limit.");
+        if (!result || !current()) return false;
+        const catalog = parseExperimentCatalog(result, project_id);
+        experiments.catalog = catalog;
+        experiments.error = null;
+        return true;
+      } catch (error) {
+        if (current()) experiments.error = `Could not load experiments. ${errorText(error)}`;
+        return false;
+      } finally {
+        if (current()) { experiments.loading = false; experiments_loading = null; publish(); }
+      }
+    })();
+    experiments_loading = pending;
+    return pending;
+  }
+  async function mutateExperiment(experiment_id: string | null, values: ExperimentDraft | null, expected_revision: string | null, create_request_id?: string): Promise<boolean> {
+    const project_id = experimentProject(currentSource()), source = source_id;
+    const existing = experiments.catalog?.experiments.find((item) => item.experiment_id === experiment_id);
+    if (!project_id || experiments.busy || !experiments.management_enabled || !experiments.supported ||
+      !experiments.catalog || (experiment_id !== null && !existing)) return false;
+    const generation = ++experiment_mutation_generation;
+    const current = () => !disposed && source_id === source && experimentProject(currentSource()) === project_id && generation === experiment_mutation_generation;
+    experiment_read_generation++;
+    experiments_lane.cancel(); experiments_loading = null;
+    experiments.busy = true; experiments.loading = false; experiments.error = null;
+    publish();
+    try {
+      const body = { project_id, experiment_id, expected_revision,
+        ...(experiment_id === null && create_request_id ? { create_request_id } : {}),
+        ...(values ?? {}) };
+      const result = await experiment_mutation_lane.post<unknown>(values ? "/api/experiments/save" : "/api/experiments/delete", body);
+      if (!result || !current()) return false;
+      // Refresh may have started a read before this write committed. Its
+      // snapshot cannot replace the newly acknowledged revision.
+      experiment_read_generation++;
+      experiments_lane.cancel(); experiments_loading = null; experiments.loading = false;
+      if (values) {
+        const saved = parseExperiment(result, project_id);
+        if (experiment_id !== null && saved.experiment_id !== experiment_id) throw new Error("The saved experiment does not match this edit.");
+        const catalog = experiments.catalog!;
+        experiments.catalog = { ...catalog, experiments: [...catalog.experiments.filter((item) => item.experiment_id !== saved.experiment_id), saved] };
+      } else {
+        const deleted = result as { project_id?: string; experiment_id?: string; deleted?: boolean };
+        if (deleted.project_id !== project_id || deleted.experiment_id !== experiment_id || deleted.deleted !== true)
+          throw new Error("The deletion response does not match this experiment.");
+        experiments.catalog = { ...experiments.catalog!, experiments: experiments.catalog!.experiments.filter((item) => item.experiment_id !== experiment_id) };
+        if (experiments.filter === experiment_id) experiments.filter = "";
+      }
+      detail_cache.clear();
+      detail_revisions.clear();
+      comparison_revision = null;
+      publish();
+      await loadExperiments(true);
+      if (!current()) return true;
+      await loadRuns();
+      if (current() && review?.kind === "run" && review.run_ids[0]) await loadRun(review.run_ids[0], true);
+      announce(values ? "Experiment saved. Runs and metrics are unchanged." : "Experiment removed. Its runs and metrics are preserved.");
+      return true;
+    } catch (error) {
+      if (current()) {
+        if (error instanceof RequestError && error.status === 409) {
+          experiment_read_generation++;
+          experiments_lane.cancel(); experiments_loading = null; experiments.loading = false;
+          await loadExperiments(true);
+        }
+        if (current()) { experiments.error = `Could not save the experiment. ${errorText(error)}`; publish(); }
+      }
+      return false;
+    } finally {
+      if (current()) { experiments.busy = false; publish(); }
+    }
   }
   function resetRunColumns(): void {
     run_columns_version++;
@@ -957,6 +1077,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     publish();
   }
   function applyRunList(result: RunList, context: string, quiet = false): void {
+    if (!experiments.busy) void loadExperiments(true);
     const unchanged =
       last_run_list_context === context && JSON.stringify(last_run_list) === JSON.stringify(result);
     const was_ready = list_ready;
@@ -993,7 +1114,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
       const row = [...document.querySelectorAll<HTMLElement>("[data-run-key]")].find(node => node.dataset.runKey === runIdentity(replacement));
       row?.querySelector<HTMLElement>(".run-link")?.focus({ preventScroll: true });
     }
-    if (!runs.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status || ui.origin), result.source);
+    if (!runs.length) showEmptyRuns(Boolean(ui.search || ui.task || ui.status || ui.origin || experiments.filter), result.source);
     announce(`${result.total_count} matching runs`);
   }
   async function loadRuns(): Promise<boolean> {
@@ -1673,6 +1794,9 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     return projects === null ? catalog : projects;
   }
   function applyCatalog(catalog: Catalog, quiet = false): void {
+    experiments.supported = catalog.access_mode === "hosted" && catalog.experiments_supported === true;
+    experiments.management_enabled = experiments.supported && catalog.experiment_management_enabled === true;
+    if (!experiments.supported) resetExperiments();
     run_system_supported = catalog.capabilities?.includes("run-system-metrics-v1") === true;
     if (!run_system_supported) {
       system_run_aligned = false;
@@ -1681,7 +1805,10 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     }
     ui.run_management_enabled = catalog.access_mode === "hosted" && catalog.run_management_enabled === true;
     last_catalog_snapshot = now();
-    if (quiet && JSON.stringify(last_catalog) === JSON.stringify(catalog)) return;
+    if (quiet && JSON.stringify(last_catalog) === JSON.stringify(catalog)) {
+      if (experiments.supported) void loadExperiments(true);
+      return;
+    }
     last_catalog = catalog;
     sources = catalog.sources;
     access_mode = catalog.access_mode ?? "local";
@@ -1698,6 +1825,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     if (linked_source) source_id = linked_source.source_id;
     catalog_initialized = true;
     if (source_id !== previous_source) {
+      resetExperiments();
       resetStorage();
       resetRunColumns();
       offset = 0;
@@ -1719,6 +1847,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     });
     sourceNote();
     syncRunSystemMode();
+    if (experiments.supported) void loadExperiments(true);
   }
   function emptyCatalog(): void {
     list_lane.cancel();
@@ -2429,6 +2558,7 @@ export function startDashboard(options: DashboardOptions = {}): () => void {
     system_monitor.cancel();
     run_system_monitor.cancel();
     for (const lane of foreground_lanes) lane.cancel();
+    experiments_lane.cancel();
     clearSearchTimeout();
     clearStorageSearchTimeout();
     clearSelectionTimeout();

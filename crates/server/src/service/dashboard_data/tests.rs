@@ -156,6 +156,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     .list_table(
       "hosted:project:worker",
       &ListQuery {
+        experiment_id: None,
         archived: false,
         origin: None,
         search: None,
@@ -180,6 +181,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     .list_table(
       "hosted:project:worker",
       &ListQuery {
+        experiment_id: None,
         archived: false,
         origin: None,
         search: None,
@@ -213,6 +215,7 @@ fn hosted_scalar_columns_sort_before_pagination_and_reuse_versioned_legacy_cache
     .list_table(
       "hosted:project:worker",
       &ListQuery {
+        experiment_id: None,
         archived: false,
         origin: None,
         search: None,
@@ -302,6 +305,7 @@ fn tracking_table_columns_use_sqlite_summaries_and_refresh_on_append_without_sto
   )
   .unwrap();
   let query = ListQuery {
+    experiment_id: None,
     archived: false,
     origin: None,
     search: None,

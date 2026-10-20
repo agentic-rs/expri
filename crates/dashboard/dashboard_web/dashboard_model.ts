@@ -3,6 +3,7 @@ import type { RefreshClock } from "./auto_refresh";
 import type { EventSourceFactory } from "./live_updates";
 import type { RunQueue, RunRedirect } from "./run_queue";
 import type { ResourceRequirements, ResourceStatus } from "./run_resources";
+import type { ExperimentSummary } from "./experiments";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Warning = { run_id?: string; message: string; severity?: "info" | "warning" | "error" };
@@ -54,6 +55,7 @@ export type Run = {
   requirements?: ResourceRequirements | null;
   resource_status?: ResourceStatus | null;
   manual_paused?: boolean;
+  experiment?: ExperimentSummary | null;
   task: string | null;
   status: string;
   started_at: string | null;
@@ -107,6 +109,8 @@ export type Catalog = {
   access_mode?: "local" | "hosted";
   run_management_enabled?: boolean;
   capabilities?: string[];
+  experiments_supported?: boolean;
+  experiment_management_enabled?: boolean;
 };
 export type RunList = {
   source: Source;

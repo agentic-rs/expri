@@ -16,6 +16,7 @@ mod catalog_files;
 mod catalog_runs;
 mod cli_credentials;
 mod dashboard_storage;
+pub(super) mod experiments;
 mod projects;
 mod references;
 mod resource_queue;
@@ -29,7 +30,7 @@ const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
-pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 11;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 12;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -201,6 +202,7 @@ impl<S: ObjectStorage> Store<S> {
       .map_err(|_| crate::error::ExpriError::Message("cannot initialize archive storage".into()))?;
     projects::initialize(&connection)?;
     run_annotations::initialize(&connection)?;
+    experiments::initialize(&connection)?;
     run_control::initialize(&connection)?;
     run_retention::initialize(&connection)?;
     resource_queue::initialize(&connection)?;
@@ -634,6 +636,7 @@ impl<S: ObjectStorage> Store<S> {
       metadata_revision.push(archive.map(|(id, status)| format!("archive:{id}:{status}")));
       metadata_revision.push(run_retention::revision(&db, scope)?);
       metadata_revision.push(run_annotations::revision(&db, scope)?);
+      metadata_revision.push(experiments::revision(&db, scope)?);
       metadata_revision.push(run_control::revision(&db, scope)?);
       runs.push(RunUpdate {
         run_id: run_id.clone(),

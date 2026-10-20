@@ -222,6 +222,7 @@ fn list<'a>(
   offset: usize,
 ) -> ListQuery<'a> {
   ListQuery {
+    experiment_id: None,
     archived: false,
     origin,
     search: None,

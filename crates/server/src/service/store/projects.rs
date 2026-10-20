@@ -242,7 +242,8 @@ fn preview(directory: &Path, db: &Connection, project_id: &str) -> ApiResult<Pro
     UNION ALL SELECT 1 FROM streams WHERE {TARGET_PROJECT}=?1
     UNION ALL SELECT 1 FROM tracking_versions WHERE {TARGET_PROJECT}=?1
     UNION ALL SELECT 1 FROM result_archives WHERE json_extract(scope,'$.project_id')=?1
-    UNION ALL SELECT 1 FROM run_cleanup_tasks WHERE project_id=?1 AND done=0)"
+    UNION ALL SELECT 1 FROM run_cleanup_tasks WHERE project_id=?1 AND done=0
+    UNION ALL SELECT 1 FROM experiments WHERE project_id=?1)"
       ),
       [project_id],
       |row| row.get(0),
@@ -482,6 +483,19 @@ impl<S: ObjectStorage> Store<S> {
         [project_id],
       )
       .map_err(database)?;
+    for table in [
+      "experiment_members",
+      "experiments",
+      "experiment_revisions",
+      "experiment_creates",
+    ] {
+      transaction
+        .execute(
+          &format!("DELETE FROM {table} WHERE project_id=?1"),
+          [project_id],
+        )
+        .map_err(database)?;
+    }
     for table in ["run_control_bindings", "run_control_commands"] {
       transaction
         .execute(
