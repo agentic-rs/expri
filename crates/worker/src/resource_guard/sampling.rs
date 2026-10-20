@@ -41,13 +41,21 @@ struct Permit(Arc<Budget>);
 
 impl Permit {
   fn acquire(budget: &Arc<Budget>) -> Option<Self> {
-    budget
-      .active
-      .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
-        (active < budget.limit).then_some(active + 1)
-      })
-      .ok()
-      .map(|_| Self(budget.clone()))
+    let mut active = budget.active.load(Ordering::Relaxed);
+    loop {
+      if active >= budget.limit {
+        return None;
+      }
+      match budget.active.compare_exchange_weak(
+        active,
+        active + 1,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+      ) {
+        Ok(_) => return Some(Self(budget.clone())),
+        Err(observed) => active = observed,
+      }
+    }
   }
 }
 
