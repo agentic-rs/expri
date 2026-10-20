@@ -18,6 +18,7 @@ const QUERY_LIMIT: usize = 8 * 1024;
 const HEADER_LIMIT: usize = 16 * 1024;
 const JSON_LIMIT: usize = 512 * 1024;
 const HTML_LIMIT: usize = 2 * 1024 * 1024;
+const ASSET_LIMIT: usize = 2 * 1024 * 1024;
 const WORKERS: usize = 4;
 const CONNECTION_QUEUE: usize = 16;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -335,6 +336,10 @@ impl Reply {
     let body = body.into();
     let limit = if content_type.starts_with("text/html") {
       HTML_LIMIT
+    } else if content_type.starts_with("text/javascript") || content_type.starts_with("text/css") {
+      // Bundled browser resources have the same budget as hosted assets;
+      // growth in the frontend must not consume the smaller JSON API budget.
+      ASSET_LIMIT
     } else {
       JSON_LIMIT
     };

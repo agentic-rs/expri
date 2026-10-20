@@ -139,6 +139,23 @@ def client(container, action, *args, check=True, config=None):
 def worker_service_status(container):
   return json.loads(execute(container, 'expri', 'service', 'status', '--json').stdout)
 
+def wait_shared_worker_service(container, expected_pid, timeout=10):
+  deadline = time.monotonic() + timeout
+  while True:
+    shared = worker_service_status(container)
+    observed = json.dumps({key: shared.get(key) for key in
+      ['pid', 'running', 'ready', 'collection_ready', 'status']}, sort_keys=True)
+    # A busy control socket can temporarily report unready from cached state.
+    # Retry only readiness: replacing the shared process must fail immediately.
+    assert shared.get('pid') == expected_pid, (
+      f'shared worker service was replaced; expected pid {expected_pid}; observed {observed}')
+    if shared.get('running') is True and shared.get('ready') is True:
+      return shared
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      raise AssertionError(f'shared worker service did not become ready after {timeout}s; observed {observed}')
+    time.sleep(min(0.2, remaining))
+
 def collect_publisher_diagnostics(container):
   """Keep bounded public state when a drain wait fails; never read credentials."""
   report = python(container, '''import json
@@ -1223,8 +1240,7 @@ prefix = "acceptance"
     python(worker, f"from pathlib import Path;Path({sync_gate!r}).unlink(missing_ok=True)")
     second = json.loads(execute(worker, 'sh', '-c', 'cd /home/tester/experiment && expri run --detach --json train /tmp/expri-live-sync.release').stdout)
     assert second['run_id'] != run_id, 'second experiment reused the first run identity'
-    shared = worker_service_status(worker)
-    assert shared['pid'] == resumed_service['pid'] and shared['ready'] is True, 'two runs spawned separate worker services or replaced their shared collector'
+    shared = wait_shared_worker_service(worker, resumed_service['pid'])
     assert {job['scope']['run_id'] for job in shared['jobs']} == {run_id, second['run_id']}, 'shared service did not retain both run registrations'
     live_repo = '/home/tester/live-review'
     watch_config = '''[project]

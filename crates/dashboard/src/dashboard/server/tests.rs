@@ -14,6 +14,29 @@ fn assert_error(reply: Reply, status: u16) {
 }
 
 #[test]
+fn browser_assets_have_a_separate_size_budget_from_json_api_responses() {
+  for content_type in ["text/javascript; charset=utf-8", "text/css; charset=utf-8"] {
+    let bytes = vec![b'x'; JSON_LIMIT + 1];
+    let reply = Reply::bytes(content_type, bytes.clone());
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.content_type, content_type);
+    assert_eq!(reply.body, bytes);
+    assert_eq!(
+      Reply::bytes(content_type, vec![b'x'; ASSET_LIMIT]).status,
+      200
+    );
+    assert_error(Reply::bytes(content_type, vec![b'x'; ASSET_LIMIT + 1]), 413);
+  }
+  assert_error(
+    Reply::bytes(
+      "application/json; charset=utf-8",
+      vec![b' '; JSON_LIMIT + 1],
+    ),
+    413,
+  );
+}
+
+#[test]
 fn local_download_streams_large_file_and_head_never_reads_body() {
   struct Sink {
     bytes: u64,
