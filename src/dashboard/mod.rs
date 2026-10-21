@@ -321,6 +321,8 @@ impl Dashboard {
       &table::ListQuery {
         archived: false,
         origin: None,
+        experiment_id: None,
+        group_experiments: false,
         search,
         task,
         status,
@@ -335,6 +337,8 @@ impl Dashboard {
     let table::ListQuery {
       archived,
       origin,
+      experiment_id,
+      group_experiments,
       search,
       task,
       status,
@@ -347,6 +351,11 @@ impl Dashboard {
     }
     if origin.is_some() {
       return Err(message("machine filters are available for hosted projects"));
+    }
+    if experiment_id.is_some() || group_experiments {
+      return Err(message(
+        "experiment filters are available on the hosted dashboard",
+      ));
     }
     if !(1..=1000).contains(&limit) {
       return Err(message("limit must be between 1 and 1000"));

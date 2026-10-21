@@ -18,6 +18,7 @@ const QUERY_LIMIT: usize = 8 * 1024;
 const HEADER_LIMIT: usize = 16 * 1024;
 const JSON_LIMIT: usize = 512 * 1024;
 const HTML_LIMIT: usize = 2 * 1024 * 1024;
+const ASSET_LIMIT: usize = 2 * 1024 * 1024;
 const WORKERS: usize = 4;
 const CONNECTION_QUEUE: usize = 16;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -335,6 +336,10 @@ impl Reply {
     let body = body.into();
     let limit = if content_type.starts_with("text/html") {
       HTML_LIMIT
+    } else if content_type.starts_with("text/javascript") || content_type.starts_with("text/css") {
+      // Bundled browser resources have the same budget as hosted assets;
+      // growth in the frontend must not consume the smaller JSON API budget.
+      ASSET_LIMIT
     } else {
       JSON_LIMIT
     };
@@ -678,6 +683,8 @@ fn route_content_checked(
         "direction",
         "origin",
         "archival",
+        "experiment_id",
+        "group_experiments",
       ])?;
       let archived = match query.optional("archival").unwrap_or("active") {
         "active" => false,
@@ -686,6 +693,16 @@ fn route_content_checked(
       };
       let limit = query.number("limit", 100, 1, 1000)?;
       let offset = query.number("offset", 0, 0, usize::MAX)?;
+      let experiment_id = query.optional("experiment_id");
+      let group_experiments = match query.optional("group_experiments") {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => return Err(Reply::error(400, "group_experiments must be true or false")),
+      };
+      if let Some(experiment_id) = experiment_id {
+        expri_core::identifiers::validate_component(experiment_id)
+          .map_err(|_| Reply::error(400, "invalid experiment filter"))?;
+      }
       let table = ["param", "metric", "reduction", "sort", "direction"]
         .iter()
         .any(|field| query.optional(field).is_some())
@@ -707,6 +724,8 @@ fn route_content_checked(
             &super::table::ListQuery {
               archived,
               origin: query.optional("origin"),
+              experiment_id,
+              group_experiments,
               search: query.optional("search"),
               task: query.optional("task"),
               status: query.optional("status"),

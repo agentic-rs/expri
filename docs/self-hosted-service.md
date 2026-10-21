@@ -86,8 +86,9 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this server revision upgrades the SQLite schema to version 11. Older binaries
-refuse that directory because they cannot preserve task-attempt publication
+Opening this server revision upgrades the SQLite schema to version 12. Older binaries
+refuse that directory because they cannot preserve experiment membership and
+lineage, task-attempt publication
 fences, durable website lifecycle commands, queue allocations, worker fencing, smoke archival, asset
 provenance, and run retention. Back up the entire service directory before
 upgrading; restoring that backup is required for a backend downgrade. Deploy
@@ -126,6 +127,11 @@ Equal run IDs from different origins remain distinct, with machine provenance
 shown in the comparison. Logs, files, browser downloads, and generated fetch
 commands retain each run's actual project, origin, and run ID. Existing worker
 run links open the same exact run within the project view.
+Use **Experiments** to group related runs across origins and record continuation,
+restart, or split lineage. Experiment metadata is managed by the service and
+survives worker publishing. The primary website can edit it; AB previews remain
+read-only. Each run retains its individual execution controls and metric history.
+See [experiments and lineage](experiments.md) for membership, retention, and limits.
 Choose up to eight parameter or metric columns using the **Columns** checkbox
 tags. Click table headers to sort before paging, and use the table's
 **Last / Min / Max** tags to choose its metric values. Missing values

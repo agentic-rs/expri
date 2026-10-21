@@ -1,3 +1,4 @@
+mod experiment_groups;
 mod queue;
 mod reader;
 mod source;
@@ -52,6 +53,28 @@ pub(super) struct HostedDashboard<'a, S> {
 }
 
 impl<S: ObjectStorage> HostedDashboard<'_, S> {
+  pub(super) fn experiments(&self, project_id: &str) -> ApiResult<Value> {
+    self.store.experiments(project_id)
+  }
+
+  pub(super) fn save_experiment(
+    &self,
+    selection: super::store::experiments::ExperimentSave,
+  ) -> ApiResult<super::store::experiments::Experiment> {
+    self.store.save_experiment(selection)
+  }
+
+  pub(super) fn delete_experiment(
+    &self,
+    project_id: &str,
+    experiment_id: &str,
+    revision: &str,
+  ) -> ApiResult<Value> {
+    self
+      .store
+      .delete_experiment(project_id, experiment_id, revision)
+  }
+
   pub(super) fn run_control(&self, scope: &RunScope) -> ApiResult<Value> {
     self.store.run_control(scope)
   }
@@ -290,6 +313,16 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         sources.push(source::project_record(&project_id, None));
       }
     }
+    for project_id in self
+      .store
+      .dashboard_experiment_projects(SOURCE_LIMIT)
+      .map_err(api_error)?
+    {
+      let id = format!("hosted-project:{project_id}");
+      if sources.len() < SOURCE_LIMIT && !sources.iter().any(|source| source.source_id == id) {
+        sources.push(source::project_record(&project_id, None));
+      }
+    }
     let mut warnings = Vec::new();
     if page.total_count > SOURCE_LIMIT {
       warnings.push(
@@ -437,6 +470,8 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     self.list_table(
       source_id,
       &ListQuery {
+        group_experiments: false,
+        experiment_id: None,
         archived: false,
         origin: None,
         search,
@@ -450,9 +485,14 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
   }
 
   pub(super) fn list_table(&self, source_id: &str, query: &ListQuery<'_>) -> Result<Value> {
+    if query.group_experiments {
+      return self.list_experiment_groups(source_id, query);
+    }
     let ListQuery {
+      group_experiments: _,
       archived,
       origin,
+      experiment_id,
       search,
       task,
       status,
@@ -484,7 +524,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         return Err(message("machine filter is outside the dashboard source"));
       }
     }
-    let page = self
+    let mut page = self
       .store
       .dashboard_project_runs_with_archival(
         &source.project_id,
@@ -494,6 +534,41 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         archived,
       )
       .map_err(api_error)?;
+    if let Some(experiment_id) = experiment_id.filter(|id| *id != "ungrouped") {
+      validate_component(experiment_id)?;
+      let members = self
+        .store
+        .experiment_members(&source.project_id, experiment_id)
+        .map_err(api_error)?;
+      page.items.clear();
+      for scope in members {
+        if origin
+          .or(source.origin.as_deref())
+          .is_some_and(|origin| scope.origin != origin)
+        {
+          continue;
+        }
+        let archival = self.store.run_archival(&scope).map_err(api_error)?;
+        if (archival.status == "archived") == archived {
+          page.items.push(scope);
+        }
+      }
+      page.total_count = page.items.len();
+      page.legacy_order = false;
+    } else if experiment_id == Some("ungrouped") {
+      let mut ungrouped = Vec::new();
+      for scope in page.items {
+        if self
+          .store
+          .dashboard_run_experiment(&scope)
+          .map_err(api_error)?
+          .is_null()
+        {
+          ungrouped.push(scope);
+        }
+      }
+      page.items = ungrouped;
+    }
     let queue_page = self
       .store
       .dashboard_queue_jobs(
@@ -584,7 +659,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
         reports.push(report);
       }
     }
-    if queue_page.total_count > OVERVIEW_LIMIT {
+    if queue_page.total_count > OVERVIEW_LIMIT && experiment_id.is_none_or(|id| id == "ungrouped") {
       warnings.push(json!({"message":"Queue history covers the 500 most recent server jobs; older jobs remain available by their job IDs."}));
     }
     let mut queue_only_count = 0;
@@ -597,7 +672,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
             report["run"]["queue"] = serde_json::to_value(context)?;
           }
         }
-      } else if !archived {
+      } else if !archived && experiment_id.is_none_or(|id| id == "ungrouped") {
         queue_only_count += 1;
         reports.push(json!({"run":queue::queue_run(&source, context),"task_filter":context.task,"metadata_truncated":false,"warnings":[]}));
       }
@@ -1301,6 +1376,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     let annotations = self.store.dashboard_run_annotations(scope)?;
     run["nickname"] = json!(annotations.nickname);
     run["tags"] = json!(annotations.tags);
+    run["experiment"] = self.store.dashboard_run_experiment(scope)?;
     // Retained names remain readable while expired runs finish cleanup, but
     // only available runs expose the editor's replacement capability.
     run["annotations"] = if matches!(
@@ -1488,6 +1564,7 @@ fn run_preview(run: &Value, truncated: &mut bool) -> Value {
     "nickname",
     "tags",
     "annotations",
+    "experiment",
     "queue",
     "run_key",
     "queue_message",

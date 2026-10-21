@@ -814,6 +814,14 @@ expri service run annotate --project-id vision --origin gpu-1 --run-id run-1 --c
 support up to 128 characters; each of up to 16 tags supports 48 characters.
 Whitespace is trimmed and duplicate tags are removed, preserving their order.
 
+Hosted projects also support **Experiments**: named groups of runs that serve the
+same ongoing goal across machines and implementations. Group related runs and
+record checkpoint continuation, restart, or split relationships in the website.
+Runs keep their own metrics and lifecycle controls. The **Experiments** view
+collapses each group to its latest matching run; expand it for earlier runs.
+Choose **Runs** for the flat sortable history, with optional experiment filters.
+Deleting an experiment preserves its runs. See [experiments and lineage](docs/experiments.md).
+
 On the hosted dashboard, switch to **Storage** to browse finalized S3 objects
 for the selected project. **Private inputs** shows immutable input IDs and
 sizes; **Run outputs** shows uploaded files, including checkpoints, with their

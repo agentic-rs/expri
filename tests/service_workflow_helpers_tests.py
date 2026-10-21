@@ -1,4 +1,4 @@
-"""Publication readiness waits for the inventory revision, not registration."""
+"""Check shared-service identity and exact publication acknowledgments."""
 import ast
 from contextlib import redirect_stdout
 import hashlib
@@ -6,8 +6,71 @@ import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
+
+
+class SharedWorkerServiceReadinessTests(unittest.TestCase):
+  def setUp(self):
+    self.now = 0
+    self.sleeps = []
+    self.status = Mock()
+    def sleep(seconds):
+      self.sleeps.append(seconds)
+      self.now += seconds
+    clock = SimpleNamespace(monotonic=lambda: self.now, sleep=sleep)
+    # The runner owns real Docker startup at module scope. Load its actual wait
+    # helper without starting containers, as the publication tests below do.
+    path = Path(__file__).parent / 'containers/service_workflow.py'
+    tree = ast.parse(path.read_text(), filename=str(path))
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'wait_shared_worker_service')
+    namespace = {'json': json, 'time': clock, 'worker_service_status': self.status}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), 'exec'), namespace)
+    self.wait_shared = namespace['wait_shared_worker_service']
+
+  def report(self, *, pid=357, ready=True, running=True):
+    return {'pid': pid, 'ready': ready, 'running': running,
+      'collection_ready': ready, 'status': 'running',
+      'jobs': [{'scope': {'run_id': 'run-first'}}, {'scope': {'run_id': 'run-second'}}]}
+
+  def test_transient_readiness_returns_the_same_ready_registration_snapshot(self):
+    ready = self.report()
+    self.status.side_effect = [self.report(ready=False), ready]
+    self.assertIs(self.wait_shared('worker', 357), ready)
+    self.assertEqual(self.status.call_args_list, [call('worker')] * 2)
+    self.assertEqual(self.sleeps, [0.2])
+
+  def test_replacement_fails_immediately_even_when_the_new_service_is_ready(self):
+    self.status.return_value = self.report(pid=358)
+    with self.assertRaisesRegex(AssertionError, r'was replaced; expected pid 357; observed .*"pid": 358'):
+      self.wait_shared('worker', 357)
+    self.assertEqual(self.status.call_count, 1)
+    self.assertEqual(self.sleeps, [])
+
+  def test_replacement_during_readiness_recovery_is_not_retried(self):
+    self.status.side_effect = [self.report(ready=False), self.report(pid=358, ready=False)]
+    with self.assertRaisesRegex(AssertionError, 'was replaced'):
+      self.wait_shared('worker', 357)
+    self.assertEqual(self.status.call_count, 2)
+    self.assertEqual(self.sleeps, [0.2])
+
+  def test_persistent_unreadiness_has_a_deadline_and_bounded_public_diagnostics(self):
+    self.status.return_value = {**self.report(ready=False), 'jobs': [{'private': 'not-in-diagnostics'}]}
+    with self.assertRaises(AssertionError) as caught:
+      self.wait_shared('worker', 357, timeout=0.5)
+    self.assertIn('did not become ready after 0.5s', str(caught.exception))
+    self.assertIn('"ready": false', str(caught.exception))
+    self.assertIn('"pid": 357', str(caught.exception))
+    self.assertNotIn('not-in-diagnostics', str(caught.exception))
+    self.assertEqual(self.now, 0.5)
+    self.assertEqual(self.status.call_count, 4)
+
+  def test_cached_ready_state_without_a_running_service_does_not_pass(self):
+    self.status.return_value = self.report(running=False)
+    with self.assertRaisesRegex(AssertionError, 'did not become ready'):
+      self.wait_shared('worker', 357, timeout=0)
+    self.assertEqual(self.sleeps, [])
 
 
 class PublicationReadinessTests(unittest.TestCase):

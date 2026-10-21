@@ -921,7 +921,9 @@ def workspace_layout(browser, width, wide=False):
         }),
         run: bounds('#run-rows .run-cell'), selection: bounds('#run-rows .selection-column'),
         status: bounds('#run-rows .status-column'), region: bounds('#runs-region'),
-        row_counts: [...table.querySelectorAll('tbody tr')].map(row => row.children.length)},
+        row_counts: [...table.querySelectorAll('tbody tr:not(.experiment-history-footer)')].map(row => row.children.length),
+        history_spans: [...table.querySelectorAll('tbody .experiment-history-footer')].map(row =>
+          row.children.length === 1 ? row.firstElementChild.colSpan : 0)},
       table: {client_width: table.clientWidth, scroll_width: table.scrollWidth, scroll_left: table.scrollLeft}};''', 'args': []})
   assert geometry['viewport_width'] == width, f'layout viewport is not {width} CSS pixels wide'
   assert geometry['page_width'] <= geometry['client_width'] + 1, f'{width}px workspace overflows horizontally'
@@ -946,6 +948,7 @@ def workspace_layout(browser, width, wide=False):
   expected_columns = columns['builtin_count'] + columns['custom_count']
   assert columns['header_count'] == expected_columns, 'run table omitted built-in or selected column headings'
   assert all(count == expected_columns for count in columns['row_counts']), 'run rows do not align with their column headings'
+  assert all(span == expected_columns for span in columns['history_spans']), 'experiment history controls do not span the run columns'
   if width > 1000 and geometry['table']['scroll_left'] == 0:
     assert columns['status']['right'] <= columns['region']['left'] + geometry['table']['client_width'] + 1, 'desktop Run status is outside the visible table'
   assert geometry['table']['client_width'] <= runs['width'] + 1, f'{width}px table escapes its Runs panel'
@@ -1123,7 +1126,7 @@ def workspace(run_id, second_run_id):
     browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'uploaded runs did not appear')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") == 2, 'uploaded runs did not appear')
     assert not workspace_layout(browser, 1440)['has_review'], 'initial run browser opened an implicit review'
     browser.click('#auto-refresh-toggle')
     start = len(trace_records())
@@ -1212,13 +1215,13 @@ def workspace(run_id, second_run_id):
     remember_chart_preview(browser)
     search = browser.element('#search-input')
     browser.call('POST', '/element/' + search + '/value', {'text': run_id})
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'run search did not apply')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") == 1, 'run search did not apply')
     assert not visible('#review-section'), 'filtering left an unrelated comparison visible'
     assert evaluate("return document.querySelectorAll('#run-rows input:checked').length;") == 0, 'filtering left an implicit selection'
     assert_chart_preview_cleaned(browser)
     set_run_control(browser, 'run-filters', True)
     browser.click('#run-filters-panel #clear-filters')
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'Clear filters did not restore the runs')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") == 2, 'Clear filters did not restore the runs')
     browser.click(f'input[aria-label="Select {run_id} for comparison"]')
     wait_for(lambda: check_selection([run_id]), 'selection did not recover after filtering')
     wait_for(lambda: evaluate("return document.querySelector('#chart-preview')?.querySelectorAll('[data-chart-hit]').length;") == 2, 'single-run selection did not restore chart interactions')
@@ -1234,13 +1237,13 @@ def workspace(run_id, second_run_id):
     browser.keys('#status-completed', '\ue014')
     wait_for(lambda: evaluate("return document.querySelector('#status-failed').checked && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'native status ArrowRight did not select Failed')
     assert evaluate("return getComputedStyle(document.querySelector('#status-failed + span')).outlineStyle;") == 'solid', 'keyboard status tag has no visible focus'
-    assert evaluate("return document.querySelectorAll('#run-rows tr').length;") == 0, 'Failed status filter retained completed runs'
+    assert evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") == 0, 'Failed status filter retained completed runs'
     browser.click('#run-filters-panel #clear-filters')
-    wait_for(lambda: evaluate("return document.querySelector('#status-any').checked && document.querySelectorAll('#run-rows tr').length === 2;"), 'Clear filters did not restore the Any status tag')
+    wait_for(lambda: evaluate("return document.querySelector('#status-any').checked && document.querySelectorAll('#run-rows tr[data-run-key]').length === 2;"), 'Clear filters did not restore the Any status tag')
     set_run_control(browser, 'run-filters', False)
     for width in [1000, 390, 320]:
       browser.set_viewport(width, 800)
-      browser.click('#run-rows tr:first-child .run-link')
+      browser.click('#run-rows tr[data-run-key] .run-link')
       wait_for(lambda: evaluate("return !document.querySelector('#chart-card').hidden && document.querySelector('#chart-preview svg') !== null && document.querySelector('#chart-card').getAttribute('aria-busy') === 'false';"), 'compact inspection did not finish loading its charts')
       compact_focus_visible(browser, 'review-title', width)
       browser.click('#close-review')
@@ -1261,12 +1264,12 @@ def previews(run_id, second_run_id):
         catalog: response.ok ? await response.json() : null})).catch(() => done({status: 0}));''', 'args': []})
   def shared_catalog(result):
     return {**result, 'catalog': {name: value for name, value in result['catalog'].items()
-      if name != 'run_management_enabled'}}
+      if name not in {'run_management_enabled', 'experiment_management_enabled'}}}
   def pause_dashboard():
     # Cookie replay intentionally presents a revoked/other-host session. Finish
     # initial page requests and pause automatic checks so those checks do not
     # navigate away while WebDriver observes the explicit catalog response.
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length === 2 && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'preview authentication page did not finish its initial run request')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length === 2 && document.querySelector('#runs-region').getAttribute('aria-busy') === 'false';"), 'preview authentication page did not finish its initial run request')
     if evaluate("return document.querySelector('#auto-refresh-toggle').checked;"):
       browser.click('#auto-refresh-toggle')
     wait_for(lambda: 'Auto updates off' in evaluate("return document.querySelector('#updated-at').textContent;"), 'preview authentication fixture did not pause automatic checks')
@@ -1292,6 +1295,7 @@ def previews(run_id, second_run_id):
     main_cookie = browser.cookies()[0]
     main_catalog = catalog()
     assert main_catalog['status'] == 200 and main_catalog['catalog']['run_management_enabled'] is True, 'primary dashboard did not allow run management'
+    assert main_catalog['catalog']['experiment_management_enabled'] is True, 'primary dashboard did not allow experiment management'
     assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/app.js', 'main did not serve its embedded assets'
 
     start = len(trace_records())
@@ -1314,9 +1318,10 @@ def previews(run_id, second_run_id):
     assert ab_cookie['value'] != main_cookie['value'], 'preview reused the main session'
     ab_catalog = catalog()
     assert ab_catalog['status'] == 200 and ab_catalog['catalog']['run_management_enabled'] is False, 'read-only preview unexpectedly allowed run management'
+    assert ab_catalog['catalog']['experiment_management_enabled'] is False, 'read-only preview unexpectedly allowed experiment management'
     assert shared_catalog(ab_catalog) == shared_catalog(main_catalog), 'preview and main do not share one catalog'
     assert evaluate("return document.querySelector('script[src]').getAttribute('src');") == '/assets/' + 'a' * 40 + '/app.js', 'preview did not serve pinned branch assets'
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") == 2, 'shared run list is missing in preview')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") == 2, 'shared run list is missing in preview')
     assert_provenance()
     for selected in [run_id, second_run_id]:
       browser.click(f'input[aria-label="Select {selected} for comparison"]')
@@ -1368,7 +1373,7 @@ def project_workspace(run_id):
   def select(key):
     browser.click(f'#run-rows tr[data-run-key="{key}"] input[type="checkbox"]')
   def table_value(key):
-    return evaluate('''const row = [...document.querySelectorAll('#run-rows tr')].find(node => node.dataset.runKey === arguments[0]);
+    return evaluate('''const row = [...document.querySelectorAll('#run-rows tr[data-run-key]')].find(node => node.dataset.runKey === arguments[0]);
       return row?.querySelector('td[data-column-kind="metric"][data-column-key="loss"]')?.title ?? null;''', key)
   def project_selected():
     return evaluate("return document.querySelector('#project-demo')?.checked === true && document.querySelector('#project-name').textContent === 'demo';")
@@ -1377,7 +1382,7 @@ def project_workspace(run_id):
   def chart_keys():
     return evaluate("const link=document.querySelector('#open-chart'); return link?.getAttribute('href') ? new URL(link.href).searchParams.getAll('run_id').sort() : [];")
   def selected_keys():
-    return evaluate("return [...document.querySelectorAll('#run-rows tr')].filter(row=>row.querySelector('input[type=\"checkbox\"]').checked).map(row=>row.dataset.runKey).sort();")
+    return evaluate("return [...document.querySelectorAll('#run-rows tr[data-run-key]')].filter(row=>row.querySelector('input[type=\"checkbox\"]').checked).map(row=>row.dataset.runKey).sort();")
   def chart_state():
     return evaluate('''const doc=document.querySelector('#chart-preview');
       const card=[...doc.querySelectorAll('[data-interactive-chart]')].find(node=>node.querySelector('h2').textContent==='loss');
@@ -1396,10 +1401,10 @@ def project_workspace(run_id):
     workspace_layout(browser, 1440, wide=True)
     set_run_control(browser, 'run-filters', True)
     browser.click('#machine-worker-b + span')
-    wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") == 1, 'native machine filter did not isolate worker-b')
-    assert evaluate("return document.querySelector('#run-rows tr').dataset.runKey;") == keys[1], 'machine filter resolved the colliding ID to worker'
+    wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") == 1, 'native machine filter did not isolate worker-b')
+    assert evaluate("return document.querySelector('#run-rows tr[data-run-key]').dataset.runKey;") == keys[1], 'machine filter resolved the colliding ID to worker'
     browser.click('#machine-all + span')
-    wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 4, 'All machines did not restore project history')
+    wait_for(lambda: settled() and evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") >= 4, 'All machines did not restore project history')
     set_run_control(browser, 'run-filters', False)
     for key in keys:
       select(key)
@@ -1545,11 +1550,11 @@ def automatic_refresh(run_id, updated_run_id):
     browser.set_viewport(1440, 1000)
     browser.navigate('/login')
     browser.login()
-    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh fixture runs did not load')
+    wait_for(lambda: evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") >= 2, 'auto-refresh fixture runs did not load')
     set_run_control(browser, 'run-filters', True)
     browser.keys('#run-filters-panel #task-input', 'train')
     wait_for(lambda: evaluate("return document.querySelector('#task-input').value;") == 'train' and
-      evaluate("return document.querySelectorAll('#run-rows tr').length;") >= 2, 'auto-refresh task filter did not apply')
+      evaluate("return document.querySelectorAll('#run-rows tr[data-run-key]').length;") >= 2, 'auto-refresh task filter did not apply')
     set_run_control(browser, 'run-filters', False)
     wait_for(lambda: 'Live updates' in evaluate("return document.querySelector('#updated-at').textContent;"), 'native hosted EventSource did not connect', timeout=20)
     assert any(record['path'] == '/api/events' and record['status'] == 200 for record in trace_records()), 'native EventSource did not open its authenticated endpoint'
@@ -1612,7 +1617,7 @@ def automatic_refresh(run_id, updated_run_id):
     assert evaluate("return document.querySelector('#task-input').value;") == 'train', 'automatic update changed the task filter'
     assert evaluate("return document.querySelector('.runs-table').dataset.columnCount;") == '2', 'automatic update changed selected run table columns'
     assert evaluate("return document.querySelector('.run-column').getAttribute('aria-sort');") == 'ascending', 'automatic update changed run table sorting'
-    wait_for(lambda: evaluate('''const row = [...document.querySelectorAll('#run-rows tr')].find(node => node.querySelector('.run-link').textContent === arguments[0]);
+    wait_for(lambda: evaluate('''const row = [...document.querySelectorAll('#run-rows tr[data-run-key]')].find(node => node.querySelector('.run-link').textContent === arguments[0]);
       return Number(row?.querySelector('td[data-column-kind="metric"][data-column-key="loss"]')?.title) === 0.005;''', updated_run_id), 'new metric sample did not update its selected run table column', timeout=15)
     assert evaluate("return document.querySelector('#review-tab-charts').getAttribute('aria-selected');") == 'true', 'automatic update changed the active tab'
     assert evaluate("return document.querySelector('#chart-preview') === window.__refresh_original_preview;"), 'automatic replacement changed the stable chart preview'

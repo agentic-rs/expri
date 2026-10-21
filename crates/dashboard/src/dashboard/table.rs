@@ -22,6 +22,10 @@ const STRING_LIMIT: usize = 256;
 pub struct ListQuery<'a> {
   pub archived: bool,
   pub origin: Option<&'a str>,
+  /// Hosted experiment ID, or "ungrouped" for runs without membership.
+  pub experiment_id: Option<&'a str>,
+  /// Hosted experiment summaries, paginated before member history.
+  pub group_experiments: bool,
   pub search: Option<&'a str>,
   pub task: Option<&'a str>,
   pub status: Option<&'a str>,

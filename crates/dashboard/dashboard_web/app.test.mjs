@@ -322,8 +322,9 @@ async function selectRow(nodes, index, checked = true) {
   assert.equal(input.disabled, false, "the row must be selectable");
   if (input.checked !== checked) await click(input);
 }
-function runCheckbox(nodes, index) { return nodes.get("run-rows").children[index].querySelector('input[type="checkbox"]'); }
-function runButton(nodes, index) { return nodes.get("run-rows").children[index].querySelector("button"); }
+function runRows(nodes) { return [...nodes.get("run-rows").querySelectorAll("tr[data-run-key]")]; }
+function runCheckbox(nodes, index) { return runRows(nodes)[index].querySelector('input[type="checkbox"]'); }
+function runButton(nodes, index) { return runRows(nodes)[index].querySelector(".run-link"); }
 function columnCheckbox(nodes, name) {
   const input = [...nodes.get("run-columns-panel").querySelectorAll('input[type="checkbox"]')]
     .find(node => node.getAttribute("aria-label") === name);
@@ -344,6 +345,695 @@ async function settledTable(nodes) {
 function latestRunQuery(model) {
   return new URL(model.requests.filter(url => url.startsWith("/api/runs?")).at(-1), "http://localhost").searchParams;
 }
+
+async function experimentFixture(t, { mutable = true, count = 3, member_indices = [0, 1], experiments: initial, catalog_status = 200,
+  group_supported = false, group_entries = [], group_orders = {}, run_patches = {}, server_orders = {}, intercept, ...fields } = {}) {
+  const source = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null, machines: ["gpu-a", "gpu-b"] };
+  const scope = (origin, run_id) => ({ project_id: "vision", origin, run_id });
+  const runs = Array.from({ length: count }, (_, index) => ({ run_id: `run-${index}`, run_key: `gpu-${index === 1 ? "b" : "a"}:run-${index}`,
+    origin: index === 1 ? "gpu-b" : "gpu-a", task: "train", status: index === 0 ? "running" : index === 1 ? "failed" : "completed",
+    started_at: new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000).toISOString(),
+    finished_at: index === 0 ? null : new Date(Date.UTC(2026, 9, 3, 1) - index * 60_000 + 3000).toISOString(), exit_code: index === 1 ? 1 : null,
+    ...run_patches[index] }));
+  const make = (patch = {}) => ({ experiment_id: "experiment-1", name: "Language model", description: "Across machines\nIndependent metrics", revision: "exp-revision-1",
+    members: member_indices.map((index) => scope(runs[index].origin, runs[index].run_id)),
+    lineage: member_indices.includes(0) && member_indices.includes(1) ? [{ parent: scope(runs[0].origin, runs[0].run_id), child: scope(runs[1].origin, runs[1].run_id), kind: "continued", checkpoint: "checkpoint-900", step: "900" }] : [],
+    created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: member_indices.length, unavailable_runs: [], ...patch });
+  const state = { experiments: initial ?? [make()], runs, group_entries, catalog_status, saves: [], deletes: [], reads: 0, project_revision: "project-1", replay: new Map() };
+  const model = await reviewFixture(t, { ...fields, hosted: true, projects: true, project_runs: runs, override: (url, options) => {
+    const overridden = intercept?.(url, options, state);
+    if (overridden !== undefined) return overridden;
+    if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [source], initial_source: source.source_id,
+      access_mode: "hosted", warnings: [], run_management_enabled: mutable, experiments_supported: true, experiment_management_enabled: mutable,
+      ...(group_supported ? { experiment_groups_supported: true } : {}) });
+    if (url.pathname === "/api/experiments") {
+      state.reads++;
+      return state.catalog_status === 200 ? response({ project_id: "vision", revision: state.project_revision, experiments: structuredClone(state.experiments) }) :
+        response({ error: "Experiment metadata is temporarily unavailable" }, state.catalog_status);
+    }
+    if (url.pathname === "/api/experiments/save") {
+      const body = JSON.parse(options.body); state.saves.push(body);
+      assert.equal(options.method, "POST"); assert.equal(options.credentials, "same-origin");
+      const existing = state.experiments.find((item) => item.experiment_id === body.experiment_id);
+      if (existing && existing.revision !== body.expected_revision) return response({ error: "Experiment changed; reload its latest revision." }, 409);
+      const replay = body.create_request_id && state.replay.get(body.create_request_id);
+      if (replay) return response(replay);
+      const saved = make({ ...body, experiment_id: body.experiment_id ?? `experiment-${state.experiments.length + 1}`, revision: `saved-${state.saves.length}`, membership_count: body.members.length });
+      delete saved.project_id; delete saved.expected_revision; delete saved.create_request_id;
+      state.experiments = [...state.experiments.filter((item) => item.experiment_id !== saved.experiment_id), saved];
+      if (body.create_request_id) state.replay.set(body.create_request_id, saved);
+      return response(saved);
+    }
+    if (url.pathname === "/api/runs") {
+      const id = url.searchParams.get("experiment_id"), offset = Number(url.searchParams.get("offset")), limit = Number(url.searchParams.get("limit"));
+      if (url.searchParams.get("group_experiments") === "true") {
+        assert.equal(group_supported, true, "group requests require explicit server support");
+        const order = group_orders[`${url.searchParams.get("sort")}:${url.searchParams.get("direction")}`];
+        const ordered = order ? order.flatMap((key) => state.group_entries.filter((entry) => (entry.experiment?.experiment_id ?? entry.run_key) === key)) : state.group_entries;
+        const entries = ordered.slice(offset, offset + limit);
+        return response({ source, runs: entries.flatMap((entry) => runs.filter((run) => runIdentity(run) === entry.run_key)),
+          experiment_groups: structuredClone(entries), total_count: ordered.length, offset,
+          next_offset: offset + limit < ordered.length ? offset + limit : null, warnings: [] });
+      }
+      const chosen = state.experiments.find((item) => item.experiment_id === id);
+      const contains = (item, run) => item.members.some((member) => member.origin === run.origin && member.run_id === run.run_id);
+      const visible = runs.filter((run) => !id || (id === "ungrouped" ? !state.experiments.some((item) => contains(item, run)) : chosen && contains(chosen, run)));
+      const order = server_orders[`${url.searchParams.get("sort")}:${url.searchParams.get("direction")}`];
+      const ordered = order ? order.flatMap((run_id) => visible.filter((run) => run.run_id === run_id)) : visible;
+      return response({ source, runs: ordered.slice(offset, offset + limit), total_count: visible.length, offset, next_offset: offset + limit < visible.length ? offset + limit : null, warnings: [] });
+    }
+  } });
+  await settled(() => model.nodes.document.querySelector("#experiment-manager-trigger") && state.reads > 0 &&
+    (state.catalog_status !== 200 || !model.nodes.get("experiment-filter").disabled));
+  return Object.assign(model, { state, source, scope, make });
+}
+
+function experimentGroup(run_key, fields = {}) {
+  return { experiment: { experiment_id: "experiment-1", name: "Language model", revision: "exp-revision-1" }, run_key,
+    membership_count: 2, matching_count: 2, active_count: 1, unavailable_count: 0, ...fields };
+}
+function standaloneGroup(run_key) {
+  return { experiment: null, run_key, membership_count: 1, matching_count: 1, active_count: 0, unavailable_count: 0 };
+}
+function experimentChildRequests(model) {
+  return model.requests.map((url) => new URL(url, "http://localhost")).filter((url) =>
+    url.pathname === "/api/runs" && url.searchParams.has("experiment_id") && url.searchParams.get("group_experiments") !== "true");
+}
+function experimentTopKeys(nodes) {
+  return runRows(nodes).filter((row) => !row.hasAttribute("data-experiment-child")).map((row) => row.dataset.runKey);
+}
+function experimentChildren(nodes, id = "experiment-1") {
+  return [...nodes.get("run-rows").querySelectorAll(`tr[data-experiment-child="${id}"]`)];
+}
+async function expandExperiment(nodes, id = "experiment-1") {
+  const button = nodes.get("run-rows").querySelector(`tr[data-experiment-id="${id}"] button[aria-expanded]`);
+  assert.ok(button, "the experiment has an explicit expansion control");
+  if (button.getAttribute("aria-expanded") !== "true") await click(button);
+}
+
+test("collapsed experiments show the latest failed run and other matching activity with lazy read-only history", async t => {
+  const model = await experimentFixture(t, { mutable: false, count: 4, member_indices: [0, 1, 2], group_supported: true,
+    run_patches: { 0: { status: "failed", finished_at: "2026-10-03T01:00:03Z", exit_code: 1 },
+      1: { run_id: "run-0", run_key: "gpu-b:run-0", status: "running", finished_at: null, exit_code: null }, 2: { status: "waiting", finished_at: null } },
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 3, matching_count: 3, active_count: 2 }), standaloneGroup("gpu-a:run-3")] });
+  const { nodes } = model;
+  assert.equal(latestRunQuery(model).get("group_experiments"), "true");
+  assert.equal(nodes.get("history-view-experiments").checked, true);
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-3"]);
+  const row = nodes.get("run-rows").querySelector('tr[data-experiment-id="experiment-1"]');
+  assert.match(row.textContent, /Latest/i);
+  assert.equal(row.querySelector(".experiment-active-count").getAttribute("aria-label"), "2 active matching runs");
+  assert.equal(row.querySelector(".status").textContent.trim(), "failed");
+  assert.equal(row.querySelector("button[aria-expanded]").getAttribute("aria-expanded"), "false");
+  assert.equal(experimentChildRequests(model).length, 0, "collapsed groups do not read child run history");
+  const top_rows = runRows(nodes);
+  await expandExperiment(nodes);
+  await settled(() => experimentChildren(nodes).length === 2);
+  assert.deepEqual(experimentChildren(nodes).map((child) => child.dataset.runKey), ["gpu-b:run-0", "gpu-a:run-2"],
+    "representative exclusion uses the full worker/run identity rather than the actual run ID");
+  assert.equal(nodes.get("run-rows").querySelectorAll('[data-run-key="gpu-a:run-0"]').length, 1,
+    "the representative appears only once after expansion");
+  assert.equal(experimentChildRequests(model).length, 1);
+  const request = experimentChildRequests(model)[0].searchParams;
+  assert.equal(request.get("experiment_id"), "experiment-1");
+  assert.notEqual(request.get("group_experiments"), "true");
+  assert.equal(request.get("sort") ?? "started_at", "started_at");
+  assert.equal(request.get("direction") ?? "desc", "desc");
+  runRows(nodes).filter((item) => !item.hasAttribute("data-experiment-child")).forEach((item, index) => assert.equal(item, top_rows[index]));
+  assert.equal(model.state.saves.length, 0, "read-only expansion does not mutate experiments");
+  await click(row.querySelector("button[aria-expanded]"));
+  assert.equal(experimentChildren(nodes).length, 0);
+  await click(nodes.get("history-view-runs")); await settledTable(nodes);
+  assert.notEqual(latestRunQuery(model).get("group_experiments"), "true");
+  assert.deepEqual(runRows(nodes).map((item) => item.dataset.runKey), model.runs.map((run) => run.run_key));
+  assert.equal(nodes.get("run-rows").querySelector("[data-experiment-id], [data-experiment-child]"), null);
+});
+
+test("experiment pages count top-level entries while expanded history has independent pagination and ordering", async t => {
+  const standalone = Array.from({ length: 22 }, (_, index) => `gpu-a:run-${index + 23}`);
+  const model = await experimentFixture(t, { count: 45, member_indices: Array.from({ length: 23 }, (_, index) => index), group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 23, matching_count: 23 }), ...standalone.map(standaloneGroup)],
+    group_orders: { "run_id:asc": ["experiment-1", ...standalone], "run_id:desc": [...standalone].reverse().concat("experiment-1") } });
+  const { nodes } = model;
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", ...standalone.slice(0, 19)]);
+  const parent_request_count = () => model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length;
+  await expandExperiment(nodes);
+  await settled(() => experimentChildren(nodes).length === 19);
+  const top_keys = experimentTopKeys(nodes), parent_reads = parent_request_count();
+  await click(nodes.get("experiment-more-experiment-1"));
+  await settled(() => experimentChildren(nodes).length === 22);
+  assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), Array.from({ length: 22 }, (_, index) =>
+    `${index === 0 ? "gpu-b" : "gpu-a"}:run-${index + 1}`));
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  assert.equal(parent_request_count(), parent_reads, "loading child pages does not reload or advance the group page");
+  assert.equal(latestRunQuery(model).get("experiment_id"), "experiment-1");
+  assert.equal(experimentChildRequests(model).at(-1).searchParams.get("offset"), "20");
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("offset"), "20");
+  assert.equal(latestRunQuery(model).get("group_experiments"), "true");
+  assert.deepEqual(experimentTopKeys(nodes), standalone.slice(19));
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run ascending"]')); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(latestRunQuery(model).get("sort"), "run_id");
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", ...standalone.slice(0, 19)]);
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run descending"]')); await settledTable(nodes);
+  assert.deepEqual(experimentTopKeys(nodes), [...standalone].reverse().slice(0, 20));
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.deepEqual(experimentTopKeys(nodes), [standalone[1], standalone[0], "gpu-a:run-0"]);
+  await expandExperiment(nodes);
+  await settled(() => experimentChildren(nodes).length > 0);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1", "child history keeps chronology when top-level entries sort by Run descending");
+  assert.equal(nodes.get("run-rows").querySelector('tr[data-experiment-id="experiment-1"]').dataset.runKey, "gpu-a:run-0",
+    "changing the group sort does not choose a different representative");
+});
+
+test("empty and wholly unavailable experiments remain visible without invented run controls", async t => {
+  const historical = { project_id: "vision", origin: "retired-worker", run_id: "old-run" };
+  const record = (id, name, members) => ({ experiment_id: id, name, description: "", revision: "1", members, lineage: [],
+    created_at: "2026-10-20T00:00:00Z", updated_at: "2026-10-20T00:00:00Z", membership_count: members.length, unavailable_runs: members });
+  const records = [record("empty", "Empty experiment", []), record("retained", "Retained experiment", [historical])];
+  const model = await experimentFixture(t, { mutable: false, experiments: records, group_supported: true,
+    group_entries: records.map((item) => experimentGroup(null, { experiment: { experiment_id: item.experiment_id, name: item.name, revision: item.revision },
+      membership_count: item.membership_count, matching_count: 0, active_count: 0, unavailable_count: item.unavailable_runs.length })) });
+  const { nodes } = model;
+  assert.equal(runRows(nodes).length, 0);
+  assert.equal(nodes.get("list-empty").hidden, true, "experiments remain browseable without a representative run");
+  for (const item of records) {
+    const row = nodes.get("run-rows").querySelector(`tr[data-experiment-id="${item.experiment_id}"]`);
+    assert.ok(row); assert.match(row.textContent, new RegExp(item.name));
+    assert.equal(row.querySelector('.run-link, input[type="checkbox"], .status'), null);
+  }
+  assert.match(nodes.get("run-rows").querySelector('tr[data-experiment-id="retained"]').textContent, /1 retained run is unavailable/i);
+  assert.equal(model.state.saves.length, 0);
+});
+
+test("changing an experiment representative discards an in-flight child snapshot before it can replace current history", async t => {
+  const stale = deferred(); let held = false, signal;
+  const model = await experimentFixture(t, { count: 3, member_indices: [0, 1, 2], group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 3, matching_count: 3 })],
+    intercept: (url, options) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && !held) {
+        held = true; signal = options.signal; return stale.promise;
+      }
+    } });
+  const { nodes, state } = model;
+  await expandExperiment(nodes); await settled(() => held);
+  state.runs[2].started_at = "2026-10-04T01:00:00Z";
+  state.group_entries[0].run_key = "gpu-a:run-2";
+  await click(nodes.get("refresh-button"));
+  await settled(() => experimentTopKeys(nodes)[0] === "gpu-a:run-2");
+  assert.equal(signal.aborted, true);
+  await act(async () => { stale.resolve(response({ source: model.source, runs: [{ ...state.runs[1], task: "STALE CHILD SNAPSHOT" }],
+    total_count: 1, offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  assert.doesNotMatch(nodes.get("run-rows").textContent, /STALE CHILD SNAPSHOT/);
+  assert.equal(nodes.get("run-rows").querySelectorAll('[data-run-key="gpu-a:run-2"]').length, 1);
+});
+
+test("late experiment child pages cannot replace history after switching projects away and back", async t => {
+  const stale = deferred(); let held = false, signal;
+  const vision = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const other = { ...vision, source_id: "hosted-project:other", project_id: "other", label: "other" };
+  const model = await experimentFixture(t, { group_supported: true, group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url, options) => {
+      if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [vision, other], initial_source: vision.source_id,
+        access_mode: "hosted", warnings: [], run_management_enabled: true, experiments_supported: true, experiment_management_enabled: true, experiment_groups_supported: true });
+      if (url.pathname === "/api/experiments" && url.searchParams.get("project_id") === "other") return response({ project_id: "other", revision: "1", experiments: [] });
+      if (url.pathname === "/api/runs" && url.searchParams.get("source") === other.source_id)
+        return response({ source: other, runs: [], experiment_groups: [], total_count: 0, offset: 0, next_offset: null, warnings: [] });
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && !held) {
+        held = true; signal = options.signal; return stale.promise;
+      }
+    } });
+  const { nodes } = model;
+  await expandExperiment(nodes); await settled(() => held);
+  await click(nodes.get("project-other")); await settled(() => nodes.get("project-other").checked && nodes.get("runs-region").getAttribute("aria-busy") === "false");
+  assert.equal(nodes.get("run-rows").querySelector('[data-experiment-id="experiment-1"]'), null);
+  assert.equal(signal.aborted, true);
+  await click(nodes.get("project-vision")); await settled(() => nodes.get("project-vision").checked && nodes.get("run-rows").querySelector('[data-experiment-id="experiment-1"]'));
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 1);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  await act(async () => { stale.resolve(response({ source: vision, runs: [{ ...model.runs[1], task: "OLD PROJECT CHILD PAGE" }],
+    total_count: 1, offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  assert.doesNotMatch(nodes.get("run-rows").textContent, /OLD PROJECT CHILD PAGE/);
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+});
+
+test("failed initial experiment history can retry without moving or rereading the top-level groups", async t => {
+  let fail = true;
+  const model = await experimentFixture(t, { group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && fail)
+        return response({ error: "Child history temporarily unavailable" }, 503);
+    } });
+  const { nodes } = model, before = runRows(nodes), top_keys = experimentTopKeys(nodes);
+  const group_reads = model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length;
+  await expandExperiment(nodes);
+  await settled(() => nodes.document.querySelector("#experiment-retry-experiment-1"));
+  assert.match(nodes.get("run-rows").querySelector('[data-experiment-history="experiment-1"]').textContent, /Child history temporarily unavailable/);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  assert.equal(experimentChildren(nodes).length, 0);
+  fail = false;
+  await click(nodes.get("experiment-retry-experiment-1"));
+  await settled(() => experimentChildren(nodes).length === 1 && !nodes.document.querySelector("#experiment-retry-experiment-1"));
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  assert.equal(experimentChildRequests(model).length, 2);
+  assert.equal(model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length, group_reads);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  runRows(nodes).filter((row) => !row.hasAttribute("data-experiment-child")).forEach((row, index) => assert.equal(row, before[index]));
+});
+
+test("expanded experiment history retains its loaded page window across manual and quiet refreshes", async t => {
+  const clock = new RefreshClock();
+  const model = await experimentFixture(t, { count: 26, member_indices: Array.from({ length: 24 }, (_, index) => index),
+    updates: true, refresh_clock: clock, group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 24, matching_count: 24 }), standaloneGroup("gpu-a:run-24"), standaloneGroup("gpu-a:run-25")] });
+  const { nodes, state } = model;
+  await clock.advance(5000);
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 19);
+  await click(nodes.get("experiment-more-experiment-1")); await settled(() => experimentChildren(nodes).length === 23);
+  const top_keys = experimentTopKeys(nodes), child_keys = experimentChildren(nodes).map((row) => row.dataset.runKey);
+  let reads = experimentChildRequests(model).length;
+  state.runs[1].task = "Manually refreshed child";
+  await click(nodes.get("refresh-button"));
+  await settled(() => experimentChildRequests(model).length >= reads + 2 && experimentChildren(nodes).length === 23 &&
+    !nodes.get("run-rows").querySelector('[data-experiment-history="experiment-1"]').textContent.includes("Loading history"));
+  assert.deepEqual(experimentChildRequests(model).slice(-2).map((url) => url.searchParams.get("offset")), ["0", "20"]);
+  assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), child_keys);
+  assert.match(experimentChildren(nodes)[0].textContent, /Manually refreshed child/);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  reads = experimentChildRequests(model).length;
+  state.runs[22].task = "Quietly refreshed child";
+  model.list_revision = "worker-changed-child-history";
+  await clock.advance(5000);
+  await settled(() => experimentChildRequests(model).length >= reads + 2 && experimentChildren(nodes).length === 23 &&
+    !nodes.get("run-rows").querySelector('[data-experiment-history="experiment-1"]').textContent.includes("Loading history"));
+  assert.deepEqual(experimentChildRequests(model).slice(-2).map((url) => url.searchParams.get("offset")), ["0", "20"]);
+  assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), child_keys);
+  assert.match(experimentChildren(nodes)[21].textContent, /Quietly refreshed child/);
+  assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  assert.equal(nodes.get("page-label").textContent, "Page 1");
+});
+
+test("unchanged pending experiment history survives main-list refresh while workers remain active", async t => {
+  const pending = deferred(), clock = new RefreshClock(); let signal, held = false;
+  const model = await experimentFixture(t, { updates: true, refresh_clock: clock, group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url, options) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && !held) {
+        held = true; signal = options.signal; return pending.promise;
+      }
+    } });
+  const { nodes } = model;
+  await clock.advance(5000);
+  await expandExperiment(nodes); await settled(() => held);
+  const group_reads = model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length;
+  model.list_revision = "worker-still-publishing";
+  await clock.advance(5000);
+  assert.ok(model.requests.filter((url) => new URL(url, "http://localhost").searchParams.get("group_experiments") === "true").length > group_reads);
+  assert.equal(signal.aborted, false, "an unchanged group refresh must not starve a slower child read");
+  assert.equal(experimentChildRequests(model).length, 1);
+  await act(async () => { pending.resolve(response({ source: model.source, runs: model.runs.slice(0, 2), total_count: 2,
+    offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  await settled(() => experimentChildren(nodes).length === 1);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+});
+
+test("experiment history rejects stale or foreign membership metadata while accepting older responses without it", async t => {
+  const invalid = [{ experiment_id: "experiment-1", name: "Language model", revision: "stale-revision" },
+    { experiment_id: "another-experiment", name: "Other work", revision: "exp-revision-1" }, null];
+  let attempt = 0;
+  const model = await experimentFixture(t, { group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    intercept: (url, _options, state) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1") {
+        const valid = attempt >= invalid.length;
+        const run = { ...state.runs[1], task: valid ? "Recovered child" : "UNTRUSTED CHILD METADATA",
+          ...(valid ? {} : { experiment: invalid[attempt] }) };
+        return response({ source: { source_id: "hosted-project:vision" }, runs: [run], total_count: 1, offset: 0, next_offset: null, warnings: [] });
+      }
+    } });
+  const { nodes } = model;
+  await expandExperiment(nodes);
+  for (let index = 0; index < invalid.length; index++) {
+    await settled(() => nodes.document.querySelector("#experiment-retry-experiment-1"));
+    assert.equal(experimentChildren(nodes).length, 0);
+    assert.doesNotMatch(nodes.get("run-rows").textContent, /UNTRUSTED CHILD METADATA/);
+    assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+    attempt = index + 1;
+    await click(nodes.get("experiment-retry-experiment-1"));
+  }
+  await settled(() => experimentChildren(nodes).length === 1);
+  assert.match(experimentChildren(nodes)[0].textContent, /Recovered child/);
+  assert.equal(nodes.get("run-rows").querySelector(".experiment-history-error"), null);
+});
+
+test("acknowledged child nickname saves invalidate pre-save experiment history reads", async t => {
+  const pending = deferred(); let hold = false, held = false, signal, old_rows;
+  const scope = { project_id: "vision", origin: "gpu-b", run_id: "run-1" };
+  const model = await experimentFixture(t, { group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0"), standaloneGroup("gpu-a:run-2")],
+    run_patches: { 1: { nickname: null, tags: [], annotations: { scope, nickname: null, tags: [] } } },
+    intercept: (url, options, state) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && hold && !held) {
+        held = true; signal = options.signal; old_rows = structuredClone(state.runs.slice(0, 2)); return pending.promise;
+      }
+      if (url.pathname === "/api/runs/annotations") {
+        const body = JSON.parse(options.body);
+        assert.deepEqual({ project_id: body.project_id, origin: body.origin, run_id: body.run_id }, scope);
+        const annotations = { scope, nickname: body.nickname, tags: body.tags };
+        state.runs[1] = { ...state.runs[1], nickname: body.nickname, tags: body.tags, annotations };
+        return response(annotations);
+      }
+    } });
+  const { nodes } = model;
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 1);
+  await click(experimentChildren(nodes)[0].querySelector(".run-link"));
+  await settled(() => nodes.document.querySelector("#run-nickname") && !nodes.get("run-nickname").matches(":disabled"));
+  hold = true;
+  await click(nodes.get("refresh-button")); await settled(() => held && !nodes.get("refresh-button").disabled);
+  setValue(nodes.get("run-nickname"), "Acknowledged child nickname"); await emit(nodes.get("run-nickname"), "input");
+  await emit(nodes.get("save-run-annotations").form, "submit");
+  await settled(() => experimentChildren(nodes)[0]?.querySelector(".run-link").textContent === "Acknowledged child nickname" && signal.aborted);
+  assert.equal(signal.aborted, true);
+  assert.equal(nodes.get("run-rows").querySelector('tr[data-experiment-id="experiment-1"] button[aria-expanded]').getAttribute("aria-expanded"), "true");
+  await act(async () => { pending.resolve(response({ source: model.source, runs: old_rows, total_count: 2,
+    offset: 0, next_offset: null, warnings: [] })); await microtasks(); });
+  assert.equal(experimentChildren(nodes).length, 1);
+  assert.equal(experimentChildren(nodes)[0].dataset.runKey, "gpu-b:run-1");
+  assert.equal(experimentChildren(nodes)[0].querySelector(".run-link").textContent, "Acknowledged child nickname");
+  assert.equal(nodes.get("review-title").textContent, "Acknowledged child nickname");
+  assert.deepEqual(experimentTopKeys(nodes), ["gpu-a:run-0", "gpu-a:run-2"]);
+});
+
+test("experiment history Retry replays a failed refresh instead of appending at its retained cursor", async t => {
+  let fail_at = null;
+  const model = await experimentFixture(t, { count: 46, member_indices: Array.from({ length: 45 }, (_, index) => index), group_supported: true,
+    group_entries: [experimentGroup("gpu-a:run-0", { membership_count: 45, matching_count: 45 }), standaloneGroup("gpu-a:run-45")],
+    intercept: (url) => {
+      if (url.pathname === "/api/runs" && url.searchParams.get("experiment_id") === "experiment-1" && url.searchParams.get("offset") === fail_at) {
+        fail_at = null; return response({ error: "Refresh page temporarily unavailable" }, 503);
+      }
+    } });
+  const { nodes, state } = model;
+  await expandExperiment(nodes); await settled(() => experimentChildren(nodes).length === 19);
+  await click(nodes.get("experiment-more-experiment-1")); await settled(() => experimentChildren(nodes).length === 39);
+  const keys = experimentChildren(nodes).map((row) => row.dataset.runKey), top_keys = experimentTopKeys(nodes);
+  for (const offset of ["0", "20"]) {
+    const changed = offset === "0" ? 1 : 30;
+    state.runs[changed] = { ...state.runs[changed], task: `Refreshed after failure at ${offset}` };
+    fail_at = offset;
+    await click(nodes.get("refresh-button"));
+    await settled(() => nodes.document.querySelector("#experiment-retry-experiment-1"));
+    assert.equal(experimentChildren(nodes).length, 39, "a failed refresh retains the loaded window");
+    const reads = experimentChildRequests(model).length;
+    await click(nodes.get("experiment-retry-experiment-1"));
+    await settled(() => experimentChildRequests(model).length >= reads + 2 && !nodes.document.querySelector("#experiment-retry-experiment-1"));
+    assert.deepEqual(experimentChildRequests(model).slice(reads).map((url) => url.searchParams.get("offset")), ["0", "20"],
+      "Retry rereads the loaded pages instead of starting at the still-available cursor 40");
+    assert.deepEqual(experimentChildren(nodes).map((row) => row.dataset.runKey), keys);
+    assert.match(experimentChildren(nodes).find((row) => row.dataset.runKey === state.runs[changed].run_key).textContent,
+      new RegExp(`Refreshed after failure at ${offset}`));
+    assert.ok(nodes.document.querySelector("#experiment-more-experiment-1"), "later child pages remain available after refresh recovery");
+    assert.deepEqual(experimentTopKeys(nodes), top_keys);
+  }
+});
+
+test("experiment membership never regroups interleaved chronological run history", async t => {
+  const model = await experimentFixture(t, { count: 5, member_indices: [0, 2, 4] });
+  const { nodes } = model;
+  const expected = ["gpu-a:run-0", "gpu-b:run-1", "gpu-a:run-2", "gpu-a:run-3", "gpu-a:run-4"];
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), expected);
+  assert.deepEqual(runRows(nodes).map((row) => row.querySelector("time").dateTime), model.runs.map((run) => run.started_at));
+  assert.equal(nodes.get("run-rows").querySelector(".experiment-group-row, .run-lineage-badge, .run-experiment-name"), null,
+    "membership and provenance do not add rows or metadata lines to run history");
+  assert.equal(nodes.document.querySelector('input[name="run_grouping"]'), null);
+  assert.ok(nodes.get("experiment-manager-trigger").closest(".run-history-header"));
+  assert.ok(nodes.get("experiment-filter").closest("#run-filters-panel"));
+  const row = nodes.get("run-rows").querySelector('[data-run-key="gpu-b:run-1"]');
+  assert.match(row.querySelector(".machine-name").textContent, /gpu-b/);
+  await openRunControl(nodes, "experiment-manager");
+  await openRunControl(nodes, "run-filters");
+  assert.equal(nodes.get("experiment-manager-panel").hidden, true, "only one history popover remains open");
+  await openRunControl(nodes, "experiment-manager");
+  assert.equal(nodes.get("run-filters-panel").hidden, true);
+  await openRunControl(nodes, "run-filters");
+  setValue(nodes.get("experiment-filter"), "ungrouped"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("experiment_id"), "ungrouped");
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), ["gpu-b:run-1", "gpu-a:run-3"]);
+  await click(nodes.get("clear-filter-experiment")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).has("experiment_id"), false);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), expected);
+});
+
+test("experiment filters preserve server sorting and pagination without hiding or moving rows", async t => {
+  const ascending = Array.from({ length: 45 }, (_, index) => `run-${index}`).sort();
+  const descending = [...ascending].reverse(), members = Array.from({ length: 23 }, (_, index) => index * 2);
+  const model = await experimentFixture(t, { count: 45, member_indices: members,
+    server_orders: { "run_id:asc": ascending, "run_id:desc": descending } });
+  const { nodes } = model;
+  const keys = (ids) => ids.map((id) => `gpu-a:${id}`), rendered = () => runRows(nodes).map((row) => row.dataset.runKey);
+  await openRunControl(nodes, "run-filters");
+  setValue(nodes.get("experiment-filter"), "experiment-1"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
+  assert.deepEqual(rendered(), keys(members.slice(0, 20).map((index) => `run-${index}`)));
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("experiment_id"), "experiment-1");
+  assert.equal(latestRunQuery(model).get("offset"), "20");
+  assert.deepEqual(rendered(), keys(["run-40", "run-42", "run-44"]));
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run ascending"]')); await settledTable(nodes);
+  const ascending_members = ascending.filter((id) => Number(id.slice(4)) % 2 === 0);
+  assert.equal(latestRunQuery(model).get("sort"), "run_id");
+  assert.equal(latestRunQuery(model).get("direction"), "asc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(latestRunQuery(model).get("experiment_id"), "experiment-1");
+  assert.equal(nodes.get("previous-page").disabled, true);
+  assert.deepEqual(rendered(), keys(ascending_members.slice(0, 20)));
+  await click(nodes.get("next-page")); await settledTable(nodes);
+  assert.deepEqual(rendered(), keys(ascending_members.slice(20)));
+  await click(nodes.document.querySelector('button[aria-label="Sort by Run descending"]')); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).get("direction"), "desc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.deepEqual(rendered(), keys([...ascending_members].reverse().slice(0, 20)));
+  await click(nodes.get("clear-filter-experiment")); await settledTable(nodes);
+  assert.equal(latestRunQuery(model).has("experiment_id"), false);
+  assert.equal(latestRunQuery(model).get("sort"), "run_id");
+  assert.equal(latestRunQuery(model).get("direction"), "desc");
+  assert.equal(latestRunQuery(model).get("offset"), "0");
+  assert.equal(nodes.get("previous-page").disabled, true);
+  assert.deepEqual(rendered(), descending.slice(0, 20).map((id) => `${id === "run-1" ? "gpu-b" : "gpu-a"}:${id}`));
+});
+
+test("experiment creation reuses its request ID after a committed response is lost", async t => {
+  let first = true, committed = null;
+  const attempts = [];
+  const model = await experimentFixture(t, { experiments: [], intercept: (url, options, state) => {
+    if (url.pathname !== "/api/experiments/save") return;
+    const body = JSON.parse(options.body); attempts.push(body);
+    assert.ok(body.create_request_id);
+    if (first) {
+      first = false;
+      committed = { experiment_id: "created-once", name: body.name, description: body.description, revision: "committed-1", members: body.members,
+        lineage: body.lineage, created_at: "2026-10-20T01:00:00Z", updated_at: "2026-10-20T01:00:00Z", membership_count: body.members.length, unavailable_runs: [] };
+      state.experiments = [committed];
+      return Promise.reject(new Error("Connection lost after the server committed"));
+    }
+    assert.equal(body.create_request_id, attempts[0].create_request_id);
+    return response(committed);
+  } });
+  const { nodes } = model;
+  await click(nodes.get("experiment-manager-trigger"));
+  await click([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "+ New"));
+  setValue(nodes.get("experiment-name"), "Stable work"); await emit(nodes.get("experiment-name"), "input");
+  await click(nodes.get("save-experiment"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("Connection lost"));
+  assert.equal(nodes.get("experiment-name").value, "Stable work", "an unknown outcome retains the draft");
+  await click(nodes.get("save-experiment"));
+  await settled(() => !nodes.document.querySelector("#experiment-name"));
+  assert.equal(attempts.length, 2); assert.deepEqual(attempts[1], attempts[0]);
+  assert.equal(model.state.experiments.length, 1);
+  assert.equal(model.state.experiments[0].experiment_id, "created-once");
+});
+
+test("experiment lineage retains checkpoint provenance across relationship choices and submits captured revisions", async t => {
+  const { nodes, state } = await experimentFixture(t);
+  await click(nodes.get("run-rows").querySelector('[data-run-key="gpu-b:run-1"] .run-link'));
+  await settled(() => nodes.document.querySelector("#run-experiment-panel"));
+  const panel = nodes.get("run-experiment-panel"); panel.open = true; await emit(panel, "toggle");
+  await click([...panel.querySelectorAll("button")].find((button) => button.textContent === "Edit lineage"));
+  await click(panel.querySelector('[aria-label="Remove relationship from run-0 · gpu-a"]'));
+  const parent = nodes.get("experiment-lineage-parent"); setValue(parent, parent.options[1].value); await emit(parent, "change");
+  setValue(nodes.get("experiment-checkpoint-step"), "18446744073709551615"); await emit(nodes.get("experiment-checkpoint-step"), "input");
+  setValue(nodes.get("experiment-checkpoint-reference"), "weights/checkpoint-900"); await emit(nodes.get("experiment-checkpoint-reference"), "input");
+  await click(panel.querySelector('input[name="lineage_kind"][value="split"]'));
+  assert.equal(nodes.get("experiment-checkpoint-reference").value, "weights/checkpoint-900");
+  assert.equal(nodes.get("experiment-checkpoint-step").disabled, false);
+  await click(nodes.get("save-experiment-lineage"));
+  await settled(() => state.saves.length === 1 && !nodes.document.querySelector("#save-experiment-lineage"));
+  assert.equal(state.saves[0].expected_revision, "exp-revision-1");
+  assert.deepEqual(state.saves[0].lineage[0], { parent: { project_id: "vision", origin: "gpu-a", run_id: "run-0" },
+    child: { project_id: "vision", origin: "gpu-b", run_id: "run-1" }, kind: "split", checkpoint: "weights/checkpoint-900", step: "18446744073709551615" });
+});
+
+test("read-only experiments expose retained lineage and members without allowing writes", async t => {
+  const model = await experimentFixture(t, { mutable: false });
+  model.state.experiments[0].unavailable_runs = [model.scope("gpu-a", "run-0")];
+  const { nodes } = model;
+  await click(nodes.get("experiment-manager-trigger"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("1 unavailable"));
+  const history = nodes.get("experiment-manager-panel").querySelector(".experiment-recorded-history");
+  history.open = true; await emit(history, "toggle");
+  assert.match(history.textContent, /run-0 · gpu-a.*Unavailable · provenance retained.*Continued from run-0 · gpu-a.*step 900.*checkpoint-900/s);
+  assert.equal([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "+ New").disabled, true);
+  assert.equal(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]').disabled, true);
+  await openRunControl(nodes, "run-filters");
+  assert.equal(nodes.get("experiment-filter").disabled, false, "read-only dashboards can still filter experiments");
+  setValue(nodes.get("experiment-filter"), "experiment-1"); await emit(nodes.get("experiment-filter"), "change"); await settledTable(nodes);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), ["gpu-a:run-0", "gpu-b:run-1"]);
+  assert.equal(model.state.saves.length, 0);
+});
+
+test("missing experiment capabilities preserve ordinary chronological run browsing", async t => {
+  const source = { source_id: "hosted-project:vision", project_id: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const runs = ["new", "middle", "old"].map((name, index) => ({ run_id: name, run_key: `gpu-a:${name}`, origin: "gpu-a", task: "train", status: "completed",
+    started_at: new Date(Date.UTC(2026, 9, 3 - index)).toISOString(), finished_at: new Date(Date.UTC(2026, 9, 3 - index, 1)).toISOString(), exit_code: 0,
+    experiment: index === 1 ? null : { experiment_id: "experiment-1", name: "Shared work", revision: "1" } }));
+  const model = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs });
+  assert.deepEqual(runRows(model.nodes).map((row) => row.dataset.runKey), runs.map((run) => run.run_key));
+  assert.equal(model.nodes.document.querySelector("#experiment-manager-trigger, #experiment-filter, .experiment-group-row"), null);
+  assert.equal(model.requests.some((url) => new URL(url, "http://localhost").pathname === "/api/experiments"), false);
+  assert.equal(latestRunQuery(model).get("source"), source.source_id);
+});
+
+test("failed experiment metadata never hides or reorders the available run history", async t => {
+  const model = await experimentFixture(t, { count: 5, member_indices: [0, 2, 4], catalog_status: 503 });
+  const { nodes, state } = model, before = runRows(nodes);
+  assert.deepEqual(before.map((row) => row.dataset.runKey), model.runs.map((run) => run.run_key));
+  assert.equal(nodes.get("experiment-filter").disabled, true);
+  assert.equal(nodes.get("runs-region").getAttribute("aria-busy"), "false");
+  await openRunControl(nodes, "experiment-manager");
+  assert.match(nodes.get("experiment-manager-panel").textContent, /Experiment metadata is temporarily unavailable/);
+  state.catalog_status = 200;
+  await click(nodes.get("experiment-manager-trigger"));
+  await openRunControl(nodes, "experiment-manager");
+  await settled(() => !nodes.get("experiment-filter").disabled);
+  assert.deepEqual(runRows(nodes).map((row) => row.dataset.runKey), before.map((row) => row.dataset.runKey));
+  runRows(nodes).forEach((row, index) => assert.equal(row, before[index], "metadata recovery preserves each run row"));
+});
+
+test("experiment conflicts retain drafts and require an explicit reload before retrying", async t => {
+  const { nodes, state } = await experimentFixture(t);
+  await click(nodes.get("experiment-manager-trigger"));
+  await click(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]'));
+  setValue(nodes.get("experiment-name"), "My unsaved name"); await emit(nodes.get("experiment-name"), "input");
+  state.experiments[0] = { ...state.experiments[0], name: "Changed elsewhere", revision: "external-revision" };
+  await click(nodes.get("save-experiment"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("changed while you were editing"));
+  assert.equal(nodes.get("experiment-name").value, "My unsaved name");
+  assert.equal(nodes.get("save-experiment").disabled, true);
+  await click([...nodes.get("experiment-manager-panel").querySelectorAll("button")].find((button) => button.textContent === "Reload latest"));
+  assert.equal(nodes.get("experiment-name").value, "Changed elsewhere");
+  assert.equal(nodes.get("save-experiment").disabled, false);
+  await click(nodes.get("save-experiment"));
+  await settled(() => !nodes.document.querySelector("#experiment-name"));
+  assert.equal(state.saves.at(-1).expected_revision, "external-revision");
+});
+
+test("empty experiment metadata refreshes on catalog revisions without changes to run history", async t => {
+  const clock = new RefreshClock();
+  const model = await experimentFixture(t, { updates: true, refresh_clock: clock });
+  await clock.advance(5000);
+  const rows_before = runRows(model.nodes);
+  const empty = model.make({ experiment_id: "empty-experiment", name: "Empty experiment", revision: "empty-1", members: [], lineage: [], membership_count: 0 });
+  model.state.experiments.push(empty);
+  const reads = model.state.reads, runs_before = model.requests.filter((url) => url.startsWith("/api/runs?")).length;
+  model.catalog_revision = "catalog-with-empty-experiment";
+  await clock.advance(5000);
+  await settled(() => model.nodes.get("experiment-filter").textContent.includes("Empty experiment"));
+  assert.ok(model.state.reads > reads);
+  const previous_reads = model.state.reads;
+  empty.name = "Renamed empty group"; empty.revision = "empty-2";
+  model.catalog_revision = "catalog-renamed-empty-experiment";
+  await clock.advance(5000);
+  await settled(() => model.nodes.get("experiment-filter").textContent.includes("Renamed empty group"));
+  assert.ok(model.state.reads > previous_reads);
+  model.state.experiments[0] = { ...model.state.experiments[0], name: "Membership changed", revision: "membership-2",
+    members: [model.scope("gpu-a", "run-2"), model.scope("gpu-a", "run-0")], lineage: [] };
+  model.catalog_revision = "catalog-changed-membership";
+  await clock.advance(5000);
+  await settled(() => model.nodes.get("experiment-filter").textContent.includes("Membership changed"));
+  assert.deepEqual(runRows(model.nodes).map((row) => row.dataset.runKey), ["gpu-a:run-0", "gpu-b:run-1", "gpu-a:run-2"]);
+  runRows(model.nodes).forEach((row, index) => assert.equal(row, rows_before[index], "membership-only changes preserve the ordered row DOM"));
+  assert.equal(model.requests.filter((url) => url.startsWith("/api/runs?")).length, runs_before,
+    "metadata updates do not need to reread the unchanged run list");
+});
+
+test("a precommit experiment refresh cannot overwrite an acknowledged save", async t => {
+  const post = deferred(), stale = deferred();
+  let hold_read = false, read_held = false, submitted = null;
+  const model = await experimentFixture(t, { intercept: (url, options) => {
+    if (url.pathname === "/api/experiments/save") { submitted = JSON.parse(options.body); return post.promise; }
+    if (url.pathname === "/api/experiments" && hold_read) { hold_read = false; read_held = true; return stale.promise; }
+  } });
+  const { nodes, state } = model;
+  const old_snapshot = structuredClone(state.experiments);
+  await click(nodes.get("experiment-manager-trigger"));
+  await click(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]'));
+  setValue(nodes.get("experiment-name"), "Acknowledged new name"); await emit(nodes.get("experiment-name"), "input");
+  await click(nodes.get("save-experiment"));
+  await settled(() => submitted !== null);
+  hold_read = true; await click(nodes.get("refresh-button"));
+  await settled(() => read_held);
+  const saved = { ...state.experiments[0], name: submitted.name, revision: "acknowledged-revision" };
+  state.experiments = [saved];
+  await act(async () => { post.resolve(response(saved)); await microtasks(); });
+  await settled(() => !nodes.document.querySelector("#experiment-name"));
+  await act(async () => { stale.resolve(response({ project_id: "vision", revision: "old-project", experiments: old_snapshot })); await microtasks(); });
+  assert.match(nodes.get("experiment-filter").textContent, /Acknowledged new name/);
+  assert.doesNotMatch(nodes.get("experiment-filter").textContent, /Language model/);
+});
+
+test("unavailable experiment members can be removed with their edges while all runs are preserved", async t => {
+  const model = await experimentFixture(t);
+  const { nodes, state } = model;
+  state.experiments[0].unavailable_runs = [model.scope("gpu-a", "run-0")];
+  await click(nodes.get("experiment-manager-trigger"));
+  await settled(() => nodes.get("experiment-manager-panel").textContent.includes("1 unavailable"));
+  await click(nodes.get("experiment-manager-panel").querySelector('[aria-label="Edit experiment Language model"]'));
+  const history = nodes.get("experiment-manager-panel").querySelector("form .experiment-recorded-history");
+  history.open = true; await emit(history, "toggle");
+  assert.match(history.textContent, /Removing a member also removes its lineage relationships when you save/);
+  await click(history.querySelector('[aria-label="Remove member run-0 · gpu-a"]'));
+  assert.equal(state.experiments[0].members.length, 2, "removal remains an unsaved draft until Save");
+  await click(nodes.get("save-experiment"));
+  await settled(() => state.saves.length === 1);
+  assert.equal(state.saves[0].members.length, 1); assert.deepEqual(state.saves[0].lineage, []);
+  assert.equal(model.runs.length, 3, "removing membership does not remove a run");
+});
+
+test("late experiment reads cannot replace the catalog after switching projects away and back", async t => {
+  const old = deferred(); let hold = false, held = false;
+  const vision = { source_id: "hosted-project:vision", project_id: "vision", label: "vision", kind: "hosted_project", origin: null, target_name: null };
+  const other = { ...vision, source_id: "hosted-project:other", project_id: "other", label: "other" };
+  const model = await experimentFixture(t, { intercept: (url, _options, state) => {
+    if (["/api/catalog", "/api/projects"].includes(url.pathname)) return response({ project_name: "Hosted experiments", sources: [vision, other], initial_source: vision.source_id,
+      access_mode: "hosted", warnings: [], run_management_enabled: true, experiments_supported: true, experiment_management_enabled: true });
+    if (url.pathname === "/api/experiments") {
+      if (url.searchParams.get("project_id") === "other") return response({ project_id: "other", revision: "other-1", experiments: [] });
+      if (hold) { hold = false; held = true; return old.promise; }
+    }
+    if (url.pathname === "/api/runs" && url.searchParams.get("source") === other.source_id) return response({ source: other, runs: [], total_count: 0, offset: 0, next_offset: null, warnings: [] });
+  } });
+  const { nodes } = model;
+  hold = true; await click(nodes.get("experiment-manager-trigger")); await settled(() => held);
+  await click(nodes.get("project-other")); await settled(() => nodes.get("project-other").checked && !nodes.get("experiment-filter").disabled);
+  assert.doesNotMatch(nodes.get("experiment-filter").textContent, /Language model/);
+  await click(nodes.get("project-vision")); await settled(() => nodes.get("experiment-filter").textContent.includes("Language model"));
+  const stale = { ...model.state.experiments[0], name: "Late wrong catalog", revision: "old-read" };
+  await act(async () => { old.resolve(response({ project_id: "vision", revision: "old-project", experiments: [stale] })); await microtasks(); });
+  assert.match(nodes.get("experiment-filter").textContent, /Language model/);
+  assert.doesNotMatch(nodes.get("experiment-filter").textContent, /Late wrong catalog/);
+});
 function workspacePanes(nodes) {
   const grid = nodes.document.querySelector(".workspace-grid");
   const browser = grid.querySelector(":scope > .runs-card");
@@ -696,7 +1386,7 @@ test("System polling and manual Refresh work with no project catalog or experime
   assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /55%/);
   value = 60; await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
   assert.match(nodes.document.querySelector('[data-system-metric="cpu/usage_percent"] .metric-chart-summary').textContent, /60%/);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   assert.equal(model.requests.some(url => url.startsWith("/api/run?")), false);
 });
 
@@ -959,7 +1649,7 @@ test("compact explicit inspection moves to review while refresh preserves positi
 
 test("axis choice applies to run and comparison charts and survives manual refresh", async t => {
   const model = await reviewFixture(t), { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(chartQuery(nodes).get("x_axis"), "step");
@@ -991,7 +1681,7 @@ test("axis choice applies to run and comparison charts and survives manual refre
 
 test("summary tags select reductions in one action and retain the choice on refresh", async t => {
   const model = await reviewFixture(t), { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   await selectRow(nodes, 0); await selectRow(nodes, 1);
   await settled(() => model.requests.some(url => url.startsWith("/api/compare")));
   assert.equal(nodes.get("reduction-last").checked, true);
@@ -1030,8 +1720,8 @@ test("columns and server sorting preserve the selected run, chart settings and i
   assert.equal(nodes.document.querySelector(".runs-table").classList.contains("has-custom-columns"), true);
   assert.deepEqual(latestRunQuery(model).getAll("param"), ["/learning_rate"]);
   assert.deepEqual(latestRunQuery(model).getAll("metric"), ["loss"]);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 6);
-  assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
+  assert.equal(runRows(nodes)[0].children.length, 6);
+  assert.equal(runRows(nodes)[0].querySelector('[data-column-kind="param"]').textContent, "0.01");
   await click(nodes.get("next-page")); await settledTable(nodes);
   assert.equal(nodes.get("page-label").textContent, "Page 2");
   const loss_header = () => [...nodes.document.querySelectorAll("th")].find(node => node.querySelector("button")?.getAttribute("aria-label")?.startsWith("Sort by loss "));
@@ -1070,7 +1760,7 @@ test("column discovery failure leaves the dashboard usable and retries after an 
   await openRunControl(nodes, "run-issues");
   assert.match(nodes.get("run-issues-panel").textContent, /Upgrade the expri server/);
   assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.has("sort")), false);
-  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(nodes).length, 3);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   await openRunControl(nodes, "run-columns");
@@ -1096,7 +1786,7 @@ test("automatic list updates keep table choices and sorting while refreshing onl
   fixture.model.metric_value = 0.125;
   fixture.model.list_revision = "table-2";
   await fixture.clock.advance(5_000);
-  const cell = nodes.get("run-rows").children[0].querySelector('[data-column-kind="metric"]');
+  const cell = runRows(nodes)[0].querySelector('[data-column-kind="metric"]');
   assert.equal(cell.textContent, "0.125");
   assert.equal(columnCheckbox(nodes, "Metric loss").checked, true);
   assert.equal(latestRunQuery(fixture).get("sort"), "metric:loss");
@@ -1138,7 +1828,7 @@ test("informational column notes do not rescan history during periodic run refre
   model.model.metric_value = 0.125;
   model.model.list_revision = "new-metric-values";
   await clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children[0].querySelector('[data-column-kind="metric"]').textContent, "0.125");
+  assert.equal(runRows(nodes)[0].querySelector('[data-column-kind="metric"]').textContent, "0.125");
   assert.equal(requestCounts(model.requests)["/api/run-columns"], discoveries, "a harmless history note does not force another full column scan");
   assert.equal(columnCheckbox(nodes, "Metric loss"), choice);
   assert.equal(choice.disabled, false); assert.equal(choice.checked, true);
@@ -1171,7 +1861,7 @@ test("cached columns remain interactive through a periodic discovery repair and 
   assert.equal(list_signal.aborted, true, "the newer column selection replaces its obsolete table request");
   pending_list.resolve(response({ source: model.sources[0], runs: [], warnings: [], total_count: 0, offset: 0, next_offset: null }));
   await flush();
-  assert.equal(nodes.get("run-rows").children.length, 3, "an older table response cannot remove the current runs");
+  assert.equal(runRows(nodes).length, 3, "an older table response cannot remove the current runs");
   await click(nodes.get("run-columns-trigger")); await openRunControl(nodes, "run-columns");
   assert.equal(requestCounts(model.requests)["/api/run-columns"], discoveries, "table changes and reopening join the existing discovery");
   assert.equal(signal.aborted, false);
@@ -1240,10 +1930,10 @@ test("initial column discovery joins repeated opens and ignores a late response 
 
 test("run inspection opens Charts and keyboard tabs load logs only on demand", async t => {
   const { nodes, requests } = await reviewFixture(t);
-  await settled(() => nodes.get("run-rows").children.length === 3);
-  assert.equal(nodes.get("run-rows").children[0].children.length, 4);
-  assert.equal(nodes.get("run-rows").children[0].querySelector(".run-cell .run-task").textContent, "train");
-  assert.match(text(nodes.get("run-rows").children[0].querySelector(".status-column")), /3s/);
+  await settled(() => runRows(nodes).length === 3);
+  assert.equal(runRows(nodes)[0].children.length, 4);
+  assert.equal(runRows(nodes)[0].querySelector(".run-cell .run-task").textContent, "train");
+  assert.match(text(runRows(nodes)[0].querySelector(".status-column")), /3s/);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   assert.equal(nodes.get("review-tab-charts").getAttribute("aria-selected"), "true");
@@ -1271,7 +1961,7 @@ test("run inspection opens Charts and keyboard tabs load logs only on demand", a
 
 test("selection updates charts, caps eight runs, and inspection returns to the selection", async t => {
   const { nodes, requests } = await reviewFixture(t, { count: 9 });
-  await settled(() => nodes.get("run-rows").children.length === 9);
+  await settled(() => runRows(nodes).length === 9);
   await selectRow(nodes, 0);
   assert.equal(nodes.get("review-section").hidden, false);
   await settled(() => chartQuery(nodes).getAll("run_id").length === 1);
@@ -1308,7 +1998,7 @@ test("selection updates charts, caps eight runs, and inspection returns to the s
 
 test("pagination preserves explicit selected IDs while edited filters immediately clear the review", async t => {
   const { nodes, requests } = await reviewFixture(t, { count: 40, hosted: true });
-  await settled(() => nodes.get("run-rows").children.length === 20);
+  await settled(() => runRows(nodes).length === 20);
   await selectRow(nodes, 0);
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   await click(nodes.get("next-page"));
@@ -1336,7 +2026,7 @@ test("late comparison and catalog responses cannot restore an old source after a
   ];
   const model = await reviewFixture(t, { sources, hosted: true });
   const { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   const old_comparison = deferred();
   let comparison_started = false;
   model.override = parsed => {
@@ -1366,7 +2056,7 @@ test("late comparison and catalog responses cannot restore an old source after a
 test("manual Refresh preserves the review tab and metrics and only updates Last checked after success", async t => {
   const model = await reviewFixture(t);
   const { nodes, requests } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   await click(runButton(nodes, 0));
   await settled(() => chartQuery(nodes).get("run_id") === "run-0");
   const accuracy = metricCheckbox(nodes, "accuracy");
@@ -1400,7 +2090,7 @@ test("manual Refresh preserves the review tab and metrics and only updates Last 
 test("a tab change during Refresh does not strand an unfinished initial run review", async t => {
   const model = await reviewFixture(t);
   const { nodes } = model;
-  await settled(() => nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(nodes).length === 3);
   const initial_detail = deferred();
   const refresh_catalog = deferred();
   let detail_started = false;
@@ -1452,7 +2142,7 @@ test("empty hosted catalog refreshes into published runs with opaque source IDs 
   await settled(() => nodes.get("refresh-button").disabled === false);
   catalog = { ...catalog, sources: [source], initial_source: source.source_id, warnings: [{ message: "The overview is limited to 500 runs." }] };
   await emit(nodes.get("refresh-button"), "click");
-  await settled(() => nodes.get("run-rows").children.length === 20);
+  await settled(() => runRows(nodes).length === 20);
   assert.equal(nodes.get("source-select").value, source.source_id);
   assert.equal(nodes.get("source-select").disabled, false);
   assert.equal(nodes.get("search-input").disabled, false);
@@ -1537,7 +2227,7 @@ async function autoFixture(t, fields = {}) {
   return { ...model, model, clock, chart, page_document: globalThis.document };
 }
 async function inspect(model, index = 0) {
-  await settled(() => model.nodes.get("run-rows").children.length > index);
+  await settled(() => runRows(model.nodes).length > index);
   await click(runButton(model.nodes, index));
   await settled(() => chartQuery(model.nodes).get("run_id") === runIdentity(model.runs[index]));
 }
@@ -1562,7 +2252,7 @@ test("running durations tick with automatic refresh off without requests or repl
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); assert.equal(nodes.get("auto-refresh-toggle").checked, false);
   await inspect(model); await click(nodes.get("review-tab-overview"));
-  const rows = [...nodes.get("run-rows").children], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
+  const rows = [...runRows(nodes)], preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
   const header = nodes.document.querySelector(".inspector-meta .run-duration"), overview = overviewDuration(nodes), checked_at = nodes.get("updated-at").textContent;
   const durations = () => rows.map(row => row.querySelector(".status-column .run-duration").textContent);
   assert.deepEqual(durations(), ["1m 5s", "30s", "2s", "45s"]);
@@ -1574,7 +2264,7 @@ test("running durations tick with automatic refresh off without requests or repl
   assert.deepEqual(durations(), ["1m 7s", "30s", "4s", "47s"]);
   assert.equal(header.textContent, "1m 7s"); assert.equal(overview.textContent, "1m 7s");
   assert.deepEqual(requestCounts(model.requests), requests, "display ticks never poll the API");
-  assert.deepEqual([...nodes.get("run-rows").children], rows); assert.equal(nodes.get("chart-preview"), preview);
+  assert.deepEqual([...runRows(nodes)], rows); assert.equal(nodes.get("chart-preview"), preview);
   assert.equal(chartSource(nodes), chart_url); assert.equal(previewMounts(nodes), mounts);
   assert.equal(nodes.document.activeElement, runCheckbox(nodes, 0)); assert.equal(nodes.get("updated-at").textContent, checked_at);
   assert.equal(overviewDuration(nodes), overview);
@@ -1589,13 +2279,13 @@ for (const status of ["running", "waiting"]) test(`${status} durations freeze at
   await clock.advance(2000); assert.equal(overviewDuration(nodes).textContent, "12s");
   run.status = "completed"; run.finished_at = new Date(clock.time - 1000).toISOString(); run.exit_code = 0;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
-  const row = nodes.get("run-rows").children[0], duration = row.querySelector(".run-duration"), header = nodes.document.querySelector(".inspector-meta .run-duration");
+  const row = runRows(nodes)[0], duration = row.querySelector(".run-duration"), header = nodes.document.querySelector(".inspector-meta .run-duration");
   assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
   assert.equal(duration.dataset.live, "false"); assert.equal(clock.timers.size, 0, "terminal records need no display timer");
   const requests = requestCounts(model.requests);
   await clock.advance(60_000);
   assert.equal(duration.textContent, "11s"); assert.equal(header.textContent, "11s"); assert.equal(overviewDuration(nodes).textContent, "11s");
-  assert.deepEqual(requestCounts(model.requests), requests); assert.equal(nodes.get("run-rows").children[0], row);
+  assert.deepEqual(requestCounts(model.requests), requests); assert.equal(runRows(nodes)[0], row);
 });
 
 for (const status of ["running", "waiting"]) test(`${status} durations keep missing invalid and future starts explicitly unavailable`, async t => {
@@ -1604,12 +2294,12 @@ for (const status of ["running", "waiting"]) test(`${status} durations keep miss
   runs.push({ ...publishedRun("run-terminal-unknown"), status: "completed", started_at: null });
   const model = await reviewFixture(t, { hosted: true, updates: true, refresh_clock: clock, project_runs: runs }), { nodes } = model;
   await click(nodes.get("auto-refresh-toggle")); await inspect(model); await click(nodes.get("review-tab-overview"));
-  for (const row of [...nodes.get("run-rows").children].slice(0, 3)) {
+  for (const row of [...runRows(nodes)].slice(0, 3)) {
     const duration = row.querySelector(".run-duration");
     assert.equal(duration.textContent, "—"); assert.equal(duration.title, "Elapsed time unavailable");
     assert.equal(duration.getAttribute("aria-label"), "Elapsed time: unavailable");
   }
-  assert.equal(nodes.get("run-rows").children[3].querySelector(".run-duration"), null, "unknown terminal timing does not invent elapsed time");
+  assert.equal(runRows(nodes)[3].querySelector(".run-duration"), null, "unknown terminal timing does not invent elapsed time");
   const header = nodes.document.querySelector(".inspector-meta .run-duration");
   assert.equal(header.textContent, "—"); assert.equal(overviewDuration(nodes).textContent, "—");
   const requests = requestCounts(model.requests); await clock.advance(2000);
@@ -1627,13 +2317,13 @@ test("running and waiting metadata changes retain focused runs, filters and char
   await emit(nodes.document, "keydown", { key: "Escape" });
   await inspect(model); await chooseAxis(nodes, "wall_clock"); await chooseTimeZone(nodes, "utc");
   await clock.advance(5000);
-  const row = nodes.get("run-rows").children[0], focused = runCheckbox(nodes, 0), preview = nodes.get("chart-preview");
+  const row = runRows(nodes)[0], focused = runCheckbox(nodes, 0), preview = nodes.get("chart-preview");
   const chart_url = chartSource(nodes), mounts = previewMounts(nodes), start = run.started_at;
   await act(async () => focused.focus());
   for (const status of ["waiting", "running"]) {
     run.status = status; model.model.list_revision = `list-${status}`; model.model.metadata_revision = `metadata-${status}`;
     await clock.advance(5000);
-    assert.equal(nodes.get("run-rows").children[0], row);
+    assert.equal(runRows(nodes)[0], row);
     assert.equal(row.querySelector(".status").textContent, status);
     assert.equal(row.querySelector(".status").classList.contains(status), true);
     assert.equal(nodes.document.querySelector(".inspector-status").textContent, status);
@@ -1659,7 +2349,7 @@ test("waiting filters track resumed and waiting runs without losing an off-list 
   await openRunControl(nodes, "run-filters"); await click(nodes.get("status-waiting")); await settledTable(nodes);
   assert.equal(nodes.get("status-waiting").type, "radio"); assert.equal(nodes.get("status-waiting").checked, true);
   assert.equal(nodes.document.activeElement, nodes.get("status-waiting")); assert.equal(latestRunQuery(model).get("status"), "waiting");
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-waiting");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-waiting");
   await emit(nodes.document, "keydown", { key: "Escape" });
   await click(runButton(nodes, 0)); await settled(() => chartQuery(nodes).get("run_id") === runIdentity(waiting));
   const preview = nodes.get("chart-preview"), chart_url = chartSource(nodes), mounts = previewMounts(nodes);
@@ -1667,14 +2357,14 @@ test("waiting filters track resumed and waiting runs without losing an off-list 
   await clock.advance(5000);
   waiting.status = "running"; model.model.list_revision = "resumed-list"; model.model.metadata_revision = "resumed-metadata";
   await clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children.length, 0); assert.equal(nodes.get("list-empty").hidden, false);
+  assert.equal(runRows(nodes).length, 0); assert.equal(nodes.get("list-empty").hidden, false);
   assert.equal(nodes.get("review-section").hidden, false); assert.equal(nodes.document.querySelector(".inspector-status").textContent, "running");
   assert.equal(nodes.get("status-waiting").checked, true); assert.equal(latestRunQuery(model).get("status"), "waiting");
   assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
   assert.equal(nodes.get("review-error").hidden, true);
   running.status = "waiting"; model.model.list_revision = "waiting-list"; model.model.metadata_revision = "waiting-metadata";
   await clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-running");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runButton(nodes, 0).textContent, "sample-running");
   assert.equal(nodes.document.querySelector(".inspector-status").textContent, "running", "the inspector keeps its original run when a different run enters the filter");
   assert.equal(chartSource(nodes), chart_url); assert.equal(nodes.get("chart-preview"), preview);
   assert.equal(model.requests.some(url => url === "/api/runs/archive"), false);
@@ -2021,7 +2711,7 @@ test("an active chart drag defers adoption and the next check still applies the 
 
 test("automatic recovery completes an initially failed comparison and reopening a review gets a fresh baseline", async t => {
   const model = await autoFixture(t);
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   model.model.override = parsed => parsed.pathname === "/api/compare" ? response({ error: "temporarily unavailable" }, 503) : undefined;
   await selectRow(model.nodes, 0); await selectRow(model.nodes, 1);
   await settled(() => model.nodes.get("review-error").hidden === false);
@@ -2206,7 +2896,7 @@ test("a failed initial hosted catalog recovers through a catalog-only probe", as
     if (!parsed.searchParams.has("source")) return response({ catalog_revision: "catalog-1", source_revision: null, runs: [] });
   };
   await model.clock.advance(5_000);
-  assert.equal(model.nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(model.nodes).length, 3);
   assert.equal(model.nodes.get("source-select").value, source.source_id);
   assert.equal(model.nodes.get("global-error").hidden, true);
   const probe = new URL(model.requests.find(url => url.startsWith("/api/updates")), "http://localhost");
@@ -2223,18 +2913,18 @@ test("failed initial run loading ends the loading state and retains successful r
   assert.equal(nodes.get("refresh-button").disabled, false);
   unavailable = false;
   await click(nodes.get("refresh-button"));
-  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(nodes).length, 3);
   assert.equal(nodes.get("list-empty").hidden, true);
   unavailable = true;
   await click(nodes.get("refresh-button"));
-  assert.equal(nodes.get("run-rows").children.length, 3, "an error must keep the last successful run history");
+  assert.equal(runRows(nodes).length, 3, "an error must keep the last successful run history");
   assert.equal(nodes.get("list-empty").hidden, true);
   assert.match(nodes.get("global-error").textContent, /Results unavailable/);
 });
 
 test("an initially failed run can recover directly into Logs without overlapping log requests", async t => {
   const model = await autoFixture(t);
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   model.model.override = parsed => parsed.pathname === "/api/run" ? response({ error: "Run temporarily unavailable" }, 503) : undefined;
   await click(runButton(model.nodes, 0));
   await settled(() => model.nodes.get("review-error").hidden === false);
@@ -2252,7 +2942,7 @@ test("an initially failed run can recover directly into Logs without overlapping
 
 test("failed page loads recover even with unchanged revisions and identical retries restore controls", async t => {
   const model = await autoFixture(t, { count: 45 });
-  await settled(() => model.nodes.get("run-rows").children.length === 20);
+  await settled(() => runRows(model.nodes).length === 20);
   await model.clock.advance(5_000);
   model.model.failed_list = true;
   await click(model.nodes.get("next-page"));
@@ -2265,10 +2955,10 @@ test("failed page loads recover even with unchanged revisions and identical retr
   await click(model.nodes.get("refresh-button"));
   await settled(() => model.nodes.get("refresh-button").disabled === false);
   assert.equal(model.nodes.get("run-count").textContent, "Could not read run history");
-  const row = model.nodes.get("run-rows").children[0];
+  const row = runRows(model.nodes)[0];
   model.model.failed_list = false;
   await model.clock.advance(5_000);
-  assert.equal(model.nodes.get("run-rows").children[0], row, "an identical quiet retry does not rebuild the table");
+  assert.equal(runRows(model.nodes)[0], row, "an identical quiet retry does not rebuild the table");
   assert.equal(model.nodes.get("previous-page").disabled, false);
   assert.equal(model.nodes.get("next-page").disabled, false);
   assert.match(model.nodes.get("run-count").textContent, /21–40 of 45 runs/);
@@ -2278,7 +2968,7 @@ test("failed page loads recover even with unchanged revisions and identical retr
 test("missing selected runs retain their preview without artifact retries and reappear with identical revisions", async t => {
   const model = await autoFixture(t, { hosted: false });
   model.model.catalog_revision = null; model.model.list_revision = null;
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   await selectRow(model.nodes, 0);
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-0");
   await model.clock.advance(5_000);
@@ -2331,7 +3021,7 @@ test("source changes cancel only obsolete background work and late probes cannot
   };
   await model.clock.advance(5_000);
   setValue(model.nodes.get("source-select"), "hosted:b"); await emit(model.nodes.get("source-select"), "change");
-  await settled(() => model.nodes.get("run-rows").children.length === 3);
+  await settled(() => runRows(model.nodes).length === 3);
   assert.equal(signal.aborted, true);
   model.model.override = null;
   pending.resolve(response({ catalog_revision: "late", source_revision: "late", runs: [] })); await flush();
@@ -2416,7 +3106,7 @@ test("a published run link selects its catalog source and opens a run outside th
   await settled(() => chartQuery(model.nodes).get("run_id") === "run-44");
   assert.equal(model.nodes.get("source-select").value, linked_source.source_id);
   assert.equal(model.nodes.get("review-title").textContent, "run-44");
-  assert.equal(model.nodes.get("run-rows").children.length, 20);
+  assert.equal(runRows(model.nodes).length, 20);
   assert.equal(model.nodes.get("source-note").textContent.includes("Waiting for"), false);
   assert.equal(model.requests.filter(url => url.startsWith("/api/run?")).length, 1, "the linked detail is reused for rendering");
   assert.equal(model.requests.some(url => new URL(url, "http://localhost").searchParams.get("source") === other_source.source_id), false);
@@ -2455,7 +3145,7 @@ test("a missing linked run waits using lightweight probes and opens after public
 
 test("explicit source choice cancels a pending link before its source arrives", async t => {
   const model = await autoFixture(t, { count: 2, sources: [other_source], url: runLink() });
-  await settled(() => model.nodes.get("run-rows").children.length === 2);
+  await settled(() => runRows(model.nodes).length === 2);
   setValue(model.nodes.get("source-select"), other_source.source_id); await emit(model.nodes.get("source-select"), "change");
   await settled(() => model.nodes.get("runs-region").getAttribute("aria-busy") === "false");
   model.sources.push(linked_source); model.model.catalog_revision = "catalog-published";
@@ -2841,7 +3531,7 @@ test("run data errors stay on the exact worker row and deduplicate list and colu
   });
   const { nodes } = model;
   await settledTable(nodes); await openColumns(nodes);
-  const [affected, healthy] = nodes.get("run-rows").children;
+  const [affected, healthy] = runRows(nodes);
   const diagnostic = affected.querySelector("details.run-diagnostics");
   assert.ok(diagnostic, "the affected row exposes its data errors");
   assert.equal(diagnostic.querySelector("summary .run-diagnostics-label").textContent, "Errors (2)");
@@ -2934,7 +3624,7 @@ test("run data errors from column discovery clear after an automatic unchanged-r
   const model = await autoFixture(t, { column_warnings: [issue] }), { nodes, clock } = model;
   await settledTable(nodes); await openColumns(nodes);
   await click(columnCheckbox(nodes, "Parameter learning_rate")); await settledTable(nodes);
-  const choice = columnCheckbox(nodes, "Parameter learning_rate"), row = nodes.get("run-rows").children[0];
+  const choice = columnCheckbox(nodes, "Parameter learning_rate"), row = runRows(nodes)[0];
   assert.match(row.querySelector(".run-diagnostics").textContent, /invalid record/);
   await clock.advance(5000);
   const counts = requestCounts(model.requests);
@@ -2945,7 +3635,7 @@ test("run data errors from column discovery clear after an automatic unchanged-r
   await settled(() => nodes.get("run-rows").querySelector(".run-diagnostics") === null);
   assert.ok(requestCounts(model.requests)["/api/runs"] > counts["/api/runs"]);
   assert.ok(requestCounts(model.requests)["/api/run-columns"] > counts["/api/run-columns"], "an unchanged run-list body still rechecks saved-file diagnostics");
-  assert.equal(nodes.get("run-rows").children[0], row, "quiet repair preserves the row DOM");
+  assert.equal(runRows(nodes)[0], row, "quiet repair preserves the row DOM");
   assert.equal(columnCheckbox(nodes, "Parameter learning_rate"), choice);
   assert.equal(choice.checked, true, "column discovery refresh keeps the selected table column");
   assert.equal(nodes.document.querySelector(".runs-table").dataset.columnCount, "1");
@@ -2962,11 +3652,11 @@ test("opening Columns keeps step-order notes out of run rows and Issues while re
     detail_warnings: [{ message }],
   }), { nodes } = model;
   await settledTable(nodes);
-  const row = nodes.get("run-rows").children[0], before = row.textContent;
+  const row = runRows(nodes)[0], before = row.textContent;
   assert.equal(requestCounts(model.requests)["/api/run-columns"] ?? 0, 0, "column discovery remains lazy");
   await openColumns(nodes);
   assert.ok(requestCounts(model.requests)["/api/run-columns"] > 0);
-  assert.equal(nodes.get("run-rows").children[0], row);
+  assert.equal(runRows(nodes)[0], row);
   assert.equal(row.textContent, before, "discovering a data note does not expand or mark the run row");
   assert.equal(nodes.get("run-rows").querySelector(".run-diagnostics"), null);
   assert.equal(nodes.get("run-issues").hidden, true, "off-page and unscoped informational notes do not create an Issues count");
@@ -2994,7 +3684,7 @@ test("column diagnostics distinguish incomplete metrics from actual errors with 
     ],
   }), { nodes } = model;
   await openColumns(nodes);
-  const [partial, broken] = nodes.get("run-rows").children;
+  const [partial, broken] = runRows(nodes);
   const warning = partial.querySelector("details.run-diagnostics.warning");
   const error = broken.querySelector("details.run-diagnostics.error");
   assert.ok(warning, "a skipped metric row gets an amber incomplete-data indicator");
@@ -3138,7 +3828,7 @@ test("Storage searches and pages on the server, including a project with no runs
   const model = await autoFixture(t, { projects: true, project_runs: [] }), { nodes } = model;
   model.model.storage_inputs = Array.from({ length: 105 }, (_, index) => ({ input_id: `dataset-${String(index).padStart(3, "0")}`, size: index }));
   await settled(() => nodes.get("refresh-button").disabled === false);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   await click(nodes.get("workspace-view-storage"));
   await settled(() => nodes.get("storage-rows").children.length === 100);
   assert.equal(nodes.get("storage-page-label").textContent, "1–100 of 105");
@@ -3353,8 +4043,8 @@ test("project browsing selects projects and preserves duplicate run IDs across r
   assert.equal(nodes.document.title, "expri · vision");
   assert.equal(nodes.get("project-vision").checked, true);
   assert.equal(nodes.get("machine-all").checked, true);
-  assert.equal(nodes.get("run-rows").children.length, 2);
-  assert.deepEqual([...nodes.get("run-rows").children].map(row => row.dataset.runKey), ["gpu-a:same-run", "gpu-b:same-run"]);
+  assert.equal(runRows(nodes).length, 2);
+  assert.deepEqual([...runRows(nodes)].map(row => row.dataset.runKey), ["gpu-a:same-run", "gpu-b:same-run"]);
   assert.deepEqual([...nodes.get("run-rows").querySelectorAll("button.run-link")].map(button => button.textContent), ["same-run", "same-run"]);
   assert.deepEqual(model.requests.filter(url => url.startsWith("/api/runs")).map(url => new URL(url, "http://localhost").searchParams.get("source")), [project_source.source_id], "no transient worker list is fetched");
   await selectRow(nodes, 0); await selectRow(nodes, 1); await click(nodes.get("compare-button"));
@@ -3401,13 +4091,13 @@ test("machine filters operate within projects, clear run selection and use one-c
   await settledTable(nodes); await selectRow(nodes, 0);
   await openRunControl(nodes, "run-filters");
   await click(nodes.get("machine-gpu-b")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 1);
-  assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-b:same-run");
+  assert.equal(runRows(nodes).length, 1);
+  assert.equal(runRows(nodes)[0].dataset.runKey, "gpu-b:same-run");
   assert.equal(latestRunQuery(model).get("origin"), "gpu-b");
   assert.equal(nodes.get("review-section").hidden, true);
   assert.equal(runCheckbox(nodes, 0).checked, false);
   await click(nodes.get("machine-all")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 2);
+  assert.equal(runRows(nodes).length, 2);
   assert.equal(latestRunQuery(model).has("origin"), false);
   await click(nodes.document.querySelector('button[aria-label="Sort by Machine ascending"]')); await settledTable(nodes);
   assert.equal(latestRunQuery(model).get("sort"), "origin");
@@ -3452,7 +4142,7 @@ test("project capability fallback retries manually and transient project failure
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
   assert.match(nodes.get("global-error").textContent, /Project browsing unavailable/);
   assert.equal(nodes.get("project-vision").checked, true);
-  assert.equal(nodes.get("run-rows").children.length, 3);
+  assert.equal(runRows(nodes).length, 3);
   assert.equal(nodes.get("chart-preview"), frame);
   model.model.projects_status = 200;
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
@@ -3682,7 +4372,7 @@ test("smoke badges follow explicit metadata rather than run ID prefixes", async 
     { ...annotatedRun("run-invalid"), smoke: "true" },
   ];
   const { nodes } = await reviewFixture(t, { hosted: true, projects: true, project_runs: runs });
-  const rows = [...nodes.get("run-rows").children];
+  const rows = [...runRows(nodes)];
   assert.equal(rows[0].querySelector(".run-smoke")?.textContent, "Smoke");
   for (const row of rows.slice(1)) assert.equal(row.querySelector(".run-smoke"), null);
   await click(runButton(nodes, 0));
@@ -3695,7 +4385,7 @@ test("history limits tag badges while keeping every tag accessible in inspection
   run.tags = ["baseline", "vision", "resnet-50", "validated", "published"];
   run.annotations = { ...run.annotations, tags: run.tags };
   const { nodes } = await reviewFixture(t, { hosted: true, projects: true, project_runs: [run] });
-  const row = nodes.get("run-rows").children[0];
+  const row = runRows(nodes)[0];
   assert.deepEqual([...row.querySelectorAll(".run-tag")].map(node => node.textContent), run.tags.slice(0, 2));
   const remaining = row.querySelector(".run-tag-count");
   assert.equal(remaining.textContent, "+3");
@@ -3862,7 +4552,7 @@ test("run pagination remembers actual offsets when annotation-rich pages contain
       offset, next_offset: offset + count < runs.length ? offset + count : null });
   } });
   const { nodes } = model;
-  const ids = () => [...nodes.document.querySelectorAll("#run-rows tr")].map(row => row.dataset.runKey);
+  const ids = () => [...nodes.document.querySelectorAll("#run-rows tr[data-run-key]")].map(row => row.dataset.runKey);
   assert.deepEqual(ids(), ["gpu-a:run-0", "gpu-a:run-1"]);
   await click(nodes.get("next-page"));
   assert.equal(nodes.get("page-label").textContent, "Page 2");
@@ -3948,7 +4638,7 @@ test("hosted archive tags filter in one click without replacing training statuse
   await settledTable(nodes);
   assert.equal(nodes.get("archival-active").checked, true);
   assert.equal(latestRunQuery(model).get("archival"), "active");
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(runButton(nodes, 0).textContent, "active");
   await selectRow(nodes, 0);
   await settled(() => nodes.get("selected-runs").textContent.includes("active"));
@@ -3988,7 +4678,7 @@ test("archiving confirms the exact worker run, clears its selection, and preserv
   await click(nodes.get("cancel-archive-run"));
   assert.equal(nodes.document.getElementById("archive-run-confirmation"), null);
   await click(nodes.get("archive-run-button")); await click(nodes.get("confirm-archive-run"));
-  await settled(() => nodes.document.getElementById("restore-run-button") && nodes.get("run-rows").children.length === 1);
+  await settled(() => nodes.document.getElementById("restore-run-button") && runRows(nodes).length === 1);
   assert.equal(model.runs[0].archival.status, "archived");
   assert.equal(model.runs[1].archival.status, "active");
   assert.equal(nodes.get("selected-runs").textContent, "");
@@ -4001,7 +4691,7 @@ test("archiving confirms the exact worker run, clears its selection, and preserv
   await click(nodes.get("review-tab-overview"));
   assert.match(nodes.get("run-detail").textContent, /completed/);
   await click(nodes.get("restore-run-button"));
-  await settled(() => nodes.document.getElementById("archive-run-button") && nodes.get("run-rows").children.length === 2);
+  await settled(() => nodes.document.getElementById("archive-run-button") && runRows(nodes).length === 2);
   assert.equal(model.runs[0].archival.status, "active");
   assert.equal(model.requests.filter(url => url === "/api/runs/restore").length, 1);
   assert.equal(nodes.document.getElementById("run-archival-summary"), null);
@@ -4019,7 +4709,7 @@ test("archived direct links open from the active list and restoration leaves the
   await click(nodes.get("archival-archived")); await settledTable(nodes);
   await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("restore-run-button"));
   await click(nodes.get("restore-run-button")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   assert.match(nodes.get("list-empty").textContent, /No archived runs.*15 days/s);
   assert.equal(nodes.get("review-section").hidden, false);
   assert.equal(nodes.document.getElementById("archive-run-button")?.disabled, false);
@@ -4066,7 +4756,7 @@ test("archive failures preserve the row and confirmation, with no automatic retr
   await settled(() => nodes.document.getElementById("run-archival-error"));
   assert.match(nodes.get("run-archival-error").textContent, /Refresh the run before trying again.*Run is still running/);
   assert.equal(model.runs[0].archival.status, "active");
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.get("confirm-archive-run").disabled, false);
   assert.equal(model.requests.filter(url => url === "/api/runs/archive").length, 1);
   await click(nodes.get("cancel-archive-run"));
@@ -4097,7 +4787,7 @@ test("busy archive requests prevent duplicate submits and ignore successes after
     delete_after: new Date(Date.now() + 15 * 86_400_000).toISOString() })); await flush();
   assert.equal(nodes.get("source-select").value, sources[1].source_id);
   assert.equal(nodes.get("review-section").hidden, true);
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.document.getElementById("run-archival-error"), null);
 });
 
@@ -4110,7 +4800,7 @@ test("an external archive refreshes the detail and removes hidden selections wit
   model.runs[0].archival = { ...archivalRun("run", { archived: true }).archival };
   model.model.list_revision = "archived-elsewhere"; model.model.metadata_revision = "archived-elsewhere";
   await model.clock.advance(5_000);
-  assert.equal(nodes.get("run-rows").children.length, 0);
+  assert.equal(runRows(nodes).length, 0);
   assert.equal(nodes.get("selected-runs").textContent, "");
   assert.equal(nodes.document.getElementById("archive-run-button"), null);
   assert.ok(nodes.document.getElementById("restore-run-button"));
@@ -4129,7 +4819,7 @@ test("external archival removes only that run from a comparison and retains the 
   model.model.list_revision = "first-archived"; model.model.metadata_revision = "first-archived";
   await model.clock.advance(5_000);
   await settled(() => nodes.get("review-title").textContent.includes("second") && nodes.document.getElementById("archive-run-button"));
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.match(nodes.get("selected-runs").textContent, /second/);
   assert.equal(nodes.get("selected-runs").textContent.includes("first"), false);
   assert.equal(runCheckbox(nodes, 0).checked, true);
@@ -4147,7 +4837,7 @@ test("a successful response for another worker never hides or alters the reviewe
   await settled(() => nodes.document.getElementById("run-archival-error"));
   assert.match(nodes.get("run-archival-error").textContent, /different run or archive state/);
   assert.equal(run.archival.status, "active");
-  assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.document.getElementById("run-archival-summary"), null);
 });
 
@@ -4257,10 +4947,10 @@ test("queue publication follows the native run once while preserving history foc
   const preview = nodes.get("chart-preview"), mounts = previewMounts(nodes);
   await act(async () => runButton(nodes, 0).focus());
   model.phase("running", { acknowledged: true }); await model.clock.advance(5000);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(runButton(nodes, 0).textContent, "job-mock-pending"); assert.equal(nativeRequestCount(model), 0);
+  assert.equal(runRows(nodes).length, 1); assert.equal(runButton(nodes, 0).textContent, "job-mock-pending"); assert.equal(nativeRequestCount(model), 0);
   model.publishNative(); await model.clock.advance(5000);
   await settled(() => nodes.get("review-title").textContent === "MOCK published worker run");
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-a:run-mock-native");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runRows(nodes)[0].dataset.runKey, "gpu-a:run-mock-native");
   assert.equal(nodes.document.activeElement, runButton(nodes, 0)); assert.equal(nodes.get("review-eyebrow").textContent, "Run");
   assert.equal(nodes.get("review-tab-overview").getAttribute("aria-selected"), "true"); assert.equal(nodes.document.getElementById("queue-overview"), null);
   assert.equal(nodes.get("chart-preview"), preview); assert.equal(previewMounts(nodes), mounts);
@@ -4268,22 +4958,22 @@ test("queue publication follows the native run once while preserving history foc
   assert.equal(nodes.document.querySelector(".inspector-meta .run-duration").textContent, "15s");
   assert.ok(nativeRequestCount(model) > 0, "real worker metadata unlocks native inspection");
   for (const url of model.requests.filter(url => url.startsWith("/api/chart-data"))) assert.equal(new URL(url, "http://localhost").searchParams.get("run_id"), "gpu-a:run-mock-native");
-  await model.clock.advance(5000); assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("review-title").textContent, "MOCK published worker run");
+  await model.clock.advance(5000); assert.equal(runRows(nodes).length, 1); assert.equal(nodes.get("review-title").textContent, "MOCK published worker run");
 });
 
 test("the Pending filter retains a followed native inspector after the job leaves the scheduling list", async t => {
   const model = await pendingFixture(t), { nodes } = model;
   await settledTable(nodes); await openRunControl(nodes, "run-filters"); await click(nodes.get("status-pending")); await settledTable(nodes);
   assert.equal(nodes.get("status-pending").type, "radio"); assert.equal(nodes.get("status-pending").checked, true);
-  assert.equal(latestRunQuery(model).get("status"), "pending"); assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(latestRunQuery(model).get("status"), "pending"); assert.equal(runRows(nodes).length, 1);
   await emit(nodes.document, "keydown", { key: "Escape" }); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
   await model.clock.advance(5000); model.publishNative(); await model.clock.advance(5000);
   await settled(() => nodes.get("review-title").textContent === "MOCK published worker run");
-  assert.equal(nodes.get("run-rows").children.length, 0); assert.equal(nodes.get("status-pending").checked, true); assert.equal(nodes.get("list-empty").hidden, false);
+  assert.equal(runRows(nodes).length, 0); assert.equal(nodes.get("status-pending").checked, true); assert.equal(nodes.get("list-empty").hidden, false);
   assert.equal(nodes.get("review-section").hidden, false); assert.equal(nodes.get("review-error").hidden, true);
   assert.equal(chartQuery(nodes).get("run_id"), "gpu-a:run-mock-native");
   await click(nodes.get("clear-filter-status")); await settledTable(nodes);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "gpu-a:run-mock-native");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runRows(nodes)[0].dataset.runKey, "gpu-a:run-mock-native");
 });
 
 test("explicit refresh follows a queue detail redirect when update hints are unavailable", async t => {
@@ -4291,7 +4981,7 @@ test("explicit refresh follows a queue detail redirect when update hints are una
   await settledTable(nodes); await click(runButton(nodes, 0)); await settled(() => nodes.document.getElementById("queue-overview"));
   assert.equal(nativeRequestCount(model), 0); model.publishNative();
   await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
-  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(nodes.get("run-rows").children.length, 1);
+  assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(runRows(nodes).length, 1);
   assert.equal(nodes.get("review-error").hidden, true); assert.equal(nodes.document.getElementById("queue-overview"), null);
 });
 
@@ -4316,7 +5006,7 @@ test("explicit Refresh during the first queue detail load follows the valid nati
   assert.equal(nodes.document.getElementById("queue-overview"), null, "the first scheduling detail has not arrived");
   const preview = nodes.get("chart-preview");
   model.publishNative(); await click(nodes.get("refresh-button")); await settled(() => !nodes.get("refresh-button").disabled);
-  assert.equal(nodes.get("run-rows").children.length, 1); assert.equal(nodes.get("run-rows").children[0].dataset.runKey, "queue:run-mock-native");
+  assert.equal(runRows(nodes).length, 1); assert.equal(runRows(nodes)[0].dataset.runKey, "queue:run-mock-native");
   assert.equal(nodes.get("review-title").textContent, "MOCK published worker run"); assert.equal(nodes.get("review-error").hidden, true);
   assert.equal(nodes.get("review-eyebrow").textContent, "Run"); assert.equal(nodes.get("chart-preview"), preview);
   model.resolveInitial(); await flush();
@@ -4344,7 +5034,7 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} Overvie
     ? response({ ...detailRecord(source, run), state: { command: "python train.py", supervisor } }) : null });
   const { nodes } = model;
   await inspect(model); await click(nodes.get("review-tab-overview"));
-  const history = nodes.get("run-detail").querySelector(".supervisor-history"), row = nodes.get("run-rows").children[0];
+  const history = nodes.get("run-detail").querySelector(".supervisor-history"), row = runRows(nodes)[0];
   assert.ok(history);
   assert.equal(history.open, false);
   assert.match(history.querySelector("summary").textContent, /Generation 2 · 1 restart attempt$/);
@@ -4375,7 +5065,7 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} checkpo
   model.logs.stdout = "Original attempt output\n";
   await inspect(model); await chooseAxis(nodes, "elapsed");
   await click(nodes.get("review-tab-overview"));
-  const panel = nodes.get("run-detail").querySelector(".task-attempt-history"), row = nodes.get("run-rows").children[0], preview = nodes.get("chart-preview");
+  const panel = nodes.get("run-detail").querySelector(".task-attempt-history"), row = runRows(nodes)[0], preview = nodes.get("chart-preview");
   assert.ok(panel); assert.equal(overviewDuration(nodes).textContent, "3s");
   panel.open = true;
   const next = { ...first, attempt: 2, request_id: "continue-2", reason: "Extend steps", status: "running", requested_at: "2026-10-15T01:01:00Z", started_at: "2026-10-15T01:01:02Z", finished_at: null, exit_code: null, worker_restarted: true, previous_worker_stopped_at: first.finished_at, source: { kind: "git", git_head: "b".repeat(40) }, checkpoint: { name: "checkpoint.pt", relative_path: "outputs/checkpoint.pt", sha256: "c".repeat(64), size: "100" }, metric_step_offset: "101" };
@@ -4385,7 +5075,7 @@ for (const hosted of [false, true]) test(`${hosted ? "hosted" : "local"} checkpo
   await click(nodes.get("refresh-button"));
   await settled(() => panel.querySelector("summary").textContent.includes("Current 2"));
   assert.equal(nodes.get("run-detail").querySelector(".task-attempt-history"), panel); assert.equal(panel.open, true);
-  assert.equal(nodes.get("run-rows").children[0], row); assert.equal(row.dataset.runKey, run.run_id);
+  assert.equal(runRows(nodes)[0], row); assert.equal(row.dataset.runKey, run.run_id);
   assert.equal(nodes.get("review-title").textContent, run.run_id); assert.equal(nodes.get("chart-preview"), preview);
   assert.equal(selectedAxis(nodes), "elapsed"); assert.equal(run.started_at, original_start);
   assert.equal(overviewDuration(nodes).textContent, "1m 5s");

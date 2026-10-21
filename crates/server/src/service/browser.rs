@@ -1,6 +1,7 @@
 use http::{Request as HttpRequest, Response as HttpResponse};
 use serde_json::json;
 
+mod experiments;
 mod project_management;
 mod run_control;
 mod run_management;
@@ -212,6 +213,9 @@ fn route<S: ObjectStorage>(
     ("POST", "/api/runs/control") => {
       return run_control::mutate(dashboard, auth, allow_run_management, request);
     }
+    ("POST", "/api/experiments/save" | "/api/experiments/delete") => {
+      return experiments::mutate(dashboard, auth, allow_run_management, request);
+    }
     _ if !matches!(method, "GET" | "HEAD") => {
       return Err(ApiError::new(405, "dashboard routes require GET or HEAD"));
     }
@@ -251,6 +255,9 @@ fn route<S: ObjectStorage>(
   if path == "/api/runs/control" {
     return run_control::read(dashboard, request);
   }
+  if path == "/api/experiments" {
+    return experiments::read(dashboard, request);
+  }
   if let Some(reply) = project_management::read(dashboard, allow_project_deletion, request)? {
     return Ok(reply);
   }
@@ -279,6 +286,12 @@ fn route<S: ObjectStorage>(
       .as_object_mut()
       .ok_or_else(|| ApiError::new(500, "invalid dashboard capabilities"))?;
     fields.insert("run_management_enabled".into(), json!(allow_run_management));
+    fields.insert("experiments_supported".into(), json!(true));
+    fields.insert("experiment_groups_supported".into(), json!(true));
+    fields.insert(
+      "experiment_management_enabled".into(),
+      json!(allow_run_management),
+    );
     reply.body = serde_json::to_vec(&value)
       .map_err(|_| ApiError::new(500, "cannot encode dashboard capabilities"))?;
   }

@@ -2,6 +2,65 @@ use super::*;
 use crate::config::Config;
 
 #[test]
+fn local_dashboard_rejects_experiment_filters_instead_of_returning_unfiltered_runs() {
+  let fixture = Fixture::new();
+  fixture.run("run-a");
+  for experiment_id in ["exp-example", "ungrouped"] {
+    let reply = server::route_content(
+      &fixture.dashboard,
+      &format!("/api/runs?source=local&experiment_id={experiment_id}"),
+    );
+    assert_eq!(reply.status, 400);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(
+      body["error"],
+      "experiment filters are available on the hosted dashboard"
+    );
+  }
+  for filter in ["", "..", "project%2Fexperiment", "%00", "%C3%A9"] {
+    let reply = server::route_content(
+      &fixture.dashboard,
+      &format!("/api/runs?source=local&experiment_id={filter}"),
+    );
+    assert_eq!(reply.status, 400);
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["error"], "invalid experiment filter");
+  }
+  let duplicate = server::route_content(
+    &fixture.dashboard,
+    "/api/runs?source=local&experiment_id=exp-a&experiment_id=exp-b",
+  );
+  assert_eq!(duplicate.status, 400);
+  assert_eq!(
+    server::route_content(&fixture.dashboard, "/api/runs?source=local").status,
+    200
+  );
+}
+
+#[test]
+fn local_dashboard_validates_and_rejects_hosted_grouping() {
+  let fixture = Fixture::new();
+  fixture.run("run-a");
+  let grouped = server::route_content(
+    &fixture.dashboard,
+    "/api/runs?source=local&group_experiments=true",
+  );
+  assert_eq!(grouped.status, 400);
+  let ordinary = server::route_content(
+    &fixture.dashboard,
+    "/api/runs?source=local&group_experiments=false",
+  );
+  assert_eq!(ordinary.status, 200);
+  for value in ["", "1", "TRUE", "true&group_experiments=false"] {
+    let reply = server::route_content(
+      &fixture.dashboard,
+      &format!("/api/runs?source=local&group_experiments={value}"),
+    );
+    assert_eq!(reply.status, 400);
+  }
+}
+
+#[test]
 fn run_rows_retain_scoped_errors_after_the_aggregate_warning_limit() {
   let fixture = Fixture::new();
   for index in 0..101 {
@@ -40,6 +99,8 @@ fn run_rows_retain_scoped_errors_after_the_aggregate_warning_limit() {
           &table::ListQuery {
             archived: false,
             origin: None,
+            experiment_id: None,
+            group_experiments: false,
             search: None,
             task: None,
             status: None,
@@ -154,6 +215,8 @@ fn local_scalar_cache_refreshes_appended_metrics_and_replaced_parameter_files() 
   let query = table::ListQuery {
     archived: false,
     origin: None,
+    experiment_id: None,
+    group_experiments: false,
     search: None,
     task: None,
     status: None,
@@ -221,6 +284,8 @@ fn configurable_columns_sort_the_filtered_history_before_pagination() {
   let query = table::ListQuery {
     archived: false,
     origin: None,
+    experiment_id: None,
+    group_experiments: false,
     search: Some("TRAIN"),
     task: Some("train"),
     status: Some("completed"),
@@ -260,6 +325,8 @@ fn configurable_columns_sort_the_filtered_history_before_pagination() {
   let query = table::ListQuery {
     archived: false,
     origin: None,
+    experiment_id: None,
+    group_experiments: false,
     search: None,
     task: None,
     status: None,
@@ -356,6 +423,8 @@ fn parameter_only_tables_do_not_open_metrics_and_long_values_have_explicit_previ
       &table::ListQuery {
         archived: false,
         origin: None,
+        experiment_id: None,
+        group_experiments: false,
         search: None,
         task: None,
         status: None,
@@ -376,6 +445,8 @@ fn parameter_only_tables_do_not_open_metrics_and_long_values_have_explicit_previ
         &table::ListQuery {
           archived: false,
           origin: None,
+          experiment_id: None,
+          group_experiments: false,
           search: None,
           task: None,
           status: None,
