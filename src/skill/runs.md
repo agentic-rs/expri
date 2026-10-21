@@ -36,6 +36,45 @@ Logs default to stdout and its last 100 lines. Following ends when the run
 finishes or its supervisor is lost. Interrupting the log reader leaves training
 running. For bounded agent inspection, start with a tail rather than a follow.
 
+## Experiment groups and lineage in the website
+
+An experiment groups runs serving one goal, including work across machines or
+implementations. The hierarchy is **project → experiment → run → task attempt**.
+Each run can belong to one experiment or remain ungrouped. Preserve its full
+identity: project, publishing origin, and run ID. Equal run IDs from different
+origins are separate runs.
+
+On the primary hosted dashboard, open the experiment manager in the run history
+header to create a group and assign selected runs or a run from its inspector.
+Grouping and lineage management currently use the website; there are no CLI
+assignment commands. AB previews allow read-only browsing. Local, cached, and
+older dashboards keep their existing browsing when grouping is unsupported.
+
+The **Experiments** view starts collapsed. A group's summary uses its latest
+started matching run when available. It is not a designated primary or best
+version. Status and selected columns describe that run; retained member counts
+stay full, while matching and active counts honor filters. Filters can change
+the **Latest matching** representative. Sorting and top-level pagination operate
+on whole groups. Expand a group to load its other matching runs newest first
+with independent history pagination. Choose **Runs** for a flat sortable table,
+newest first by default; its experiment filter includes older members beyond
+the normal recent-run window. Selection and lifecycle controls always target
+individual runs.
+
+Membership does not require lineage. In the experiment editor, record directed
+**Continued**, **Restarted**, or **Split** relationships between members to
+describe resumed work, another execution, or parallel parts. Relationships must
+stay within the group and cannot form cycles. Any relationship can include a
+parent checkpoint reference and step; these record provenance without verifying
+or loading the checkpoint or launching work. Existing Continue retains the run
+ID and adds a task attempt, so membership follows that run. Assign and link new
+runs, including Restart results, explicitly.
+
+Every run retains its own metrics and step axis. Groups do not concatenate
+history, shift steps, aggregate parallel metrics, or coordinate execution.
+Comparison charts keep each run's series separate. Deleting a group preserves
+its runs and data; expired members can remain as unavailable historical links.
+
 ## Task-controlled waiting
 
 Run `"$EXPRI_BIN" runs set-status waiting` from a live task to report that it is
