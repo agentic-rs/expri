@@ -285,6 +285,10 @@ Older files may already contain several readings per minute. Browser charts and
 summaries select the first eligible reading per minute of each capture, while
 the original upload offsets and archive bytes stay valid. New capture writes
 use the minute policy; existing committed local prefixes are never rewritten.
+On a worker upgrade, large active captures seed their minute selections in
+bounded background passes before export catches up. Training and machine
+collection continue. Allow this migration to finish before treating temporarily
+unchanged capture-file lengths as an exporter failure.
 The hosted backend can reclaim space from older high-rate streams using
 [lossless system-capture storage compression](self-hosted-service.md#system-capture-storage-compression).
 This private storage format reconstructs the original bytes for downloads,
