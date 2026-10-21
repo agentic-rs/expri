@@ -286,7 +286,7 @@ impl<S: ObjectStorage> Store<S> {
           "previous system capture is still draining",
         ));
       }
-      run_system::validate_seal(&self.directory, &files, &state_value)?;
+      run_system::validate_seal(&self.directory, &tx, &files, &state_value)?;
     }
     let snapshot = serde_json::to_string(
       &json!({"attempt":attempt,"documents":documents,"streams":streams,"state":state_value}),

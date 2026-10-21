@@ -29,7 +29,7 @@ export function RunSystemPanel({ state: s, actions: a, runs, time_zone, now, sco
   const inventory = data?.inventories.at(-1)?.inventory;
   const error = Object.hasOwn(s.errors, s.focused_run_id) ? s.errors[s.focused_run_id] : null;
   return <section className="run-system-panel" aria-label="System metrics recorded during runs" aria-busy={s.loading}>
-    <div className="run-system-heading"><div><h2>System metrics</h2><p className="muted">Whole-machine readings recorded during the run. Exact captures follow run retention.</p></div>{s.loading && <span className="muted" role="status">Loading retained readings…</span>}</div>
+    <div className="run-system-heading"><div><h2>System metrics</h2><p className="muted">One whole-machine reading per minute of each capture. Retained with the run.</p></div>{s.loading && <span className="muted" role="status">Loading retained readings…</span>}</div>
     {s.run_ids.length > 1 && <>
       <div className="inspector-controls"><SystemChoices name={`${scope_id}-run-system-reduction`} legend="Compare summary" value={s.reduction} options={[{ value: "last", label: "Last" }, { value: "min", label: "Minimum" }, { value: "max", label: "Maximum" }, { value: "mean", label: "Mean" }]} on_change={a.reduction} /></div>
       <div className="table-scroll run-system-comparison"><table><thead><tr><th>Run</th>{s.selected_metrics.map(name => <th key={name}>system/{name}</th>)}</tr></thead><tbody>{s.run_ids.map(id => <tr key={id}>
@@ -53,7 +53,7 @@ export function RunSystemPanel({ state: s, actions: a, runs, time_zone, now, sco
         <div className="choice-tags">{names.map(name => <label className="choice-tag" key={name}><input className="sr-only" type="checkbox" checked={s.selected_metrics.includes(name)} disabled={!s.selected_metrics.includes(name) && s.selected_metrics.length >= 6} onChange={event => a.metric(name, event.currentTarget.checked)} /><span>system/{name}</span></label>)}</div>
         {names.length < s.metric_names.length && <p className="muted">Showing up to 64 matches. Search for another recorded system metric.</p>}
       </details>
-      {data && <details className="run-system-summaries"><summary>Complete capture summaries</summary><div className="table-scroll"><table><thead><tr><th>System metric</th><th>Samples</th><th>Last</th><th>Minimum</th><th>Maximum</th><th>Mean</th></tr></thead><tbody>{s.selected_metrics.map(name => {
+      {data && <details className="run-system-summaries"><summary>Retained reading summaries</summary><div className="table-scroll"><table><thead><tr><th>System metric</th><th>Samples</th><th>Last</th><th>Minimum</th><th>Maximum</th><th>Mean</th></tr></thead><tbody>{s.selected_metrics.map(name => {
         const summary = ownSummary(data.metric_summaries, name);
         return <tr key={name}><th scope="row">system/{name}</th><td className="number">{summary?.count ?? "—"}</td>{(["last", "min", "max", "mean"] as const).map(reduction => <td className="number" key={reduction}>{summaryValue(summary, reduction, name)}</td>)}</tr>;
       })}</tbody></table></div></details>}
@@ -61,9 +61,9 @@ export function RunSystemPanel({ state: s, actions: a, runs, time_zone, now, sco
         <SystemChoices name={`${scope_id}-run-system-axis`} legend="Time axis" value={s.x_axis} options={[{ value: "run_elapsed", label: "Run elapsed" }, { value: "wall_clock", label: "Date & time" }]} on_change={a.axis} />
         {s.x_axis === "wall_clock" && <SystemChoices name={`${scope_id}-run-system-time-zone`} legend="Timezone" value={time_zone} options={[{ value: "local", label: "Local" }, { value: "utc", label: "UTC" }]} on_change={a.time_zone} />}
       </div>
-      <p className="muted system-data-note">{s.x_axis === "run_elapsed" ? "Time since this run started." : "Original observation times within this run’s recorded period."} Counter rates use each original measured interval. Gaps remain missing.</p>
+      <p className="muted system-data-note">{s.x_axis === "run_elapsed" ? "Time since this run started." : "Original observation times within this run’s recorded period."} Each point is a recorded reading, not a minute average. Counter rates use its original measured interval. Gaps remain missing.</p>
     </>}
-    {item?.preview_truncated && <p className="notice warning">The chart preview shows the first 8192 retained readings or its bounded byte window. Summary values cover the complete capture.</p>}
+    {item?.preview_truncated && <p className="notice warning">The chart preview shows the first 8192 retained readings or its bounded byte window. Summary values cover all retained minute readings.</p>}
     <div className="system-charts">{item && data?.start_ms !== null && s.selected_metrics.map(name => {
       const series = item.series.find(series => series.metric_name === name);
       return series?.points.length ? <SystemPlot key={`${s.focused_run_id}:${name}:${s.x_axis}`} series={series} start_ms={data!.start_ms!} end_ms={runSystemEnd(data!, now)} resolution="detail" time_zone={time_zone} x_axis={s.x_axis} title_label={`system/${name}`} summary_last={ownSummary(data!.metric_summaries, name)?.last ?? null} /> : <p className="notice" key={name}>system/{name}: no displayed readings in this capture.</p>;

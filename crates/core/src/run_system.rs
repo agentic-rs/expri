@@ -1,4 +1,5 @@
-//! Run-owned exact system observations. These records never carry training steps.
+//! Run-owned system observations, retaining original values and measurement intervals.
+//! These records never carry training steps.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +10,8 @@ use crate::system_profile::{InventoryRevision, SystemSample, validate_inventory,
 pub const RUN_SYSTEM_CAPABILITY: &str = "run-system-metrics-v1";
 pub const RUN_SYSTEM_PATH: &str = "outputs/system-profile.jsonl";
 pub const RUN_SYSTEM_SCHEMA_VERSION: u32 = 1;
+/// Keep the first actual observation in each wall-clock minute of each capture.
+pub const RUN_SYSTEM_SAMPLE_INTERVAL_MS: i64 = 60_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

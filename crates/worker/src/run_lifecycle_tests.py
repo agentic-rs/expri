@@ -53,6 +53,20 @@ def worker_source():
   )
 
 
+def capture_observation(sequence, observed_at):
+  return {"sequence": sequence, "session_id": "session-test", "observed_at_ms": observed_at,
+    "interval_ms": 10, "collection_duration_ms": 1, "inventory_revision": 1,
+    "metrics": {"cpu/usage_percent": {"kind": "gauge", "value": 30}},
+    "counters": {"network/test/received_bytes": "18446744073709551615"}, "warnings": []}
+
+
+def capture_inventory():
+  return {"revision": 1, "inventory": {"observed_at_ms": 999, "hostname": "host", "os_name": None,
+    "os_version": None, "kernel_version": None, "architecture": "test",
+    "cpu": {"brand": "cpu", "vendor": "test", "logical_cpu_count": 1, "physical_core_count": 1},
+    "memory_total_bytes": 1024, "measurement_scope": "whole machine", "devices": [], "warnings": []}}
+
+
 class RunLifecycleTests(unittest.TestCase):
   def setUp(self):
     self.temporary = tempfile.TemporaryDirectory(prefix="expri-run-lifecycle-tests-")
@@ -267,14 +281,14 @@ class RunLifecycleTests(unittest.TestCase):
     self.assertEqual(state["system_capture_status"], "complete", state)
     self.assertGreaterEqual(len(collector_writes), 2)
 
-  def test_capture_retains_exact_window_and_counters_without_experiment_steps(self):
+  def test_capture_selects_real_minutes_with_exact_boundaries_and_counters(self):
     database = self.capture_profile()
-    inventory = {"revision": 1, "inventory": {"observed_at_ms": 999, "hostname": "host", "os_name": None, "os_version": None, "kernel_version": None, "architecture": "test", "cpu": {"brand": "cpu", "vendor": "test", "logical_cpu_count": 1, "physical_core_count": 1}, "memory_total_bytes": 1024, "measurement_scope": "whole machine", "devices": [], "warnings": []}}
+    inventory = capture_inventory()
     connection = sqlite3.connect(database)
     try:
       connection.execute("INSERT INTO system_inventories VALUES(?,?,?)", ("machine-fixture", 1, json.dumps(inventory)))
-      for sequence, observed_at in enumerate([999, 1000, 1999, 2000], 1):
-        sample = {"sequence": sequence, "session_id": "session-test", "observed_at_ms": observed_at, "interval_ms": 10, "collection_duration_ms": 1, "inventory_revision": 1, "metrics": {"cpu/usage_percent": {"kind": "gauge", "value": 30}}, "counters": {"network/test/received_bytes": "18446744073709551615"}, "warnings": []}
+      for sequence, observed_at in enumerate([999, 1000, 1999, 60_000, 61_000, 62_000], 1):
+        sample = capture_observation(sequence, observed_at)
         connection.execute("INSERT INTO system_samples VALUES(?,?,?,?,?)", ("machine-fixture", sequence, observed_at, 1, json.dumps(sample)))
       connection.commit()
     finally:
@@ -283,16 +297,97 @@ class RunLifecycleTests(unittest.TestCase):
     (run / "outputs").mkdir(parents=True)
     metrics = run / "outputs/metrics.jsonl"
     metrics.write_text('{"step":3,"loss":0.5}\n')
-    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z", "finished_at": "1970-01-01T00:00:02Z"}
+    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z", "finished_at": "1970-01-01T00:01:02Z"}
     system_capture._capture_begin(run, state)
     system_capture._capture_close(run, state)
     self.assertEqual(state["system_capture_status"], "complete", state)
     records = [json.loads(line) for line in (run / "outputs/system-profile.jsonl").read_text().splitlines()]
     samples = [record["sample"] for record in records if record["kind"] == "sample"]
-    self.assertEqual([sample["observed_at_ms"] for sample in samples], [1000, 1999])
+    self.assertEqual([sample["observed_at_ms"] for sample in samples], [1000, 60_000])
+    self.assertTrue(all(sample["interval_ms"] == 10 for sample in samples))
     self.assertEqual(samples[0]["counters"]["network/test/received_bytes"], "18446744073709551615")
     self.assertTrue(all("step" not in sample for sample in samples))
     self.assertEqual(metrics.read_text(), '{"step":3,"loss":0.5}\n')
+
+  def capture_fixture(self):
+    self.capture_profile()
+    run = self.repo / "run-capture"
+    (run / "outputs").mkdir(parents=True)
+    state = {"run_id": run.name, "machine_id": "machine-fixture", "started_at": "1970-01-01T00:00:01Z"}
+    system_capture._capture_begin(run, state)
+    self.assertEqual(state.get("system_capture_status"), "capturing", state)
+    _database, connection = system_capture._capture_connection()
+    self.addCleanup(connection.close)
+    return run, state, connection
+
+  def insert_capture_sample(self, connection, capture_id, sequence, time):
+    # These direct inserts represent an old collector with no Python/Rust gate.
+    inventory = capture_inventory()
+    connection.execute("INSERT INTO system_run_capture_samples(capture_id,sequence,observed_at_ms,inventory,sample) VALUES(?,?,?,?,?)",
+      (capture_id, sequence, time, json.dumps(inventory), json.dumps(capture_observation(sequence, time))))
+    connection.commit()
+
+  def test_capture_minute_ledger_survives_export_reopen_and_clock_regression(self):
+    run, state, connection = self.capture_fixture()
+    capture_id = state["system_capture_id"]
+    self.insert_capture_sample(connection, capture_id, 1, 121_000)
+    system_capture._capture_export(connection, capture_id)
+    connection.close()
+    _database, connection = system_capture._capture_connection()
+    self.addCleanup(connection.close)
+    for sequence, time in enumerate([1000, 122_000, 61_000, 1500], 2):
+      self.insert_capture_sample(connection, capture_id, sequence, time)
+      system_capture._capture_export(connection, capture_id)
+    samples = [record["sample"] for record in map(json.loads, (run / "outputs/system-profile.jsonl").read_text().splitlines()) if record["kind"] == "sample"]
+    self.assertEqual([sample["observed_at_ms"] for sample in samples], [121_000, 1000, 61_000])
+    self.assertTrue(all(sample["interval_ms"] == 10 for sample in samples))
+
+  def test_legacy_capture_migration_preserves_committed_prefix_and_pending_rows(self):
+    run, state, connection = self.capture_fixture()
+    capture_id = state["system_capture_id"]
+    connection.executescript("DROP TRIGGER system_run_capture_minute_gate; DROP TRIGGER system_run_capture_minute_reserve;")
+    for sequence, time in enumerate([1000, 1500], 1):
+      self.insert_capture_sample(connection, capture_id, sequence, time)
+    system_capture._capture_export(connection, capture_id)
+    prefix = (run / "outputs/system-profile.jsonl").read_bytes()
+    self.insert_capture_sample(connection, capture_id, 3, 61_000)
+    self.insert_capture_sample(connection, capture_id, 4, 62_000)
+    connection.executescript("DELETE FROM system_run_capture_policy; DELETE FROM system_run_capture_minutes;")
+    connection.executescript(system_capture._CAPTURE_SCHEMA)
+    system_capture._capture_export(connection, capture_id)
+    self.insert_capture_sample(connection, capture_id, 5, 1800)
+    self.insert_capture_sample(connection, capture_id, 6, 121_000)
+    system_capture._capture_export(connection, capture_id)
+    data = (run / "outputs/system-profile.jsonl").read_bytes()
+    self.assertTrue(data.startswith(prefix))
+    samples = [record["sample"]["observed_at_ms"] for record in map(json.loads, data.splitlines()) if record["kind"] == "sample"]
+    self.assertEqual(samples, [1000, 1500, 61_000, 121_000])
+    self.assertEqual(connection.execute("SELECT COUNT(*) FROM system_run_capture_minute_seed").fetchone()[0], 0)
+
+  def test_legacy_seed_is_bounded_resumable_and_does_not_rescan_initialized_files(self):
+    run, state, connection = self.capture_fixture()
+    capture_id = state["system_capture_id"]
+    stream = run / "outputs/system-profile.jsonl"
+    with stream.open("ab") as output:
+      for sequence in range(1, 5001):
+        output.write(json.dumps({"kind": "sample", "sample": capture_observation(sequence, 1000 + sequence)}).encode() + b"\n")
+    target = stream.stat().st_size
+    connection.execute("UPDATE system_run_captures SET file_offset=?,exported_sequence=5000 WHERE capture_id=?", (target, capture_id))
+    connection.commit()
+    connection.executescript("DELETE FROM system_run_capture_policy;")
+    connection.executescript(system_capture._CAPTURE_SCHEMA)
+    row = dict(connection.execute("SELECT * FROM system_run_captures WHERE capture_id=?", (capture_id,)).fetchone())
+    self.assertFalse(system_capture._capture_seed_minutes(connection, row))
+    offset = connection.execute("SELECT scan_offset FROM system_run_capture_minute_seed WHERE capture_id=?", (capture_id,)).fetchone()[0]
+    self.assertGreater(offset, 0)
+    self.assertLess(offset, target)
+    connection.close()
+    _database, connection = system_capture._capture_connection()
+    self.addCleanup(connection.close)
+    self.assertEqual(connection.execute("SELECT scan_offset FROM system_run_capture_minute_seed WHERE capture_id=?", (capture_id,)).fetchone()[0], offset)
+    self.assertTrue(system_capture._capture_seed_minutes(connection, row))
+    stream.unlink()
+    self.assertTrue(system_capture._capture_seed_minutes(connection, row))
 
   def test_foreground_and_detached_runs_preserve_existing_machine_identity(self):
     database = self.profile_identity()

@@ -408,15 +408,15 @@ fn collector_metadata_leaves_waiting_intact_and_preserves_fields_when_terminal()
 }
 
 #[test]
-fn outbox_retains_exact_period_samples_after_raw_expiry() {
+fn outbox_retains_selected_minute_samples_after_raw_expiry() {
   let (_directory, mut store, run) = fixture();
   let id = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
   record(&mut store, 999);
   record(&mut store, 1000);
-  store.close_run_capture(&id, 2000).unwrap();
-  record(&mut store, 1999); // collection began before close and commits afterward
-  record(&mut store, 2000); // collector acknowledges the exclusive end boundary
-  prune(&mut store.connection, DETAIL_RETENTION_MS + 10_000, 10_000).unwrap();
+  store.close_run_capture(&id, 62_000).unwrap();
+  record(&mut store, 61_999); // collection began before close and commits afterward
+  record(&mut store, 62_000); // same-minute sample still acknowledges the end
+  prune(&mut store.connection, DETAIL_RETENTION_MS + 100_000, 10_000).unwrap();
   assert_eq!(store.status().unwrap().detail_count, 0);
   assert!(capture(&store.connection, &id).unwrap().acknowledged);
   store.finish_capture(&id, true, Vec::new()).unwrap();
@@ -436,13 +436,13 @@ fn outbox_retains_exact_period_samples_after_raw_expiry() {
       .iter()
       .map(|sample| sample.observed_at_ms)
       .collect::<Vec<_>>(),
-    [1000, 1999]
+    [1000, 61_999]
   );
   assert_eq!(samples[0].counters["network/test/received_bytes"], u64::MAX);
   assert!(matches!(
     records.last(),
     Some(RunSystemRecord::End {
-      end_ms: 2000,
+      end_ms: 62_000,
       complete: true,
       ..
     })
@@ -585,9 +585,9 @@ fn upgraded_collector_keeps_a_durable_gap_after_a_downgrade() {
     .connection
     .execute("UPDATE system_local SET sequence=sequence+1", [])
     .unwrap();
-  record(&mut store, 1500);
-  store.close_run_capture(&id, 2000).unwrap();
-  record(&mut store, 2000);
+  record(&mut store, 61_500);
+  store.close_run_capture(&id, 62_000).unwrap();
+  record(&mut store, 62_000);
   assert!(capture(&store.connection, &id).unwrap().acknowledged);
   store.finish_capture(&id, true, Vec::new()).unwrap();
   assert!(!capture(&store.connection, &id).unwrap().complete);
@@ -641,7 +641,7 @@ fn native_clock_repair_preserves_exact_run_owned_readings_without_duplicate_back
 fn exporter_bounds_memory_and_transaction_payload_for_large_observations() {
   let (_directory, mut store, run) = fixture();
   let id = store.begin_run_capture(&run, "run-fixture", 1000).unwrap();
-  for time in [1000, 1500, 1999] {
+  for time in [1000, 61_500, 121_999] {
     let (mut inventory, mut sample) = observation(time);
     // Valid source payload remains small; this simulates future payload growth
     // by adding JSON whitespace to its durable copies without changing values.
@@ -667,8 +667,8 @@ fn exporter_bounds_memory_and_transaction_payload_for_large_observations() {
     )
     .unwrap();
   assert_eq!(pending, 2);
-  store.close_run_capture(&id, 2000).unwrap();
-  record(&mut store, 2000);
+  store.close_run_capture(&id, 122_000).unwrap();
+  record(&mut store, 122_000);
   store.finish_capture(&id, true, Vec::new()).unwrap();
   assert_eq!(
     records(&run)
@@ -722,9 +722,11 @@ fn close_acknowledgement_freezes_eligibility_before_later_clock_regressions() {
       }
     })
     .collect::<Vec<_>>();
-  assert_eq!(observations, [1000, 1999]);
+  assert_eq!(observations, [1000]);
   assert!(capture(&store.connection, &id).unwrap().complete);
 }
+
+mod minute_sampling;
 
 #[test]
 fn independent_compaction_does_not_certify_an_old_collector() {

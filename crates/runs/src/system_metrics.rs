@@ -7,7 +7,7 @@ use chrono::DateTime;
 use expri_core::error::{ExpriError, Result};
 use expri_core::identifiers::validate_component;
 use expri_core::run_state::{is_active_status, is_terminal_status};
-use expri_core::run_system::RunSystemRecord;
+use expri_core::run_system::{RUN_SYSTEM_SAMPLE_INTERVAL_MS, RunSystemRecord};
 use expri_core::system_profile::{InventoryRevision, MetricKind, SystemSample};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -345,6 +345,32 @@ pub fn read<R: Read>(
   cursor: Option<u64>,
   limit: usize,
 ) -> Result<RunSystemMetrics> {
+  read_selected(reader, reopen, run_id, window, cursor, limit, false)
+}
+
+/// Project the first recorded observation in each UTC minute of each capture.
+/// Every record is validated, and cursors retain their original raw ordinals.
+/// Samples keep their original timestamp, measured interval and counter values.
+pub fn read_minutes<R: Read>(
+  reader: R,
+  reopen: impl FnOnce() -> Result<R>,
+  run_id: &str,
+  window: &RunSystemWindow,
+  cursor: Option<u64>,
+  limit: usize,
+) -> Result<RunSystemMetrics> {
+  read_selected(reader, reopen, run_id, window, cursor, limit, true)
+}
+
+fn read_selected<R: Read>(
+  reader: R,
+  reopen: impl FnOnce() -> Result<R>,
+  run_id: &str,
+  window: &RunSystemWindow,
+  cursor: Option<u64>,
+  limit: usize,
+  minute_samples: bool,
+) -> Result<RunSystemMetrics> {
   if !(1..=MAX_ROWS).contains(&limit) {
     return Err(rejected(400, "run system limit must be between 1 and 1024"));
   }
@@ -384,6 +410,8 @@ pub fn read<R: Read>(
   let mut page_closed = false;
   let mut coverage: BTreeMap<String, u64> = BTreeMap::new();
   let mut previous_time = None;
+  let mut retained_minutes = BTreeSet::new();
+  let mut measurement_kinds = BTreeMap::new();
   let complete_lines = records(reader, |record| {
     match record {
       RunSystemRecord::Capture {
@@ -414,6 +442,7 @@ pub fn read<R: Read>(
         segment_start = start_ms;
         segment_end = expected.and_then(|segment| segment.end_ms);
         inventory_revisions.clear();
+        retained_minutes.clear();
         ended = false;
         header = true;
       }
@@ -454,6 +483,12 @@ pub fn read<R: Read>(
           );
         }
         previous_time = Some(sample.observed_at_ms);
+        let keep_sample = !minute_samples
+          || retained_minutes.insert(
+            sample
+              .observed_at_ms
+              .div_euclid(RUN_SYSTEM_SAMPLE_INTERVAL_MS),
+          );
         for note in &sample.warnings {
           warning(&mut result, note);
         }
@@ -469,6 +504,17 @@ pub fn read<R: Read>(
         }
         let duration = sample.interval_ms;
         for (name, reading) in &sample.metrics {
+          if minute_samples {
+            if measurement_kinds
+              .get(name)
+              .is_some_and(|kind| *kind != reading.kind)
+            {
+              return Err(rejected(422, "run system metric changes measurement kind"));
+            }
+            if measurement_kinds.len() < MAX_METRICS {
+              measurement_kinds.insert(name.clone(), reading.kind);
+            }
+          }
           let value = match reading.kind {
             MetricKind::Gauge => reading.value,
             MetricKind::CounterDelta if sample.interval_ms > 0 => {
@@ -484,6 +530,9 @@ pub fn read<R: Read>(
           };
           if !value.is_finite() {
             warning(&mut result, "Non-finite derived system rates are omitted.");
+            continue;
+          }
+          if !keep_sample {
             continue;
           }
           if !result.metric_summaries.contains_key(name)
@@ -529,7 +578,7 @@ pub fn read<R: Read>(
             *covered = next;
           }
         }
-        if ordinal > cursor.unwrap_or(0) && !page_closed {
+        if keep_sample && ordinal > cursor.unwrap_or(0) && !page_closed {
           let size = serde_json::to_vec(&sample)?.len() + 1;
           if result.samples.len() == limit || bytes + size > PAGE_BYTES {
             if result.samples.is_empty() {

@@ -315,6 +315,83 @@ fn retained_run_capture_is_independent_of_global_retention_and_has_its_own_refre
 }
 
 #[test]
+fn retained_run_api_projects_first_recorded_minutes_with_original_raw_cursors() {
+  use expri_core::run_system::RunSystemRecord as Record;
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let scope = RunScope {
+    project_id: "project".into(),
+    origin: "worker".into(),
+    run_id: "run-minutes".into(),
+  };
+  publish_run_state(
+    &store,
+    &scope,
+    &json!({
+      "schema_version":1,"run_id":scope.run_id,"machine_id":"machine-test",
+      "system_capture_id":"capture-test","system_capture_status":"complete",
+      "task":"train","status":"completed","started_at":"1970-01-01T00:00:10Z",
+      "finished_at":"1970-01-01T00:01:20Z","exit_code":0
+    }),
+  );
+  let mut records = vec![
+    Record::Capture {
+      schema_version: 1,
+      capture_id: "capture-test".into(),
+      machine_id: "machine-test".into(),
+      start_ms: 10_000,
+    },
+    Record::Inventory {
+      inventory: InventoryRevision {
+        revision: 1,
+        inventory: inventory(10_000),
+      },
+    },
+  ];
+  for (index, observed_at_ms, value) in [
+    (1, 11_000, 2.0),
+    (2, 12_000, 999.0),
+    (3, 60_000, 4.0),
+    (4, 70_000, 998.0),
+  ] {
+    let mut reading = sample(index, observed_at_ms, 0);
+    reading.interval_ms = 1000;
+    reading.metrics = BTreeMap::from([(
+      "cpu/usage_percent".into(),
+      MetricReading {
+        kind: MetricKind::Gauge,
+        value,
+      },
+    )]);
+    records.push(Record::Sample { sample: reading });
+  }
+  records.push(Record::End {
+    end_ms: 80_000,
+    complete: true,
+    warnings: vec![],
+  });
+  append_capture(&store, &scope, 0, &records);
+  let dashboard = HostedDashboard::new(&store).unwrap();
+  let first = dashboard
+    .run_system("hosted:project:worker", &scope.run_id, None, 1)
+    .unwrap();
+  assert_eq!(first.status, "complete");
+  assert_eq!(first.sample_count, 4);
+  assert_eq!(first.samples[0].sequence, 1);
+  assert_eq!(first.next_cursor, Some(1));
+  assert_eq!(first.metric_summaries["cpu/usage_percent"].count, 2);
+  assert_eq!(first.metric_summaries["cpu/usage_percent"].max, 4.0);
+  let second = dashboard
+    .run_system("hosted:project:worker", &scope.run_id, first.next_cursor, 1)
+    .unwrap();
+  assert_eq!(second.samples[0].sequence, 3);
+  assert_eq!(second.samples[0].observed_at_ms, 60_000);
+  assert_eq!(second.samples[0].interval_ms, 1000);
+  assert_eq!(second.next_cursor, None);
+  assert_eq!(second.sample_count, 4);
+}
+
+#[test]
 fn missing_and_spoofed_run_capture_metadata_never_falls_back_to_global_machine_history() {
   use expri_core::run_system::RunSystemRecord as Record;
   let directory = tempfile::tempdir().unwrap();

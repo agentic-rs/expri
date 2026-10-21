@@ -229,7 +229,7 @@ Missing or unreadable profiles leave the run without a mapping and do not stop
 the experiment. Existing runs do not acquire an inferred machine identity from
 their hostname or worker label.
 
-## Exact system metrics for runs
+## Retained system metrics for runs
 
 Deploy the updated server first so complete captures fit its nine-file tracking
 archive limit. Then upgrade run workers and stop any older standalone collector
@@ -238,11 +238,13 @@ Native and Python launchers reserve `outputs/system-profile.jsonl` when existing
 local profile storage is available. They record `system_capture_id` alongside `machine_id` in
 run state. An existing user file at that path is never replaced.
 
-The collector copies each matching raw sample and its inventory into a durable
-capture outbox in the same transaction as collection. The exporter appends the
-original records to the run file, flushes them to disk, and checkpoints the
-committed byte prefix before releasing outbox rows. This preserves exact readings
-even when exporting or publishing is interrupted for more than 72 hours.
+For each capture, the collector keeps the first matching observation in each
+wall-clock minute and its inventory in a durable outbox. Selection commits in
+the same transaction as collection and survives export, restart, and clock
+corrections. Live machine collection and disk-space checks retain their normal
+cadence. The exporter appends the selected original records to the run file,
+flushes them to disk, and checkpoints the committed byte prefix before releasing
+outbox rows. Selected readings survive interruptions longer than 72 hours.
 The run file, hosted tracking stream, and result archive follow normal run
 retention and deletion. Rolling machine detail and hourly history remain separate.
 
@@ -250,6 +252,11 @@ The mapping uses the run's existing period: `started_at` includes environment
 preparation, and observations satisfy `start <= observed_at < finish`. Overlapping
 runs capture the same whole-machine readings. Original intervals, sequence,
 session, inventory revisions, warnings, and decimal counter strings remain intact.
+Each point is one actual observation, not a minute average or a minute's total
+counter activity. Minute buckets do not impose a uniform 60-second spacing:
+readings near opposite minute boundaries may be close together. Continuation
+starts a separate capture, so each attempt can retain its first reading even
+when two attempts occupy the same minute.
 Counter charts show rates over the full measured interval, including intervals
 that begin before the run. They do not prorate a boundary interval into exact
 per-process usage. Missing observations and clock changes remain visible.
@@ -263,16 +270,25 @@ code. Recorded readings remain available; no boundary sample is invented.
 Run captures use the existing experiment publisher and credentials. The server
 must advertise `run-system-metrics-v1` for automatic stream uploads. Unsupported
 servers still receive normal experiment data; publishing status explains that
-the exact capture remains local. New browser APIs read only the run's own uploaded
+the retained capture remains local. New browser APIs read only the run's own uploaded
 capture, never arbitrary global machine history inferred from run metadata.
 
-Open **System metrics** in a run or comparison to inspect mapped values, full
+Open **System metrics** in a run or comparison to inspect mapped values, retained
 summaries, and Run elapsed or Wall clock charts. The System page's Run period
 mode uses retained captures, so older runs can be inspected after machine detail
 expires. Pre-existing runs without a capture remain explicitly unavailable;
 hourly averages cannot reconstruct exact short-run readings. Browser pages and
 chart previews are bounded with visible truncation notes. The full raw file is
 included by default when fetching a run from the service.
+
+Older files may already contain several readings per minute. Browser charts and
+summaries select the first eligible reading per minute of each capture, while
+the original upload offsets and archive bytes stay valid. New capture writes
+use the minute policy; existing committed local prefixes are never rewritten.
+The hosted backend can reclaim space from older high-rate streams using
+[lossless system-capture storage compression](self-hosted-service.md#system-capture-storage-compression).
+This private storage format reconstructs the original bytes for downloads,
+upload retries, continuation, and archives. It does not alter training metrics.
 
 The CLI can also inspect the same local or hosted history:
 

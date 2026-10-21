@@ -83,7 +83,7 @@ impl Dashboard {
     };
     let size = file.metadata()?.len();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    expri_runs::system_metrics::read(
+    expri_runs::system_metrics::read_minutes(
       SystemDeadlineReader {
         reader: file.take(size),
         deadline,

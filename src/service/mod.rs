@@ -85,6 +85,15 @@ enum ServiceSubcommand {
     #[arg(long)]
     create_bucket: bool,
   },
+  /// Preview or apply lossless compression to hosted system-capture storage.
+  CompactSystemCaptures {
+    /// Existing self-hosted service data directory; no client or S3 credentials are needed.
+    #[arg(long)]
+    data_dir: PathBuf,
+    /// Reclaim disk blocks. Requires the backend using this directory to be stopped.
+    #[arg(long)]
+    apply: bool,
+  },
   /// Queue ongoing run publication and return; optionally wait or watch.
   Publish(PublishOptions),
   /// Retry a run's saved publication job in the shared worker service.
@@ -453,6 +462,9 @@ pub fn run(command: ServiceCommand, target: Option<&str>, quiet: bool) -> Result
       let config = toml::from_str(&std::fs::read_to_string(config)?)?;
       return server::serve(config, listen, data_dir, create_bucket);
     }
+    ServiceSubcommand::CompactSystemCaptures { data_dir, apply } => {
+      server::compact_system_captures(&data_dir, apply)?
+    }
     ServiceSubcommand::Publish(options) => {
       let watch = options.watch;
       let wait = options.wait || watch;
@@ -623,6 +635,34 @@ mod tests {
   struct Cli {
     #[command(flatten)]
     service: ServiceCommand,
+  }
+
+  #[test]
+  fn system_capture_compaction_defaults_to_preview_and_requires_a_directory() {
+    assert!(Cli::try_parse_from(["expri", "compact-system-captures"]).is_err());
+    for apply in [false, true] {
+      let mut args = vec![
+        "expri",
+        "compact-system-captures",
+        "--data-dir",
+        "/var/lib/expri",
+        "--json",
+      ];
+      if apply {
+        args.push("--apply");
+      }
+      let cli = Cli::try_parse_from(args).unwrap();
+      assert!(cli.service.json);
+      let ServiceSubcommand::CompactSystemCaptures {
+        data_dir,
+        apply: actual_apply,
+      } = cli.service.command
+      else {
+        unreachable!()
+      };
+      assert_eq!(data_dir, PathBuf::from("/var/lib/expri"));
+      assert_eq!(actual_apply, apply);
+    }
   }
 
   #[test]
