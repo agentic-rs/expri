@@ -26,9 +26,9 @@ enum SkillTopic {
   Run,
   /// Queue frozen tasks with resource reservations and operate execution workers.
   Queue,
-  /// Inspect status and logs, cancel detached runs, and fetch worker results.
+  /// Inspect runs, fetch worker results, and understand website experiment groups.
   Runs,
-  /// Record scalar metrics and parameters, then compare experiments.
+  /// Record scalar metrics and parameters, then compare runs.
   Metrics,
   /// Register finalized outputs for background upload.
   Artifacts,

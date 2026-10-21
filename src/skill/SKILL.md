@@ -1,6 +1,6 @@
 ---
 name: expri
-description: Run experiments and query published results with the expri CLI, including remote workers, isolated Python environments, metrics, managed assets, and result transfers.
+description: Execute tasks, inspect published runs, and understand website experiment groups with expri, including remote workers, isolated Python environments, metrics, managed assets, and result transfers.
 ---
 
 # Expri for agents
@@ -16,9 +16,9 @@ prints an embedded Markdown guide and works without project configuration.
 | `expri skill login` | Authenticate to the server and revoke an issued CLI token |
 | `expri skill config` | Configure the global server, define tasks, or select a target |
 | `expri skill push` | Transfer source and config to a worker |
-| `expri skill run` | Launch a task, including a detached experiment |
+| `expri skill run` | Launch a task, including a detached run |
 | `expri skill queue` | Submit frozen tasks, reserve resources, and inspect queued jobs/workers |
-| `expri skill runs` | Inspect status/logs, cancel, or retrieve worker results |
+| `expri skill runs` | Inspect runs, retrieve worker results, or understand website experiment groups and lineage |
 | `expri skill metrics` | Instrument training or compare recorded metrics |
 | `expri skill artifacts` | Hand finalized checkpoints to background publishing |
 | `expri skill assets` | Pin datasets/models or reuse a producing run's output |
