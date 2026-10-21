@@ -25,12 +25,14 @@ pub(super) mod run_control;
 mod run_retention;
 mod system_profiles;
 mod tracking;
+pub use tracking::compact_system_captures;
+pub(in crate::service) use tracking::raw_io::TrackingReader;
 
 const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
-pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 12;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 13;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 

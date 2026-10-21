@@ -306,9 +306,10 @@ fn save_checkpoint(row: &Capture) -> Result<()> {
 }
 
 mod export;
+mod sampling;
 
 fn backfill(transaction: &Transaction<'_>, capture_id: &str) -> Result<()> {
-  sql(transaction.execute("INSERT OR IGNORE INTO system_run_capture_samples(capture_id,sequence,observed_at_ms,inventory,sample) SELECT c.capture_id,s.sequence,s.observed_at_ms,i.payload,s.payload FROM system_run_captures c JOIN system_samples s ON s.machine_id=c.machine_id JOIN system_inventories i ON i.machine_id=s.machine_id AND i.revision=s.inventory_revision WHERE c.capture_id=?1 AND c.closed=0 AND s.sequence>c.exported_sequence AND s.observed_at_ms>=c.start_ms AND (c.end_ms IS NULL OR s.observed_at_ms<c.end_ms) AND NOT EXISTS(SELECT 1 FROM system_local_quarantine q WHERE q.machine_id=s.machine_id AND q.kind='sample' AND q.record_key=s.sequence)", [capture_id]))?;
+  sql(transaction.execute("INSERT OR IGNORE INTO system_run_capture_samples(capture_id,sequence,observed_at_ms,inventory,sample) SELECT c.capture_id,s.sequence,s.observed_at_ms,i.payload,s.payload FROM system_run_captures c JOIN system_samples s ON s.machine_id=c.machine_id JOIN system_inventories i ON i.machine_id=s.machine_id AND i.revision=s.inventory_revision WHERE c.capture_id=?1 AND c.closed=0 AND s.sequence>c.exported_sequence AND s.observed_at_ms>=c.start_ms AND (c.end_ms IS NULL OR s.observed_at_ms<c.end_ms) AND NOT EXISTS(SELECT 1 FROM system_local_quarantine q WHERE q.machine_id=s.machine_id AND q.kind='sample' AND q.record_key=s.sequence) ORDER BY s.sequence", [capture_id]))?;
   Ok(())
 }
 

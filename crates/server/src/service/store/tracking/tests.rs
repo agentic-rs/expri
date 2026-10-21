@@ -762,9 +762,8 @@ fn process_kills_before_and_after_commit_preserve_acknowledged_bytes_and_dedupe_
       store
         .tracking_open(&file)
         .unwrap()
-        .metadata()
-        .unwrap()
-        .len(),
+        .seek(SeekFrom::End(0))
+        .unwrap(),
       file.size
     );
     assert_eq!(

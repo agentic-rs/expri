@@ -15,7 +15,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
     limit: usize,
     deadline: Instant,
   ) -> Result<expri_runs::system_metrics::RunSystemMetrics> {
-    expri_runs::system_metrics::read(
+    expri_runs::system_metrics::read_minutes(
       SystemDeadlineReader {
         reader: self.run_system_reader(record, deadline)?,
         deadline,
@@ -254,7 +254,7 @@ impl<S: ObjectStorage> HostedDashboard<'_, S> {
 }
 
 struct CaptureFileReader {
-  file: std::fs::File,
+  file: crate::service::store::TrackingReader,
   remaining: u64,
   deadline: Instant,
 }

@@ -4191,11 +4191,12 @@ test("project usage shows stored S3 and server local bytes instead of reference-
   await settled(() => nodes.get("storage-usage").textContent.includes("9 KiB"));
   const usage = nodes.get("storage-usage");
   assert.match(usage.textContent, /S3 storage9 KiB3 stored objects, including retained uploads/);
-  assert.match(usage.textContent, /Local storage1 KiBTracking files and result ZIPs on the server/);
+  assert.match(usage.textContent, /Local storage1 KiBTracking files and result ZIPs, before storage compression/);
   assert.doesNotMatch(usage.textContent, /File totals|Shared references|16 KiB/);
   assert.match(usage.textContent, /Pending uploads512 B declared/);
   assert.match(usage.textContent, /Shared inputs and outputs count once/);
   assert.match(usage.textContent, /historical S3 versions and shared database overhead are excluded/);
+  assert.match(usage.textContent, /Compressed system captures use less disk space than these file lengths/);
   assert.equal(nodes.document.getElementById("delete-project-button"), null);
   assert.equal(nodes.get("delete-project-dialog").open, false);
   assert.equal(nodes.document.querySelectorAll("#storage-kind-options input[type=radio]").length, 2);

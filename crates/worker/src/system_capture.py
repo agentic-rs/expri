@@ -96,12 +96,12 @@ def _capture_identity(descriptor):
   return str(metadata.st_dev) + ":" + str(metadata.st_ino)
 
 
-def _capture_open(run_dir, create=False):
+def _capture_open(run_dir, create=False, read_only=False):
   run_dir = _CapturePath(run_dir)
   for path in (run_dir, run_dir / "outputs"):
     if not _capture_stat.S_ISDIR(path.lstat().st_mode):
       raise ValueError("capture directory must not be a symlink")
-  flags = _capture_os.O_RDWR | getattr(_capture_os, "O_NOFOLLOW", 0) | getattr(_capture_os, "O_CLOEXEC", 0)
+  flags = (_capture_os.O_RDONLY if read_only else _capture_os.O_RDWR) | getattr(_capture_os, "O_NOFOLLOW", 0) | getattr(_capture_os, "O_CLOEXEC", 0) | getattr(_capture_os, "O_NONBLOCK", 0)
   if create:
     flags |= _capture_os.O_CREAT | _capture_os.O_EXCL
   descriptor = _capture_os.open(run_dir / _CAPTURE_PATH, flags, 0o600)
@@ -195,7 +195,7 @@ def _capture_begin(run_dir, state):
     connection.execute("BEGIN IMMEDIATE")
     connection.execute("INSERT INTO system_run_captures(capture_id,machine_id,run_id,run_dir,start_ms,file_offset,file_identity) VALUES(?,?,?,?,?,?,?)", (capture_id, machine_id, state["run_id"], str(run_dir), start_ms, file_offset, file_identity))
     connection.execute("UPDATE system_run_captures SET coverage_lost=1 WHERE capture_id=? AND acknowledged=0 AND NOT EXISTS(SELECT 1 FROM system_run_capture_support p JOIN system_local l ON l.singleton=p.singleton WHERE p.sequence=l.sequence) AND EXISTS(SELECT 1 FROM system_local WHERE sequence>0)", (capture_id,))
-    connection.execute("INSERT OR IGNORE INTO system_run_capture_samples(capture_id,sequence,observed_at_ms,inventory,sample) SELECT c.capture_id,s.sequence,s.observed_at_ms,i.payload,s.payload FROM system_run_captures c JOIN system_samples s ON s.machine_id=c.machine_id JOIN system_inventories i ON i.machine_id=s.machine_id AND i.revision=s.inventory_revision WHERE c.capture_id=? AND s.observed_at_ms>=c.start_ms AND s.sequence>c.exported_sequence AND NOT EXISTS(SELECT 1 FROM system_local_quarantine q WHERE q.machine_id=s.machine_id AND q.kind='sample' AND q.record_key=s.sequence)", (capture_id,))
+    connection.execute("INSERT OR IGNORE INTO system_run_capture_samples(capture_id,sequence,observed_at_ms,inventory,sample) SELECT c.capture_id,s.sequence,s.observed_at_ms,i.payload,s.payload FROM system_run_captures c JOIN system_samples s ON s.machine_id=c.machine_id JOIN system_inventories i ON i.machine_id=s.machine_id AND i.revision=s.inventory_revision WHERE c.capture_id=? AND s.observed_at_ms>=c.start_ms AND s.sequence>c.exported_sequence AND NOT EXISTS(SELECT 1 FROM system_local_quarantine q WHERE q.machine_id=s.machine_id AND q.kind='sample' AND q.record_key=s.sequence) ORDER BY s.sequence", (capture_id,))
     connection.commit()
     state.update(system_capture_id=capture_id, system_capture_status="capturing")
     state.pop("system_capture_error", None)
@@ -220,6 +220,62 @@ def _capture_validate(descriptor, row):
     raise ValueError("capture header changed")
 
 
+def _capture_seed_minutes(connection, row):
+  pending = connection.execute("SELECT * FROM system_run_capture_minute_seed WHERE capture_id=?", (row["capture_id"],)).fetchone()
+  if pending is None:
+    return True
+  if row["closed"]:
+    connection.execute("DELETE FROM system_run_capture_minute_seed WHERE capture_id=?", (row["capture_id"],))
+    connection.commit()
+    return True
+  target = pending["file_offset"]
+  offset = max(pending["scan_offset"], row.get("segment_offset", 0))
+  minutes = {}
+  consumed = 0
+  descriptor = _capture_open(_CapturePath(row["run_dir"]), read_only=True)
+  with _capture_os.fdopen(descriptor, "rb") as source:
+    if (_capture_identity(source.fileno()) != pending["file_identity"]
+        or pending["file_identity"] != row["file_identity"]
+        or target > row["file_offset"] or _capture_os.fstat(source.fileno()).st_size < target
+        or offset > target):
+      raise ValueError("legacy capture prefix changed during minute sampling migration")
+    header = _capture_json.loads(_capture_os.pread(source.fileno(), 1024, row.get("segment_offset", 0)).split(b"\n", 1)[0])
+    if header != {"kind": "capture", "schema_version": 1, "capture_id": row["capture_id"], "machine_id": row["machine_id"], "start_ms": row["start_ms"]}:
+      raise ValueError("legacy capture sampling scope changed")
+    source.seek(offset)
+    for _ in range(4096):
+      if offset == target or consumed >= 4 * 1024 * 1024:
+        break
+      line = source.readline(min(800 * 1024 + 1025, target - offset))
+      if len(line) > 800 * 1024 + 1024 or not line.endswith(b"\n"):
+        raise ValueError("legacy capture prefix has an invalid sampling record")
+      record = _capture_json.loads(line)
+      if record.get("kind") == "sample":
+        sample = record["sample"]
+        observed = sample["observed_at_ms"]
+        sequence = sample["sequence"]
+        if type(observed) is not int or type(sequence) is not int:
+          raise ValueError("legacy capture sample identity is invalid")
+        minute = observed // 60000
+        minutes[minute] = min(minutes.get(minute, sequence), sequence)
+      offset += len(line)
+      consumed += len(line)
+  connection.execute("BEGIN IMMEDIATE")
+  try:
+    for minute, sequence in minutes.items():
+      connection.execute("INSERT INTO system_run_capture_minutes(capture_id,minute,sequence) VALUES(?,?,?) ON CONFLICT(capture_id,minute) DO UPDATE SET sequence=MIN(sequence,excluded.sequence)", (row["capture_id"], minute, sequence))
+    if offset == target:
+      connection.execute("DELETE FROM system_run_capture_samples WHERE capture_id=? AND sequence!=(SELECT m.sequence FROM system_run_capture_minutes m WHERE m.capture_id=system_run_capture_samples.capture_id AND m.minute=system_run_capture_samples.observed_at_ms/60000-CASE WHEN system_run_capture_samples.observed_at_ms%60000<0 THEN 1 ELSE 0 END)", (row["capture_id"],))
+      connection.execute("DELETE FROM system_run_capture_minute_seed WHERE capture_id=?", (row["capture_id"],))
+    else:
+      connection.execute("UPDATE system_run_capture_minute_seed SET scan_offset=? WHERE capture_id=?", (offset, row["capture_id"]))
+    connection.commit()
+  except Exception:
+    connection.rollback()
+    raise
+  return offset == target
+
+
 def _capture_export(connection, capture_id, end=None):
   import fcntl
   row = connection.execute("SELECT * FROM system_run_captures WHERE capture_id=?", (capture_id,)).fetchone()
@@ -228,6 +284,9 @@ def _capture_export(connection, capture_id, end=None):
   descriptor = None
   try:
     fcntl.flock(lease_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    row = dict(connection.execute("SELECT * FROM system_run_captures WHERE capture_id=?", (capture_id,)).fetchone())
+    if not _capture_seed_minutes(connection, row):
+      return row, None
     connection.execute("BEGIN")
     row = dict(connection.execute("SELECT * FROM system_run_captures WHERE capture_id=?", (capture_id,)).fetchone())
     records = []
@@ -312,6 +371,7 @@ def _capture_close(run_dir, state):
     connection.execute("BEGIN IMMEDIATE")
     connection.execute("UPDATE system_run_captures SET end_ms=? WHERE capture_id=? AND closed=0", (end_ms, capture_id))
     connection.execute("UPDATE system_run_captures SET coverage_lost=1 WHERE capture_id=? AND acknowledged=0 AND NOT EXISTS(SELECT 1 FROM system_run_capture_support p JOIN system_local l ON l.singleton=p.singleton WHERE p.sequence=l.sequence) AND EXISTS(SELECT 1 FROM system_local WHERE sequence>0)", (capture_id,))
+    connection.execute("DELETE FROM system_run_capture_minutes WHERE capture_id=? AND sequence IN (SELECT sequence FROM system_run_capture_samples WHERE capture_id=? AND observed_at_ms>=?) AND sequence>(SELECT exported_sequence FROM system_run_captures WHERE capture_id=?)", (capture_id, capture_id, end_ms, capture_id))
     connection.execute("DELETE FROM system_run_capture_samples WHERE capture_id=? AND observed_at_ms>=?", (capture_id, end_ms))
     connection.commit()
     row, pending = _capture_export(connection, capture_id)

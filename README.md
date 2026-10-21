@@ -105,8 +105,9 @@ outages do not stop the other parts. See
 These service restarts leave existing per-run supervisors on their current
 executable; use [a live supervisor upgrade](#live-supervisor-upgrades) for a supported run.
 Both local and server stores keep 72 hours of machine detail and retain historical
-hourly summaries indefinitely. New runs also preserve their exact system observations
-for as long as the run is retained. Existing project configuration, caches, and run
+hourly summaries indefinitely. Run captures keep the first recorded system observation
+in each minute for as long as the run is retained. Live collection and resource checks
+keep their normal cadence. Existing project configuration, caches, and run
 storage keep their current paths. See [system profiles](docs/system-profiles.md)
 for GPU support, service authentication, publishing, and history queries.
 

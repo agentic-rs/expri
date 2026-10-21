@@ -9,4 +9,5 @@ mod store;
 mod types;
 
 pub use server::serve;
+pub use store::compact_system_captures;
 pub use types::ServerConfig;

@@ -10,6 +10,30 @@ use super::{
   document_path, stream_path, target_json, validate_scope,
 };
 
+trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
+
+/// Exact logical tracking bytes, including privately compressed system prefixes.
+pub(in crate::service) struct TrackingReader(Box<dyn ReadSeek>);
+
+impl TrackingReader {
+  pub(super) fn new(reader: impl Read + Seek + Send + 'static) -> Self {
+    Self(Box::new(reader))
+  }
+}
+
+impl Read for TrackingReader {
+  fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    self.0.read(buffer)
+  }
+}
+
+impl Seek for TrackingReader {
+  fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+    self.0.seek(position)
+  }
+}
+
 pub(super) fn recover(directory: &Path, connection: &Connection) -> crate::error::Result<()> {
   let mut statement = connection
     .prepare("SELECT target,revision,size FROM tracking_versions")
@@ -90,9 +114,18 @@ fn open_raw_options(
   create: bool,
   writable: bool,
 ) -> ApiResult<File> {
+  let path = raw_path(directory, target, revision)?;
+  open_path(directory, &path, create, writable)
+}
+
+pub(super) fn open_path(
+  directory: &Path,
+  path: &Path,
+  create: bool,
+  writable: bool,
+) -> ApiResult<File> {
   use std::os::fd::{AsRawFd, FromRawFd};
   use std::os::unix::fs::OpenOptionsExt;
-  let path = raw_path(directory, target, revision)?;
   let relative = path.strip_prefix(directory).expect("tracking path");
   let mut dir = OpenOptions::new()
     .read(true)
@@ -189,13 +222,13 @@ pub(super) fn append_raw(file: &mut File, size: u64, offset: u64, bytes: &[u8]) 
 }
 
 impl<S: ObjectStorage> Store<S> {
-  pub(in crate::service) fn tracking_open(&self, record: &FileRecord) -> ApiResult<File> {
-    super::run_retention::ensure_target_available(&*self.db()?, &record.target)?;
+  pub(in crate::service) fn tracking_open(&self, record: &FileRecord) -> ApiResult<TrackingReader> {
+    let db = self.db()?;
+    super::run_retention::ensure_target_available(&db, &record.target)?;
     let FileStorage::Tracking { revision, .. } = record.storage else {
       return Err(ApiError::new(400, "file is not in tracking storage"));
     };
-    let row: Option<(u64, bool)> = self
-      .db()?
+    let row: Option<(u64, bool)> = db
       .query_row(
         "SELECT size,complete FROM tracking_versions WHERE target=?1 AND revision=?2",
         params![target_json(&record.target)?, revision],
@@ -213,7 +246,8 @@ impl<S: ObjectStorage> Store<S> {
         "acknowledged tracking bytes are missing",
       ));
     }
-    Ok(file)
+    drop(file);
+    super::system_compression::reader(&self.directory, &db, &record.target, revision)
   }
 
   pub(in crate::service) fn tracking_range(

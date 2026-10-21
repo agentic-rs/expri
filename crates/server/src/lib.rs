@@ -6,4 +6,4 @@ use expri_runs::{metrics, run_artifacts, runs};
 
 mod service;
 
-pub use service::{ServerConfig, serve};
+pub use service::{ServerConfig, compact_system_captures, serve};

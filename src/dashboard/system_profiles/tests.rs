@@ -197,14 +197,14 @@ fn system_routes_retain_the_local_host_and_origin_boundary() {
 }
 
 #[test]
-fn local_run_system_reads_the_retained_run_file_without_opening_global_profile_storage() {
+fn local_and_cached_run_system_select_real_minutes_without_opening_global_profile_storage() {
   use expri_core::run_system::RunSystemRecord as Record;
   let directory = tempfile::tempdir().unwrap();
   let missing = directory.path().join("global-missing/profiles.sqlite3");
   let dashboard = dashboard(directory.path(), &missing);
   let run = directory.path().join(".expri/runs/run-system");
   fs::create_dir_all(run.join("outputs")).unwrap();
-  fs::write(run.join("run-state.json"),json!({"schema_version":1,"run_id":"run-system","task":"train","machine_id":"machine-test","system_capture_id":"capture-test","system_capture_status":"complete","status":"completed","started_at":"1970-01-01T00:00:10Z","finished_at":"1970-01-01T00:00:20Z","exit_code":0}).to_string()).unwrap();
+  fs::write(run.join("run-state.json"),json!({"schema_version":1,"run_id":"run-system","task":"train","machine_id":"machine-test","system_capture_id":"capture-test","system_capture_status":"complete","status":"completed","started_at":"1970-01-01T00:00:10Z","finished_at":"1970-01-01T00:01:20Z","exit_code":0}).to_string()).unwrap();
   let inventory = SystemInventory {
     observed_at_ms: 10_000,
     hostname: "retained-local".into(),
@@ -227,7 +227,7 @@ fn local_run_system_reads_the_retained_run_file_without_opening_global_profile_s
     sequence: 700,
     session_id: "session-retained".into(),
     observed_at_ms: 11_000,
-    interval_ms: 0,
+    interval_ms: 1000,
     collection_duration_ms: 0,
     inventory_revision: 1,
     metrics: BTreeMap::from([(
@@ -240,6 +240,22 @@ fn local_run_system_reads_the_retained_run_file_without_opening_global_profile_s
     counters: BTreeMap::new(),
     warnings: Vec::new(),
   };
+  let mut same_minute = sample.clone();
+  same_minute.sequence = 701;
+  same_minute.observed_at_ms = 12_000;
+  same_minute
+    .metrics
+    .get_mut("memory/used_bytes")
+    .unwrap()
+    .value = 999.0;
+  let mut next_minute = sample.clone();
+  next_minute.sequence = 702;
+  next_minute.observed_at_ms = 61_000;
+  next_minute
+    .metrics
+    .get_mut("memory/used_bytes")
+    .unwrap()
+    .value = 256.0;
   let records = vec![
     Record::Capture {
       schema_version: 1,
@@ -256,8 +272,14 @@ fn local_run_system_reads_the_retained_run_file_without_opening_global_profile_s
     Record::Sample {
       sample: sample.clone(),
     },
+    Record::Sample {
+      sample: same_minute,
+    },
+    Record::Sample {
+      sample: next_minute.clone(),
+    },
     Record::End {
-      end_ms: 20_000,
+      end_ms: 80_000,
       complete: true,
       warnings: Vec::new(),
     },
@@ -267,17 +289,44 @@ fn local_run_system_reads_the_retained_run_file_without_opening_global_profile_s
     bytes.extend(serde_json::to_vec(&record).unwrap());
     bytes.push(b'\n');
   }
-  fs::write(run.join(expri_core::run_system::RUN_SYSTEM_PATH), bytes).unwrap();
-  let result = super::super::server::route_content(
-    &dashboard,
-    "/api/run-system?source=local&run_id=run-system&limit=1",
-  );
-  assert_eq!(result.status, 200);
-  let result: expri_runs::system_metrics::RunSystemMetrics =
-    serde_json::from_slice(&result.body).unwrap();
-  assert_eq!(result.status, "complete");
-  assert_eq!(result.samples, [sample]);
-  assert!(!missing.parent().unwrap().exists());
-  let before = dashboard.updates("local", &["run-system".into()]).unwrap();
-  assert!(before["runs"][0]["system_revision"].is_string());
+  fs::write(run.join(expri_core::run_system::RUN_SYSTEM_PATH), &bytes).unwrap();
+  for source in ["local", "cached:worker"] {
+    let runs_dir = if source == "local" {
+      directory.path().join(".expri/runs")
+    } else {
+      let cached = directory.path().join("results/worker");
+      fs::create_dir_all(&cached).unwrap();
+      fs::rename(directory.path().join(".expri/runs"), cached.join("runs")).unwrap();
+      cached.join("runs")
+    };
+    let path = format!("/api/run-system?source={source}&run_id=run-system&limit=1");
+    let result = super::super::server::route_content(&dashboard, &path);
+    assert_eq!(result.status, 200);
+    let result: expri_runs::system_metrics::RunSystemMetrics =
+      serde_json::from_slice(&result.body).unwrap();
+    assert_eq!(result.status, "complete");
+    assert_eq!(result.samples.as_slice(), std::slice::from_ref(&sample));
+    assert_eq!(result.next_cursor, Some(1));
+    assert_eq!(result.sample_count, 3, "cursors preserve raw ordinals");
+    assert_eq!(result.metric_summaries["memory/used_bytes"].count, 2);
+    assert_eq!(result.metric_summaries["memory/used_bytes"].max, 512.0);
+    let result = super::super::server::route_content(&dashboard, &format!("{path}&cursor=1"));
+    assert_eq!(result.status, 200);
+    let result: expri_runs::system_metrics::RunSystemMetrics =
+      serde_json::from_slice(&result.body).unwrap();
+    assert_eq!(result.samples, [next_minute.clone()]);
+    assert_eq!(result.next_cursor, None);
+    assert_eq!(
+      fs::read(
+        runs_dir
+          .join("run-system")
+          .join(expri_core::run_system::RUN_SYSTEM_PATH)
+      )
+      .unwrap(),
+      bytes
+    );
+    assert!(!missing.parent().unwrap().exists());
+    let before = dashboard.updates(source, &["run-system".into()]).unwrap();
+    assert!(before["runs"][0]["system_revision"].is_string());
+  }
 }

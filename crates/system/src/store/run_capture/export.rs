@@ -163,6 +163,12 @@ impl LocalStore {
       params![capture_id, end_ms],
     ))?;
     sql(transaction.execute("UPDATE system_run_captures SET coverage_lost=1 WHERE capture_id=?1 AND acknowledged=0 AND NOT EXISTS(SELECT 1 FROM system_run_capture_support p JOIN system_local l ON l.singleton=p.singleton WHERE p.sequence=l.sequence) AND EXISTS(SELECT 1 FROM system_local WHERE sequence>0)", [capture_id]))?;
+    // Only unexported, now-ineligible reservations can be released. A committed
+    // prefix remains immutable, including through later clock corrections.
+    sql(transaction.execute(
+      "DELETE FROM system_run_capture_minutes WHERE capture_id=?1 AND sequence IN (SELECT sequence FROM system_run_capture_samples WHERE capture_id=?1 AND observed_at_ms>=?2) AND sequence>(SELECT exported_sequence FROM system_run_captures WHERE capture_id=?1)",
+      params![capture_id, end_ms],
+    ))?;
     sql(transaction.execute(
       "DELETE FROM system_run_capture_samples WHERE capture_id=?1 AND observed_at_ms>=?2",
       params![capture_id, end_ms],
@@ -183,6 +189,13 @@ impl LocalStore {
       LockAttempt::Busy => return Ok(false),
       LockAttempt::Missing => unreachable!(),
     };
+    let current = capture(&self.connection, &capture_id)?;
+    if current.header_pending {
+      self.materialize_capture_header(&mut open_stream(&current.run_dir, false)?, &current)?;
+    }
+    if !sampling::seed(&self.connection, &current)? {
+      return Ok(false);
+    }
     let transaction = sql(
       self
         .connection

@@ -7,7 +7,7 @@ use std::path::Path;
 use expri_core::run_system::{RUN_SYSTEM_PATH, RunSystemRecord};
 use serde_json::Value;
 
-use super::{ApiError, ApiResult, FileRecord, FileStorage, FileTarget, open_raw};
+use super::{ApiError, ApiResult, FileRecord, FileStorage, FileTarget};
 
 fn invalid() -> ApiError {
   ApiError::new(
@@ -90,6 +90,7 @@ fn captures(state: &Value) -> ApiResult<BTreeMap<String, Capture>> {
 
 pub(super) fn validate_seal(
   directory: &Path,
+  connection: &rusqlite::Connection,
   files: &[FileRecord],
   state: &Value,
 ) -> ApiResult<()> {
@@ -106,7 +107,7 @@ pub(super) fn validate_seal(
   let FileStorage::Tracking { revision, .. } = record.storage else {
     return Err(invalid());
   };
-  let file = open_raw(directory, &record.target, revision, false)?;
+  let file = super::system_compression::reader(directory, connection, &record.target, revision)?;
   let mut reader = BufReader::new(file.take(record.size));
   let mut seen = BTreeSet::new();
   let mut inventories = BTreeSet::new();

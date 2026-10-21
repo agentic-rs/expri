@@ -86,17 +86,52 @@ Only one service process may use a data directory. Keep the storage
 configuration stable for that directory. S3 endpoints used in signed URLs must
 be reachable from the workers and laptops.
 
-Opening this server revision upgrades the SQLite schema to version 12. Older binaries
-refuse that directory because they cannot preserve experiment membership and
-lineage, task-attempt publication
-fences, durable website lifecycle commands, queue allocations, worker fencing, smoke archival, asset
-provenance, and run retention. Back up the entire service directory before
+Opening this server revision upgrades the SQLite schema to version 13. Older
+binaries refuse that directory because they cannot read compressed system-capture
+storage or preserve experiment membership and lineage, task-attempt publication
+fences, durable website lifecycle commands, queue allocations, worker fencing,
+smoke archival, asset provenance, and run retention. Back up the entire service directory before
 upgrading; restoring that backup is required for a backend downgrade. Deploy
 the server before upgrading workers so it can accept system captures and the
 new publication records. Existing S3 runs remain readable after the upgrade.
 
 The optional object prefix is limited to 512 bytes to leave room for scoped IDs
 within S3's object-key limit.
+
+## System-capture storage compression
+
+New run captures retain one actual reading per minute of each capture. Machine
+collection and resource checks keep their existing cadence. For captures already
+uploaded at a higher rate, use the local maintenance command to reclaim disk
+blocks without changing acknowledged upload offsets:
+
+```sh
+# Read-only preview; can run while the backend is serving.
+expri service compact-system-captures --data-dir /var/lib/expri --json
+# Stop the backend using this directory before applying, then start it again.
+expri service compact-system-captures --data-dir /var/lib/expri --apply --json
+```
+
+Apply requires exclusive access to the service directory and fails while the
+backend is running. It currently requires Linux and a filesystem supporting
+hole punching; preview also works on other platforms. Workers retain pending
+uploads while the backend is stopped; training can continue. Run this with the same filesystem permissions as the
+backend. It uses local storage and requires no client or S3 credentials.
+
+Compression stores independently verified blocks before releasing their original
+disk blocks. The logical file sizes, upload acknowledgments, and archive bytes
+remain unchanged. Downloads and continuation reconstruct the original stream.
+Existing result ZIPs are immutable and are not rewritten. The command can be
+retried after interruption; committed block mappings remain authoritative.
+Physical space savings depend on compressibility and filesystem support, rather
+than the difference between the displayed minute rows and the original row count.
+The command reports actual `allocated_bytes` before and after compression and
+`physical_bytes_reclaimed`. Project storage totals continue to count logical
+file lengths; those totals do not shrink when the same bytes are compressed.
+
+The compressed blocks and their SQLite mappings are part of the service data
+directory and must be backed up together. Do not copy only the sparse raw files,
+remove compressed storage, or open the directory with an older binary.
 
 ## Hosted dashboard
 

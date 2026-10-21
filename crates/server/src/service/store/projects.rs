@@ -452,6 +452,8 @@ impl<S: ObjectStorage> Store<S> {
       "tracking_metric_summaries",
       "tracking_metric_state",
       "tracking_asset_uses",
+      "tracking_system_blocks",
+      "tracking_system_packs",
       "tracking_versions",
       "files",
       "uploads",

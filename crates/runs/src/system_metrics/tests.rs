@@ -108,6 +108,199 @@ fn project(
   )
 }
 
+fn minute_project(
+  records: &[RunSystemRecord],
+  state: &Value,
+  cursor: Option<u64>,
+  limit: usize,
+) -> Result<RunSystemMetrics> {
+  let data = bytes(records);
+  read_minutes(
+    Cursor::new(&data),
+    || Ok(Cursor::new(&data)),
+    "run-test",
+    &RunSystemWindow::from_state("run-test", state).unwrap(),
+    cursor,
+    limit,
+  )
+}
+
+#[test]
+fn minute_projection_keeps_real_first_observations_and_raw_cursor_watermarks() {
+  let records = [
+    header(),
+    inventory(),
+    sample(1, 11_000, 1000, 2.0),
+    sample(2, 12_000, 1000, 999.0),
+    sample(3, 59_999, 1000, 998.0),
+    sample(4, 60_000, 2000, 4.0),
+    sample(5, 60_001, 1000, 997.0),
+    sample(6, 120_000, 3000, 6.0),
+  ];
+  let state = state("running");
+  let first = minute_project(&records, &state, None, 1).unwrap();
+  assert_eq!(first.sample_count, 6);
+  assert_eq!(first.next_cursor, Some(1));
+  assert_eq!(first.samples[0].sequence, 1);
+  assert_eq!(first.samples[0].observed_at_ms, 11_000);
+  assert_eq!(first.samples[0].interval_ms, 1000);
+  assert_eq!(
+    first.samples[0].counters["network/device/received_bytes"],
+    u64::MAX
+  );
+  let summary = &first.metric_summaries["cpu/usage_percent"];
+  assert_eq!(summary.count, 3);
+  assert_eq!(summary.min, 2.0);
+  assert_eq!(summary.max, 6.0);
+  assert_eq!(summary.last, 6.0);
+  assert!((summary.mean.unwrap() - 28.0 / 6.0).abs() < 1e-12);
+  let second = minute_project(&records, &state, first.next_cursor, 1).unwrap();
+  assert_eq!(second.samples[0].sequence, 4);
+  assert_eq!(second.next_cursor, Some(4));
+  let third = minute_project(&records, &state, second.next_cursor, 1).unwrap();
+  assert_eq!(third.samples[0].sequence, 6);
+  assert_eq!(third.next_cursor, None);
+  assert_eq!(third.sample_count, 6);
+  let refresh = minute_project(&records, &state, Some(third.sample_count), 1).unwrap();
+  assert!(refresh.samples.is_empty());
+  assert_eq!(refresh.sample_count, 6);
+}
+
+#[test]
+fn minute_projection_resets_at_capture_boundaries_and_preserves_inventory_references() {
+  let mut second_inventory = inventory();
+  if let RunSystemRecord::Inventory { inventory } = &mut second_inventory {
+    inventory.revision = 2;
+  }
+  let mut second_sample = sample(2, 31_000, 1000, 4.0);
+  if let RunSystemRecord::Sample { sample } = &mut second_sample {
+    sample.inventory_revision = 2;
+  }
+  let records = [
+    header(),
+    inventory(),
+    sample(1, 11_000, 1000, 2.0),
+    sample(2, 12_000, 1000, 999.0),
+    end(true),
+    second_header(),
+    second_inventory,
+    second_sample,
+    RunSystemRecord::End {
+      end_ms: 40_000,
+      complete: true,
+      warnings: vec![],
+    },
+  ];
+  let result = minute_project(&records, &continued_state("completed"), None, 10).unwrap();
+  assert_eq!(result.status, "complete");
+  assert_eq!(result.sample_count, 3);
+  assert_eq!(
+    result
+      .samples
+      .iter()
+      .map(|sample| sample.observed_at_ms)
+      .collect::<Vec<_>>(),
+    [11_000, 31_000]
+  );
+  assert_eq!(
+    result
+      .inventories
+      .iter()
+      .map(|inventory| inventory.revision)
+      .collect::<Vec<_>>(),
+    [1, 2]
+  );
+  assert_eq!(result.metric_summaries["cpu/usage_percent"].count, 2);
+}
+
+#[test]
+fn minute_projection_keeps_first_recording_order_across_clock_regressions() {
+  let result = minute_project(
+    &[
+      header(),
+      inventory(),
+      sample(1, 65_000, 1000, 2.0),
+      sample(2, 120_000, 1000, 4.0),
+      sample(3, 75_000, 1000, 999.0),
+      sample(4, 25_000, 1000, 6.0),
+    ],
+    &state("running"),
+    None,
+    10,
+  )
+  .unwrap();
+  assert_eq!(
+    result
+      .samples
+      .iter()
+      .map(|sample| sample.sequence)
+      .collect::<Vec<_>>(),
+    [1, 2, 4]
+  );
+  assert_eq!(result.sample_count, 4);
+  assert!(
+    result
+      .warnings
+      .iter()
+      .any(|warning| warning.contains("backward"))
+  );
+  assert_eq!(result.metric_summaries["cpu/usage_percent"].max, 6.0);
+}
+
+#[test]
+fn minute_projection_validates_samples_that_are_not_retained() {
+  let mut bad_inventory = sample(2, 12_000, 1000, 4.0);
+  if let RunSystemRecord::Sample { sample } = &mut bad_inventory {
+    sample.inventory_revision = 999;
+  }
+  let mut changed_kind = sample(2, 12_000, 1000, 4.0);
+  if let RunSystemRecord::Sample { sample } = &mut changed_kind {
+    sample.metrics.get_mut("cpu/usage_percent").unwrap().kind = MetricKind::CounterDelta;
+  }
+  for invalid in [bad_inventory, changed_kind] {
+    assert!(matches!(
+      minute_project(
+        &[header(), inventory(), sample(1, 11_000, 1000, 2.0), invalid],
+        &state("running"),
+        None,
+        10
+      ),
+      Err(ExpriError::ServiceRejected { status: 422, .. })
+    ));
+  }
+}
+
+#[test]
+fn minute_projection_large_history_pagination_never_replays_a_consumed_minute() {
+  let mut records = vec![header(), inventory()];
+  for index in 0..1801u64 {
+    records.push(sample(
+      index + 1,
+      10_000 + index as i64 * 1000,
+      1000,
+      index as f64,
+    ));
+  }
+  let mut cursor = None;
+  let mut sequences = Vec::new();
+  loop {
+    let page = minute_project(&records, &state("running"), cursor, 7).unwrap();
+    assert_eq!(page.sample_count, 1801);
+    assert_eq!(page.metric_summaries["cpu/usage_percent"].count, 31);
+    sequences.extend(page.samples.iter().map(|sample| sample.sequence));
+    if let Some(next) = page.next_cursor {
+      assert!(next > cursor.unwrap_or(0));
+      cursor = Some(next);
+    } else {
+      break;
+    }
+  }
+  assert_eq!(sequences.len(), 31);
+  assert_eq!(&sequences[..3], [1, 51, 111]);
+  assert_eq!(sequences.last(), Some(&1791));
+  assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
 #[test]
 fn active_windows_keep_waiting_samples_and_ignore_nonterminal_finish_timestamps() {
   let data = bytes(&[header(), inventory(), sample(1, 25_000, 1000, 2.0)]);

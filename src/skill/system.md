@@ -101,6 +101,20 @@ Local summaries commit with each sample and upload as absolute versioned
 snapshots. Retries do not inflate totals. An offline period longer than 72 hours
 can still publish hourly history after its raw samples have expired.
 
+Run-owned captures have a separate policy: retain the first real observation
+in each wall-clock minute of each capture for as long as the run is retained.
+The minute selection does not slow machine collection or resource checks.
+Original timestamps, measurement intervals, counter strings, inventory revisions,
+and attempt boundaries stay intact. A selected point is not a minute average;
+counter rates still use its original interval. Continuation starts a new capture.
+Existing committed capture files keep their upload offsets. Hosted charts and
+summaries apply the minute selection to older high-rate captures as well.
+Hosted storage can compress those original bytes losslessly with
+`expri service compact-system-captures --data-dir /var/lib/expri --json` to
+preview, then `--apply` while the backend is stopped. Never truncate or rewrite
+acknowledged capture files to thin history; publisher offsets and continuation
+checkpoints depend on their original byte prefixes.
+
 Hourly gauges expose measured coverage and weighted sum, plus count/min/max/last.
 Divide sum by coverage milliseconds for the mean. Counter summaries sum measured
 deltas; divide by coverage seconds for throughput. Raw counters serialize as

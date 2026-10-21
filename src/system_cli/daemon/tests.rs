@@ -330,6 +330,9 @@ fn wait_for_sequence(paths: &StoragePaths, expected: u64) {
 
 #[test]
 fn capture_export_can_stop_and_resume_while_collection_keeps_its_durable_outbox() {
+  use expri_core::run_system::{RUN_SYSTEM_SAMPLE_INTERVAL_MS, RunSystemRecord};
+  use expri_core::system_profile::SystemSample;
+
   let directory = tempfile::tempdir().unwrap();
   let paths = paths(&directory);
   let (collecting, ready, collection) = start(paths.clone(), Duration::from_secs(1));
@@ -343,18 +346,50 @@ fn capture_export_can_stop_and_resume_while_collection_keeps_its_durable_outbox(
   store
     .begin_run_capture(&run, "run-export-resume", first)
     .unwrap();
-  drop(store);
+  // Advance fixture observations across minute buckets without waiting for the
+  // wall clock. The live collector keeps sampling independently every second.
+  let minute = first.div_euclid(RUN_SYSTEM_SAMPLE_INTERVAL_MS) * RUN_SYSTEM_SAMPLE_INTERVAL_MS;
+  fn record_minute(store: &mut LocalStore, observed_at_ms: i64) -> u64 {
+    let mut inventory = store.profile().unwrap().unwrap().inventory;
+    inventory.observed_at_ms = observed_at_ms;
+    store
+      .record(
+        inventory,
+        SystemSample {
+          sequence: 0,
+          session_id: "session-export-resume".into(),
+          observed_at_ms,
+          interval_ms: 1000,
+          collection_duration_ms: 1,
+          inventory_revision: 0,
+          metrics: Default::default(),
+          counters: Default::default(),
+          warnings: Vec::new(),
+        },
+      )
+      .unwrap()
+      .sequence
+  }
+  let first_selected = record_minute(&mut store, minute + 2 * RUN_SYSTEM_SAMPLE_INTERVAL_MS);
   let output = run.join(expri_core::run_system::RUN_SYSTEM_PATH);
+  let has_sample = |sequence| {
+    std::fs::read(&output)
+      .unwrap()
+      .split_inclusive(|byte| *byte == b'\n')
+      .filter(|line| line.ends_with(b"\n"))
+      .any(|line| {
+        matches!(
+          serde_json::from_slice::<RunSystemRecord>(line).unwrap(),
+          RunSystemRecord::Sample { sample } if sample.sequence == sequence
+        )
+      })
+  };
   let (exporting, _) = TestControl::new(paths.clone());
   let export_paths = paths.clone();
   let export_control = exporting.clone();
   let exporter = thread::spawn(move || materialize_loop(export_paths, export_control));
-  wait_for_sequence(&paths, 2);
   let deadline = Instant::now() + Duration::from_secs(3);
-  while !std::fs::read_to_string(&output)
-    .unwrap()
-    .contains("\"sequence\":2")
-  {
+  while !has_sample(first_selected) {
     assert!(
       Instant::now() < deadline,
       "exporter did not flush the sample"
@@ -372,6 +407,8 @@ fn capture_export_can_stop_and_resume_while_collection_keeps_its_durable_outbox(
     .unwrap()
     .sample_sequence;
   wait_for_sequence(&paths, sequence + 1);
+  let queued = record_minute(&mut store, minute + 3 * RUN_SYSTEM_SAMPLE_INTERVAL_MS);
+  assert!(!has_sample(queued));
   assert_eq!(std::fs::read(&output).unwrap(), paused);
 
   let (restarted, _) = TestControl::new(paths.clone());
@@ -379,7 +416,7 @@ fn capture_export_can_stop_and_resume_while_collection_keeps_its_durable_outbox(
   let export_control = restarted.clone();
   let exporter = thread::spawn(move || materialize_loop(export_paths, export_control));
   let deadline = Instant::now() + Duration::from_secs(3);
-  while std::fs::read(&output).unwrap() == paused {
+  while !has_sample(queued) {
     assert!(
       Instant::now() < deadline,
       "restart did not flush the outbox"

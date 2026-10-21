@@ -11,9 +11,11 @@ use super::*;
 
 mod continuation;
 mod projection;
-mod raw_io;
+pub(super) mod raw_io;
 mod run_system;
+mod system_compression;
 pub(super) use continuation::publication_epoch;
+pub use system_compression::compact_system_captures;
 
 use projection::{index_metrics, seal_metric_tail};
 use raw_io::{append_raw, io_error, open_raw};
@@ -21,6 +23,7 @@ use raw_io::{append_raw, io_error, open_raw};
 const DOCUMENT_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub(super) fn recover(directory: &Path, connection: &Connection) -> crate::error::Result<()> {
+  system_compression::recover(directory, connection)?;
   raw_io::recover(directory, connection)
 }
 
@@ -45,7 +48,8 @@ pub(super) fn initialize(connection: &Connection) -> crate::error::Result<()> {
     CREATE TABLE IF NOT EXISTS tracking_metric_summaries (
       target TEXT NOT NULL, name TEXT NOT NULL, record TEXT NOT NULL,
       first_timestamp_ordinal INTEGER, last_timestamp_ordinal INTEGER, PRIMARY KEY(target,name));")
-    .map_err(|_| crate::error::ExpriError::Message("cannot initialize tracking storage".into()))
+    .map_err(|_| crate::error::ExpriError::Message("cannot initialize tracking storage".into()))?;
+  system_compression::initialize(connection)
 }
 
 fn decode(data: &str) -> ApiResult<Vec<u8>> {
@@ -286,7 +290,19 @@ impl<S: ObjectStorage> Store<S> {
       return Err(ApiError::new(409, "tracking stream is sealed"));
     }
     let mut file = open_raw(&self.directory, &target, 1, true)?;
-    let end = append_raw(&mut file, size, offset, &bytes)?;
+    let end = if path == expri_core::run_system::RUN_SYSTEM_PATH {
+      system_compression::append(
+        &self.directory,
+        &tx,
+        &target,
+        &mut file,
+        size,
+        offset,
+        &bytes,
+      )?
+    } else {
+      append_raw(&mut file, size, offset, &bytes)?
+    };
     checkpoint(&self.directory, "raw_synced");
     tx.execute("INSERT INTO tracking_versions(target,revision,size,total_size,document,complete,sealed) VALUES(?1,1,?2,?2,0,1,0)
       ON CONFLICT(target,revision) DO UPDATE SET size=excluded.size,total_size=excluded.total_size", params![key,end]).map_err(database)?;
@@ -453,7 +469,7 @@ impl<S: ObjectStorage> Store<S> {
       if state["system_capture_id"].is_string() && state["system_capture_status"] == "capturing" {
         return Err(ApiError::new(409, "run system capture is still draining"));
       }
-      run_system::validate_seal(&self.directory, &files, &state)?;
+      run_system::validate_seal(&self.directory, &tx, &files, &state)?;
       for record in &files {
         if let FileTarget::Run { path, .. } = &record.target
           && stream_path(path)
