@@ -25,6 +25,42 @@ It retains build and case logs in the printed directory. Set
 `EXPRI_CONTAINER_ARTIFACTS=/absolute/path` to choose that directory; CI uploads
 the logs as `container-workflow-logs` on success or failure.
 
+## CI build caches
+
+Both container jobs build and load their images with the local
+`.github/actions/container-images` action, then invoke the same runners with
+`--no-build`. All six host/worker scenarios and the complete service acceptance
+sequence still run. Local commands above continue to build images by default.
+CI image builds do not push to a registry; their build logs and cache results
+appear in the individual GitHub build steps and Docker build summaries. Runtime
+logs and screenshots keep their existing artifact names.
+
+Docker layers use separate GitHub Actions cache scopes for each job, image,
+runner OS, and architecture. This preserves the source-built MinIO fixture and
+the browser image across expri changes without making the parallel jobs replace
+one another's cache. Package installation and fixture-wheel preparation precede
+the final executable copies, so a new expri binary does not invalidate them.
+
+Cargo's registry and release target directories are cache mounts, which ordinary
+Docker layer exports do not preserve. A commit-pinned cache helper imports them
+into the selected Buildx builder before compilation and extracts them before
+the GitHub cache save and builder cleanup. The snapshot key includes the job,
+OS, architecture, `Cargo.lock`, and container Dockerfile. It deliberately omits
+the commit ID: source-only changes recompile against a stable dependency cache
+without uploading another large snapshot. An exact snapshot hit skips extraction
+and re-saving; dependency or Dockerfile changes start a new snapshot.
+
+On a snapshot miss, the first worker build executes the compiler stage even
+when its Docker layer is reusable. This seeds the mounts instead of permanently
+saving an empty Cargo cache. Cache misses otherwise use the normal build path,
+and layer-cache export failures do not fail acceptance checks.
+
+To compare cold and warm CI runs, record the image-build steps and acceptance
+step separately, including post-job cache extraction/save time. Rerun the same
+job after its first successful cache save and confirm a Cargo snapshot hit and
+cached MinIO/browser steps. The service runner's phase summary measures the
+acceptance sequence; with prebuilt images it excludes CI image-build time.
+
 ## Installed distributions and isolation
 
 The host has fake Torch `2.9.0+cpu`; the worker normally has fake Torch

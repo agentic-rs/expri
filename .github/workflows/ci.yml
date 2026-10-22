@@ -119,10 +119,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Build cached host and worker images
+        uses: ./.github/actions/container-images
+        with:
+          cache-role: host-worker
+
       - name: Run real uv and SSH workflows with installed Torch fixtures
         env:
           EXPRI_CONTAINER_ARTIFACTS: ${{ runner.temp }}/expri-containers
-        run: tests/containers/run.sh
+        run: tests/containers/run.sh --no-build
 
       - name: Save bounded workflow and image build diagnostics
         if: always()
@@ -144,13 +149,20 @@ jobs:
 
       - name: Verify service workflow fixtures and progress reporting
         run: |
+          python3 -B tests/containers/build_cache_tests.py
           python3 -B tests/containers/workflow_progress_tests.py
           python3 -B tests/service_workflow_helpers_tests.py
+
+      - name: Build cached service workflow images
+        uses: ./.github/actions/container-images
+        with:
+          cache-role: service
+          include-service: 'true'
 
       - name: Test private inputs, offline runs, resumable checkpoints and local review
         env:
           EXPRI_CONTAINER_ARTIFACTS: ${{ runner.temp }}/expri-service-containers
-        run: python3 -B tests/containers/service_workflow.py
+        run: python3 -B tests/containers/service_workflow.py --no-build
 
       - name: Save service workflow and image build diagnostics
         if: always()
