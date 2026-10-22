@@ -45,7 +45,7 @@ Cargo's registry and release target directories are cache mounts, which ordinary
 Docker layer exports do not preserve. A commit-pinned cache helper imports them
 into the selected Buildx builder before compilation and extracts them before
 the GitHub cache save and builder cleanup. The snapshot key includes the job,
-OS, architecture, `Cargo.lock`, and container Dockerfile. It deliberately omits
+OS, architecture, `Cargo.lock`, Cargo manifests, and container Dockerfile. It deliberately omits
 the commit ID: source-only changes recompile against a stable dependency cache
 without uploading another large snapshot. An exact snapshot hit skips extraction
 and re-saving; dependency or Dockerfile changes start a new snapshot.

@@ -26,7 +26,7 @@ runs:
         path: |
           ${{ runner.temp }}/expri-cargo-${{ inputs.cache-role }}/registry
           ${{ runner.temp }}/expri-cargo-${{ inputs.cache-role }}/target
-        key: expri-container-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-role }}-${{ hashFiles('Cargo.lock', 'tests/containers/Dockerfile') }}
+        key: expri-container-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-role }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'tests/containers/Dockerfile') }}
 
     - name: Inject and later extract Cargo cache mounts
       uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723 # v3.4.0
