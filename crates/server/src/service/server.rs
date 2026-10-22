@@ -298,6 +298,16 @@ fn authorize_role<S: ObjectStorage>(
   role: Role<'_>,
   request: &Request,
 ) -> ApiResult<()> {
+  if matches!(
+    request,
+    Request::ValidateExperimentSelection { .. } | Request::AssignRunExperiment { .. }
+  ) && !matches!(role, Role::Owner | Role::IssuedOwner { .. })
+  {
+    return Err(ApiError::new(
+      403,
+      "experiment grouping requires an owner credential; use expri login or an owner service configuration",
+    ));
+  }
   let machine = match role {
     Role::Owner | Role::IssuedOwner { .. } => return authorize(store, None, request),
     Role::Worker(worker) => return authorize(store, Some(worker), request),
@@ -434,6 +444,8 @@ fn authorize<S: ObjectStorage>(
       ..
     } => worker.project_id == scope.project_id && worker.origin == scope.origin,
     Request::ReferenceFile { .. }
+    | Request::ValidateExperimentSelection { .. }
+    | Request::AssignRunExperiment { .. }
     | Request::Queue { .. }
     | Request::ImportOutput { .. }
     | Request::ProjectStorage { .. }
@@ -781,8 +793,14 @@ fn route<S: ObjectStorage>(
   let mut operation: Request = serde_json::from_slice(request.body())
     .map_err(|_| ApiError::new(400, "invalid service request"))?;
   narrow_worker_catalog(&role, &mut operation)?;
+  let experiment_owner = matches!(role, Role::Owner | Role::IssuedOwner { .. });
   authorize_role(store, role, &operation)?;
-  let response = store.execute(operation)?;
+  let mut response = store.execute(operation)?;
+  if !experiment_owner && let types::Response::Capabilities { features } = &mut response {
+    features.retain(|feature| {
+      feature != expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY
+    });
+  }
   let mut body = LimitedBytes(Vec::new());
   serde_json::to_writer(&mut body, &response).map_err(|_| {
     ApiError::new(
@@ -1066,6 +1084,83 @@ mod tests {
   }
 
   #[test]
+  fn experiment_assignment_requires_owner_and_advertises_only_to_owner_credentials() {
+    use expri_core::experiment_assignment::{
+      EXPERIMENT_ASSIGNMENT_CAPABILITY, ExperimentSelection, RunExperimentIntent,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let mut auth = auth();
+    auth.machines.push((
+      b"machine-token-with-at-least-24-characters".to_vec(),
+      MachineAuth {
+        machine_id: "machine-one".into(),
+        token_env: "unused".into(),
+      },
+    ));
+    let selection = ExperimentSelection::New {
+      name: "Training".into(),
+    };
+    let operations = [
+      Request::ValidateExperimentSelection {
+        project_id: "project".into(),
+        intent: RunExperimentIntent {
+          request_id: "request-one".into(),
+          selection: selection.clone(),
+        },
+      },
+      Request::AssignRunExperiment {
+        scope: scope(),
+        intent: RunExperimentIntent {
+          request_id: "request-one".into(),
+          selection,
+        },
+      },
+    ];
+    for operation in &operations {
+      assert!(authorize_role(&store, Role::Owner, operation).is_ok());
+      assert!(authorize_role(&store, Role::IssuedOwner { digest: [0; 32] }, operation).is_ok());
+      for token in [
+        "worker-token-with-at-least-24-characters",
+        "machine-token-with-at-least-24-characters",
+      ] {
+        let error = route(&store, &auth, request(Some(token), operation)).unwrap_err();
+        assert_eq!(error.status, 403);
+        assert!(error.message.contains("owner credential"));
+      }
+    }
+    for (token, expected) in [
+      ("owner-token-with-at-least-24-characters", true),
+      ("worker-token-with-at-least-24-characters", false),
+      ("machine-token-with-at-least-24-characters", false),
+    ] {
+      let body = route(&store, &auth, request(Some(token), &Request::Capabilities)).unwrap();
+      let Response::Capabilities { features } = serde_json::from_slice(&body).unwrap() else {
+        panic!("expected capabilities");
+      };
+      assert_eq!(
+        features
+          .iter()
+          .any(|feature| feature == EXPERIMENT_ASSIGNMENT_CAPABILITY),
+        expected
+      );
+    }
+    let body = route(
+      &store,
+      &auth,
+      request(
+        Some("owner-token-with-at-least-24-characters"),
+        &operations[0],
+      ),
+    )
+    .unwrap();
+    assert!(matches!(
+      serde_json::from_slice::<Response>(&body).unwrap(),
+      Response::ExperimentSelectionValidated
+    ));
+  }
+
+  #[test]
   fn execution_queue_requires_owner_credentials_for_reads_and_claims() {
     use expri_core::resource_queue::QueueRequest;
 
@@ -1096,6 +1191,7 @@ mod tests {
         claim_id: "claim".into(),
       },
       QueueRequest::RegisterWorker {
+        experiment_assignment_supported: None,
         worker_id: "worker".into(),
         session_id: "session".into(),
         project_ids: Vec::new(),
@@ -1956,6 +2052,7 @@ mod tests {
         requirements: None,
         resource_status: None,
         manual_paused: None,
+        experiment_assignment_supported: None,
         result: None,
       },
     };
@@ -1999,6 +2096,7 @@ mod tests {
       requirements: None,
       resource_status: None,
       manual_paused: None,
+      experiment_assignment_supported: None,
       result: None,
     };
     for foreign in [

@@ -3,7 +3,7 @@ use crate::service::store::tests::MockStorage;
 
 mod grouped;
 
-fn scope(origin: &str, run_id: &str) -> RunScope {
+pub(super) fn scope(origin: &str, run_id: &str) -> RunScope {
   RunScope {
     project_id: "project".into(),
     origin: origin.into(),
@@ -11,7 +11,7 @@ fn scope(origin: &str, run_id: &str) -> RunScope {
   }
 }
 
-fn document(store: &Store<MockStorage>, scope: &RunScope) {
+pub(super) fn document(store: &Store<MockStorage>, scope: &RunScope) {
   let bytes = serde_json::to_vec(&json!({"schema_version":1,"run_id":scope.run_id,"task":"train","status":"completed","started_at":"2026-10-20T00:00:00Z","finished_at":"2026-10-20T00:01:00Z","exit_code":0})).unwrap();
   store
     .execute(Request::PutDocument {
@@ -25,7 +25,7 @@ fn document(store: &Store<MockStorage>, scope: &RunScope) {
     .unwrap();
 }
 
-fn selection(members: Vec<RunScope>, lineage: Vec<Lineage>) -> ExperimentSave {
+pub(super) fn selection(members: Vec<RunScope>, lineage: Vec<Lineage>) -> ExperimentSave {
   static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
   ExperimentSave {
     project_id: "project".into(),
@@ -42,7 +42,7 @@ fn selection(members: Vec<RunScope>, lineage: Vec<Lineage>) -> ExperimentSave {
   }
 }
 
-fn edit(experiment: &Experiment) -> ExperimentSave {
+pub(super) fn edit(experiment: &Experiment) -> ExperimentSave {
   ExperimentSave {
     project_id: "project".into(),
     experiment_id: Some(experiment.experiment_id.clone()),
@@ -55,7 +55,7 @@ fn edit(experiment: &Experiment) -> ExperimentSave {
   }
 }
 
-fn edge(parent: &RunScope, child: &RunScope) -> Lineage {
+pub(super) fn edge(parent: &RunScope, child: &RunScope) -> Lineage {
   Lineage {
     parent: parent.clone(),
     child: child.clone(),

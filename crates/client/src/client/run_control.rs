@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, atomic::AtomicBool};
 
+use expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY;
 use expri_core::resource_requirements::{
   RUN_REQUIREMENTS_CAPABILITY, ResourceRequirements, ResourceStatus,
 };
@@ -33,6 +34,8 @@ struct Facts {
   resource_status: Option<ResourceStatus>,
   #[serde(default)]
   manual_paused: Option<bool>,
+  #[serde(default)]
+  experiment_assignment_supported: Option<bool>,
 }
 
 /// Reuses one HTTP pool without exposing its saved bearer credential.
@@ -43,6 +46,7 @@ pub struct RunControlClient {
   binding_id: String,
   batch: bool,
   requirements: bool,
+  experiment_assignment: bool,
 }
 
 impl RunControlClient {
@@ -67,12 +71,16 @@ impl RunControlClient {
     let requirements = features
       .iter()
       .any(|feature| feature == RUN_REQUIREMENTS_CAPABILITY);
+    let experiment_assignment = features
+      .iter()
+      .any(|feature| feature == EXPERIMENT_ASSIGNMENT_CAPABILITY);
     Ok(Some(Self {
       api,
       scope,
       binding_id,
       batch,
       requirements,
+      experiment_assignment,
     }))
   }
 
@@ -84,6 +92,7 @@ impl RunControlClient {
       binding_id,
       batch: self.batch,
       requirements: self.requirements,
+      experiment_assignment: self.experiment_assignment,
     }
   }
 
@@ -120,6 +129,10 @@ impl RunControlClient {
       requirements: facts.requirements,
       resource_status: facts.resource_status.map(Box::new),
       manual_paused: facts.manual_paused,
+      experiment_assignment_supported: self
+        .experiment_assignment
+        .then_some(facts.experiment_assignment_supported)
+        .flatten(),
       result,
     })
   }
@@ -254,6 +267,7 @@ mod tests {
           assert!(!body.contains("set_requirements"));
           assert!(!body.contains("requirements"));
           assert!(!body.contains("manual_paused"));
+          assert!(!body.contains("experiment_assignment_supported"));
           Response::RunControl {
             response: RunControlResponse { command: None },
           }
@@ -277,7 +291,7 @@ mod tests {
     )
     .unwrap()
     .unwrap();
-    let facts = json!({"current_attempt":2,"generation":1,"status":"paused","capabilities":["resume","stop","set_requirements"],"requirements":{"disk":[],"recovery_seconds":30},"manual_paused":true,"command":["python","train.py"],"checkpoints":["outputs/best.pt"],"scope":{"run_id":"untrusted"},"run_dir":"/private/run","source":"/private/source"});
+    let facts = json!({"current_attempt":2,"generation":1,"status":"paused","capabilities":["resume","stop","set_requirements"],"requirements":{"disk":[],"recovery_seconds":30},"manual_paused":true,"experiment_assignment_supported":true,"command":["python","train.py"],"checkpoints":["outputs/best.pt"],"scope":{"run_id":"untrusted"},"run_dir":"/private/run","source":"/private/source"});
     let response = transport
       .poll(
         &facts,
@@ -359,6 +373,57 @@ mod tests {
     let mut mismatched = facts;
     mismatched["resource_status"]["disk"][0]["path"] = json!("/unconfigured");
     assert!(transport.validate_facts(&mismatched).is_err());
+    server.join().unwrap();
+  }
+
+  #[test]
+  fn experiment_assignment_is_advertised_only_by_supported_publishing_workers() {
+    let (url, server) = mock(2, move |request, _| {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::Capabilities => Response::Capabilities {
+          features: vec![
+            "run-control-v1".into(),
+            EXPERIMENT_ASSIGNMENT_CAPABILITY.into(),
+          ],
+        },
+        Request::RunControl {
+          request:
+            RunControlRequest::Poll {
+              experiment_assignment_supported,
+              ..
+            },
+        } => {
+          assert_eq!(experiment_assignment_supported, Some(true));
+          Response::RunControl {
+            response: RunControlResponse { command: None },
+          }
+        }
+        _ => panic!("unexpected experiment lifecycle request"),
+      };
+      (200, Vec::new(), serde_json::to_vec(&response).unwrap())
+    });
+    let client = ResolvedClient::from_config(ClientConfig {
+      url,
+      token: Some("owner-token".into()),
+      token_env: None,
+      project_id: None,
+    })
+    .unwrap();
+    let transport = RunControlClient::new(
+      &client,
+      RunScope {
+        project_id: "project".into(),
+        origin: "worker".into(),
+        run_id: "run-one".into(),
+      },
+      "binding-one".into(),
+      Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap()
+    .unwrap();
+    let facts = json!({"attempt":1,"generation":1,"status":"completed","capabilities":["restart"],
+      "command":["train"],"checkpoints":[],"experiment_assignment_supported":true});
+    assert!(transport.poll(&facts, None).unwrap().command.is_none());
     server.join().unwrap();
   }
 

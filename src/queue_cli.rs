@@ -171,6 +171,7 @@ pub(crate) fn submit(
     .clone()
     .unwrap_or_else(|| format!("submit-{}", uuid::Uuid::new_v4().simple()));
   validate_component(&submission_id)?;
+  let experiment = command.experiment.resolve(Some(&submission_id))?;
   let mut argv = task.command;
   argv.extend(parts.cloned());
   let (extras, sync_args) = crate::environment_selection(&context.config);
@@ -191,17 +192,25 @@ pub(crate) fn submit(
   remote_managed.sort();
   remote_managed.dedup();
   let publish = !command.no_publish && service.is_none_or(|service| service.publish);
+  if experiment.is_some() && !publish {
+    return Err(invalid(
+      "experiment assignment requires automatic publishing",
+    ));
+  }
   if command.dry_run {
     if command.json || !quiet {
       crate::output::print_report(
         &json!({"dry_run":true,"project_id":project_id,"task":name,"command":argv,
-        "resources":resources,"worker_id":worker_id,"smoke":command.smoke,"publish":publish}),
+        "resources":resources,"worker_id":worker_id,"smoke":command.smoke,"publish":publish,"experiment":experiment}),
         command.json,
       )?;
     }
     return Ok(());
   }
   let config = resolve_client_config(command.resources.server_config.as_deref())?;
+  if experiment.is_some() {
+    expri_client::experiment_assignment::check_support(&config)?;
+  }
   let client = ResourceQueueClient::new(&config)?;
   let bundle = expri_worker::queue::source::freeze_source(&context.repo_root, &remote_managed)?;
   let source = SourceRef {
@@ -213,6 +222,7 @@ pub(crate) fn submit(
     submission_id: submission_id.clone(),
     project_id: project_id.clone(),
     task: name.clone(),
+    experiment,
     command: argv,
     environment,
     extras,

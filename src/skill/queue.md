@@ -22,6 +22,15 @@ The source ZIP and extracted contents each have a 512 MiB limit; use managed
 assets for large inputs. Only execution links an actual run ID. Use that run ID
 for published dashboard results, `query files`, and worker run inspection.
 
+Queued launches also accept `--experiment ID`, `--new-experiment NAME`, or
+`--join-run RUN [--join-origin ORIGIN]`. Membership is applied after the worker
+publishes its run. Retries of one queued submission share the same experiment
+request, so a new-group selection does not create a group per retry. Read
+`expri skill run` for permissions and background grouping behavior.
+The scheduler only assigns these jobs to workers that advertise experiment
+support; upgrade the worker if the job is waiting for that capability.
+Restart the worker service after a server upgrade to negotiate new capabilities.
+
 Memory must be supplied with `--memory` or task defaults. CPU defaults to one
 logical slot and GPU count to zero. Task defaults use:
 

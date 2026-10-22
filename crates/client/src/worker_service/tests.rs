@@ -127,6 +127,7 @@ fn manual_pause_is_durable_and_lazy_registration_does_not_resume_components() {
   });
   wait_ready(&paths);
   let pid = status(&paths).unwrap()["pid"].clone();
+  ensure_experiment_assignment_ready(&paths).unwrap();
   stop_component(&paths, ServiceComponent::Publishing).unwrap();
   wait_component(&paths, ServiceComponent::Publishing, "stopped");
   stop_component(&paths, ServiceComponent::Collection).unwrap();

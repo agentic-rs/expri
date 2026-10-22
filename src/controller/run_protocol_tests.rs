@@ -43,6 +43,7 @@ fn automatic_publishing_and_assets_never_fall_back_to_an_older_node_or_python() 
     "durable-runs-v1",
     "run-publishing-v1",
     "assets-v2",
+    "run-experiment-assignment-v1",
   ] {
     fs::write(
       &node,
@@ -60,6 +61,11 @@ fn automatic_publishing_and_assets_never_fall_back_to_an_older_node_or_python() 
       assert_eq!(result.is_ok(), capability == "assets-v2");
       if let Err(error) = result {
         assert!(error.to_string().contains("assets-v2"));
+      }
+      let result = super::require_run_experiment(&remote, preference, "./expri");
+      assert_eq!(result.is_ok(), capability == "run-experiment-assignment-v1");
+      if let Err(error) = result {
+        assert!(error.to_string().contains("run-experiment-assignment-v1"));
       }
     }
   }
@@ -86,6 +92,9 @@ fn automatic_publishing_and_assets_never_fall_back_to_an_older_node_or_python() 
   assert!(error.to_string().contains("native expri worker"));
   let error =
     super::require_run_assets(&remote, ProtocolPreference::Python, "/missing-node").unwrap_err();
+  assert!(error.to_string().contains("native expri worker"));
+  let error = super::require_run_experiment(&remote, ProtocolPreference::Python, "/missing-node")
+    .unwrap_err();
   assert!(error.to_string().contains("native expri worker"));
 }
 

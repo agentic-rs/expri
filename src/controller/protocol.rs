@@ -353,6 +353,21 @@ pub(crate) fn require_run_publishing(
   )
 }
 
+pub(crate) fn require_run_experiment(
+  remote: &Remote,
+  preference: ProtocolPreference,
+  node_bin: &str,
+) -> Result<()> {
+  require_run_capability(
+    remote,
+    preference,
+    node_bin,
+    expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY,
+    "experiment assignment",
+    "or remove experiment selection",
+  )
+}
+
 pub(crate) fn require_run_assets(
   remote: &Remote,
   preference: ProtocolPreference,

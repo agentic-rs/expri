@@ -15,6 +15,7 @@ pub struct LocalTaskOptions {
   pub project_name: Option<String>,
   pub name: String,
   pub task: TaskConfig,
+  pub experiment: Option<expri_core::experiment_assignment::RunExperimentIntent>,
   pub args: Vec<String>,
   pub dry_run: bool,
   pub detach: bool,
@@ -38,6 +39,7 @@ pub struct RemoteTaskOptions {
   pub control_persist: String,
   pub name: String,
   pub task: TaskConfig,
+  pub experiment: Option<expri_core::experiment_assignment::RunExperimentIntent>,
   pub args: Vec<String>,
   pub dry_run: bool,
   pub detach: bool,
@@ -126,6 +128,31 @@ pub fn check_run_publishing_target(
   require_service(&remote, preference, node_bin, target.service.as_ref())
 }
 
+pub fn check_run_experiment_target(
+  target: &TargetConfig,
+  control_path: &str,
+  control_persist: &str,
+  dry_run: bool,
+  verbosity: u8,
+  quiet: bool,
+) -> Result<()> {
+  let preference = ProtocolPreference::parse(target.protocol.as_deref())?;
+  let remote = Remote::new(
+    target.clone(),
+    control_path.into(),
+    control_persist.into(),
+    dry_run,
+    verbosity,
+    quiet,
+  )?;
+  remote.connect()?;
+  super::protocol::require_run_experiment(
+    &remote,
+    preference,
+    target.node_bin.as_deref().unwrap_or("expri"),
+  )
+}
+
 fn require_service(
   remote: &Remote,
   preference: ProtocolPreference,
@@ -186,6 +213,11 @@ fn require_asset_environment(environment: Option<&EnvironmentConfig>) -> Result<
 }
 
 pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
+  crate::experiment_cli::validate_mode(
+    options.experiment.as_ref(),
+    options.service.as_ref(),
+    options.environment.is_some(),
+  )?;
   validate_requirements_mode(
     &options.task.requirements,
     options.detach,
@@ -209,6 +241,7 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
     command.extend(options.args.clone());
     let request = RunRequest {
       name: options.name.clone(),
+      experiment: options.experiment,
       command,
       environment: environment.clone(),
       requirements: options.task.requirements,
@@ -287,6 +320,11 @@ pub fn run_local_task(options: LocalTaskOptions) -> Result<()> {
 }
 
 pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
+  crate::experiment_cli::validate_mode(
+    options.experiment.as_ref(),
+    options.target.service.as_ref(),
+    options.target.environment.is_some(),
+  )?;
   validate_requirements_mode(
     &options.task.requirements,
     options.detach,
@@ -307,6 +345,7 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     command.extend(options.args.clone());
     let request = RunRequest {
       name: options.name.clone(),
+      experiment: options.experiment,
       command,
       environment: environment.clone(),
       requirements: options.task.requirements,
@@ -334,6 +373,10 @@ pub fn run_remote_task(options: RemoteTaskOptions) -> Result<()> {
     )?
     .with_diagnostic_stdout(options.detach);
     remote.connect()?;
+    if request.experiment.is_some() {
+      super::protocol::require_run_experiment(&remote, preference, &node_bin)?;
+      preference = ProtocolPreference::ExpriNode;
+    }
     if !request.requirements.is_empty() {
       super::protocol::require_run_requirements(&remote, preference, &node_bin)?;
       preference = ProtocolPreference::ExpriNode;
@@ -514,6 +557,7 @@ mod tests {
   fn credentials_only_service_does_not_require_publishing_for_an_ordinary_task() {
     let root = tempfile::tempdir().unwrap();
     let options = LocalTaskOptions {
+      experiment: None,
       repo_root: root.path().into(), project_name: None, name: "train".into(),
       task: TaskConfig {
         command: vec!["python".into(), "train.py".into()], uv: false, resources: None,

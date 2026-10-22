@@ -136,6 +136,7 @@ fn executor_fixture(root: &std::path::Path, url: &str) -> Executor {
     attempts: vec![apple_assignment().attempt],
     stop: Arc::new(AtomicBool::new(false)),
     worker: WorkerSummary {
+      experiment_assignment_supported: false,
       worker_id: "worker-a".into(),
       session_id: "session-a".into(),
       project_ids: vec![],
@@ -214,6 +215,7 @@ fn assignment() -> JobAssignment {
       pending_reason: None,
     },
     submission: JobSubmission {
+      experiment: None,
       submission_id: "submission-a".into(),
       project_id: "project-a".into(),
       task: "train".into(),
@@ -464,6 +466,7 @@ fn lost_gpu_wait_finish_reply_is_settled_from_server_confirmation_on_next_tick()
     gpus: cancelled.allocation.gpus.clone(),
   };
   let released_worker = WorkerSummary {
+    experiment_assignment_supported: false,
     worker_id: "worker-a".into(),
     session_id: "session-a".into(),
     project_ids: vec![],
@@ -652,6 +655,24 @@ fn project_restrictions_are_optional_and_do_not_change_worker_assignment_identit
 }
 
 #[test]
+fn queue_retry_preserves_experiment_creation_identity_on_another_worker() {
+  let mut assignment = assignment();
+  let intent = expri_core::experiment_assignment::RunExperimentIntent {
+    request_id: assignment.submission.submission_id.clone(),
+    selection: expri_core::experiment_assignment::ExperimentSelection::New {
+      name: "Scale study".into(),
+    },
+  };
+  assignment.submission.experiment = Some(intent.clone());
+  let journal = Journal::claimed(assignment);
+  for worker in ["worker-a", "worker-b"] {
+    let request = queued_run_request(&journal, worker, std::path::Path::new("/tmp/client.toml"));
+    assert_eq!(request.experiment, Some(intent.clone()));
+    assert_eq!(request.service.unwrap().origin, worker);
+  }
+}
+
+#[test]
 fn preparing_a_run_records_its_path_without_launching_and_can_cancel_before_launch() {
   let temporary = tempfile::tempdir().unwrap();
   fs::create_dir(temporary.path().join(".expri")).unwrap();
@@ -663,6 +684,7 @@ fn preparing_a_run_records_its_path_without_launching_and_can_cancel_before_laun
   fs::write(temporary.path().join("train.py"), "print('source')").unwrap();
   let marker = temporary.path().join("must-not-start");
   let request = RunRequest {
+    experiment: None,
     name: "train".into(),
     command: vec!["touch".into(), marker.to_string_lossy().into_owned()],
     environment: crate::config::EnvironmentConfig {

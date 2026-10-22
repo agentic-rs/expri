@@ -34,6 +34,7 @@ fn poll(result: Option<ControlResult>) -> RunControlRequest {
     requirements: None,
     resource_status: None,
     manual_paused: None,
+    experiment_assignment_supported: None,
     result,
   }
 }
@@ -53,6 +54,7 @@ fn selection(action: ControlAction) -> ControlSubmission {
     checkpoint: (action == ControlAction::Continue).then(|| "checkpoints/last.pt".into()),
     requirements: None,
     reason: "Requested from dashboard".into(),
+    experiment: None,
     grace_seconds: 30,
   }
 }
@@ -75,6 +77,97 @@ fn fixture() -> (tempfile::TempDir, Store<MockStorage>) {
 
 fn view(store: &Store<MockStorage>, at: i64) -> Value {
   snapshot(&store.db().unwrap(), &encode(&scope()).unwrap(), at).unwrap()
+}
+
+#[test]
+fn restart_experiment_selection_requires_capability_and_survives_delivery_retries() {
+  let (_directory, store) = fixture();
+  let mut command = selection(ControlAction::Restart);
+  command.experiment = Some(ExperimentSelection::New {
+    name: "Replacement training".into(),
+  });
+  assert_eq!(
+    store
+      .submit_run_control_at(command.clone(), AT + 1)
+      .unwrap_err()
+      .status,
+    409
+  );
+  let mut supported = poll(None);
+  let RunControlRequest::Poll {
+    experiment_assignment_supported,
+    ..
+  } = &mut supported;
+  *experiment_assignment_supported = Some(true);
+  store
+    .poll_run_control_at(supported.clone(), AT + 2)
+    .unwrap();
+  assert_eq!(
+    view(&store, AT + 2)["experiment_assignment_supported"],
+    true
+  );
+  let queued = store
+    .submit_run_control_at(command.clone(), AT + 3)
+    .unwrap();
+  assert_eq!(
+    store
+      .submit_run_control_at(command.clone(), AT + 4)
+      .unwrap(),
+    queued
+  );
+  let delivered = store
+    .poll_run_control_at(supported, AT + 5)
+    .unwrap()
+    .command
+    .unwrap();
+  assert_eq!(delivered.experiment, command.experiment);
+  let mut conflict = command;
+  conflict.experiment = Some(ExperimentSelection::New {
+    name: "Different experiment".into(),
+  });
+  assert_eq!(
+    store
+      .submit_run_control_at(conflict, AT + 6)
+      .unwrap_err()
+      .status,
+    409
+  );
+}
+
+#[test]
+fn experiment_selection_is_validated_before_enqueuing_a_replacement() {
+  let (_directory, store) = fixture();
+  let mut supported = poll(None);
+  let RunControlRequest::Poll {
+    experiment_assignment_supported,
+    ..
+  } = &mut supported;
+  *experiment_assignment_supported = Some(true);
+  store.poll_run_control_at(supported, AT + 1).unwrap();
+  let mut command = selection(ControlAction::Continue);
+  command.experiment = Some(ExperimentSelection::New {
+    name: "Wrong action".into(),
+  });
+  assert_eq!(
+    store
+      .submit_run_control_at(command.clone(), AT + 2)
+      .unwrap_err()
+      .status,
+    400
+  );
+  command.action = ControlAction::Restart;
+  command.checkpoint = None;
+  command.experiment = Some(ExperimentSelection::Existing {
+    experiment_id: "missing".into(),
+  });
+  assert_eq!(
+    store
+      .submit_run_control_at(command, AT + 3)
+      .unwrap_err()
+      .status,
+    404
+  );
+  assert_eq!(view(&store, AT + 4)["request"], Value::Null);
 }
 
 #[test]

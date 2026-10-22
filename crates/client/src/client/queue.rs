@@ -54,6 +54,8 @@ pub(super) struct QueueState {
   pub(super) archive: Option<ArchiveRecord>,
   #[serde(default)]
   pub(super) archive_history: Vec<ArchiveRecord>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(super) experiment_assignment: Option<super::experiment_assignment::Acknowledgement>,
 }
 
 pub(super) struct Queue {
@@ -95,6 +97,7 @@ impl Queue {
         documents: BTreeMap::new(),
         archive: None,
         archive_history: Vec::new(),
+        experiment_assignment: None,
       }
     };
     let queue = Self {

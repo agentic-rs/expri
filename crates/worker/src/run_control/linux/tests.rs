@@ -26,6 +26,7 @@ fn control(action: ControlAction, id: &str) -> ControlCommand {
     arguments: None,
     checkpoint: None,
     requirements: None,
+    experiment: None,
     reason: "test lifecycle".into(),
     grace_seconds: 3,
     expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
@@ -357,6 +358,70 @@ fn recorded_arguments_keep_executable_and_preserve_literal_shell_characters() {
     ["/bin/sh", "train.sh", "$(touch should-not-exist); literal"]
   );
   assert!(!run.join("should-not-exist").exists());
+}
+
+#[test]
+fn restart_replaces_experiment_intent_while_continuation_keeps_the_original() {
+  use expri_core::experiment_assignment::ExperimentSelection;
+  let (_root, run) = fixture();
+  let path = run.join("run-request.json");
+  let mut request = read_json(&path, LIMIT).unwrap();
+  let original = RunExperimentIntent {
+    request_id: "original-launch".into(),
+    selection: ExperimentSelection::New {
+      name: "Original experiment".into(),
+    },
+  };
+  request["experiment"] = json!(original);
+  write_json(&path, &request).unwrap();
+  let mut command = control(ControlAction::Continue, "continue-existing");
+  assert_eq!(
+    recorded_request(&run, &command).unwrap().experiment,
+    Some(original)
+  );
+  command.action = ControlAction::Restart;
+  assert_eq!(recorded_request(&run, &command).unwrap().experiment, None);
+  command.experiment = Some(ExperimentSelection::JoinRun {
+    run_id: "other-run".into(),
+    origin: Some("other-worker".into()),
+  });
+  let intent = recorded_request(&run, &command)
+    .unwrap()
+    .experiment
+    .unwrap();
+  assert_eq!(intent.request_id, command.request_id);
+  assert_eq!(Some(intent.selection), command.experiment);
+}
+
+#[test]
+fn rejected_experiment_restart_preserves_the_running_task() {
+  use expri_core::experiment_assignment::ExperimentSelection;
+  let (_root, run) = fixture();
+  let _supervisor = start_counter(
+    &run,
+    "trap 'exit 0' TERM; while :; do echo tick >> outputs/counter; sleep 0.02; done",
+  );
+  wait_for(|| {
+    state(&run).unwrap()["run_control_protocol_version"] == 1
+      && run.join("outputs/counter").exists()
+  });
+  let before = fs::read(run.join("outputs/counter")).unwrap().len();
+  let mut command = control(ControlAction::Restart, "grouping-without-publishing");
+  command.experiment = Some(ExperimentSelection::New {
+    name: "Unavailable publishing".into(),
+  });
+  let result = execute(&run, &command).unwrap();
+  assert_eq!(result.status, "failed");
+  assert!(
+    result
+      .error
+      .unwrap()
+      .contains("automatic service publishing")
+  );
+  assert_eq!(state(&run).unwrap()["status"], "running");
+  assert!(!run.join(MAILBOX).exists());
+  assert_eq!(fs::read_dir(run.parent().unwrap()).unwrap().count(), 1);
+  wait_for(|| fs::read(run.join("outputs/counter")).unwrap().len() > before);
 }
 
 #[test]

@@ -608,6 +608,7 @@ pub(in crate::worker_service) fn snapshot(
     .map(|(component, state)| (component.as_str(), state.snapshot()))
     .collect();
   json!({"schema_version": 1, "pid": std::process::id(), "running": true,
+    "capabilities": [expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY],
     "ready": !context.is_stopping(), "collection_ready": state.ready && !context.is_stopping(), "status": status,
     "collection": state.detail, "active_jobs": active, "pending_jobs": pending,
     "execution": context.shared.execution.lock().unwrap_or_else(|poison| poison.into_inner()).clone(),

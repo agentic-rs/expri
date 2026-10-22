@@ -493,6 +493,23 @@ fn merge_public(destination: &mut Value, detail: &Value) {
   }
 }
 
+/// Require a live publisher that understands launch-time experiment intent.
+pub fn ensure_experiment_assignment_ready(paths: &StoragePaths) -> Result<()> {
+  let service = ensure_started(paths)?;
+  if service["ready"] != true
+    || !service["capabilities"].as_array().is_some_and(|values| {
+      values
+        .iter()
+        .any(|value| value == expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY)
+    })
+  {
+    return Err(error(
+      "the running worker service does not support experiment assignment; upgrade expri and run `expri service restart` before launching this run",
+    ));
+  }
+  Ok(())
+}
+
 /// Accept a job durably before startup. Paused components remain paused.
 pub fn register(paths: &StoragePaths, job: PreparedJob) -> Result<Value> {
   let mut report = registry::register(paths, job)?;

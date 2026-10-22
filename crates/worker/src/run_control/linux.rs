@@ -4,6 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use expri_core::error::{ExpriError, Result};
+use expri_core::experiment_assignment::RunExperimentIntent;
 use expri_core::lock::LockAttempt;
 use expri_core::protocol::{ContinueRunRequest, RunRequest};
 use expri_core::run_control::{ControlAction, ControlCommand, ControlResult};
@@ -153,6 +154,10 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
     capabilities.clear();
     reason = Some("recorded run request is unavailable".into());
   }
+  let experiment_assignment_supported = request
+    .as_ref()
+    .and_then(|request| request.service.as_ref())
+    .is_some_and(|service| service.publish);
   let command = value["command"].as_array().cloned().unwrap_or_else(|| {
     request
       .take()
@@ -181,9 +186,9 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
     .get("task_exit_code")
     .filter(|value| !value.is_null())
     .unwrap_or(&value["exit_code"]);
-  Ok(
-    json!({"supported":reason.is_none(),"protocol_version":value["run_control_protocol_version"].as_u64().unwrap_or(0),"attempt":attempt(&value),"generation":generation(&value),"status":status,"capabilities":capabilities,"command":command,"checkpoints":checkpoints,"reason":reason,"requirements":crate::resource_guard::requirements(&value)?,"resource_status":value["resource_status"],"manual_paused":value["manual_paused"].as_bool().unwrap_or(value["status"] == "paused" && value["resource_paused"] != true),"lifecycle":{"started_at":value["started_at"],"finished_at":value["finished_at"],"exit_code":exit_code}}),
-  )
+  let mut facts = json!({"supported":reason.is_none(),"protocol_version":value["run_control_protocol_version"].as_u64().unwrap_or(0),"attempt":attempt(&value),"generation":generation(&value),"status":status,"capabilities":capabilities,"command":command,"checkpoints":checkpoints,"reason":reason,"requirements":crate::resource_guard::requirements(&value)?,"resource_status":value["resource_status"],"manual_paused":value["manual_paused"].as_bool().unwrap_or(value["status"] == "paused" && value["resource_paused"] != true),"lifecycle":{"started_at":value["started_at"],"finished_at":value["finished_at"],"exit_code":exit_code}});
+  facts["experiment_assignment_supported"] = json!(experiment_assignment_supported);
+  Ok(facts)
 }
 
 fn registered_checkpoints(run_dir: &Path) -> Result<Vec<String>> {
@@ -244,6 +249,12 @@ pub fn execute(run_dir: &Path, command: &ControlCommand) -> Result<ControlResult
   }
   if let Some(requirements) = &command.requirements {
     requirements.validate()?;
+  }
+  if let Some(experiment) = &command.experiment {
+    if command.action != ControlAction::Restart {
+      return Err(message("only restart accepts an experiment selection"));
+    }
+    experiment.validate()?;
   }
   if (command.action == ControlAction::SetRequirements) != command.requirements.is_some() {
     return Err(message(
@@ -504,6 +515,16 @@ fn recorded_request(run_dir: &Path, command: &ControlCommand) -> Result<RunReque
     return Err(message("recorded task arguments are invalid"));
   }
   request.expected_sync = None;
+  if command.action == ControlAction::Restart {
+    // A fresh run must not replay the source run's assignment request.
+    request.experiment = command
+      .experiment
+      .clone()
+      .map(|selection| RunExperimentIntent {
+        request_id: command.request_id.clone(),
+        selection,
+      });
+  }
   request.requirements = crate::resource_guard::requirements(&value)?;
   request.name = value["task"].as_str().unwrap_or(&request.name).to_owned();
   request.detach = true;
@@ -589,6 +610,7 @@ fn restart_recorded(run_dir: &Path, journal: &mut Journal) -> Result<Option<Stri
   journal.result.new_run_id = Some(new_id.clone());
   save(run_dir, journal)?;
   if journal.stage == "accepted" {
+    crate::node::run::validate_experiment_request(&request)?;
     let (source, manifest) = super::recorded_source(run_dir, &value)?;
     // Retrying preparation may remove only this request's still-unpublished clone.
     if new_dir.exists() && !new_dir.join("run-state.json").exists() {
@@ -641,6 +663,7 @@ fn restart_recorded(run_dir: &Path, journal: &mut Journal) -> Result<Option<Stri
     } else {
       let mut stop = command.clone();
       stop.action = ControlAction::Stop;
+      stop.experiment = None;
       // Delivery expiry fences unstarted requests. This transition has already
       // been accepted and may have spent minutes preparing its environment.
       stop.expires_at_ms = chrono::Utc::now().timestamp_millis().saturating_add(60_000);

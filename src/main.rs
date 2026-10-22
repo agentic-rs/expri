@@ -6,6 +6,7 @@ mod context;
 mod controller;
 mod dashboard;
 mod environment;
+mod experiment_cli;
 mod fetch_cli;
 mod global_config;
 mod login_cli;
@@ -232,6 +233,8 @@ struct DownloadCommand {
 #[derive(Debug, Args)]
 #[command(group(clap::ArgGroup::new("receipt_mode").args(["queue", "detach"]).multiple(true)))]
 struct RunCommand {
+  #[command(flatten)]
+  experiment: Box<experiment_cli::RunExperiment>,
   /// Print the queued or detached start receipt as JSON.
   #[arg(long, requires = "receipt_mode")]
   json: bool,
@@ -487,6 +490,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     }
     return queue_cli::submit(command, context, target, quiet);
   }
+  let experiment = command.experiment.resolve(None)?;
   let mut task_parts = command.task.into_iter();
   let name = task_parts
     .next()
@@ -505,6 +509,21 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     let mut context = context.into_target(target, command.control_path)?;
     if command.no_publish {
       disable_publishing(&mut context.target.service);
+    }
+    experiment_cli::validate_mode(
+      experiment.as_ref(),
+      context.target.service.as_ref(),
+      context.target.environment.is_some(),
+    )?;
+    if experiment.is_some() {
+      controller::task::check_run_experiment_target(
+        &context.target,
+        &context.control_path,
+        &command.control_persist,
+        command.dry_run,
+        verbosity,
+        quiet,
+      )?;
     }
     if command.smoke && context.target.environment.is_none() {
       return Err(ExpriError::Message(
@@ -592,6 +611,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
       control_persist: command.control_persist,
       name,
       task,
+      experiment,
       args,
       dry_run: command.dry_run,
       verbosity,
@@ -611,6 +631,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
   if command.no_publish {
     disable_publishing(&mut service);
   }
+  experiment_cli::validate_mode(experiment.as_ref(), service.as_ref(), environment.is_some())?;
   let mut local_sources = remote_managed;
   if let Some(paths) = context
     .config
@@ -625,6 +646,7 @@ fn run_task(command: RunCommand, target: Option<&str>, verbosity: u8, quiet: boo
     project_name: context.project_name,
     name,
     task,
+    experiment,
     args,
     dry_run: command.dry_run,
     detach: command.detach,

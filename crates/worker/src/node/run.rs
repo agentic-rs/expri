@@ -100,6 +100,7 @@ pub fn prepare_request_at_with_initializer(
   if let Some(service) = &request.service {
     service.validate()?;
   }
+  validate_experiment_request(request)?;
   environment::task_argv(&request.command)?;
   let snapshot = environment::snapshot::create_expected_with_smoke(
     &repo_root,
@@ -108,6 +109,28 @@ pub fn prepare_request_at_with_initializer(
     request.smoke,
   )?;
   prepare_snapshot(request, repo_root, snapshot, initialize)
+}
+
+pub(crate) fn validate_experiment_request(request: &RunRequest) -> Result<()> {
+  if let Some(intent) = &request.experiment {
+    intent.validate()?;
+    let service = request
+      .service
+      .as_ref()
+      .filter(|service| service.publish)
+      .ok_or_else(|| {
+        ExpriError::Message("experiment assignment requires automatic service publishing".into())
+      })?;
+    crate::service::experiment_assignment::preflight(
+      &service.client_config,
+      &service.project_id,
+      intent,
+    )?;
+    crate::service::worker_service::ensure_experiment_assignment_ready(&StoragePaths::resolve(
+      None,
+    )?)?;
+  }
+  Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -173,6 +196,7 @@ fn prepare_snapshot(
     "schema_version": 1,
     "run_id": snapshot.run_id,
     "task": request.name,
+    "experiment_intent": request.experiment,
     "command": request.command,
     "code_dir": snapshot.code_dir,
     "output_dir": snapshot.run_dir.join("outputs"),
@@ -976,6 +1000,65 @@ mod tests {
   }
 
   #[test]
+  fn experiment_intent_is_durable_before_both_foreground_and_detached_launches() {
+    use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
+    let root = asset_repository();
+    let intent = RunExperimentIntent {
+      request_id: "create-study".into(),
+      selection: ExperimentSelection::JoinRun {
+        run_id: "run-parent".into(),
+        origin: Some("other-worker".into()),
+      },
+    };
+    for detach in [false, true] {
+      let request = RunRequest {
+        name: "train".into(),
+        command: vec!["python".into(), "train.py".into()],
+        experiment: Some(intent.clone()),
+        environment: expri_core::config::EnvironmentConfig {
+          base_python: None,
+          reuse_packages: vec![],
+          require_cuda: false,
+          env: Default::default(),
+        },
+        service: Some(expri_core::config::RunServiceConfig {
+          client_config: "/tmp/not-read-by-preparation.toml".into(),
+          project_id: "project".into(),
+          origin: "worker".into(),
+          dashboard_url: None,
+          publish: true,
+        }),
+        detach,
+        smoke: false,
+        remote_managed: vec![],
+        extras: vec![],
+        sync_args: vec![],
+        expected_sync: None,
+        requirements: Default::default(),
+      };
+      let snapshot =
+        environment::snapshot::create_expected_with_smoke(root.path(), &[], None, false).unwrap();
+      let prepared = prepare_snapshot(
+        &request,
+        root.path().canonicalize().unwrap(),
+        snapshot,
+        || Err(ExpriError::Message("collection unavailable".into())),
+      )
+      .unwrap();
+      let state: serde_json::Value = serde_json::from_slice(
+        &fs::read(prepared.snapshot.run_dir.join("run-state.json")).unwrap(),
+      )
+      .unwrap();
+      assert_eq!(state["experiment_intent"], json!(intent));
+      assert_eq!(state["status"], "preparing");
+      assert_eq!(
+        prepared.snapshot.run_dir.join("run-request.json").exists(),
+        detach
+      );
+    }
+  }
+
+  #[test]
   fn failed_collection_initialization_preserves_identity_without_certifying_an_empty_capture() {
     const CHILD: &str = "EXPRI_NODE_CAPTURE_TEST_CHILD";
     const MACHINE: &str = "EXPRI_NODE_CAPTURE_TEST_MACHINE";
@@ -1010,6 +1093,7 @@ mod tests {
     let root = asset_repository();
     fs::write(root.path().join("train.sh"), "exit 0\n").unwrap();
     let request = RunRequest {
+      experiment: None,
       name: "train".into(),
       command: vec!["/bin/sh".into(), "train.sh".into()],
       environment: expri_core::config::EnvironmentConfig {
@@ -1182,6 +1266,7 @@ mod tests {
     fs::write(&sidecar, text).unwrap();
     let marker = canonical.join("training-started");
     let request = RunRequest {
+      experiment: None,
       name: "test".into(),
       command: vec!["touch".into(), marker.to_string_lossy().into_owned()],
       environment: expri_core::config::EnvironmentConfig {

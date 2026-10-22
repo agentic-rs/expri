@@ -84,6 +84,66 @@ fn legacy_queue_servers_are_refused_before_submission_or_worker_registration() {
 }
 
 #[test]
+fn experiment_worker_registration_negotiates_new_field_with_the_server() {
+  for supported in [false, true] {
+    let (url, server) = mock(2, move |request, _| {
+      let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+      match serde_json::from_value::<Request>(value.clone()).unwrap() {
+        Request::Capabilities => {
+          let mut features = vec![RESOURCE_QUEUE_CAPABILITY.into()];
+          if supported {
+            features
+              .push(expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY.into());
+          }
+          (
+            200,
+            vec![],
+            serde_json::to_vec(&Response::Capabilities { features }).unwrap(),
+          )
+        }
+        Request::Queue {
+          request:
+            QueueRequest::RegisterWorker {
+              experiment_assignment_supported,
+              ..
+            },
+        } => {
+          assert_eq!(experiment_assignment_supported, supported.then_some(true));
+          assert_eq!(
+            value["request"]
+              .get("experiment_assignment_supported")
+              .is_some(),
+            supported
+          );
+          (
+            503,
+            vec![],
+            br#"{"error":"registration observed"}"#.to_vec(),
+          )
+        }
+        other => panic!("unexpected registration request: {other:?}"),
+      }
+    });
+    let root = tempfile::tempdir().unwrap();
+    let client = ResourceQueueClient::new(&config(root.path(), &url)).unwrap();
+    let registration = QueueRequest::RegisterWorker {
+      worker_id: "worker-one".into(),
+      session_id: "session-one".into(),
+      project_ids: vec![],
+      capacity: WorkerCapacity {
+        cpus: 1,
+        memory_bytes: 1024,
+        gpus: vec![],
+      },
+      gpu_availability: None,
+      experiment_assignment_supported: client.experiment_assignment_registration(),
+    };
+    assert!(client.request(&registration).is_err());
+    server.join().unwrap();
+  }
+}
+
+#[test]
 fn pinned_sources_keep_integrity_and_private_permissions_in_both_transports() {
   for cooperative in [false, true] {
     let bytes = b"pinned source bytes";

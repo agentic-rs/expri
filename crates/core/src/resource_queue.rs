@@ -96,6 +96,8 @@ pub struct JobSubmission {
   pub submission_id: String,
   pub project_id: String,
   pub task: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub experiment: Option<crate::experiment_assignment::RunExperimentIntent>,
   pub command: Vec<String>,
   pub environment: EnvironmentConfig,
   #[serde(default)]
@@ -302,6 +304,9 @@ impl From<&JobSummary> for QueueJobContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
+  /// This worker can decode and publish launch-time experiment assignments.
+  #[serde(default, skip_serializing_if = "is_false")]
+  pub experiment_assignment_supported: bool,
   pub worker_id: String,
   pub session_id: String,
   /// An empty list accepts any project permitted by the worker's credentials.
@@ -360,6 +365,8 @@ pub enum QueueRequest {
     #[serde(default)]
     project_ids: Vec<String>,
     capacity: WorkerCapacity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    experiment_assignment_supported: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     gpu_availability: Option<GpuAvailabilityReport>,
   },
@@ -440,6 +447,10 @@ pub enum QueueResponse {
 
 fn invalid(message: &str) -> ExpriError {
   ExpriError::Message(message.into())
+}
+
+fn is_false(value: &bool) -> bool {
+  !*value
 }
 
 fn text(value: &str, limit: usize, empty: bool) -> Result<()> {
@@ -604,6 +615,14 @@ impl JobSubmission {
   pub fn validate(&self) -> Result<()> {
     validate_component(&self.submission_id)?;
     validate_component(&self.project_id)?;
+    if let Some(intent) = &self.experiment {
+      intent.validate()?;
+      if !self.publish {
+        return Err(invalid(
+          "experiment assignment requires automatic publishing",
+        ));
+      }
+    }
     text(&self.task, 256, false)?;
     if let Some(worker_id) = &self.worker_id {
       validate_component(worker_id)?;
@@ -708,6 +727,7 @@ impl QueueRequest {
         project_ids,
         capacity,
         gpu_availability,
+        ..
       } => {
         validate_component(worker_id)?;
         validate_component(session_id)?;
@@ -893,6 +913,7 @@ impl JobSummary {
 impl WorkerSummary {
   pub fn validate(&self) -> Result<()> {
     QueueRequest::RegisterWorker {
+      experiment_assignment_supported: Some(self.experiment_assignment_supported),
       worker_id: self.worker_id.clone(),
       session_id: self.session_id.clone(),
       project_ids: self.project_ids.clone(),
@@ -1038,6 +1059,15 @@ impl QueueResponse {
         Self::Worker { worker, attempts },
       ) => {
         worker.validate()?;
+        if let QueueRequest::RegisterWorker {
+          experiment_assignment_supported,
+          ..
+        } = request
+          && worker.experiment_assignment_supported
+            != experiment_assignment_supported.unwrap_or(false)
+        {
+          return Err(wrong());
+        }
         if &worker.worker_id != worker_id
           || &worker.session_id != session_id
           || attempts.len() > MAX_OUTSTANDING_ATTEMPTS
@@ -1185,6 +1215,18 @@ mod tests {
   }
 
   #[test]
+  fn experiment_registration_support_is_opt_in_and_legacy_wire_stays_unchanged() {
+    let legacy = serde_json::json!({"operation":"register_worker", "worker_id":"worker", "session_id":"session", "project_ids":[], "capacity":{"cpus":1,"memory_bytes":1000,"gpus":[]}});
+    let request: QueueRequest = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), legacy);
+    let mut modern = legacy;
+    modern["experiment_assignment_supported"] = serde_json::json!(true);
+    let request: QueueRequest = serde_json::from_value(modern.clone()).unwrap();
+    request.validate().unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), modern);
+  }
+
+  #[test]
   fn gpu_availability_reports_are_bounded_unique_and_registered() {
     let capacity = WorkerCapacity {
       cpus: 4,
@@ -1293,6 +1335,7 @@ mod tests {
   fn worker_gpu_availability_partitions_cover_capacity_without_overlap() {
     let gpus = ["GPU-a", "GPU-b", "GPU-c", "GPU-d"].map(gpu);
     let mut worker = WorkerSummary {
+      experiment_assignment_supported: false,
       worker_id: "worker-a".into(),
       session_id: "session-a".into(),
       project_ids: vec![],
@@ -1431,6 +1474,7 @@ mod tests {
   fn cuda_environment_requires_a_gpu_reservation_in_direct_api_submissions() {
     let sha256 = "a".repeat(64);
     let mut submission = JobSubmission {
+      experiment: None,
       submission_id: "test".into(),
       project_id: "project".into(),
       task: "train".into(),
@@ -1524,6 +1568,7 @@ mod tests {
       selector: Some("0".into()),
     };
     let mut worker = WorkerSummary {
+      experiment_assignment_supported: false,
       worker_id: "worker-one".into(),
       session_id: "session-one".into(),
       project_ids: vec!["project".into()],

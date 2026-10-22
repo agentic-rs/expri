@@ -134,6 +134,7 @@ pub(super) fn run(
           checkpoint: command.checkpoint,
           run: RunRequest {
             name,
+            experiment: None,
             command: argv,
             environment,
             requirements,
@@ -176,6 +177,7 @@ pub(super) fn run(
           checkpoint: command.checkpoint,
           run: RunRequest {
             name,
+            experiment: None,
             command: argv,
             environment,
             requirements: recorded_requirements(&status)?,

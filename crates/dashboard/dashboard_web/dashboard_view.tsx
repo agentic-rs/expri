@@ -1315,6 +1315,7 @@ function ReviewWorkspace({
         {s.review?.kind === "run" && review_run && <RunLifecyclePanel key={lifecyclePanelKey(s.source_id, review_run)}
           run={review_run} source={s.sources.find(source => source.source_id === s.source_id)} detail={s.detail}
           enabled={s.run_management_enabled} visible={s.workspace_view === "workspace"}
+          experiment_catalog={s.experiments.catalog}
           on_applied={a.refresh} on_open_run={a.inspect_run} />}
         <div className="review-tabs" role="tablist" aria-label="Run inspection">
           {(queue_only ? available : tabs).map((tab) => (

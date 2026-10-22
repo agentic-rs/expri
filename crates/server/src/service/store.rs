@@ -32,7 +32,7 @@ const MAX_PARTS: u64 = 1000;
 const MAX_PART_SIZE: u64 = 5 * 1024_u64.pow(3);
 const MAX_FILE_SIZE: u64 = MAX_PARTS * MAX_PART_SIZE;
 const MAX_ETAG_BYTES: usize = 256;
-pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 13;
+pub(in crate::service) const METADATA_SCHEMA_VERSION: i64 = 14;
 
 pub(super) type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -961,6 +961,13 @@ impl<S: ObjectStorage> Store<S> {
     self.ensure_request_runs(&request)?;
     self.guard_publication_epoch(&request, epoch)?;
     match request {
+      Request::ValidateExperimentSelection { project_id, intent } => {
+        self.validate_experiment_intent(&project_id, &intent)?;
+        Ok(Response::ExperimentSelectionValidated)
+      }
+      Request::AssignRunExperiment { scope, intent } => Ok(Response::RunExperimentAssigned {
+        assignment: self.assign_run_experiment(&scope, &intent)?,
+      }),
       Request::AtRunEpoch { .. }
       | Request::RunControlBatch { .. }
       | Request::BeginRunAttempt { .. }
@@ -1043,6 +1050,7 @@ impl<S: ObjectStorage> Store<S> {
           expri_core::system_profile::SYSTEM_PROFILE_CAPABILITY.into(),
           expri_core::run_system::RUN_SYSTEM_CAPABILITY.into(),
           "run-annotations-v1".into(),
+          expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY.into(),
           expri_core::service_catalog::SERVICE_CATALOG_CAPABILITY.into(),
           expri_core::resource_queue::RESOURCE_QUEUE_CAPABILITY.into(),
           expri_core::resource_queue::RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY.into(),

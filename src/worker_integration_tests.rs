@@ -218,6 +218,7 @@ impl Fixture {
     std::os::unix::fs::symlink(python.trim(), bin_dir.join("python"))
       .expect("ambient Python alias");
     let request = RunRequest {
+      experiment: None,
       service: None,
       requirements: Default::default(),
       detach: false,

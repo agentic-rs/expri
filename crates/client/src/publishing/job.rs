@@ -139,6 +139,8 @@ pub struct PreparedJob {
   automatic: bool,
   repo_root: Option<PathBuf>,
   dashboard_url: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  experiment: Option<expri_core::experiment_assignment::RunExperimentIntent>,
 }
 
 fn canonical_destination(path: &Path) -> Result<PathBuf> {
@@ -208,6 +210,11 @@ pub fn prepare_manual(options: &PublishOptions) -> Result<PreparedJob> {
     automatic: false,
     repo_root: None,
     dashboard_url: None,
+    experiment: state
+      .get("experiment_intent")
+      .filter(|value| !value.is_null())
+      .map(|value| serde_json::from_value(value.clone()))
+      .transpose()?,
   };
   // An explicit request to observe/resume the same automatic run retains its
   // existing source context instead of registering a conflicting second job.
@@ -268,6 +275,14 @@ impl PreparedJob {
     )?)?;
     if state["run_id"].as_str() != Some(self.scope.run_id.as_str()) {
       return Err(error("prepared publishing job belongs to another run"));
+    }
+    if let Some(intent) = &self.experiment {
+      intent.validate()?;
+      if state.get("experiment_intent") != Some(&serde_json::to_value(intent)?) {
+        return Err(error(
+          "prepared publishing job changed its experiment intent",
+        ));
+      }
     }
     if client::artifacts(&self.artifacts)?
       .into_iter()

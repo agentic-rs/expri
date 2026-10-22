@@ -60,6 +60,7 @@ fn observe(
         requirements: None,
         resource_status: None,
         manual_paused: None,
+        experiment_assignment_supported: None,
         result: None,
       },
     })
@@ -209,6 +210,7 @@ fn pending_resource_reason_reaches_rows_and_detail_without_truncating_the_policy
           }],
         })),
         manual_paused: Some(false),
+        experiment_assignment_supported: None,
         result: None,
       },
     })
