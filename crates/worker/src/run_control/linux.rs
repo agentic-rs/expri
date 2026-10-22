@@ -82,7 +82,23 @@ fn save(run_dir: &Path, journal: &Journal) -> Result<()> {
   Ok(())
 }
 
-fn supported(run_dir: &Path, value: &Value) -> Result<()> {
+fn supervisor_state(run_dir: &Path) -> Result<(Value, LockAttempt)> {
+  read_supervisor_state(run_dir, || state(run_dir))
+}
+
+fn read_supervisor_state(
+  run_dir: &Path,
+  read_state: impl FnOnce() -> Result<Value>,
+) -> Result<(Value, LockAttempt)> {
+  // Terminal state is committed before the supervisor releases its lease.
+  // Observe ownership first so an earlier running snapshot cannot be mistaken
+  // for lost ownership after normal shutdown. Retain an acquired shared lease
+  // while inspecting the state to exclude a concurrently starting successor.
+  let ownership = expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?;
+  Ok((read_state()?, ownership))
+}
+
+fn supported(run_dir: &Path, value: &Value, ownership: &LockAttempt) -> Result<()> {
   if value["queue_cleanup"] == true {
     return Err(message(
       "queued runs require scheduler allocation and do not support website controls yet",
@@ -103,12 +119,7 @@ fn supported(run_dir: &Path, value: &Value) -> Result<()> {
       "the former task group was not verified stopped; lifecycle replacement is unavailable",
     ));
   }
-  if !terminal(value)
-    && !matches!(
-      expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?,
-      LockAttempt::Busy
-    )
-  {
+  if !terminal(value) && !matches!(ownership, LockAttempt::Busy) {
     return Err(message("run supervisor ownership was lost"));
   }
   if value["run_id"].as_str() != run_dir.file_name().and_then(|part| part.to_str()) {
@@ -119,10 +130,10 @@ fn supported(run_dir: &Path, value: &Value) -> Result<()> {
 
 pub fn inspect(run_dir: &Path) -> Result<Value> {
   let run_dir = crate::supervisor::linux::validate_run_directory(run_dir)?;
-  let value = state(&run_dir)?;
+  let (value, ownership) = supervisor_state(&run_dir)?;
   let mut capabilities = Vec::new();
   let mut reason = None;
-  match supported(&run_dir, &value) {
+  match supported(&run_dir, &value, &ownership) {
     Ok(()) => {
       match value["status"].as_str().unwrap_or_default() {
         "running" | "waiting" => capabilities.extend([ControlAction::Pause, ControlAction::Stop]),
@@ -170,10 +181,8 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
   let status = if matches!(
     recorded_status,
     "preparing" | "pending" | "running" | "waiting" | "paused"
-  ) && !matches!(
-    expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?,
-    LockAttempt::Busy
-  ) {
+  ) && !matches!(ownership, LockAttempt::Busy)
+  {
     "lost"
   } else {
     recorded_status
@@ -294,8 +303,8 @@ pub fn execute(run_dir: &Path, command: &ControlCommand) -> Result<ControlResult
       journal
     }
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-      let value = state(&run_dir)?;
-      supported(&run_dir, &value)?;
+      let (value, ownership) = supervisor_state(&run_dir)?;
+      supported(&run_dir, &value, &ownership)?;
       fence(&value, command)?;
       let expired = chrono::Utc::now().timestamp_millis() >= command.expires_at_ms;
       let journal = Journal {
@@ -411,7 +420,7 @@ fn stop_complete(value: &Value) -> Result<bool> {
 }
 
 fn supervisor_action(run_dir: &Path, command: &ControlCommand) -> Result<Option<String>> {
-  let value = state(run_dir)?;
+  let (value, ownership) = supervisor_state(run_dir)?;
   let saved = saved_event(&value, command);
   if let Some(done) = &saved {
     if done.status != "applied" {
@@ -430,13 +439,14 @@ fn supervisor_action(run_dir: &Path, command: &ControlCommand) -> Result<Option<
   if command.action == ControlAction::Stop && stop_complete(&value)? {
     return Ok(None);
   }
-  supported(run_dir, &value)?;
+  supported(run_dir, &value, &ownership)?;
+  drop(ownership);
   if saved.is_none() {
     write_json(&run_dir.join(MAILBOX), &serde_json::to_value(command)?)?;
   }
   let deadline = Instant::now() + Duration::from_secs(u64::from(command.grace_seconds) + 30);
   loop {
-    let value = state(run_dir)?;
+    let (value, ownership) = supervisor_state(run_dir)?;
     if let Some(done) = saved_event(&value, command) {
       if done.status == "failed" {
         return Err(message(
@@ -458,10 +468,7 @@ fn supervisor_action(run_dir: &Path, command: &ControlCommand) -> Result<Option<
         "supervisor lifecycle acknowledgment timed out; inspect the run before retrying",
       ));
     }
-    if !matches!(
-      expri_core::lock::try_lock_file_readonly(&run_dir.join(".run.lock"))?,
-      LockAttempt::Busy
-    ) {
+    if !matches!(ownership, LockAttempt::Busy) {
       return Err(message(
         "supervisor ownership was lost before lifecycle acknowledgment",
       ));

@@ -505,6 +505,44 @@ fn accepted_restart_can_stop_after_its_original_delivery_deadline() {
 }
 
 #[test]
+fn terminal_transition_during_state_read_retains_the_prior_ownership_observation() {
+  let (_root, run) = fixture();
+  let lease = expri_core::lock::run_lock(&run).unwrap();
+  update_state(&run.join("run-state.json"), |value| {
+    value["run_control_protocol_version"] = json!(1);
+    value["supervisor"] = json!({"generation":1});
+    Ok(())
+  })
+  .unwrap();
+  let (stale, ownership) = read_supervisor_state(&run, || {
+    let running = state(&run)?;
+    // Force the CI interleaving: the reader captured a running snapshot just
+    // before the supervisor committed its final state and released its lease.
+    update_state(&run.join("run-state.json"), |value| {
+      value["status"] = json!("cancelled");
+      value["task_process_group_clean"] = json!(true);
+      Ok(())
+    })?;
+    drop(lease);
+    Ok(running)
+  })
+  .unwrap();
+  assert!(matches!(ownership, LockAttempt::Busy));
+  supported(&run, &stale, &ownership).unwrap();
+  assert!(!stop_complete(&stale).unwrap());
+
+  let (finished, ownership) = supervisor_state(&run).unwrap();
+  assert!(matches!(ownership, LockAttempt::Acquired(_)));
+  assert!(stop_complete(&finished).unwrap());
+  assert!(matches!(
+    expri_core::lock::try_lock_file(&run.join(".run.lock"), false).unwrap(),
+    LockAttempt::Busy
+  ));
+  drop(ownership);
+  supervisor_action(&run, &control(ControlAction::Stop, "finished-stop")).unwrap();
+}
+
+#[test]
 fn replayed_stop_acceptance_waits_for_terminal_state_and_verified_cleanup() {
   let (_root, run) = fixture();
   let supervisor = start_counter(
