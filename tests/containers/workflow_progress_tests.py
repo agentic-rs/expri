@@ -52,11 +52,15 @@ class ProgressTests(unittest.TestCase):
       # A silent subprocess also blocks the main thread. The heartbeat must run
       # independently and flush both destinations before that work completes.
       self.assertTrue(stream.heartbeat.wait(timeout=2), "blocked work had no heartbeat")
-      output = stream.getvalue()
+      # Freeze the two snapshots together: a later heartbeat can otherwise
+      # append to the file after the stream snapshot has already been taken.
+      with progress._lock:
+        output = stream.getvalue()
+        recorded = log_path.read_text()
       self.assertIn("START Build worker (log: build-worker.log)", output)
       self.assertIn("RUNNING Build worker (log: build-worker.log)", output)
       self.assertNotIn("/tmp/", output)
-      self.assertEqual(log_path.read_text(), output)
+      self.assertEqual(recorded, output)
     progress.close()
     self.assertIn("PASS Build worker", stream.getvalue())
     self.assertEqual(log_path.read_text(), stream.getvalue())
@@ -207,6 +211,8 @@ Path(str(key) + ".pub").write_text("unused public fixture key")
     self.assertNotIn("During handling of the above exception", result.stderr)
     self.assertEqual(list(self.tmp.iterdir()), [], "temporary fixture state was retained")
     commands = [json.loads(line) for line in self.commands.read_text().splitlines()]
+    self.assertIn("PASS Use existing container images", progress)
+    self.assertFalse(any(command[0] in {"build", "buildx", "pull"} for command in commands))
     return result, progress, summary, commands
 
   def test_real_workflow_reports_fixture_failure_and_cleanup_without_docker(self):

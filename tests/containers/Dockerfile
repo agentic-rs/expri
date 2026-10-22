@@ -28,7 +28,6 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --create-home --uid 1000 --user-group --shell /bin/bash tester \
   && mkdir -p /run/expri-ssh
-COPY --from=builder /artifacts/expri /usr/local/bin/expri
 COPY tests/containers/build_wheels.py tests/containers/fake_torch.py \
   tests/containers/fetch_helper_wheels.py /opt/expri-fixtures/scripts/
 RUN python /opt/expri-fixtures/scripts/build_wheels.py /opt/expri-fixtures/wheels \
@@ -52,6 +51,8 @@ RUN uv pip install --system --no-index --find-links /opt/expri-fixtures/wheels \
 RUN printf '#!/bin/sh\nset -eu\nif [ "${1:-}" = node ] && [ "${2:-}" = ping ]; then\n  echo ok\n  exit 0\nfi\nexit 1\n' > /usr/local/bin/expri-old \
   && chmod 755 /usr/local/bin/expri-old
 COPY --chmod=755 tests/containers/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
+# Keep package setup reusable when only the Rust executable changes.
+COPY --from=builder /artifacts/expri /usr/local/bin/expri
 EXPOSE 22 8000
 ENTRYPOINT ["/usr/local/bin/worker-entrypoint"]
 
@@ -59,10 +60,12 @@ FROM common AS host
 RUN uv pip install --system --no-index --find-links /opt/expri-fixtures/wheels 'torch==2.9.0+cpu'
 COPY --from=builder /artifacts/expri-container-tests /usr/local/bin/expri-container-tests
 COPY --chmod=755 tests/containers/host-entrypoint.sh /usr/local/bin/host-entrypoint
+COPY --from=builder /artifacts/expri /usr/local/bin/expri
 ENV EXPRI_TEST_BIN=/usr/local/bin/expri
 ENTRYPOINT ["/usr/local/bin/host-entrypoint"]
 
 FROM common AS service
+COPY --from=builder /artifacts/expri /usr/local/bin/expri
 USER tester
 ENTRYPOINT ["/usr/local/bin/expri", "service", "serve"]
 
