@@ -3,6 +3,7 @@ pub(crate) mod checkpoints;
 mod continuation;
 mod download;
 pub mod experiment_assignment;
+mod experiments;
 pub(super) mod fs;
 pub(crate) mod http;
 mod inventory;
@@ -41,6 +42,7 @@ pub(crate) use continuation::{
   begin_task_attempt, check_task_attempt_support, reconcile_task_attempt,
 };
 pub use download::{fetch, input_download, input_download_prepared};
+pub use experiments::ExperimentCatalogClient;
 pub use http::ResolvedClient;
 pub use login::{login, logout, revoke_login, validate_login_url};
 pub use resource_queue::ResourceQueueClient;

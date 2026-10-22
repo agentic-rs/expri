@@ -286,6 +286,24 @@ impl<S: ObjectStorage> Store<S> {
     if !selection.members.contains(scope) {
       selection.members.push(scope.clone());
     }
+    if let Some(parent) = run_control::experiment_restart_parent(&tx, scope, intent)? {
+      // An explicit different experiment never moves the source run. Preserve
+      // manually recorded relationships when this pair is already present.
+      if selection.members.contains(&parent)
+        && !selection
+          .lineage
+          .iter()
+          .any(|edge| edge.parent == parent && edge.child == *scope)
+      {
+        selection.lineage.push(Lineage {
+          parent,
+          child: scope.clone(),
+          kind: LineageKind::Restarted,
+          checkpoint: None,
+          step: None,
+        });
+      }
+    }
     let experiment = save_normalized(&tx, normalize(selection)?)?;
     let receipt = RunExperimentAssignment {
       scope: scope.clone(),

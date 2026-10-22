@@ -1,22 +1,24 @@
 import { apiUrl, parseRunDeepLink, type RunDeepLink } from "./dashboard_model";
-import { experimentDisplayName, type ExperimentCatalog } from "./experiments";
+import { experimentDisplayName, memberExperiment, type ExperimentCatalog } from "./experiments";
 
 export type ExperimentSelection = { kind: "existing"; experiment_id: string } | { kind: "new"; name: string } |
   { kind: "join_run"; run_id: string; origin: string };
 export type RestartExperimentDraft = {
-  kind: "ungrouped" | ExperimentSelection["kind"];
+  kind: "unresolved" | "ungrouped" | ExperimentSelection["kind"];
   experiment_id: string;
   name: string;
   run_id: string;
   origin: string;
 };
 
-export function restartExperimentDraft(scope: RunDeepLink | null): RestartExperimentDraft {
-  return { kind: "ungrouped", experiment_id: "", name: "", run_id: scope?.run_id ?? "", origin: scope?.origin ?? "" };
+export function restartExperimentDraft(scope: RunDeepLink | null, catalog: ExperimentCatalog | null | undefined): RestartExperimentDraft {
+  const experiment = scope && catalog?.project_id === scope.project_id ? memberExperiment(catalog, scope) : null;
+  return { kind: catalog?.project_id !== scope?.project_id ? "unresolved" : experiment ? "existing" : "ungrouped", experiment_id: experiment?.experiment_id ?? "", name: "", run_id: scope?.run_id ?? "", origin: scope?.origin ?? "" };
 }
 
 export function restartExperimentSelection(draft: RestartExperimentDraft, project_id: string,
   catalog: ExperimentCatalog | null | undefined): ExperimentSelection | null {
+  if (draft.kind === "unresolved") throw new Error("Experiment membership is unavailable. Refresh and reopen Restart, or explicitly choose a grouping option.");
   if (draft.kind === "ungrouped") return null;
   if (draft.kind === "existing") {
     if (catalog?.project_id !== project_id || !catalog.experiments.some(item => item.experiment_id === draft.experiment_id)) {
@@ -38,11 +40,12 @@ export function restartExperimentSelection(draft: RestartExperimentDraft, projec
   return { kind: "join_run", run_id, origin };
 }
 
-export function RestartExperimentEditor({ draft, catalog, project_id, disabled, on_change }: {
+export function RestartExperimentEditor({ draft, catalog, project_id, disabled, assignment_supported, on_change }: {
   draft: RestartExperimentDraft;
   catalog: ExperimentCatalog | null | undefined;
   project_id: string;
   disabled: boolean;
+  assignment_supported: boolean;
   on_change: (draft: RestartExperimentDraft) => void;
 }) {
   const experiments = catalog?.project_id === project_id ? catalog.experiments : [];
@@ -51,8 +54,9 @@ export function RestartExperimentEditor({ draft, catalog, project_id, disabled, 
     <div className="choice-tags">{([['ungrouped', 'Ungrouped'], ['existing', 'Existing experiment'], ['new', 'New experiment'], ['join_run', 'Join a run']] as const).map(([kind, label]) =>
       <label className="choice-tag" key={kind}><input id={`restart-experiment-${kind}`} className="sr-only" type="radio"
         name="restart-experiment" value={kind} checked={draft.kind === kind}
+        disabled={kind !== "ungrouped" && (!assignment_supported || (kind === "existing" && catalog?.project_id !== project_id))}
         onChange={() => on_change({ ...draft, kind })} /><span>{label}</span></label>)}</div>
-    {draft.kind === "existing" && <label className="field">Choose experiment<select id="restart-experiment-id" value={draft.experiment_id}
+    {draft.kind === "existing" && <label className="field">Choose experiment<select id="restart-experiment-id" value={draft.experiment_id} disabled={!assignment_supported}
       onChange={event => on_change({ ...draft, experiment_id: event.currentTarget.value })}>
       <option value="">{experiments.length ? "Choose an experiment" : "No experiments available"}</option>
       {[...experiments].sort((a, b) => a.name.localeCompare(b.name)).map(item => <option key={item.experiment_id} value={item.experiment_id}>
@@ -67,6 +71,7 @@ export function RestartExperimentEditor({ draft, catalog, project_id, disabled, 
         autoComplete="off" onChange={event => on_change({ ...draft, run_id: event.currentTarget.value })} /></label></div>
       <p className="muted">Join this run’s experiment. If it is ungrouped, create an experiment containing both runs.</p>
     </>}
-    {draft.kind !== "ungrouped" && <p className="muted">The worker saves this choice and retries assignment when publishing is available. Each run keeps its own metrics.</p>}
+    {draft.kind === "unresolved" && <p className="muted">Experiment membership is unavailable. Refresh and reopen Restart to keep the current group, or choose an option explicitly.</p>}
+    {draft.kind !== "ungrouped" && draft.kind !== "unresolved" && <p className="muted">The new run keeps separate metrics. When both runs belong to this experiment, their restart relationship is recorded after the worker confirms the restart.</p>}
   </fieldset>;
 }

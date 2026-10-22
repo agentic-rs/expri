@@ -2,6 +2,8 @@ use super::super::tests::{document, edge, edit, scope, selection};
 use super::*;
 use crate::service::store::tests::MockStorage;
 
+mod restart;
+
 fn intent(id: &str, selection: ExperimentSelection) -> RunExperimentIntent {
   RunExperimentIntent {
     request_id: id.into(),

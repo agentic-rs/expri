@@ -14,7 +14,9 @@ pub mod worker_service;
 pub use client::ResourceQueueClient;
 pub use client::RunControlClient;
 pub use client::experiment_assignment;
-pub use client::{ResolvedClient, ServiceCatalogClient, SystemProfileClient};
+pub use client::{
+  ExperimentCatalogClient, ResolvedClient, ServiceCatalogClient, SystemProfileClient,
+};
 pub use client::{
   fetch_files, fetch_files_with_reporter, file_metadata, import_output, input_download_prepared,
 };

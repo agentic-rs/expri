@@ -16,7 +16,7 @@ pub struct RunsCommand {
 
 #[derive(Debug, Subcommand)]
 enum RunsSubcommand {
-  /// List recorded experiments, newest first.
+  /// List recorded runs, newest first.
   List(RunsListCommand),
   /// Inspect a run's status, provenance, and environment record.
   Show(RunsShowCommand),

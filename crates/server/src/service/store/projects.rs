@@ -328,6 +328,7 @@ impl<S: ObjectStorage> Store<S> {
       | Request::RunAnnotations { .. }
       | Request::SetRunAnnotations { .. }
       | Request::ValidateExperimentSelection { .. }
+      | Request::ListExperiments { .. }
       | Request::AssignRunExperiment { .. }
       | Request::PutSystemProfile { .. }
       | Request::ListSystemMachines { .. }

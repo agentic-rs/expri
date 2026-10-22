@@ -42,6 +42,7 @@ expri run --new-experiment "Translation model v2" --detach train
 expri -T gpu run --join-run run-abc123 --join-origin workstation --detach train
 ```
 
+Find IDs with `expri experiments list --project-id PROJECT --json`.
 `--experiment` takes an existing experiment ID. `--new-experiment` creates a
 named group. `--join-run` uses an existing published run in the configured
 project: it joins that run's group, or creates one containing both runs if the

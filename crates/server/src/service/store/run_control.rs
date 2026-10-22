@@ -1,4 +1,4 @@
-use expri_core::experiment_assignment::ExperimentSelection;
+use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
 use expri_core::resource_requirements::{ResourceRequirements, ResourceStatus};
 use expri_core::run_control::{
   ControlAction, ControlCommand, ControlLifecycle, ControlResult, RunControlRequest,
@@ -216,6 +216,52 @@ fn latest(db: &Connection, scope: &str) -> ApiResult<Option<StoredCommand>> {
     "SELECT command,fingerprint,status,error,new_run_id FROM run_control_commands WHERE scope=?1 ORDER BY rowid DESC LIMIT 1",
     [scope], command_row,
   ).optional().map_err(database)?.map(stored).transpose()
+}
+
+/// Launch assignments carry the lifecycle request ID, but grouping alone is not
+/// provenance. Only a matching, acknowledged restart identifies its successor.
+pub(super) fn experiment_restart_parent(
+  db: &Connection,
+  child: &RunScope,
+  intent: &RunExperimentIntent,
+) -> ApiResult<Option<RunScope>> {
+  let record: Option<(String, String, String, Option<String>)> = db
+    .query_row(
+      "SELECT scope,command,status,new_run_id FROM run_control_commands WHERE request_id=?1",
+      [&intent.request_id],
+      |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .optional()
+    .map_err(database)?;
+  let Some((scope, command, status, new_run_id)) = record else {
+    return Ok(None);
+  };
+  let parent: RunScope = decode(scope)?;
+  let command: ControlCommand = decode(command)?;
+  if parent.project_id != child.project_id
+    || parent.origin != child.origin
+    || parent == *child
+    || command.action != ControlAction::Restart
+    || command.experiment.as_ref() != Some(&intent.selection)
+  {
+    return Ok(None);
+  }
+  if status == "requested" && command.expires_at_ms <= now_ms() {
+    // The source run may not have polled since delivery expired. Such a request
+    // can no longer launch, while delivered/executing commands may have actuated.
+    return Ok(None);
+  }
+  if matches!(status.as_str(), "requested" | "delivered" | "executing") {
+    // Publishing can reach the server before the independent lifecycle poll.
+    // Do not issue a receipt yet: retries must still be able to add the edge.
+    return Err(ApiError::new(
+      409,
+      "restart acknowledgement is pending; retry experiment assignment",
+    ));
+  }
+  Ok(
+    (status == "applied" && new_run_id.as_deref() == Some(child.run_id.as_str())).then_some(parent),
+  )
 }
 
 fn expire(db: &Connection, scope: &str, at: i64) -> ApiResult<()> {

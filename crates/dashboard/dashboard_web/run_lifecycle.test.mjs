@@ -13,6 +13,10 @@ const { RunLifecyclePanel, lifecycleActions, lifecyclePanelKey, lifecyclePending
 const source = { source_id: "hosted-project:vision", project_id: "vision", kind: "hosted_project" };
 const run = { run_id: "run-one", run_key: "gpu-a:run-one", origin: "gpu-a", task: "train", status: "running", started_at: "2026-10-18T00:00:00Z", finished_at: null, exit_code: null };
 const control = { supported: true, online: true, status: "running", attempt: 2, generation: 8, binding_id: "worker-binding", capabilities: ["pause", "resume", "stop", "continue", "restart"], command: ["python", "train.py", "--epochs", "20"], checkpoints: ["step-100.pt", "step-200.pt"], last_seen_at_ms: Date.now(), request: null };
+const empty_catalog = { project_id: "vision", revision: "1", experiments: [] };
+const grouped_catalog = { ...empty_catalog, experiments: [{ experiment_id: "exp-training", name: "Training", members: [
+  { project_id: "vision", origin: "gpu-a", run_id: "run-one" },
+] }] };
 const reply = (value, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => value });
 function deferred() { let resolve; const promise = new Promise(accept => { resolve = accept; }); return { promise, resolve }; }
 
@@ -72,7 +76,7 @@ async function fixture(t, values = {}, handler = () => reply(control)) {
   const requests = [];
   globalThis.fetch = async (url, options) => { const request = { url, ...options }; requests.push(request); return handler(request); };
   let applied = 0; const opened = [];
-  let props = { run, source, detail: null, enabled: true, visible: true, on_applied: () => { applied++; }, on_open_run: id => opened.push(id), ...values };
+  let props = { run, source, detail: null, enabled: true, visible: true, experiment_catalog: empty_catalog, on_applied: () => { applied++; }, on_open_run: id => opened.push(id), ...values };
   const render = async (next = {}) => { props = { ...props, ...next }; await act(async () => root.render(createElement(RunLifecyclePanel, { ...props, key: lifecyclePanelKey(props.source?.source_id ?? "local", props.run) }))); };
   await render();
   t.after(async () => { await act(async () => root.unmount()); container.remove(); globalThis.fetch = previous_fetch; globalThis.setTimeout = previous_timeout; globalThis.clearTimeout = previous_clear; });
@@ -132,7 +136,7 @@ test("restart confirms fresh history and links the acknowledged new run", async 
   await f.click("run-lifecycle-open-result"); assert.deepEqual(f.opened, ["gpu-a:run-new"]);
 });
 
-test("restart grouping is opt-in and joining a run keeps its exact machine scope", async t => {
+test("ungrouped restarts stay ungrouped and joining a run keeps its exact machine scope", async t => {
   const current = { ...control, experiment_assignment_supported: true };
   const f = await fixture(t, {}, () => reply(current));
   await f.click("run-lifecycle-restart");
@@ -147,6 +151,66 @@ test("restart grouping is opt-in and joining a run keeps its exact machine scope
   const body = JSON.parse(f.requests.find(request => request.method === "POST").body);
   assert.deepEqual(body.experiment, { kind: "join_run", origin: "gpu-b", run_id: "run-one" });
   assert.equal(body.origin, "gpu-a", "the task remains bound to its original worker");
+});
+
+test("restart inherits the source experiment and preserves that selection across polling and retries", async t => {
+  const current = { ...control, experiment_assignment_supported: true };
+  const f = await fixture(t, { experiment_catalog: grouped_catalog }, request => request.method === "POST" ? reply({ error: "Temporary failure" }, 503) : reply(current));
+  await f.click("run-lifecycle-restart");
+  assert.equal(f.container.querySelector("#restart-experiment-existing").checked, true);
+  assert.equal(f.container.querySelector("#restart-experiment-id").value, "exp-training");
+  await f.click("run-lifecycle-confirm");
+  await f.render({ experiment_catalog: { ...grouped_catalog, revision: "2", experiments: grouped_catalog.experiments.map(item => ({ ...item, members: [] })) } });
+  await f.poll();
+  await f.click("run-lifecycle-confirm");
+  const posts = f.requests.filter(request => request.method === "POST").map(request => JSON.parse(request.body));
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].request_id, posts[1].request_id);
+  assert.deepEqual(posts[0].experiment, { kind: "existing", experiment_id: "exp-training" });
+  assert.deepEqual(posts[1].experiment, posts[0].experiment);
+});
+
+test("restart can explicitly opt out of the source experiment", async t => {
+  const f = await fixture(t, { experiment_catalog: grouped_catalog }, () => reply({ ...control, experiment_assignment_supported: true }));
+  await f.click("run-lifecycle-restart");
+  await f.click("restart-experiment-ungrouped");
+  await f.click("run-lifecycle-confirm");
+  assert.equal(Object.hasOwn(JSON.parse(f.requests.find(request => request.method === "POST").body), "experiment"), false);
+});
+
+test("restart defaults match full run identity and do not guess while the catalog is unavailable", async t => {
+  const f = await fixture(t, { experiment_catalog: null }, () => reply({ ...control, experiment_assignment_supported: true }));
+  await f.click("run-lifecycle-restart");
+  assert.equal(f.container.querySelector('input[name="restart-experiment"]:checked'), null);
+  await f.click("run-lifecycle-confirm");
+  assert.equal(f.requests.filter(request => request.method === "POST").length, 0);
+  assert.match(f.container.textContent, /Experiment membership is unavailable/);
+  const other_origin = { ...grouped_catalog, experiments: grouped_catalog.experiments.map(item => ({ ...item, members: item.members.map(member => ({ ...member, origin: "gpu-b" })) })) };
+  await f.render({ experiment_catalog: other_origin });
+  await f.click("run-lifecycle-restart");
+  assert.equal(f.container.querySelector("#restart-experiment-ungrouped").checked, true);
+});
+
+test("unknown membership on older workers requires an explicit ungrouped choice", async t => {
+  const f = await fixture(t, { experiment_catalog: null });
+  await f.click("run-lifecycle-restart");
+  await f.click("run-lifecycle-confirm");
+  assert.equal(f.requests.filter(request => request.method === "POST").length, 0);
+  await f.click("restart-experiment-ungrouped");
+  await f.click("run-lifecycle-confirm");
+  assert.equal(Object.hasOwn(JSON.parse(f.requests.find(request => request.method === "POST").body), "experiment"), false);
+});
+
+test("a grouped run on an older worker requires an explicit ungrouped restart", async t => {
+  const f = await fixture(t, { experiment_catalog: grouped_catalog });
+  await f.click("run-lifecycle-restart");
+  assert.equal(f.container.querySelector("#restart-experiment-existing").checked, true);
+  assert.equal(f.container.querySelector("#restart-experiment-existing").disabled, true);
+  await f.click("run-lifecycle-confirm");
+  assert.equal(f.requests.filter(request => request.method === "POST").length, 0);
+  await f.click("restart-experiment-ungrouped");
+  await f.click("run-lifecycle-confirm");
+  assert.equal(Object.hasOwn(JSON.parse(f.requests.find(request => request.method === "POST").body), "experiment"), false);
 });
 
 test("new experiment restart retries reuse the lifecycle request ID and preserve its draft", async t => {
@@ -167,7 +231,7 @@ test("new experiment restart retries reuse the lifecycle request ID and preserve
 
 test("restart chooses existing experiment IDs and rejects a removed or foreign selection", async t => {
   const catalog = { project_id: "vision", revision: "1", experiments: [
-    { experiment_id: "experiment-first", name: "Same name" }, { experiment_id: "experiment-second", name: "Same name" }] };
+    { experiment_id: "experiment-first", name: "Same name", members: [] }, { experiment_id: "experiment-second", name: "Same name", members: [] }] };
   const f = await fixture(t, { experiment_catalog: catalog }, () => reply({ ...control, experiment_assignment_supported: true }));
   await f.click("run-lifecycle-restart");
   await f.click("restart-experiment-existing");
@@ -201,7 +265,8 @@ test("restart grouping capability loss and stale task generations cannot silentl
 test("older workers and read-only dashboards never offer unsupported experiment writes", async t => {
   const f = await fixture(t);
   await f.click("run-lifecycle-restart");
-  assert.equal(f.container.querySelector("#restart-experiment"), null);
+  assert.equal(f.container.querySelector("#restart-experiment-ungrouped").checked, true);
+  for (const kind of ["existing", "new", "join_run"]) assert.equal(f.container.querySelector(`#restart-experiment-${kind}`).disabled, true);
   await f.click("run-lifecycle-confirm");
   assert.equal(Object.hasOwn(JSON.parse(f.requests.find(request => request.method === "POST").body), "experiment"), false);
   await f.render({ enabled: false });

@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod experiment_assignment;
+pub mod experiment_catalog;
 pub mod global_config;
 pub mod identifiers;
 pub mod lock;

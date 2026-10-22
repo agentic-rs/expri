@@ -36,7 +36,7 @@ Logs default to stdout and its last 100 lines. Following ends when the run
 finishes or its supervisor is lost. Interrupting the log reader leaves training
 running. For bounded agent inspection, start with a tail rather than a follow.
 
-## Experiment groups and lineage in the website
+## Experiment groups and lineage
 
 An experiment groups runs serving one goal, including work across machines or
 implementations. The hierarchy is **project → experiment → run → task attempt**.
@@ -44,12 +44,27 @@ Each run can belong to one experiment or remain ungrouped. Preserve its full
 identity: project, publishing origin, and run ID. Equal run IDs from different
 origins are separate runs.
 
+Discover stable experiment IDs and inspect recorded members and lineage through
+the global server connection, without a local project or SSH target:
+
+```sh
+expri experiments list --project-id vision --json
+expri experiments show exp-abc123 --project-id vision --json
+```
+
+`--project-id` is required, `show` takes an exact experiment ID, and `--config`
+can select another client file. These read-only commands require owner access
+and a server advertising `experiment-catalog-v1`. Names need not be unique.
+Unavailable retained members remain historical references.
+
 On the primary hosted dashboard, open the experiment manager in the run history
 header to create a group and assign selected runs or a run from its inspector.
 New runs can also select membership with `run --experiment`,
 `--new-experiment`, or `--join-run`; read `expri skill run` for launch and retry
-semantics. The website's Restart dialog offers membership choices for its new
-run. Edit existing memberships and lineage in the website. AB previews allow
+semantics. The website's Restart dialog defaults to the source experiment and
+offers an explicit Ungrouped choice, another experiment, a new group, or joining
+a run. An ungrouped source stays ungrouped by default. Edit existing memberships
+and lineage in the website. AB previews allow
 read-only browsing. Local, cached, and
 older dashboards keep their existing browsing when grouping is unsupported.
 
@@ -70,8 +85,13 @@ describe resumed work, another execution, or parallel parts. Relationships must
 stay within the group and cannot form cycles. Any relationship can include a
 parent checkpoint reference and step; these record provenance without verifying
 or loading the checkpoint or launching work. Existing Continue retains the run
-ID and adds a task attempt, so membership follows that run. New runs can choose
-membership at launch; record their lineage explicitly.
+ID and adds a task attempt, so membership follows that run. A confirmed website
+Restart automatically records a Restarted relationship when the source and
+successor share the selected experiment. Assignment waits for the confirmed
+successor and commits membership, lineage, and its retry receipt together.
+Retries preserve later manual edits. Choosing a different group leaves the
+source in place. Ordinary `run --join-run` remains membership-only; record other
+lineage explicitly.
 
 Every run retains its own metrics and step axis. Groups do not concatenate
 history, shift steps, aggregate parallel metrics, or coordinate execution.
