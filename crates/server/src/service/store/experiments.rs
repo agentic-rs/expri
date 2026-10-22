@@ -1,5 +1,4 @@
 //! Service-owned grouping and lineage never alter worker-owned run history.
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::TryLockError;
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,7 @@ pub(in crate::service) use expri_core::experiment_catalog::{
   EXPERIMENT_LIMIT, Experiment, Lineage, LineageKind,
 };
 use expri_core::experiment_catalog::{
-  ExperimentCatalog, LINEAGE_LIMIT, MEMBER_LIMIT, PROJECT_BYTE_LIMIT,
+  ExperimentCatalog, ExperimentLimits, MEMBER_LIMIT, PROJECT_BYTE_LIMIT, validate_content,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -57,29 +56,6 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
   .map_err(|_| crate::error::ExpriError::Message("cannot initialize experiments".into()))
 }
 
-fn key(scope: &RunScope) -> (&str, &str) {
-  (&scope.origin, &scope.run_id)
-}
-
-fn text(
-  value: &str,
-  field: &str,
-  characters: usize,
-  bytes: usize,
-  multiline: bool,
-) -> ApiResult<String> {
-  let value = value.trim();
-  if value.len() > bytes
-    || value.chars().count() > characters
-    || value
-      .chars()
-      .any(|ch| ch.is_control() && !(multiline && matches!(ch, '\n' | '\t')))
-  {
-    return Err(ApiError::new(400, format!("invalid experiment {field}")));
-  }
-  Ok(value.into())
-}
-
 fn normalize(mut selection: ExperimentSave) -> ApiResult<ExperimentSave> {
   validate_component(&selection.project_id).map_err(bad)?;
   match (&selection.experiment_id, &selection.expected_revision) {
@@ -103,53 +79,11 @@ fn normalize(mut selection: ExperimentSave) -> ApiResult<ExperimentSave> {
       ));
     }
   }
-  selection.name = text(&selection.name, "name", 128, 512, false)?;
-  if selection.name.is_empty() {
-    return Err(ApiError::new(400, "experiment name is required"));
-  }
-  selection.description = text(&selection.description, "description", 2048, 8192, true)?;
-  if selection.members.len() > MEMBER_LIMIT || selection.lineage.len() > LINEAGE_LIMIT {
-    return Err(ApiError::new(
-      400,
-      "experiment supports at most 256 runs and 512 lineage relationships",
-    ));
-  }
-  let mut members = BTreeSet::new();
-  for scope in &selection.members {
-    validate_scope(scope).map_err(bad)?;
-    if scope.project_id != selection.project_id || !members.insert(key(scope)) {
-      return Err(ApiError::new(
-        400,
-        "experiment members must be distinct runs from this project",
-      ));
-    }
-  }
-  let mut pairs = BTreeSet::new();
-  let mut children = BTreeMap::<_, Vec<_>>::new();
-  let mut degrees: BTreeMap<_, usize> = members.iter().map(|scope| (*scope, 0)).collect();
+  selection.name = selection.name.trim().into();
+  selection.description = selection.description.trim().into();
   for edge in &mut selection.lineage {
-    validate_scope(&edge.parent).map_err(bad)?;
-    validate_scope(&edge.child).map_err(bad)?;
-    let parent = key(&edge.parent);
-    let child = key(&edge.child);
-    if edge.parent.project_id != selection.project_id
-      || edge.child.project_id != selection.project_id
-      || !members.contains(&parent)
-      || !members.contains(&child)
-      || parent == child
-      || !pairs.insert((parent, child))
-    {
-      return Err(ApiError::new(
-        400,
-        "lineage requires distinct parent and child members, with one relationship per pair",
-      ));
-    }
     if let Some(checkpoint) = &edge.checkpoint {
-      let checkpoint = text(checkpoint, "checkpoint reference", 1024, 4096, false)?;
-      if checkpoint.is_empty() {
-        return Err(ApiError::new(400, "checkpoint reference must not be empty"));
-      }
-      edge.checkpoint = Some(checkpoint);
+      edge.checkpoint = Some(checkpoint.trim().into());
     }
     if let Some(step) = &edge.step {
       if step.is_empty() || !step.bytes().all(|byte| byte.is_ascii_digit()) || step.len() > 20 {
@@ -162,30 +96,15 @@ fn normalize(mut selection: ExperimentSave) -> ApiResult<ExperimentSave> {
           .to_string(),
       );
     }
-    children.entry(parent).or_default().push(child);
-    *degrees.get_mut(&child).expect("validated member") += 1;
   }
-  let mut ready: Vec<_> = degrees
-    .iter()
-    .filter_map(|(scope, degree)| (*degree == 0).then_some(*scope))
-    .collect();
-  let mut visited = 0;
-  while let Some(parent) = ready.pop() {
-    visited += 1;
-    for child in children.get(&parent).into_iter().flatten() {
-      let degree = degrees.get_mut(child).expect("validated child");
-      *degree -= 1;
-      if *degree == 0 {
-        ready.push(*child);
-      }
-    }
-  }
-  if visited != members.len() {
-    return Err(ApiError::new(
-      400,
-      "experiment lineage must not contain a cycle",
-    ));
-  }
+  validate_content(
+    &selection.project_id,
+    &selection.name,
+    &selection.description,
+    &selection.members,
+    &selection.lineage,
+  )
+  .map_err(bad)?;
   Ok(selection)
 }
 
@@ -238,7 +157,7 @@ fn project_revision(db: &Connection, project_id: &str) -> ApiResult<String> {
   .map(|revision| revision.unwrap_or(0).to_string())
 }
 
-fn snapshot(db: &Connection, project_id: &str) -> ApiResult<Value> {
+fn snapshot(db: &Connection, project_id: &str) -> ApiResult<ExperimentCatalog> {
   let mut statement = db
     .prepare("SELECT record FROM experiments WHERE project_id=?1 ORDER BY experiment_id")
     .map_err(database)?;
@@ -251,10 +170,12 @@ fn snapshot(db: &Connection, project_id: &str) -> ApiResult<Value> {
       .map_err(|_| ApiError::new(500, "invalid stored experiment"))?;
     experiments.push(decorate(db, experiment)?);
   }
-  Ok(
-    json!({"project_id":project_id,"revision":project_revision(db,project_id)?,"experiments":experiments,
-    "limits":{"experiments":EXPERIMENT_LIMIT,"members":MEMBER_LIMIT,"lineage":LINEAGE_LIMIT,"project_bytes":PROJECT_BYTE_LIMIT}}),
-  )
+  Ok(ExperimentCatalog {
+    project_id: project_id.into(),
+    revision: project_revision(db, project_id)?,
+    experiments,
+    limits: ExperimentLimits::default(),
+  })
 }
 
 fn changed(db: &Connection, project_id: &str, scopes: &[RunScope]) -> ApiResult<()> {
@@ -283,8 +204,10 @@ impl<S: ObjectStorage> Store<S> {
     &self,
     project_id: &str,
   ) -> ApiResult<ExperimentCatalog> {
-    let catalog: ExperimentCatalog = serde_json::from_value(self.experiments(project_id)?)
-      .map_err(|_| ApiError::new(500, "invalid stored experiment catalog"))?;
+    validate_component(project_id).map_err(bad)?;
+    let db = self.db()?;
+    projects::ensure_active(&db, project_id)?;
+    let catalog = snapshot(&db, project_id)?;
     catalog
       .validate(project_id)
       .map_err(|_| ApiError::new(500, "invalid stored experiment catalog"))?;
@@ -292,10 +215,8 @@ impl<S: ObjectStorage> Store<S> {
   }
 
   pub(in crate::service) fn experiments(&self, project_id: &str) -> ApiResult<Value> {
-    validate_component(project_id).map_err(bad)?;
-    let db = self.db()?;
-    projects::ensure_active(&db, project_id)?;
-    snapshot(&db, project_id)
+    serde_json::to_value(self.experiment_catalog(project_id)?)
+      .map_err(|_| ApiError::new(500, "cannot encode experiment catalog"))
   }
 
   pub(in crate::service) fn dashboard_experiment_projects(
@@ -558,11 +479,8 @@ fn save_normalized(db: &Connection, selection: ExperimentSave) -> ApiResult<Expe
   }
   // Reserve enough space for every retained run to become unavailable later.
   let mut budget = snapshot(db, &selection.project_id)?;
-  for record in budget["experiments"]
-    .as_array_mut()
-    .expect("snapshot experiments")
-  {
-    record["unavailable_runs"] = record["members"].clone();
+  for record in &mut budget.experiments {
+    record.unavailable_runs = record.members.clone();
   }
   if serde_json::to_vec(&budget)
     .map_err(|_| ApiError::new(500, "cannot encode experiments"))?

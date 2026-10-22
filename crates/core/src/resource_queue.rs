@@ -205,8 +205,10 @@ pub struct ResourceAllocation {
   pub gpus: Vec<WorkerGpu>,
 }
 
+/// One scheduler dispatch and its fenced reservation lease. This is separate
+/// from checkpoint-continuation task attempts retained inside a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AttemptSummary {
+pub struct DispatchAttempt {
   pub attempt_id: String,
   pub job_id: String,
   pub worker_id: String,
@@ -226,7 +228,10 @@ pub struct AttemptSummary {
   pub message: Option<String>,
 }
 
-impl AttemptSummary {
+/// Compatibility name for existing clients; the serialized shape is unchanged.
+pub type AttemptSummary = DispatchAttempt;
+
+impl DispatchAttempt {
   pub fn identity(&self) -> AttemptIdentity {
     AttemptIdentity {
       attempt_id: self.attempt_id.clone(),
@@ -252,7 +257,7 @@ pub struct JobSummary {
   pub pending_reason: Option<String>,
   pub submitted_at_ms: i64,
   pub updated_at_ms: i64,
-  pub attempt: Option<AttemptSummary>,
+  pub attempt: Option<DispatchAttempt>,
 }
 
 /// Public scheduling context for dashboard history. Worker fencing identities,
@@ -333,7 +338,7 @@ pub struct WorkerSummary {
 pub struct JobAssignment {
   pub job: JobSummary,
   pub submission: JobSubmission,
-  pub attempt: AttemptSummary,
+  pub attempt: DispatchAttempt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -430,13 +435,13 @@ pub enum QueueResponse {
   },
   Worker {
     worker: WorkerSummary,
-    attempts: Vec<AttemptSummary>,
+    attempts: Vec<DispatchAttempt>,
   },
   Claimed {
     assignment: Option<Box<JobAssignment>>,
   },
   Attempt {
-    attempt: AttemptSummary,
+    attempt: DispatchAttempt,
   },
   SourceUrl {
     url: String,
@@ -804,7 +809,7 @@ impl QueueRequest {
   }
 }
 
-impl AttemptSummary {
+impl DispatchAttempt {
   pub fn validate(&self) -> Result<()> {
     self.identity().validate()?;
     validate_component(&self.job_id)?;

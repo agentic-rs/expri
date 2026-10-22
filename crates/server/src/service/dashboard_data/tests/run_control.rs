@@ -90,6 +90,10 @@ fn live_lifecycle_overlay_updates_detail_filters_and_probes_without_mutating_pub
     original["runs"][0]["metadata_revision"]
   );
   let paused = dashboard.detail(SOURCE, "run-control").unwrap();
+  assert_eq!(
+    paused["run"]["identity"],
+    json!({"kind":"run","scope":scope()})
+  );
   assert_eq!(paused["run"]["status"], "paused");
   assert_eq!(paused["run"]["recorded_status"], "running");
   assert_eq!(paused["state"]["status"], "running");

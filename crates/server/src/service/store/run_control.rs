@@ -1,8 +1,8 @@
 use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
 use expri_core::resource_requirements::{ResourceRequirements, ResourceStatus};
 use expri_core::run_control::{
-  ControlAction, ControlCommand, ControlLifecycle, ControlResult, RunControlRequest,
-  RunControlResponse,
+  ControlAction, ControlCommand, ControlLifecycle, ControlPayload, ControlResult,
+  RunControlRequest, RunControlResponse,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -96,6 +96,26 @@ struct Facts {
   manual_paused: Option<bool>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   experiment_assignment_supported: Option<bool>,
+}
+
+impl Facts {
+  fn available_actions(&self) -> Vec<ControlAction> {
+    // Replacing requirements clears their observation while the worker samples
+    // the new policy, but does not release its existing resource hold. In that
+    // gap the worker's Pause capability confirms it can add a manual hold.
+    let resource_blocked = self.resource_status.as_ref().map_or_else(
+      || {
+        self.status == "paused"
+          && self.manual_paused == Some(false)
+          && self.capabilities.contains(&ControlAction::Pause)
+      },
+      |status| status.blocked,
+    );
+    expri_core::run_control::available_actions(&self.status, self.manual_paused, resource_blocked)
+      .into_iter()
+      .filter(|action| self.capabilities.contains(action))
+      .collect()
+  }
 }
 
 #[derive(Serialize)]
@@ -310,13 +330,13 @@ fn snapshot(db: &Connection, scope: &str, at: i64) -> ApiResult<Value> {
   let Some((facts, last_seen_at_ms)) = binding(db, scope)? else {
     return Ok(
       json!({"supported":false,"online":false,"status":"unknown","attempt":0,
-      "generation":0,"binding_id":"","capabilities":[],"command":[],"checkpoints":[],
+      "generation":0,"binding_id":"","capabilities":[],"available_actions":[],"command":[],"checkpoints":[],
       "last_seen_at_ms":0,"request":request}),
     );
   };
   let mut snapshot = json!({"supported":true,"online":at.saturating_sub(last_seen_at_ms)<=ONLINE_MS,
     "status":facts.status,"attempt":facts.attempt,"generation":facts.generation,
-    "binding_id":facts.binding_id,"capabilities":facts.capabilities,"command":facts.command,
+    "binding_id":facts.binding_id,"capabilities":facts.capabilities,"available_actions":facts.available_actions(),"command":facts.command,
     "checkpoints":facts.checkpoints,"lifecycle":facts.lifecycle,
     "last_seen_at_ms":last_seen_at_ms,"request":request});
   if let Some(requirements) = &facts.requirements {
@@ -644,6 +664,7 @@ impl<S: ObjectStorage> Store<S> {
     if resource_queue::is_queued_run(&tx, scope)? {
       result["supported"] = json!(false);
       result["capabilities"] = json!([]);
+      result["available_actions"] = json!([]);
     }
     tx.commit().map_err(database)?;
     Ok(result)
@@ -676,46 +697,14 @@ impl<S: ObjectStorage> Store<S> {
     if let Some(path) = &selection.checkpoint {
       checkpoint(path)?;
     }
-    if !matches!(
+    let payload = ControlPayload::from_fields(
       selection.action,
-      ControlAction::Continue | ControlAction::Restart
-    ) && (selection.arguments.is_some() || selection.checkpoint.is_some())
-    {
-      return Err(ApiError::new(
-        400,
-        "only continue or restart accepts task arguments",
-      ));
-    }
-    if selection.action == ControlAction::Restart && selection.checkpoint.is_some() {
-      return Err(ApiError::new(400, "restart does not accept a checkpoint"));
-    }
-    if let Some(experiment) = &selection.experiment {
-      if selection.action != ControlAction::Restart {
-        return Err(ApiError::new(
-          400,
-          "only restart accepts an experiment selection",
-        ));
-      }
-      experiment.validate().map_err(bad)?;
-    }
-    match (&selection.action, &selection.requirements) {
-      (ControlAction::SetRequirements, Some(requirements)) => {
-        requirements.validate().map_err(bad)?
-      }
-      (ControlAction::SetRequirements, None) => {
-        return Err(ApiError::new(
-          400,
-          "set_requirements requires a disk requirements policy",
-        ));
-      }
-      (_, Some(_)) => {
-        return Err(ApiError::new(
-          400,
-          "only set_requirements accepts requirements",
-        ));
-      }
-      (_, None) => {}
-    }
+      selection.arguments.clone(),
+      selection.checkpoint.clone(),
+      selection.requirements.clone(),
+      selection.experiment.clone(),
+    )
+    .map_err(bad)?;
     let fingerprint = encode(&selection)?;
     let scope_json = encode(&scope)?;
     let gate = self.project_gate(&scope.project_id)?;
@@ -754,7 +743,7 @@ impl<S: ObjectStorage> Store<S> {
         "run attempt, generation, or worker binding changed; refresh before retrying",
       ));
     }
-    if !facts.capabilities.contains(&selection.action) {
+    if !facts.available_actions().contains(&selection.action) {
       return Err(ApiError::new(
         409,
         "worker does not support this action in the current run state",
@@ -769,11 +758,8 @@ impl<S: ObjectStorage> Store<S> {
     if let Some(experiment) = &selection.experiment {
       experiments::validate_assignment_selection(&tx, &scope.project_id, experiment)?;
     }
-    if selection.action == ControlAction::Continue
-      && selection
-        .checkpoint
-        .as_ref()
-        .is_none_or(|path| !facts.checkpoints.contains(path))
+    if let ControlPayload::Continue { checkpoint, .. } = &payload
+      && !facts.checkpoints.contains(checkpoint)
     {
       return Err(ApiError::new(
         400,

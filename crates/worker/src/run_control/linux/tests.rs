@@ -204,6 +204,10 @@ fn resource_recovery_never_undoes_manual_pause_and_resume_cannot_bypass_a_hold()
   assert_eq!(state(&run).unwrap()["resource_paused"], true);
   assert_eq!(state(&run).unwrap()["manual_paused"], false);
   assert_eq!(
+    state(&run).unwrap()["task_attempts"]["attempts"][0]["status"],
+    "paused"
+  );
+  assert_eq!(
     execute(&run, &control(ControlAction::Resume, "resume-blocked"))
       .unwrap()
       .status,
@@ -222,6 +226,10 @@ fn resource_recovery_never_undoes_manual_pause_and_resume_cannot_bypass_a_hold()
   thread::sleep(Duration::from_millis(100));
   assert_eq!(state(&run).unwrap()["status"], "paused");
   assert_eq!(state(&run).unwrap()["manual_paused"], true);
+  assert_eq!(
+    state(&run).unwrap()["task_attempts"]["attempts"][0]["status"],
+    "paused"
+  );
   assert_eq!(
     fs::metadata(run.join("outputs/counter")).unwrap().len(),
     bytes
@@ -295,6 +303,10 @@ fn owned_pause_freezes_progress_resume_restores_waiting_and_stop_unfreezes_for_c
   drop(state_lease);
   assert_eq!(resume.join().unwrap().unwrap().status, "applied");
   assert_eq!(state(&run).unwrap()["status"], "waiting");
+  assert_eq!(
+    state(&run).unwrap()["task_attempts"]["attempts"][0]["status"],
+    "waiting"
+  );
   wait_for(|| fs::read(run.join("outputs/counter")).unwrap().len() > frozen.len());
   assert_eq!(
     execute(&run, &control(ControlAction::Pause, "pause-two"))

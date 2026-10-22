@@ -89,24 +89,23 @@ impl ExperimentCatalog {
       validate_component(&experiment.experiment_id)?;
       if !ids.insert(&experiment.experiment_id)
         || !decimal(&experiment.revision)
-        || !valid_text(&experiment.name, 128, 512, false)
-        || experiment.name.trim().is_empty()
-        || !valid_text(&experiment.description, 2048, 8192, true)
         || chrono::DateTime::parse_from_rfc3339(&experiment.created_at).is_err()
         || chrono::DateTime::parse_from_rfc3339(&experiment.updated_at).is_err()
-        || experiment.members.len() > MEMBER_LIMIT
         || experiment.membership_count != experiment.members.len()
-        || experiment.lineage.len() > LINEAGE_LIMIT
       {
         return Err(invalid());
       }
-      let mut members = BTreeSet::new();
+      validate_content(
+        project_id,
+        &experiment.name,
+        &experiment.description,
+        &experiment.members,
+        &experiment.lineage,
+      )
+      .map_err(|_| invalid())?;
+      let members: BTreeSet<_> = experiment.members.iter().map(key).collect();
       for scope in &experiment.members {
-        validate_scope(scope)?;
-        if scope.project_id != project_id
-          || !members.insert(key(scope))
-          || !assigned.insert(key(scope))
-        {
+        if !assigned.insert(key(scope)) {
           return Err(invalid());
         }
       }
@@ -119,50 +118,97 @@ impl ExperimentCatalog {
           return Err(invalid());
         }
       }
-      let mut pairs = BTreeSet::new();
-      let mut children = BTreeMap::<_, Vec<_>>::new();
-      let mut degrees: BTreeMap<_, usize> = members.iter().map(|scope| (*scope, 0)).collect();
-      for edge in &experiment.lineage {
-        let parent = key(&edge.parent);
-        let child = key(&edge.child);
-        if edge.parent.project_id != project_id
-          || edge.child.project_id != project_id
-          || parent == child
-          || !members.contains(&parent)
-          || !members.contains(&child)
-          || !pairs.insert((parent, child))
-          || edge
-            .checkpoint
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty() || !valid_text(value, 1024, 4096, false))
-          || edge.step.as_ref().is_some_and(|value| !decimal(value))
-        {
-          return Err(invalid());
-        }
-        children.entry(parent).or_default().push(child);
-        *degrees.get_mut(&child).expect("validated member") += 1;
-      }
-      let mut ready: Vec<_> = degrees
-        .iter()
-        .filter_map(|(scope, degree)| (*degree == 0).then_some(*scope))
-        .collect();
-      let mut visited = 0;
-      while let Some(parent) = ready.pop() {
-        visited += 1;
-        for child in children.get(&parent).into_iter().flatten() {
-          let degree = degrees.get_mut(child).expect("validated child");
-          *degree -= 1;
-          if *degree == 0 {
-            ready.push(*child);
-          }
-        }
-      }
-      if visited != members.len() {
-        return Err(invalid());
-      }
     }
     Ok(())
   }
+}
+
+/// Shared invariants for normalized writes and independently validated reads.
+/// Transport envelopes and cross-experiment membership remain caller-owned.
+pub fn validate_content(
+  project_id: &str,
+  name: &str,
+  description: &str,
+  members: &[RunScope],
+  lineage: &[Lineage],
+) -> Result<()> {
+  let message = |text: &str| ExpriError::Message(text.into());
+  validate_component(project_id)?;
+  if !valid_text(name, 128, 512, false) {
+    return Err(message("invalid experiment name"));
+  }
+  if name.trim().is_empty() {
+    return Err(message("experiment name is required"));
+  }
+  if !valid_text(description, 2048, 8192, true) {
+    return Err(message("invalid experiment description"));
+  }
+  if members.len() > MEMBER_LIMIT || lineage.len() > LINEAGE_LIMIT {
+    return Err(message(
+      "experiment supports at most 256 runs and 512 lineage relationships",
+    ));
+  }
+  let mut identities = BTreeSet::new();
+  for scope in members {
+    validate_scope(scope)?;
+    if scope.project_id != project_id || !identities.insert(key(scope)) {
+      return Err(message(
+        "experiment members must be distinct runs from this project",
+      ));
+    }
+  }
+  let mut pairs = BTreeSet::new();
+  let mut children = BTreeMap::<_, Vec<_>>::new();
+  let mut degrees: BTreeMap<_, usize> = identities.iter().map(|scope| (*scope, 0)).collect();
+  for edge in lineage {
+    validate_scope(&edge.parent)?;
+    validate_scope(&edge.child)?;
+    let parent = key(&edge.parent);
+    let child = key(&edge.child);
+    if edge.parent.project_id != project_id
+      || edge.child.project_id != project_id
+      || parent == child
+      || !identities.contains(&parent)
+      || !identities.contains(&child)
+      || !pairs.insert((parent, child))
+    {
+      return Err(message(
+        "lineage requires distinct parent and child members, with one relationship per pair",
+      ));
+    }
+    if let Some(checkpoint) = &edge.checkpoint {
+      if !valid_text(checkpoint, 1024, 4096, false) {
+        return Err(message("invalid experiment checkpoint reference"));
+      }
+      if checkpoint.trim().is_empty() {
+        return Err(message("checkpoint reference must not be empty"));
+      }
+    }
+    if edge.step.as_ref().is_some_and(|value| !decimal(value)) {
+      return Err(message("lineage step must be decimal u64 text"));
+    }
+    children.entry(parent).or_default().push(child);
+    *degrees.get_mut(&child).expect("validated member") += 1;
+  }
+  let mut ready: Vec<_> = degrees
+    .iter()
+    .filter_map(|(scope, degree)| (*degree == 0).then_some(*scope))
+    .collect();
+  let mut visited = 0;
+  while let Some(parent) = ready.pop() {
+    visited += 1;
+    for child in children.get(&parent).into_iter().flatten() {
+      let degree = degrees.get_mut(child).expect("validated child");
+      *degree -= 1;
+      if *degree == 0 {
+        ready.push(*child);
+      }
+    }
+  }
+  if visited != identities.len() {
+    return Err(message("experiment lineage must not contain a cycle"));
+  }
+  Ok(())
 }
 
 fn key(scope: &RunScope) -> (&str, &str) {
@@ -190,6 +236,67 @@ fn invalid() -> ExpriError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn content_validation_preserves_full_scopes_and_rejects_invalid_lineage() {
+    let parent = RunScope {
+      project_id: "project".into(),
+      origin: "worker-a".into(),
+      run_id: "same-run".into(),
+    };
+    let child = RunScope {
+      origin: "worker-b".into(),
+      ..parent.clone()
+    };
+    let members = vec![parent.clone(), child.clone()];
+    let edge = Lineage {
+      parent: parent.clone(),
+      child: child.clone(),
+      kind: LineageKind::Continued,
+      checkpoint: Some("outputs/checkpoint.pt".into()),
+      step: Some(u64::MAX.to_string()),
+    };
+    validate_content(
+      "project",
+      "Training",
+      "",
+      &members,
+      std::slice::from_ref(&edge),
+    )
+    .unwrap();
+    let reverse = Lineage {
+      parent: child.clone(),
+      child: parent.clone(),
+      ..edge.clone()
+    };
+    for edges in [
+      vec![edge.clone(), reverse],
+      vec![edge.clone(), edge.clone()],
+      vec![Lineage {
+        child: parent.clone(),
+        ..edge.clone()
+      }],
+      vec![Lineage {
+        child: RunScope {
+          project_id: "other".into(),
+          ..child.clone()
+        },
+        ..edge.clone()
+      }],
+      vec![Lineage {
+        checkpoint: Some("\u{1b}[2J".into()),
+        ..edge.clone()
+      }],
+      vec![Lineage {
+        step: Some("18446744073709551616".into()),
+        ..edge.clone()
+      }],
+    ] {
+      assert!(validate_content("project", "Training", "", &members, &edges).is_err());
+    }
+    assert!(validate_content("project", "Training", "", &[parent.clone(), parent], &[]).is_err());
+    assert!(validate_content("project", "bad\nname", "", &members, &[]).is_err());
+  }
 
   #[test]
   fn catalog_size_limit_is_independent_of_server_advertised_limits() {

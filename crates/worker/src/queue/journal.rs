@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use expri_core::resource_queue::{AttemptSummary, JobAssignment};
+use expri_core::resource_queue::{DispatchAttempt, JobAssignment};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ExpriError, Result};
@@ -27,7 +27,7 @@ pub(super) enum Stage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Journal {
   pub assignment: JobAssignment,
-  pub attempt: AttemptSummary,
+  pub attempt: DispatchAttempt,
   pub stage: Stage,
   pub repo_root: Option<PathBuf>,
   pub run_dir: Option<PathBuf>,

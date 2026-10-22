@@ -24,6 +24,17 @@ export type Source = {
   machines?: string[];
 };
 export type RunDeepLink = { project_id: string; origin: string; run_id: string };
+export type RunIdentity =
+  | { kind: "run"; scope: RunDeepLink }
+  | { kind: "queue_job"; project_id: string; job_id: string };
+export type RunObservation = {
+  recorded_status: string;
+  observed_at_ms: number;
+  online: boolean;
+  attempt: number;
+  generation: number;
+  available_actions: string[];
+};
 
 /** Public service identifiers select existing catalog entries; they are never URLs. */
 export function parseRunDeepLink(search: string): RunDeepLink | null {
@@ -43,6 +54,8 @@ export function parseRunDeepLink(search: string): RunDeepLink | null {
 }
 export type Run = {
   run_id: string;
+  identity?: RunIdentity;
+  observation?: RunObservation;
   run_key?: string;
   queue?: RunQueue | null;
   queue_only?: boolean;
@@ -72,6 +85,23 @@ export type Run = {
   table_values_truncated?: boolean;
   warnings?: Warning[];
 };
+
+/** Resolve once at the API boundary; queued submissions have no run identity. */
+export function runScope(
+  run: Pick<Run, "run_id" | "run_key" | "origin" | "queue_only" | "identity">,
+  source: Source | undefined,
+): RunDeepLink | null {
+  if (!source?.project_id || !["hosted_project", "service"].includes(source.kind) || run.queue_only) return null;
+  if (run.identity !== undefined && run.identity?.kind !== "run") return null;
+  const legacy = source.kind === "hosted_project" ? parseProjectRunKey(run.run_key ?? "") :
+    source.origin ? { origin: source.origin, run_id: run.run_id } : null;
+  const scope = run.identity?.kind === "run" ? run.identity.scope : legacy ? { project_id: source.project_id, ...legacy } : null;
+  if (!scope || scope.project_id !== source.project_id || scope.run_id !== run.run_id ||
+    (run.origin !== undefined && run.origin !== scope.origin) ||
+    (source.kind === "service" && source.origin !== scope.origin) ||
+    (run.run_key !== undefined && (!legacy || legacy.origin !== scope.origin || legacy.run_id !== scope.run_id))) return null;
+  return parseRunDeepLink(apiUrl("", scope));
+}
 export type RunAnnotations = {
   scope: RunDeepLink;
   nickname: string | null;

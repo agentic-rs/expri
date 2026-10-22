@@ -15,7 +15,7 @@ use expri_client::ResourceQueueClient;
 use expri_core::config::RunServiceConfig;
 use expri_core::global_config::ResolvedQueueWorkerConfig;
 use expri_core::resource_queue::{
-  AttemptStatus, AttemptSummary, AttemptTerminalStatus, GpuAvailabilityReport, GpuVendor,
+  AttemptStatus, AttemptTerminalStatus, DispatchAttempt, GpuAvailabilityReport, GpuVendor,
   QueueRequest, QueueResponse, ResourceAllocation, WorkerCapacity,
 };
 use expri_core::storage::StoragePaths;
@@ -182,7 +182,7 @@ struct Executor {
   client_config: PathBuf,
   directory: PathBuf,
   session: Arc<Mutex<String>>,
-  attempts: Vec<AttemptSummary>,
+  attempts: Vec<DispatchAttempt>,
   stop: Arc<AtomicBool>,
   worker: expri_core::resource_queue::WorkerSummary,
 }
@@ -334,7 +334,7 @@ impl Executor {
     report
   }
 
-  fn reconcile(&mut self, mut attempt: AttemptSummary) -> Result<()> {
+  fn reconcile(&mut self, mut attempt: DispatchAttempt) -> Result<()> {
     let directory = self.directory.join("attempts").join(&attempt.attempt_id);
     if !directory.exists() {
       return Err(message(
@@ -789,9 +789,9 @@ fn local_status(journal: &Journal) -> Result<Option<serde_json::Value>> {
 /// Local spawn evidence is durable even when a fast task finishes between polls.
 fn acknowledge_started(
   client: &ResourceQueueClient,
-  attempt: &AttemptSummary,
+  attempt: &DispatchAttempt,
   status: &serde_json::Value,
-) -> Result<Option<AttemptSummary>> {
+) -> Result<Option<DispatchAttempt>> {
   let Some(request) = task_start_request(attempt, status)? else {
     return Ok(None);
   };
@@ -802,7 +802,7 @@ fn acknowledge_started(
 }
 
 fn task_start_request(
-  attempt: &AttemptSummary,
+  attempt: &DispatchAttempt,
   status: &serde_json::Value,
 ) -> Result<Option<QueueRequest>> {
   if attempt.started_at_ms.is_some() || status["state"]["task_started_at"].is_null() {
@@ -900,7 +900,7 @@ fn request_cancel(journal: &Journal) -> Result<()> {
 /// Only the native supervisor owns signals and writes terminal run state.
 fn cancel_known_attempt(
   worker_directory: &std::path::Path,
-  attempt: &AttemptSummary,
+  attempt: &DispatchAttempt,
 ) -> Result<()> {
   if !attempt.cancel_requested || attempt.status.is_terminal() {
     return Ok(());
@@ -933,7 +933,7 @@ fn cancel_known_attempt(
 fn acknowledge_known_progress(
   client: &ResourceQueueClient,
   worker_directory: &std::path::Path,
-  attempt: &AttemptSummary,
+  attempt: &DispatchAttempt,
 ) -> Result<()> {
   if attempt.status.is_terminal()
     || attempt.status == AttemptStatus::Unknown
@@ -1076,7 +1076,7 @@ fn register(
   path: &std::path::Path,
 ) -> Result<(
   expri_core::resource_queue::WorkerSummary,
-  Vec<AttemptSummary>,
+  Vec<DispatchAttempt>,
 )> {
   let register_request = || QueueRequest::RegisterWorker {
     worker_id: worker.worker_id.clone(),

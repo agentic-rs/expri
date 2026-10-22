@@ -1,4 +1,4 @@
-import { apiUrl, parseProjectRunKey, parseRunDeepLink, runIdentity, type Run, type RunDeepLink, type Source } from "./dashboard_model";
+import { apiUrl, parseRunDeepLink, runIdentity, runScope, type Run, type RunDeepLink, type Source } from "./dashboard_model";
 
 export const MAX_EXPERIMENT_MEMBERS = 256;
 export const MAX_EXPERIMENT_EDGES = 512;
@@ -103,14 +103,8 @@ export function sameScope(first: RunDeepLink, second: RunDeepLink): boolean {
 export function experimentProject(source: Source | undefined): string | null {
   return source && ["hosted_project", "service"].includes(source.kind) && source.project_id ? source.project_id : null;
 }
-export function experimentRunScope(run: Pick<Run, "run_id" | "run_key" | "origin" | "queue_only">, source: Source | undefined): RunDeepLink | null {
-  const project_id = experimentProject(source);
-  if (!project_id || run.queue_only) return null;
-  const identity = source?.kind === "hosted_project" ? parseProjectRunKey(runIdentity(run)) :
-    source?.kind === "service" && source.origin ? { origin: source.origin, run_id: run.run_id } : null;
-  if (!identity || identity.run_id !== run.run_id || (run.origin && run.origin !== identity.origin)) return null;
-  const scope = { project_id, ...identity };
-  return parseRunDeepLink(apiUrl("", scope)) ? scope : null;
+export function experimentRunScope(run: Pick<Run, "run_id" | "run_key" | "origin" | "queue_only" | "identity">, source: Source | undefined): RunDeepLink | null {
+  return runScope(run, source);
 }
 function text(value: unknown, name: string, maximum: number, multiline = false, maximum_chars = maximum): string {
   if (typeof value !== "string" || (multiline ? /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u : /\p{Cc}/u).test(value) ||

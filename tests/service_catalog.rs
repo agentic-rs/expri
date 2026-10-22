@@ -202,6 +202,7 @@ fn run_entry(scope: RunScope, archived: bool) -> RunListEntry {
     exit_code: Some(0),
     archived,
     warnings: Vec::new(),
+    observation: None,
   }
 }
 
@@ -229,6 +230,7 @@ fn run_list_defaults_to_all_accessible_runs_without_reading_or_writing_a_project
       exit_code: Some(0),
       archived: false,
       warnings: Vec::new(),
+      observation: None,
     }],
     next_cursor: Some(cursor.clone()),
   };
@@ -738,6 +740,7 @@ fn run_list_defaults_to_a_table_with_scopes_status_and_pagination() {
         exit_code: None,
         archived: false,
         warnings: vec!["worker inventory is incomplete".into()],
+        observation: None,
       },
       RunListEntry {
         scope: archived_scope,
@@ -748,6 +751,7 @@ fn run_list_defaults_to_a_table_with_scopes_status_and_pagination() {
         exit_code: Some(17),
         archived: true,
         warnings: Vec::new(),
+        observation: None,
       },
     ],
     next_cursor: Some(cursor.clone()),

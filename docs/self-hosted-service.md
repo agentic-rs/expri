@@ -1036,9 +1036,17 @@ and/or `--origin` to narrow the selection. Providing both selects the scope
 directly. Resolution uses the existing `service-catalog-v1` catalog and may page
 through newer runs; supplying both scope fields avoids that lookup for large catalogs.
 
-Run pages include the full `scope`, task, last published execution status,
+Run pages include the full `scope`, task, execution status,
 timestamps and bounded warnings when metadata is missing or unavailable. A run
 ID can appear on more than one worker, so keep its project and origin with it.
+When the server also advertises `run-summary-v1`, the client requests the same
+last-known worker observation used by the dashboard. JSON rows with an applied
+observation include `observation.recorded_status`, `observed_at_ms`, `online`,
+`attempt`, `generation`, and `available_actions`. The receipt time and `online`
+describe connection freshness, not a globally ordered execution revision;
+observations can lag the task. Missing or incompatible observations retain the
+published state. Older servers and clients keep the original published-only
+catalog response, and neither projection changes uploaded history.
 Results order by descending run ID, then ascending project and origin; this is
 a stable catalog order rather than a sort by live activity. Query the worker
 with `runs status`, `runs logs`, or `runs cancel` for live supervision.

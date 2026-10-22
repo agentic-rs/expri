@@ -234,6 +234,10 @@ pub enum Request {
   BrowseRuns {
     query: RunListQuery,
   },
+  /// Negotiated run summaries with effective worker state and its provenance.
+  BrowseRunSummaries {
+    query: RunListQuery,
+  },
   /// Received files and bounded worker-reported outputs for one published run.
   BrowseRunFiles {
     query: RunFilesQuery,

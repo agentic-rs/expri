@@ -1,6 +1,6 @@
 import {
   apiUrl,
-  parseProjectRunKey,
+  runScope,
   parseRunDeepLink,
   type Run,
   type RunAnnotations,
@@ -57,12 +57,6 @@ export function runAnnotationsMatchesScope(value: unknown, scope: RunDeepLink): 
 export function runAnnotationsScope(run: Run, source: Source | undefined): RunDeepLink | null {
   const scope = run.annotations?.scope;
   if (!scope || !source || !runAnnotationsMatchesScope(run.annotations, scope)) return null;
-  if (source.kind === "hosted_project") {
-    const identity = parseProjectRunKey(run.run_key ?? "");
-    return source.project_id === scope.project_id && identity?.origin === scope.origin &&
-      identity.run_id === scope.run_id ? scope : null;
-  }
-  if (source.kind !== "service") return null;
-  return source.project_id === scope.project_id && source.origin === scope.origin &&
-    run.run_id === scope.run_id ? scope : null;
+  const identity = runScope(run, source);
+  return identity?.project_id === scope.project_id && identity.origin === scope.origin && identity.run_id === scope.run_id ? scope : null;
 }

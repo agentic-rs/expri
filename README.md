@@ -1002,8 +1002,11 @@ These commands show tables by default. Add `--json` for complete bounded pages
 with `next_cursor`; table output shows the next cursor when more rows are available.
 To pin later file pages to the same scope, optionally pass the resolved project
 and origin with the cursor.
-File rows distinguish received data from reported outputs still awaiting upload. Execution status is
-the last published state. See [server browsing](docs/self-hosted-service.md#browse-published-runs-and-files).
+File rows distinguish received data from reported outputs still awaiting upload.
+Upgraded servers use the same last-known worker observations as the dashboard;
+`--json` includes their receipt time, connection freshness and original published
+status. Older servers return the published status. See
+[server browsing](docs/self-hosted-service.md#browse-published-runs-and-files).
 
 See the [self-hosted service guide](docs/self-hosted-service.md) for server and
 worker configuration, browser sign-in, input files, selective downloads, and offline dashboard

@@ -943,7 +943,7 @@ fn lease_loss_survives_restart_and_requires_recovery_before_new_claims() {
   register_at(&store, "worker-one", "session-one", 1_000);
   submit_at(&store, submission("first", resources(4, 8_000, 1)), 1_001);
   let first = claim_at(&store, "worker-one", "session-one", "claim-one", 1_002).unwrap();
-  submit_at(&store, submission("second", resources(4, 8_000, 1)), 1_003);
+  let second = submit_at(&store, submission("second", resources(4, 8_000, 1)), 1_003);
   let expired = 1_000 + QUEUE_LEASE_MS;
   assert_eq!(
     store
@@ -965,6 +965,12 @@ fn lease_loss_survives_restart_and_requires_recovery_before_new_claims() {
   assert!(worker.quarantined);
   assert_eq!(attempts[0].status, AttemptStatus::Unknown);
   assert_eq!(attempts[0].allocation, first.attempt.allocation);
+  let blocked = job(&store.db().unwrap(), &second.job_id, expired + 1).unwrap();
+  assert!(blocked.assigned_worker_id.is_none());
+  assert_eq!(
+    blocked.pending_reason.as_deref(),
+    Some("workers_need_reconciliation")
+  );
   assert_eq!(
     store
       .resource_queue_at(
@@ -1210,13 +1216,137 @@ fn current_session_can_reconcile_only_its_already_linked_supervisor() {
 
 #[test]
 fn cuda_placement_requires_nvidia_even_when_another_vendor_matches_the_model() {
-  let request = resources(1, 1_000, 1);
-  let mut capacity = capacity();
-  capacity.gpus[0].vendor = GpuVendor::Amd;
-  assert!(allocate(&capacity, &request, &[], true, &[]).is_none());
-  assert!(allocate(&capacity, &request, &[], false, &[]).is_some());
-  capacity.gpus[0].vendor = GpuVendor::Nvidia;
-  assert!(allocate(&capacity, &request, &[], true, &[]).is_some());
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let mut amd = capacity();
+  amd.gpus[0].vendor = GpuVendor::Amd;
+  let (worker, _) = register_capacity_at(&store, "worker", "session", amd, 1_000);
+  let mut submitted = submission("cuda", resources(1, 1_000, 1));
+  submitted.environment.base_python = Some("/usr/bin/python3".into());
+  submitted.environment.require_cuda = true;
+  submitted.environment.reuse_packages.push("torch".into());
+  let queued = submit_at(&store, submitted, 1_001);
+  assert!(queued.assigned_worker_id.is_none());
+  assert_eq!(
+    queued.pending_reason.as_deref(),
+    Some("resources_unavailable")
+  );
+  assert_eq!(
+    placement::evaluate(&worker, &queued, &[], true, false, 1_001),
+    Err(placement::PlacementBlocker::Gpu)
+  );
+  assert!(placement::evaluate(&worker, &queued, &[], false, false, 1_001).is_ok());
+  register_capacity_at(&store, "worker", "session", capacity(), 1_002);
+  let claimed = claim_at(&store, "worker", "session", "cuda-claim", 1_003).unwrap();
+  assert_eq!(claimed.job.job_id, queued.job_id);
+  assert_eq!(claimed.attempt.allocation.gpus[0].vendor, GpuVendor::Nvidia);
+}
+
+#[test]
+fn resource_blockers_explain_unplaced_jobs_until_the_same_worker_can_fit_them() {
+  for (name, request, expected) in [
+    (
+      "cpu",
+      resources(5, 1_000, 0),
+      placement::PlacementBlocker::Cpu,
+    ),
+    (
+      "memory",
+      resources(1, 9_000, 0),
+      placement::PlacementBlocker::Memory,
+    ),
+    (
+      "gpu",
+      resources(1, 1_000, 2),
+      placement::PlacementBlocker::Gpu,
+    ),
+  ] {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+    let (worker, _) = register_at(&store, "worker", "session", 1_000);
+    let queued = submit_at(&store, submission(name, request), 1_001);
+    assert!(queued.assigned_worker_id.is_none(), "{name}");
+    assert_eq!(
+      queued.pending_reason.as_deref(),
+      Some("resources_unavailable")
+    );
+    assert_eq!(
+      placement::evaluate(&worker, &queued, &[], false, false, 1_001),
+      Err(expected)
+    );
+    let expanded = WorkerCapacity {
+      cpus: 8,
+      memory_bytes: 16_000,
+      ..two_gpu_capacity()
+    };
+    register_capacity_at(&store, "worker", "session", expanded, 1_002);
+    let offered = job(&store.db().unwrap(), &queued.job_id, 1_002).unwrap();
+    assert_eq!(offered.assigned_worker_id.as_deref(), Some("worker"));
+    assert_eq!(
+      offered.pending_reason.as_deref(),
+      Some("waiting_for_worker_claim")
+    );
+    assert_eq!(
+      claim_at(&store, "worker", "session", "claim", 1_003)
+        .unwrap()
+        .job
+        .job_id,
+      queued.job_id
+    );
+  }
+}
+
+#[test]
+fn mixed_worker_pool_explanations_follow_the_furthest_eligible_placement_stage() {
+  use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let mut submitted = submission("grouped", resources(2, 1_000, 0));
+  submitted.publish = true;
+  submitted.experiment = Some(RunExperimentIntent {
+    request_id: "grouped-intent".into(),
+    selection: ExperimentSelection::New {
+      name: "Group".into(),
+    },
+  });
+  let queued = submit_at(&store, submitted, 1_000);
+  let assert_pending = |now, reason| {
+    let queued = job(&store.db().unwrap(), &queued.job_id, now).unwrap();
+    assert!(queued.assigned_worker_id.is_none());
+    assert_eq!(queued.pending_reason.as_deref(), Some(reason));
+  };
+  assert_pending(1_000, "no_eligible_worker");
+  register_at(&store, "legacy", "legacy-session", 1_001);
+  assert_pending(1_001, "experiment_worker_upgrade_required");
+
+  let register_supported = |worker_id: &str, cpus, now| {
+    store
+      .resource_queue_at(
+        QueueRequest::RegisterWorker {
+          worker_id: worker_id.into(),
+          session_id: format!("{worker_id}-session"),
+          project_ids: vec!["project".into()],
+          capacity: WorkerCapacity { cpus, ..capacity() },
+          gpu_availability: Some(GpuAvailabilityReport::default()),
+          experiment_assignment_supported: Some(true),
+        },
+        now,
+      )
+      .unwrap();
+  };
+  register_supported("old", 1, 1_002);
+  assert_pending(1_002, "resources_unavailable");
+  let later = 1_002 + QUEUE_LEASE_MS;
+  assert_pending(later, "eligible_workers_offline");
+  register_supported("current", 1, later);
+  assert_pending(later, "resources_unavailable");
+  register_supported("current", 4, later + 1);
+  let offered = job(&store.db().unwrap(), &queued.job_id, later + 1).unwrap();
+  assert_eq!(offered.assigned_worker_id.as_deref(), Some("current"));
+  assert_eq!(
+    offered.pending_reason.as_deref(),
+    Some("waiting_for_worker_claim")
+  );
 }
 
 #[test]
@@ -2216,6 +2346,12 @@ fn pending_history_uses_job_identity_and_public_resource_context_without_runtime
     .unwrap();
   assert_eq!(list["total_count"], 1);
   let row = &list["runs"][0];
+  assert_eq!(
+    row["identity"],
+    serde_json::json!({
+      "kind":"queue_job", "project_id":"project", "job_id":pending.job_id
+    })
+  );
   assert_eq!(row["run_id"], pending.job_id);
   assert_eq!(row["run_key"], key);
   assert_eq!(row["status"], "pending");
@@ -2401,11 +2537,16 @@ fn queue_history_handoff_keeps_selection_live_without_duplicate_or_unpublished_r
   let list = dashboard.list(source, None, None, None, 20, 0).unwrap();
   assert_eq!(list["total_count"], 1);
   assert_eq!(list["runs"][0]["run_id"], "run-native");
+  assert_eq!(
+    list["runs"][0]["identity"],
+    serde_json::json!({"kind":"run","scope":scope})
+  );
   assert_eq!(list["runs"][0]["status"], "waiting");
   assert_eq!(list["runs"][0]["queue"]["job_id"], pending.job_id);
   assert!(list["runs"][0]["queue_only"].is_null());
   let redirected = dashboard.detail(source, &key).unwrap();
   assert_eq!(redirected["run"]["run_id"], "run-native");
+  assert_eq!(redirected["run"]["identity"], list["runs"][0]["identity"]);
   assert_eq!(redirected["redirect"]["source_id"], source);
   assert_eq!(redirected["redirect"]["run_id"], "queue:run-native");
   let updates = dashboard

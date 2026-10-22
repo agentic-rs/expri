@@ -147,7 +147,7 @@ pub(crate) fn task(
   }
   let mut child = None;
   let initialized = update_state(&run_dir.join("run-state.json"), |state| {
-    state["status"] = json!("running");
+    expri_core::run_state::set_phase(state, expri_core::run_state::RunPhase::Running)?;
     // A fast task may report its phase immediately. Keep the state lease
     // from spawn through activation so it sees its own active attempt.
     let spawned = command.spawn()?;
@@ -320,7 +320,7 @@ fn pump_inner(
     if !cancelled && cancel_requested(run_dir)? {
       cancelled = true;
       update_state(&run_dir.join("run-state.json"), |state| {
-        crate::run_control::linux::restore_phase(state);
+        crate::run_control::linux::restore_phase(state)?;
         Ok(())
       })
       .map_err(io::Error::other)?;

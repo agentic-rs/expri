@@ -333,7 +333,11 @@ fn authorize_role<S: ObjectStorage>(
 }
 
 fn narrow_worker_catalog(role: &Role<'_>, request: &mut Request) -> ApiResult<()> {
-  if let (Role::Worker(worker), Request::BrowseRuns { query }) = (role, request) {
+  if let (
+    Role::Worker(worker),
+    Request::BrowseRuns { query } | Request::BrowseRunSummaries { query },
+  ) = (role, request)
+  {
     if query
       .project_id
       .as_deref()
@@ -417,7 +421,7 @@ fn authorize<S: ObjectStorage>(
     Request::RunControl { request } => {
       worker.project_id == request.scope().project_id && worker.origin == request.scope().origin
     }
-    Request::BrowseRuns { query } => {
+    Request::BrowseRuns { query } | Request::BrowseRunSummaries { query } => {
       query.project_id.as_deref() == Some(worker.project_id.as_str())
         && query.origin.as_deref() == Some(worker.origin.as_str())
     }
@@ -1275,7 +1279,8 @@ mod tests {
   fn catalog_owner_discovery_and_worker_defaults_preserve_scope_boundaries() {
     use base64::Engine;
     use expri_core::service_catalog::{
-      RunArchiveFilter, RunFilesQuery, RunListQuery, SERVICE_CATALOG_CAPABILITY, encode_run_cursor,
+      RUN_SUMMARY_CAPABILITY, RunArchiveFilter, RunFilesQuery, RunListQuery,
+      SERVICE_CATALOG_CAPABILITY, encode_run_cursor,
     };
 
     let directory = tempfile::tempdir().unwrap();
@@ -1307,9 +1312,6 @@ mod tests {
       limit: 100,
       cursor: None,
     };
-    let browse = Request::BrowseRuns {
-      query: selected.clone(),
-    };
     let owner = "owner-token-with-at-least-24-characters";
     let worker = "worker-token-with-at-least-24-characters";
     let Response::Capabilities { features } = serde_json::from_slice(
@@ -1318,65 +1320,87 @@ mod tests {
     .unwrap() else {
       panic!("expected capabilities")
     };
-    assert!(
-      features
-        .iter()
-        .any(|feature| feature == SERVICE_CATALOG_CAPABILITY)
-    );
-    let Response::RunPage { page } =
-      serde_json::from_slice(&route(&store, &auth, request(Some(owner), &browse)).unwrap())
-        .unwrap()
-    else {
-      panic!("expected run page")
-    };
-    assert_eq!(page.runs.len(), 3);
-    let Response::RunPage { page } =
-      serde_json::from_slice(&route(&store, &auth, request(Some(worker), &browse)).unwrap())
-        .unwrap()
-    else {
-      panic!("expected run page")
-    };
-    assert_eq!(page.runs.len(), 1);
-    assert_eq!(page.runs[0].scope, own);
+    for capability in [SERVICE_CATALOG_CAPABILITY, RUN_SUMMARY_CAPABILITY] {
+      assert!(features.iter().any(|feature| feature == capability));
+    }
+    for summaries in [false, true] {
+      let browse = |query| {
+        if summaries {
+          Request::BrowseRunSummaries { query }
+        } else {
+          Request::BrowseRuns { query }
+        }
+      };
+      let operation = browse(selected.clone());
+      assert_eq!(
+        route(&store, &auth, request(None, &operation))
+          .unwrap_err()
+          .status,
+        401
+      );
+      let Response::RunPage { page } =
+        serde_json::from_slice(&route(&store, &auth, request(Some(owner), &operation)).unwrap())
+          .unwrap()
+      else {
+        panic!("expected owner run page")
+      };
+      assert_eq!(page.runs.len(), 3);
+      let Response::RunPage { page } =
+        serde_json::from_slice(&route(&store, &auth, request(Some(worker), &operation)).unwrap())
+          .unwrap()
+      else {
+        panic!("expected worker run page")
+      };
+      assert_eq!(page.runs.len(), 1);
+      assert_eq!(page.runs[0].scope, own);
 
-    for (project_id, origin) in [
-      (Some(other_project.project_id.clone()), None),
-      (None, Some(other_origin.origin.clone())),
-    ] {
-      let operation = Request::BrowseRuns {
-        query: RunListQuery {
+      for (project_id, origin) in [
+        (Some(other_project.project_id.clone()), None),
+        (None, Some(other_origin.origin.clone())),
+      ] {
+        let operation = browse(RunListQuery {
           project_id,
           origin,
           ..selected.clone()
-        },
-      };
-      assert_eq!(
-        route(&store, &auth, request(Some(worker), &operation))
-          .unwrap_err()
-          .status,
-        403
-      );
-    }
-    let operation = Request::BrowseRuns {
-      query: RunListQuery {
-        cursor: Some(encode_run_cursor(&other_project).unwrap()),
-        ..selected.clone()
-      },
-    };
-    assert_eq!(
-      route(&store, &auth, request(Some(worker), &operation))
-        .unwrap_err()
-        .status,
-      400
-    );
-    let operation = Request::BrowseRuns {
-      query: RunListQuery {
+        });
+        assert_eq!(
+          route(&store, &auth, request(Some(worker), &operation))
+            .unwrap_err()
+            .status,
+          403
+        );
+      }
+      for foreign in [&other_project, &other_origin] {
+        let operation = browse(RunListQuery {
+          cursor: Some(encode_run_cursor(foreign).unwrap()),
+          ..selected.clone()
+        });
+        assert_eq!(
+          route(&store, &auth, request(Some(worker), &operation))
+            .unwrap_err()
+            .status,
+          400
+        );
+      }
+      let operation = browse(RunListQuery {
         project_id: Some(own.project_id.clone()),
         origin: Some(own.origin.clone()),
-        ..selected
-      },
-    };
-    assert!(route(&store, &auth, request(Some(worker), &operation)).is_ok());
+        ..selected.clone()
+      });
+      assert!(route(&store, &auth, request(Some(worker), &operation)).is_ok());
+      let operation = browse(RunListQuery {
+        cursor: Some(encode_run_cursor(&own).unwrap()),
+        ..selected.clone()
+      });
+      let Response::RunPage { page } =
+        serde_json::from_slice(&route(&store, &auth, request(Some(worker), &operation)).unwrap())
+          .unwrap()
+      else {
+        panic!("expected worker continuation page")
+      };
+      assert!(page.runs.is_empty());
+      assert!(page.next_cursor.is_none());
+    }
 
     for published in [&own, &other_project, &other_origin] {
       let operation = Request::BrowseRunFiles {
@@ -1548,6 +1572,15 @@ mod tests {
         origin: "worker".into(),
       },
       Request::BrowseRuns {
+        query: expri_core::service_catalog::RunListQuery {
+          project_id: None,
+          origin: None,
+          archival: expri_core::service_catalog::RunArchiveFilter::Active,
+          limit: 100,
+          cursor: None,
+        },
+      },
+      Request::BrowseRunSummaries {
         query: expri_core::service_catalog::RunListQuery {
           project_id: None,
           origin: None,

@@ -175,3 +175,59 @@ fn old_workers_cannot_receive_requirement_edits() {
     409
   );
 }
+
+#[test]
+fn resource_resampling_preserves_only_the_workers_advertised_manual_hold_action() {
+  for (advertised, manual, ready, allowed) in [
+    (true, Some(false), false, true),
+    (false, Some(false), false, false),
+    (true, Some(true), false, false),
+    (true, None, false, false),
+    (true, Some(false), true, false),
+  ] {
+    let (_directory, store) = fixture();
+    let mut request = pending();
+    let RunControlRequest::Poll {
+      status,
+      capabilities,
+      resource_status,
+      manual_paused,
+      ..
+    } = &mut request;
+    *status = "paused".into();
+    *manual_paused = manual;
+    *capabilities = vec![
+      ControlAction::Resume,
+      ControlAction::Stop,
+      ControlAction::SetRequirements,
+    ];
+    if advertised {
+      capabilities.push(ControlAction::Pause);
+    }
+    *resource_status = if ready {
+      let mut status = observation();
+      status.phase = ResourcePhase::Ready;
+      status.blocked = false;
+      status.disk[0].phase = ResourcePhase::Ready;
+      status.disk[0].available_bytes = Some(130);
+      Some(Box::new(status))
+    } else {
+      None
+    };
+    store.poll_run_control_at(request, AT + 1).unwrap();
+    let response = view(&store, AT + 1);
+    assert_eq!(
+      response["available_actions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("pause")),
+      allowed
+    );
+    let submitted = store.submit_run_control_at(selection(ControlAction::Pause), AT + 2);
+    if allowed {
+      assert_eq!(submitted.unwrap()["request"]["status"], "requested");
+    } else {
+      assert_eq!(submitted.unwrap_err().status, 409);
+    }
+  }
+}

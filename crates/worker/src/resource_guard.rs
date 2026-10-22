@@ -15,7 +15,7 @@ use expri_core::error::{ExpriError, Result};
 use expri_core::resource_requirements::{
   DiskObservation, ResourcePhase, ResourceRequirements, ResourceStatus,
 };
-use expri_core::run_state::{MAX_STATE_BYTES, update_state};
+use expri_core::run_state::{HoldSignal, MAX_STATE_BYTES, RunHolds, hold_transition, update_state};
 use serde_json::{Value, json};
 
 use crate::run_logs::groups;
@@ -138,8 +138,7 @@ impl Guard {
     if self.policy.as_ref() == Some(policy) {
       // A bounded in-flight probe is not an observed resource failure. Keep
       // its prior hold and recovery dwell, and never resume on old readings.
-      self.launch_held =
-        pid.is_none() || snapshot["resource_paused"] == true || manual_pause(snapshot);
+      self.launch_held = pid.is_none() || RunHolds::from_state(snapshot).is_held();
       self.next_check = Some(deadline);
       return Ok(self.launch_held);
     }
@@ -171,10 +170,12 @@ impl Guard {
           .collect(),
       };
       status.validate(policy)?;
-      state["manual_paused"] = json!(manual_pause(state));
+      let holds = RunHolds {
+        resource: true,
+        ..RunHolds::from_state(state)
+      };
       state["resource_status"] = serde_json::to_value(status)?;
-      state["resource_paused"] = json!(true);
-      hold_task(state, pid)?;
+      change_holds(state, holds, pid)?;
       Ok(true)
     })?;
     if held {
@@ -342,7 +343,7 @@ impl Guard {
     let snapshot = read_json(&run_dir.join("run-state.json"), MAX_STATE_BYTES)?;
     let sampled_policy = requirements(&snapshot)?;
     if sampled_policy.is_empty() {
-      let manually_paused = manual_pause(&snapshot);
+      let manually_paused = RunHolds::from_state(&snapshot).manual;
       let needs_update = snapshot["resource_paused"] == true
         || snapshot.get("resource_status").is_some()
         || snapshot.get("resource_mounts").is_some()
@@ -352,22 +353,15 @@ impl Guard {
           if requirements(state)? != sampled_policy {
             return Ok(None);
           }
-          let manually_paused = manual_pause(state);
-          state["manual_paused"] = json!(manually_paused);
+          let holds = RunHolds {
+            resource: false,
+            ..RunHolds::from_state(state)
+          };
+          change_holds(state, holds, pid)?;
           for field in ["resource_status", "resource_paused", "resource_mounts"] {
             state.as_object_mut().unwrap().remove(field);
           }
-          if !manually_paused {
-            if state["status"] == "paused" {
-              if let Some(pid) = pid {
-                groups::signal(pid, libc::SIGCONT)?;
-              }
-              crate::run_control::linux::restore_phase(state);
-            } else if state["status"] == "pending" {
-              state["status"] = json!("preparing");
-            }
-          }
-          Ok(Some(manually_paused))
+          Ok(Some(holds.is_held()))
         })?
       } else {
         Some(manually_paused)
@@ -411,11 +405,12 @@ impl Guard {
             .unwrap_or_else(|| Err(io::Error::other("disk observation is unavailable")))
         },
       );
-      let manually_paused = manual_pause(state);
+      let holds = RunHolds {
+        resource: status.blocked,
+        ..RunHolds::from_state(state)
+      };
       status.validate(&policy)?;
-      state["manual_paused"] = json!(manually_paused);
       state["resource_status"] = serde_json::to_value(&status)?;
-      state["resource_paused"] = json!(status.blocked);
       // Retain mount identity across a supervisor exec. Hashing keys avoids
       // duplicating every potentially long path in the bounded run metadata.
       state["resource_mounts"] = json!(
@@ -430,25 +425,8 @@ impl Guard {
           })
           .collect::<BTreeMap<_, _>>()
       );
-      match pid {
-        Some(pid) => {
-          let paused = state["status"] == "paused";
-          if status.blocked || manually_paused {
-            hold_task(state, Some(pid))?;
-          } else if paused {
-            groups::signal(pid, libc::SIGCONT)?;
-            crate::run_control::linux::restore_phase(state);
-          }
-        }
-        None => {
-          state["status"] = json!(if status.blocked || manually_paused {
-            "pending"
-          } else {
-            "preparing"
-          });
-        }
-      }
-      Ok(Some(status.blocked || manually_paused))
+      change_holds(state, holds, pid)?;
+      Ok(Some(holds.is_held()))
     })?;
     let Some(held) = held else {
       self.force_check();
@@ -460,24 +438,15 @@ impl Guard {
   }
 }
 
-fn manual_pause(state: &Value) -> bool {
-  state["manual_paused"]
-    .as_bool()
-    .unwrap_or(state["status"] == "paused" && state["resource_paused"] != true)
-}
-
-fn hold_task(state: &mut Value, pid: Option<u32>) -> Result<()> {
-  match pid {
-    Some(pid) if state["status"] != "paused" => {
-      // The caller holds the state lease before freezing its owned child.
-      groups::signal(pid, libc::SIGSTOP)?;
-      state["paused_previous_status"] = state["status"].clone();
-      state["status"] = json!("paused");
-      crate::run_control::linux::set_attempt_phase(state, "paused");
-    }
-    None => state["status"] = json!("pending"),
-    _ => {}
+/// The caller holds the state lease and owns the unreaped child, if any.
+pub(crate) fn change_holds(state: &mut Value, holds: RunHolds, pid: Option<u32>) -> Result<()> {
+  let transition = hold_transition(state, holds, pid.is_some())?;
+  match transition.signal {
+    HoldSignal::Pause => groups::signal(pid.expect("live hold transition"), libc::SIGSTOP)?,
+    HoldSignal::Resume => groups::signal(pid.expect("live hold transition"), libc::SIGCONT)?,
+    HoldSignal::None => {}
   }
+  transition.apply(state)?;
   Ok(())
 }
 

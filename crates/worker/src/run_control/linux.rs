@@ -7,8 +7,10 @@ use expri_core::error::{ExpriError, Result};
 use expri_core::experiment_assignment::RunExperimentIntent;
 use expri_core::lock::LockAttempt;
 use expri_core::protocol::{ContinueRunRequest, RunRequest};
-use expri_core::run_control::{ControlAction, ControlCommand, ControlResult};
-use expri_core::run_state::{MAX_STATE_BYTES, is_terminal_status, update_state};
+use expri_core::run_control::{ControlAction, ControlCommand, ControlResult, available_actions};
+use expri_core::run_state::{
+  MAX_STATE_BYTES, RunHolds, is_terminal_status, restored_phase, set_phase, update_state,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -135,22 +137,16 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
   let mut reason = None;
   match supported(&run_dir, &value, &ownership) {
     Ok(()) => {
-      match value["status"].as_str().unwrap_or_default() {
-        "running" | "waiting" => capabilities.extend([ControlAction::Pause, ControlAction::Stop]),
-        "paused" => {
-          capabilities.extend([ControlAction::Resume, ControlAction::Stop]);
-          if value["resource_paused"] == true && value["manual_paused"] != true {
-            capabilities.push(ControlAction::Pause);
-          }
-        }
-        "pending" => capabilities.push(ControlAction::Stop),
-        _ => {}
-      }
-      if matches!(
-        value["status"].as_str(),
-        Some("running" | "waiting" | "paused" | "completed" | "failed" | "cancelled")
-      ) {
-        capabilities.extend([ControlAction::Continue, ControlAction::Restart]);
+      let holds = RunHolds::from_state(&value);
+      capabilities = available_actions(
+        value["status"].as_str().unwrap_or_default(),
+        Some(holds.manual),
+        holds.resource,
+      );
+      capabilities.retain(|action| *action != ControlAction::SetRequirements);
+      // A preparing supervisor has not entered the responsive control loop yet.
+      if value["status"] == "preparing" {
+        capabilities.clear();
       }
       if value["run_requirements_protocol_version"] == 1 || terminal(&value) {
         capabilities.push(ControlAction::SetRequirements);
@@ -195,7 +191,7 @@ pub fn inspect(run_dir: &Path) -> Result<Value> {
     .get("task_exit_code")
     .filter(|value| !value.is_null())
     .unwrap_or(&value["exit_code"]);
-  let mut facts = json!({"supported":reason.is_none(),"protocol_version":value["run_control_protocol_version"].as_u64().unwrap_or(0),"attempt":attempt(&value),"generation":generation(&value),"status":status,"capabilities":capabilities,"command":command,"checkpoints":checkpoints,"reason":reason,"requirements":crate::resource_guard::requirements(&value)?,"resource_status":value["resource_status"],"manual_paused":value["manual_paused"].as_bool().unwrap_or(value["status"] == "paused" && value["resource_paused"] != true),"lifecycle":{"started_at":value["started_at"],"finished_at":value["finished_at"],"exit_code":exit_code}});
+  let mut facts = json!({"supported":reason.is_none(),"protocol_version":value["run_control_protocol_version"].as_u64().unwrap_or(0),"attempt":attempt(&value),"generation":generation(&value),"status":status,"capabilities":capabilities,"command":command,"checkpoints":checkpoints,"reason":reason,"requirements":crate::resource_guard::requirements(&value)?,"resource_status":value["resource_status"],"manual_paused":RunHolds::from_state(&value).manual,"lifecycle":{"started_at":value["started_at"],"finished_at":value["finished_at"],"exit_code":exit_code}});
   facts["experiment_assignment_supported"] = json!(experiment_assignment_supported);
   Ok(facts)
 }
@@ -247,6 +243,7 @@ fn registered_checkpoints(run_dir: &Path) -> Result<Vec<String>> {
 }
 
 pub fn execute(run_dir: &Path, command: &ControlCommand) -> Result<ControlResult> {
+  command.payload()?;
   expri_core::identifiers::validate_component(&command.request_id)?;
   if command.reason.trim().is_empty()
     || command.reason.len() > 1024
@@ -255,20 +252,6 @@ pub fn execute(run_dir: &Path, command: &ControlCommand) -> Result<ControlResult
     || command.grace_seconds > 3600
   {
     return Err(message("lifecycle reason or grace period is invalid"));
-  }
-  if let Some(requirements) = &command.requirements {
-    requirements.validate()?;
-  }
-  if let Some(experiment) = &command.experiment {
-    if command.action != ControlAction::Restart {
-      return Err(message("only restart accepts an experiment selection"));
-    }
-    experiment.validate()?;
-  }
-  if (command.action == ControlAction::SetRequirements) != command.requirements.is_some() {
-    return Err(message(
-      "set_requirements requires a resource policy, and other actions must not supply one",
-    ));
   }
   let run_dir = crate::supervisor::linux::validate_run_directory(run_dir)?;
   let LockAttempt::Acquired(_lock) =
@@ -757,14 +740,11 @@ fn process_owned(run_dir: &Path, pid: Option<u32>) -> Result<Option<u32>> {
           // Acquire the state lease first: freezing a task which currently owns
           // it would strand that lease and prevent the pause acknowledgement.
           fence(current, &command)?;
-          groups::signal(pid, libc::SIGSTOP)?;
-          if current["status"] != "paused" {
-            current["paused_previous_status"] = current["status"].clone();
-          }
-          current["manual_paused"] = json!(true);
-          current["status"] = json!("paused");
-          set_attempt_phase(current, "paused");
-          Ok(())
+          let holds = RunHolds {
+            manual: true,
+            ..RunHolds::from_state(current)
+          };
+          crate::resource_guard::change_holds(current, holds, Some(pid))
         })?;
         Ok(None)
       }
@@ -772,12 +752,11 @@ fn process_owned(run_dir: &Path, pid: Option<u32>) -> Result<Option<u32>> {
         let pid = pid.ok_or_else(|| message("task has not started"))?;
         update_state(&run_dir.join("run-state.json"), |current| {
           fence(current, &command)?;
-          current["manual_paused"] = json!(false);
-          if current["resource_paused"] != true {
-            groups::signal(pid, libc::SIGCONT)?;
-            restore_phase(current);
-          }
-          Ok(())
+          let holds = RunHolds {
+            manual: false,
+            ..RunHolds::from_state(current)
+          };
+          crate::resource_guard::change_holds(current, holds, Some(pid))
         })?;
         Ok(None)
       }
@@ -800,7 +779,7 @@ fn process_owned(run_dir: &Path, pid: Option<u32>) -> Result<Option<u32>> {
               .create_new(true)
               .open(run_dir.join(".cancel-request"))?;
           }
-          restore_phase(current);
+          restore_phase(current)?;
           Ok(())
         })?;
         Ok(Some(command.grace_seconds))
@@ -832,26 +811,11 @@ fn process_owned(run_dir: &Path, pid: Option<u32>) -> Result<Option<u32>> {
   }
 }
 
-pub(crate) fn set_attempt_phase(value: &mut Value, phase: &str) {
-  let number = attempt(value);
-  if let Some(entry) = value["task_attempts"]["attempts"]
-    .as_array_mut()
-    .and_then(|entries| entries.iter_mut().find(|entry| entry["attempt"] == number))
-  {
-    entry["status"] = json!(phase);
-  }
-}
-
-pub(crate) fn restore_phase(value: &mut Value) {
+pub(crate) fn restore_phase(value: &mut Value) -> Result<()> {
   if value["status"] == "paused" {
-    let phase = if value["paused_previous_status"] == "waiting" {
-      "waiting"
-    } else {
-      "running"
-    };
-    value["status"] = json!(phase);
-    set_attempt_phase(value, phase);
+    set_phase(value, restored_phase(value))?;
   }
+  Ok(())
 }
 
 #[cfg(test)]

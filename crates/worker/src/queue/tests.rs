@@ -182,7 +182,7 @@ fn assignment() -> JobAssignment {
     gpu_model: None,
     gpu_memory_bytes: None,
   };
-  let attempt = AttemptSummary {
+  let attempt = DispatchAttempt {
     attempt_id: "attempt-a".into(),
     job_id: "job-a".into(),
     worker_id: "worker-a".into(),

@@ -412,7 +412,7 @@ fn execute_snapshot(
       ));
     }
     let argv = environment::task_argv(&request.command)?;
-    state["status"] = json!("running");
+    expri_core::run_state::set_phase(&mut state, expri_core::run_state::RunPhase::Running)?;
     state["environment_manifest"] = json!(prepared.manifest_path);
     state["python"] = json!(prepared.python);
     write_state(&state_path, &state)?;

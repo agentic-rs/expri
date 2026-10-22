@@ -237,7 +237,8 @@ fn large_complete_tracking_state_can_automatically_archive_a_smoke_run() {
     }),
   );
   let state = store.file(&run_file(&scope(), "run-state.json")).unwrap();
-  assert!(state.size > STATE_LIMIT);
+  assert!(state.size > 64 * 1024);
+  assert!(state.size <= STATE_LIMIT);
   assert_eq!(store.run_archival(&scope()).unwrap().status, "archived");
 }
 
@@ -571,6 +572,28 @@ fn only_authoritative_finished_states_can_be_archived() {
     409,
     "a disposable overview cannot authorize archival"
   );
+}
+
+#[test]
+fn archival_accepts_the_shared_run_state_budget_and_rejects_larger_documents() {
+  for size in [96 * 1024, STATE_LIMIT as usize, STATE_LIMIT as usize + 1] {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Backend::default()).unwrap();
+    let mut state = json!({"run_id": scope().run_id, "status": "completed", "command": ""});
+    let envelope_size = serde_json::to_vec(&state).unwrap().len();
+    state["command"] = json!("x".repeat(size - envelope_size));
+    assert_eq!(serde_json::to_vec(&state).unwrap().len(), size);
+    state_document(&store, &scope(), 1, state);
+    let result = store.archive_run(&scope());
+    if size <= expri_core::run_state::MAX_STATE_BYTES {
+      assert_eq!(result.unwrap().status, "archived", "{size} bytes");
+    } else {
+      let error = result.unwrap_err();
+      assert_eq!(error.status, 409);
+      assert_eq!(error.message, "run state exceeds the archival limit");
+      assert_eq!(store.run_archival(&scope()).unwrap().status, "active");
+    }
+  }
 }
 
 #[test]

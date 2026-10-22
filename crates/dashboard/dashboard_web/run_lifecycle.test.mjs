@@ -41,6 +41,28 @@ test("control scopes cannot cross project, origin or run identities", () => {
   assert.equal(lifecycleScope(run, { ...source, kind: "local" }), null);
 });
 
+test("explicit run identities are shared across action scopes and never coerce queue jobs into runs", () => {
+  const scope = { project_id: "vision", origin: "gpu-a", run_id: "run-one" };
+  assert.deepEqual(lifecycleScope({ ...run, identity: { kind: "run", scope } }, source), scope);
+  assert.deepEqual(lifecycleScope({ ...run, run_key: undefined, identity: { kind: "run", scope } }, source), scope);
+  for (const identity of [null, { kind: "unknown", scope }, { kind: "queue_job", project_id: "vision", job_id: "run-one" },
+    { kind: "run", scope: { ...scope, origin: "gpu-b" } }, { kind: "run", scope: { ...scope, project_id: "other" } },
+    { kind: "run", scope: { ...scope, run_id: "other" } }, { kind: "run" }]) {
+    assert.equal(lifecycleScope({ ...run, identity }, source), null);
+  }
+  assert.equal(lifecycleScope({ ...run, queue_only: true, identity: { kind: "run", scope } }, source), null);
+});
+
+test("negotiated lifecycle actions use the server decision and validate its capability boundary", () => {
+  const current = { ...control, capabilities: [...control.capabilities, "set_requirements"], available_actions: ["resume", "set_requirements"] };
+  assert.deepEqual(parseRunLifecycle(current), current);
+  assert.deepEqual(lifecycleActions(current), ["resume"], "current clients do not reinterpret server state");
+  assert.deepEqual(lifecycleActions({ ...control, available_actions: [] }), [], "an empty decision does not use legacy fallback");
+  for (const available_actions of [null, ["shell"], ["pause", "pause"], ["set_requirements"]]) {
+    assert.throws(() => parseRunLifecycle({ ...control, available_actions }), /available lifecycle actions/);
+  }
+});
+
 test("control payloads preserve argument boundaries and reject malformed acknowledgements", () => {
   assert.deepEqual(parseRunLifecycle(control), control);
   assert.deepEqual(parseLifecycleArguments('["train.py", "with space", "", "$(command)"]'), ["train.py", "with space", "", "$(command)"]);

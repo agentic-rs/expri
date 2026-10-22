@@ -446,7 +446,7 @@ pub(crate) fn mark_stopping(run_dir: &Path, prepared: &mut PreparedContinuation)
   prepared.stage = "stopping".into();
   write_prepared(run_dir, prepared)?;
   update_state(&run_dir.join("run-state.json"), |state| {
-    crate::run_control::linux::restore_phase(state);
+    crate::run_control::linux::restore_phase(state)?;
     Ok(())
   })
 }

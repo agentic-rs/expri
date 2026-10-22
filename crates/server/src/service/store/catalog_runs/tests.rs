@@ -47,6 +47,90 @@ fn state<S: ObjectStorage>(store: &Store<S>, scope: &RunScope, value: serde_json
 }
 
 #[test]
+fn negotiated_catalog_and_dashboard_share_observations_without_changing_legacy_history() {
+  use expri_core::run_control::{ControlAction, ControlLifecycle, RunControlRequest};
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let scope = scope("project", "worker", "run-observed");
+  let started_at = "2026-10-19T00:00:00Z";
+  state(
+    &store,
+    &scope,
+    serde_json::json!({
+      "schema_version":1,"run_id":scope.run_id,"task":"train","status":"running",
+      "started_at":started_at,"finished_at":null,"exit_code":null,
+      "supervisor":{"generation":1},
+    }),
+  );
+  store
+    .execute(Request::RunControl {
+      request: RunControlRequest::Poll {
+        scope: scope.clone(),
+        binding_id: "binding".into(),
+        attempt: 1,
+        generation: 2,
+        status: "paused".into(),
+        capabilities: vec![ControlAction::Resume, ControlAction::Stop],
+        command: vec!["train".into()],
+        checkpoints: vec![],
+        lifecycle: Some(ControlLifecycle {
+          started_at: started_at.into(),
+          finished_at: None,
+          exit_code: None,
+        }),
+        requirements: None,
+        resource_status: None,
+        manual_paused: Some(true),
+        experiment_assignment_supported: None,
+        result: None,
+      },
+    })
+    .unwrap();
+  let legacy = store.browse_runs(&query()).unwrap().runs.remove(0);
+  assert_eq!(legacy.status, "running");
+  assert!(
+    serde_json::to_value(&legacy)
+      .unwrap()
+      .get("observation")
+      .is_none()
+  );
+  let effective = store.browse_run_summaries(&query()).unwrap().runs.remove(0);
+  assert_eq!(effective.status, "paused");
+  let observation = effective.observation.unwrap();
+  assert_eq!(observation.recorded_status, "running");
+  assert!(observation.online);
+  assert_eq!(
+    observation.available_actions,
+    vec![ControlAction::Resume, ControlAction::Stop]
+  );
+  let mut dashboard =
+    serde_json::json!({"status":"running","started_at":started_at,"current_attempt":1});
+  store
+    .decorate_run_control(&mut dashboard, &scope, 1)
+    .unwrap();
+  assert_eq!(dashboard["status"], effective.status);
+  assert_eq!(
+    dashboard["observation"],
+    serde_json::to_value(observation).unwrap()
+  );
+  store
+    .db()
+    .unwrap()
+    .execute("UPDATE run_control_bindings SET last_seen_at_ms=1", [])
+    .unwrap();
+  let offline = store.browse_run_summaries(&query()).unwrap().runs.remove(0);
+  assert_eq!(
+    offline.status, "paused",
+    "disconnect does not invent an execution outcome"
+  );
+  assert!(!offline.observation.unwrap().online);
+  assert_eq!(
+    store.browse_runs(&query()).unwrap().runs[0].status,
+    "running"
+  );
+}
+
+#[test]
 fn paged_catalog_covers_more_than_500_runs_and_keeps_scope_collisions_distinct() {
   let directory = tempfile::tempdir().unwrap();
   let store = Store::open(directory.path(), MockStorage::default()).unwrap();

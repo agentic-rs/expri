@@ -513,13 +513,14 @@ fn one_command_runs_at_a_time_and_duplicate_final_ack_does_not_block_the_next_co
     409
   );
   store.poll_run_control_at(poll(None), AT + 3).unwrap();
-  store
-    .poll_run_control_at(poll(Some(result("applied"))), AT + 4)
-    .unwrap();
+  let mut applied = poll(Some(result("applied")));
+  let RunControlRequest::Poll { status, .. } = &mut applied;
+  *status = "paused".into();
+  store.poll_run_control_at(applied.clone(), AT + 4).unwrap();
   store.submit_run_control_at(next, AT + 5).unwrap();
   assert_eq!(
     store
-      .poll_run_control_at(poll(Some(result("applied"))), AT + 6)
+      .poll_run_control_at(applied, AT + 6)
       .unwrap()
       .command
       .unwrap()

@@ -41,6 +41,50 @@ Python API and owns the standalone metrics/status helper sources. The worker's
 Python copies are generated with `scripts/sync_python_sdk.py` so its Cargo
 package can embed them without referring outside its package directory.
 
+## State ownership and projections
+
+| Entity | Identity and responsibility |
+| --- | --- |
+| Experiment | Project and experiment ID; grouping and lineage, independent of execution |
+| Run | Project, origin and run ID; durable metric history across task attempts |
+| Task attempt | Run scope and attempt number; one execution or checkpoint continuation |
+| Dispatch attempt | Queue job and attempt ID; scheduler lease, reservation and worker assignment |
+| Queue-only row | Project and job ID; has no run identity until execution publishes one |
+
+`core::run_state` defines `RunPhase` and independent manual/resource holds.
+Worker code validates a hold transition under the state lease, signals the
+process group, then applies the run/current-attempt update. Releasing one hold
+preserves the other and restores task-reported `waiting` when appropriate.
+Finished attempts remain immutable during continuation preparation: the
+successor becomes current only when its process starts. Terminal completion
+still owns finish timestamps and exit outcomes.
+
+`core::run_control` owns lifecycle action policy and typed command payload
+validation. Server actions intersect that policy with worker capabilities;
+current dashboard responses carry the resulting `available_actions`. Older
+dashboard responses retain a compatibility fallback. Flattened wire commands
+and persisted run-state extension fields remain compatible.
+
+Dashboard and negotiated `run-summary-v1` CLI responses share one observation
+projection. Uploaded state is the recorded history; a compatible worker binding
+can supply last-known execution status. The response retains recorded status,
+attempt/generation fences, receipt time and online status. Receipt time does not
+totally order task updates against uploads. Raw cached previews stay unmodified,
+and original `service-catalog-v1` responses remain published-only. Archival and
+cleanup status stay separate from execution status.
+
+The scheduler's placement evaluator returns an allocation or typed blockers.
+Both assignment and pending explanations use it, including existing freshness,
+reservation and quarantine rules. `DispatchAttempt` names scheduler attempts;
+the old Rust `AttemptSummary` alias and serialized fields remain compatible.
+
+Experiment payloads share pure core validation before storage-specific checks.
+Run and project deletion share a transaction-only inventory of owned records;
+callers retain deletion fences, receipts, lineage and shared-object references
+according to their existing policies. Run-state readers, including archival,
+use `MAX_STATE_BYTES` (256 KiB), so valid continuation history is not rejected
+by a smaller deletion-specific limit.
+
 ## Validation and packaging
 
 Check every workspace library and the existing CLI integration tests:

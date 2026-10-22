@@ -63,6 +63,7 @@ fn run(id: &str) -> RunListEntry {
     exit_code: Some(0),
     archived: false,
     warnings: Vec::new(),
+    observation: None,
   }
 }
 
@@ -193,6 +194,41 @@ fn run_pages_use_bearer_transport_and_preserve_requested_scope_and_cursor() {
     Some(encode_run_cursor(&scope("run-001")).unwrap())
   );
   server.join().unwrap();
+}
+
+#[test]
+fn run_summaries_are_requested_only_after_capability_negotiation() {
+  for summaries in [false, true] {
+    let mut count = 0;
+    let (url, server) = mock(2, move |request, _| {
+      count += 1;
+      if count == 1 {
+        let mut features = vec![SERVICE_CATALOG_CAPABILITY.into()];
+        if summaries {
+          features.push(RUN_SUMMARY_CAPABILITY.into());
+        }
+        return (
+          200,
+          Vec::new(),
+          encoded(&Response::Capabilities { features }),
+        );
+      }
+      let request: Request = serde_json::from_slice(&request.body).unwrap();
+      assert_eq!(
+        matches!(request, Request::BrowseRunSummaries { .. }),
+        summaries
+      );
+      assert_eq!(matches!(request, Request::BrowseRuns { .. }), !summaries);
+      (
+        200,
+        Vec::new(),
+        encoded(&Response::RunPage { page: run_page() }),
+      )
+    });
+    let client = ServiceCatalogClient::from_api(api(&url)).unwrap();
+    assert_eq!(client.runs(&run_query()).unwrap().runs.len(), 2);
+    server.join().unwrap();
+  }
 }
 
 #[test]
