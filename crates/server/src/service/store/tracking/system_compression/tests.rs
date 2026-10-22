@@ -187,7 +187,7 @@ fn preview_is_live_readonly_and_apply_requires_exclusive_lease_and_new_schema() 
       .unwrap()
       .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
       .unwrap(),
-    13
+    crate::service::store::METADATA_SCHEMA_VERSION
   );
 }
 
