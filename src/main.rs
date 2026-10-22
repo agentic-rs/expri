@@ -7,6 +7,7 @@ mod controller;
 mod dashboard;
 mod environment;
 mod experiment_cli;
+mod experiments_cli;
 mod fetch_cli;
 mod global_config;
 mod login_cli;
@@ -72,6 +73,8 @@ enum Command {
   Config(config_cli::ConfigCommand),
   /// Query published runs and files using the configured server connection.
   Query(query_cli::QueryCommand),
+  /// Discover experiments and inspect their run membership and lineage.
+  Experiments(experiments_cli::ExperimentsCommand),
   /// Manage server-queued jobs and inspect execution workers.
   Queue(queue_cli::QueueCommand),
   /// Print progressive agent guidance, with deeper instructions by topic.
@@ -299,6 +302,9 @@ fn run() -> Result<()> {
     Command::Logout(command) => login_cli::run_logout(command, cli.target.as_deref(), cli.quiet),
     Command::Config(command) => config_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Query(command) => query_cli::run(command, cli.target.as_deref(), cli.quiet),
+    Command::Experiments(command) => {
+      experiments_cli::run(command, cli.target.as_deref(), cli.quiet)
+    }
     Command::Queue(command) => queue_cli::run(command, cli.target.as_deref(), cli.quiet),
     Command::Skill(command) => skill_cli::run(command),
     Command::System(command) => system_cli::run(command, cli.target.as_deref(), cli.quiet),

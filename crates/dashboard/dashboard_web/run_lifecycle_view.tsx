@@ -150,7 +150,7 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, exper
     setError(null);
     setDraft({ action, arguments: JSON.stringify(control?.command.slice(1) ?? [], null, 2),
       checkpoint: control?.checkpoints[0] ?? "", reason: "", grace_seconds: 30,
-      experiment: restartExperimentDraft(scope),
+      experiment: restartExperimentDraft(scope, experiment_catalog),
       expected_attempt: control!.attempt, expected_generation: control!.generation, binding_id: control!.binding_id });
   };
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -243,11 +243,12 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, exper
           <textarea id="run-lifecycle-arguments" rows={4} value={draft.arguments} disabled={disabled} spellCheck={false}
             aria-describedby="run-lifecycle-arguments-hint" onChange={event => setDraft({ ...draft, arguments: event.currentTarget.value })} /></label>
         <p id="run-lifecycle-arguments-hint" className="muted">A JSON array of argument strings. The recorded executable and source stay fixed. No shell expansion is performed.</p>
-        {draft.action === "restart" && control?.experiment_assignment_supported === true && scope &&
+        {draft.action === "restart" && scope &&
           <RestartExperimentEditor draft={draft.experiment} catalog={experiment_catalog} project_id={scope.project_id} disabled={disabled}
+            assignment_supported={control?.experiment_assignment_supported === true}
             on_change={experiment => setDraft({ ...draft, experiment })} />}
         {draft.action === "restart" && control?.experiment_assignment_supported !== true && <p className="muted">
-          Experiment grouping requires a current server and a publishing connection authorized to manage experiments.</p>}
+          Keeping experiment membership requires a current server and a publishing connection authorized to manage experiments. Choose Ungrouped explicitly to restart without a group.</p>}
       </>}
       <div className="lifecycle-fields">
         <label className="field" htmlFor="run-lifecycle-reason"><span>Reason <span className="muted">optional</span></span>

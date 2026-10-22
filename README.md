@@ -520,6 +520,9 @@ The primary hosted dashboard also offers **Pause**, **Resume**, **Stop**,
 allocated resources; Resume restores the same task. Stop ends the current attempt
 without removing its history. Continue selects a registered checkpoint and adds an
 attempt to the same run. Restart starts a linked run with a new ID and clean metrics.
+Its dialog defaults to the source experiment, with an explicit Ungrouped option.
+When the worker confirms the restart and both runs share the selected experiment,
+the server records their Restarted relationship automatically.
 Continue and Restart reuse the recorded source and task executable; their argument
 array is editable. See [website task controls](docs/self-hosted-service.md#website-task-controls)
 for worker requirements and acknowledgement behavior.
@@ -565,6 +568,17 @@ Retry an interrupted request with the same `--request-id` and arguments. The
 recorded attempt guard prevents a stale request from replacing a later task.
 
 ## Run records and selective fetching
+
+Discover hosted experiment IDs and inspect their members and lineage:
+
+```sh
+expri experiments list --project-id vision
+expri experiments show exp-abc123 --project-id vision --json
+```
+
+These commands use the global server connection with owner credentials and need
+no local project or worker target. See [experiments and lineage](docs/experiments.md)
+for grouping, restart inheritance, and catalog compatibility.
 
 List local runs or inspect the configured target directly:
 

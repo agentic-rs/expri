@@ -300,12 +300,14 @@ fn authorize_role<S: ObjectStorage>(
 ) -> ApiResult<()> {
   if matches!(
     request,
-    Request::ValidateExperimentSelection { .. } | Request::AssignRunExperiment { .. }
+    Request::ValidateExperimentSelection { .. }
+      | Request::AssignRunExperiment { .. }
+      | Request::ListExperiments { .. }
   ) && !matches!(role, Role::Owner | Role::IssuedOwner { .. })
   {
     return Err(ApiError::new(
       403,
-      "experiment grouping requires an owner credential; use expri login or an owner service configuration",
+      "experiment access requires an owner credential; use expri login or an owner service configuration",
     ));
   }
   let machine = match role {
@@ -446,6 +448,7 @@ fn authorize<S: ObjectStorage>(
     Request::ReferenceFile { .. }
     | Request::ValidateExperimentSelection { .. }
     | Request::AssignRunExperiment { .. }
+    | Request::ListExperiments { .. }
     | Request::Queue { .. }
     | Request::ImportOutput { .. }
     | Request::ProjectStorage { .. }
@@ -799,6 +802,7 @@ fn route<S: ObjectStorage>(
   if !experiment_owner && let types::Response::Capabilities { features } = &mut response {
     features.retain(|feature| {
       feature != expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY
+        && feature != expri_core::experiment_catalog::EXPERIMENT_CATALOG_CAPABILITY
     });
   }
   let mut body = LimitedBytes(Vec::new());
@@ -1088,6 +1092,7 @@ mod tests {
     use expri_core::experiment_assignment::{
       EXPERIMENT_ASSIGNMENT_CAPABILITY, ExperimentSelection, RunExperimentIntent,
     };
+    use expri_core::experiment_catalog::EXPERIMENT_CATALOG_CAPABILITY;
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path(), MockStorage::default()).unwrap();
     let mut auth = auth();
@@ -1115,6 +1120,9 @@ mod tests {
           request_id: "request-one".into(),
           selection,
         },
+      },
+      Request::ListExperiments {
+        project_id: "project".into(),
       },
     ];
     for operation in &operations {
@@ -1144,6 +1152,12 @@ mod tests {
           .any(|feature| feature == EXPERIMENT_ASSIGNMENT_CAPABILITY),
         expected
       );
+      assert_eq!(
+        features
+          .iter()
+          .any(|feature| feature == EXPERIMENT_CATALOG_CAPABILITY),
+        expected
+      );
     }
     let body = route(
       &store,
@@ -1158,6 +1172,17 @@ mod tests {
       serde_json::from_slice::<Response>(&body).unwrap(),
       Response::ExperimentSelectionValidated
     ));
+    let body = route(
+      &store,
+      &auth,
+      request(
+        Some("owner-token-with-at-least-24-characters"),
+        &operations[2],
+      ),
+    )
+    .unwrap();
+    assert!(matches!(serde_json::from_slice::<Response>(&body).unwrap(),
+      Response::Experiments { catalog } if catalog.project_id == "project" && catalog.experiments.is_empty()));
   }
 
   #[test]

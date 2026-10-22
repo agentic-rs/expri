@@ -178,6 +178,10 @@ pub struct AssetProvenance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  /// Read the bounded project catalog; owner credentials are required.
+  ListExperiments {
+    project_id: String,
+  },
   /// Owner-only preflight; does not create a group or require a published child.
   ValidateExperimentSelection {
     project_id: String,
@@ -373,6 +377,9 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  Experiments {
+    catalog: crate::experiment_catalog::ExperimentCatalog,
+  },
   ExperimentSelectionValidated,
   RunExperimentAssigned {
     assignment: crate::experiment_assignment::RunExperimentAssignment,

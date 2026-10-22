@@ -3,6 +3,58 @@ use crate::service::store::tests::MockStorage;
 
 mod grouped;
 
+#[test]
+fn service_catalog_matches_dashboard_members_and_lineage_without_writing() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let parent = scope("worker-a", "same-run");
+  let child = scope("worker-b", "same-run");
+  document(&store, &parent);
+  document(&store, &child);
+  let saved = store
+    .save_experiment(selection(
+      vec![parent.clone(), child.clone()],
+      vec![edge(&parent, &child)],
+    ))
+    .unwrap();
+  let before = store.experiments("project").unwrap();
+  let Response::Experiments { catalog } = store
+    .execute(Request::ListExperiments {
+      project_id: "project".into(),
+    })
+    .unwrap()
+  else {
+    panic!("expected experiments");
+  };
+  assert_eq!(catalog.experiments, vec![saved]);
+  assert_eq!(serde_json::to_value(&catalog).unwrap(), before);
+  assert_eq!(store.experiments("project").unwrap(), before);
+  assert!(
+    serde_json::to_vec(&Response::Experiments { catalog })
+      .unwrap()
+      .len()
+      < MAX_REQUEST
+  );
+  let Response::Experiments { catalog } = store
+    .execute(Request::ListExperiments {
+      project_id: "empty-project".into(),
+    })
+    .unwrap()
+  else {
+    panic!("expected empty catalog");
+  };
+  assert!(catalog.experiments.is_empty());
+  assert_eq!(
+    store
+      .execute(Request::ListExperiments {
+        project_id: "../bad".into()
+      })
+      .unwrap_err()
+      .status,
+    400
+  );
+}
+
 pub(super) fn scope(origin: &str, run_id: &str) -> RunScope {
   RunScope {
     project_id: "project".into(),

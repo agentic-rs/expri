@@ -18,7 +18,7 @@ prints an embedded Markdown guide and works without project configuration.
 | `expri skill push` | Transfer source and config to a worker |
 | `expri skill run` | Launch a task, including a detached run or experiment membership |
 | `expri skill queue` | Submit frozen tasks, reserve resources, and inspect queued jobs/workers |
-| `expri skill runs` | Inspect runs, retrieve worker results, or understand website experiment groups and lineage |
+| `expri skill runs` | Inspect runs and experiments, retrieve worker results, or understand grouping and lineage |
 | `expri skill metrics` | Instrument training or compare recorded metrics |
 | `expri skill artifacts` | Hand finalized checkpoints to background publishing |
 | `expri skill assets` | Pin datasets/models or reuse a producing run's output |
@@ -50,6 +50,9 @@ prints an embedded Markdown guide and works without project configuration.
 - `query runs` and `query files` read published server JSON through the global
   `[server]` connection without a repository or target. Use `expri skill query`
   for scope, pagination, and received/reported availability.
+- `experiments list --project-id PROJECT` and `experiments show ID --project-id PROJECT`
+  discover groups and recorded lineage through the same server connection with
+  owner credentials. Add `--json` for structured results; read `expri skill runs`.
 - Reports are human-readable tables by default. Prefer `--json` when reading reports. Use the installed CLI's
   `--help` for exact flags, for example `expri runs status --help`.
 

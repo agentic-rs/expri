@@ -43,6 +43,25 @@ individual runs in Runs. Selection, inspection, and lifecycle actions always
 target individual runs. Lineage stays in the inspector and experiment manager;
 run comparisons preserve separate series.
 
+## Find experiments from the CLI
+
+Read experiment IDs, members, and lineage through the configured server:
+
+```sh
+expri experiments list --project-id vision
+expri experiments show exp-abc123 --project-id vision
+expri experiments show exp-abc123 --project-id vision --json
+```
+
+These read-only commands use the global `[server]` connection, or `--config PATH`
+for another client configuration, without a local project or SSH target. Supply
+the project explicitly and use the stable experiment ID for `show`; names need
+not be unique. The server must advertise `experiment-catalog-v1`, and the
+credential must have owner access because experiments can span multiple origins.
+The catalog includes retained membership and unavailable historical members.
+Run identities include their project, origin, and run ID. Management remains in
+the website; use `run --experiment` to select a listed group when launching.
+
 ## Choose an experiment when starting a run
 
 Managed runs can request their experiment when launched. Put these options
@@ -83,16 +102,23 @@ status if a run remains ungrouped. Retrying an acknowledged request does not
 create another experiment or undo a later manual removal or reassignment.
 Queued runs still require the server to accept and schedule their submission.
 
-The primary website's **Restart** dialog offers the same choices: **Ungrouped**,
-an existing experiment, a new named experiment, or joining a run. Joining the
-current run is useful when restarting work while keeping both executions
-together. These choices require an updated server and worker with an
-owner-authorized publishing connection. **Continue** retains the existing run
-and its membership.
+The primary website's **Restart** dialog defaults to the source run's current
+experiment; an ungrouped source stays ungrouped. You can explicitly choose
+**Ungrouped**, another existing experiment, a new named experiment, or joining
+a run. Joining an ungrouped source creates a group containing both executions.
+These choices require an updated server and worker with an owner-authorized
+publishing connection. **Continue** retains the existing run and its membership.
 
-Joining records membership only. Add any continuation, restart, or split
-relationship separately in the experiment editor; metric histories remain
-attached to their own runs.
+After the worker confirms a successful Restart and publishes the successor,
+the server records a **Restarted** relationship when both runs belong to the
+selected experiment. Assignment can wait for this confirmation while metrics
+continue uploading. The membership, relationship, and retry receipt commit
+together; retries do not duplicate links or restore relationships later removed
+manually. Choosing a different experiment does not move the source run.
+
+Ordinary `run --join-run` records membership only. Add other continuation,
+restart, or split relationships in the experiment editor; metric histories
+remain attached to their own runs.
 
 Names, descriptions, membership, and lineage are service-owned metadata. Worker
 publishing cannot replace them. Edits use the experiment's revision so that a
@@ -127,8 +153,9 @@ does not verify or download a checkpoint or launch a task.
 
 Existing Continue keeps the same run ID and adds a task attempt, so experiment
 membership follows that run. New runs, including Restart results, can choose
-membership at creation or be assigned later in the experiment editor. Record
-their lineage explicitly.
+membership at creation or be assigned later in the experiment editor. Website
+Restart records its relationship automatically when source and successor share
+the selected experiment; other lineage is explicit.
 
 ## History and removal
 
@@ -150,8 +177,9 @@ controls. Deleting a project also removes its experiment metadata.
 
 ## Availability and bounds
 
-Grouping can be selected at launch or edited through the hosted website;
-lineage is managed through the website.
+Grouping can be selected at launch or edited through the hosted website.
+The CLI can list and inspect experiments. Lineage is editable in the website;
+confirmed website Restarts also record same-experiment relationships automatically.
 Run controls continue to target individual runs. Cross-machine launches, task
 partitioning, collective pause/stop, and combined experiment metrics are separate
 execution features.

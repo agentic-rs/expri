@@ -11,43 +11,12 @@ use super::*;
 mod assignment;
 pub(super) use assignment::validate_selection as validate_assignment_selection;
 
-pub(in crate::service) const EXPERIMENT_LIMIT: usize = 128;
-const MEMBER_LIMIT: usize = 256;
-const LINEAGE_LIMIT: usize = 512;
-const PROJECT_BYTE_LIMIT: usize = 1024 * 1024;
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(in crate::service) struct Lineage {
-  pub parent: RunScope,
-  pub child: RunScope,
-  pub kind: LineageKind,
-  pub checkpoint: Option<String>,
-  /// Decimal text preserves all u64 steps when the browser decodes JSON.
-  pub step: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::service) enum LineageKind {
-  Continued,
-  Restarted,
-  Split,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-pub(in crate::service) struct Experiment {
-  pub experiment_id: String,
-  pub name: String,
-  pub description: String,
-  pub revision: String,
-  pub members: Vec<RunScope>,
-  pub lineage: Vec<Lineage>,
-  pub created_at: String,
-  pub updated_at: String,
-  pub unavailable_runs: Vec<RunScope>,
-  pub membership_count: usize,
-}
+pub(in crate::service) use expri_core::experiment_catalog::{
+  EXPERIMENT_LIMIT, Experiment, Lineage, LineageKind,
+};
+use expri_core::experiment_catalog::{
+  ExperimentCatalog, LINEAGE_LIMIT, MEMBER_LIMIT, PROJECT_BYTE_LIMIT,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +279,18 @@ pub(super) fn revision(db: &Connection, scope: &RunScope) -> ApiResult<Option<St
 }
 
 impl<S: ObjectStorage> Store<S> {
+  pub(in crate::service) fn experiment_catalog(
+    &self,
+    project_id: &str,
+  ) -> ApiResult<ExperimentCatalog> {
+    let catalog: ExperimentCatalog = serde_json::from_value(self.experiments(project_id)?)
+      .map_err(|_| ApiError::new(500, "invalid stored experiment catalog"))?;
+    catalog
+      .validate(project_id)
+      .map_err(|_| ApiError::new(500, "invalid stored experiment catalog"))?;
+    Ok(catalog)
+  }
+
   pub(in crate::service) fn experiments(&self, project_id: &str) -> ApiResult<Value> {
     validate_component(project_id).map_err(bad)?;
     let db = self.db()?;

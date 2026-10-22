@@ -961,6 +961,9 @@ impl<S: ObjectStorage> Store<S> {
     self.ensure_request_runs(&request)?;
     self.guard_publication_epoch(&request, epoch)?;
     match request {
+      Request::ListExperiments { project_id } => Ok(Response::Experiments {
+        catalog: self.experiment_catalog(&project_id)?,
+      }),
       Request::ValidateExperimentSelection { project_id, intent } => {
         self.validate_experiment_intent(&project_id, &intent)?;
         Ok(Response::ExperimentSelectionValidated)
@@ -1051,6 +1054,7 @@ impl<S: ObjectStorage> Store<S> {
           expri_core::run_system::RUN_SYSTEM_CAPABILITY.into(),
           "run-annotations-v1".into(),
           expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY.into(),
+          expri_core::experiment_catalog::EXPERIMENT_CATALOG_CAPABILITY.into(),
           expri_core::service_catalog::SERVICE_CATALOG_CAPABILITY.into(),
           expri_core::resource_queue::RESOURCE_QUEUE_CAPABILITY.into(),
           expri_core::resource_queue::RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY.into(),
