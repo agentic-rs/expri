@@ -168,6 +168,7 @@ fn capabilities(command: CapabilitiesCommand) -> Result<()> {
     expri_core::resource_requirements::RUN_REQUIREMENTS_CAPABILITY,
     RUN_METRICS_CAPABILITY,
     RUN_PUBLISHING_CAPABILITY,
+    expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY,
     SMOKE_RUNS_CAPABILITY,
     #[cfg(unix)]
     WORKER_SERVICE_CAPABILITY,

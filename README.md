@@ -818,6 +818,12 @@ Whitespace is trimmed and duplicate tags are removed, preserving their order.
 Hosted projects also support **Experiments**: named groups of runs that serve the
 same ongoing goal across machines and implementations. Group related runs and
 record checkpoint continuation, restart, or split relationships in the website.
+At launch, use `run --experiment <id>`, `--new-experiment <name>`, or
+`--join-run <run_id> [--join-origin <origin>]` before the task name. Joining an
+ungrouped run creates one experiment containing both runs; joining a grouped run
+uses its existing experiment. The website's Restart dialog also supports these
+membership choices. Automatic publishing applies the request after initial run
+metadata reaches the server and retries through temporary outages.
 Runs keep their own metrics and lifecycle controls. The **Experiments** view
 collapses each group to its latest matching run; expand it for earlier runs.
 Choose **Runs** for the flat sortable history, with optional experiment filters.

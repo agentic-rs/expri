@@ -846,6 +846,7 @@ fn queued_run_request(
   );
   RunRequest {
     name: submission.task.clone(),
+    experiment: submission.experiment.clone(),
     command: submission.command.clone(),
     environment,
     // Downloading private assets still needs the executing owner's credentials
@@ -1083,6 +1084,7 @@ fn register(
     project_ids: worker.project_ids.clone(),
     capacity: worker.capacity.clone(),
     gpu_availability: gpu_report(worker),
+    experiment_assignment_supported: client.experiment_assignment_registration(),
   };
   let response = match client.request(&register_request()) {
     Err(error) if expired_session(&error) => {

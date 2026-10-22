@@ -80,9 +80,9 @@ async function fixture(t, values = {}, handler = () => reply(control)) {
   const click = async id => { const node = container.querySelector(`#${id}`); assert.ok(node, `missing ${id}`); await act(async () => node.click()); };
   const setValue = async (id, value) => {
     const input = container.querySelector(`#${id}`); assert.ok(input);
-    const prototype = input.tagName === "TEXTAREA" ? dom.window.HTMLTextAreaElement.prototype : dom.window.HTMLInputElement.prototype;
+    const prototype = input.tagName === "TEXTAREA" ? dom.window.HTMLTextAreaElement.prototype : input.tagName === "SELECT" ? dom.window.HTMLSelectElement.prototype : dom.window.HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(prototype, "value").set.call(input, value);
-    await act(async () => input.dispatchEvent(new dom.window.Event("input", { bubbles: true })));
+    await act(async () => input.dispatchEvent(new dom.window.Event(input.tagName === "SELECT" ? "change" : "input", { bubbles: true })));
   };
   return { container, requests, timers, render, poll, click, setValue, applied: () => applied, opened };
 }
@@ -130,6 +130,90 @@ test("restart confirms fresh history and links the acknowledged new run", async 
   await f.click("run-lifecycle-confirm");
   assert.equal(f.applied(), 1);
   await f.click("run-lifecycle-open-result"); assert.deepEqual(f.opened, ["gpu-a:run-new"]);
+});
+
+test("restart grouping is opt-in and joining a run keeps its exact machine scope", async t => {
+  const current = { ...control, experiment_assignment_supported: true };
+  const f = await fixture(t, {}, () => reply(current));
+  await f.click("run-lifecycle-restart");
+  assert.equal(f.container.querySelector("#restart-experiment-ungrouped").checked, true);
+  assert.equal(f.container.querySelectorAll('input[name="restart-experiment"]').length, 4);
+  await f.click("restart-experiment-join_run");
+  assert.equal(f.container.querySelector("#restart-experiment-origin").value, "gpu-a");
+  assert.equal(f.container.querySelector("#restart-experiment-run-id").value, "run-one");
+  await f.setValue("restart-experiment-origin", "gpu-b");
+  await f.setValue("restart-experiment-run-id", "run-one");
+  await f.click("run-lifecycle-confirm");
+  const body = JSON.parse(f.requests.find(request => request.method === "POST").body);
+  assert.deepEqual(body.experiment, { kind: "join_run", origin: "gpu-b", run_id: "run-one" });
+  assert.equal(body.origin, "gpu-a", "the task remains bound to its original worker");
+});
+
+test("new experiment restart retries reuse the lifecycle request ID and preserve its draft", async t => {
+  const current = { ...control, experiment_assignment_supported: true };
+  const f = await fixture(t, {}, request => request.method === "POST" ? reply({ error: "Temporary failure" }, 503) : reply(current));
+  await f.click("run-lifecycle-restart");
+  await f.click("restart-experiment-new");
+  await f.setValue("restart-experiment-name", "  Better optimizer  ");
+  await f.poll();
+  assert.equal(f.container.querySelector("#restart-experiment-name").value, "  Better optimizer  ");
+  await f.click("run-lifecycle-confirm");
+  await f.click("run-lifecycle-confirm");
+  const posts = f.requests.filter(request => request.method === "POST").map(request => JSON.parse(request.body));
+  assert.equal(posts.length, 2);
+  assert.equal(posts[0].request_id, posts[1].request_id);
+  assert.deepEqual(posts[0].experiment, { kind: "new", name: "Better optimizer" });
+});
+
+test("restart chooses existing experiment IDs and rejects a removed or foreign selection", async t => {
+  const catalog = { project_id: "vision", revision: "1", experiments: [
+    { experiment_id: "experiment-first", name: "Same name" }, { experiment_id: "experiment-second", name: "Same name" }] };
+  const f = await fixture(t, { experiment_catalog: catalog }, () => reply({ ...control, experiment_assignment_supported: true }));
+  await f.click("run-lifecycle-restart");
+  await f.click("restart-experiment-existing");
+  await f.setValue("restart-experiment-id", "experiment-second");
+  await f.click("run-lifecycle-confirm");
+  assert.deepEqual(JSON.parse(f.requests.find(request => request.method === "POST").body).experiment,
+    { kind: "existing", experiment_id: "experiment-second" });
+  await f.render({ experiment_catalog: { ...catalog, project_id: "other" } });
+  await f.click("run-lifecycle-confirm");
+  assert.equal(f.requests.filter(request => request.method === "POST").length, 1);
+  assert.match(f.container.textContent, /Choose an available experiment in this project/);
+});
+
+test("restart grouping capability loss and stale task generations cannot silently drop a selection", async t => {
+  let current = { ...control, experiment_assignment_supported: true };
+  const f = await fixture(t, {}, () => reply(current));
+  await f.click("run-lifecycle-restart");
+  await f.click("restart-experiment-join_run");
+  current = { ...current, experiment_assignment_supported: false };
+  await f.poll();
+  await f.click("run-lifecycle-confirm");
+  assert.equal(f.requests.filter(request => request.method === "POST").length, 0);
+  assert.match(f.container.textContent, /Experiment assignment is unavailable/);
+  current = { ...current, experiment_assignment_supported: true, generation: 9 };
+  await f.poll();
+  await f.click("run-lifecycle-confirm");
+  assert.match(f.container.textContent, /task changed while this form was open/);
+  assert.equal(f.requests.filter(request => request.method === "POST").length, 0);
+});
+
+test("older workers and read-only dashboards never offer unsupported experiment writes", async t => {
+  const f = await fixture(t);
+  await f.click("run-lifecycle-restart");
+  assert.equal(f.container.querySelector("#restart-experiment"), null);
+  await f.click("run-lifecycle-confirm");
+  assert.equal(Object.hasOwn(JSON.parse(f.requests.find(request => request.method === "POST").body), "experiment"), false);
+  await f.render({ enabled: false });
+  assert.equal(f.container.querySelector("#run-lifecycle-confirm").disabled, true);
+});
+
+test("continuation keeps its run membership without a new grouping selection", async t => {
+  const f = await fixture(t, {}, () => reply({ ...control, experiment_assignment_supported: true }));
+  await f.click("run-lifecycle-continue");
+  assert.equal(f.container.querySelector("#restart-experiment"), null);
+  await f.click("run-lifecycle-confirm");
+  assert.equal(Object.hasOwn(JSON.parse(f.requests.find(request => request.method === "POST").body), "experiment"), false);
 });
 
 test("restarted runs link their recorded parent using the selected project or worker scope", async t => {

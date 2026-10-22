@@ -42,6 +42,7 @@ fn fixture() -> (tempfile::TempDir, Store<MockStorage>, BrowserAuth, String) {
         requirements: None,
         resource_status: None,
         manual_paused: None,
+        experiment_assignment_supported: None,
         result: None,
       },
     })

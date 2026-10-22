@@ -1,4 +1,4 @@
-//! Dashboard-owned grouping and lineage never alter worker-owned run history.
+//! Service-owned grouping and lineage never alter worker-owned run history.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::TryLockError;
 
@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::*;
+
+mod assignment;
+pub(super) use assignment::validate_selection as validate_assignment_selection;
 
 pub(in crate::service) const EXPERIMENT_LIMIT: usize = 128;
 const MEMBER_LIMIT: usize = 256;
@@ -73,7 +76,14 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
     CREATE TABLE IF NOT EXISTS experiment_creates (
       project_id TEXT NOT NULL, create_request_id TEXT NOT NULL,
       experiment_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
-      PRIMARY KEY(project_id,create_request_id));",
+      PRIMARY KEY(project_id,create_request_id));
+    CREATE TABLE IF NOT EXISTS experiment_assignment_intents (
+      project_id TEXT NOT NULL, request_id TEXT NOT NULL, fingerprint TEXT NOT NULL,
+      experiment_id TEXT NOT NULL, PRIMARY KEY(project_id,request_id));
+    CREATE TABLE IF NOT EXISTS experiment_assignment_receipts (
+      project_id TEXT NOT NULL, request_id TEXT NOT NULL, origin TEXT NOT NULL,
+      run_id TEXT NOT NULL, receipt TEXT NOT NULL,
+      PRIMARY KEY(project_id,request_id,origin,run_id));",
   )
   .map_err(|_| crate::error::ExpriError::Message("cannot initialize experiments".into()))
 }
@@ -379,158 +389,7 @@ impl<S: ObjectStorage> Store<S> {
     };
     let mut db = self.db()?;
     let tx = db.transaction().map_err(database)?;
-    projects::ensure_active(&tx, &selection.project_id)?;
-    let fingerprint = hex_digest(
-      &serde_json::to_vec(&selection)
-        .map_err(|_| ApiError::new(500, "cannot encode experiment request"))?,
-    );
-    if let Some(request_id) = &selection.create_request_id {
-      let existing: Option<(String,String)> = tx.query_row("SELECT experiment_id,fingerprint FROM experiment_creates WHERE project_id=?1 AND create_request_id=?2",params![selection.project_id,request_id],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(database)?;
-      if let Some((id, previous)) = existing {
-        if previous != fingerprint {
-          return Err(ApiError::new(
-            409,
-            "experiment create_request_id is already assigned to different values",
-          ));
-        }
-        let experiment = load(&tx, &selection.project_id, &id)?.ok_or_else(|| {
-          ApiError::new(
-            410,
-            "this experiment creation was already completed and the experiment was deleted",
-          )
-        })?;
-        return decorate(&tx, experiment);
-      }
-    }
-    let old = selection
-      .experiment_id
-      .as_ref()
-      .map(|id| load(&tx, &selection.project_id, id))
-      .transpose()?
-      .flatten();
-    if selection.experiment_id.is_some() && old.is_none() {
-      return Err(ApiError::new(404, "experiment is missing"));
-    }
-    if old.as_ref().map(|experiment| &experiment.revision) != selection.expected_revision.as_ref() {
-      return Err(ApiError::new(
-        409,
-        "experiment changed; refresh before saving",
-      ));
-    }
-    let id = match &old {
-      Some(experiment) => experiment.experiment_id.clone(),
-      None => {
-        let count: usize = tx
-          .query_row(
-            "SELECT COUNT(*) FROM experiments WHERE project_id=?1",
-            [&selection.project_id],
-            |row| row.get(0),
-          )
-          .map_err(database)?;
-        if count >= EXPERIMENT_LIMIT {
-          return Err(ApiError::new(
-            409,
-            "project supports at most 128 experiments",
-          ));
-        }
-        tx.query_row("SELECT 'exp-'||lower(hex(randomblob(12)))", [], |row| {
-          row.get(0)
-        })
-        .map_err(database)?
-      }
-    };
-    for scope in &selection.members {
-      let retained = old
-        .as_ref()
-        .is_some_and(|experiment| experiment.members.contains(scope));
-      if !retained && !available(&tx, scope)? {
-        return Err(ApiError::new(
-          404,
-          "cannot add a missing or expired run to an experiment",
-        ));
-      }
-      let assigned: Option<String> = tx.query_row("SELECT experiment_id FROM experiment_members WHERE project_id=?1 AND origin=?2 AND run_id=?3",params![scope.project_id,scope.origin,scope.run_id],|row|row.get(0)).optional().map_err(database)?;
-      if assigned.is_some_and(|assigned| assigned != id) {
-        return Err(ApiError::new(
-          409,
-          "run belongs to another experiment; remove it there before assigning it",
-        ));
-      }
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut experiment = Experiment {
-      experiment_id: id.clone(),
-      name: selection.name,
-      description: selection.description,
-      revision: old
-        .as_ref()
-        .map_or(Ok(1), |old| {
-          old
-            .revision
-            .parse::<u64>()
-            .ok()
-            .and_then(|revision| revision.checked_add(1))
-            .ok_or_else(|| ApiError::new(500, "invalid stored experiment revision"))
-        })?
-        .to_string(),
-      members: selection.members,
-      lineage: selection.lineage,
-      created_at: old
-        .as_ref()
-        .map_or_else(|| now.clone(), |old| old.created_at.clone()),
-      updated_at: now,
-      unavailable_runs: Vec::new(),
-      membership_count: 0,
-    };
-    experiment.membership_count = experiment.members.len();
-    if let Some(old) = &old
-      && old.name == experiment.name
-      && old.description == experiment.description
-      && old.members == experiment.members
-      && old.lineage == experiment.lineage
-    {
-      return decorate(&tx, old.clone());
-    }
-    let encoded = serde_json::to_string(&experiment)
-      .map_err(|_| ApiError::new(500, "cannot encode experiment"))?;
-    tx.execute("INSERT INTO experiments(project_id,experiment_id,record) VALUES(?1,?2,?3) ON CONFLICT(project_id,experiment_id) DO UPDATE SET record=excluded.record",params![selection.project_id,id,encoded]).map_err(database)?;
-    if let Some(request_id) = &selection.create_request_id {
-      tx.execute("INSERT INTO experiment_creates(project_id,create_request_id,experiment_id,fingerprint) VALUES(?1,?2,?3,?4)",params![selection.project_id,request_id,id,fingerprint]).map_err(database)?;
-    }
-    tx.execute(
-      "DELETE FROM experiment_members WHERE project_id=?1 AND experiment_id=?2",
-      params![selection.project_id, id],
-    )
-    .map_err(database)?;
-    for scope in &experiment.members {
-      tx.execute("INSERT INTO experiment_members(project_id,origin,run_id,experiment_id) VALUES(?1,?2,?3,?4)",params![scope.project_id,scope.origin,scope.run_id,id]).map_err(database)?;
-    }
-    // Reserve enough space for every retained run to become unavailable later.
-    let mut budget = snapshot(&tx, &selection.project_id)?;
-    for record in budget["experiments"]
-      .as_array_mut()
-      .expect("snapshot experiments")
-    {
-      record["unavailable_runs"] = record["members"].clone();
-    }
-    if serde_json::to_vec(&budget)
-      .map_err(|_| ApiError::new(500, "cannot encode experiments"))?
-      .len()
-      > PROJECT_BYTE_LIMIT - 128
-    {
-      return Err(ApiError::new(
-        409,
-        "project experiment metadata exceeds the 1 MiB limit",
-      ));
-    }
-    let mut scopes = old.map_or_else(Vec::new, |old| old.members);
-    for scope in &experiment.members {
-      if !scopes.contains(scope) {
-        scopes.push(scope.clone());
-      }
-    }
-    changed(&tx, &selection.project_id, &scopes)?;
-    let result = decorate(&tx, experiment)?;
+    let result = save_normalized(&tx, selection)?;
     tx.commit().map_err(database)?;
     Ok(result)
   }
@@ -582,6 +441,167 @@ impl<S: ObjectStorage> Store<S> {
       json!({"project_id":project_id,"experiment_id":experiment_id,"deleted":true,"revision":revision}),
     )
   }
+}
+
+/// Shared transactional save; callers have normalized and validated the selection.
+fn save_normalized(db: &Connection, selection: ExperimentSave) -> ApiResult<Experiment> {
+  projects::ensure_active(db, &selection.project_id)?;
+  let fingerprint = hex_digest(
+    &serde_json::to_vec(&selection)
+      .map_err(|_| ApiError::new(500, "cannot encode experiment request"))?,
+  );
+  if let Some(request_id) = &selection.create_request_id {
+    let existing: Option<(String,String)> = db.query_row("SELECT experiment_id,fingerprint FROM experiment_creates WHERE project_id=?1 AND create_request_id=?2",params![selection.project_id,request_id],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(database)?;
+    if let Some((id, previous)) = existing {
+      if previous != fingerprint {
+        return Err(ApiError::new(
+          409,
+          "experiment create_request_id is already assigned to different values",
+        ));
+      }
+      let experiment = load(db, &selection.project_id, &id)?.ok_or_else(|| {
+        ApiError::new(
+          410,
+          "this experiment creation was already completed and the experiment was deleted",
+        )
+      })?;
+      return decorate(db, experiment);
+    }
+  }
+  let old = selection
+    .experiment_id
+    .as_ref()
+    .map(|id| load(db, &selection.project_id, id))
+    .transpose()?
+    .flatten();
+  if selection.experiment_id.is_some() && old.is_none() {
+    return Err(ApiError::new(404, "experiment is missing"));
+  }
+  if old.as_ref().map(|experiment| &experiment.revision) != selection.expected_revision.as_ref() {
+    return Err(ApiError::new(
+      409,
+      "experiment changed; refresh before saving",
+    ));
+  }
+  let id = match &old {
+    Some(experiment) => experiment.experiment_id.clone(),
+    None => {
+      let count: usize = db
+        .query_row(
+          "SELECT COUNT(*) FROM experiments WHERE project_id=?1",
+          [&selection.project_id],
+          |row| row.get(0),
+        )
+        .map_err(database)?;
+      if count >= EXPERIMENT_LIMIT {
+        return Err(ApiError::new(
+          409,
+          "project supports at most 128 experiments",
+        ));
+      }
+      db.query_row("SELECT 'exp-'||lower(hex(randomblob(12)))", [], |row| {
+        row.get(0)
+      })
+      .map_err(database)?
+    }
+  };
+  for scope in &selection.members {
+    let retained = old
+      .as_ref()
+      .is_some_and(|experiment| experiment.members.contains(scope));
+    if !retained && !available(db, scope)? {
+      return Err(ApiError::new(
+        404,
+        "cannot add a missing or expired run to an experiment",
+      ));
+    }
+    let assigned: Option<String> = db.query_row("SELECT experiment_id FROM experiment_members WHERE project_id=?1 AND origin=?2 AND run_id=?3",params![scope.project_id,scope.origin,scope.run_id],|row|row.get(0)).optional().map_err(database)?;
+    if assigned.is_some_and(|assigned| assigned != id) {
+      return Err(ApiError::new(
+        409,
+        "run belongs to another experiment; remove it there before assigning it",
+      ));
+    }
+  }
+  let now = chrono::Utc::now().to_rfc3339();
+  let mut experiment = Experiment {
+    experiment_id: id.clone(),
+    name: selection.name,
+    description: selection.description,
+    revision: old
+      .as_ref()
+      .map_or(Ok(1), |old| {
+        old
+          .revision
+          .parse::<u64>()
+          .ok()
+          .and_then(|revision| revision.checked_add(1))
+          .ok_or_else(|| ApiError::new(500, "invalid stored experiment revision"))
+      })?
+      .to_string(),
+    members: selection.members,
+    lineage: selection.lineage,
+    created_at: old
+      .as_ref()
+      .map_or_else(|| now.clone(), |old| old.created_at.clone()),
+    updated_at: now,
+    unavailable_runs: Vec::new(),
+    membership_count: 0,
+  };
+  experiment.membership_count = experiment.members.len();
+  if let Some(old) = &old
+    && old.name == experiment.name
+    && old.description == experiment.description
+    && old.members == experiment.members
+    && old.lineage == experiment.lineage
+  {
+    return decorate(db, old.clone());
+  }
+  let encoded = serde_json::to_string(&experiment)
+    .map_err(|_| ApiError::new(500, "cannot encode experiment"))?;
+  db.execute("INSERT INTO experiments(project_id,experiment_id,record) VALUES(?1,?2,?3) ON CONFLICT(project_id,experiment_id) DO UPDATE SET record=excluded.record",params![selection.project_id,id,encoded]).map_err(database)?;
+  if let Some(request_id) = &selection.create_request_id {
+    db.execute("INSERT INTO experiment_creates(project_id,create_request_id,experiment_id,fingerprint) VALUES(?1,?2,?3,?4)",params![selection.project_id,request_id,id,fingerprint]).map_err(database)?;
+  }
+  db.execute(
+    "DELETE FROM experiment_members WHERE project_id=?1 AND experiment_id=?2",
+    params![selection.project_id, id],
+  )
+  .map_err(database)?;
+  for scope in &experiment.members {
+    db.execute(
+      "INSERT INTO experiment_members(project_id,origin,run_id,experiment_id) VALUES(?1,?2,?3,?4)",
+      params![scope.project_id, scope.origin, scope.run_id, id],
+    )
+    .map_err(database)?;
+  }
+  // Reserve enough space for every retained run to become unavailable later.
+  let mut budget = snapshot(db, &selection.project_id)?;
+  for record in budget["experiments"]
+    .as_array_mut()
+    .expect("snapshot experiments")
+  {
+    record["unavailable_runs"] = record["members"].clone();
+  }
+  if serde_json::to_vec(&budget)
+    .map_err(|_| ApiError::new(500, "cannot encode experiments"))?
+    .len()
+    > PROJECT_BYTE_LIMIT - 128
+  {
+    return Err(ApiError::new(
+      409,
+      "project experiment metadata exceeds the 1 MiB limit",
+    ));
+  }
+  let mut scopes = old.map_or_else(Vec::new, |old| old.members);
+  for scope in &experiment.members {
+    if !scopes.contains(scope) {
+      scopes.push(scope.clone());
+    }
+  }
+  changed(db, &selection.project_id, &scopes)?;
+  let result = decorate(db, experiment)?;
+  Ok(result)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

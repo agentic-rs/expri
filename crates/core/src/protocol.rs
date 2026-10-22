@@ -42,6 +42,8 @@ pub struct SetupRequest {
 pub struct RunRequest {
   pub name: String,
   pub command: Vec<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub experiment: Option<crate::experiment_assignment::RunExperimentIntent>,
   pub environment: EnvironmentConfig,
   #[serde(default, skip_serializing_if = "ResourceRequirements::is_empty")]
   pub requirements: ResourceRequirements,

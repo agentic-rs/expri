@@ -656,7 +656,7 @@ fn assert_core_sync_without_inventory(linked_outputs: bool) {
     &scope,
     &run_dir,
     &BTreeSet::new(),
-    true,
+    PublishPurpose::Run { watch: true },
     &mut |_| Ok(()),
   );
   if !linked_outputs {
@@ -745,7 +745,7 @@ fn prepared_inventory_transport_failure_remains_retryable_after_core_publication
       &scope,
       &run_dir,
       &BTreeSet::new(),
-      false,
+      PublishPurpose::Run { watch: false },
       &mut |_| Ok(())
     )
     .is_err()
@@ -1473,7 +1473,7 @@ fn watching_a_future_artifact_still_forwards_live_complete_metric_rows() {
       &scope,
       &run_dir,
       &selected,
-      true,
+      PublishPurpose::Run { watch: true },
       &mut |_| Ok(())
     )
     .unwrap()

@@ -1,3 +1,4 @@
+use expri_core::experiment_assignment::ExperimentSelection;
 use expri_core::resource_requirements::{ResourceRequirements, ResourceStatus};
 use expri_core::run_control::{
   ControlAction, ControlCommand, ControlLifecycle, ControlResult, RunControlRequest,
@@ -60,6 +61,8 @@ pub(in crate::service) struct ControlSubmission {
   pub checkpoint: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub requirements: Option<ResourceRequirements>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub experiment: Option<ExperimentSelection>,
   pub reason: String,
   pub grace_seconds: u32,
 }
@@ -91,6 +94,8 @@ struct Facts {
   resource_status: Option<ResourceStatus>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   manual_paused: Option<bool>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  experiment_assignment_supported: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -275,6 +280,9 @@ fn snapshot(db: &Connection, scope: &str, at: i64) -> ApiResult<Value> {
   if let Some(paused) = facts.manual_paused {
     snapshot["manual_paused"] = json!(paused);
   }
+  if let Some(supported) = facts.experiment_assignment_supported {
+    snapshot["experiment_assignment_supported"] = json!(supported);
+  }
   Ok(snapshot)
 }
 
@@ -440,6 +448,7 @@ impl<S: ObjectStorage> Store<S> {
       requirements,
       resource_status,
       manual_paused,
+      experiment_assignment_supported,
       result,
     } = request;
     validate_scope(&scope).map_err(bad)?;
@@ -498,6 +507,7 @@ impl<S: ObjectStorage> Store<S> {
       requirements,
       resource_status: resource_status.map(|status| *status),
       manual_paused,
+      experiment_assignment_supported,
     };
     let mut db = self.db()?;
     let tx = db.transaction().map_err(database)?;
@@ -633,6 +643,15 @@ impl<S: ObjectStorage> Store<S> {
     if selection.action == ControlAction::Restart && selection.checkpoint.is_some() {
       return Err(ApiError::new(400, "restart does not accept a checkpoint"));
     }
+    if let Some(experiment) = &selection.experiment {
+      if selection.action != ControlAction::Restart {
+        return Err(ApiError::new(
+          400,
+          "only restart accepts an experiment selection",
+        ));
+      }
+      experiment.validate().map_err(bad)?;
+    }
     match (&selection.action, &selection.requirements) {
       (ControlAction::SetRequirements, Some(requirements)) => {
         requirements.validate().map_err(bad)?
@@ -695,6 +714,15 @@ impl<S: ObjectStorage> Store<S> {
         "worker does not support this action in the current run state",
       ));
     }
+    if selection.experiment.is_some() && facts.experiment_assignment_supported != Some(true) {
+      return Err(ApiError::new(
+        409,
+        "experiment assignment requires a current publishing worker authorized to manage experiments",
+      ));
+    }
+    if let Some(experiment) = &selection.experiment {
+      experiments::validate_assignment_selection(&tx, &scope.project_id, experiment)?;
+    }
     if selection.action == ControlAction::Continue
       && selection
         .checkpoint
@@ -726,6 +754,7 @@ impl<S: ObjectStorage> Store<S> {
       arguments: selection.arguments,
       checkpoint: selection.checkpoint,
       requirements: selection.requirements,
+      experiment: selection.experiment,
       reason: selection.reason,
       grace_seconds: selection.grace_seconds,
       expires_at_ms: at.saturating_add(DELIVERY_MS),

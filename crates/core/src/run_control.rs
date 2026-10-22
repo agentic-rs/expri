@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::experiment_assignment::ExperimentSelection;
 use crate::resource_requirements::{ResourceRequirements, ResourceStatus};
 use crate::service::RunScope;
 
@@ -38,6 +39,8 @@ pub struct ControlCommand {
   pub checkpoint: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub requirements: Option<ResourceRequirements>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub experiment: Option<ExperimentSelection>,
   pub reason: String,
   pub grace_seconds: u32,
   pub expires_at_ms: i64,
@@ -72,6 +75,8 @@ pub enum RunControlRequest {
     resource_status: Option<Box<ResourceStatus>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manual_paused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    experiment_assignment_supported: Option<bool>,
     result: Option<ControlResult>,
   },
 }

@@ -16,6 +16,7 @@ use crate::types::{Request, Response};
 pub struct ResourceQueueClient {
   api: Api,
   gpu_availability: bool,
+  experiment_assignment: bool,
 }
 
 impl ResourceQueueClient {
@@ -47,9 +48,13 @@ impl ResourceQueueClient {
     let gpu_availability = features
       .iter()
       .any(|feature| feature == RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY);
+    let experiment_assignment = features.iter().any(|feature| {
+      feature == expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY
+    });
     Ok(Self {
       api,
       gpu_availability,
+      experiment_assignment,
     })
   }
 
@@ -62,6 +67,11 @@ impl ResourceQueueClient {
       ));
     }
     Ok(())
+  }
+
+  /// An omitted field preserves registration compatibility with old servers.
+  pub fn experiment_assignment_registration(&self) -> Option<bool> {
+    self.experiment_assignment.then_some(true)
   }
 
   pub fn request(&self, request: &QueueRequest) -> Result<QueueResponse> {

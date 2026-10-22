@@ -3,18 +3,21 @@ import { apiUrl, dateText, errorText, jsonObject, parseRunDeepLink, projectRunKe
 import { lifecycleActions, lifecyclePending, lifecycleScope, parseLifecycleArguments, parseLifecycleReason, parseRunLifecycle, type RunLifecycle, type RunLifecycleAction } from "./run_lifecycle";
 import { ResourceRequirementsEditor, ResourceStatusSummary } from "./run_resources_view";
 import type { ResourceRequirements } from "./run_resources";
+import type { ExperimentCatalog } from "./experiments";
+import { RestartExperimentEditor, restartExperimentDraft, restartExperimentSelection, type RestartExperimentDraft } from "./restart_experiment";
 
 const LABELS: Record<RunLifecycleAction, string> = { pause: "Pause", resume: "Resume", stop: "Stop", continue: "Continue", restart: "Restart", set_requirements: "Requirements" };
 type Fence = { expected_attempt: number; expected_generation: number; binding_id: string };
 type Draft = { action: "stop" | "continue" | "restart"; arguments: string; checkpoint: string; reason: string; grace_seconds: number;
-  expected_attempt: number; expected_generation: number; binding_id: string };
+  expected_attempt: number; expected_generation: number; binding_id: string; experiment: RestartExperimentDraft };
 
-export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_applied, on_open_run }: {
+export function RunLifecyclePanel({ run, source, detail, enabled, visible, experiment_catalog, on_applied, on_open_run }: {
   run: Run;
   source: Source | undefined;
   detail: Detail | null;
   enabled: boolean;
   visible: boolean;
+  experiment_catalog?: ExperimentCatalog | null;
   on_applied: () => void;
   on_open_run: (id: string) => void;
 }) {
@@ -114,12 +117,15 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
       }
       if (action === "continue" && (!form?.checkpoint || !control.checkpoints.includes(form.checkpoint))) throw new Error("Choose a finalized checkpoint.");
       if (form && (!Number.isInteger(form.grace_seconds) || form.grace_seconds < 1 || form.grace_seconds > 3600)) throw new Error("Grace period must be between 1 and 3,600 seconds.");
+      const experiment = action === "restart" && form ? restartExperimentSelection(form.experiment, scope.project_id, experiment_catalog) : null;
+      if (experiment && control.experiment_assignment_supported !== true) throw new Error("Experiment assignment is unavailable. Check the server, worker version, and publishing permissions, then reopen Restart.");
       const body = {
         ...scope, expected_attempt: control.attempt,
         expected_generation: control.generation, binding_id: control.binding_id, action,
         arguments: arguments_value, checkpoint: action === "continue" ? form!.checkpoint : null,
         reason: parseLifecycleReason(form?.reason ?? ""), grace_seconds: form?.grace_seconds ?? 30,
         ...(action === "set_requirements" ? { requirements } : {}),
+        ...(experiment ? { experiment } : {}),
       };
       const key = JSON.stringify(body);
       if (submission.current?.key !== key) submission.current = { key, request_id: crypto.randomUUID() };
@@ -144,6 +150,7 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
     setError(null);
     setDraft({ action, arguments: JSON.stringify(control?.command.slice(1) ?? [], null, 2),
       checkpoint: control?.checkpoints[0] ?? "", reason: "", grace_seconds: 30,
+      experiment: restartExperimentDraft(scope),
       expected_attempt: control!.attempt, expected_generation: control!.generation, binding_id: control!.binding_id });
   };
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -236,6 +243,11 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, on_ap
           <textarea id="run-lifecycle-arguments" rows={4} value={draft.arguments} disabled={disabled} spellCheck={false}
             aria-describedby="run-lifecycle-arguments-hint" onChange={event => setDraft({ ...draft, arguments: event.currentTarget.value })} /></label>
         <p id="run-lifecycle-arguments-hint" className="muted">A JSON array of argument strings. The recorded executable and source stay fixed. No shell expansion is performed.</p>
+        {draft.action === "restart" && control?.experiment_assignment_supported === true && scope &&
+          <RestartExperimentEditor draft={draft.experiment} catalog={experiment_catalog} project_id={scope.project_id} disabled={disabled}
+            on_change={experiment => setDraft({ ...draft, experiment })} />}
+        {draft.action === "restart" && control?.experiment_assignment_supported !== true && <p className="muted">
+          Experiment grouping requires a current server and a publishing connection authorized to manage experiments.</p>}
       </>}
       <div className="lifecycle-fields">
         <label className="field" htmlFor="run-lifecycle-reason"><span>Reason <span className="muted">optional</span></span>

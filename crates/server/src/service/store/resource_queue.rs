@@ -70,6 +70,10 @@ pub(super) fn initialize(db: &Connection) -> crate::error::Result<()> {
   for (column, kind) in [
     ("gpu_availability", "TEXT"),
     ("gpu_availability_observed_at_ms", "INTEGER"),
+    (
+      "experiment_assignment_supported",
+      "INTEGER NOT NULL DEFAULT 0",
+    ),
   ] {
     if !columns.contains(column) {
       db.execute_batch(&format!(
@@ -309,6 +313,7 @@ fn unavailable_gpus(
 }
 
 struct WorkerRecord {
+  experiment_assignment_supported: bool,
   session_id: String,
   project_ids: String,
   capacity: String,
@@ -321,7 +326,7 @@ struct WorkerRecord {
 
 fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary> {
   let row: Option<WorkerRecord> = db.query_row(
-    "SELECT session_id,project_ids,capacity,last_seen_at_ms,lease_expires_at_ms,quarantined,gpu_availability,gpu_availability_observed_at_ms FROM queue_workers WHERE worker_id=?1",
+    "SELECT session_id,project_ids,capacity,last_seen_at_ms,lease_expires_at_ms,quarantined,gpu_availability,gpu_availability_observed_at_ms,experiment_assignment_supported FROM queue_workers WHERE worker_id=?1",
     [worker_id], |row| Ok(WorkerRecord {
       session_id: row.get(0)?,
       project_ids: row.get(1)?,
@@ -331,9 +336,11 @@ fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary
       quarantined: row.get(5)?,
       gpu_availability: row.get(6)?,
       gpu_availability_observed_at_ms: row.get(7)?,
+      experiment_assignment_supported: row.get(8)?,
     }),
   ).optional().map_err(database)?;
   let WorkerRecord {
+    experiment_assignment_supported,
     session_id,
     project_ids,
     capacity,
@@ -377,6 +384,7 @@ fn worker(db: &Connection, worker_id: &str, now: i64) -> ApiResult<WorkerSummary
       .any(|unavailable| unavailable.device_id == gpu.device_id)
   });
   Ok(WorkerSummary {
+    experiment_assignment_supported,
     worker_id: worker_id.into(),
     session_id,
     project_ids: decode(&project_ids)?,
@@ -546,6 +554,7 @@ fn prune_offers(db: &Connection, now: i64) -> ApiResult<()> {
     SELECT 1 FROM queue_jobs j JOIN queue_workers w ON w.worker_id=queue_offers.worker_id
     WHERE j.job_id=queue_offers.job_id AND j.status='queued'
     AND w.session_id=queue_offers.session_id AND w.lease_expires_at_ms>?1 AND w.quarantined=0
+    AND (json_extract(j.spec,'$.experiment') IS NULL OR w.experiment_assignment_supported=1)
     AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id)
     AND (json_array_length(w.project_ids)=0 OR EXISTS(SELECT 1 FROM json_each(w.project_ids) WHERE value=j.project_id))
     AND NOT EXISTS(SELECT 1 FROM json_each(queue_offers.allocation,'$.gpus') gpu
@@ -597,7 +606,7 @@ fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
   });
   let mut statement = db
     .prepare(
-      "SELECT j.job_id,j.record,json_extract(j.spec,'$.environment.require_cuda') FROM queue_jobs j
+      "SELECT j.job_id,j.record,json_extract(j.spec,'$.environment.require_cuda'),json_extract(j.spec,'$.experiment') IS NOT NULL FROM queue_jobs j
     WHERE j.status='queued' AND NOT EXISTS(SELECT 1 FROM queue_offers WHERE job_id=j.job_id)
     AND NOT EXISTS(SELECT 1 FROM project_deletions WHERE project_id=j.project_id)
     ORDER BY j.sequence",
@@ -609,14 +618,16 @@ fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
         row.get::<_, String>(0)?,
         row.get::<_, String>(1)?,
         row.get::<_, bool>(2)?,
+        row.get::<_, bool>(3)?,
       ))
     })
     .map_err(database)?;
   for candidate in candidates {
-    let (job_id, record, require_cuda) = candidate.map_err(database)?;
+    let (job_id, record, require_cuda, experiment) = candidate.map_err(database)?;
     let summary: JobSummary = decode(&record)?;
     for (worker, used) in &mut workers {
       if used.len() >= MAX_OUTSTANDING_ATTEMPTS
+        || (experiment && !worker.experiment_assignment_supported)
         || (!worker.project_ids.is_empty() && !worker.project_ids.contains(&summary.project_id))
         || summary
           .worker_id
@@ -642,11 +653,11 @@ fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
 }
 
 fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<String> {
-  let require_cuda: bool = db
+  let (require_cuda, experiment): (bool, bool) = db
     .query_row(
-      "SELECT json_extract(spec,'$.environment.require_cuda') FROM queue_jobs WHERE job_id=?1",
+      "SELECT json_extract(spec,'$.environment.require_cuda'),json_extract(spec,'$.experiment') IS NOT NULL FROM queue_jobs WHERE job_id=?1",
       [&job.job_id],
-      |row| row.get(0),
+      |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .map_err(database)?;
   let mut statement = db.prepare("SELECT worker_id FROM queue_workers WHERE (?1 IS NULL OR worker_id=?1) AND (json_array_length(project_ids)=0 OR EXISTS(SELECT 1 FROM json_each(project_ids) WHERE value=?2)) ORDER BY worker_id LIMIT ?3").map_err(database)?;
@@ -662,8 +673,13 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
   }
   let mut online = false;
   let mut available = false;
+  let mut supported = false;
   for id in ids {
     let worker = worker(db, &id, now)?;
+    if experiment && !worker.experiment_assignment_supported {
+      continue;
+    }
+    supported = true;
     if worker.lease_expires_at_ms <= now {
       continue;
     }
@@ -689,7 +705,9 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
     }
   }
   Ok(
-    if !online {
+    if !supported {
+      "experiment_worker_upgrade_required"
+    } else if !online {
       "eligible_workers_offline"
     } else if !available {
       "workers_need_reconciliation"
@@ -1074,9 +1092,10 @@ impl<S: ObjectStorage> Store<S> {
         mut project_ids,
         capacity,
         gpu_availability,
+        experiment_assignment_supported,
       } => {
         project_ids.sort();
-        register(
+        let response = register(
           db,
           &worker_id,
           &session_id,
@@ -1084,7 +1103,15 @@ impl<S: ObjectStorage> Store<S> {
           capacity,
           gpu_availability,
           now,
-        )?
+        )?;
+        // Missing capability belongs to legacy workers, including a downgraded
+        // binary reusing a still-live session. Unaccepted offers are pruned below.
+        db.execute(
+          "UPDATE queue_workers SET experiment_assignment_supported=?2 WHERE worker_id=?1",
+          params![worker_id, experiment_assignment_supported.unwrap_or(false)],
+        )
+        .map_err(database)?;
+        response
       }
       QueueRequest::Heartbeat {
         worker_id,
@@ -1233,6 +1260,9 @@ fn submit(db: &Connection, submission: JobSubmission, now: i64) -> ApiResult<Que
     return Ok(QueueResponse::Job {
       job: Box::new(job(db, &job_id, now)?),
     });
+  }
+  if let Some(intent) = &submission.experiment {
+    experiments::validate_assignment_selection(db, &submission.project_id, &intent.selection)?;
   }
   let count: usize = db
     .query_row(
@@ -1448,12 +1478,21 @@ fn claim(
     .optional()
     .map_err(database)?;
   if let Some(previous) = previous {
-    return Ok(QueueResponse::Claimed {
-      assignment: match previous {
-        Some(id) => assignment(db, &id, now)?.map(Box::new),
-        None => None,
-      },
-    });
+    let assignment = match previous {
+      Some(id) => assignment(db, &id, now)?.map(Box::new),
+      None => None,
+    };
+    if !worker.experiment_assignment_supported
+      && assignment
+        .as_ref()
+        .is_some_and(|assignment| assignment.submission.experiment.is_some())
+    {
+      return Err(ApiError::new(
+        409,
+        "upgrade the queue worker to recover this experiment assignment; its reservation remains held",
+      ));
+    }
+    return Ok(QueueResponse::Claimed { assignment });
   }
   if worker.quarantined {
     return Err(ApiError::new(
@@ -1474,8 +1513,14 @@ fn claim(
   let selected: Option<(String, String)> = db
     .query_row(
       "SELECT o.job_id,o.allocation FROM queue_offers o JOIN queue_jobs j ON j.job_id=o.job_id
-    WHERE o.worker_id=?1 AND o.session_id=?2 AND j.status='queued' ORDER BY j.sequence LIMIT 1",
-      params![worker_id, session_id],
+    WHERE o.worker_id=?1 AND o.session_id=?2 AND j.status='queued'
+      AND (json_extract(j.spec,'$.experiment') IS NULL OR ?3)
+      ORDER BY j.sequence LIMIT 1",
+      params![
+        worker_id,
+        session_id,
+        worker.experiment_assignment_supported
+      ],
       |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()

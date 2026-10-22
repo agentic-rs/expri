@@ -155,7 +155,7 @@ fn a_terminal_task_with_a_draining_capture_publishes_state_without_sealing() {
       &scope,
       &run,
       &BTreeSet::new(),
-      true,
+      PublishPurpose::Run { watch: true },
       &mut |_| Ok(())
     )
     .unwrap()
@@ -223,7 +223,7 @@ fn capture_identity_failure_keeps_logs_and_terminal_state_publication_alive() {
       &scope,
       &run,
       &BTreeSet::new(),
-      true,
+      PublishPurpose::Run { watch: true },
       &mut |_| Ok(())
     )
     .is_err()
@@ -353,7 +353,7 @@ fn supported_capture_is_published_at_its_checkpoint_and_included_in_final_seal()
       &scope,
       &run,
       &BTreeSet::new(),
-      true,
+      PublishPurpose::Run { watch: true },
       &mut |_| Ok(())
     )
     .unwrap()
@@ -587,7 +587,7 @@ fn terminal_tracking_seals_original_bytes_without_uploading_them_to_s3() {
       &scope,
       &run,
       &BTreeSet::new(),
-      true,
+      PublishPurpose::Run { watch: true },
       &mut |_| Ok(())
     )
     .unwrap()

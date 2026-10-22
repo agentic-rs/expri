@@ -166,6 +166,11 @@ Use **Experiments** to group related runs across origins and record continuation
 restart, or split lineage. Experiment metadata is managed by the service and
 survives worker publishing. The primary website can edit it; AB previews remain
 read-only. Each run retains its individual execution controls and metric history.
+Launch options `--experiment`, `--new-experiment`, and `--join-run` retain a
+membership request for the publisher to apply after initial metadata arrives.
+This additive operation requires owner credentials and retries without
+overwriting later manual grouping changes. Website Restart offers the same
+membership choices.
 See [experiments and lineage](experiments.md) for membership, retention, and limits.
 Choose up to eight parameter or metric columns using the **Columns** checkbox
 tags. Click table headers to sort before paging, and use the table's

@@ -178,6 +178,16 @@ pub struct AssetProvenance {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
+  /// Owner-only preflight; does not create a group or require a published child.
+  ValidateExperimentSelection {
+    project_id: String,
+    intent: crate::experiment_assignment::RunExperimentIntent,
+  },
+  /// Add a published run without replacing existing experiment metadata.
+  AssignRunExperiment {
+    scope: RunScope,
+    intent: crate::experiment_assignment::RunExperimentIntent,
+  },
   /// Fence one mutation to the publication generation that prepared its bytes.
   AtRunEpoch {
     epoch: u64,
@@ -363,6 +373,10 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+  ExperimentSelectionValidated,
+  RunExperimentAssigned {
+    assignment: crate::experiment_assignment::RunExperimentAssignment,
+  },
   ReconciledRunAttempt {
     committed_epoch: Option<u64>,
   },

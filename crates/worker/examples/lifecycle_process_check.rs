@@ -278,6 +278,7 @@ mod linux {
       arguments: None,
       checkpoint: None,
       requirements: None,
+      experiment: None,
       reason: "isolated lifecycle verification".into(),
       grace_seconds: 3,
       expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,

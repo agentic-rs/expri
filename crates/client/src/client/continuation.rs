@@ -177,7 +177,7 @@ pub(crate) fn begin_task_attempt(
       // Its task is already reaped and the caller retains the run lifetime lease.
       let sealed = sealed_snapshot(&publisher.api, &publisher.scope)?;
       if sealed.is_none() {
-        publisher.cycle(&mut |_| Ok(()))?;
+        publisher.flush_for_continuation()?;
       }
       if publisher.queue.state.protocol != Some(queue::Protocol::TrackingV1) {
         return Err(message(

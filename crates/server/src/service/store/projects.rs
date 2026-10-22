@@ -327,6 +327,8 @@ impl<S: ObjectStorage> Store<S> {
       | Request::RunArchival { .. }
       | Request::RunAnnotations { .. }
       | Request::SetRunAnnotations { .. }
+      | Request::ValidateExperimentSelection { .. }
+      | Request::AssignRunExperiment { .. }
       | Request::PutSystemProfile { .. }
       | Request::ListSystemMachines { .. }
       | Request::GetSystemMachine { .. }
@@ -490,6 +492,8 @@ impl<S: ObjectStorage> Store<S> {
       "experiments",
       "experiment_revisions",
       "experiment_creates",
+      "experiment_assignment_intents",
+      "experiment_assignment_receipts",
     ] {
       transaction
         .execute(

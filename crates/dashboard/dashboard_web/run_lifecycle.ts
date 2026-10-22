@@ -25,6 +25,7 @@ export type RunLifecycle = {
   requirements?: ResourceRequirements | null;
   resource_status?: ResourceStatus | null;
   manual_paused?: boolean;
+  experiment_assignment_supported?: boolean;
 };
 
 export function lifecycleScope(run: Run, source: Source | undefined): RunDeepLink | null {
@@ -61,6 +62,7 @@ export function parseRunLifecycle(value: unknown): RunLifecycle {
     !Number.isFinite(new Date(item.last_seen_at_ms).valueOf())) throw new Error("Invalid run control response.");
   if (item.supported && (item.attempt < 1 || !item.binding_id)) throw new Error("Run control is missing its worker binding.");
   if (item.manual_paused !== undefined && typeof item.manual_paused !== "boolean") throw new Error("Invalid manual pause state.");
+  if (item.experiment_assignment_supported !== undefined && typeof item.experiment_assignment_supported !== "boolean") throw new Error("Invalid experiment assignment capability.");
   const resource_fields: Pick<RunLifecycle, "requirements" | "resource_status" | "manual_paused"> = {};
   if (item.requirements !== undefined) resource_fields.requirements = item.requirements === null ? null : parseResourceRequirements(item.requirements);
   if (item.resource_status !== undefined) resource_fields.resource_status = item.resource_status === null ? null : parseResourceStatus(item.resource_status);
@@ -83,6 +85,7 @@ export function parseRunLifecycle(value: unknown): RunLifecycle {
     attempt: item.attempt, generation: item.generation, binding_id: item.binding_id,
     capabilities: item.capabilities as RunLifecycleAction[], command: item.command,
     checkpoints: item.checkpoints, last_seen_at_ms: item.last_seen_at_ms, request, ...resource_fields,
+    ...(item.experiment_assignment_supported !== undefined ? { experiment_assignment_supported: item.experiment_assignment_supported } : {}),
   };
 }
 

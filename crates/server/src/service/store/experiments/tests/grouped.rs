@@ -406,6 +406,7 @@ fn queued_jobs_are_standalone_until_native_metadata_and_keep_context_when_groupe
     )
     .unwrap();
   let submission = JobSubmission {
+    experiment: None,
     submission_id: "grouped-pending".into(),
     project_id: "project".into(),
     task: "queued-task".into(),
@@ -468,6 +469,7 @@ fn queued_jobs_are_standalone_until_native_metadata_and_keep_context_when_groupe
   assert_eq!(ungrouped["runs"][0]["queue_only"], true);
   store
     .resource_queue(QueueRequest::RegisterWorker {
+      experiment_assignment_supported: None,
       worker_id: "worker-a".into(),
       session_id: "grouped-session".into(),
       project_ids: vec!["project".into()],

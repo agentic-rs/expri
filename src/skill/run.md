@@ -31,6 +31,35 @@ ID and eventual run ID are separate. Use `--queue --detach` to return a job
 receipt immediately. Ctrl-C stops waiting without cancelling the durable job;
 use `expri queue cancel <job_id>` for cancellation.
 
+## Experiment membership at launch
+
+For a managed run with automatic service publishing, choose one option before
+the task name:
+
+```sh
+expri run --experiment exp-abc123 --detach train
+expri run --new-experiment "Translation model v2" --detach train
+expri -T gpu run --join-run run-abc123 --join-origin workstation --detach train
+```
+
+`--experiment` takes an existing experiment ID. `--new-experiment` creates a
+named group. `--join-run` uses an existing published run in the configured
+project: it joins that run's group, or creates one containing both runs if the
+reference is ungrouped. Omit `--join-origin` only for a unique run ID. These
+options are mutually exclusive and also apply to queued launches.
+
+The publishing credential needs owner permissions; origin-scoped worker tokens
+cannot manage grouping. Known permission/reference errors fail preflight.
+Temporary connectivity failures let direct runs start and retain the request for
+background retry after initial metadata publication. Launch success therefore
+does not prove membership is already visible; check publishing status and the
+hosted experiment. Successful retries do not duplicate groups or undo later
+manual regrouping.
+Queued launches still need the server to accept and schedule their submission.
+
+Grouping preserves each run's history and does not imply lineage. Use
+`expri skill runs` for the website's group and relationship controls.
+
 ## Managed runs and outputs
 
 With `[environment]` configured, each run gets a frozen source snapshot, uv

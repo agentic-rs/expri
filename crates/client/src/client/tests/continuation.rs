@@ -65,6 +65,117 @@ fn sealed_files(scope: &RunScope) -> Vec<FileRecord> {
 }
 
 #[test]
+fn continuation_flush_defers_experiment_assignment_but_preserves_data_errors() {
+  use base64::{Engine, engine::general_purpose::STANDARD};
+  use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
+
+  for reject_metadata in [false, true] {
+    let (_temporary, root) = root();
+    let group = RunExperimentIntent {
+      request_id: "pending-group".into(),
+      selection: ExperimentSelection::Existing {
+        experiment_id: "missing-experiment".into(),
+      },
+    };
+    let began = Arc::new(Mutex::new(false));
+    let received_begin = Arc::clone(&began);
+    let (url, server) = mock(if reject_metadata { 5 } else { 10 }, move |request, _| {
+      let response = match serde_json::from_slice::<Request>(&request.body).unwrap() {
+        Request::Capabilities => Response::Capabilities {
+          features: vec!["tracking-v1".into(), "run-task-continuation-v1".into()],
+        },
+        Request::CheckRunContinuation { .. } => Response::RunAttempt { epoch: 0 },
+        Request::ListFiles { .. } => Response::Files { files: vec![] },
+        Request::PutDocument {
+          revision,
+          total_size,
+          ..
+        } => {
+          if reject_metadata {
+            return (503, vec![], br#"{"error":"metadata unavailable"}"#.to_vec());
+          }
+          Response::DocumentAcknowledged {
+            offset: total_size,
+            revision,
+            complete: true,
+          }
+        }
+        Request::AppendTracking {
+          offset,
+          data_base64,
+          ..
+        } => Response::Acknowledged {
+          offset: offset + STANDARD.decode(data_base64).unwrap().len() as u64,
+        },
+        Request::SealRun { .. } => Response::Archive {
+          archive: ArchiveRecord {
+            status: "pending".into(),
+            incomplete: false,
+            file: None,
+            last_error: None,
+          },
+        },
+        Request::BeginRunAttempt {
+          expected_epoch,
+          attempt,
+          ..
+        } => {
+          assert_eq!((expected_epoch, attempt), (0, 2));
+          *received_begin.lock().unwrap() = true;
+          Response::RunAttempt { epoch: 1 }
+        }
+        other => panic!("continuation must defer independent experiment assignment: {other:?}"),
+      };
+      (200, vec![], serde_json::to_vec(&response).unwrap())
+    });
+    let run_dir = root.join("run-child");
+    std::fs::create_dir_all(run_dir.join("outputs")).unwrap();
+    std::fs::write(run_dir.join("snapshot.json"), br#"{"run_id":"run-child"}"#).unwrap();
+    std::fs::write(
+      run_dir.join("outputs/metrics.jsonl"),
+      b"{\"step\":0,\"loss\":1}\n",
+    )
+    .unwrap();
+    std::fs::write(
+      run_dir.join("run-state.json"),
+      serde_json::to_vec(
+        &json!({"run_id":"run-child","status":"completed","experiment_intent":group}),
+      )
+      .unwrap(),
+    )
+    .unwrap();
+    let options = PublishOptions {
+      config: config(&root, &url),
+      run_dir: run_dir.clone(),
+      project_id: "project".into(),
+      origin: "worker".into(),
+      artifacts: vec![],
+      watch: true,
+      queue_dir: root.join("queue"),
+    };
+    let result = begin_task_attempt(
+      &options,
+      Api::new(&options.config).unwrap(),
+      "continue-child",
+      1,
+      2,
+    );
+    assert_eq!(result.is_err(), reject_metadata);
+    assert_eq!(*began.lock().unwrap(), !reject_metadata);
+    let state: Value =
+      serde_json::from_slice(&std::fs::read(run_dir.join("run-state.json")).unwrap()).unwrap();
+    assert_eq!(state["experiment_intent"], json!(group));
+    assert_eq!(
+      state["publication_epoch"].as_u64().unwrap_or(0),
+      u64::from(!reject_metadata)
+    );
+    let publisher = Publisher::new(&options).unwrap();
+    assert!(publisher.queue.state.experiment_assignment.is_none());
+    server.join().unwrap();
+  }
+}
+
+#[test]
 fn sealed_attempt_retries_the_exact_cas_without_rewriting_old_metadata() {
   let (_temporary, root) = root();
   let scope = RunScope {

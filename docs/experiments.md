@@ -43,6 +43,57 @@ individual runs in Runs. Selection, inspection, and lifecycle actions always
 target individual runs. Lineage stays in the inspector and experiment manager;
 run comparisons preserve separate series.
 
+## Choose an experiment when starting a run
+
+Managed runs can request their experiment when launched. Put these options
+before the task name and select exactly one of the three forms:
+
+```sh
+# Join an existing experiment by its stable ID.
+expri run --experiment exp-abc123 --detach train --epochs 3
+
+# Create a named experiment for the new run.
+expri run --new-experiment "Translation model v2" --detach train --epochs 3
+
+# Group with an existing published run in the same project.
+expri -T gpu run --join-run run-abc123 --join-origin workstation --detach train --epochs 3
+```
+
+`--join-run` joins the referenced run's experiment when it already has one.
+Otherwise, the server creates one experiment containing both runs. Simultaneous
+joins to the same ungrouped run converge on the same experiment. Omit
+`--join-origin` only when the run ID identifies a unique run in the project.
+An experiment ID is unambiguous; experiment names need not be unique.
+
+These options require a managed environment and automatic service publishing.
+They also work with `--queue`; the eventual worker run joins after its initial
+metadata publishes. Grouped jobs wait for an updated worker that advertises
+experiment support. The publishing connection must have owner permissions,
+including credentials issued by `expri login`. Origin-scoped worker credentials
+do not gain permission to edit project-wide grouping. An online preflight
+rejects invalid references, unsupported servers, and authorization failures
+before training starts.
+After upgrading the server and workers, restart the worker service so it
+negotiates and advertises the new capability.
+
+A temporary server outage allows a direct run to start. The run retains its grouping
+request and the publisher retries it after reconnecting; normal metric and state
+uploads can continue independently of a grouping error. Inspect publishing
+status if a run remains ungrouped. Retrying an acknowledged request does not
+create another experiment or undo a later manual removal or reassignment.
+Queued runs still require the server to accept and schedule their submission.
+
+The primary website's **Restart** dialog offers the same choices: **Ungrouped**,
+an existing experiment, a new named experiment, or joining a run. Joining the
+current run is useful when restarting work while keeping both executions
+together. These choices require an updated server and worker with an
+owner-authorized publishing connection. **Continue** retains the existing run
+and its membership.
+
+Joining records membership only. Add any continuation, restart, or split
+relationship separately in the experiment editor; metric histories remain
+attached to their own runs.
+
 Names, descriptions, membership, and lineage are service-owned metadata. Worker
 publishing cannot replace them. Edits use the experiment's revision so that a
 stale page cannot overwrite a newer edit. A conflict retains the unsaved draft;
@@ -75,8 +126,9 @@ decimal text. Checkpoint references describe provenance; saving a relationship
 does not verify or download a checkpoint or launch a task.
 
 Existing Continue keeps the same run ID and adds a task attempt, so experiment
-membership follows that run. New runs, including Restart results, can be assigned
-and linked explicitly in the experiment editor.
+membership follows that run. New runs, including Restart results, can choose
+membership at creation or be assigned later in the experiment editor. Record
+their lineage explicitly.
 
 ## History and removal
 
@@ -98,7 +150,8 @@ controls. Deleting a project also removes its experiment metadata.
 
 ## Availability and bounds
 
-This first version manages grouping and lineage through the hosted website.
+Grouping can be selected at launch or edited through the hosted website;
+lineage is managed through the website.
 Run controls continue to target individual runs. Cross-machine launches, task
 partitioning, collective pause/stop, and combined experiment metrics are separate
 execution features.

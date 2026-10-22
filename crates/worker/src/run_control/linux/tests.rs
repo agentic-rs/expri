@@ -26,6 +26,7 @@ fn control(action: ControlAction, id: &str) -> ControlCommand {
     arguments: None,
     checkpoint: None,
     requirements: None,
+    experiment: None,
     reason: "test lifecycle".into(),
     grace_seconds: 3,
     expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
@@ -360,6 +361,70 @@ fn recorded_arguments_keep_executable_and_preserve_literal_shell_characters() {
 }
 
 #[test]
+fn restart_replaces_experiment_intent_while_continuation_keeps_the_original() {
+  use expri_core::experiment_assignment::ExperimentSelection;
+  let (_root, run) = fixture();
+  let path = run.join("run-request.json");
+  let mut request = read_json(&path, LIMIT).unwrap();
+  let original = RunExperimentIntent {
+    request_id: "original-launch".into(),
+    selection: ExperimentSelection::New {
+      name: "Original experiment".into(),
+    },
+  };
+  request["experiment"] = json!(original);
+  write_json(&path, &request).unwrap();
+  let mut command = control(ControlAction::Continue, "continue-existing");
+  assert_eq!(
+    recorded_request(&run, &command).unwrap().experiment,
+    Some(original)
+  );
+  command.action = ControlAction::Restart;
+  assert_eq!(recorded_request(&run, &command).unwrap().experiment, None);
+  command.experiment = Some(ExperimentSelection::JoinRun {
+    run_id: "other-run".into(),
+    origin: Some("other-worker".into()),
+  });
+  let intent = recorded_request(&run, &command)
+    .unwrap()
+    .experiment
+    .unwrap();
+  assert_eq!(intent.request_id, command.request_id);
+  assert_eq!(Some(intent.selection), command.experiment);
+}
+
+#[test]
+fn rejected_experiment_restart_preserves_the_running_task() {
+  use expri_core::experiment_assignment::ExperimentSelection;
+  let (_root, run) = fixture();
+  let _supervisor = start_counter(
+    &run,
+    "trap 'exit 0' TERM; while :; do echo tick >> outputs/counter; sleep 0.02; done",
+  );
+  wait_for(|| {
+    state(&run).unwrap()["run_control_protocol_version"] == 1
+      && run.join("outputs/counter").exists()
+  });
+  let before = fs::read(run.join("outputs/counter")).unwrap().len();
+  let mut command = control(ControlAction::Restart, "grouping-without-publishing");
+  command.experiment = Some(ExperimentSelection::New {
+    name: "Unavailable publishing".into(),
+  });
+  let result = execute(&run, &command).unwrap();
+  assert_eq!(result.status, "failed");
+  assert!(
+    result
+      .error
+      .unwrap()
+      .contains("automatic service publishing")
+  );
+  assert_eq!(state(&run).unwrap()["status"], "running");
+  assert!(!run.join(MAILBOX).exists());
+  assert_eq!(fs::read_dir(run.parent().unwrap()).unwrap().count(), 1);
+  wait_for(|| fs::read(run.join("outputs/counter")).unwrap().len() > before);
+}
+
+#[test]
 fn interrupted_restart_launch_intent_retains_one_successor_and_never_spawns_again() {
   let (_root, run) = fixture();
   let successor = run.parent().unwrap().join("run-successor");
@@ -437,6 +502,44 @@ fn accepted_restart_can_stop_after_its_original_delivery_deadline() {
   );
   assert_eq!(state(&run).unwrap()["status"], "cancelled");
   assert!(supervisor.join().unwrap().cancelled);
+}
+
+#[test]
+fn terminal_transition_during_state_read_retains_the_prior_ownership_observation() {
+  let (_root, run) = fixture();
+  let lease = expri_core::lock::run_lock(&run).unwrap();
+  update_state(&run.join("run-state.json"), |value| {
+    value["run_control_protocol_version"] = json!(1);
+    value["supervisor"] = json!({"generation":1});
+    Ok(())
+  })
+  .unwrap();
+  let (stale, ownership) = read_supervisor_state(&run, || {
+    let running = state(&run)?;
+    // Force the CI interleaving: the reader captured a running snapshot just
+    // before the supervisor committed its final state and released its lease.
+    update_state(&run.join("run-state.json"), |value| {
+      value["status"] = json!("cancelled");
+      value["task_process_group_clean"] = json!(true);
+      Ok(())
+    })?;
+    drop(lease);
+    Ok(running)
+  })
+  .unwrap();
+  assert!(matches!(ownership, LockAttempt::Busy));
+  supported(&run, &stale, &ownership).unwrap();
+  assert!(!stop_complete(&stale).unwrap());
+
+  let (finished, ownership) = supervisor_state(&run).unwrap();
+  assert!(matches!(ownership, LockAttempt::Acquired(_)));
+  assert!(stop_complete(&finished).unwrap());
+  assert!(matches!(
+    expri_core::lock::try_lock_file(&run.join(".run.lock"), false).unwrap(),
+    LockAttempt::Busy
+  ));
+  drop(ownership);
+  supervisor_action(&run, &control(ControlAction::Stop, "finished-stop")).unwrap();
 }
 
 #[test]

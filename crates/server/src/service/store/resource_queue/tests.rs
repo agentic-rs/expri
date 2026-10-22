@@ -29,6 +29,7 @@ fn capacity() -> WorkerCapacity {
 fn submission(id: &str, resources: ResourceRequest) -> JobSubmission {
   let sha256 = "a".repeat(64);
   JobSubmission {
+    experiment: None,
     submission_id: id.into(),
     project_id: "project".into(),
     task: "train".into(),
@@ -126,6 +127,7 @@ fn register_report_at(
   let QueueResponse::Worker { worker, attempts } = store
     .resource_queue_at(
       QueueRequest::RegisterWorker {
+        experiment_assignment_supported: None,
         worker_id: worker_id.into(),
         session_id: session_id.into(),
         project_ids,
@@ -215,6 +217,163 @@ fn claim_at(
     panic!("expected claim")
   };
   assignment.map(|assignment| *assignment)
+}
+
+#[test]
+fn legacy_workers_skip_grouped_jobs_while_upgraded_workers_claim_them() {
+  use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  register_report_at(
+    &store,
+    "legacy",
+    "old-session",
+    vec![],
+    capacity(),
+    None,
+    1_000,
+  );
+  let mut grouped = submission("grouped-job", resources(1, 1_000, 0));
+  grouped.publish = true;
+  grouped.experiment = Some(RunExperimentIntent {
+    request_id: "grouped-intent".into(),
+    selection: ExperimentSelection::New {
+      name: "Grouped".into(),
+    },
+  });
+  let grouped = submit_at(&store, grouped, 1_001);
+  assert!(grouped.assigned_worker_id.is_none());
+  assert_eq!(
+    grouped.pending_reason.as_deref(),
+    Some("experiment_worker_upgrade_required")
+  );
+  let ordinary = submit_at(
+    &store,
+    submission("ordinary-job", resources(1, 1_000, 0)),
+    1_002,
+  );
+  let claimed = claim_at(&store, "legacy", "old-session", "ordinary-claim", 1_003).unwrap();
+  assert_eq!(claimed.job.job_id, ordinary.job_id);
+  assert!(claimed.submission.experiment.is_none());
+  assert!(claim_at(&store, "legacy", "old-session", "no-grouped-claim", 1_004).is_none());
+  let request = QueueRequest::RegisterWorker {
+    worker_id: "modern".into(),
+    session_id: "new-session".into(),
+    project_ids: vec![],
+    capacity: capacity(),
+    gpu_availability: None,
+    experiment_assignment_supported: Some(true),
+  };
+  let response = store.resource_queue_at(request.clone(), 1_005).unwrap();
+  response.validate_for(&request).unwrap();
+  let claimed = claim_at(&store, "modern", "new-session", "grouped-claim", 1_006).unwrap();
+  assert_eq!(claimed.job.job_id, grouped.job_id);
+  assert!(claimed.submission.experiment.is_some());
+}
+
+#[test]
+fn capability_downgrade_prunes_offers_and_preserves_accepted_reservations() {
+  use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let registration = |supported| QueueRequest::RegisterWorker {
+    worker_id: "worker".into(),
+    session_id: "session".into(),
+    project_ids: vec![],
+    capacity: capacity(),
+    gpu_availability: None,
+    experiment_assignment_supported: supported,
+  };
+  store
+    .resource_queue_at(registration(Some(true)), 1_000)
+    .unwrap();
+  let mut grouped = submission("grouped-job", resources(1, 1_000, 0));
+  grouped.publish = true;
+  grouped.experiment = Some(RunExperimentIntent {
+    request_id: "grouped-intent".into(),
+    selection: ExperimentSelection::New {
+      name: "Grouped".into(),
+    },
+  });
+  let grouped = submit_at(&store, grouped, 1_001);
+  assert_eq!(grouped.assigned_worker_id.as_deref(), Some("worker"));
+  let QueueResponse::Worker {
+    worker: downgraded, ..
+  } = store.resource_queue_at(registration(None), 1_002).unwrap()
+  else {
+    panic!("expected worker");
+  };
+  assert!(!downgraded.experiment_assignment_supported);
+  assert_eq!(downgraded.assigned_jobs, 0);
+  assert_eq!(downgraded.reserved.cpus, 0);
+  assert!(claim_at(&store, "worker", "session", "unsupported", 1_003).is_none());
+  store
+    .resource_queue_at(registration(Some(true)), 1_004)
+    .unwrap();
+  let claimed = claim_at(&store, "worker", "session", "accepted", 1_005).unwrap();
+  store.resource_queue_at(registration(None), 1_006).unwrap();
+  let request = QueueRequest::Claim {
+    worker_id: "worker".into(),
+    session_id: "session".into(),
+    claim_id: "accepted".into(),
+  };
+  let error = store.resource_queue_at(request, 1_007).unwrap_err();
+  assert_eq!(error.status, 409);
+  assert!(error.message.contains("reservation remains held"));
+  let registered = worker(&store.db().unwrap(), "worker", 1_007).unwrap();
+  assert_eq!(registered.outstanding_attempts, 1);
+  assert_eq!(registered.reserved.cpus, 1);
+  store
+    .resource_queue_at(registration(Some(true)), 1_008)
+    .unwrap();
+  let replay = claim_at(&store, "worker", "session", "accepted", 1_009).unwrap();
+  assert_eq!(replay.attempt.attempt_id, claimed.attempt.attempt_id);
+}
+
+#[test]
+fn experiment_submission_validation_preserves_accepted_retries_after_group_deletion() {
+  use expri_core::experiment_assignment::{ExperimentSelection, RunExperimentIntent};
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let group = store
+    .save_experiment(experiments::ExperimentSave {
+      project_id: "project".into(),
+      experiment_id: None,
+      expected_revision: None,
+      create_request_id: Some("queue-group".into()),
+      name: "Queue experiment".into(),
+      description: String::new(),
+      members: Vec::new(),
+      lineage: Vec::new(),
+    })
+    .unwrap();
+  let mut original = submission("grouped", resources(1, 1_000, 0));
+  original.publish = true;
+  original.experiment = Some(RunExperimentIntent {
+    request_id: "grouped".into(),
+    selection: ExperimentSelection::Existing {
+      experiment_id: group.experiment_id.clone(),
+    },
+  });
+  let first = submit_at(&store, original.clone(), 1_000);
+  store
+    .delete_experiment("project", &group.experiment_id, &group.revision)
+    .unwrap();
+  let replay = submit_at(&store, original.clone(), 1_001);
+  assert_eq!(first.job_id, replay.job_id);
+  original.submission_id = "another-submission".into();
+  assert_eq!(
+    store
+      .resource_queue_at(
+        QueueRequest::Submit {
+          submission: Box::new(original)
+        },
+        1_002
+      )
+      .unwrap_err()
+      .status,
+    404
+  );
 }
 
 #[test]
@@ -469,6 +628,7 @@ fn changing_project_restrictions_replans_offers_but_preserves_accepted_reservati
     store
       .resource_queue_at(
         QueueRequest::RegisterWorker {
+          experiment_assignment_supported: None,
           worker_id: "worker".into(),
           session_id: "session".into(),
           project_ids: vec!["project".into()],
@@ -1789,6 +1949,7 @@ fn large_job_and_worker_pages_fit_the_transport_and_do_not_skip_entries() {
     store
       .resource_queue_at(
         QueueRequest::RegisterWorker {
+          experiment_assignment_supported: None,
           worker_id: worker_id.clone(),
           session_id: "s".repeat(96),
           project_ids: project_ids.clone(),
@@ -2420,6 +2581,7 @@ fn queue_update_revisions_ignore_private_inputs_and_track_shared_worker_resource
   store
     .resource_queue_at(
       QueueRequest::RegisterWorker {
+        experiment_assignment_supported: None,
         worker_id: "worker".into(),
         session_id: "session".into(),
         project_ids: vec![],

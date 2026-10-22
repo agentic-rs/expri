@@ -46,8 +46,11 @@ origins are separate runs.
 
 On the primary hosted dashboard, open the experiment manager in the run history
 header to create a group and assign selected runs or a run from its inspector.
-Grouping and lineage management currently use the website; there are no CLI
-assignment commands. AB previews allow read-only browsing. Local, cached, and
+New runs can also select membership with `run --experiment`,
+`--new-experiment`, or `--join-run`; read `expri skill run` for launch and retry
+semantics. The website's Restart dialog offers membership choices for its new
+run. Edit existing memberships and lineage in the website. AB previews allow
+read-only browsing. Local, cached, and
 older dashboards keep their existing browsing when grouping is unsupported.
 
 The **Experiments** view starts collapsed. A group's summary uses its latest
@@ -67,8 +70,8 @@ describe resumed work, another execution, or parallel parts. Relationships must
 stay within the group and cannot form cycles. Any relationship can include a
 parent checkpoint reference and step; these record provenance without verifying
 or loading the checkpoint or launching work. Existing Continue retains the run
-ID and adds a task attempt, so membership follows that run. Assign and link new
-runs, including Restart results, explicitly.
+ID and adds a task attempt, so membership follows that run. New runs can choose
+membership at launch; record their lineage explicitly.
 
 Every run retains its own metrics and step axis. Groups do not concatenate
 history, shift steps, aggregate parallel metrics, or coordinate execution.

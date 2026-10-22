@@ -2,6 +2,7 @@ mod catalog;
 pub(crate) mod checkpoints;
 mod continuation;
 mod download;
+pub mod experiment_assignment;
 pub(super) mod fs;
 pub(crate) mod http;
 mod inventory;
@@ -128,6 +129,18 @@ impl Publisher {
   }
 
   pub(super) fn cycle(&mut self, progress: &mut dyn FnMut(Value) -> Result<()>) -> Result<bool> {
+    self.cycle_for(PublishPurpose::Run { watch: self.watch }, progress)
+  }
+
+  fn flush_for_continuation(&mut self) -> Result<bool> {
+    self.cycle_for(PublishPurpose::Continuation, &mut |_| Ok(()))
+  }
+
+  fn cycle_for(
+    &mut self,
+    purpose: PublishPurpose,
+    progress: &mut dyn FnMut(Value) -> Result<()>,
+  ) -> Result<bool> {
     self.api.reset_stream_backlog();
     let checkpoints_done = self.checkpoints.poll(
       &self.api,
@@ -142,7 +155,7 @@ impl Publisher {
       &self.scope,
       &self.run_dir,
       &self.artifacts,
-      self.watch,
+      purpose,
       progress,
     )?;
     Ok(metadata_done && checkpoints_done)
@@ -324,13 +337,23 @@ pub(crate) fn artifacts(values: &[String]) -> Result<BTreeSet<String>> {
     .collect()
 }
 
+#[derive(Clone, Copy)]
+enum PublishPurpose {
+  Run {
+    watch: bool,
+  },
+  /// Flush the stopped attempt's data without making grouping a prerequisite
+  /// for its successor. Its unchanged intent remains in the publishing queue.
+  Continuation,
+}
+
 fn publish_cycle(
   api: &Api,
   queue: &mut Queue,
   scope: &RunScope,
   run_dir: &Path,
   artifacts: &BTreeSet<String>,
-  watch: bool,
+  purpose: PublishPurpose,
   progress: &mut dyn FnMut(Value) -> Result<()>,
 ) -> Result<bool> {
   fs::directory(run_dir)?;
@@ -347,7 +370,7 @@ fn publish_cycle(
     ));
   }
   let done = terminal(&state);
-  if !done && !artifacts.is_empty() && !watch {
+  if !done && !artifacts.is_empty() && matches!(purpose, PublishPurpose::Run { watch: false }) {
     return Err(message(
       "explicit output artifacts require a completed, failed, cancelled or lost run",
     ));
@@ -469,6 +492,12 @@ fn publish_cycle(
     sync_metadata(api, queue, scope, path, &run_dir.join(path), protocol)?;
     progress(queue_progress(queue))?;
   }
+  // Membership is independent metadata: publish this cycle's task progress
+  // first, even when the selected group is temporarily unavailable.
+  let experiment_failure = match purpose {
+    PublishPurpose::Run { .. } => experiment_assignment::publish(api, queue, scope, &state).err(),
+    PublishPurpose::Continuation => None,
+  };
   // Capture retries keep their durable queue, while ordinary logs and task
   // metadata above continue to reach the service in the same cycle.
   if let Some(error) = capture_failure {
@@ -501,6 +530,11 @@ fn publish_cycle(
       tracking::seal(api, queue, scope)?;
       progress(queue_progress(queue))?;
     }
+  }
+  // A terminal run can seal/archive independently of its experiment. Keep the
+  // publishing job alive to retry grouping after ordinary data has completed.
+  if let Some(error) = experiment_failure {
+    return Err(error);
   }
   Ok(done)
 }
