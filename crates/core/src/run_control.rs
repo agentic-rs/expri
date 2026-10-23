@@ -27,6 +27,104 @@ pub enum ControlAction {
   SetRequirements,
 }
 
+/// State eligibility shared by worker reporting and server presentation. Runtime
+/// support (leases, platform, checkpoints) is intersected by the worker.
+pub fn available_actions(
+  status: &str,
+  manual_paused: Option<bool>,
+  resource_blocked: bool,
+) -> Vec<ControlAction> {
+  use crate::run_state::RunPhase;
+  use ControlAction::*;
+  let mut actions = match RunPhase::parse(status) {
+    Some(RunPhase::Running | RunPhase::Waiting) => vec![Pause, Stop, Continue, Restart],
+    Some(RunPhase::Paused) => {
+      let mut actions = Vec::new();
+      if manual_paused == Some(false) && resource_blocked {
+        actions.push(Pause);
+      }
+      actions.extend([Resume, Stop, Continue, Restart]);
+      actions
+    }
+    Some(RunPhase::Pending | RunPhase::Preparing) => vec![Stop],
+    Some(RunPhase::Completed | RunPhase::Failed | RunPhase::Cancelled | RunPhase::Lost) => {
+      vec![Continue, Restart]
+    }
+    _ => Vec::new(),
+  };
+  actions.push(SetRequirements);
+  actions
+}
+
+/// Validated internal command payload. The flattened wire envelope remains
+/// compatible with existing workers; impossible field combinations stop here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlPayload {
+  Pause,
+  Resume,
+  Stop,
+  Continue {
+    checkpoint: String,
+    arguments: Option<Vec<String>>,
+  },
+  Restart {
+    arguments: Option<Vec<String>>,
+    experiment: Option<ExperimentSelection>,
+  },
+  SetRequirements(ResourceRequirements),
+}
+
+impl ControlPayload {
+  pub fn from_fields(
+    action: ControlAction,
+    arguments: Option<Vec<String>>,
+    checkpoint: Option<String>,
+    requirements: Option<ResourceRequirements>,
+    experiment: Option<ExperimentSelection>,
+  ) -> crate::error::Result<Self> {
+    use crate::error::ExpriError;
+    let invalid = |text: &str| ExpriError::Message(text.into());
+    if !matches!(action, ControlAction::Continue | ControlAction::Restart)
+      && (arguments.is_some() || checkpoint.is_some())
+    {
+      return Err(invalid("only continue or restart accepts task arguments"));
+    }
+    if action != ControlAction::Restart && experiment.is_some() {
+      return Err(invalid("only restart accepts an experiment selection"));
+    }
+    if action != ControlAction::SetRequirements && requirements.is_some() {
+      return Err(invalid("only set_requirements accepts requirements"));
+    }
+    if let Some(selection) = &experiment {
+      selection.validate()?;
+    }
+    Ok(match action {
+      ControlAction::Pause => Self::Pause,
+      ControlAction::Resume => Self::Resume,
+      ControlAction::Stop => Self::Stop,
+      ControlAction::Continue => Self::Continue {
+        checkpoint: checkpoint.ok_or_else(|| invalid("continue requires a recorded checkpoint"))?,
+        arguments,
+      },
+      ControlAction::Restart => {
+        if checkpoint.is_some() {
+          return Err(invalid("restart does not accept a checkpoint"));
+        }
+        Self::Restart {
+          arguments,
+          experiment,
+        }
+      }
+      ControlAction::SetRequirements => {
+        let policy = requirements
+          .ok_or_else(|| invalid("set_requirements requires a disk requirements policy"))?;
+        policy.validate()?;
+        Self::SetRequirements(policy)
+      }
+    })
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlCommand {
@@ -44,6 +142,18 @@ pub struct ControlCommand {
   pub reason: String,
   pub grace_seconds: u32,
   pub expires_at_ms: i64,
+}
+
+impl ControlCommand {
+  pub fn payload(&self) -> crate::error::Result<ControlPayload> {
+    ControlPayload::from_fields(
+      self.action,
+      self.arguments.clone(),
+      self.checkpoint.clone(),
+      self.requirements.clone(),
+      self.experiment.clone(),
+    )
+  }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -105,6 +215,93 @@ pub struct ControlPollResult {
 mod tests {
   use super::*;
   use serde_json::json;
+
+  #[test]
+  fn typed_payloads_reject_cross_action_fields_before_execution() {
+    for action in [
+      ControlAction::Pause,
+      ControlAction::Resume,
+      ControlAction::Stop,
+    ] {
+      assert!(ControlPayload::from_fields(action, None, None, None, None).is_ok());
+      assert!(ControlPayload::from_fields(action, Some(vec![]), None, None, None).is_err());
+      assert!(
+        ControlPayload::from_fields(action, None, Some("checkpoint.pt".into()), None, None)
+          .is_err()
+      );
+      assert!(
+        ControlPayload::from_fields(
+          action,
+          None,
+          None,
+          Some(ResourceRequirements::default()),
+          None
+        )
+        .is_err()
+      );
+    }
+    assert!(ControlPayload::from_fields(ControlAction::Continue, None, None, None, None).is_err());
+    assert!(matches!(
+      ControlPayload::from_fields(
+        ControlAction::Continue,
+        Some(vec!["--step".into(), "100".into()]),
+        Some("checkpoint.pt".into()),
+        None,
+        None
+      )
+      .unwrap(),
+      ControlPayload::Continue { .. }
+    ));
+    assert!(
+      ControlPayload::from_fields(
+        ControlAction::Restart,
+        None,
+        Some("checkpoint.pt".into()),
+        None,
+        None
+      )
+      .is_err()
+    );
+    assert!(
+      ControlPayload::from_fields(ControlAction::SetRequirements, None, None, None, None).is_err()
+    );
+    assert!(matches!(
+      ControlPayload::from_fields(
+        ControlAction::SetRequirements,
+        None,
+        None,
+        Some(ResourceRequirements::default()),
+        None
+      )
+      .unwrap(),
+      ControlPayload::SetRequirements(_)
+    ));
+  }
+
+  #[test]
+  fn action_policy_distinguishes_task_waiting_and_composable_holds() {
+    use ControlAction::*;
+    assert_eq!(
+      available_actions("waiting", Some(false), false),
+      vec![Pause, Stop, Continue, Restart, SetRequirements]
+    );
+    assert_eq!(
+      available_actions("paused", Some(false), true),
+      vec![Pause, Resume, Stop, Continue, Restart, SetRequirements]
+    );
+    assert_eq!(
+      available_actions("paused", Some(true), true),
+      vec![Resume, Stop, Continue, Restart, SetRequirements]
+    );
+    assert_eq!(
+      available_actions("pending", Some(false), true),
+      vec![Stop, SetRequirements]
+    );
+    assert_eq!(
+      available_actions("completed", None, false),
+      vec![Continue, Restart, SetRequirements]
+    );
+  }
 
   #[test]
   fn legacy_control_polls_remain_unchanged_without_requirement_fields() {

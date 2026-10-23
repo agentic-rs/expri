@@ -4,8 +4,9 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use expri_core::service_catalog::{
-  MAX_CATALOG_ROWS, RunArchiveFilter, RunFilesPage, RunFilesQuery, RunListPage, RunListQuery,
-  RunSelector, SERVICE_CATALOG_CAPABILITY, validate_run_files_page, validate_run_list_page,
+  MAX_CATALOG_ROWS, RUN_SUMMARY_CAPABILITY, RunArchiveFilter, RunFilesPage, RunFilesQuery,
+  RunListPage, RunListQuery, RunSelector, SERVICE_CATALOG_CAPABILITY, validate_run_files_page,
+  validate_run_list_page,
 };
 
 use super::{Api, fs};
@@ -14,6 +15,7 @@ use crate::types::{Request, Response, RunScope};
 
 pub struct ServiceCatalogClient {
   api: Api,
+  summaries_supported: bool,
 }
 
 impl ServiceCatalogClient {
@@ -33,16 +35,28 @@ impl ServiceCatalogClient {
         "service does not support service-catalog-v1; upgrade the server",
       ));
     }
-    Ok(Self { api })
+    let summaries_supported = features
+      .iter()
+      .any(|feature| feature == RUN_SUMMARY_CAPABILITY);
+    Ok(Self {
+      api,
+      summaries_supported,
+    })
   }
 
   /// Inspect published records without fetching run bytes or writing a local cache.
   pub fn runs(&self, query: &RunListQuery) -> Result<RunListPage> {
     query.validate()?;
-    let Response::RunPage { page } = self.api.request(&Request::BrowseRuns {
-      query: query.clone(),
-    })?
-    else {
+    let request = if self.summaries_supported {
+      Request::BrowseRunSummaries {
+        query: query.clone(),
+      }
+    } else {
+      Request::BrowseRuns {
+        query: query.clone(),
+      }
+    };
+    let Response::RunPage { page } = self.api.request(&request)? else {
       return Err(fs::message("service did not return a run catalog page"));
     };
     validate_run_list_page(query, &page)

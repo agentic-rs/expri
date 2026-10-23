@@ -1,4 +1,4 @@
-import { apiUrl, parseRunDeepLink, parseProjectRunKey, type Run, type RunArchival, type RunDeepLink, type Source } from "./dashboard_model";
+import { apiUrl, parseRunDeepLink, runScope, type Run, type RunArchival, type RunDeepLink, type Source } from "./dashboard_model";
 
 export type ArchivalView = "active" | "archived";
 export type ArchivalAction = "archive" | "restore";
@@ -21,14 +21,8 @@ export function runArchivalMatchesScope(value: unknown, scope: RunDeepLink): val
 export function runArchivalScope(run: Run, source: Source | undefined): RunDeepLink | null {
   const scope = run.archival?.scope;
   if (!scope || !source || !runArchivalMatchesScope(run.archival, scope)) return null;
-  if (source.kind === "hosted_project") {
-    const identity = parseProjectRunKey(run.run_key ?? "");
-    return source.project_id === scope.project_id && identity?.origin === scope.origin &&
-      identity.run_id === scope.run_id ? scope : null;
-  }
-  if (source.kind !== "service") return null;
-  return source.project_id === scope.project_id && source.origin === scope.origin &&
-    run.run_id === scope.run_id ? scope : null;
+  const identity = runScope(run, source);
+  return identity?.project_id === scope.project_id && identity.origin === scope.origin && identity.run_id === scope.run_id ? scope : null;
 }
 
 export function runIsArchived(run: Run): boolean {

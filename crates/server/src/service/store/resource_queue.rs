@@ -7,6 +7,9 @@ use expri_core::resource_queue::*;
 
 use super::*;
 
+mod placement;
+use placement::PendingReason;
+
 const MAX_WORKERS: usize = 256;
 const MAX_QUEUED_JOBS: usize = 10_000;
 // The shared transport limits the complete response, including both envelopes.
@@ -180,7 +183,7 @@ fn identifier(prefix: &str) -> ApiResult<String> {
   ))
 }
 
-fn attempt(db: &Connection, attempt_id: &str) -> ApiResult<AttemptSummary> {
+fn attempt(db: &Connection, attempt_id: &str) -> ApiResult<DispatchAttempt> {
   let record: Option<String> = db
     .query_row(
       "SELECT record FROM queue_attempts WHERE attempt_id=?1",
@@ -192,7 +195,7 @@ fn attempt(db: &Connection, attempt_id: &str) -> ApiResult<AttemptSummary> {
   decode(&record.ok_or_else(|| ApiError::new(404, "queue attempt is missing"))?)
 }
 
-fn outstanding(db: &Connection, worker_id: &str) -> ApiResult<Vec<AttemptSummary>> {
+fn outstanding(db: &Connection, worker_id: &str) -> ApiResult<Vec<DispatchAttempt>> {
   let mut statement = db.prepare("SELECT record FROM queue_attempts WHERE worker_id=?1 AND released=0 ORDER BY attempt_id LIMIT ?2").map_err(database)?;
   let records = statement
     .query_map(params![worker_id, MAX_OUTSTANDING_ATTEMPTS + 1], |row| {
@@ -424,7 +427,7 @@ fn current_worker(
   Ok(worker)
 }
 
-fn save_attempt(db: &Connection, attempt: &AttemptSummary, released: bool) -> ApiResult<()> {
+fn save_attempt(db: &Connection, attempt: &DispatchAttempt, released: bool) -> ApiResult<()> {
   db.execute(
     "UPDATE queue_attempts SET session_id=?2,record=?3,released=?4 WHERE attempt_id=?1",
     params![
@@ -466,7 +469,7 @@ fn expire(db: &Connection, now: i64) -> ApiResult<()> {
     .map_err(database)?;
   drop(statement);
   for record in records {
-    let mut attempt: AttemptSummary = decode(&record)?;
+    let mut attempt: DispatchAttempt = decode(&record)?;
     attempt.status = AttemptStatus::Unknown;
     attempt.updated_at_ms = now;
     attempt.message = Some(
@@ -488,63 +491,6 @@ fn expire(db: &Connection, now: i64) -> ApiResult<()> {
   db.execute("UPDATE queue_workers SET quarantined=1 WHERE lease_expires_at_ms<=?1 AND EXISTS(SELECT 1 FROM queue_attempts WHERE worker_id=queue_workers.worker_id AND released=0)", [now]).map_err(database)?;
   prune_offers(db, now)?;
   Ok(())
-}
-
-fn allocate(
-  capacity: &WorkerCapacity,
-  request: &ResourceRequest,
-  used: &[ResourceAllocation],
-  require_cuda: bool,
-  unavailable: &[UnavailableGpu],
-) -> Option<ResourceAllocation> {
-  let cpus = used.iter().try_fold(0u64, |total, allocation| {
-    total.checked_add(allocation.cpus as u64)
-  })?;
-  let memory = used.iter().try_fold(0u64, |total, allocation| {
-    total.checked_add(allocation.memory_bytes)
-  })?;
-  if cpus.checked_add(request.cpus as u64)? > capacity.cpus as u64
-    || memory.checked_add(request.memory_bytes)? > capacity.memory_bytes
-  {
-    return None;
-  }
-  let reserved: BTreeSet<&str> = used
-    .iter()
-    .flat_map(|allocation| allocation.gpus.iter().map(|gpu| gpu.device_id.as_str()))
-    .collect();
-  let model = request
-    .gpu_model
-    .as_ref()
-    .map(|value| value.to_ascii_lowercase());
-  let mut gpus: Vec<WorkerGpu> = capacity
-    .gpus
-    .iter()
-    .filter(|gpu| {
-      !reserved.contains(gpu.device_id.as_str())
-        && !unavailable
-          .iter()
-          .any(|unavailable| unavailable.device_id == gpu.device_id)
-        && (!require_cuda || gpu.vendor == GpuVendor::Nvidia)
-        && (request.gpu_ids.is_empty() || request.gpu_ids.contains(&gpu.device_id))
-        && model
-          .as_ref()
-          .is_none_or(|model| gpu.model.to_ascii_lowercase().contains(model))
-        && request
-          .gpu_memory_bytes
-          .is_none_or(|bytes| gpu.memory_bytes.is_some_and(|capacity| capacity >= bytes))
-    })
-    .cloned()
-    .collect();
-  gpus.sort_by(|left, right| left.device_id.cmp(&right.device_id));
-  if gpus.len() < request.gpus as usize {
-    return None;
-  }
-  gpus.truncate(request.gpus as usize);
-  Some(ResourceAllocation {
-    cpus: request.cpus,
-    memory_bytes: request.memory_bytes,
-    gpus,
-  })
 }
 
 /// Offers have never been accepted and cannot authorize execution. Unlike an
@@ -626,23 +572,9 @@ fn schedule(db: &Connection, now: i64) -> ApiResult<()> {
     let (job_id, record, require_cuda, experiment) = candidate.map_err(database)?;
     let summary: JobSummary = decode(&record)?;
     for (worker, used) in &mut workers {
-      if used.len() >= MAX_OUTSTANDING_ATTEMPTS
-        || (experiment && !worker.experiment_assignment_supported)
-        || (!worker.project_ids.is_empty() && !worker.project_ids.contains(&summary.project_id))
-        || summary
-          .worker_id
-          .as_ref()
-          .is_some_and(|pin| pin != &worker.worker_id)
+      if let Ok(allocation) =
+        placement::evaluate(worker, &summary, used, require_cuda, experiment, now)
       {
-        continue;
-      }
-      if let Some(allocation) = allocate(
-        &worker.capacity,
-        &summary.resources,
-        used,
-        require_cuda,
-        &worker.unavailable_gpus,
-      ) {
         db.execute("INSERT INTO queue_offers(job_id,worker_id,session_id,allocation,created_at_ms) VALUES(?1,?2,?3,?4,?5)", params![job_id, worker.worker_id, worker.session_id, encode(&allocation)?, now]).map_err(database)?;
         used.push(allocation);
         break;
@@ -660,6 +592,8 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
       |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .map_err(database)?;
+  // Prefilter identities before loading their reservation ledgers. The shared
+  // evaluator still enforces placement constraints for both reads and offers.
   let mut statement = db.prepare("SELECT worker_id FROM queue_workers WHERE (?1 IS NULL OR worker_id=?1) AND (json_array_length(project_ids)=0 OR EXISTS(SELECT 1 FROM json_each(project_ids) WHERE value=?2)) ORDER BY worker_id LIMIT ?3").map_err(database)?;
   let ids = statement
     .query_map(params![job.worker_id, job.project_id, MAX_WORKERS], |row| {
@@ -668,54 +602,16 @@ fn pending_reason(db: &Connection, job: &JobSummary, now: i64) -> ApiResult<Stri
     .map_err(database)?
     .collect::<rusqlite::Result<Vec<_>>>()
     .map_err(database)?;
-  if ids.is_empty() {
-    return Ok("no_eligible_worker".into());
-  }
-  let mut online = false;
-  let mut available = false;
-  let mut supported = false;
+  let mut reason = PendingReason::NoEligibleWorker;
   for id in ids {
     let worker = worker(db, &id, now)?;
-    if experiment && !worker.experiment_assignment_supported {
-      continue;
-    }
-    supported = true;
-    if worker.lease_expires_at_ms <= now {
-      continue;
-    }
-    online = true;
-    if worker.quarantined {
-      continue;
-    }
-    available = true;
     let reserved = reservations(db, &id)?;
-    if reserved.len() >= MAX_OUTSTANDING_ATTEMPTS {
-      continue;
-    }
-    if allocate(
-      &worker.capacity,
-      &job.resources,
-      &reserved,
-      require_cuda,
-      &worker.unavailable_gpus,
-    )
-    .is_some()
-    {
-      return Ok("waiting_for_worker_claim".into());
+    match placement::evaluate(&worker, job, &reserved, require_cuda, experiment, now) {
+      Ok(_) => return Ok("waiting_for_worker_claim".into()),
+      Err(blocker) => reason = reason.max(blocker.pending_reason()),
     }
   }
-  Ok(
-    if !supported {
-      "experiment_worker_upgrade_required"
-    } else if !online {
-      "eligible_workers_offline"
-    } else if !available {
-      "workers_need_reconciliation"
-    } else {
-      "resources_unavailable"
-    }
-    .into(),
-  )
+  Ok(reason.as_str().into())
 }
 
 fn job(db: &Connection, job_id: &str, now: i64) -> ApiResult<JobSummary> {
@@ -812,7 +708,7 @@ pub(super) fn cancel_project(db: &Connection, project_id: &str, now: i64) -> Api
     .map_err(database)?;
   drop(statement);
   for record in records {
-    let mut attempt: AttemptSummary = decode(&record)?;
+    let mut attempt: DispatchAttempt = decode(&record)?;
     attempt.cancel_requested = true;
     attempt.updated_at_ms = now;
     save_attempt(db, &attempt, false)?;
@@ -1527,7 +1423,7 @@ fn claim(
     .map_err(database)?;
   let attempt_id = if let Some((job_id, allocation)) = selected {
     let attempt_id = identifier("attempt-")?;
-    let attempt = AttemptSummary {
+    let attempt = DispatchAttempt {
       attempt_id: attempt_id.clone(),
       job_id: job_id.clone(),
       worker_id: worker_id.into(),
@@ -1578,7 +1474,7 @@ fn fenced_attempt(
   db: &Connection,
   identity: &AttemptIdentity,
   now: i64,
-) -> ApiResult<AttemptSummary> {
+) -> ApiResult<DispatchAttempt> {
   current_worker(db, &identity.worker_id, &identity.session_id, now)?;
   let attempt = attempt(db, &identity.attempt_id)?;
   if attempt.worker_id != identity.worker_id

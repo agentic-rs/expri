@@ -101,7 +101,7 @@ export function RunLifecyclePanel({ run, source, detail, enabled, visible, exper
 
   const pending = lifecyclePending(control?.request);
   const available = control && control.supported ? lifecycleActions(control) : [];
-  const can_configure = control?.supported === true && control.capabilities.includes("set_requirements");
+  const can_configure = control?.supported === true && (control.available_actions ?? control.capabilities).includes("set_requirements");
   const disabled = !enabled || !visible || sending || pending || !control?.online;
   const send = async (action: RunLifecycleAction, form: Draft | null = null, requirements: ResourceRequirements | null = null) => {
     if (disabled || posting.current || !scope || !control || !(action === "set_requirements" ? can_configure && requirements : available.includes(action))) return;

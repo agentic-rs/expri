@@ -9,7 +9,7 @@ use super::*;
 use crate::service::storage::CleanupError;
 
 const RETENTION_SECONDS: i64 = 15 * 24 * 60 * 60;
-const STATE_LIMIT: u64 = 64 * 1024;
+const STATE_LIMIT: u64 = expri_core::run_state::MAX_STATE_BYTES as u64;
 const TARGET_SCOPE: &str = "json_extract(target,'$.scope.project_id')=?1 AND json_extract(target,'$.scope.origin')=?2 AND json_extract(target,'$.scope.run_id')=?3";
 
 pub(super) fn now() -> i64 {
@@ -397,45 +397,7 @@ impl<S: ObjectStorage> Store<S> {
     let encoded =
       serde_json::to_string(scope).map_err(|_| ApiError::new(500, "cannot encode run scope"))?;
     tx.execute("INSERT OR IGNORE INTO run_cleanup_tasks(project_id,origin,run_id,kind,value) SELECT ?1,?2,?3,'archive',CAST(id AS TEXT) FROM result_archives WHERE scope=?4",params![scope.project_id,scope.origin,scope.run_id,encoded]).map_err(database)?;
-    tx.execute(
-      &format!(
-        "DELETE FROM parts WHERE upload_id IN (SELECT upload_id FROM uploads WHERE {TARGET_SCOPE})"
-      ),
-      scope_params(scope),
-    )
-    .map_err(database)?;
-    for table in [
-      "chunks",
-      "streams",
-      "dashboard_overviews",
-      "tracking_metric_rows",
-      "tracking_metric_summaries",
-      "tracking_metric_state",
-      "tracking_asset_uses",
-      "tracking_system_blocks",
-      "tracking_system_packs",
-      "tracking_versions",
-      "files",
-      "uploads",
-    ] {
-      tx.execute(
-        &format!("DELETE FROM {table} WHERE {TARGET_SCOPE}"),
-        scope_params(scope),
-      )
-      .map_err(database)?;
-    }
-    for table in [
-      "tracking_run_seals",
-      "tracking_run_epochs",
-      "tracking_attempt_history",
-      "tracking_attempt_aborts",
-      "result_archives",
-      "run_control_bindings",
-      "run_control_commands",
-    ] {
-      tx.execute(&format!("DELETE FROM {table} WHERE scope=?1"), [&encoded])
-        .map_err(database)?;
-    }
+    owned_records::delete(&tx, owned_records::Owner::Run(scope))?;
     tx.execute(
       "DELETE FROM run_annotations WHERE project_id=?1 AND origin=?2 AND run_id=?3",
       scope_params(scope),

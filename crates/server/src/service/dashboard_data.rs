@@ -1367,6 +1367,7 @@ impl<'a, S: ObjectStorage> HostedDashboard<'a, S> {
     scope: &RunScope,
     published_generation: u64,
   ) -> ApiResult<()> {
+    run["identity"] = json!({"kind":"run","scope":scope});
     if let Some(context) = self.store.dashboard_run_queue_context(scope)? {
       run["queue"] = serde_json::to_value(context)
         .map_err(|_| ApiError::new(500, "cannot encode scheduling context"))?;

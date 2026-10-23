@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::error::{ExpriError, Result};
-use crate::run_state::{MAX_STATE_BYTES, is_terminal_status};
+use crate::run_state::{MAX_STATE_BYTES, RunPhase, is_terminal_status};
 
 const HISTORY_RESERVE: usize = 12 * 1024;
 const METRIC_BYTES: u64 = 128 * 1024 * 1024;
@@ -21,7 +21,7 @@ fn message(detail: &str) -> ExpriError {
 pub fn is_attempt_status(status: &str) -> bool {
   matches!(
     status,
-    "preparing" | "running" | "waiting" | "paused" | "continued"
+    "pending" | "preparing" | "running" | "waiting" | "paused" | "continued"
   ) || is_terminal_status(status)
 }
 
@@ -130,8 +130,56 @@ pub fn set_current_phase(state: &mut Value, status: &str) -> Result<bool> {
   {
     return Err(message("current task attempt is not active"));
   }
-  let changed = entry["status"] != status;
-  entry["status"] = json!(status);
+  set_supervisor_phase(
+    state,
+    RunPhase::parse(status).expect("validated task phase"),
+  )
+}
+
+pub(crate) fn set_supervisor_phase(state: &mut Value, phase: RunPhase) -> Result<bool> {
+  if state.get("task_attempts").is_none() {
+    return Ok(false);
+  }
+  let current = current_attempt(state)?;
+  if matches!(phase, RunPhase::Pending | RunPhase::Preparing)
+    && matches!(state["status"].as_str(), Some("pending" | "preparing"))
+  {
+    let entries = attempts(state)?;
+    let previous = entries
+      .iter()
+      .find(|entry| entry["attempt"] == current)
+      .unwrap();
+    // A continuation keeps current_attempt on the finished predecessor until
+    // the replacement process starts. Its resource wait belongs to the run;
+    // neither the predecessor nor the preparing successor is active yet.
+    if previous["status"]
+      .as_str()
+      .is_some_and(|status| is_terminal_status(status) || status == "continued")
+      && previous["finished_at"].is_string()
+      && entries.iter().any(|entry| {
+        entry["attempt"]
+          .as_u64()
+          .is_some_and(|number| number > current)
+          && entry["status"] == "preparing"
+          && entry["started_at"].is_null()
+          && entry["finished_at"].is_null()
+          && entry["previous_worker_stopped_at"].is_string()
+      })
+    {
+      return Ok(false);
+    }
+  }
+  let entry = attempt_mut(state, current)?;
+  if !phase.is_active()
+    || !entry["status"]
+      .as_str()
+      .is_some_and(crate::run_state::is_active_status)
+    || !entry["finished_at"].is_null()
+  {
+    return Err(message("current task attempt is not active"));
+  }
+  let changed = entry["status"] != phase.as_str();
+  entry["status"] = json!(phase.as_str());
   Ok(changed)
 }
 

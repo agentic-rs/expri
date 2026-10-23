@@ -11,11 +11,19 @@ use serde_json::Value;
 use super::*;
 use crate::service::dashboard_data::HostedDashboard;
 
-const METADATA_LIMIT: u64 = 256 * 1024;
+const METADATA_LIMIT: u64 = expri_core::run_state::MAX_STATE_BYTES as u64;
 const METADATA_BUDGET: Duration = Duration::from_secs(3);
 
 impl<S: ObjectStorage> Store<S> {
   pub(super) fn browse_runs(&self, query: &RunListQuery) -> ApiResult<RunListPage> {
+    self.browse_run_page(query, false)
+  }
+
+  pub(super) fn browse_run_summaries(&self, query: &RunListQuery) -> ApiResult<RunListPage> {
+    self.browse_run_page(query, true)
+  }
+
+  fn browse_run_page(&self, query: &RunListQuery, observations: bool) -> ApiResult<RunListPage> {
     query.validate().map_err(bad)?;
     let cursor = query
       .cursor
@@ -88,7 +96,14 @@ impl<S: ObjectStorage> Store<S> {
     let mut budget = MAX_CATALOG_PAGE_BYTES - 512;
     for (scope, archived) in candidates.into_iter().take(query.limit) {
       validate_scope(&scope).map_err(|_| ApiError::new(500, "invalid stored run scope"))?;
-      let entry = run_entry(reader.as_ref(), scope, archived, deadline);
+      let entry = run_entry(
+        self,
+        reader.as_ref(),
+        scope,
+        archived,
+        deadline,
+        observations,
+      )?;
       let bytes = serde_json::to_vec(&entry)
         .map_err(|_| ApiError::new(500, "cannot encode run catalog metadata"))?
         .len()
@@ -190,11 +205,13 @@ fn selection_sql(query: &RunListQuery) -> String {
 }
 
 fn run_entry<S: ObjectStorage>(
+  store: &Store<S>,
   reader: Option<&HostedDashboard<'_, S>>,
   scope: RunScope,
   archived: bool,
   deadline: Instant,
-) -> RunListEntry {
+  observations: bool,
+) -> ApiResult<RunListEntry> {
   let mut warnings = Vec::new();
   let state = match reader {
     Some(reader) => {
@@ -221,14 +238,20 @@ fn run_entry<S: ObjectStorage>(
       None
     }
   };
-  let normalized = crate::runs::summary_from_state(&scope.run_id, state);
+  let mut normalized = crate::runs::summary_from_state(&scope.run_id, state);
+  if observations {
+    let generation = normalized["state"]["supervisor"]["generation"]
+      .as_u64()
+      .unwrap_or(0);
+    store.decorate_run_control(&mut normalized["run"], &scope, generation)?;
+  }
   for warning in normalized["warnings"].as_array().into_iter().flatten() {
     if let Some(message) = warning["message"].as_str() {
       warn(&mut warnings, message);
     }
   }
   let run = &normalized["run"];
-  RunListEntry {
+  Ok(RunListEntry {
     scope,
     task: field(run, "task", 4096, &mut warnings),
     status: run["status"].as_str().unwrap_or("unknown").into(),
@@ -237,7 +260,13 @@ fn run_entry<S: ObjectStorage>(
     exit_code: run["exit_code"].as_i64(),
     archived,
     warnings,
-  }
+    observation: run
+      .get("observation")
+      .cloned()
+      .map(serde_json::from_value)
+      .transpose()
+      .map_err(|_| ApiError::new(500, "invalid run observation"))?,
+  })
 }
 
 fn field(run: &Value, name: &str, limit: usize, warnings: &mut Vec<String>) -> Option<String> {

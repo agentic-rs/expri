@@ -4,6 +4,52 @@ use crate::service::store::tests::MockStorage;
 mod grouped;
 
 #[test]
+fn normalized_experiment_content_is_validated_on_both_read_paths() {
+  let directory = tempfile::tempdir().unwrap();
+  let store = Store::open(directory.path(), MockStorage::default()).unwrap();
+  let parent = scope("worker-a", "same-run");
+  let child = scope("worker-b", "same-run");
+  document(&store, &parent);
+  document(&store, &child);
+  let mut relationship = edge(&parent, &child);
+  relationship.checkpoint = Some("  outputs/checkpoint.pt  ".into());
+  relationship.step = Some("00042".into());
+  let saved = store
+    .save_experiment(selection(
+      vec![parent.clone(), child.clone()],
+      vec![relationship],
+    ))
+    .unwrap();
+  assert_eq!(
+    saved.lineage[0].checkpoint.as_deref(),
+    Some("outputs/checkpoint.pt")
+  );
+  assert_eq!(saved.lineage[0].step.as_deref(), Some("42"));
+  store
+    .experiment_catalog("project")
+    .unwrap()
+    .validate("project")
+    .unwrap();
+
+  // Stored corruption must be rejected by browser and service discovery alike.
+  let mut corrupt = saved;
+  corrupt.lineage.push(edge(&child, &parent));
+  store
+    .db()
+    .unwrap()
+    .execute(
+      "UPDATE experiments SET record=?1 WHERE project_id='project' AND experiment_id=?2",
+      params![
+        serde_json::to_string(&corrupt).unwrap(),
+        corrupt.experiment_id
+      ],
+    )
+    .unwrap();
+  assert_eq!(store.experiment_catalog("project").unwrap_err().status, 500);
+  assert_eq!(store.experiments("project").unwrap_err().status, 500);
+}
+
+#[test]
 fn service_catalog_matches_dashboard_members_and_lineage_without_writing() {
   let directory = tempfile::tempdir().unwrap();
   let store = Store::open(directory.path(), MockStorage::default()).unwrap();

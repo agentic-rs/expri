@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{ExpriError, Result};
@@ -25,15 +25,197 @@ pub const STATUSES: &[&str] = &[
 pub const TASK_STATUSES: &[&str] = &["running", "waiting"];
 pub const MAX_STATE_BYTES: usize = 256 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+  Pending,
+  Preparing,
+  Running,
+  Waiting,
+  Paused,
+  Completed,
+  Failed,
+  Cancelled,
+  Lost,
+  Unknown,
+}
+
+impl RunPhase {
+  pub fn parse(value: &str) -> Option<Self> {
+    Some(match value {
+      "pending" => Self::Pending,
+      "preparing" => Self::Preparing,
+      "running" => Self::Running,
+      "waiting" => Self::Waiting,
+      "paused" => Self::Paused,
+      "completed" => Self::Completed,
+      "failed" => Self::Failed,
+      "cancelled" => Self::Cancelled,
+      "lost" => Self::Lost,
+      "unknown" => Self::Unknown,
+      _ => return None,
+    })
+  }
+
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Pending => "pending",
+      Self::Preparing => "preparing",
+      Self::Running => "running",
+      Self::Waiting => "waiting",
+      Self::Paused => "paused",
+      Self::Completed => "completed",
+      Self::Failed => "failed",
+      Self::Cancelled => "cancelled",
+      Self::Lost => "lost",
+      Self::Unknown => "unknown",
+    }
+  }
+
+  pub fn is_active(self) -> bool {
+    matches!(
+      self,
+      Self::Pending | Self::Preparing | Self::Running | Self::Waiting | Self::Paused
+    )
+  }
+
+  pub fn is_terminal(self) -> bool {
+    matches!(
+      self,
+      Self::Completed | Self::Failed | Self::Cancelled | Self::Lost
+    )
+  }
+
+  pub fn is_task_phase(self) -> bool {
+    matches!(self, Self::Running | Self::Waiting)
+  }
+}
+
+/// Independent causes of suspension. Legacy paused records without a resource
+/// hold represent a manual pause; clearing one cause never clears the other.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RunHolds {
+  pub manual: bool,
+  pub resource: bool,
+}
+
+impl RunHolds {
+  pub fn from_state(state: &Value) -> Self {
+    let resource = state["resource_paused"] == true;
+    Self {
+      manual: state["manual_paused"]
+        .as_bool()
+        .unwrap_or(state["status"] == "paused" && !resource),
+      resource,
+    }
+  }
+
+  pub fn is_held(self) -> bool {
+    self.manual || self.resource
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HoldSignal {
+  None,
+  Pause,
+  Resume,
+}
+
+/// A pure, validated transition. The worker sends any required process-group
+/// signal while holding the state lease, then applies these metadata changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HoldTransition {
+  pub phase: RunPhase,
+  pub signal: HoldSignal,
+  holds: RunHolds,
+  previous_phase: Option<RunPhase>,
+}
+
+impl HoldTransition {
+  pub fn apply(self, state: &mut Value) -> Result<bool> {
+    let changed = set_phase(state, self.phase)?;
+    if let Some(previous) = self.previous_phase {
+      state["paused_previous_status"] = previous.as_str().into();
+    }
+    let holds_changed = state["manual_paused"] != self.holds.manual
+      || state["resource_paused"] != self.holds.resource;
+    state["manual_paused"] = self.holds.manual.into();
+    state["resource_paused"] = self.holds.resource.into();
+    Ok(changed || holds_changed)
+  }
+}
+
+pub fn hold_transition(
+  state: &Value,
+  holds: RunHolds,
+  task_started: bool,
+) -> Result<HoldTransition> {
+  let current = state["status"]
+    .as_str()
+    .and_then(RunPhase::parse)
+    .filter(|phase| phase.is_active())
+    .ok_or_else(|| message("only an active run can change resource or manual holds"))?;
+  let phase = match current {
+    _ if !task_started && current != RunPhase::Paused => {
+      if holds.is_held() {
+        RunPhase::Pending
+      } else {
+        RunPhase::Preparing
+      }
+    }
+    _ if holds.is_held() => RunPhase::Paused,
+    RunPhase::Paused => restored_phase(state),
+    _ => current,
+  };
+  let transition = HoldTransition {
+    phase,
+    signal: match (
+      task_started,
+      current == RunPhase::Paused,
+      phase == RunPhase::Paused,
+    ) {
+      (true, false, true) => HoldSignal::Pause,
+      (true, true, false) => HoldSignal::Resume,
+      _ => HoldSignal::None,
+    },
+    holds,
+    previous_phase: (phase == RunPhase::Paused && current != RunPhase::Paused).then_some(current),
+  };
+  // Validate the current attempt before a caller can freeze its process.
+  transition.apply(&mut state.clone())?;
+  Ok(transition)
+}
+
+pub fn restored_phase(state: &Value) -> RunPhase {
+  if state["paused_previous_status"] == "waiting" {
+    RunPhase::Waiting
+  } else {
+    RunPhase::Running
+  }
+}
+
+/// Apply an active phase to the run and its current task attempt together.
+/// Terminal completion remains responsible for timestamps and exit outcomes.
+pub fn set_phase(state: &mut Value, phase: RunPhase) -> Result<bool> {
+  if !phase.is_active()
+    || !state["status"].as_str().is_some_and(is_active_status)
+    || !state["finished_at"].is_null()
+  {
+    return Err(message("only an unfinished active run can change phase"));
+  }
+  let attempt_changed = crate::task_attempts::set_supervisor_phase(state, phase)?;
+  let changed = state["status"] != phase.as_str() || attempt_changed;
+  state["status"] = phase.as_str().into();
+  Ok(changed)
+}
+
 pub fn is_active_status(status: &str) -> bool {
-  matches!(
-    status,
-    "pending" | "preparing" | "running" | "waiting" | "paused"
-  )
+  RunPhase::parse(status).is_some_and(RunPhase::is_active)
 }
 
 pub fn is_terminal_status(status: &str) -> bool {
-  matches!(status, "completed" | "failed" | "cancelled" | "lost")
+  RunPhase::parse(status).is_some_and(RunPhase::is_terminal)
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -118,9 +300,10 @@ pub fn set_task_status(run_dir: &Path, status: &str) -> Result<RunStatusUpdate> 
         "run supervisor is not active; task status was not changed",
       ));
     }
-    let attempt_changed = crate::task_attempts::set_current_phase(state, status)?;
-    let changed = previous_status != status || attempt_changed;
-    state["status"] = Value::String(status.into());
+    let changed = set_phase(
+      state,
+      RunPhase::parse(status).expect("validated task phase"),
+    )?;
     Ok(RunStatusUpdate {
       run_id,
       previous_status,

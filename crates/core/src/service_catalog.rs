@@ -11,6 +11,7 @@ use crate::service::{
 };
 
 pub const SERVICE_CATALOG_CAPABILITY: &str = "service-catalog-v1";
+pub const RUN_SUMMARY_CAPABILITY: &str = "run-summary-v1";
 pub const MAX_CATALOG_ROWS: usize = 100;
 pub const MAX_CATALOG_PAGE_BYTES: usize = 900 * 1024;
 
@@ -52,13 +53,27 @@ impl RunListQuery {
 pub struct RunListEntry {
   pub scope: RunScope,
   pub task: Option<String>,
-  /// Last published execution state; this does not supervise the live worker.
+  /// Published state for catalog-v1, or effective state for negotiated summaries.
   pub status: String,
   pub started_at: Option<String>,
   pub finished_at: Option<String>,
   pub exit_code: Option<i64>,
   pub archived: bool,
   pub warnings: Vec<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub observation: Option<RunObservation>,
+}
+
+/// Provenance of a compatible last-known worker observation over published history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunObservation {
+  pub recorded_status: String,
+  pub observed_at_ms: i64,
+  pub online: bool,
+  pub attempt: u64,
+  pub generation: u64,
+  pub available_actions: Vec<crate::run_control::ControlAction>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,6 +237,14 @@ pub fn validate_run_entry(run: &RunListEntry) -> Result<()> {
   }
   for time in [&run.started_at, &run.finished_at].into_iter().flatten() {
     text(time, 128)?;
+  }
+  if let Some(observation) = &run.observation
+    && (!crate::run_state::STATUSES.contains(&observation.recorded_status.as_str())
+      || observation.observed_at_ms < 0
+      || observation.attempt == 0
+      || observation.available_actions.len() > 6)
+  {
+    return Err(invalid("invalid run observation"));
   }
   validate_catalog_warnings(&run.warnings)
 }
@@ -475,6 +498,7 @@ mod tests {
       exit_code: None,
       archived: false,
       warnings: Vec::new(),
+      observation: None,
     };
     validate_run_entry(&run).unwrap();
     run.status = "paused".into();

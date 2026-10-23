@@ -28,7 +28,12 @@ unavailable. Results order by descending run ID, then ascending project and
 origin. Keep each run's full `scope`: identical run IDs can exist on different
 workers or projects.
 
-Execution status is the last published state. Missing or unavailable metadata
+Servers advertising `run-summary-v1` return the dashboard's last-known worker
+status when a compatible observation exists; otherwise status remains published.
+JSON `observation` includes the original `recorded_status`, receipt time
+`observed_at_ms`, connection freshness `online`, attempt, generation and available
+actions. Receipt time does not prove globally newest execution state. Older
+servers keep published-only responses. Missing or unavailable metadata
 produces bounded warnings. Use worker `runs status`, `runs logs`, and `runs cancel`
 for live supervision; `service run status` describes archival and cleanup.
 

@@ -173,8 +173,10 @@ project/origin; machine-profile tokens cannot browse runs. `query runs` defaults
 to active runs and 50 rows; `query files` defaults to 100. Pass `next_cursor` using
 `--cursor`, with the same filters, to continue. Limits are 1 to 100 per page.
 
-Keep every run's full project/origin/run ID scope. Status is the last published
-execution state; `service run status` is archival status, and worker `runs status`,
+Keep every run's full project/origin/run ID scope. With `run-summary-v1`, status
+uses the dashboard's last-known compatible worker observation; JSON `observation`
+retains published status and receipt/freshness details. It may lag the task.
+Older servers return published status. `service run status` is archival status, and worker `runs status`,
 `runs logs`, and `runs cancel` provide live supervision. Missing metadata produces warnings.
 
 Files distinguish received data, reported-only outputs and known version

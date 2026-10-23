@@ -26,6 +26,7 @@ pub(super) fn queue_run(source: &Source, context: &QueueJobContext) -> Value {
     Some("No published worker run metadata is available")
   };
   json!({
+    "identity":{"kind":"queue_job","project_id":context.project_id,"job_id":context.job_id},
     "run_id":context.job_id,"run_key":format!("queue::{}",context.job_id),
     "task":context.task,"status":status,"started_at":null,"finished_at":null,
     "exit_code":null,"submitted_at":submitted_at,"origin":context.worker_id,

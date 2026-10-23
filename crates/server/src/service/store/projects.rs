@@ -317,6 +317,7 @@ impl<S: ObjectStorage> Store<S> {
       | Request::RunControlBatch { .. }
       | Request::Queue { .. }
       | Request::BrowseRuns { .. }
+      | Request::BrowseRunSummaries { .. }
       | Request::BrowseRunFiles { .. }
       | Request::ProjectStorage { .. }
       | Request::PreviewProjectDelete { .. }
@@ -446,42 +447,7 @@ impl<S: ObjectStorage> Store<S> {
         [project_id],
       )
       .map_err(database)?;
-    transaction.execute(&format!("DELETE FROM parts WHERE upload_id IN (SELECT upload_id FROM uploads WHERE {TARGET_PROJECT}=?1)"), [project_id]).map_err(database)?;
-    for table in [
-      "chunks",
-      "streams",
-      "dashboard_overviews",
-      "tracking_metric_rows",
-      "tracking_metric_summaries",
-      "tracking_metric_state",
-      "tracking_asset_uses",
-      "tracking_system_blocks",
-      "tracking_system_packs",
-      "tracking_versions",
-      "files",
-      "uploads",
-    ] {
-      transaction
-        .execute(
-          &format!("DELETE FROM {table} WHERE {TARGET_PROJECT}=?1"),
-          [project_id],
-        )
-        .map_err(database)?;
-    }
-    for table in [
-      "tracking_run_seals",
-      "tracking_run_epochs",
-      "tracking_attempt_history",
-      "tracking_attempt_aborts",
-      "result_archives",
-    ] {
-      transaction
-        .execute(
-          &format!("DELETE FROM {table} WHERE json_extract(scope,'$.project_id')=?1"),
-          [project_id],
-        )
-        .map_err(database)?;
-    }
+    owned_records::delete(&transaction, owned_records::Owner::Project(project_id))?;
     transaction
       .execute(
         "DELETE FROM run_annotations WHERE project_id=?1",
@@ -499,14 +465,6 @@ impl<S: ObjectStorage> Store<S> {
       transaction
         .execute(
           &format!("DELETE FROM {table} WHERE project_id=?1"),
-          [project_id],
-        )
-        .map_err(database)?;
-    }
-    for table in ["run_control_bindings", "run_control_commands"] {
-      transaction
-        .execute(
-          &format!("DELETE FROM {table} WHERE json_extract(scope,'$.project_id')=?1"),
           [project_id],
         )
         .map_err(database)?;

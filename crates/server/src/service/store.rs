@@ -17,6 +17,7 @@ mod catalog_runs;
 mod cli_credentials;
 mod dashboard_storage;
 pub(super) mod experiments;
+mod owned_records;
 mod projects;
 mod references;
 mod resource_queue;
@@ -982,6 +983,9 @@ impl<S: ObjectStorage> Store<S> {
       Request::BrowseRuns { query } => Ok(Response::RunPage {
         page: self.browse_runs(&query)?,
       }),
+      Request::BrowseRunSummaries { query } => Ok(Response::RunPage {
+        page: self.browse_run_summaries(&query)?,
+      }),
       Request::BrowseRunFiles { query } => Ok(Response::RunFilesPage {
         page: self.browse_run_files(&query)?,
       }),
@@ -1056,6 +1060,7 @@ impl<S: ObjectStorage> Store<S> {
           expri_core::experiment_assignment::EXPERIMENT_ASSIGNMENT_CAPABILITY.into(),
           expri_core::experiment_catalog::EXPERIMENT_CATALOG_CAPABILITY.into(),
           expri_core::service_catalog::SERVICE_CATALOG_CAPABILITY.into(),
+          expri_core::service_catalog::RUN_SUMMARY_CAPABILITY.into(),
           expri_core::resource_queue::RESOURCE_QUEUE_CAPABILITY.into(),
           expri_core::resource_queue::RESOURCE_QUEUE_GPU_AVAILABILITY_CAPABILITY.into(),
         ],

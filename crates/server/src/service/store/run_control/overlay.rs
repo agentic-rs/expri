@@ -1,7 +1,7 @@
 use super::*;
 
 impl<S: ObjectStorage> Store<S> {
-  /// Worker observations decorate dashboard reads independently of byte upload.
+  /// One projection for dashboard and negotiated CLI summaries, independent of upload.
   /// The original tracking document and its versioned preview remain unchanged.
   pub(in crate::service) fn decorate_run_control(
     &self,
@@ -31,10 +31,10 @@ impl<S: ObjectStorage> Store<S> {
     {
       return Ok(());
     }
-    let recorded_status = run["status"].as_str().unwrap_or("unknown");
+    let recorded_status = run["status"].as_str().unwrap_or("unknown").to_owned();
     let active = expri_core::run_state::is_active_status(&facts.status);
     if published_attempt == facts.attempt
-      && expri_core::run_state::is_terminal_status(recorded_status)
+      && expri_core::run_state::is_terminal_status(&recorded_status)
       && active
     {
       return Ok(());
@@ -46,6 +46,14 @@ impl<S: ObjectStorage> Store<S> {
       return Ok(());
     }
     run["recorded_status"] = run["status"].clone();
+    run["observation"] = json!(expri_core::service_catalog::RunObservation {
+      recorded_status,
+      observed_at_ms: last_seen_at_ms,
+      online: now_ms().saturating_sub(last_seen_at_ms) <= ONLINE_MS,
+      attempt: facts.attempt,
+      generation: facts.generation,
+      available_actions: facts.available_actions(),
+    });
     run["status"] = json!(facts.status);
     run["finished_at"] = if active {
       Value::Null
